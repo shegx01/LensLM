@@ -13,7 +13,7 @@ wraps each file in a transaction (one file = one atomic unit).
 2. **Numbering:** `NNNN_description.sql`, monotonically increasing
    (`0001_init.sql`, `0002_...`).
 3. **Idempotent DDL:** use `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT
-   EXISTS` as defense-in-depth.
+EXISTS` as defense-in-depth.
 4. **Own your tables:** each milestone adds the tables it introduces
    (e.g. `tts_voice` in M2, `audio_overview` in M7) as its own additive
    migration rather than pre-creating them here.
