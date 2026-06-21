@@ -5,6 +5,7 @@
 //! into a migration. If DB-resident flags are ever needed, add an `app_flags`
 //! table as an additive migration in the milestone that requires it.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -28,6 +29,11 @@ pub struct ModelConfig {
     /// Sampling temperature.
     pub temperature: f32,
     /// Optional API key (empty when not required, e.g. local providers).
+    ///
+    /// NOTE: stored in PLAINTEXT inside `config.json`. The file is written with
+    /// restrictive `0o600` permissions on Unix (owner read/write only) as a
+    /// stopgap. Migrating secrets into the OS keychain is deferred to M2; do not
+    /// rely on this field being secure at rest.
     pub api_key: String,
 }
 
@@ -78,7 +84,7 @@ pub struct AppConfig {
     /// Configured chat/inference models keyed by role.
     pub models: Vec<ModelConfig>,
     /// Arbitrary named endpoints (label -> URL).
-    pub endpoints: std::collections::BTreeMap<String, String>,
+    pub endpoints: BTreeMap<String, String>,
     /// Host/guest TTS voices.
     pub voices: VoiceConfig,
     /// Filesystem paths.
@@ -115,6 +121,10 @@ impl AppConfig {
     }
 
     /// Serializes and writes this config to `{dir}/config.json` (pretty JSON).
+    ///
+    /// On Unix the file is given `0o600` permissions (owner read/write only)
+    /// because it may hold a plaintext `api_key`. This is a stopgap until M2
+    /// moves secrets into the OS keychain.
     #[tracing::instrument(skip_all, fields(dir = %dir.as_ref().display()))]
     pub fn save(&self, dir: impl AsRef<Path>) -> Result<(), LensError> {
         let dir = dir.as_ref();
@@ -124,7 +134,25 @@ impl AppConfig {
         let json = serde_json::to_string_pretty(self)?;
         std::fs::write(&path, json)
             .map_err(|e| LensError::Io(format!("{}: {e}", path.display())))?;
+        Self::restrict_permissions(&path)?;
         tracing::debug!("saved config to {}", path.display());
+        Ok(())
+    }
+
+    /// Restricts `config.json` to owner read/write (`0o600`) on Unix; a no-op on
+    /// other platforms (Windows ACLs are not addressed in M0).
+    #[cfg(unix)]
+    fn restrict_permissions(path: &Path) -> Result<(), LensError> {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(path, perms)
+            .map_err(|e| LensError::Io(format!("{}: {e}", path.display())))?;
+        Ok(())
+    }
+
+    /// Permission-tightening is Unix-only; elsewhere this is intentionally inert.
+    #[cfg(not(unix))]
+    fn restrict_permissions(_path: &Path) -> Result<(), LensError> {
         Ok(())
     }
 }
