@@ -3,6 +3,8 @@ name = "lenslm"
 version.workspace = true
 edition.workspace = true
 description = "LensLM desktop shell — Tauri v2 IPC bridge over lens-core."
+# Application binary, not published to crates.io (no license chosen yet).
+publish = false
 
 # Produce a binary named "LensLM" (shown in logs and the macOS app/menu name).
 [[bin]]
