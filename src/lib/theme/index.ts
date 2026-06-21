@@ -47,7 +47,7 @@ function isValidMode(v: string): v is Mode {
  *
  * Single-read boot (plan change #14): callers that already hold a fresh
  * AppConfig (e.g. the `+layout` boot gate, which reads `get_config` ONCE to
- * drive BOTH theme reconciliation AND the routing gate) pass it via `cfg` to
+ * drive BOTH theme reconciliation AND the onboarding gate) pass it via `cfg` to
  * skip the internal `get_config` — one IPC round-trip, no double read. When
  * `cfg` is omitted the original behavior is preserved (own guarded read).
  */
