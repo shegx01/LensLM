@@ -1,12 +1,14 @@
+/// <reference types="vitest/config" />
 import { sveltekit } from '@sveltejs/kit/vite';
-import { defineConfig } from 'vite';
+import { svelteTesting } from '@testing-library/svelte/vite';
+import { defineConfig } from 'vitest/config';
 
-// @ts-expect-error process is a node global available under the Vite/Bun runtime.
 const host = process.env.TAURI_DEV_HOST;
 
 // https://v2.tauri.app/start/frontend/sveltekit/
 export default defineConfig({
-  plugins: [sveltekit()],
+  // svelteTesting() adds auto-cleanup + browser resolution conditions for tests.
+  plugins: [sveltekit(), svelteTesting()],
   // Prevent Vite from obscuring Rust compiler errors.
   clearScreen: false,
   server: {
@@ -25,5 +27,11 @@ export default defineConfig({
       // Don't watch the Rust backend from the frontend dev server.
       ignored: ['**/src-tauri/**']
     }
+  },
+  test: {
+    // Simulated DOM for component tests (faster than jsdom; fixes Svelte transition RAF).
+    environment: 'happy-dom',
+    setupFiles: ['./vitest-setup.ts'],
+    include: ['src/**/*.{test,spec}.{js,ts}', 'src/**/*.svelte.{test,spec}.{js,ts}']
   }
 });

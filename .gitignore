@@ -12,6 +12,12 @@ node_modules
 # Tauri generated schemas
 src-tauri/gen/schemas
 
+# Test artifacts
+/test-results
+/playwright-report
+/playwright/.cache
+/coverage
+
 # OS
 .DS_Store
 

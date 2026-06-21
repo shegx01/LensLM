@@ -18,3 +18,8 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 lens-core = { path = "../lens-core" }
 tauri = { version = "2", features = [] }
+
+[dev-dependencies]
+# The `test` feature (mock runtime) is unioned in only for test builds.
+tauri = { version = "2", features = ["test"] }
+tokio = { workspace = true, features = ["rt", "macros"] }
