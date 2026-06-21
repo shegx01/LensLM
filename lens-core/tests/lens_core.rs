@@ -7,7 +7,7 @@ use rstest::rstest;
 /// exercising the interior mutability the Tauri managed state relies on.
 #[tokio::test]
 async fn engine_write_then_read_roundtrip() {
-    let engine = LensEngine::new();
+    let engine = LensEngine::for_test().await;
     {
         let _write = engine.write().await;
     } // write guard dropped here
@@ -18,7 +18,7 @@ async fn engine_write_then_read_roundtrip() {
 /// so concurrent shared read guards are allowed.
 #[tokio::test]
 async fn cloned_handles_share_state() {
-    let engine = LensEngine::new();
+    let engine = LensEngine::for_test().await;
     let clone = engine.clone();
     let _a = engine.read().await;
     let _b = clone.read().await; // second shared read is fine

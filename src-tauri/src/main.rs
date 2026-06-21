@@ -4,14 +4,26 @@
 mod commands;
 
 use lens_core::LensEngine;
+use tauri::Manager;
 
 fn main() {
-    // Instantiate the headless engine container once at runtime boot.
-    let lens_core_instance = LensEngine::new();
+    // Initialize a tracing subscriber so engine/command spans are visible.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
 
     tauri::Builder::default()
-        // Cache the instance safely inside Tauri's thread-safe managed state.
-        .manage(lens_core_instance)
+        // Resolve the OS app-data dir, init the engine (open db + migrate +
+        // load config) on it, and store the handle in Tauri managed state.
+        .setup(|app| {
+            let data_dir = app.path().app_data_dir()?;
+            let engine = tauri::async_runtime::block_on(LensEngine::init(&data_dir))?;
+            app.manage(engine);
+            Ok(())
+        })
         // Register the behaviorless bridge command handles.
         .invoke_handler(tauri::generate_handler![commands::invoke_core_action])
         .run(tauri::generate_context!())

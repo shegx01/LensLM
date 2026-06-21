@@ -23,7 +23,7 @@ mod tests {
     #[tokio::test]
     async fn invoke_core_action_returns_empty_string() {
         let app = tauri::test::mock_app();
-        app.manage(LensEngine::new());
+        app.manage(LensEngine::for_test().await);
 
         let engine = app.state::<LensEngine>();
         let result = invoke_core_action("payload".to_string(), engine).await;
