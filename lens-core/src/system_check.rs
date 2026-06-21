@@ -544,7 +544,11 @@ mod tests {
         let dead_url = server.uri();
         drop(server);
 
-        let config = config_with_ollama(&dead_url);
+        // Point BOTH runtimes at the dead address. Overriding only Ollama would
+        // leave the LM Studio probe on its default :1234, which is environment-
+        // dependent (a real local LM Studio / another service on a CI runner can
+        // answer and flip this to Pass — observed failing in CI).
+        let config = config_with_runtimes(&dead_url, &dead_url);
         let probe = probe_llm_runtime(&config).await;
 
         assert_eq!(probe.result.status, CheckStatus::Fail);
@@ -586,7 +590,9 @@ mod tests {
         let dead_url = server.uri();
         drop(server);
 
-        let config = config_with_ollama(&dead_url);
+        // Both runtimes dead (refused) so this measures the genuinely-offline
+        // path and never reaches a real LM Studio on the default :1234.
+        let config = config_with_runtimes(&dead_url, &dead_url);
         let start = Instant::now();
         let _ = probe_llm_runtime(&config).await;
         let elapsed = start.elapsed();
