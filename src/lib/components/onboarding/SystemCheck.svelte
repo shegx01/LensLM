@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import LoaderCircle from '@lucide/svelte/icons/loader-circle';
-  import RefreshCw from '@lucide/svelte/icons/refresh-cw';
+  import ArrowRight from '@lucide/svelte/icons/arrow-right';
   import TriangleAlert from '@lucide/svelte/icons/triangle-alert';
   import ScanSearch from '@lucide/svelte/icons/scan-search';
   import Sun from '@lucide/svelte/icons/sun';
@@ -48,6 +48,10 @@
     checkError !== null ||
       results.some((r) => (BLOCKING_IDS as readonly string[]).includes(r.id) && r.status === 'fail')
   );
+
+  // Footer summary, verbatim per the design: "{readyCount} of {totalCount} checks passed".
+  const readyCount = $derived(results.filter((r) => r.status === 'pass').length);
+  const totalCount = $derived(results.length);
 
   async function check(): Promise<void> {
     loading = true;
@@ -160,18 +164,23 @@
       {/if}
     </CardContent>
 
-    <CardFooter class="flex flex-col gap-2 pt-2">
+    <CardFooter class="flex flex-col gap-3 pt-2">
       {#if continueError}
         <p class="text-destructive w-full text-center text-sm" role="alert">{continueError}</p>
       {/if}
-      <div class="flex w-full items-center justify-between gap-2">
-        <Button variant="outline" size="sm" onclick={check} disabled={loading || finishing}>
-          <RefreshCw />
-          Retry
-        </Button>
-        <Button onclick={handleContinue} disabled={loading || finishing || blocked}>Continue</Button
-        >
-      </div>
+      {#if !loading && !checkError}
+        <p class="text-muted-foreground w-full text-center text-[11px]">
+          {readyCount} of {totalCount} checks passed
+        </p>
+      {/if}
+      <Button
+        class="h-11 w-full"
+        onclick={handleContinue}
+        disabled={loading || finishing || blocked}
+      >
+        Continue to setup
+        <ArrowRight />
+      </Button>
     </CardFooter>
   </Card>
 </main>
