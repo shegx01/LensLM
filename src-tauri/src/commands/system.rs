@@ -2,9 +2,12 @@
 
 use lens_core::{LensEngine, LensError};
 use serde::Serialize;
+
+#[cfg(debug_assertions)]
 use tauri::ipc::Channel;
 
-use crate::stream::StreamEvent;
+#[cfg(debug_assertions)]
+use crate::stream::{StreamEvent, send_event};
 
 /// Result of a [`health_check`]: DB reachable + applied migration count.
 #[derive(Debug, Clone, Serialize)]
@@ -28,32 +31,36 @@ pub async fn health_check(engine: tauri::State<'_, LensEngine>) -> Result<Health
 
 /// Demonstrator that exercises the streaming primitive end to end: emits
 /// `Started`, three `Progress` updates, then `Done` over the channel.
+///
+/// Gated behind `debug_assertions` so it never appears on the release command
+/// surface — it exists only to validate the streaming plumbing during dev.
+#[cfg(debug_assertions)]
 #[tracing::instrument(skip_all)]
 #[tauri::command]
 pub async fn stream_demo(channel: Channel<StreamEvent<String>>) -> Result<(), LensError> {
     let total = 3u64;
-    channel
-        .send(StreamEvent::Started)
-        .map_err(|e| LensError::Internal(e.to_string()))?;
+    send_event(&channel, StreamEvent::Started)?;
     for done in 1..=total {
-        channel
-            .send(StreamEvent::Progress {
+        send_event(
+            &channel,
+            StreamEvent::Progress {
                 done,
                 total: Some(total),
-            })
-            .map_err(|e| LensError::Internal(e.to_string()))?;
+            },
+        )?;
     }
-    channel
-        .send(StreamEvent::Done)
-        .map_err(|e| LensError::Internal(e.to_string()))?;
+    send_event(&channel, StreamEvent::Done)?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(debug_assertions)]
     use std::sync::{Arc, Mutex};
     use tauri::Manager;
+    #[cfg(debug_assertions)]
+    use tauri::ipc::Channel;
 
     #[tokio::test]
     async fn health_check_reports_db_ok_and_migrations() {
@@ -67,6 +74,7 @@ mod tests {
         assert_eq!(status.migration_count, 1);
     }
 
+    #[cfg(debug_assertions)]
     #[tokio::test]
     async fn stream_demo_emits_started_progress_done_in_order() {
         let collected = Arc::new(Mutex::new(Vec::new()));

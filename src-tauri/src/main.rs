@@ -37,6 +37,8 @@ fn main() {
             commands::notebooks::rename_notebook,
             commands::notebooks::delete_notebook,
             commands::system::health_check,
+            // Dev-only streaming demonstrator; absent from the release surface.
+            #[cfg(debug_assertions)]
             commands::system::stream_demo,
         ])
         .run(tauri::generate_context!())
