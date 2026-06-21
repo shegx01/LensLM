@@ -15,6 +15,9 @@
   });
 </script>
 
-<ModeWatcher />
+<!-- disableHeadScriptInjection: under ssr=false the ModeWatcher head script is
+     never executed; the pre-paint script in app.html owns first paint (FOUC-free).
+     Runtime onMount reconciliation via loadThemeFromConfig still runs normally. -->
+<ModeWatcher disableHeadScriptInjection />
 
 {@render children?.()}

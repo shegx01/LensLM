@@ -1,8 +1,9 @@
-// TypeScript mirror of the Rust `AppConfig` (lens-core/src/config.rs), used so the
-// theme read-modify-write preserves EVERY field across set_config (which replaces
-// the whole struct). serde uses the field names verbatim (snake_case), so this
-// shape must match exactly. M1-0 only mutates `theme`; all other fields are
-// round-tripped untouched.
+// SYNC-CHECK: must match lens-core/src/config.rs AppConfig — update both together.
+//
+// TypeScript mirror of the Rust `AppConfig`, used so the theme read-modify-write
+// preserves EVERY field across set_config (which replaces the whole struct).
+// serde uses the field names verbatim (snake_case), so this shape must match
+// exactly. M1-0 only mutates `theme`; all other fields are round-tripped untouched.
 
 export interface ModelConfig {
   provider: string;
