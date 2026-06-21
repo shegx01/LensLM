@@ -19,8 +19,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use sqlx::SqlitePool;
 
-use crate::LensEngineInner;
 use crate::config::AppConfig;
 
 /// Connect timeout for a single runtime-detection HTTP request.
@@ -142,33 +142,65 @@ struct LlmRuntimeProbe {
 ///
 /// Both connect and read timeouts are bounded so a closed port or a black-hole
 /// host fails fast rather than hanging the onboarding screen.
-fn probe_client() -> reqwest::Client {
+/// The shared probe-client builder: bounded connect/read timeouts plus SSRF
+/// hardening (never follow a redirect — a malicious / misconfigured endpoint
+/// could 30x a probe toward an internal host; a probe only ever inspects the
+/// directly-addressed service). Centralized so the primary build and its
+/// fallback can never drift apart.
+fn probe_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .connect_timeout(PROBE_CONNECT_TIMEOUT)
         .timeout(PROBE_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+}
+
+fn probe_client() -> reqwest::Client {
+    // The builder only fails if the TLS backend can't initialize. Retry the
+    // identical (timeout + no-redirect) builder once; the final
+    // `unwrap_or_default` is a last-resort guard that can realistically never
+    // run (rustls is pure Rust with no system deps) so a probe degrades to a
+    // clean Fail, never a panic.
+    probe_builder()
         .build()
-        // The builder only fails if the TLS backend can't initialize; fall back
-        // to a default client so a probe degrades to a clean Fail, never a panic.
-        .unwrap_or_default()
+        .unwrap_or_else(|_| probe_builder().build().unwrap_or_default())
 }
 
 /// Resolves the configured Ollama base URL, defaulting to localhost.
 fn ollama_base_url(config: &AppConfig) -> String {
+    provider_base_url(config, "ollama").unwrap_or_else(|| DEFAULT_OLLAMA_BASE_URL.to_string())
+}
+
+/// Resolves the configured LM Studio base URL, defaulting to localhost:1234.
+///
+/// Mirrors [`ollama_base_url`] so the LM Studio probe target is configurable
+/// rather than hard-coded, and so the aggregate fallback can be tested via the
+/// seam (point both seams at a mock server).
+fn lmstudio_base_url(config: &AppConfig) -> String {
+    provider_base_url(config, "lmstudio")
+        .or_else(|| provider_base_url(config, "lm_studio"))
+        .or_else(|| provider_base_url(config, "lm studio"))
+        .unwrap_or_else(|| DEFAULT_LMSTUDIO_BASE_URL.to_string())
+}
+
+/// Finds the first configured model for `provider` with a non-empty base URL,
+/// returning its trailing-slash-trimmed URL.
+fn provider_base_url(config: &AppConfig, provider: &str) -> Option<String> {
     config
         .models
         .iter()
-        .find(|m| m.provider.eq_ignore_ascii_case("ollama") && !m.base_url.is_empty())
+        .find(|m| m.provider.eq_ignore_ascii_case(provider) && !m.base_url.is_empty())
         .map(|m| m.base_url.trim_end_matches('/').to_string())
-        .unwrap_or_else(|| DEFAULT_OLLAMA_BASE_URL.to_string())
 }
 
 /// Probe 1 — in-process engine / database health.
 ///
-/// The engine is already constructed (we hold `inner`), so we only verify the
-/// database answers. No port string is reported: there is no separate service.
-async fn probe_local_backend(inner: &LensEngineInner) -> CheckResult {
+/// The engine is already constructed, so we only verify the database answers.
+/// No port string is reported: there is no separate service. Takes a cloned
+/// pool (cheap `Arc` clone) so the caller can drop the engine read guard before
+/// running this against the clone.
+async fn probe_local_backend(db: &SqlitePool) -> CheckResult {
     let healthy = sqlx::query_scalar::<_, i64>("SELECT 1")
-        .fetch_one(&inner.db)
+        .fetch_one(db)
         .await
         .map(|one| one == 1)
         .unwrap_or(false);
@@ -221,10 +253,11 @@ async fn detect_lmstudio(client: &reqwest::Client, base_url: &str) -> bool {
 async fn probe_llm_runtime(config: &AppConfig) -> LlmRuntimeProbe {
     let client = probe_client();
     let ollama_base = ollama_base_url(config);
+    let lmstudio_base = lmstudio_base_url(config);
 
     let (ollama_version, lmstudio_up) = tokio::join!(
         detect_ollama(&client, &ollama_base),
-        detect_lmstudio(&client, DEFAULT_LMSTUDIO_BASE_URL),
+        detect_lmstudio(&client, &lmstudio_base),
     );
 
     let ollama_up = ollama_version.is_some();
@@ -376,22 +409,26 @@ fn write_test_sentinel(dir: &Path) -> std::io::Result<()> {
 ///
 /// Probes run via [`tokio::join!`] so the wall-clock cost is roughly the slowest
 /// probe (the bounded LLM timeout window), not the sum of all probes.
-pub(crate) async fn run_system_check(inner: &LensEngineInner) -> Vec<CheckResult> {
-    let config = inner.config.clone();
+///
+/// Takes a `&AppConfig` + `&SqlitePool` rather than the engine handle: the
+/// caller clones both cheaply under the engine read guard and DROPS the guard
+/// before calling here, so the multi-second HTTP probes never hold the engine
+/// lock (which would block concurrent `get_config`/`set_config`).
+pub(crate) async fn run_system_check(config: &AppConfig, db: &SqlitePool) -> Vec<CheckResult> {
     let embed_client = probe_client();
 
     // The embedding probe reuses the LLM-runtime outcome, so it is awaited after
     // the LLM probe within this future; the other three run truly concurrently.
     let llm_and_embed = async {
-        let runtime = probe_llm_runtime(&config).await;
+        let runtime = probe_llm_runtime(config).await;
         let embedding = probe_embedding_model(&embed_client, &runtime).await;
         (runtime.result, embedding)
     };
 
     let (local_backend, (llm_runtime, embedding_model), disk_permissions) = tokio::join!(
-        probe_local_backend(inner),
+        probe_local_backend(db),
         llm_and_embed,
-        probe_disk_permissions(&config),
+        probe_disk_permissions(config),
     );
 
     vec![
@@ -421,6 +458,64 @@ mod tests {
             }],
             ..AppConfig::default()
         }
+    }
+
+    /// Builds a config carrying both an Ollama and an LM Studio model entry so
+    /// both probe seams can be pointed at mock servers (or dead URLs).
+    fn config_with_runtimes(ollama_url: &str, lmstudio_url: &str) -> AppConfig {
+        AppConfig {
+            models: vec![
+                ModelConfig {
+                    provider: "ollama".to_string(),
+                    base_url: ollama_url.to_string(),
+                    ..ModelConfig::default()
+                },
+                ModelConfig {
+                    provider: "lmstudio".to_string(),
+                    base_url: lmstudio_url.to_string(),
+                    ..ModelConfig::default()
+                },
+            ],
+            ..AppConfig::default()
+        }
+    }
+
+    #[test]
+    fn lmstudio_base_url_defaults_then_reads_config() {
+        // No lmstudio entry ⇒ the default seam.
+        assert_eq!(
+            lmstudio_base_url(&AppConfig::default()),
+            DEFAULT_LMSTUDIO_BASE_URL
+        );
+        // A configured entry wins, trailing slash trimmed.
+        let cfg = config_with_runtimes("", "http://127.0.0.1:9999/");
+        assert_eq!(lmstudio_base_url(&cfg), "http://127.0.0.1:9999");
+    }
+
+    #[tokio::test]
+    async fn aggregate_falls_back_to_lmstudio_via_seam() {
+        // Ollama is down (dead URL), but a configured LM Studio seam answers 200
+        // on /v1/models ⇒ the aggregate LLM probe reports Pass via the fallback.
+        let ollama = MockServer::start().await;
+        let dead_ollama = ollama.uri();
+        drop(ollama);
+
+        let lmstudio = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": []
+            })))
+            .mount(&lmstudio)
+            .await;
+
+        let config = config_with_runtimes(&dead_ollama, &lmstudio.uri());
+        let probe = probe_llm_runtime(&config).await;
+
+        assert_eq!(probe.result.status, CheckStatus::Pass);
+        assert!(!probe.ollama_up);
+        assert_eq!(probe.result.detail, "LM Studio detected");
+        assert_eq!(probe.result.action, Some(CheckAction::Configure));
     }
 
     #[tokio::test]
@@ -496,8 +591,11 @@ mod tests {
         let _ = probe_llm_runtime(&config).await;
         let elapsed = start.elapsed();
 
-        // Concurrent (not sequential) probing keeps the wall-clock within the
-        // stated ≤ 2.5s budget; allow generous slack for CI scheduling jitter.
+        // Concurrent (not sequential) probing keeps the wall-clock to roughly
+        // ONE timeout window: PROBE_CONNECT_TIMEOUT (1s) + PROBE_TIMEOUT (2s) =
+        // 3s for the slowest single probe, NOT the ~6s of two sequential ones.
+        // The 3500ms budget is that 3s window plus 500ms of slack for CI
+        // scheduling jitter; bump it only if those two constants change.
         assert!(
             elapsed < Duration::from_millis(3_500),
             "llm probe took {elapsed:?}, exceeding the concurrent budget"

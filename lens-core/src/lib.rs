@@ -148,8 +148,16 @@ impl LensEngine {
     /// but the `Result` signature is the frozen contract for future probes.)
     #[tracing::instrument(skip_all)]
     pub async fn run_system_check(&self) -> Result<Vec<CheckResult>, LensError> {
-        let inner = self.read().await;
-        Ok(system_check::run_system_check(&inner).await)
+        // Clone config + pool under the read guard, then DROP the guard before
+        // running the probes. The probes issue multi-second HTTP requests; doing
+        // so while holding the read guard would block any concurrent writer
+        // (`set_config`) for the whole probe window. Both clones are cheap (the
+        // pool is an internal `Arc`).
+        let (config, db) = {
+            let inner = self.read().await;
+            (inner.config.clone(), inner.db.clone())
+        };
+        Ok(system_check::run_system_check(&config, &db).await)
     }
 
     /// Lists all live (non-trashed) notebooks, newest first.
