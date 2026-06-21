@@ -3,6 +3,10 @@
   import LoaderCircle from '@lucide/svelte/icons/loader-circle';
   import RefreshCw from '@lucide/svelte/icons/refresh-cw';
   import TriangleAlert from '@lucide/svelte/icons/triangle-alert';
+  import ScanSearch from '@lucide/svelte/icons/scan-search';
+  import Sun from '@lucide/svelte/icons/sun';
+  import Moon from '@lucide/svelte/icons/moon';
+  import Monitor from '@lucide/svelte/icons/monitor';
   import {
     Card,
     CardHeader,
@@ -12,7 +16,6 @@
     CardFooter
   } from '$lib/components/ui/card/index.js';
   import { Button } from '$lib/components/ui/button/index.js';
-  import ThemeSwitcher from '$lib/components/ThemeSwitcher.svelte';
   import SystemCheckRow from '$lib/components/onboarding/SystemCheckRow.svelte';
   import {
     runSystemCheck,
@@ -20,6 +23,8 @@
     type CheckAction
   } from '$lib/onboarding/system-check.js';
   import { completeOnboarding } from '$lib/onboarding/completeOnboarding.js';
+  import { setMode, userPrefersMode } from 'mode-watcher';
+  import { persistTheme, type Mode } from '$lib/theme/index.js';
 
   // The first-run system-check screen. State-based: the layout renders this
   // (instead of the app) while onboarding is incomplete, and flips to the app
@@ -84,19 +89,49 @@
     if (action === 'retry') void check();
   }
 
+  // Compact onboarding-local theme toggle: cycles light → dark → system.
+  // Keeps the shared ThemeSwitcher on /showcase untouched.
+  const CYCLE: Mode[] = ['light', 'dark', 'system'];
+  const CYCLE_ICON = { light: Sun, dark: Moon, system: Monitor } as const;
+  const CYCLE_LABEL = { light: 'Light', dark: 'Dark', system: 'System' } as const;
+
+  const currentMode = $derived(userPrefersMode.current ?? 'system');
+  const NextIcon = $derived(CYCLE_ICON[currentMode]);
+  const nextLabel = $derived(CYCLE_LABEL[currentMode]);
+
+  function cycleTheme(): void {
+    const idx = CYCLE.indexOf(currentMode);
+    const next = CYCLE[(idx + 1) % CYCLE.length];
+    setMode(next);
+    persistTheme(next);
+  }
+
   onMount(() => {
     void check();
   });
 </script>
 
 <div class="absolute top-4 right-4 z-10">
-  <ThemeSwitcher />
+  <Button
+    variant="outline"
+    size="icon"
+    aria-label={`Theme: ${nextLabel}`}
+    onclick={cycleTheme}
+    class="size-9 rounded-lg"
+  >
+    <NextIcon class="size-4" />
+  </Button>
 </div>
 
 <main class="flex min-h-svh items-center justify-center p-4">
   <Card class="w-full max-w-lg">
     <CardHeader class="items-center text-center">
-      <div class="bg-muted mx-auto mb-2 size-12 rounded-2xl" aria-hidden="true"></div>
+      <div
+        class="bg-primary mx-auto mb-2 flex size-12 items-center justify-center rounded-2xl text-primary-foreground"
+        aria-hidden="true"
+      >
+        <ScanSearch class="size-6" />
+      </div>
       <CardTitle class="text-2xl">System check</CardTitle>
       <CardDescription>Verifying your local intelligence engine before launch</CardDescription>
     </CardHeader>

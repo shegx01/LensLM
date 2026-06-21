@@ -57,9 +57,17 @@
   // shipping a button that silently does nothing. `retry` is live (it re-runs
   // the check via the parent's `onaction`).
   const isAvailable = (action: CheckAction): boolean => action === 'retry';
+
+  // Attention rows (fail status OR a row with an action affordance) get a
+  // subtly stronger ring to match the design mock — token-based only.
+  // Pass/Pending rows keep the Card default (ring-foreground/10).
+  const needsEmphasis = $derived(result.status === 'fail' || result.action !== null);
 </script>
 
-<Card size="sm" class="flex-row items-center gap-3 px-4 py-3">
+<Card
+  size="sm"
+  class={cn('flex-row items-center gap-3 px-4 py-3', needsEmphasis && 'ring-foreground/20')}
+>
   <span
     class={cn(
       'flex size-8 shrink-0 items-center justify-center rounded-full [&_svg]:size-4',
