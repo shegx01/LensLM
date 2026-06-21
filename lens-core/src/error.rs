@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Top-level error type for the LensLM engine.
 ///
@@ -11,7 +11,7 @@ use serde::Serialize;
 /// variant serializes independently, so adding variants cannot change the wire
 /// shape of the existing `Validation`/`Internal` variants (locked by an insta
 /// snapshot in `tests/lens_core.rs`).
-#[derive(Debug, thiserror::Error, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "message")]
 pub enum LensError {
     /// Caller supplied invalid input.

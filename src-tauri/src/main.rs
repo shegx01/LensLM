@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod commands;
+mod stream;
 
 use lens_core::LensEngine;
 use tauri::Manager;
@@ -24,8 +25,20 @@ fn main() {
             app.manage(engine);
             Ok(())
         })
-        // Register the behaviorless bridge command handles.
-        .invoke_handler(tauri::generate_handler![commands::invoke_core_action])
+        // Register typed per-feature commands; the deprecated shim is kept so
+        // the existing frontend invoke stays green through M0.
+        .invoke_handler(tauri::generate_handler![
+            #[allow(deprecated)]
+            commands::invoke_core_action,
+            commands::config::get_config,
+            commands::config::set_config,
+            commands::notebooks::list_notebooks,
+            commands::notebooks::create_notebook,
+            commands::notebooks::rename_notebook,
+            commands::notebooks::delete_notebook,
+            commands::system::health_check,
+            commands::system::stream_demo,
+        ])
         .run(tauri::generate_context!())
         .expect("Fatal Error: Failed to launch the LensLM application context.");
 }
