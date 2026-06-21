@@ -13,7 +13,7 @@ test('home page renders the Hello World heading for a returning user', async ({ 
       voices: { host: '', guest: '' },
       paths: { data_dir: '' },
       tier_thresholds: { tier1_token_cap: 4000, tier2_token_cap: 16000 },
-      onboarding_complete: true,
+      onboarding_complete: true
     };
     (window as unknown as { isTauri: boolean }).isTauri = true;
     (globalThis as unknown as { isTauri: boolean }).isTauri = true;
@@ -21,7 +21,7 @@ test('home page renders the Hello World heading for a returning user', async ({ 
       invoke: (cmd: string) => {
         if (cmd === 'get_config') return Promise.resolve(config);
         return Promise.resolve(undefined);
-      },
+      }
     };
   });
 

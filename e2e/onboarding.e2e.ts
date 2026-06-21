@@ -44,11 +44,41 @@ function makeConfig(onboardingComplete: boolean): AppConfig {
 // rendering. local_backend + disk_permissions stay `pass` so Continue is NOT
 // blocked (gating predicate, plan change #12).
 const SYSTEM_CHECK = [
-  { id: 'local_backend', label: 'Local backend', status: 'pass', detail: 'In-process engine ready', action: null },
-  { id: 'llm_runtime', label: 'LLM runtime', status: 'fail', detail: 'No local LLM runtime detected', action: 'configure' },
-  { id: 'embedding_model', label: 'Embedding model', status: 'pending', detail: 'Set up when you add your first source', action: 'choose' },
-  { id: 'vector_database', label: 'Vector database', status: 'pending', detail: 'Built-in storage, set up automatically', action: null },
-  { id: 'disk_permissions', label: 'Disk permissions', status: 'pass', detail: '/tmp/lens', action: null }
+  {
+    id: 'local_backend',
+    label: 'Local backend',
+    status: 'pass',
+    detail: 'In-process engine ready',
+    action: null
+  },
+  {
+    id: 'llm_runtime',
+    label: 'LLM runtime',
+    status: 'fail',
+    detail: 'No local LLM runtime detected',
+    action: 'configure'
+  },
+  {
+    id: 'embedding_model',
+    label: 'Embedding model',
+    status: 'pending',
+    detail: 'Set up when you add your first source',
+    action: 'choose'
+  },
+  {
+    id: 'vector_database',
+    label: 'Vector database',
+    status: 'pending',
+    detail: 'Built-in storage, set up automatically',
+    action: null
+  },
+  {
+    id: 'disk_permissions',
+    label: 'Disk permissions',
+    status: 'pass',
+    detail: '/tmp/lens',
+    action: null
+  }
 ];
 
 /**
