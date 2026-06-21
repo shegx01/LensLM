@@ -539,16 +539,14 @@ mod tests {
 
     #[tokio::test]
     async fn llm_runtime_fail_when_nothing_responds() {
-        // Reserve a port then drop the server so the address refuses connections.
-        let server = MockServer::start().await;
-        let dead_url = server.uri();
-        drop(server);
-
-        // Point BOTH runtimes at the dead address. Overriding only Ollama would
-        // leave the LM Studio probe on its default :1234, which is environment-
-        // dependent (a real local LM Studio / another service on a CI runner can
-        // answer and flip this to Pass — observed failing in CI).
-        let config = config_with_runtimes(&dead_url, &dead_url);
+        // Both runtimes pointed at a fixed, always-refused localhost port (1).
+        // A dropped-MockServer port is NOT safe: cargo runs tests in parallel, so
+        // the freed ephemeral port can be re-bound by a concurrent test's mock
+        // server, which then answers 200 and flips this to Pass (observed in CI).
+        // Nothing binds 127.0.0.1:1, so the connection is deterministically
+        // refused → both runtimes absent → Fail.
+        let dead_url = "http://127.0.0.1:1";
+        let config = config_with_runtimes(dead_url, dead_url);
         let probe = probe_llm_runtime(&config).await;
 
         assert_eq!(probe.result.status, CheckStatus::Fail);
@@ -586,13 +584,11 @@ mod tests {
 
     #[tokio::test]
     async fn llm_probe_stays_within_time_budget_when_offline() {
-        let server = MockServer::start().await;
-        let dead_url = server.uri();
-        drop(server);
-
-        // Both runtimes dead (refused) so this measures the genuinely-offline
-        // path and never reaches a real LM Studio on the default :1234.
-        let config = config_with_runtimes(&dead_url, &dead_url);
+        // Fixed always-refused port (avoids the parallel-test port-reuse race; see
+        // llm_runtime_fail_when_nothing_responds). Genuinely offline; never reaches
+        // a real LM Studio on :1234.
+        let dead_url = "http://127.0.0.1:1";
+        let config = config_with_runtimes(dead_url, dead_url);
         let start = Instant::now();
         let _ = probe_llm_runtime(&config).await;
         let elapsed = start.elapsed();
