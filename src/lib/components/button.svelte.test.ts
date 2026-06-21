@@ -1,6 +1,6 @@
 import { render, screen, fireEvent } from '@testing-library/svelte';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import Host from './button-test-host.svelte';
+import Host from './__tests__/button-test-host.svelte';
 
 afterEach(() => {
   vi.restoreAllMocks();
