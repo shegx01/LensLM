@@ -1,6 +1,6 @@
 //! Notebook commands. Thin pass-throughs to `lens-core`; full CRUD UI is M3.
 
-use lens_core::{LensEngine, LensError, Notebook};
+use lens_core::{LensEngine, LensError, Notebook, NotebookId};
 
 /// Lists live (non-trashed) notebooks, newest first.
 #[tracing::instrument(skip_all)]
@@ -29,7 +29,7 @@ pub async fn rename_notebook(
     title: String,
     engine: tauri::State<'_, LensEngine>,
 ) -> Result<(), LensError> {
-    engine.rename_notebook(&id, &title).await
+    engine.rename_notebook(&NotebookId::from(id), &title).await
 }
 
 /// Deletes a notebook (child rows cascade).
@@ -39,7 +39,7 @@ pub async fn delete_notebook(
     id: String,
     engine: tauri::State<'_, LensEngine>,
 ) -> Result<(), LensError> {
-    engine.delete_notebook(&id).await
+    engine.delete_notebook(&NotebookId::from(id)).await
 }
 
 #[cfg(test)]
@@ -74,13 +74,15 @@ mod tests {
         let nb = create_notebook("Original".into(), engine.clone())
             .await
             .unwrap();
-        rename_notebook(nb.id.clone(), "Renamed".into(), engine.clone())
+        rename_notebook(nb.id.to_string(), "Renamed".into(), engine.clone())
             .await
             .unwrap();
         let listed = list_notebooks(engine.clone()).await.unwrap();
         assert_eq!(listed[0].title, "Renamed");
 
-        delete_notebook(nb.id, engine.clone()).await.unwrap();
+        delete_notebook(nb.id.to_string(), engine.clone())
+            .await
+            .unwrap();
         assert!(list_notebooks(engine).await.unwrap().is_empty());
     }
 }
