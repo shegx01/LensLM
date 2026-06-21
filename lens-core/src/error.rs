@@ -57,12 +57,31 @@ impl From<serde_json::Error> for LensError {
 
 impl From<sqlx::Error> for LensError {
     fn from(err: sqlx::Error) -> Self {
-        LensError::Internal(err.to_string())
+        // IPC sanitization: never leak raw sqlx/io strings or filesystem paths
+        // across the IPC boundary. Constraint violations carry actionable, safe
+        // information (the caller can fix the input), so route those to
+        // `Validation` with a generic message; everything else is logged in full
+        // for operators and surfaced as an opaque `Internal` error.
+        if let sqlx::Error::Database(db_err) = &err {
+            if db_err.is_unique_violation() {
+                tracing::error!(error = %err, "database unique-constraint violation");
+                return LensError::Validation("a record with that value already exists".into());
+            }
+            if db_err.is_foreign_key_violation() {
+                tracing::error!(error = %err, "database foreign-key violation");
+                return LensError::Validation("referenced record does not exist".into());
+            }
+        }
+        tracing::error!(error = %err, "database operation failed");
+        LensError::Internal("database operation failed".into())
     }
 }
 
 impl From<sqlx::migrate::MigrateError> for LensError {
     fn from(err: sqlx::migrate::MigrateError) -> Self {
-        LensError::Internal(err.to_string())
+        // Migrations run at startup, not across IPC, but keep the message opaque
+        // and log the detail for operators for consistency with the sqlx mapping.
+        tracing::error!(error = %err, "database migration failed");
+        LensError::Internal("database migration failed".into())
     }
 }

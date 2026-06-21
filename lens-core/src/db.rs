@@ -14,13 +14,21 @@ use crate::LensError;
 /// File name of the on-disk database within the engine data directory.
 const DB_FILE_NAME: &str = "lens.db";
 
-/// Embedded migrator over `lens-core/migrations/`. Files are compiled into the
-/// binary at build time and applied idempotently; each file runs in its own
-/// transaction (one file = one atomic unit).
+/// Embedded migrator over the crate's `./migrations` directory. Files are
+/// compiled into the binary at build time and applied idempotently; each file
+/// runs in its own transaction (one file = one atomic unit).
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
+/// Maximum number of pooled connections for the production on-disk database.
+const MAX_CONNECTIONS: u32 = 5;
+
+/// Busy-timeout (milliseconds) applied to each connection: how long SQLite waits
+/// on a locked database before returning `SQLITE_BUSY` instead of failing fast.
+const BUSY_TIMEOUT_MS: u64 = 5_000;
+
 /// Opens (creating if necessary) the on-disk pool at `{data_dir}/lens.db` with
-/// WAL journaling and foreign-key enforcement enabled.
+/// WAL journaling, foreign-key enforcement, a bounded connection count, and a
+/// busy-timeout so concurrent writers wait rather than erroring on lock.
 #[tracing::instrument(skip_all, fields(dir = %data_dir.display()))]
 pub async fn open_pool(data_dir: &Path) -> Result<SqlitePool, LensError> {
     let db_path = data_dir.join(DB_FILE_NAME);
@@ -28,8 +36,12 @@ pub async fn open_pool(data_dir: &Path) -> Result<SqlitePool, LensError> {
         .filename(&db_path)
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS))
         .foreign_keys(true);
-    let pool = SqlitePool::connect_with(options).await?;
+    let pool = SqlitePoolOptions::new()
+        .max_connections(MAX_CONNECTIONS)
+        .connect_with(options)
+        .await?;
     tracing::info!("opened db at {}", db_path.display());
     Ok(pool)
 }
@@ -43,7 +55,7 @@ pub async fn open_pool(data_dir: &Path) -> Result<SqlitePool, LensError> {
 /// `tempfile`-backed on-disk DB via [`open_pool`] instead.
 pub async fn open_in_memory_pool() -> Result<SqlitePool, LensError> {
     let options = SqliteConnectOptions::from_str("sqlite::memory:")
-        .map_err(|e| LensError::Internal(e.to_string()))?
+        .map_err(|e| LensError::Parse(e.to_string()))?
         .foreign_keys(true);
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
