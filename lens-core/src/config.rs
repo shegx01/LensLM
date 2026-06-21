@@ -106,8 +106,10 @@ impl AppConfig {
         match std::fs::read_to_string(&path) {
             Ok(contents) => {
                 tracing::debug!("loading config from {}", path.display());
-                let config = serde_json::from_str(&contents)
-                    .map_err(|e| LensError::Parse(format!("{}: {e}", path.display())))?;
+                let config = serde_json::from_str(&contents).map_err(|e| {
+                    tracing::error!("malformed config at {}: {e}", path.display());
+                    LensError::Parse(format!("{CONFIG_FILE_NAME}: {e}"))
+                })?;
                 Ok(config)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -116,7 +118,12 @@ impl AppConfig {
                 config.save(dir)?;
                 Ok(config)
             }
-            Err(e) => Err(LensError::Io(format!("{}: {e}", path.display()))),
+            Err(e) => {
+                tracing::error!("failed to read config at {}: {e}", path.display());
+                Err(LensError::Io(format!(
+                    "failed to read {CONFIG_FILE_NAME}: {e}"
+                )))
+            }
         }
     }
 
@@ -128,12 +135,16 @@ impl AppConfig {
     #[tracing::instrument(skip_all, fields(dir = %dir.as_ref().display()))]
     pub fn save(&self, dir: impl AsRef<Path>) -> Result<(), LensError> {
         let dir = dir.as_ref();
-        std::fs::create_dir_all(dir)
-            .map_err(|e| LensError::Io(format!("{}: {e}", dir.display())))?;
+        std::fs::create_dir_all(dir).map_err(|e| {
+            tracing::error!("failed to create config dir {}: {e}", dir.display());
+            LensError::Io(format!("failed to create config directory: {e}"))
+        })?;
         let path = dir.join(CONFIG_FILE_NAME);
         let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, json)
-            .map_err(|e| LensError::Io(format!("{}: {e}", path.display())))?;
+        std::fs::write(&path, json).map_err(|e| {
+            tracing::error!("failed to write config at {}: {e}", path.display());
+            LensError::Io(format!("failed to write {CONFIG_FILE_NAME}: {e}"))
+        })?;
         Self::restrict_permissions(&path)?;
         tracing::debug!("saved config to {}", path.display());
         Ok(())
@@ -145,8 +156,10 @@ impl AppConfig {
     fn restrict_permissions(path: &Path) -> Result<(), LensError> {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(path, perms)
-            .map_err(|e| LensError::Io(format!("{}: {e}", path.display())))?;
+        std::fs::set_permissions(path, perms).map_err(|e| {
+            tracing::error!("failed to set permissions on {}: {e}", path.display());
+            LensError::Io(format!("failed to secure {CONFIG_FILE_NAME}: {e}"))
+        })?;
         Ok(())
     }
 

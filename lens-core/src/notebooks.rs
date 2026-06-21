@@ -28,7 +28,7 @@ const MAX_TITLE_LEN: usize = 500;
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
 #[serde(transparent)]
 #[sqlx(transparent)]
-pub struct NotebookId(pub String);
+pub struct NotebookId(pub(crate) String);
 
 impl NotebookId {
     /// Mints a fresh time-ordered (UUIDv7) notebook id.
