@@ -24,3 +24,6 @@ src-tauri/gen/schemas
 # Icon generation source (regenerated on demand)
 /app-icon.png
 .omc/
+
+# Git worktrees (feature work is isolated in worktrees; never tracked)
+worktrees/
