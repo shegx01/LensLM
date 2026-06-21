@@ -141,6 +141,10 @@ export async function installTauriStub(
               if (next) currentCfg = next; // reflect the write for any later read
               return Promise.resolve(null);
             }
+            case 'detect_llm':
+              // Default stub: not reachable (safe — no local server in CI).
+              // Override via page.addInitScript if a test needs a reachable stub.
+              return Promise.resolve({ reachable: false, version: null, models: [] });
             default:
               return Promise.resolve(null);
           }

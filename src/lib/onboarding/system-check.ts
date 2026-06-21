@@ -28,6 +28,28 @@ export interface CheckResult {
   action: CheckAction | null;
 }
 
+// SYNC-CHECK: must match lens-core/src/llm_detect.rs LlmDetection
+//
+// Result of probing a local LLM endpoint. The backend command is `detect_llm`
+// (frozen contract, parallel agent adds the Rust impl). `reachable` is the
+// primary gate; `version` and `models` are best-effort (may be null/empty even
+// when reachable, depending on the runtime's /api/version + /api/tags support).
+export interface LlmDetection {
+  reachable: boolean;
+  version: string | null;
+  models: string[];
+}
+
+/**
+ * Probe an OpenAI-compatible local LLM endpoint via `detect_llm`. Guarded for
+ * non-Tauri contexts: returns `{reachable:false, version:null, models:[]}` so
+ * callers can use the same code path in tests and the browser dev server.
+ */
+export async function detectLlm(baseUrl: string): Promise<LlmDetection> {
+  if (!isTauri()) return { reachable: false, version: null, models: [] };
+  return invoke<LlmDetection>('detect_llm', { base_url: baseUrl });
+}
+
 /**
  * Run all system probes via the aggregate `run_system_check` command. Guarded
  * for `ssr=false` / tests-without-Tauri: outside a Tauri host this returns `[]`

@@ -159,7 +159,7 @@
         </div>
       {:else}
         {#each results as result (result.id)}
-          <SystemCheckRow {result} onaction={handleAction} />
+          <SystemCheckRow {result} onaction={handleAction} oncheck={check} />
         {/each}
       {/if}
     </CardContent>
