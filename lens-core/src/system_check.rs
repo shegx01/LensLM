@@ -98,6 +98,122 @@ pub struct CheckResult {
     pub action: Option<CheckAction>,
 }
 
+/// Result of probing a single LLM endpoint via [`detect_llm`].
+///
+/// THIS IS THE FROZEN IPC CONTRACT for the "Configure → Auto-detect" flow.
+/// It crosses the Tauri boundary verbatim and is mirrored in the Svelte client;
+/// field names and the serde shape are locked.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct LlmDetection {
+    /// Whether the endpoint answered with a successful (2xx) response.
+    pub reachable: bool,
+    /// Ollama version string, if the endpoint spoke the Ollama protocol.
+    pub version: Option<String>,
+    /// Model names/ids collected from the endpoint (Ollama + OpenAI-compatible).
+    pub models: Vec<String>,
+}
+
+/// Probes `base_url` for both Ollama-style and OpenAI-compatible endpoints,
+/// returning a [`LlmDetection`] that merges both responses.
+///
+/// Uses the shared [`probe_client`] (rustls, no-redirect, connect 1s / total 2s).
+/// Both protocol probes run concurrently via [`tokio::join!`].
+///
+/// - Ollama style: `GET {base_url}/api/version` → version; `GET {base_url}/api/tags` → models.
+/// - OpenAI-compatible: `GET {base_url}/v1/models` → models from `data[].id`.
+/// - Any connect/timeout/non-200 response contributes nothing (not an error).
+/// - If neither probe responds: `reachable=false`, `version=None`, `models=[]`.
+/// - Never returns `Err` for "not reachable"; `LensError` is reserved for genuine
+///   internal faults (which cannot realistically occur here).
+pub async fn detect_llm(base_url: &str) -> LlmDetection {
+    let base_url = base_url.trim_end_matches('/');
+    let client = probe_client();
+
+    let (ollama_result, openai_models) = tokio::join!(
+        probe_ollama_endpoint(&client, base_url),
+        probe_openai_endpoint(&client, base_url),
+    );
+
+    let (ollama_version, ollama_models) = ollama_result;
+
+    // Merge + deduplicate models from both protocols.
+    let mut models = ollama_models;
+    for id in openai_models {
+        if !models.contains(&id) {
+            models.push(id);
+        }
+    }
+
+    let reachable = ollama_version.is_some() || !models.is_empty();
+
+    LlmDetection {
+        reachable,
+        version: ollama_version,
+        models,
+    }
+}
+
+/// Probes the Ollama protocol: `GET /api/version` then `GET /api/tags`.
+/// Returns `(version, model_names)`.
+async fn probe_ollama_endpoint(
+    client: &reqwest::Client,
+    base_url: &str,
+) -> (Option<String>, Vec<String>) {
+    let version_url = format!("{base_url}/api/version");
+    let version = match client.get(&version_url).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            resp.json::<OllamaVersion>().await.ok().map(|v| v.version)
+        }
+        _ => None,
+    };
+
+    if version.is_none() {
+        return (None, vec![]);
+    }
+
+    let tags_url = format!("{base_url}/api/tags");
+    let models = match client.get(&tags_url).send().await {
+        Ok(resp) if resp.status().is_success() => resp
+            .json::<OllamaTags>()
+            .await
+            .ok()
+            .map(|tags| tags.models.into_iter().map(|m| m.name).collect())
+            .unwrap_or_default(),
+        _ => vec![],
+    };
+
+    (version, models)
+}
+
+/// Probes the OpenAI-compatible protocol: `GET /v1/models`.
+/// Returns `data[].id` strings on success, empty vec otherwise.
+async fn probe_openai_endpoint(client: &reqwest::Client, base_url: &str) -> Vec<String> {
+    let url = format!("{base_url}/v1/models");
+    match client.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => resp
+            .json::<OpenAiModels>()
+            .await
+            .ok()
+            .map(|m| m.data.into_iter().map(|d| d.id).collect())
+            .unwrap_or_default(),
+        _ => vec![],
+    }
+}
+
+/// Shape of the OpenAI-compatible `GET /v1/models` response.
+#[derive(Debug, Deserialize)]
+struct OpenAiModels {
+    #[serde(default)]
+    data: Vec<OpenAiModelEntry>,
+}
+
+/// One entry from `GET /v1/models`.
+#[derive(Debug, Deserialize)]
+struct OpenAiModelEntry {
+    id: String,
+}
+
 /// Shape of Ollama's `GET /api/version` response.
 #[derive(Debug, Deserialize)]
 struct OllamaVersion {
@@ -783,5 +899,91 @@ mod tests {
             detail: "fixture".to_string(),
             action: None,
         }
+    }
+
+    // --- detect_llm tests ---
+
+    #[tokio::test]
+    async fn detect_llm_ollama_responds_version_and_tags() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/version"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "version": "0.4.1"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [
+                    { "name": "llama3:latest" },
+                    { "name": "nomic-embed-text:latest" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let result = detect_llm(&server.uri()).await;
+
+        assert!(result.reachable);
+        assert_eq!(result.version, Some("0.4.1".to_string()));
+        assert_eq!(
+            result.models,
+            vec!["llama3:latest", "nomic-embed-text:latest"]
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_llm_openai_compatible_only() {
+        let server = MockServer::start().await;
+        // No /api/version or /api/tags — only OpenAI-compatible /v1/models.
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [
+                    { "id": "mistral-7b" },
+                    { "id": "codellama-13b" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let result = detect_llm(&server.uri()).await;
+
+        assert!(result.reachable);
+        assert_eq!(result.version, None);
+        assert_eq!(result.models, vec!["mistral-7b", "codellama-13b"]);
+    }
+
+    #[tokio::test]
+    async fn detect_llm_nothing_responds_returns_unreachable() {
+        // Fixed always-refused port — avoids the parallel-test port-reuse race
+        // (see llm_runtime_fail_when_nothing_responds for the full rationale).
+        let result = detect_llm("http://127.0.0.1:1").await;
+
+        assert!(!result.reachable);
+        assert_eq!(result.version, None);
+        assert!(result.models.is_empty());
+    }
+
+    /// Snapshot the exact serde wire-format of `LlmDetection`. Locks the FROZEN
+    /// IPC contract for the "Configure → Auto-detect" feature.
+    #[test]
+    fn llm_detection_serialized_shape() {
+        let result = LlmDetection {
+            reachable: true,
+            version: Some("0.4.1".to_string()),
+            models: vec!["llama3:latest".to_string()],
+        };
+        insta::assert_json_snapshot!(result, @r#"
+        {
+          "reachable": true,
+          "version": "0.4.1",
+          "models": [
+            "llama3:latest"
+          ]
+        }
+        "#);
     }
 }

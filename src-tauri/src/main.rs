@@ -38,6 +38,7 @@ fn main() {
             commands::notebooks::delete_notebook,
             commands::system::health_check,
             commands::system::run_system_check,
+            commands::system::detect_llm,
             // Dev-only streaming demonstrator; absent from the release surface.
             #[cfg(debug_assertions)]
             commands::system::stream_demo,

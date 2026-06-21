@@ -1,6 +1,6 @@
 //! System / diagnostic commands.
 
-use lens_core::{CheckResult, LensEngine, LensError};
+use lens_core::{CheckResult, LensEngine, LensError, LlmDetection};
 use serde::Serialize;
 
 #[cfg(debug_assertions)]
@@ -38,6 +38,19 @@ pub async fn run_system_check(
     engine: tauri::State<'_, LensEngine>,
 ) -> Result<Vec<CheckResult>, LensError> {
     engine.run_system_check().await
+}
+
+/// Probes `base_url` for both Ollama-style and OpenAI-compatible endpoints,
+/// returning a [`LlmDetection`] that summarizes reachability, server version,
+/// and the list of available model names/ids.
+///
+/// Never returns an `Err` for "not reachable"; `LensError` is reserved for
+/// genuine internal faults. The frontend should invoke this command as:
+/// `invoke("detect_llm", { base_url: "http://..." })`.
+#[tracing::instrument(skip_all, fields(%base_url))]
+#[tauri::command]
+pub async fn detect_llm(base_url: String) -> Result<LlmDetection, LensError> {
+    Ok(lens_core::detect_llm(&base_url).await)
 }
 
 /// Demonstrator that exercises the streaming primitive end to end: emits

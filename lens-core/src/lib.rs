@@ -17,7 +17,7 @@ pub mod system_check;
 pub use config::AppConfig;
 pub use error::LensError;
 pub use notebooks::{Notebook, NotebookId};
-pub use system_check::{CheckAction, CheckId, CheckResult, CheckStatus};
+pub use system_check::{CheckAction, CheckId, CheckResult, CheckStatus, LlmDetection, detect_llm};
 
 /// Re-exported so the integration-test crate can re-run the migrator against a
 /// pool obtained via [`LensEngine::pool`] without exposing the rest of the
