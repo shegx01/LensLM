@@ -1,0 +1,228 @@
+@import 'tailwindcss';
+@import 'tw-animate-css';
+
+@custom-variant dark (&:is(.dark *));
+
+/* ---------------------------------------------------------------------------
+ * Proxima Nova (M1-0 typography, #50).
+ *
+ * Bundled-only woff2 (NO CDN / network request). Four real weights are shipped —
+ * Light 300, Regular 400, Bold 700, Extrabold 800. There is intentionally NO
+ * faux/synthesized 500/600: emphasis falls back to Regular 400, with real Bold
+ * for headings and Extrabold for display. Assets converted one-shot from the
+ * user-supplied commercial OTF/TTF (see scripts/convert-fonts.md); the converter
+ * is NOT part of CI. font-display: swap avoids invisible text while loading.
+ * ------------------------------------------------------------------------- */
+
+@font-face {
+  font-family: 'Proxima Nova';
+  font-style: normal;
+  font-weight: 300;
+  font-display: swap;
+  src: url('/fonts/proximanova-light.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'Proxima Nova';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('/fonts/proximanova-regular.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'Proxima Nova';
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url('/fonts/proximanova-bold.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'Proxima Nova';
+  font-style: normal;
+  font-weight: 800;
+  font-display: swap;
+  src: url('/fonts/proximanova-extrabold.woff2') format('woff2');
+}
+
+/* ---------------------------------------------------------------------------
+ * Lens design tokens (M1-0).
+ *
+ * Architecture: a primitive OKLCH ramp is the single source of truth; semantic
+ * tokens use shadcn-svelte's exact variable names and reference the primitives.
+ * Components reference ONLY semantic tokens (--background, --primary, …) — never
+ * primitives, never hardcoded colors. Swapping a single primitive (e.g. pointing
+ * --primary at --purple-600) retints the entire UI, which validates the layering.
+ *
+ * Values extracted from the Lens design screenshots (plan §2). Primitives are the
+ * cool-tinted neutrals + brand green; reds for destructive; purple-600 is shipped
+ * as a primitive (NOT wired to any semantic token) purely as the retint proof.
+ * ------------------------------------------------------------------------- */
+
+:root {
+  /* --- Primitive ramp (brand green) --- */
+  --green-bright: oklch(0.6742 0.1488 152.6); /* #3bb068 — hover/accent on dark */
+  --green-primary: oklch(0.6141 0.1485 152.91); /* #1f9d57 — brand on dark */
+  --green-primary-aa: oklch(0.5794 0.1407 152.51); /* hsl(146 67% 34%) — AA on white */
+  --green-pressed: oklch(0.4224 0.099 148.4); /* #1e5c2d — active/pressed */
+  --green-fg: oklch(0.9825 0.0082 157.09); /* #f5fbf7 — text on green */
+
+  /* --- Primitive ramp (cool neutral, ~293° hue) ---
+   * Values are design-screenshot-derived; higher step = darker (lower L). */
+  --neutral-0: oklch(1 0 0); /* #ffffff */
+  --neutral-50: oklch(0.9674 0.0013 286.38); /* #f4f4f5 */
+  --neutral-100: oklch(0.9321 0.0054 286.3); /* #e8e8ec */
+  --neutral-400: oklch(0.5517 0.0138 285.94); /* #71717a — light muted-fg */
+  --neutral-500: oklch(0.4813 0.0096 293.69); /* #5e5d63 — dark muted-fg */
+  --neutral-700: oklch(0.297 0.0126 292.17); /* #2d2c33 — secondary/chip */
+  --neutral-800: oklch(0.2472 0.0113 293.2); /* #212026 — muted/input */
+  --neutral-850: oklch(0.2085 0.0118 292.99); /* #18171d — light fg */
+  --neutral-900: oklch(0.2041 0.0119 292.96); /* #17161c — card/sidebar/rail */
+  --neutral-950: oklch(0.1586 0.0127 292.53); /* #0d0c12 — dark bg */
+
+  /* --- Primitive ramp (red, destructive) --- */
+  --red-bright: oklch(0.6613 0.1627 26.86); /* #e5645a — dark destructive */
+  --red-strong: oklch(0.5771 0.2152 27.33); /* #dc2626 — light destructive */
+
+  /* --- Primitive (purple alt-variant; documented, NOT wired) --- */
+  --purple-600: oklch(0.4773 0.2225 286.79); /* #5d33d0 — retint proof only */
+
+  /* --- Alpha primitives (for border / input overlays) --- */
+  --alpha-border: oklch(0 0 0 / 8%); /* black 8% — light mode border/sidebar-border */
+  --alpha-input: oklch(0 0 0 / 10%); /* black 10% — light mode input */
+
+  /* --- Radius scale --- */
+  --radius: 0.75rem; /* 12px base */
+
+  /* --- Semantic tokens — LIGHT (shadcn names → primitives) --- */
+  --background: var(--neutral-0);
+  --foreground: var(--neutral-850);
+  --card: var(--neutral-0);
+  --card-foreground: var(--neutral-850);
+  --popover: var(--neutral-0);
+  --popover-foreground: var(--neutral-850);
+  --primary: var(--green-primary-aa);
+  --primary-foreground: var(--green-fg);
+  --secondary: var(--neutral-50);
+  --secondary-foreground: var(--neutral-850);
+  --muted: var(--neutral-50);
+  --muted-foreground: var(--neutral-400);
+  --accent: var(--neutral-50);
+  --accent-foreground: var(--neutral-850);
+  --destructive: var(--red-strong);
+  --destructive-foreground: var(--neutral-0);
+  --border: var(--alpha-border);
+  --input: var(--alpha-input);
+  --ring: var(--green-primary-aa);
+
+  /* Reserved namespace — sidebar (M3). Aliases main surfaces for now. */
+  --sidebar: var(--neutral-50);
+  --sidebar-foreground: var(--neutral-850);
+  --sidebar-primary: var(--green-primary-aa);
+  --sidebar-primary-foreground: var(--green-fg);
+  --sidebar-accent: var(--neutral-50);
+  --sidebar-accent-foreground: var(--neutral-850);
+  --sidebar-border: var(--alpha-border);
+  --sidebar-ring: var(--green-primary-aa);
+
+  /* Reserved namespace — layered surfaces (M5). Alias base surfaces for now. */
+  --surface-raised: var(--neutral-0);
+  --surface-sunken: var(--neutral-50);
+}
+
+.dark {
+  /* --- Alpha primitives (dark mode — white overlays) --- */
+  --alpha-border: oklch(1 0 0 / 8%); /* white 8% — dark mode border/sidebar-border */
+  --alpha-input: oklch(1 0 0 / 10%); /* white 10% — dark mode input */
+
+  /* Semantic tokens — DARK (shadcn names → primitives) */
+  --background: var(--neutral-950);
+  --foreground: var(--neutral-100);
+  --card: var(--neutral-900);
+  --card-foreground: var(--neutral-100);
+  --popover: var(--neutral-800);
+  --popover-foreground: var(--neutral-100);
+  --primary: var(--green-primary);
+  --primary-foreground: var(--green-fg);
+  --secondary: var(--neutral-700);
+  --secondary-foreground: var(--neutral-100);
+  --muted: var(--neutral-800);
+  --muted-foreground: var(--neutral-500);
+  --accent: var(--green-bright);
+  --accent-foreground: var(--green-fg);
+  --destructive: var(--red-bright);
+  --destructive-foreground: var(--neutral-100);
+  --border: var(--alpha-border);
+  --input: var(--alpha-input);
+  --ring: var(--green-primary);
+
+  /* Reserved — sidebar (M3) */
+  --sidebar: var(--neutral-900);
+  --sidebar-foreground: var(--neutral-100);
+  --sidebar-primary: var(--green-primary);
+  --sidebar-primary-foreground: var(--green-fg);
+  --sidebar-accent: var(--neutral-700);
+  --sidebar-accent-foreground: var(--neutral-100);
+  --sidebar-border: var(--alpha-border);
+  --sidebar-ring: var(--green-primary);
+
+  /* Reserved — layered surfaces (M5) */
+  --surface-raised: var(--neutral-800);
+  --surface-sunken: var(--neutral-950);
+}
+
+@theme inline {
+  /* Proxima Nova with a system-stack fallback (used while woff2 swaps in / if a
+   * weight is unavailable). Maps to the `font-sans` utility + the default body. */
+  --font-sans:
+    'Proxima Nova', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial,
+    sans-serif;
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  /* Reserved namespaces exposed as utilities */
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-surface-raised: var(--surface-raised);
+  --color-surface-sunken: var(--surface-sunken);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans;
+  }
+}

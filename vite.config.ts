@@ -1,4 +1,5 @@
 /// <reference types="vitest/config" />
+import tailwindcss from '@tailwindcss/vite';
 import { sveltekit } from '@sveltejs/kit/vite';
 import { svelteTesting } from '@testing-library/svelte/vite';
 import { defineConfig } from 'vitest/config';
@@ -7,8 +8,9 @@ const host = process.env.TAURI_DEV_HOST;
 
 // https://v2.tauri.app/start/frontend/sveltekit/
 export default defineConfig({
-  // svelteTesting() adds auto-cleanup + browser resolution conditions for tests.
-  plugins: [sveltekit(), svelteTesting()],
+  // tailwindcss() = Tailwind v4 CSS-first plugin; svelteTesting() adds auto-cleanup
+  // + browser resolution conditions for tests.
+  plugins: [tailwindcss(), sveltekit(), svelteTesting()],
   // Prevent Vite from obscuring Rust compiler errors.
   clearScreen: false,
   server: {

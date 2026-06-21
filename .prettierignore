@@ -7,3 +7,5 @@ src-tauri/icons/
 src-tauri/gen/
 bun.lock
 Cargo.lock
+# shadcn-svelte generated primitives — registry-owned, formatted upstream
+src/lib/components/ui/
