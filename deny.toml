@@ -1,0 +1,54 @@
+# cargo-deny policy for the LensLM Rust workspace.
+# Consumed by the scheduled Audit workflow (.github/workflows/audit.yml).
+# Tuned to be meaningful without drowning in noise from the large Tauri v2
+# Linux dependency tree.
+
+[graph]
+# Evaluate the same targets we actually ship/test on.
+all-features = true
+
+[advisories]
+version = 2
+# RustSec advisory DB is fetched fresh each run.
+yanked = "warn"
+# The Tauri Linux stack pulls in unmaintained GTK3 bindings (gtk, gdk, atk, ...)
+# as deep transitive deps. Restricting unmaintained checks to the workspace's
+# direct dependencies keeps those known, unavoidable warnings from failing the
+# audit while still flagging anything we pull in ourselves.
+unmaintained = "workspace"
+# Add specific RUSTSEC IDs here to silence a reviewed, accepted advisory.
+ignore = []
+
+[licenses]
+version = 2
+# Permissive licenses compatible with shipping a desktop binary.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-DFS-2016",
+  "Unicode-3.0",
+  "MPL-2.0",
+  "CC0-1.0",
+  "BSL-1.0",
+  "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+# The workspace's own crates (lens-core, lenslm) are marked `publish = false` and
+# carry no license yet; skip them rather than failing the audit on internal code.
+private = { ignore = true }
+
+[bans]
+# The Tauri tree legitimately resolves multiple versions of some crates; surface
+# duplicates as a warning rather than failing the audit on them.
+multiple-versions = "warn"
+wildcards = "warn"
+
+[sources]
+# Only crates.io and explicitly allowed git/registries are permitted.
+unknown-registry = "deny"
+unknown-git = "deny"

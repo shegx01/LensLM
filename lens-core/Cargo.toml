@@ -5,6 +5,8 @@ name = "lens-core"
 version.workspace = true
 edition.workspace = true
 description = "LensLM headless engine — pure Rust, no Tauri/windowing/UI dependencies."
+# Internal crate, not published to crates.io (no license chosen yet).
+publish = false
 
 [lints]
 workspace = true

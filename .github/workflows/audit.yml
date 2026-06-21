@@ -1,0 +1,57 @@
+name: Audit
+
+# Supply-chain auditing, kept off the PR critical path so a freshly-published
+# advisory never blocks unrelated work. Runs weekly and on demand.
+on:
+  schedule:
+    # Mondays at 06:00 UTC.
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Avoid piling up redundant runs when manually dispatched alongside the schedule.
+concurrency:
+  group: audit-${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-deny:
+    name: cargo-deny (advisories + licenses + bans + sources)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # cargo-deny operates on the crate graph from Cargo.toml/Cargo.lock and does
+      # not compile the project, so no Tauri/WebKitGTK system deps are required.
+      - name: Run cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          # Policy (incl. all-features) lives in deny.toml at the repo root.
+          command: check
+
+  bun-audit:
+    name: bun audit (JS dependencies)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.15
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # Reports known advisories in the JS dependency tree. `bun audit` has no
+      # per-advisory ignore/severity filter, and a known low-severity `cookie`
+      # advisory (not in the adapter-static runtime path) currently surfaces, so
+      # this step is non-fatal to avoid a perpetually-red weekly run that trains
+      # maintainers to ignore it. Review the step output; tighten if noise drops.
+      - name: Run bun audit
+        continue-on-error: true
+        run: bun audit
