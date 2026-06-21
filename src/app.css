@@ -4,6 +4,49 @@
 @custom-variant dark (&:is(.dark *));
 
 /* ---------------------------------------------------------------------------
+ * Proxima Nova (M1-0 typography, #50).
+ *
+ * Bundled-only woff2 (NO CDN / network request). Four real weights are shipped —
+ * Light 300, Regular 400, Bold 700, Extrabold 800. There is intentionally NO
+ * faux/synthesized 500/600: emphasis falls back to Regular 400, with real Bold
+ * for headings and Extrabold for display. Assets converted one-shot from the
+ * user-supplied commercial OTF/TTF (see scripts/convert-fonts.md); the converter
+ * is NOT part of CI. font-display: swap avoids invisible text while loading.
+ * ------------------------------------------------------------------------- */
+
+@font-face {
+  font-family: 'Proxima Nova';
+  font-style: normal;
+  font-weight: 300;
+  font-display: swap;
+  src: url('/fonts/proximanova-light.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'Proxima Nova';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('/fonts/proximanova-regular.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'Proxima Nova';
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url('/fonts/proximanova-bold.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'Proxima Nova';
+  font-style: normal;
+  font-weight: 800;
+  font-display: swap;
+  src: url('/fonts/proximanova-extrabold.woff2') format('woff2');
+}
+
+/* ---------------------------------------------------------------------------
  * Lens design tokens (M1-0).
  *
  * Architecture: a primitive OKLCH ramp is the single source of truth; semantic
@@ -121,6 +164,12 @@
 }
 
 @theme inline {
+  /* Proxima Nova with a system-stack fallback (used while woff2 swaps in / if a
+   * weight is unavailable). Maps to the `font-sans` utility + the default body. */
+  --font-sans:
+    'Proxima Nova', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial,
+    sans-serif;
+
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);
   --radius-lg: var(--radius);
@@ -165,6 +214,6 @@
   }
 
   body {
-    @apply bg-background text-foreground;
+    @apply bg-background text-foreground font-sans;
   }
 }
