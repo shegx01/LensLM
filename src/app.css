@@ -68,7 +68,8 @@
   --green-pressed: oklch(0.4224 0.099 148.4); /* #1e5c2d — active/pressed */
   --green-fg: oklch(0.9825 0.0082 157.09); /* #f5fbf7 — text on green */
 
-  /* --- Primitive ramp (cool neutral, ~293° hue) --- */
+  /* --- Primitive ramp (cool neutral, ~293° hue) ---
+   * Values are design-screenshot-derived; higher step = darker (lower L). */
   --neutral-0: oklch(1 0 0); /* #ffffff */
   --neutral-50: oklch(0.9674 0.0013 286.38); /* #f4f4f5 */
   --neutral-100: oklch(0.9321 0.0054 286.3); /* #e8e8ec */
@@ -76,8 +77,8 @@
   --neutral-500: oklch(0.4813 0.0096 293.69); /* #5e5d63 — dark muted-fg */
   --neutral-700: oklch(0.297 0.0126 292.17); /* #2d2c33 — secondary/chip */
   --neutral-800: oklch(0.2472 0.0113 293.2); /* #212026 — muted/input */
-  --neutral-850: oklch(0.2041 0.0119 292.96); /* #17161c — card/sidebar/rail */
-  --neutral-900: oklch(0.2085 0.0118 292.99); /* #18171d — light fg */
+  --neutral-850: oklch(0.2085 0.0118 292.99); /* #18171d — light fg */
+  --neutral-900: oklch(0.2041 0.0119 292.96); /* #17161c — card/sidebar/rail */
   --neutral-950: oklch(0.1586 0.0127 292.53); /* #0d0c12 — dark bg */
 
   /* --- Primitive ramp (red, destructive) --- */
@@ -87,38 +88,42 @@
   /* --- Primitive (purple alt-variant; documented, NOT wired) --- */
   --purple-600: oklch(0.4773 0.2225 286.79); /* #5d33d0 — retint proof only */
 
+  /* --- Alpha primitives (for border / input overlays) --- */
+  --alpha-border: oklch(0 0 0 / 8%); /* black 8% — light mode border/sidebar-border */
+  --alpha-input: oklch(0 0 0 / 10%); /* black 10% — light mode input */
+
   /* --- Radius scale --- */
   --radius: 0.75rem; /* 12px base */
 
   /* --- Semantic tokens — LIGHT (shadcn names → primitives) --- */
   --background: var(--neutral-0);
-  --foreground: var(--neutral-900);
+  --foreground: var(--neutral-850);
   --card: var(--neutral-0);
-  --card-foreground: var(--neutral-900);
+  --card-foreground: var(--neutral-850);
   --popover: var(--neutral-0);
-  --popover-foreground: var(--neutral-900);
+  --popover-foreground: var(--neutral-850);
   --primary: var(--green-primary-aa);
   --primary-foreground: var(--green-fg);
   --secondary: var(--neutral-50);
-  --secondary-foreground: var(--neutral-900);
+  --secondary-foreground: var(--neutral-850);
   --muted: var(--neutral-50);
   --muted-foreground: var(--neutral-400);
   --accent: var(--neutral-50);
-  --accent-foreground: var(--neutral-900);
+  --accent-foreground: var(--neutral-850);
   --destructive: var(--red-strong);
   --destructive-foreground: var(--neutral-0);
-  --border: oklch(0 0 0 / 8%);
-  --input: oklch(0 0 0 / 10%);
+  --border: var(--alpha-border);
+  --input: var(--alpha-input);
   --ring: var(--green-primary-aa);
 
   /* Reserved namespace — sidebar (M3). Aliases main surfaces for now. */
   --sidebar: var(--neutral-50);
-  --sidebar-foreground: var(--neutral-900);
+  --sidebar-foreground: var(--neutral-850);
   --sidebar-primary: var(--green-primary-aa);
   --sidebar-primary-foreground: var(--green-fg);
   --sidebar-accent: var(--neutral-50);
-  --sidebar-accent-foreground: var(--neutral-900);
-  --sidebar-border: oklch(0 0 0 / 8%);
+  --sidebar-accent-foreground: var(--neutral-850);
+  --sidebar-border: var(--alpha-border);
   --sidebar-ring: var(--green-primary-aa);
 
   /* Reserved namespace — layered surfaces (M5). Alias base surfaces for now. */
@@ -127,10 +132,14 @@
 }
 
 .dark {
+  /* --- Alpha primitives (dark mode — white overlays) --- */
+  --alpha-border: oklch(1 0 0 / 8%); /* white 8% — dark mode border/sidebar-border */
+  --alpha-input: oklch(1 0 0 / 10%); /* white 10% — dark mode input */
+
   /* Semantic tokens — DARK (shadcn names → primitives) */
   --background: var(--neutral-950);
   --foreground: var(--neutral-100);
-  --card: var(--neutral-850);
+  --card: var(--neutral-900);
   --card-foreground: var(--neutral-100);
   --popover: var(--neutral-800);
   --popover-foreground: var(--neutral-100);
@@ -144,18 +153,18 @@
   --accent-foreground: var(--green-fg);
   --destructive: var(--red-bright);
   --destructive-foreground: var(--neutral-100);
-  --border: oklch(1 0 0 / 8%);
-  --input: oklch(1 0 0 / 10%);
+  --border: var(--alpha-border);
+  --input: var(--alpha-input);
   --ring: var(--green-primary);
 
   /* Reserved — sidebar (M3) */
-  --sidebar: var(--neutral-850);
+  --sidebar: var(--neutral-900);
   --sidebar-foreground: var(--neutral-100);
   --sidebar-primary: var(--green-primary);
   --sidebar-primary-foreground: var(--green-fg);
   --sidebar-accent: var(--neutral-700);
   --sidebar-accent-foreground: var(--neutral-100);
-  --sidebar-border: oklch(1 0 0 / 8%);
+  --sidebar-border: var(--alpha-border);
   --sidebar-ring: var(--green-primary);
 
   /* Reserved — layered surfaces (M5) */
