@@ -1,12 +1,6 @@
 import { mockIPC, clearMocks } from '@tauri-apps/api/mocks';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import {
-  resolveTheme,
-  persistTheme,
-  __flushNow,
-  setPersistErrorHandler,
-  PERSIST_DEBOUNCE_MS
-} from './index.js';
+import { persistTheme, __flushNow, setPersistErrorHandler, PERSIST_DEBOUNCE_MS } from './index.js';
 import type { AppConfig } from './types.js';
 
 // A fully-populated AppConfig so tests can assert the WHOLE struct survives the
@@ -42,27 +36,6 @@ afterEach(() => {
   setPersistErrorHandler(null);
   vi.useRealTimers();
   delete (globalThis as { isTauri?: boolean }).isTauri;
-});
-
-describe('resolveTheme', () => {
-  it('treats "" and "system" identically', () => {
-    expect(resolveTheme('')).toBe(resolveTheme('system'));
-  });
-
-  it('resolves ""/"system" via prefers-color-scheme', () => {
-    const spy = vi
-      .spyOn(window, 'matchMedia')
-      .mockReturnValue({ matches: true } as unknown as MediaQueryList);
-    expect(resolveTheme('')).toBe('dark');
-    expect(resolveTheme('system')).toBe('dark');
-    spy.mockReturnValue({ matches: false } as unknown as MediaQueryList);
-    expect(resolveTheme('')).toBe('light');
-  });
-
-  it('passes through explicit light/dark', () => {
-    expect(resolveTheme('light')).toBe('light');
-    expect(resolveTheme('dark')).toBe('dark');
-  });
 });
 
 describe('persistTheme (debounced read-modify-write)', () => {

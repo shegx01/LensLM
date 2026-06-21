@@ -26,24 +26,21 @@ export type Mode = 'light' | 'dark' | 'system';
 export const PERSIST_DEBOUNCE_MS = 300;
 
 /**
- * Resolves a stored theme string to a concrete mode-watcher mode.
- * `""` and `"system"` both mean "follow the OS" → resolve via prefers-color-scheme.
- * Any other value passes through (expected: `"light"` | `"dark"`).
+ * Validates that a stored string is a known Mode value.
+ * Any invalid or unknown value (e.g. hand-edited bad config.theme) returns false.
+ * Used to guard all `as Mode` casts and prevent unsafe coercions.
  */
-export function resolveTheme(theme: string): Mode {
-  if (theme === '' || theme === 'system') {
-    if (typeof window !== 'undefined' && typeof window.matchMedia === 'function') {
-      return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
-    }
-    // No matchMedia (SSR/test): treat "system" literally; mode-watcher resolves it.
-    return 'system';
-  }
-  return theme as Mode;
+function isValidMode(v: string): v is Mode {
+  return v === 'light' || v === 'dark' || v === 'system';
 }
 
 /**
  * Boot-time reconciliation: pull the durable theme from AppConfig and drive
  * mode-watcher to match (config wins on disagreement). One-shot, on mount.
+ *
+ * `""` and `"system"` → set "system" so mode-watcher tracks the OS.
+ * Any invalid stored value (e.g. a hand-edited bad config.theme) falls back to
+ * "system" — a safe default that lets the OS preference win.
  *
  * Guarded for `ssr=false` and tests-without-Tauri: if not running under Tauri,
  * this is a no-op and the localStorage/pre-paint hint remains the live state.
@@ -52,9 +49,11 @@ export async function loadThemeFromConfig(): Promise<void> {
   if (!isTauri()) return;
   try {
     const config = await invoke<AppConfig>('get_config');
-    // `""`/`"system"` → let mode-watcher track the OS by setting "system".
     const stored = config.theme;
-    const mode: Mode = stored === '' || stored === 'system' ? 'system' : (stored as Mode);
+    // `""`/`"system"` → let mode-watcher track the OS by setting "system".
+    // Any unrecognised stored value (bad config) → fall back to "system".
+    const mode: Mode =
+      stored === '' || stored === 'system' ? 'system' : isValidMode(stored) ? stored : 'system';
     setMode(mode);
   } catch (err) {
     // Read failure is non-fatal: keep the pre-paint/localStorage live state.
