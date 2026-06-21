@@ -29,6 +29,10 @@ async fn cloned_handles_share_state() {
 #[rstest]
 #[case(LensError::Validation("bad payload".into()), "invalid input: bad payload")]
 #[case(LensError::Internal("boom".into()), "internal error: boom")]
+#[case(LensError::Io("disk full".into()), "io error: disk full")]
+#[case(LensError::Parse("bad json".into()), "parse error: bad json")]
+#[case(LensError::Model("oom".into()), "model error: oom")]
+#[case(LensError::Network("timeout".into()), "network error: timeout")]
 fn lens_error_display(#[case] err: LensError, #[case] expected: &str) {
     assert_eq!(err.to_string(), expected);
 }
@@ -42,6 +46,19 @@ fn lens_error_serialized_shape() {
     {
       "kind": "Validation",
       "message": "bad payload"
+    }
+    "#);
+}
+
+/// New additive variants serialize with the SAME `{kind, message}` shape as the
+/// locked `Validation` snapshot above — proving extension didn't break the
+/// adjacent-tagged contract.
+#[test]
+fn lens_error_new_variant_serialized_shape() {
+    insta::assert_json_snapshot!(LensError::Io("disk full".into()), @r#"
+    {
+      "kind": "Io",
+      "message": "disk full"
     }
     "#);
 }
