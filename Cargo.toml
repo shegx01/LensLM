@@ -16,10 +16,29 @@ edition = "2024"
 [workspace.dependencies]
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "2"
-tokio = { version = "1", features = ["sync"] }
+# `rt`/`macros` enable the async runtime + `#[tokio::test]`; `sync` for RwLock.
+tokio = { version = "1", features = ["rt", "macros", "sync"] }
+# Async SQLite via bundled libsqlite3-sys. `macros` is for `migrate!`/`FromRow`
+# only (we use runtime-checked `query`/`query_as`, NOT `query!`, so no
+# DATABASE_URL / offline cache is needed). `uuid` feature deliberately omitted —
+# sqlx maps `Uuid` to BLOB for SQLite, contradicting the TEXT-key design.
+sqlx = { version = "=0.8.6", default-features = false, features = [
+    "runtime-tokio",
+    "sqlite",
+    "macros",
+    "migrate",
+    "chrono",
+] }
+# UUIDv7 generation only; values are stored as TEXT via `.to_string()`.
+uuid = { version = "=1.18.1", features = ["v7", "serde"] }
+chrono = { version = "=0.4.45", features = ["serde"] }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Test-only dependencies (consumed via each crate's [dev-dependencies]).
 rstest = "0.26"
 insta = { version = "1", features = ["json"] }
+tempfile = "3"
 
 # Shared lint policy across the workspace.
 [workspace.lints.clippy]

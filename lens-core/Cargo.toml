@@ -15,10 +15,14 @@ workspace = true
 serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+sqlx = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
-# `rt` + `macros` enable `#[tokio::test]`; unioned with the prod `sync` feature
-# only during test builds, so the release binary stays lean.
-tokio = { workspace = true, features = ["rt", "macros"] }
 rstest = { workspace = true }
 insta = { workspace = true }
+# Temp-dir DBs for integration tests that need real on-disk files / concurrency.
+tempfile = { workspace = true }

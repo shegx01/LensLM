@@ -19,9 +19,15 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 lens-core = { path = "../lens-core" }
+# `tauri::ipc::Channel` and `app.path()` are available without extra features.
 tauri = { version = "2", features = [] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+# Block on async engine init inside the synchronous `.setup` closure.
+tokio = { workspace = true }
 
 [dev-dependencies]
 # The `test` feature (mock runtime) is unioned in only for test builds.
 tauri = { version = "2", features = ["test"] }
-tokio = { workspace = true, features = ["rt", "macros"] }
