@@ -12,10 +12,12 @@ pub mod config;
 pub(crate) mod db;
 pub mod error;
 pub mod notebooks;
+pub mod system_check;
 
 pub use config::AppConfig;
 pub use error::LensError;
 pub use notebooks::{Notebook, NotebookId};
+pub use system_check::{CheckAction, CheckId, CheckResult, CheckStatus};
 
 /// Re-exported so the integration-test crate can re-run the migrator against a
 /// pool obtained via [`LensEngine::pool`] without exposing the rest of the
@@ -134,6 +136,20 @@ impl LensEngine {
             .fetch_one(&pool)
             .await?;
         Ok(count)
+    }
+
+    /// Runs all first-run system-check probes concurrently and returns the
+    /// ordered results (LocalBackend, LlmRuntime, EmbeddingModel,
+    /// VectorDatabase, DiskPermissions).
+    ///
+    /// Probes that detect an expected-absent subsystem return a `Fail`/`Pending`
+    /// status rather than an `Err`; this method therefore returns `Ok` unless an
+    /// unexpected internal failure occurs. (Today all probe paths are infallible,
+    /// but the `Result` signature is the frozen contract for future probes.)
+    #[tracing::instrument(skip_all)]
+    pub async fn run_system_check(&self) -> Result<Vec<CheckResult>, LensError> {
+        let inner = self.read().await;
+        Ok(system_check::run_system_check(&inner).await)
     }
 
     /// Lists all live (non-trashed) notebooks, newest first.
