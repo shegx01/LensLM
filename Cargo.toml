@@ -1,0 +1,31 @@
+# LensLM root Cargo workspace.
+# Decoupled backend: `lens-core` (pure headless engine) + `src-tauri` (LensLM bridge).
+[workspace]
+resolver = "2"
+members = [
+    "lens-core",
+    "src-tauri",
+]
+
+# Shared metadata inherited by every member crate.
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+# Single source of truth for shared dependency versions (prevents drift across crates).
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2"
+tokio = { version = "1", features = ["sync"] }
+
+# Shared lint policy across the workspace.
+[workspace.lints.clippy]
+all = "warn"
+
+[profile.release]
+codegen-units = 1
+lto = true
+# Optimize for speed — inference is CPU-bound and lives in lens-core.
+opt-level = 3
+# Unwind (not abort) so panics can be caught/logged for graceful shutdown.
+strip = true

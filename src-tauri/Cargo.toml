@@ -1,0 +1,20 @@
+[package]
+name = "lenslm"
+version.workspace = true
+edition.workspace = true
+description = "LensLM desktop shell — Tauri v2 IPC bridge over lens-core."
+
+# Produce a binary named "LensLM" (shown in logs and the macOS app/menu name).
+[[bin]]
+name = "LensLM"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+lens-core = { path = "../lens-core" }
+tauri = { version = "2", features = [] }

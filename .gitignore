@@ -1,0 +1,20 @@
+# Rust / Cargo
+/target
+**/target
+
+# Node / Bun
+node_modules
+
+# SvelteKit
+.svelte-kit
+/build
+
+# Tauri generated schemas
+src-tauri/gen/schemas
+
+# OS
+.DS_Store
+
+# Icon generation source (regenerated on demand)
+/app-icon.png
+.omc/

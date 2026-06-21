@@ -1,0 +1,15 @@
+# ARCHITECTURAL INVARIANT: this crate MUST NOT depend on tauri, any windowing/UI
+# crate, or platform-specific GUI libraries. It is the pure, headless engine.
+[package]
+name = "lens-core"
+version.workspace = true
+edition.workspace = true
+description = "LensLM headless engine — pure Rust, no Tauri/windowing/UI dependencies."
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }

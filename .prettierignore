@@ -1,0 +1,9 @@
+# Generated / vendored — do not format
+.svelte-kit/
+build/
+target/
+node_modules/
+src-tauri/icons/
+src-tauri/gen/
+bun.lock
+Cargo.lock

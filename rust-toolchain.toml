@@ -1,0 +1,5 @@
+# Read automatically by rustup/cargo (and CI), complementing asdf .tool-versions
+# which only covers developers who use asdf-rust.
+[toolchain]
+channel = "1.94.1"
+components = ["clippy", "rustfmt"]
