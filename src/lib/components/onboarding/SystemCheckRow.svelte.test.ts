@@ -1,5 +1,5 @@
-import { render, screen } from '@testing-library/svelte';
-import { describe, expect, it } from 'vitest';
+import { render, screen, fireEvent } from '@testing-library/svelte';
+import { describe, expect, it, vi } from 'vitest';
 import SystemCheckRow from './SystemCheckRow.svelte';
 import type { CheckResult } from '$lib/onboarding/system-check.js';
 
@@ -64,6 +64,52 @@ describe('SystemCheckRow', () => {
     expect(b.className).not.toContain('text-primary');
     expect(b.className).not.toContain('bg-primary');
     // It uses the muted/neutral treatment instead.
+    expect(b.className).toContain('text-muted-foreground');
+    expect(b.className).toContain('bg-muted');
+  });
+
+  it('renders a live, enabled Retry action that fires onaction', async () => {
+    const onaction = vi.fn();
+    render(SystemCheckRow, {
+      props: { result: row({ status: 'fail', action: 'retry' }), onaction }
+    });
+    const btn = screen.getByRole('button', { name: /retry/i });
+    expect(btn).not.toBeDisabled();
+    await fireEvent.click(btn);
+    expect(onaction).toHaveBeenCalledWith('retry');
+  });
+
+  it('renders configure/choose DISABLED (Available in Settings), never a dead no-op', async () => {
+    const onaction = vi.fn();
+    const { unmount } = render(SystemCheckRow, {
+      props: { result: row({ status: 'fail', action: 'configure' }), onaction }
+    });
+    const cfg = screen.getByRole('button', { name: /configure/i });
+    expect(cfg).toBeDisabled();
+    expect(cfg).toHaveAttribute('title', 'Available in Settings');
+    // A disabled button must not invoke onaction even if a click is dispatched.
+    await fireEvent.click(cfg);
+    expect(onaction).not.toHaveBeenCalled();
+    unmount();
+
+    render(SystemCheckRow, {
+      props: { result: row({ id: 'embedding_model', status: 'pending', action: 'choose' }) }
+    });
+    const choose = screen.getByRole('button', { name: /choose/i });
+    expect(choose).toBeDisabled();
+    expect(choose).toHaveAttribute('title', 'Available in Settings');
+  });
+
+  it('falls back to a neutral (non-Pass) treatment for an unknown status', () => {
+    const { container } = render(SystemCheckRow, {
+      props: {
+        // Force a value outside the CheckStatus union to exercise the fallback.
+        result: row({ status: 'unknown' as unknown as CheckResult['status'] })
+      }
+    });
+    const b = badge(container);
+    expect(b.className).not.toContain('text-primary');
+    expect(b.className).not.toContain('bg-primary');
     expect(b.className).toContain('text-muted-foreground');
     expect(b.className).toContain('bg-muted');
   });

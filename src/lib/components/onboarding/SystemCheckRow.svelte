@@ -35,7 +35,13 @@
     }
   } as const;
 
-  const view = $derived(STATUS[result.status]);
+  // Neutral fallback for any status outside the known union (defensive against a
+  // future/garbled IPC value): reuse the muted Pending treatment — NEVER the
+  // Pass green — and avoid an `undefined`-class crash. Sharing the Pending view
+  // is deliberate: an unknown status reads as "not affirmatively healthy".
+  const FALLBACK_VIEW = STATUS.pending;
+
+  const view = $derived(STATUS[result.status] ?? FALLBACK_VIEW);
   const StatusIcon = $derived(view.icon);
 
   // Action button copy + icon (Configure/Choose carry a chevron like the design;
@@ -45,6 +51,12 @@
     choose: 'Choose',
     retry: 'Retry'
   };
+
+  // `configure`/`choose` open Settings, which is not built until a later
+  // milestone. We render them DISABLED with an explanatory tooltip rather than
+  // shipping a button that silently does nothing. `retry` is live (it re-runs
+  // the check via the parent's `onaction`).
+  const isAvailable = (action: CheckAction): boolean => action === 'retry';
 </script>
 
 <Card size="sm" class="flex-row items-center gap-3 px-4 py-3">
@@ -65,7 +77,14 @@
 
   {#if result.action}
     {@const action = result.action}
-    <Button variant="outline" size="sm" onclick={() => onaction?.(action)}>
+    {@const available = isAvailable(action)}
+    <Button
+      variant="outline"
+      size="sm"
+      disabled={!available}
+      title={available ? undefined : 'Available in Settings'}
+      onclick={() => available && onaction?.(action)}
+    >
       {ACTION_LABEL[action]}
       {#if action === 'retry'}
         <RefreshCw />
