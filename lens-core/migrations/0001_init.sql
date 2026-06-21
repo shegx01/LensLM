@@ -109,3 +109,9 @@ CREATE INDEX IF NOT EXISTS idx_chunks_parent ON chunks (parent_id);
 CREATE INDEX IF NOT EXISTS idx_messages_notebook ON chat_messages (notebook_id);
 CREATE INDEX IF NOT EXISTS idx_notes_notebook ON notes (notebook_id);
 CREATE INDEX IF NOT EXISTS idx_embidx_notebook ON embedding_index (notebook_id);
+
+-- Citations are looked up by message (render a message's citations) and must be
+-- found fast when a parent source/chunk cascade-deletes; index every FK column.
+CREATE INDEX IF NOT EXISTS idx_citations_message ON citations (message_id);
+CREATE INDEX IF NOT EXISTS idx_citations_source ON citations (source_id);
+CREATE INDEX IF NOT EXISTS idx_citations_chunk ON citations (chunk_id);
