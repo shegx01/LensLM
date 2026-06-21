@@ -33,6 +33,10 @@ const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434";
 const DEFAULT_LMSTUDIO_BASE_URL: &str = "http://localhost:1234";
 /// Sentinel file used to verify the app data directory is writable.
 const WRITE_SENTINEL_NAME: &str = ".lens_write_test";
+/// Upper bound on a probe response body we will buffer + deserialize. A version
+/// string or a model list is tiny; this cap (1 MiB) is defense-in-depth so a
+/// malicious/misconfigured endpoint can't stream an unbounded body into memory.
+const MAX_PROBE_BODY_BYTES: usize = 1024 * 1024;
 
 /// Status of a single system-check row.
 ///
@@ -128,6 +132,23 @@ pub struct LlmDetection {
 ///   internal faults (which cannot realistically occur here).
 pub async fn detect_llm(base_url: &str) -> LlmDetection {
     let base_url = base_url.trim_end_matches('/');
+
+    // Defense-in-depth: only probe http/https schemes. This is a local-first app
+    // where the user controls their own machine, so the threat is self-SSRF
+    // (a typo or malicious config coaxing the probe into a non-HTTP scheme like
+    // file://) rather than a multi-tenant SSRF — hence a scheme allowlist, not a
+    // host blocklist. A non-http(s) scheme is reported as simply unreachable.
+    let scheme_ok = base_url.split_once("://").is_some_and(|(scheme, _)| {
+        scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+    });
+    if !scheme_ok {
+        return LlmDetection {
+            reachable: false,
+            version: None,
+            models: vec![],
+        };
+    }
+
     let client = probe_client();
 
     let (ollama_result, openai_models) = tokio::join!(
@@ -154,6 +175,28 @@ pub async fn detect_llm(base_url: &str) -> LlmDetection {
     }
 }
 
+/// GETs `url` and deserializes a successful (2xx) response as `T`, capping the
+/// buffered body at [`MAX_PROBE_BODY_BYTES`] before parsing. Returns `None` on a
+/// connect/timeout error, a non-2xx status, an over-cap body, or a parse miss.
+///
+/// Reading `bytes()` (vs `resp.json()`) lets us reject an oversized body without
+/// streaming it all into a `serde` deserializer — defense-in-depth against a
+/// malicious endpoint that answers a probe with an unbounded stream.
+async fn get_json_capped<T: serde::de::DeserializeOwned>(
+    client: &reqwest::Client,
+    url: &str,
+) -> Option<T> {
+    let resp = match client.get(url).send().await {
+        Ok(resp) if resp.status().is_success() => resp,
+        _ => return None,
+    };
+    let body = resp.bytes().await.ok()?;
+    if body.len() > MAX_PROBE_BODY_BYTES {
+        return None;
+    }
+    serde_json::from_slice::<T>(&body).ok()
+}
+
 /// Probes the Ollama protocol: `GET /api/version` then `GET /api/tags`.
 /// Returns `(version, model_names)`.
 async fn probe_ollama_endpoint(
@@ -161,27 +204,19 @@ async fn probe_ollama_endpoint(
     base_url: &str,
 ) -> (Option<String>, Vec<String>) {
     let version_url = format!("{base_url}/api/version");
-    let version = match client.get(&version_url).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            resp.json::<OllamaVersion>().await.ok().map(|v| v.version)
-        }
-        _ => None,
-    };
+    let version = get_json_capped::<OllamaVersion>(client, &version_url)
+        .await
+        .map(|v| v.version);
 
     if version.is_none() {
         return (None, vec![]);
     }
 
     let tags_url = format!("{base_url}/api/tags");
-    let models = match client.get(&tags_url).send().await {
-        Ok(resp) if resp.status().is_success() => resp
-            .json::<OllamaTags>()
-            .await
-            .ok()
-            .map(|tags| tags.models.into_iter().map(|m| m.name).collect())
-            .unwrap_or_default(),
-        _ => vec![],
-    };
+    let models = get_json_capped::<OllamaTags>(client, &tags_url)
+        .await
+        .map(|tags| tags.models.into_iter().map(|m| m.name).collect())
+        .unwrap_or_default();
 
     (version, models)
 }
@@ -190,15 +225,10 @@ async fn probe_ollama_endpoint(
 /// Returns `data[].id` strings on success, empty vec otherwise.
 async fn probe_openai_endpoint(client: &reqwest::Client, base_url: &str) -> Vec<String> {
     let url = format!("{base_url}/v1/models");
-    match client.get(&url).send().await {
-        Ok(resp) if resp.status().is_success() => resp
-            .json::<OpenAiModels>()
-            .await
-            .ok()
-            .map(|m| m.data.into_iter().map(|d| d.id).collect())
-            .unwrap_or_default(),
-        _ => vec![],
-    }
+    get_json_capped::<OpenAiModels>(client, &url)
+        .await
+        .map(|m| m.data.into_iter().map(|d| d.id).collect())
+        .unwrap_or_default()
 }
 
 /// Shape of the OpenAI-compatible `GET /v1/models` response.
@@ -340,23 +370,24 @@ async fn probe_local_backend(db: &SqlitePool) -> CheckResult {
     }
 }
 
-/// Detects Ollama via `GET {base}/api/version`. Returns the parsed version on a
-/// 200, `None` on a clean connect/timeout failure.
+/// Detects Ollama via the shared [`probe_ollama_endpoint`] probe, taking just the
+/// version (discarding the model list). Returns the parsed version on a 200,
+/// `None` on a clean connect/timeout failure or a non-Ollama endpoint.
+///
+/// Delegates to the single Ollama probe implementation so the runtime-detection
+/// row and the `detect_llm` command can never drift in how they speak Ollama.
 async fn detect_ollama(client: &reqwest::Client, base_url: &str) -> Option<String> {
-    let url = format!("{base_url}/api/version");
-    match client.get(&url).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            resp.json::<OllamaVersion>().await.ok().map(|v| v.version)
-        }
-        // A non-2xx response or a parse miss means "not a healthy Ollama here".
-        _ => None,
-    }
+    let (version, _models) = probe_ollama_endpoint(client, base_url).await;
+    version
 }
 
-/// Detects LM Studio via `GET {base}/v1/models`. Returns `true` on a 200.
+/// Detects LM Studio via the shared [`probe_openai_endpoint`] probe. Returns
+/// `true` when the endpoint advertises at least one model on `/v1/models`.
+///
+/// Delegates to the single OpenAI-compatible probe implementation so detection
+/// behavior stays identical to the `detect_llm` command's OpenAI path.
 async fn detect_lmstudio(client: &reqwest::Client, base_url: &str) -> bool {
-    let url = format!("{base_url}/v1/models");
-    matches!(client.get(&url).send().await, Ok(resp) if resp.status().is_success())
+    !probe_openai_endpoint(client, base_url).await.is_empty()
 }
 
 /// Probe 2 — local LLM runtime detection.
@@ -430,26 +461,21 @@ async fn probe_embedding_model(client: &reqwest::Client, runtime: &LlmRuntimePro
     }
 
     let url = format!("{}/api/tags", runtime.ollama_base_url);
-    let found = match client.get(&url).send().await {
-        Ok(resp) if resp.status().is_success() => resp
-            .json::<OllamaTags>()
-            .await
-            .ok()
-            .map(|tags| {
-                tags.models.iter().any(|m| {
-                    let name = m.name.to_ascii_lowercase();
-                    let family = m
-                        .details
-                        .as_ref()
-                        .and_then(|d| d.family.as_deref())
-                        .unwrap_or("")
-                        .to_ascii_lowercase();
-                    name.contains("embed") || matches!(family.as_str(), "bert" | "nomic-bert")
-                })
+    let found = get_json_capped::<OllamaTags>(client, &url)
+        .await
+        .map(|tags| {
+            tags.models.iter().any(|m| {
+                let name = m.name.to_ascii_lowercase();
+                let family = m
+                    .details
+                    .as_ref()
+                    .and_then(|d| d.family.as_deref())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                name.contains("embed") || matches!(family.as_str(), "bert" | "nomic-bert")
             })
-            .unwrap_or(false),
-        _ => false,
-    };
+        })
+        .unwrap_or(false);
 
     if found {
         CheckResult {
@@ -620,7 +646,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/v1/models"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": []
+                "data": [{ "id": "local-model" }]
             })))
             .mount(&lmstudio)
             .await;
@@ -681,7 +707,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/v1/models"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": []
+                "data": [{ "id": "local-model" }]
             })))
             .mount(&server)
             .await;
@@ -962,6 +988,71 @@ mod tests {
         // (see llm_runtime_fail_when_nothing_responds for the full rationale).
         let result = detect_llm("http://127.0.0.1:1").await;
 
+        assert!(!result.reachable);
+        assert_eq!(result.version, None);
+        assert!(result.models.is_empty());
+    }
+
+    #[tokio::test]
+    async fn detect_llm_dedupes_overlapping_models_across_protocols() {
+        // The same server speaks BOTH Ollama (/api/version + /api/tags) and the
+        // OpenAI-compatible protocol (/v1/models), advertising an OVERLAPPING
+        // model name. The merged `models` must dedupe it to a single entry.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/version"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "version": "0.4.1"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [
+                    { "name": "llama3:latest" },
+                    { "name": "shared-model" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [
+                    { "id": "shared-model" },
+                    { "id": "mistral-7b" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let result = detect_llm(&server.uri()).await;
+
+        assert!(result.reachable);
+        assert_eq!(result.version, Some("0.4.1".to_string()));
+        // "shared-model" appears in BOTH protocols but only once in the merge,
+        // and the Ollama-first ordering is preserved.
+        assert_eq!(
+            result.models,
+            vec!["llama3:latest", "shared-model", "mistral-7b"]
+        );
+        // Defensively assert the dedupe: the overlapping name occurs exactly once.
+        assert_eq!(
+            result
+                .models
+                .iter()
+                .filter(|m| *m == "shared-model")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_llm_rejects_non_http_scheme() {
+        // A non-http(s) scheme must short-circuit to unreachable WITHOUT probing
+        // (SSRF defense-in-depth — see detect_llm's scheme allowlist).
+        let result = detect_llm("file:///etc/passwd").await;
         assert!(!result.reachable);
         assert_eq!(result.version, None);
         assert!(result.models.is_empty());

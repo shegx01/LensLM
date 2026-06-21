@@ -47,10 +47,29 @@ pub async fn run_system_check(
 /// Never returns an `Err` for "not reachable"; `LensError` is reserved for
 /// genuine internal faults. The frontend should invoke this command as:
 /// `invoke("detect_llm", { base_url: "http://..." })`.
-#[tracing::instrument(skip_all, fields(%base_url))]
+///
+/// We log a SANITIZED target (scheme + host[:port] only) rather than the raw
+/// `base_url`: a user could paste a URL embedding `user:password@` userinfo, and
+/// `%base_url` would leak those credentials into the trace/log stream.
+#[tracing::instrument(skip_all, fields(target = %sanitize_url_for_log(&base_url)))]
 #[tauri::command]
 pub async fn detect_llm(base_url: String) -> Result<LlmDetection, LensError> {
     Ok(lens_core::detect_llm(&base_url).await)
+}
+
+/// Reduces a URL to `scheme://host[:port]` for safe logging, stripping any
+/// `userinfo` (`user:pass@`), path, query, and fragment. Falls back to just the
+/// scheme (or `<redacted>`) when the URL can't be parsed, so we never echo a raw
+/// string that might carry credentials.
+fn sanitize_url_for_log(raw: &str) -> String {
+    let Some((scheme, rest)) = raw.split_once("://") else {
+        return "<redacted>".to_string();
+    };
+    // Authority ends at the first '/', '?' or '#'.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    // Drop any userinfo before an '@'.
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, hp)| hp);
+    format!("{scheme}://{host_port}")
 }
 
 /// Demonstrator that exercises the streaming primitive end to end: emits
@@ -86,6 +105,27 @@ mod tests {
     use tauri::Manager;
     #[cfg(debug_assertions)]
     use tauri::ipc::Channel;
+
+    #[test]
+    fn sanitize_url_for_log_strips_userinfo_and_path() {
+        // Embedded credentials must never survive into the log field.
+        assert_eq!(
+            sanitize_url_for_log("http://user:secret@localhost:11434/api/version"),
+            "http://localhost:11434"
+        );
+        // Plain URL: keep scheme + host + port, drop path/query.
+        assert_eq!(
+            sanitize_url_for_log("https://api.example.com/v1/models?x=1"),
+            "https://api.example.com"
+        );
+        // No port, no path.
+        assert_eq!(
+            sanitize_url_for_log("http://localhost:1234"),
+            "http://localhost:1234"
+        );
+        // Unparseable (no scheme separator) → redacted, never echoed raw.
+        assert_eq!(sanitize_url_for_log("not-a-url"), "<redacted>");
+    }
 
     #[tokio::test]
     async fn health_check_reports_db_ok_and_migrations() {

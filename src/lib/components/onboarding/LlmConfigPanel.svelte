@@ -122,7 +122,7 @@
       class={cn(
         'flex-1 rounded-md px-3 py-1.5 text-sm font-medium transition-colors',
         activeTab === 'local'
-          ? 'bg-card text-foreground shadow-sm'
+          ? 'bg-background text-foreground shadow-sm'
           : 'text-muted-foreground hover:text-foreground'
       )}
       onclick={() => (activeTab = 'local')}
@@ -137,7 +137,7 @@
       class={cn(
         'flex-1 rounded-md px-3 py-1.5 text-sm font-medium transition-colors',
         activeTab === 'cloud'
-          ? 'bg-card text-foreground shadow-sm'
+          ? 'bg-background text-foreground shadow-sm'
           : 'text-muted-foreground hover:text-foreground'
       )}
       onclick={() => (activeTab = 'cloud')}
@@ -151,6 +151,7 @@
     id="llm-panel-local"
     role="tabpanel"
     aria-labelledby="llm-tab-local"
+    tabindex={activeTab === 'local' ? 0 : -1}
     class={cn('mt-3 flex flex-col gap-3', activeTab !== 'local' && 'hidden')}
   >
     <!-- Helper text -->
@@ -239,6 +240,7 @@
     id="llm-panel-cloud"
     role="tabpanel"
     aria-labelledby="llm-tab-cloud"
+    tabindex={activeTab === 'cloud' ? 0 : -1}
     class={cn('mt-3 flex flex-col gap-3', activeTab !== 'cloud' && 'hidden')}
   >
     <!-- BASE URL -->

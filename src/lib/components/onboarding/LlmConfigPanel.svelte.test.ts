@@ -241,4 +241,49 @@ describe('LlmConfigPanel — Save', () => {
       )
     );
   });
+
+  it('forwards the entered Cloud API key into set_config (locks the contract)', async () => {
+    const setConfig = vi.fn();
+    const oncheck = vi.fn().mockResolvedValue(undefined);
+
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return baseConfig();
+      if (cmd === 'set_config') {
+        setConfig(args);
+        return null;
+      }
+    });
+
+    render(SystemCheckRow, { props: { result: llmRow(), oncheck } });
+
+    // Expand and switch to Cloud API tab.
+    await fireEvent.click(screen.getByRole('button', { name: /configure/i }));
+    await waitFor(() =>
+      expect(screen.getByRole('tab', { name: /cloud api/i })).toBeInTheDocument()
+    );
+    await fireEvent.click(screen.getByRole('tab', { name: /cloud api/i }));
+
+    // Type an API key into the Cloud API key field.
+    const keyField = screen.getByLabelText(/api key/i);
+    await fireEvent.input(keyField, { target: { value: 'sk-test-1234' } });
+
+    // Save.
+    await fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+    // The entered api_key must reach set_config on the openai-compatible entry.
+    await waitFor(() =>
+      expect(setConfig).toHaveBeenCalledWith(
+        expect.objectContaining({
+          config: expect.objectContaining({
+            models: expect.arrayContaining([
+              expect.objectContaining({
+                provider: 'openai-compatible',
+                api_key: 'sk-test-1234'
+              })
+            ])
+          })
+        })
+      )
+    );
+  });
 });

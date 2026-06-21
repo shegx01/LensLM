@@ -28,7 +28,7 @@ export interface CheckResult {
   action: CheckAction | null;
 }
 
-// SYNC-CHECK: must match lens-core/src/llm_detect.rs LlmDetection
+// SYNC-CHECK: must match lens-core/src/system_check.rs LlmDetection
 //
 // Result of probing a local LLM endpoint. The backend command is `detect_llm`
 // (frozen contract, parallel agent adds the Rust impl). `reachable` is the
