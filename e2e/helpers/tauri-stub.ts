@@ -1,6 +1,6 @@
 import type { Page } from '@playwright/test';
 
-// Shared fake Tauri runtime for e2e (M1, plan §6).
+// Shared fake Tauri runtime for the onboarding e2e suite.
 //
 // E2E runs against the plain SvelteKit dev server (NO native Tauri backend), so
 // we inject a fake runtime BEFORE app boot via page.addInitScript(). Two pieces
@@ -22,6 +22,7 @@ export type ModelConfig = {
   api_key: string;
 };
 export type VoiceConfig = { host: string; guest: string };
+export type TtsConfig = { provider: string; api_key: string };
 export type PathConfig = { data_dir: string };
 export type TierThresholds = { tier1_token_cap: number; tier2_token_cap: number };
 export type AppConfig = {
@@ -30,6 +31,7 @@ export type AppConfig = {
   models: ModelConfig[];
   endpoints: Record<string, string>;
   voices: VoiceConfig;
+  tts: TtsConfig;
   paths: PathConfig;
   tier_thresholds: TierThresholds;
   onboarding_complete: boolean;
@@ -40,9 +42,9 @@ export type AppConfig = {
 export type CheckResult = {
   id: string;
   label: string;
-  status: 'pass' | 'fail' | 'pending';
+  status: 'pass' | 'fail';
   detail: string;
-  action: 'configure' | 'choose' | 'retry' | null;
+  action: 'configure' | 'choose' | null;
 };
 
 /** A full, correctly-shaped AppConfig with the given onboarding flag. */
@@ -53,6 +55,7 @@ export function makeConfig(onboardingComplete: boolean): AppConfig {
     models: [],
     endpoints: {},
     voices: { host: '', guest: '' },
+    tts: { provider: '', api_key: '' },
     paths: { data_dir: '' },
     tier_thresholds: { tier1_token_cap: 4000, tier2_token_cap: 16000 },
     onboarding_complete: onboardingComplete,
@@ -61,53 +64,32 @@ export function makeConfig(onboardingComplete: boolean): AppConfig {
 }
 
 /**
- * Six rows mirroring the frozen CheckResult contract (snake_case ids, lowercase
- * statuses) — the backend now returns text_to_speech too. A deliberate mix of
- * pass / fail / pending exercises icon + action rendering. local_backend +
- * disk_permissions stay `pass` so Continue is NOT blocked (gating predicate,
- * plan change #12).
+ * The three readiness gates mirroring the frozen CheckResult contract
+ * (snake_case ids, lowercase statuses): llm_runtime, embedding_model,
+ * text_to_speech. All `pass` so the Continue gate (every row must pass) is NOT
+ * blocked — returning-user / Continue flows stay green. A test that needs a
+ * failing gate passes its own `checks` override.
  */
 export const DEFAULT_CHECKS: CheckResult[] = [
   {
-    id: 'local_backend',
-    label: 'Local backend',
-    status: 'pass',
-    detail: 'In-process engine ready',
-    action: null
-  },
-  {
     id: 'llm_runtime',
     label: 'LLM runtime',
-    status: 'fail',
-    detail: 'No local LLM runtime detected',
+    status: 'pass',
+    detail: 'Ollama 0.3.2 detected',
     action: 'configure'
   },
   {
     id: 'embedding_model',
     label: 'Embedding model',
-    status: 'pending',
-    detail: 'Set up when you add your first source',
-    action: 'choose'
-  },
-  {
-    id: 'vector_database',
-    label: 'Vector database',
-    status: 'pending',
-    detail: 'Built-in storage, set up automatically',
-    action: null
-  },
-  {
-    id: 'disk_permissions',
-    label: 'Disk permissions',
     status: 'pass',
-    detail: '/tmp/lens',
-    action: null
+    detail: 'Embedding model installed',
+    action: 'choose'
   },
   {
     id: 'text_to_speech',
     label: 'Text-to-speech',
-    status: 'pending',
-    detail: 'Kokoro audio engine — download required',
+    status: 'pass',
+    detail: 'Kokoro audio engine ready',
     action: 'choose'
   }
 ];

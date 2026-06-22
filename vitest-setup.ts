@@ -22,6 +22,34 @@ if (typeof window.localStorage?.getItem !== 'function') {
   Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: storage });
 }
 
+// happy-dom doesn't implement the Web Animations API (`element.animate`), which
+// both Svelte 5 transitions (e.g. `slide`) and the `motion` engine rely on.
+// Stub it so animated components don't throw in tests — it completes instantly
+// (resolves `finished` + fires `onfinish`) so intros/outros settle immediately.
+if (typeof Element !== 'undefined' && typeof Element.prototype.animate !== 'function') {
+  Element.prototype.animate = function animateStub(): Animation {
+    const animation = {
+      finished: Promise.resolve(),
+      currentTime: 0,
+      playState: 'finished',
+      effect: null,
+      onfinish: null as null | (() => void),
+      play() {},
+      pause() {},
+      finish() {},
+      cancel() {},
+      reverse() {},
+      commitStyles() {},
+      persist() {},
+      updatePlaybackRate() {},
+      addEventListener() {},
+      removeEventListener() {}
+    };
+    queueMicrotask(() => animation.onfinish?.());
+    return animation as unknown as Animation;
+  };
+}
+
 // `@tauri-apps/api/mocks`' mockIPC needs `window.crypto.getRandomValues`, which
 // is not guaranteed in the simulated DOM. Polyfill it only if it's missing.
 beforeAll(() => {

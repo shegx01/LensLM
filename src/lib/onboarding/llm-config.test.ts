@@ -21,6 +21,7 @@ function configWithOllama(): AppConfig {
     ],
     endpoints: {},
     voices: { host: '', guest: '' },
+    tts: { provider: '', api_key: '' },
     paths: { data_dir: '' },
     tier_thresholds: { tier1_token_cap: 4000, tier2_token_cap: 16000 },
     onboarding_complete: false,

@@ -1,10 +1,20 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
+  import { invoke, isTauri } from '@tauri-apps/api/core';
+  import { Input } from '$lib/components/ui/input/index.js';
   import { Button } from '$lib/components/ui/button/index.js';
   import { cn } from '$lib/utils.js';
   import LoaderCircle from '@lucide/svelte/icons/loader-circle';
   import CircleCheck from '@lucide/svelte/icons/circle-check';
   import Download from '@lucide/svelte/icons/download';
-  import { downloadTtsEngine, listTtsVoices, type TtsVoice } from '$lib/onboarding/system-check.js';
+  import {
+    downloadTtsEngine,
+    listTtsVoices,
+    kokoroDownloaded,
+    saveTtsProvider,
+    type TtsVoice
+  } from '$lib/onboarding/system-check.js';
+  import type { AppConfig } from '$lib/theme/types.js';
   import { SELECT_CLASS } from './styles.js';
   import { updateConfig } from '$lib/config.js';
 
@@ -16,12 +26,15 @@
     oncollapse: () => void;
   } = $props();
 
-  // Download state
+  // --- Segmented tab state (mirrors LlmConfigPanel's Local | Cloud control) ---
+  type TtsTab = 'local' | 'cloud';
+  let activeTab = $state<TtsTab>('local');
+
+  // --- Local tab: Kokoro download + voice selection ---
   let downloadProgress = $state<number | null>(null);
   let downloaded = $state(false);
   let downloadError = $state<string | null>(null);
 
-  // Voice selection (post-download)
   let voices = $state<TtsVoice[]>([]);
   let maleVoice = $state('');
   let femaleVoice = $state('');
@@ -33,6 +46,58 @@
 
   const maleVoices = $derived(voices.filter((v) => v.gender === 'male'));
   const femaleVoices = $derived(voices.filter((v) => v.gender === 'female'));
+
+  // --- Cloud tab: ElevenLabs API key ---
+  let cloudApiKey = $state('');
+  let savingCloud = $state(false);
+  let cloudError = $state<string | null>(null);
+
+  // --- Saved cloud key masking ---
+  // A previously-saved ElevenLabs key is masked, never loaded into the DOM. Save
+  // stays disabled until the user clicks the field to enter a fresh key.
+  let hasSavedKey = $state(false);
+  let editingKey = $state(false);
+
+  // Gate is behaviorally identical to LlmConfigPanel's cloud Save. When NOT
+  // configured (`hasSavedKey` false), the button enables as soon as a non-empty
+  // key is typed and is disabled only while the field is empty. When a key IS
+  // saved, masking engages and re-entry of a fresh non-empty key is required.
+  const cloudSaveDisabled = $derived(
+    savingCloud || (hasSavedKey ? !editingKey || !cloudApiKey.trim() : !cloudApiKey.trim())
+  );
+
+  // On mount, detect a saved ElevenLabs config and mask its key.
+  onMount(async () => {
+    if (!isTauri()) return;
+    try {
+      const cfg = await invoke<AppConfig>('get_config');
+      if (cfg.tts?.provider === 'elevenlabs' && cfg.tts.api_key.trim() !== '') {
+        hasSavedKey = true;
+        cloudApiKey = '';
+      }
+      // If Kokoro is already on disk, skip the download step and go straight to
+      // voice selection — pre-filled from any previously saved host/guest voices.
+      // (The download detection wasn't propagating before: the panel always
+      // showed "Download Kokoro" even when the engine was installed.)
+      if (await kokoroDownloaded()) {
+        downloaded = true;
+        voices = await listTtsVoices();
+        voicesUnavailable = voices.length === 0;
+        maleVoice = cfg.voices?.host || maleVoices[0]?.id || '';
+        femaleVoice = cfg.voices?.guest || femaleVoices[0]?.id || '';
+      }
+    } catch {
+      // Non-fatal: fall back to the default empty Cloud form / download prompt.
+    }
+  });
+
+  // Entering "editing" mode clears the masked field so the user types a fresh key.
+  function startEditingKey(): void {
+    if (hasSavedKey && !editingKey) {
+      editingKey = true;
+      cloudApiKey = '';
+    }
+  }
 
   async function handleDownload(): Promise<void> {
     downloadError = null;
@@ -71,105 +136,216 @@
       savingVoices = false;
     }
   }
+
+  // Cloud save: persist the ElevenLabs provider config, re-run the system check,
+  // then collapse — same shape as LlmConfigPanel's cloud Save.
+  async function handleSaveCloud(): Promise<void> {
+    savingCloud = true;
+    cloudError = null;
+    try {
+      await saveTtsProvider({ provider: 'elevenlabs', apiKey: cloudApiKey });
+      await oncheck();
+      oncollapse();
+    } catch (err) {
+      cloudError = err instanceof Error ? err.message : 'Could not save configuration.';
+    } finally {
+      savingCloud = false;
+    }
+  }
 </script>
 
-<div class="border-border mt-3 border-t pt-3 flex flex-col gap-3">
-  {#if !downloaded}
-    <!-- Pre-download: show download button -->
-    <div class="flex flex-col gap-2">
-      <p class="text-muted-foreground text-[0.78rem] leading-relaxed">
-        Kokoro is an open-weight TTS engine that runs entirely on-device. Download once — no
-        internet required for synthesis.
-      </p>
-      <div class="flex items-center justify-between text-[0.75rem] text-muted-foreground">
-        <span>Kokoro-82M</span>
-        <span>~86 MB · CPU · Fast</span>
+<div class="pt-3">
+  <!-- Segmented tabs: Local | Cloud (mirrors LlmConfigPanel) -->
+  <div
+    class="bg-muted flex w-full items-center rounded-lg p-0.5"
+    role="tablist"
+    aria-label="Text-to-speech provider type"
+  >
+    <button
+      role="tab"
+      aria-selected={activeTab === 'local'}
+      aria-controls="tts-panel-local"
+      id="tts-tab-local"
+      class={cn(
+        'flex-1 rounded-md px-3 py-1.5 text-sm font-medium transition-colors',
+        activeTab === 'local'
+          ? 'bg-background text-foreground shadow-sm'
+          : 'text-muted-foreground hover:text-foreground'
+      )}
+      onclick={() => (activeTab = 'local')}
+    >
+      Local
+    </button>
+    <button
+      role="tab"
+      aria-selected={activeTab === 'cloud'}
+      aria-controls="tts-panel-cloud"
+      id="tts-tab-cloud"
+      class={cn(
+        'flex-1 rounded-md px-3 py-1.5 text-sm font-medium transition-colors',
+        activeTab === 'cloud'
+          ? 'bg-background text-foreground shadow-sm'
+          : 'text-muted-foreground hover:text-foreground'
+      )}
+      onclick={() => (activeTab = 'cloud')}
+    >
+      Cloud
+    </button>
+  </div>
+
+  <!-- Local tab panel: Kokoro download + voice selectors -->
+  <div
+    id="tts-panel-local"
+    role="tabpanel"
+    aria-labelledby="tts-tab-local"
+    tabindex={activeTab === 'local' ? 0 : -1}
+    class={cn('mt-3 flex flex-col gap-3', activeTab !== 'local' && 'hidden')}
+  >
+    {#if !downloaded}
+      <!-- Pre-download: show download button -->
+      <div class="flex flex-col gap-2">
+        <p class="text-muted-foreground text-[0.78rem] leading-relaxed">
+          Kokoro is an open-weight TTS engine that runs entirely on-device. Download once — no
+          internet required for synthesis.
+        </p>
+        <div class="flex items-center justify-between text-[0.75rem] text-muted-foreground">
+          <span>Kokoro-82M</span>
+          <span>~86 MB · CPU · Fast</span>
+        </div>
+
+        {#if downloadProgress !== null && downloadProgress < 100}
+          <!-- Progress bar -->
+          <div class="w-full bg-muted rounded-full h-1.5 overflow-hidden">
+            <div
+              class="bg-primary h-full rounded-full transition-all duration-300"
+              style:width="{downloadProgress}%"
+            ></div>
+          </div>
+          <p class="text-[0.72rem] text-muted-foreground text-center">
+            {downloadProgress}% downloaded
+          </p>
+        {/if}
+
+        {#if downloadError}
+          <p class="text-destructive text-[0.75rem]" role="alert">{downloadError}</p>
+        {/if}
+
+        <Button
+          class="h-10 w-full"
+          onclick={handleDownload}
+          disabled={downloadProgress !== null && downloadProgress < 100}
+        >
+          {#if downloadProgress !== null && downloadProgress < 100}
+            <LoaderCircle class="size-4 animate-spin" />
+            Downloading…
+          {:else}
+            <Download class="size-4" />
+            Download Kokoro
+          {/if}
+        </Button>
+      </div>
+    {:else}
+      <!-- Post-download: voice selectors -->
+      <div class="flex items-center gap-2 text-[0.78rem] text-primary" role="status">
+        <CircleCheck class="size-4" />
+        Kokoro engine ready
       </div>
 
-      {#if downloadProgress !== null && downloadProgress < 100}
-        <!-- Progress bar -->
-        <div class="w-full bg-muted rounded-full h-1.5 overflow-hidden">
-          <div
-            class="bg-primary h-full rounded-full transition-all duration-300"
-            style:width="{downloadProgress}%"
-          ></div>
-        </div>
-        <p class="text-[0.72rem] text-muted-foreground text-center">
-          {downloadProgress}% downloaded
+      {#if voicesUnavailable}
+        <p class="text-destructive text-[0.75rem]" role="alert">
+          Couldn't load voices — is the engine installed?
         </p>
+      {:else}
+        <!-- Male voice selector -->
+        <div class="flex flex-col gap-1.5">
+          <label
+            for="tts-male-voice"
+            class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase"
+          >
+            Host voice (male)
+          </label>
+          <select id="tts-male-voice" bind:value={maleVoice} class={SELECT_CLASS}>
+            {#each maleVoices as voice (voice.id)}
+              <option value={voice.id}>{voice.name}</option>
+            {/each}
+          </select>
+        </div>
+
+        <!-- Female voice selector -->
+        <div class="flex flex-col gap-1.5">
+          <label
+            for="tts-female-voice"
+            class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase"
+          >
+            Co-host voice (female)
+          </label>
+          <select id="tts-female-voice" bind:value={femaleVoice} class={SELECT_CLASS}>
+            {#each femaleVoices as voice (voice.id)}
+              <option value={voice.id}>{voice.name}</option>
+            {/each}
+          </select>
+        </div>
       {/if}
 
-      {#if downloadError}
-        <p class="text-destructive text-[0.75rem]" role="alert">{downloadError}</p>
+      {#if saveError}
+        <p class="text-destructive text-[0.75rem]" role="alert">{saveError}</p>
       {/if}
 
       <Button
         class="h-10 w-full"
-        onclick={handleDownload}
-        disabled={downloadProgress !== null && downloadProgress < 100}
+        onclick={handleSaveVoices}
+        disabled={savingVoices || voicesUnavailable}
       >
-        {#if downloadProgress !== null && downloadProgress < 100}
-          <LoaderCircle class="size-4 animate-spin" />
-          Downloading…
-        {:else}
-          <Download class="size-4" />
-          Download Kokoro
-        {/if}
+        {savingVoices ? 'Saving…' : 'Save voice settings'}
       </Button>
-    </div>
-  {:else}
-    <!-- Post-download: voice selectors -->
-    <div class="flex items-center gap-2 text-[0.78rem] text-primary">
-      <CircleCheck class="size-4" />
-      Kokoro engine ready
+    {/if}
+  </div>
+
+  <!-- Cloud tab panel: ElevenLabs API key -->
+  <div
+    id="tts-panel-cloud"
+    role="tabpanel"
+    aria-labelledby="tts-tab-cloud"
+    tabindex={activeTab === 'cloud' ? 0 : -1}
+    class={cn('mt-3 flex flex-col gap-3', activeTab !== 'cloud' && 'hidden')}
+  >
+    <p class="text-muted-foreground text-[0.78rem] leading-relaxed">
+      ElevenLabs synthesizes high-quality voices in the cloud. Paste your API key to enable it — no
+      local download required.
+    </p>
+
+    <!-- API KEY -->
+    <div class="flex flex-col gap-1.5">
+      <label
+        for="tts-cloud-key"
+        class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase"
+      >
+        API Key
+      </label>
+      <Input
+        id="tts-cloud-key"
+        type="password"
+        bind:value={cloudApiKey}
+        placeholder={hasSavedKey && !editingKey
+          ? '•••••••••• saved — click to replace'
+          : 'Paste API key…'}
+        autocomplete="new-password"
+        onfocus={startEditingKey}
+        oninput={startEditingKey}
+      />
+      {#if hasSavedKey && !editingKey}
+        <p class="text-muted-foreground text-[0.72rem] leading-relaxed">
+          A key is already saved. Click the field to replace it.
+        </p>
+      {/if}
     </div>
 
-    {#if voicesUnavailable}
-      <p class="text-destructive text-[0.75rem]" role="alert">
-        Couldn't load voices — is the engine installed?
-      </p>
-    {:else}
-      <!-- Male voice selector -->
-      <div class="flex flex-col gap-1.5">
-        <label
-          for="tts-male-voice"
-          class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase"
-        >
-          Host voice (male)
-        </label>
-        <select id="tts-male-voice" bind:value={maleVoice} class={SELECT_CLASS}>
-          {#each maleVoices as voice (voice.id)}
-            <option value={voice.id}>{voice.name}</option>
-          {/each}
-        </select>
-      </div>
-
-      <!-- Female voice selector -->
-      <div class="flex flex-col gap-1.5">
-        <label
-          for="tts-female-voice"
-          class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase"
-        >
-          Co-host voice (female)
-        </label>
-        <select id="tts-female-voice" bind:value={femaleVoice} class={SELECT_CLASS}>
-          {#each femaleVoices as voice (voice.id)}
-            <option value={voice.id}>{voice.name}</option>
-          {/each}
-        </select>
-      </div>
+    {#if cloudError}
+      <p class="text-destructive text-[0.75rem]" role="alert">{cloudError}</p>
     {/if}
 
-    {#if saveError}
-      <p class="text-destructive text-[0.75rem]" role="alert">{saveError}</p>
-    {/if}
-
-    <Button
-      class="h-10 w-full"
-      onclick={handleSaveVoices}
-      disabled={savingVoices || voicesUnavailable}
-    >
-      {savingVoices ? 'Saving…' : 'Save voice settings'}
+    <Button class="h-10 w-full" onclick={handleSaveCloud} disabled={cloudSaveDisabled}>
+      {savingCloud ? 'Saving…' : 'Save'}
     </Button>
-  {/if}
+  </div>
 </div>

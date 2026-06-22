@@ -26,6 +26,7 @@ function baseConfig() {
     models: [],
     endpoints: {},
     voices: { host: '', guest: '' },
+    tts: { provider: '', api_key: '' },
     paths: { data_dir: '' },
     tier_thresholds: { tier1_token_cap: 4000, tier2_token_cap: 16000 },
     onboarding_complete: false,
@@ -220,6 +221,44 @@ describe('LlmConfigPanel — Test connection (local tab)', () => {
     );
   });
 
+  it('prioritizes a custom context window typed into the input (out-of-preset size)', async () => {
+    const setConfig = vi.fn();
+    const oncheck = vi.fn().mockResolvedValue(undefined);
+
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return baseConfig();
+      if (cmd === 'set_config') {
+        setConfig(args);
+        return null;
+      }
+      if (cmd === 'detect_llm') return { reachable: true, version: 'Ollama 0.3.2', models: [] };
+    });
+
+    render(SystemCheckRow, { props: { result: llmRow(), oncheck } });
+    await fireEvent.click(screen.getByRole('button', { name: /configure/i }));
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: /test connection/i })).toBeInTheDocument()
+    );
+
+    // Type a context size that is NOT one of the presets (e.g. 64K).
+    await fireEvent.input(screen.getByLabelText(/custom context window/i), {
+      target: { value: '65536' }
+    });
+    await fireEvent.click(screen.getByRole('button', { name: /test connection/i }));
+
+    await waitFor(() =>
+      expect(setConfig).toHaveBeenCalledWith(
+        expect.objectContaining({
+          config: expect.objectContaining({
+            models: expect.arrayContaining([
+              expect.objectContaining({ provider: 'ollama', context: 65536 })
+            ])
+          })
+        })
+      )
+    );
+  });
+
   it('surfaces a connection error inline and does NOT collapse on IPC failure', async () => {
     const oncheck = vi.fn().mockResolvedValue(undefined);
 
@@ -292,6 +331,11 @@ describe('LlmConfigPanel — Save (cloud tab)', () => {
     );
     await fireEvent.click(screen.getByRole('tab', { name: /cloud api/i }));
 
+    // A key must be entered for Save to enable (no key saved for this provider).
+    await fireEvent.input(screen.getByLabelText(/api key/i), {
+      target: { value: 'sk-test-key' }
+    });
+
     // Save
     await fireEvent.click(screen.getByRole('button', { name: /save/i }));
 
@@ -350,6 +394,158 @@ describe('LlmConfigPanel — Save (cloud tab)', () => {
               expect.objectContaining({
                 provider: 'openai-compatible',
                 api_key: 'sk-test-1234'
+              })
+            ])
+          })
+        })
+      )
+    );
+  });
+
+  it('masks a previously-saved cloud key: Save disabled initially, enabled after editing the key', async () => {
+    const oncheck = vi.fn().mockResolvedValue(undefined);
+
+    // get_config returns a saved openai-compatible cloud config WITH a key.
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') {
+        const cfg = baseConfig();
+        return {
+          ...cfg,
+          models: [
+            {
+              provider: 'openai-compatible',
+              base_url: 'https://api.openai.com/v1',
+              model: 'gpt-4o',
+              context: 128000,
+              temperature: 0.7,
+              api_key: 'sk-saved-secret'
+            }
+          ]
+        };
+      }
+      if (cmd === 'set_config') return null;
+    });
+
+    render(SystemCheckRow, { props: { result: llmRow(), oncheck } });
+
+    // Expand and switch to the Cloud API tab.
+    await fireEvent.click(screen.getByRole('button', { name: /configure/i }));
+    await waitFor(() =>
+      expect(screen.getByRole('tab', { name: /cloud api/i })).toBeInTheDocument()
+    );
+    await fireEvent.click(screen.getByRole('tab', { name: /cloud api/i }));
+
+    const keyField = screen.getByLabelText(/api key/i);
+    const save = screen.getByRole('button', { name: /save/i });
+
+    // The real key is NOT in the DOM (masked placeholder, empty value).
+    await waitFor(() => expect(keyField).toHaveValue(''));
+    expect(keyField).not.toHaveValue('sk-saved-secret');
+    expect(keyField).toHaveAttribute('placeholder', expect.stringMatching(/saved/i));
+
+    // Save is disabled while the saved key is untouched.
+    expect(save).toBeDisabled();
+
+    // Editing the key enables Save.
+    await fireEvent.focus(keyField);
+    await fireEvent.input(keyField, { target: { value: 'sk-new-key' } });
+    expect(save).not.toBeDisabled();
+  });
+
+  it('does not bleed the masked-disabled state across providers: switching to an unsaved card enables normal entry', async () => {
+    const oncheck = vi.fn().mockResolvedValue(undefined);
+
+    // A saved OpenAI cloud key — only the OpenAI card should be masked.
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') {
+        const cfg = baseConfig();
+        return {
+          ...cfg,
+          models: [
+            {
+              provider: 'openai-compatible',
+              base_url: 'https://api.openai.com/v1',
+              model: 'gpt-4o',
+              context: 128000,
+              temperature: 0.7,
+              api_key: 'sk-saved-secret'
+            }
+          ]
+        };
+      }
+      if (cmd === 'set_config') return null;
+    });
+
+    render(SystemCheckRow, { props: { result: llmRow(), oncheck } });
+
+    await fireEvent.click(screen.getByRole('button', { name: /configure/i }));
+    await waitFor(() =>
+      expect(screen.getByRole('tab', { name: /cloud api/i })).toBeInTheDocument()
+    );
+    await fireEvent.click(screen.getByRole('tab', { name: /cloud api/i }));
+
+    const save = screen.getByRole('button', { name: /save/i });
+    const keyField = screen.getByLabelText(/api key/i);
+
+    // On the SAVED (OpenAI) card: masked + Save disabled until re-entry.
+    await waitFor(() => expect(keyField).toHaveValue(''));
+    expect(keyField).toHaveAttribute('placeholder', expect.stringMatching(/saved/i));
+    expect(save).toBeDisabled();
+
+    // Switch to an UNSAVED provider card (Anthropic): no masking, normal entry.
+    await fireEvent.click(screen.getByRole('radio', { name: /anthropic/i }));
+
+    // Save is disabled with an empty field…
+    expect(save).toBeDisabled();
+    expect(keyField).toHaveAttribute('placeholder', expect.stringMatching(/paste api key/i));
+
+    // …and enabled once a non-empty key is typed (no bleed-through disable).
+    await fireEvent.input(keyField, { target: { value: 'sk-anthropic-key' } });
+    expect(save).not.toBeDisabled();
+  });
+
+  it('forwards a custom model id entered in the Cloud Model field', async () => {
+    const setConfig = vi.fn();
+    const oncheck = vi.fn().mockResolvedValue(undefined);
+
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return baseConfig();
+      if (cmd === 'set_config') {
+        setConfig(args);
+        return null;
+      }
+    });
+
+    render(SystemCheckRow, { props: { result: llmRow(), oncheck } });
+
+    // Expand and switch to the Cloud API tab.
+    await fireEvent.click(screen.getByRole('button', { name: /configure/i }));
+    await waitFor(() =>
+      expect(screen.getByRole('tab', { name: /cloud api/i })).toBeInTheDocument()
+    );
+    await fireEvent.click(screen.getByRole('tab', { name: /cloud api/i }));
+
+    // Override the seeded default with a model the app shipped without. (Both the
+    // Local and Cloud panels label a field "Model", so target the cloud input.)
+    const modelField = screen.getByLabelText('Model', { selector: '#llm-cloud-model' });
+    await fireEvent.input(modelField, { target: { value: 'gpt-5-turbo' } });
+
+    // A key must be entered for Save to enable.
+    await fireEvent.input(screen.getByLabelText(/api key/i), {
+      target: { value: 'sk-test-key' }
+    });
+
+    await fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+    // The user's model id must reach set_config, not the hardcoded default.
+    await waitFor(() =>
+      expect(setConfig).toHaveBeenCalledWith(
+        expect.objectContaining({
+          config: expect.objectContaining({
+            models: expect.arrayContaining([
+              expect.objectContaining({
+                provider: 'openai-compatible',
+                model: 'gpt-5-turbo'
               })
             ])
           })

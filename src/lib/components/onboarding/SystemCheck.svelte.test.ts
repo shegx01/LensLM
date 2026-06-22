@@ -4,14 +4,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { CheckResult } from '$lib/onboarding/system-check.js';
 import SystemCheck from './SystemCheck.svelte';
 
+// All three readiness gates passing — the only state in which Continue enables.
 const ALL_PASS: CheckResult[] = [
-  {
-    id: 'local_backend',
-    label: 'Local backend',
-    status: 'pass',
-    detail: 'In-process engine ready',
-    action: null
-  },
   {
     id: 'llm_runtime',
     label: 'LLM runtime',
@@ -22,41 +16,33 @@ const ALL_PASS: CheckResult[] = [
   {
     id: 'embedding_model',
     label: 'Embedding model',
-    status: 'pending',
-    detail: 'Set up when you add your first source',
-    action: 'choose'
-  },
-  {
-    id: 'vector_database',
-    label: 'Vector database',
-    status: 'pending',
-    detail: 'Built-in · set up automatically when you add your first source',
-    action: null
-  },
-  {
-    id: 'disk_permissions',
-    label: 'Disk permissions',
     status: 'pass',
-    detail: '~/Library/Application Support/Lens',
-    action: null
+    detail: 'Embedding model installed',
+    action: 'choose'
   },
   {
     id: 'text_to_speech',
     label: 'Text-to-speech',
-    status: 'pending',
-    detail: 'Kokoro audio engine — download required',
+    status: 'pass',
+    detail: 'Kokoro audio engine ready',
     action: 'choose'
   }
 ];
 
-function withDiskFail(): CheckResult[] {
+/** All three gates failing (fresh machine). */
+function allFail(): CheckResult[] {
+  return ALL_PASS.map((r) => ({ ...r, status: 'fail' as const }));
+}
+
+/** Exactly one gate (text_to_speech) failing — Continue must stay disabled. */
+function ttsFail(): CheckResult[] {
   return ALL_PASS.map((r) =>
-    r.id === 'disk_permissions'
+    r.id === 'text_to_speech'
       ? {
           ...r,
           status: 'fail' as const,
-          detail: 'Cannot write to app data directory',
-          action: 'retry' as const
+          detail: 'No text-to-speech engine configured',
+          action: 'choose' as const
         }
       : r
   );
@@ -72,19 +58,18 @@ afterEach(() => {
 });
 
 describe('SystemCheck', () => {
-  it('renders the System check title and all six rows returned by runSystemCheck', async () => {
+  it('renders the System check title and the three rows returned by runSystemCheck', async () => {
     mockIPC((cmd) => {
       if (cmd === 'run_system_check') return ALL_PASS;
     });
     render(SystemCheck, { props: { oncomplete: vi.fn() } });
     expect(screen.getByText('System check')).toBeInTheDocument();
-    await waitFor(() => expect(screen.getByText('Local backend')).toBeInTheDocument());
-    expect(screen.getByText('Vector database')).toBeInTheDocument();
-    // The TTS row now comes from the backend (6th row), not synthesized by the UI.
+    await waitFor(() => expect(screen.getByText('LLM runtime')).toBeInTheDocument());
+    expect(screen.getByText('Embedding model')).toBeInTheDocument();
     expect(screen.getByText('Text-to-speech')).toBeInTheDocument();
   });
 
-  it('enables Continue when no blocking check fails', async () => {
+  it('enables Continue only when all three gates pass', async () => {
     mockIPC((cmd) => {
       if (cmd === 'run_system_check') return ALL_PASS;
     });
@@ -93,12 +78,21 @@ describe('SystemCheck', () => {
     await waitFor(() => expect(cont).not.toBeDisabled());
   });
 
-  it('disables Continue when disk_permissions fails', async () => {
+  it('disables Continue when even one gate fails', async () => {
     mockIPC((cmd) => {
-      if (cmd === 'run_system_check') return withDiskFail();
+      if (cmd === 'run_system_check') return ttsFail();
     });
     render(SystemCheck, { props: { oncomplete: vi.fn() } });
-    await waitFor(() => expect(screen.getByText('Disk permissions')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText('Text-to-speech')).toBeInTheDocument());
+    expect(screen.getByRole('button', { name: 'Continue to setup' })).toBeDisabled();
+  });
+
+  it('disables Continue when all gates fail', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'run_system_check') return allFail();
+    });
+    render(SystemCheck, { props: { oncomplete: vi.fn() } });
+    await waitFor(() => expect(screen.getByText('LLM runtime')).toBeInTheDocument());
     expect(screen.getByRole('button', { name: 'Continue to setup' })).toBeDisabled();
   });
 
@@ -114,6 +108,7 @@ describe('SystemCheck', () => {
           models: [],
           endpoints: {},
           voices: { host: '', guest: '' },
+          tts: { provider: '', api_key: '' },
           paths: { data_dir: '' },
           tier_thresholds: { tier1_token_cap: 4000, tier2_token_cap: 16000 },
           onboarding_complete: false,
@@ -163,29 +158,19 @@ describe('SystemCheck', () => {
     expect(screen.getByRole('button', { name: 'Continue to setup' })).toBeDisabled();
   });
 
-  it('shows the "{ready} of {total} checks passed" summary (design footer)', async () => {
+  it('shows "0 of 3" when all gates fail and "3 of 3" when all pass', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'run_system_check') return allFail();
+    });
+    const { unmount } = render(SystemCheck, { props: { oncomplete: vi.fn() } });
+    await waitFor(() => expect(screen.getByText('0 of 3 checks passed')).toBeInTheDocument());
+    unmount();
+
+    clearMocks();
     mockIPC((cmd) => {
       if (cmd === 'run_system_check') return ALL_PASS;
     });
     render(SystemCheck, { props: { oncomplete: vi.fn() } });
-    // ALL_PASS (6 backend rows) = 3 pass (backend, llm, disk) + 3 pending
-    // (embedding, vector, text_to_speech) → 3 of 6.
-    await waitFor(() => expect(screen.getByText('3 of 6 checks passed')).toBeInTheDocument());
-  });
-
-  it("a failed row's Retry action re-runs the system check", async () => {
-    let calls = 0;
-    mockIPC((cmd) => {
-      if (cmd === 'run_system_check') {
-        calls += 1;
-        return withDiskFail();
-      }
-    });
-    render(SystemCheck, { props: { oncomplete: vi.fn() } });
-    await waitFor(() => expect(screen.getByText('Disk permissions')).toBeInTheDocument());
-    expect(calls).toBe(1);
-    // The design has NO footer Retry; re-check is the failed row's per-row action.
-    await fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
-    await waitFor(() => expect(calls).toBe(2));
+    await waitFor(() => expect(screen.getByText('3 of 3 checks passed')).toBeInTheDocument());
   });
 });

@@ -67,6 +67,38 @@ pub struct VoiceConfig {
     pub guest: String,
 }
 
+/// Cloud text-to-speech provider configuration (e.g. ElevenLabs).
+///
+/// Empty `provider`/`api_key` means no cloud TTS is configured (the default);
+/// the system-check then falls back to the local Kokoro-on-disk gate.
+///
+/// `Debug` is implemented MANUALLY (not derived), exactly like [`ModelConfig`],
+/// so the `api_key` is never echoed verbatim into logs / panic messages: it is
+/// redacted to `"***"` when present and shown as `""` when empty.
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TtsConfig {
+    /// Cloud TTS provider identifier (e.g. `"elevenlabs"`). Empty when unset.
+    pub provider: String,
+    /// Optional API key for the cloud provider (empty when not configured).
+    ///
+    /// NOTE: stored in PLAINTEXT inside `config.json` — see [`ModelConfig::api_key`]
+    /// for the at-rest caveat. Migrating secrets into the OS keychain is deferred.
+    pub api_key: String,
+}
+
+impl std::fmt::Debug for TtsConfig {
+    /// Redacts `api_key` so a secret can never leak through a `{:?}` format (logs,
+    /// panic messages, tracing). A non-empty key prints as `"***"`; an empty key
+    /// prints as `""`. All other fields are shown verbatim.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let api_key = if self.api_key.is_empty() { "" } else { "***" };
+        f.debug_struct("TtsConfig")
+            .field("provider", &self.provider)
+            .field("api_key", &api_key)
+            .finish()
+    }
+}
+
 /// Filesystem paths the engine cares about.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PathConfig {
@@ -129,6 +161,11 @@ pub struct AppConfig {
     pub endpoints: BTreeMap<String, String>,
     /// Host/guest TTS voices.
     pub voices: VoiceConfig,
+    /// Cloud TTS provider config (e.g. ElevenLabs). Defaults to empty; an absent
+    /// field in an older `config.json` reads back as the default via
+    /// `#[serde(default)]` (backward compatibility).
+    #[serde(default)]
+    pub tts: TtsConfig,
     /// Filesystem paths.
     pub paths: PathConfig,
     /// Tier token thresholds.
@@ -146,6 +183,7 @@ impl Default for AppConfig {
             models: Vec::default(),
             endpoints: BTreeMap::default(),
             voices: VoiceConfig::default(),
+            tts: TtsConfig::default(),
             paths: PathConfig::default(),
             tier_thresholds: TierThresholds::default(),
             onboarding_complete: false,
@@ -321,6 +359,73 @@ mod tests {
         config.save(dir.path()).unwrap();
         let loaded = AppConfig::load(dir.path()).unwrap();
         assert_eq!(loaded.embedding_model, "nomic-embed-text");
+    }
+
+    #[test]
+    fn tts_config_debug_redacts_api_key() {
+        let cfg = TtsConfig {
+            provider: "elevenlabs".to_string(),
+            api_key: "sk-elevenlabs-supersecret".to_string(),
+        };
+        let debug = format!("{cfg:?}");
+        // The secret must never appear in the Debug output.
+        assert!(!debug.contains("sk-elevenlabs-supersecret"));
+        assert!(!debug.contains("supersecret"));
+        // Redaction marker present; provider still visible.
+        assert!(debug.contains("***"));
+        assert!(debug.contains("elevenlabs"));
+    }
+
+    #[test]
+    fn tts_config_debug_shows_empty_api_key_as_empty() {
+        let cfg = TtsConfig::default();
+        let debug = format!("{cfg:?}");
+        // An empty key is shown as "" (not redacted to ***).
+        assert!(debug.contains("api_key: \"\""));
+        assert!(!debug.contains("***"));
+    }
+
+    #[test]
+    fn default_tts_is_empty() {
+        assert_eq!(AppConfig::default().tts, TtsConfig::default());
+        assert_eq!(AppConfig::default().tts.provider, "");
+        assert_eq!(AppConfig::default().tts.api_key, "");
+    }
+
+    #[test]
+    fn missing_tts_deserializes_to_default() {
+        // A config.json written before the `tts` field existed has no `tts` key;
+        // it must read back as the default (empty) rather than failing to
+        // deserialize (backward compatibility).
+        let json = r#"{
+            "theme": "dark",
+            "accent": "purple",
+            "embedding_model": "",
+            "models": [],
+            "endpoints": {},
+            "voices": { "host": "", "guest": "" },
+            "paths": { "data_dir": "" },
+            "tier_thresholds": { "tier1_token_cap": 4000, "tier2_token_cap": 16000 },
+            "onboarding_complete": true
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.tts, TtsConfig::default());
+    }
+
+    #[test]
+    fn explicit_tts_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = AppConfig {
+            tts: TtsConfig {
+                provider: "elevenlabs".to_string(),
+                api_key: "sk-elevenlabs".to_string(),
+            },
+            ..AppConfig::default()
+        };
+        config.save(dir.path()).unwrap();
+        let loaded = AppConfig::load(dir.path()).unwrap();
+        assert_eq!(loaded.tts.provider, "elevenlabs");
+        assert_eq!(loaded.tts.api_key, "sk-elevenlabs");
     }
 
     #[test]
