@@ -72,15 +72,31 @@ impl Default for TierThresholds {
     }
 }
 
+/// Default accent token name. Drives the `[data-accent]` token layer in the UI.
+const DEFAULT_ACCENT: &str = "purple";
+
+/// The serde default for [`AppConfig::accent`]: configs written before the
+/// `accent` field existed (or with it omitted) deserialize to `"purple"` rather
+/// than the empty string, so the persisted accent always resolves to a real
+/// token name.
+fn default_accent() -> String {
+    DEFAULT_ACCENT.to_string()
+}
+
 /// Top-level application configuration.
 ///
 /// Loaded from / saved to `{data_dir}/config.json`. A missing file yields
 /// [`AppConfig::default`] (and is written back); a malformed file yields
 /// [`LensError::Parse`] rather than panicking.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppConfig {
     /// UI theme name (e.g. `"system"`, `"light"`, `"dark"`).
     pub theme: String,
+    /// UI accent token name (drives the `[data-accent]` layer). Defaults to
+    /// `"purple"`; an absent field in an older `config.json` reads back as
+    /// `"purple"` via [`default_accent`].
+    #[serde(default = "default_accent")]
+    pub accent: String,
     /// Configured chat/inference models keyed by role.
     pub models: Vec<ModelConfig>,
     /// Arbitrary named endpoints (label -> URL).
@@ -93,6 +109,21 @@ pub struct AppConfig {
     pub tier_thresholds: TierThresholds,
     /// Whether first-run onboarding has completed.
     pub onboarding_complete: bool,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            theme: String::default(),
+            accent: default_accent(),
+            models: Vec::default(),
+            endpoints: BTreeMap::default(),
+            voices: VoiceConfig::default(),
+            paths: PathConfig::default(),
+            tier_thresholds: TierThresholds::default(),
+            onboarding_complete: false,
+        }
+    }
 }
 
 impl AppConfig {
@@ -167,5 +198,43 @@ impl AppConfig {
     #[cfg(not(unix))]
     fn restrict_permissions(_path: &Path) -> Result<(), LensError> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_accent_is_purple() {
+        assert_eq!(AppConfig::default().accent, "purple");
+    }
+
+    #[test]
+    fn missing_accent_deserializes_to_purple() {
+        // A config.json written before the `accent` field existed has no
+        // `accent` key; it must read back as the default rather than failing.
+        let json = r#"{
+            "theme": "dark",
+            "models": [],
+            "endpoints": {},
+            "voices": { "host": "", "guest": "" },
+            "paths": { "data_dir": "" },
+            "tier_thresholds": { "tier1_token_cap": 4000, "tier2_token_cap": 16000 },
+            "onboarding_complete": true
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.accent, "purple");
+        assert_eq!(config.theme, "dark");
+    }
+
+    #[test]
+    fn explicit_accent_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = AppConfig::default();
+        config.accent = "emerald".to_string();
+        config.save(dir.path()).unwrap();
+        let loaded = AppConfig::load(dir.path()).unwrap();
+        assert_eq!(loaded.accent, "emerald");
     }
 }
