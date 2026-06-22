@@ -77,15 +77,15 @@
     expanded = !expanded;
   }
 
-  const needsEmphasis = $derived(result.status === 'fail' || result.action !== null);
-
+  // Uniform border on every row (the Card default ring). Per design, a failed
+  // or actionable row is differentiated ONLY by its icon badge + label color,
+  // never by a heavier border — so no per-row ring override here.
+  //
   // Always column-stretch so the header row's layout is IDENTICAL whether
   // collapsed or expanded — clicking the action button only reveals the panel
   // below, it never reflows the header (no button "jump"). gap-0: the panels
   // bring their own top border/padding.
-  const cardClass = $derived(
-    cn('flex-col items-stretch gap-0 px-4 py-3', needsEmphasis && 'ring-foreground/20')
-  );
+  const cardClass = 'flex-col items-stretch gap-0 px-4 py-3';
 </script>
 
 <Card size="sm" class={cardClass}>
