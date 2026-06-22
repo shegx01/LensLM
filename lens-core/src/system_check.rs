@@ -1,7 +1,7 @@
 //! First-run system check: honest probes of the local intelligence stack.
 //!
 //! This module defines the FROZEN IPC contract ([`CheckResult`]) returned by
-//! [`crate::LensEngine::run_system_check`], plus the five probes that populate
+//! [`crate::LensEngine::run_system_check`], plus the six probes that populate
 //! it. The contract is consumed verbatim by the Tauri command layer and mirrored
 //! in the Svelte UI; do not reshape it without updating every mirror.
 //!
@@ -33,6 +33,10 @@ const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434";
 const DEFAULT_LMSTUDIO_BASE_URL: &str = "http://localhost:1234";
 /// Sentinel file used to verify the app data directory is writable.
 const WRITE_SENTINEL_NAME: &str = ".lens_write_test";
+/// Upper bound on a probe response body we will buffer + deserialize. A version
+/// string or a model list is tiny; this cap (1 MiB) is defense-in-depth so a
+/// malicious/misconfigured endpoint can't stream an unbounded body into memory.
+const MAX_PROBE_BODY_BYTES: usize = 1024 * 1024;
 
 /// Status of a single system-check row.
 ///
@@ -60,6 +64,8 @@ pub enum CheckId {
     EmbeddingModel,
     /// Vector database (built-in, set up automatically later).
     VectorDatabase,
+    /// Text-to-speech (Kokoro) engine availability.
+    TextToSpeech,
     /// App-data-directory write permissions.
     DiskPermissions,
 }
@@ -96,6 +102,148 @@ pub struct CheckResult {
     pub detail: String,
     /// Optional UI affordance; absence is `None` (no `CheckAction::None`).
     pub action: Option<CheckAction>,
+}
+
+/// Result of probing a single LLM endpoint via [`detect_llm`].
+///
+/// THIS IS THE FROZEN IPC CONTRACT for the "Configure → Auto-detect" flow.
+/// It crosses the Tauri boundary verbatim and is mirrored in the Svelte client;
+/// field names and the serde shape are locked.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct LlmDetection {
+    /// Whether the endpoint answered with a successful (2xx) response.
+    pub reachable: bool,
+    /// Ollama version string, if the endpoint spoke the Ollama protocol.
+    pub version: Option<String>,
+    /// Model names/ids collected from the endpoint (Ollama + OpenAI-compatible).
+    pub models: Vec<String>,
+}
+
+/// Probes `base_url` for both Ollama-style and OpenAI-compatible endpoints,
+/// returning a [`LlmDetection`] that merges both responses.
+///
+/// Uses the shared [`probe_client`] (rustls, no-redirect, connect 1s / total 2s).
+/// Both protocol probes run concurrently via [`tokio::join!`].
+///
+/// - Ollama style: `GET {base_url}/api/version` → version; `GET {base_url}/api/tags` → models.
+/// - OpenAI-compatible: `GET {base_url}/v1/models` → models from `data[].id`.
+/// - Any connect/timeout/non-200 response contributes nothing (not an error).
+/// - If neither probe responds: `reachable=false`, `version=None`, `models=[]`.
+/// - Never returns `Err` for "not reachable"; `LensError` is reserved for genuine
+///   internal faults (which cannot realistically occur here).
+pub async fn detect_llm(base_url: &str) -> LlmDetection {
+    let base_url = base_url.trim_end_matches('/');
+
+    // Defense-in-depth: only probe http/https schemes. This is a local-first app
+    // where the user controls their own machine, so the threat is self-SSRF
+    // (a typo or malicious config coaxing the probe into a non-HTTP scheme like
+    // file://) rather than a multi-tenant SSRF — hence a scheme allowlist, not a
+    // host blocklist. A non-http(s) scheme is reported as simply unreachable.
+    let scheme_ok = base_url.split_once("://").is_some_and(|(scheme, _)| {
+        scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+    });
+    if !scheme_ok {
+        return LlmDetection {
+            reachable: false,
+            version: None,
+            models: vec![],
+        };
+    }
+
+    let client = probe_client();
+
+    let (ollama_result, openai_models) = tokio::join!(
+        probe_ollama_endpoint(&client, base_url),
+        probe_openai_endpoint(&client, base_url),
+    );
+
+    let (ollama_version, ollama_models) = ollama_result;
+
+    // Merge + deduplicate models from both protocols.
+    let mut models = ollama_models;
+    for id in openai_models {
+        if !models.contains(&id) {
+            models.push(id);
+        }
+    }
+
+    let reachable = ollama_version.is_some() || !models.is_empty();
+
+    LlmDetection {
+        reachable,
+        version: ollama_version,
+        models,
+    }
+}
+
+/// GETs `url` and deserializes a successful (2xx) response as `T`, capping the
+/// buffered body at [`MAX_PROBE_BODY_BYTES`] before parsing. Returns `None` on a
+/// connect/timeout error, a non-2xx status, an over-cap body, or a parse miss.
+///
+/// Reading `bytes()` (vs `resp.json()`) lets us reject an oversized body without
+/// streaming it all into a `serde` deserializer — defense-in-depth against a
+/// malicious endpoint that answers a probe with an unbounded stream.
+async fn get_json_capped<T: serde::de::DeserializeOwned>(
+    client: &reqwest::Client,
+    url: &str,
+) -> Option<T> {
+    let resp = match client.get(url).send().await {
+        Ok(resp) if resp.status().is_success() => resp,
+        _ => return None,
+    };
+    let body = resp.bytes().await.ok()?;
+    if body.len() > MAX_PROBE_BODY_BYTES {
+        return None;
+    }
+    serde_json::from_slice::<T>(&body).ok()
+}
+
+/// Probes the Ollama protocol: `GET /api/version` then `GET /api/tags`.
+/// Returns `(version, model_names)`.
+async fn probe_ollama_endpoint(
+    client: &reqwest::Client,
+    base_url: &str,
+) -> (Option<String>, Vec<String>) {
+    let version_url = format!("{base_url}/api/version");
+    let version = get_json_capped::<OllamaVersion>(client, &version_url)
+        .await
+        .map(|v| v.version);
+
+    if version.is_none() {
+        return (None, vec![]);
+    }
+
+    let tags_url = format!("{base_url}/api/tags");
+    let models = get_json_capped::<OllamaTags>(client, &tags_url)
+        .await
+        .map(|tags| tags.models.into_iter().map(|m| m.name).collect())
+        .unwrap_or_default();
+
+    (version, models)
+}
+
+/// Probes the OpenAI-compatible protocol: `GET /v1/models`.
+/// Returns `data[].id` strings on success, empty vec otherwise.
+async fn probe_openai_endpoint(client: &reqwest::Client, base_url: &str) -> Vec<String> {
+    let url = format!("{base_url}/v1/models");
+    get_json_capped::<OpenAiModels>(client, &url)
+        .await
+        .map(|m| m.data.into_iter().map(|d| d.id).collect())
+        .unwrap_or_default()
+}
+
+/// Shape of the OpenAI-compatible `GET /v1/models` response.
+#[derive(Debug, Deserialize)]
+struct OpenAiModels {
+    #[serde(default)]
+    data: Vec<OpenAiModelEntry>,
+}
+
+/// One entry from `GET /v1/models`.
+#[derive(Debug, Deserialize)]
+struct OpenAiModelEntry {
+    id: String,
 }
 
 /// Shape of Ollama's `GET /api/version` response.
@@ -166,7 +314,10 @@ fn probe_client() -> reqwest::Client {
 }
 
 /// Resolves the configured Ollama base URL, defaulting to localhost.
-fn ollama_base_url(config: &AppConfig) -> String {
+///
+/// Public so the embedding-model install command can target the SAME runtime
+/// the system-check probe detected, rather than re-deriving the URL.
+pub fn ollama_base_url(config: &AppConfig) -> String {
     provider_base_url(config, "ollama").unwrap_or_else(|| DEFAULT_OLLAMA_BASE_URL.to_string())
 }
 
@@ -224,23 +375,24 @@ async fn probe_local_backend(db: &SqlitePool) -> CheckResult {
     }
 }
 
-/// Detects Ollama via `GET {base}/api/version`. Returns the parsed version on a
-/// 200, `None` on a clean connect/timeout failure.
+/// Detects Ollama via the shared [`probe_ollama_endpoint`] probe, taking just the
+/// version (discarding the model list). Returns the parsed version on a 200,
+/// `None` on a clean connect/timeout failure or a non-Ollama endpoint.
+///
+/// Delegates to the single Ollama probe implementation so the runtime-detection
+/// row and the `detect_llm` command can never drift in how they speak Ollama.
 async fn detect_ollama(client: &reqwest::Client, base_url: &str) -> Option<String> {
-    let url = format!("{base_url}/api/version");
-    match client.get(&url).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            resp.json::<OllamaVersion>().await.ok().map(|v| v.version)
-        }
-        // A non-2xx response or a parse miss means "not a healthy Ollama here".
-        _ => None,
-    }
+    let (version, _models) = probe_ollama_endpoint(client, base_url).await;
+    version
 }
 
-/// Detects LM Studio via `GET {base}/v1/models`. Returns `true` on a 200.
+/// Detects LM Studio via the shared [`probe_openai_endpoint`] probe. Returns
+/// `true` when the endpoint advertises at least one model on `/v1/models`.
+///
+/// Delegates to the single OpenAI-compatible probe implementation so detection
+/// behavior stays identical to the `detect_llm` command's OpenAI path.
 async fn detect_lmstudio(client: &reqwest::Client, base_url: &str) -> bool {
-    let url = format!("{base_url}/v1/models");
-    matches!(client.get(&url).send().await, Ok(resp) if resp.status().is_success())
+    !probe_openai_endpoint(client, base_url).await.is_empty()
 }
 
 /// Probe 2 — local LLM runtime detection.
@@ -314,26 +466,21 @@ async fn probe_embedding_model(client: &reqwest::Client, runtime: &LlmRuntimePro
     }
 
     let url = format!("{}/api/tags", runtime.ollama_base_url);
-    let found = match client.get(&url).send().await {
-        Ok(resp) if resp.status().is_success() => resp
-            .json::<OllamaTags>()
-            .await
-            .ok()
-            .map(|tags| {
-                tags.models.iter().any(|m| {
-                    let name = m.name.to_ascii_lowercase();
-                    let family = m
-                        .details
-                        .as_ref()
-                        .and_then(|d| d.family.as_deref())
-                        .unwrap_or("")
-                        .to_ascii_lowercase();
-                    name.contains("embed") || matches!(family.as_str(), "bert" | "nomic-bert")
-                })
+    let found = get_json_capped::<OllamaTags>(client, &url)
+        .await
+        .map(|tags| {
+            tags.models.iter().any(|m| {
+                let name = m.name.to_ascii_lowercase();
+                let family = m
+                    .details
+                    .as_ref()
+                    .and_then(|d| d.family.as_deref())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                name.contains("embed") || matches!(family.as_str(), "bert" | "nomic-bert")
             })
-            .unwrap_or(false),
-        _ => false,
-    };
+        })
+        .unwrap_or(false);
 
     if found {
         CheckResult {
@@ -370,7 +517,37 @@ fn probe_vector_database() -> CheckResult {
     }
 }
 
-/// Probe 5 — app-data-directory write permissions.
+/// Probe 5 — text-to-speech (Kokoro) engine availability.
+///
+/// A real, honest probe: the Kokoro ONNX model is ~86 MiB and is downloaded on
+/// demand, so we test for the model file on disk at
+/// `{data_dir}/models/kokoro/model_q8f16.onnx` (the exact path the downloader
+/// writes). Present ⇒ `Pass`; absent ⇒ `Pending` with a "download required"
+/// affordance. Never `Fail` — an absent engine is an expected pre-download state,
+/// not an error.
+fn probe_text_to_speech(config: &AppConfig) -> CheckResult {
+    let model_path = crate::tts::kokoro_model_path(Path::new(&config.paths.data_dir));
+
+    if model_path.is_file() {
+        CheckResult {
+            id: CheckId::TextToSpeech,
+            label: "Text-to-speech".to_string(),
+            status: CheckStatus::Pass,
+            detail: "Kokoro audio engine ready".to_string(),
+            action: Some(CheckAction::Choose),
+        }
+    } else {
+        CheckResult {
+            id: CheckId::TextToSpeech,
+            label: "Text-to-speech".to_string(),
+            status: CheckStatus::Pending,
+            detail: "Kokoro audio engine — download required".to_string(),
+            action: Some(CheckAction::Choose),
+        }
+    }
+}
+
+/// Probe 6 — app-data-directory write permissions.
 ///
 /// Writes then deletes a sentinel file in the configured data directory. Success
 /// ⇒ `Pass` with the resolved path; failure ⇒ `Fail` with a retry affordance.
@@ -403,9 +580,9 @@ fn write_test_sentinel(dir: &Path) -> std::io::Result<()> {
     std::fs::remove_file(&path)
 }
 
-/// Runs all five system-check probes concurrently and returns them in the fixed
+/// Runs all six system-check probes concurrently and returns them in the fixed
 /// row order: LocalBackend, LlmRuntime, EmbeddingModel, VectorDatabase,
-/// DiskPermissions.
+/// TextToSpeech, DiskPermissions.
 ///
 /// Probes run via [`tokio::join!`] so the wall-clock cost is roughly the slowest
 /// probe (the bounded LLM timeout window), not the sum of all probes.
@@ -436,6 +613,7 @@ pub(crate) async fn run_system_check(config: &AppConfig, db: &SqlitePool) -> Vec
         llm_runtime,
         embedding_model,
         probe_vector_database(),
+        probe_text_to_speech(config),
         disk_permissions,
     ]
 }
@@ -504,7 +682,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/v1/models"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": []
+                "data": [{ "id": "local-model" }]
             })))
             .mount(&lmstudio)
             .await;
@@ -565,7 +743,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/v1/models"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": []
+                "data": [{ "id": "local-model" }]
             })))
             .mount(&server)
             .await;
@@ -674,6 +852,36 @@ mod tests {
         assert!(result.detail.contains("LanceDB"));
     }
 
+    #[test]
+    fn text_to_speech_pending_when_model_absent() {
+        // A fresh data dir has no Kokoro model on disk ⇒ Pending + Choose.
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = AppConfig::default();
+        config.paths.data_dir = dir.path().display().to_string();
+
+        let result = probe_text_to_speech(&config);
+        assert_eq!(result.id, CheckId::TextToSpeech);
+        assert_eq!(result.status, CheckStatus::Pending);
+        assert_eq!(result.action, Some(CheckAction::Choose));
+        assert_eq!(result.detail, "Kokoro audio engine — download required");
+    }
+
+    #[test]
+    fn text_to_speech_pass_when_model_present() {
+        // Materialize the model file at the exact path the downloader writes.
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = crate::tts::kokoro_model_path(dir.path());
+        std::fs::create_dir_all(model_path.parent().unwrap()).unwrap();
+        std::fs::write(&model_path, b"fake-onnx-bytes").unwrap();
+
+        let mut config = AppConfig::default();
+        config.paths.data_dir = dir.path().display().to_string();
+
+        let result = probe_text_to_speech(&config);
+        assert_eq!(result.status, CheckStatus::Pass);
+        assert_eq!(result.detail, "Kokoro audio engine ready");
+    }
+
     #[tokio::test]
     async fn disk_permissions_pass_on_writable_dir() {
         let dir = tempfile::tempdir().unwrap();
@@ -696,7 +904,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_system_check_returns_five_rows_in_order() {
+    async fn run_system_check_returns_six_rows_in_order() {
         let engine = crate::LensEngine::for_test().await;
         let dir = tempfile::tempdir().unwrap();
         {
@@ -713,6 +921,7 @@ mod tests {
                 CheckId::LlmRuntime,
                 CheckId::EmbeddingModel,
                 CheckId::VectorDatabase,
+                CheckId::TextToSpeech,
                 CheckId::DiskPermissions,
             ]
         );
@@ -783,5 +992,156 @@ mod tests {
             detail: "fixture".to_string(),
             action: None,
         }
+    }
+
+    // --- detect_llm tests ---
+
+    #[tokio::test]
+    async fn detect_llm_ollama_responds_version_and_tags() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/version"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "version": "0.4.1"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [
+                    { "name": "llama3:latest" },
+                    { "name": "nomic-embed-text:latest" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let result = detect_llm(&server.uri()).await;
+
+        assert!(result.reachable);
+        assert_eq!(result.version, Some("0.4.1".to_string()));
+        assert_eq!(
+            result.models,
+            vec!["llama3:latest", "nomic-embed-text:latest"]
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_llm_openai_compatible_only() {
+        let server = MockServer::start().await;
+        // No /api/version or /api/tags — only OpenAI-compatible /v1/models.
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [
+                    { "id": "mistral-7b" },
+                    { "id": "codellama-13b" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let result = detect_llm(&server.uri()).await;
+
+        assert!(result.reachable);
+        assert_eq!(result.version, None);
+        assert_eq!(result.models, vec!["mistral-7b", "codellama-13b"]);
+    }
+
+    #[tokio::test]
+    async fn detect_llm_nothing_responds_returns_unreachable() {
+        // Fixed always-refused port — avoids the parallel-test port-reuse race
+        // (see llm_runtime_fail_when_nothing_responds for the full rationale).
+        let result = detect_llm("http://127.0.0.1:1").await;
+
+        assert!(!result.reachable);
+        assert_eq!(result.version, None);
+        assert!(result.models.is_empty());
+    }
+
+    #[tokio::test]
+    async fn detect_llm_dedupes_overlapping_models_across_protocols() {
+        // The same server speaks BOTH Ollama (/api/version + /api/tags) and the
+        // OpenAI-compatible protocol (/v1/models), advertising an OVERLAPPING
+        // model name. The merged `models` must dedupe it to a single entry.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/version"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "version": "0.4.1"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [
+                    { "name": "llama3:latest" },
+                    { "name": "shared-model" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [
+                    { "id": "shared-model" },
+                    { "id": "mistral-7b" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let result = detect_llm(&server.uri()).await;
+
+        assert!(result.reachable);
+        assert_eq!(result.version, Some("0.4.1".to_string()));
+        // "shared-model" appears in BOTH protocols but only once in the merge,
+        // and the Ollama-first ordering is preserved.
+        assert_eq!(
+            result.models,
+            vec!["llama3:latest", "shared-model", "mistral-7b"]
+        );
+        // Defensively assert the dedupe: the overlapping name occurs exactly once.
+        assert_eq!(
+            result
+                .models
+                .iter()
+                .filter(|m| *m == "shared-model")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_llm_rejects_non_http_scheme() {
+        // A non-http(s) scheme must short-circuit to unreachable WITHOUT probing
+        // (SSRF defense-in-depth — see detect_llm's scheme allowlist).
+        let result = detect_llm("file:///etc/passwd").await;
+        assert!(!result.reachable);
+        assert_eq!(result.version, None);
+        assert!(result.models.is_empty());
+    }
+
+    /// Snapshot the exact serde wire-format of `LlmDetection`. Locks the FROZEN
+    /// IPC contract for the "Configure → Auto-detect" feature.
+    #[test]
+    fn llm_detection_serialized_shape() {
+        let result = LlmDetection {
+            reachable: true,
+            version: Some("0.4.1".to_string()),
+            models: vec!["llama3:latest".to_string()],
+        };
+        insta::assert_json_snapshot!(result, @r#"
+        {
+          "reachable": true,
+          "version": "0.4.1",
+          "models": [
+            "llama3:latest"
+          ]
+        }
+        "#);
     }
 }

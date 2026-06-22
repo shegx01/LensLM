@@ -8,6 +8,7 @@ import type { AppConfig } from './types.js';
 function fullConfig(theme: string): AppConfig {
   return {
     theme,
+    accent: 'purple',
     models: [
       {
         provider: 'ollama',
@@ -22,7 +23,8 @@ function fullConfig(theme: string): AppConfig {
     voices: { host: 'host-voice', guest: 'guest-voice' },
     paths: { data_dir: '/Users/x/Library/Application Support/Lens' },
     tier_thresholds: { tier1_token_cap: 4000, tier2_token_cap: 16000 },
-    onboarding_complete: true
+    onboarding_complete: true,
+    embedding_model: ''
   };
 }
 

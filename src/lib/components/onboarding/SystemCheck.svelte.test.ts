@@ -39,6 +39,13 @@ const ALL_PASS: CheckResult[] = [
     status: 'pass',
     detail: '~/Library/Application Support/Lens',
     action: null
+  },
+  {
+    id: 'text_to_speech',
+    label: 'Text-to-speech',
+    status: 'pending',
+    detail: 'Kokoro audio engine — download required',
+    action: 'choose'
   }
 ];
 
@@ -65,7 +72,7 @@ afterEach(() => {
 });
 
 describe('SystemCheck', () => {
-  it('renders the System check title and all rows from runSystemCheck', async () => {
+  it('renders the System check title and all six rows returned by runSystemCheck', async () => {
     mockIPC((cmd) => {
       if (cmd === 'run_system_check') return ALL_PASS;
     });
@@ -73,6 +80,8 @@ describe('SystemCheck', () => {
     expect(screen.getByText('System check')).toBeInTheDocument();
     await waitFor(() => expect(screen.getByText('Local backend')).toBeInTheDocument());
     expect(screen.getByText('Vector database')).toBeInTheDocument();
+    // The TTS row now comes from the backend (6th row), not synthesized by the UI.
+    expect(screen.getByText('Text-to-speech')).toBeInTheDocument();
   });
 
   it('enables Continue when no blocking check fails', async () => {
@@ -80,7 +89,7 @@ describe('SystemCheck', () => {
       if (cmd === 'run_system_check') return ALL_PASS;
     });
     render(SystemCheck, { props: { oncomplete: vi.fn() } });
-    const cont = screen.getByRole('button', { name: 'Continue' });
+    const cont = screen.getByRole('button', { name: 'Continue to setup' });
     await waitFor(() => expect(cont).not.toBeDisabled());
   });
 
@@ -90,7 +99,7 @@ describe('SystemCheck', () => {
     });
     render(SystemCheck, { props: { oncomplete: vi.fn() } });
     await waitFor(() => expect(screen.getByText('Disk permissions')).toBeInTheDocument());
-    expect(screen.getByRole('button', { name: 'Continue' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Continue to setup' })).toBeDisabled();
   });
 
   it('persists then calls oncomplete when Continue is clicked', async () => {
@@ -101,12 +110,14 @@ describe('SystemCheck', () => {
       if (cmd === 'get_config') {
         return {
           theme: 'dark',
+          accent: 'purple',
           models: [],
           endpoints: {},
           voices: { host: '', guest: '' },
           paths: { data_dir: '' },
           tier_thresholds: { tier1_token_cap: 4000, tier2_token_cap: 16000 },
-          onboarding_complete: false
+          onboarding_complete: false,
+          embedding_model: ''
         };
       }
       if (cmd === 'set_config') {
@@ -115,7 +126,7 @@ describe('SystemCheck', () => {
       }
     });
     render(SystemCheck, { props: { oncomplete } });
-    const cont = screen.getByRole('button', { name: 'Continue' });
+    const cont = screen.getByRole('button', { name: 'Continue to setup' });
     await waitFor(() => expect(cont).not.toBeDisabled());
     await fireEvent.click(cont);
     await waitFor(() => expect(oncomplete).toHaveBeenCalledOnce());
@@ -134,7 +145,7 @@ describe('SystemCheck', () => {
       if (cmd === 'get_config') throw new Error('disk full');
     });
     render(SystemCheck, { props: { oncomplete } });
-    const cont = screen.getByRole('button', { name: 'Continue' });
+    const cont = screen.getByRole('button', { name: 'Continue to setup' });
     await waitFor(() => expect(cont).not.toBeDisabled());
     await fireEvent.click(cont);
     await waitFor(() => expect(screen.getByText(/could not save your setup/i)).toBeInTheDocument());
@@ -149,20 +160,31 @@ describe('SystemCheck', () => {
     await waitFor(() =>
       expect(screen.getByText(/could not run the system check/i)).toBeInTheDocument()
     );
-    expect(screen.getByRole('button', { name: 'Continue' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Continue to setup' })).toBeDisabled();
   });
 
-  it('Retry re-runs the system check', async () => {
+  it('shows the "{ready} of {total} checks passed" summary (design footer)', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'run_system_check') return ALL_PASS;
+    });
+    render(SystemCheck, { props: { oncomplete: vi.fn() } });
+    // ALL_PASS (6 backend rows) = 3 pass (backend, llm, disk) + 3 pending
+    // (embedding, vector, text_to_speech) → 3 of 6.
+    await waitFor(() => expect(screen.getByText('3 of 6 checks passed')).toBeInTheDocument());
+  });
+
+  it("a failed row's Retry action re-runs the system check", async () => {
     let calls = 0;
     mockIPC((cmd) => {
       if (cmd === 'run_system_check') {
         calls += 1;
-        return ALL_PASS;
+        return withDiskFail();
       }
     });
     render(SystemCheck, { props: { oncomplete: vi.fn() } });
-    await waitFor(() => expect(screen.getByText('Local backend')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText('Disk permissions')).toBeInTheDocument());
     expect(calls).toBe(1);
+    // The design has NO footer Retry; re-check is the failed row's per-row action.
     await fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
     await waitFor(() => expect(calls).toBe(2));
   });
