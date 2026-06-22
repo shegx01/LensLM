@@ -85,8 +85,14 @@
   --red-bright: oklch(0.6613 0.1627 26.86); /* #e5645a — dark destructive */
   --red-strong: oklch(0.5771 0.2152 27.33); /* #dc2626 — light destructive */
 
-  /* --- Primitive (purple alt-variant; documented, NOT wired) --- */
-  --purple-600: oklch(0.4773 0.2225 286.79); /* #5d33d0 — retint proof only */
+  /* --- Primitive ramp (purple) --- */
+  --purple-500: oklch(0.5605 0.2201 286.79); /* #7c3aed-ish */
+  --purple-600: oklch(0.4773 0.2225 286.79); /* #5d33d0 */
+  --purple-fg: oklch(0.9725 0.012 286.8); /* near-white on purple */
+
+  /* --- Primitive (amber, warning) --- */
+  --amber-500: oklch(0.7686 0.1647 70.08); /* warning amber */
+  --amber-fg: oklch(0.2 0.05 70); /* text on amber */
 
   /* --- Alpha primitives (for border / input overlays) --- */
   --alpha-border: oklch(0 0 0 / 8%); /* black 8% — light mode border/sidebar-border */
@@ -172,6 +178,64 @@
   --surface-sunken: var(--neutral-950);
 }
 
+/* --- Accent token layer ---
+ * Overrides --primary / --ring / sidebar primaries per data-accent attribute.
+ * Default (no attribute or data-accent="purple") → purple.
+ * data-accent="green" → original brand green.
+ * data-accent="blue"  → blue variant.
+ * Set data-accent on <html> so everything beneath inherits. */
+
+:root,
+[data-accent='purple'] {
+  --primary: var(--purple-500);
+  --primary-foreground: var(--purple-fg);
+  --ring: var(--purple-500);
+  --sidebar-primary: var(--purple-500);
+  --sidebar-primary-foreground: var(--purple-fg);
+  --sidebar-ring: var(--purple-500);
+}
+
+.dark,
+.dark[data-accent='purple'],
+[data-accent='purple'] .dark {
+  --primary: var(--purple-600);
+  --primary-foreground: var(--purple-fg);
+  --ring: var(--purple-600);
+  --sidebar-primary: var(--purple-600);
+  --sidebar-primary-foreground: var(--purple-fg);
+  --sidebar-ring: var(--purple-600);
+}
+
+[data-accent='green'] {
+  --primary: var(--green-primary-aa);
+  --primary-foreground: var(--green-fg);
+  --ring: var(--green-primary-aa);
+  --sidebar-primary: var(--green-primary-aa);
+  --sidebar-primary-foreground: var(--green-fg);
+  --sidebar-ring: var(--green-primary-aa);
+}
+
+.dark[data-accent='green'],
+[data-accent='green'] .dark {
+  --primary: var(--green-primary);
+  --primary-foreground: var(--green-fg);
+  --ring: var(--green-primary);
+  --sidebar-primary: var(--green-primary);
+  --sidebar-primary-foreground: var(--green-fg);
+  --sidebar-ring: var(--green-primary);
+}
+
+[data-accent='blue'] {
+  --blue-500: oklch(0.6231 0.188 255.53);
+  --blue-fg: oklch(0.972 0.012 255);
+  --primary: var(--blue-500);
+  --primary-foreground: var(--blue-fg);
+  --ring: var(--blue-500);
+  --sidebar-primary: var(--blue-500);
+  --sidebar-primary-foreground: var(--blue-fg);
+  --sidebar-ring: var(--blue-500);
+}
+
 @theme inline {
   /* Proxima Nova with a system-stack fallback (used while woff2 swaps in / if a
    * weight is unavailable). Maps to the `font-sans` utility + the default body. */
@@ -215,6 +279,10 @@
   --color-sidebar-ring: var(--sidebar-ring);
   --color-surface-raised: var(--surface-raised);
   --color-surface-sunken: var(--surface-sunken);
+
+  /* Amber — expose as Tailwind color utility (text-amber-500, bg-amber-500/15, etc.) */
+  --color-amber-500: var(--amber-500);
+  --color-amber-fg: var(--amber-fg);
 }
 
 @layer base {

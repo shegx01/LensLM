@@ -145,6 +145,12 @@ export async function installTauriStub(
               // Default stub: not reachable (safe — no local server in CI).
               // Override via page.addInitScript if a test needs a reachable stub.
               return Promise.resolve({ reachable: false, version: null, models: [] });
+            case 'install_embedding_model':
+              return Promise.resolve(null);
+            case 'download_tts_engine':
+              return Promise.resolve(null);
+            case 'list_tts_voices':
+              return Promise.resolve([]);
             default:
               return Promise.resolve(null);
           }

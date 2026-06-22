@@ -10,6 +10,8 @@
   import { cn } from '$lib/utils.js';
   import type { CheckResult, CheckAction } from '$lib/onboarding/system-check.js';
   import LlmConfigPanel from './LlmConfigPanel.svelte';
+  import EmbeddingConfigPanel from './EmbeddingConfigPanel.svelte';
+  import TtsConfigPanel from './TtsConfigPanel.svelte';
 
   let {
     result,
@@ -18,15 +20,13 @@
   }: {
     result: CheckResult;
     onaction?: (action: CheckAction) => void;
-    /** Re-run the parent system check (for LLM configure panel's Save). */
+    /** Re-run the parent system check (for config panel's Save / Test). */
     oncheck?: () => Promise<void>;
   } = $props();
 
   // Status → icon-badge treatment. Pending is DELIBERATELY distinct from Pass
   // (plan change #13, HARD GATE): a muted/neutral clock on a muted surface with
   // muted-foreground text — never the green `text-primary`/`bg-primary` of Pass.
-  // This is load-bearing for the honesty thesis (pre-mortem #2): a future flip
-  // to green must be visually and test-detectable.
   const STATUS = {
     pass: {
       icon: Check,
@@ -45,49 +45,40 @@
     }
   } as const;
 
-  // Neutral fallback for any status outside the known union (defensive against a
-  // future/garbled IPC value): reuse the muted Pending treatment — NEVER the
-  // Pass green — and avoid an `undefined`-class crash. Sharing the Pending view
-  // is deliberate: an unknown status reads as "not affirmatively healthy".
+  // Neutral fallback for any status outside the known union.
   const FALLBACK_VIEW = STATUS.pending;
 
   const view = $derived(STATUS[result.status] ?? FALLBACK_VIEW);
   const StatusIcon = $derived(view.icon);
 
-  // Action button copy + icon (Configure/Choose carry a chevron like the design;
-  // Retry carries a refresh glyph).
   const ACTION_LABEL: Record<CheckAction, string> = {
     configure: 'Configure',
     choose: 'Choose',
     retry: 'Retry'
   };
 
-  // The `configure` action on the `llm_runtime` row is the ONLY expandable
-  // affordance in M1. All other actions (choose/retry) use the original
-  // behaviour. `choose` stays disabled (Available in Settings). `retry` is live.
-  const isExpandable = $derived(result.id === 'llm_runtime' && result.action === 'configure');
+  // Expandable rows:
+  //   llm_runtime  + configure → LlmConfigPanel
+  //   embedding_model + choose → EmbeddingConfigPanel
+  //   text_to_speech  + choose → TtsConfigPanel
+  const isExpandable = $derived(
+    (result.id === 'llm_runtime' && result.action === 'configure') ||
+      (result.id === 'embedding_model' && result.action === 'choose') ||
+      (result.id === 'text_to_speech' && result.action === 'choose')
+  );
 
-  // `configure`/`choose` open Settings, which is not built until a later
-  // milestone. For non-llm_runtime rows we render them DISABLED with an
-  // explanatory tooltip rather than shipping a button that silently does nothing.
-  // `retry` is live (it re-runs the check via the parent's `onaction`).
-  const isAvailable = (action: CheckAction): boolean =>
-    action === 'retry' || (action === 'configure' && isExpandable);
+  // `retry` is always live. Expandable rows are available (they expand inline).
+  // All other configure/choose actions are disabled (Settings not built yet).
+  const isAvailable = (action: CheckAction): boolean => action === 'retry' || isExpandable;
 
-  // Inline expand state — only meaningful when `isExpandable` is true.
   let expanded = $state(false);
 
   function toggleExpanded(): void {
     expanded = !expanded;
   }
 
-  // Attention rows (fail status OR a row with an action affordance) get a
-  // subtly stronger ring to match the design mock — token-based only.
-  // Pass/Pending rows keep the Card default (ring-foreground/10).
   const needsEmphasis = $derived(result.status === 'fail' || result.action !== null);
 
-  // The card switches from flex-row to flex-col when the panel is open so the
-  // expansion renders below the row header.
   const cardClass = $derived(
     cn(
       expanded ? 'flex-col items-stretch gap-0 px-4 py-3' : 'flex-row items-center gap-3 px-4 py-3',
@@ -148,11 +139,23 @@
     {/if}
   </div>
 
-  <!-- Inline LLM config panel — only renders when expanded -->
+  <!-- Inline expansion panels -->
   {#if isExpandable && expanded}
-    <LlmConfigPanel
-      oncheck={oncheck ?? (() => Promise.resolve())}
-      oncollapse={() => (expanded = false)}
-    />
+    {#if result.id === 'llm_runtime'}
+      <LlmConfigPanel
+        oncheck={oncheck ?? (() => Promise.resolve())}
+        oncollapse={() => (expanded = false)}
+      />
+    {:else if result.id === 'embedding_model'}
+      <EmbeddingConfigPanel
+        oncheck={oncheck ?? (() => Promise.resolve())}
+        oncollapse={() => (expanded = false)}
+      />
+    {:else if result.id === 'text_to_speech'}
+      <TtsConfigPanel
+        oncheck={oncheck ?? (() => Promise.resolve())}
+        oncollapse={() => (expanded = false)}
+      />
+    {/if}
   {/if}
 </Card>

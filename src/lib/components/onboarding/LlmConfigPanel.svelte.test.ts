@@ -133,11 +133,11 @@ describe('LlmConfigPanel — Auto-detect', () => {
 });
 
 // ──────────────────────────────────────────────────────────────────────────
-// Save — calls set_config with provider entry, then collapses
+// Local tab — "Test connection" saves config + probes endpoint
 // ──────────────────────────────────────────────────────────────────────────
 
-describe('LlmConfigPanel — Save', () => {
-  it('calls set_config with the ollama provider entry and collapses the panel', async () => {
+describe('LlmConfigPanel — Test connection (local tab)', () => {
+  it('calls set_config with the ollama provider entry and collapses when connection succeeds', async () => {
     const setConfig = vi.fn();
     const oncheck = vi.fn().mockResolvedValue(undefined);
 
@@ -147,16 +147,19 @@ describe('LlmConfigPanel — Save', () => {
         setConfig(args);
         return null;
       }
+      if (cmd === 'detect_llm') return { reachable: true, version: 'Ollama 0.3.2', models: [] };
     });
 
     render(SystemCheckRow, { props: { result: llmRow(), oncheck } });
 
     // Expand
     await fireEvent.click(screen.getByRole('button', { name: /configure/i }));
-    await waitFor(() => expect(screen.getByRole('button', { name: /save/i })).toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: /test connection/i })).toBeInTheDocument()
+    );
 
-    // Click Save
-    await fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    // Click Test connection
+    await fireEvent.click(screen.getByRole('button', { name: /test connection/i }));
 
     // set_config was called with the ollama entry
     await waitFor(() =>
@@ -176,15 +179,10 @@ describe('LlmConfigPanel — Save', () => {
     );
 
     // oncheck was called (re-run system check)
-    expect(oncheck).toHaveBeenCalledOnce();
-
-    // Panel collapses after save
-    await waitFor(() =>
-      expect(screen.queryByRole('tab', { name: /local/i })).not.toBeInTheDocument()
-    );
+    await waitFor(() => expect(oncheck).toHaveBeenCalledOnce());
   });
 
-  it('surfaces a save error inline and does NOT collapse on IPC failure', async () => {
+  it('surfaces a connection error inline and does NOT collapse on IPC failure', async () => {
     const oncheck = vi.fn().mockResolvedValue(undefined);
 
     mockIPC((cmd) => {
@@ -193,9 +191,11 @@ describe('LlmConfigPanel — Save', () => {
 
     render(SystemCheckRow, { props: { result: llmRow(), oncheck } });
     await fireEvent.click(screen.getByRole('button', { name: /configure/i }));
-    await waitFor(() => expect(screen.getByRole('button', { name: /save/i })).toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: /test connection/i })).toBeInTheDocument()
+    );
 
-    await fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    await fireEvent.click(screen.getByRole('button', { name: /test connection/i }));
 
     await waitFor(() => expect(screen.getByRole('alert')).toBeInTheDocument());
 
@@ -203,6 +203,36 @@ describe('LlmConfigPanel — Save', () => {
     expect(screen.getByRole('tab', { name: /local/i })).toBeInTheDocument();
   });
 
+  it('shows "Could not reach" message when endpoint is not reachable', async () => {
+    const oncheck = vi.fn().mockResolvedValue(undefined);
+
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return baseConfig();
+      if (cmd === 'set_config') return null;
+      if (cmd === 'detect_llm') return { reachable: false, version: null, models: [] };
+    });
+
+    render(SystemCheckRow, { props: { result: llmRow(), oncheck } });
+    await fireEvent.click(screen.getByRole('button', { name: /configure/i }));
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: /test connection/i })).toBeInTheDocument()
+    );
+
+    await fireEvent.click(screen.getByRole('button', { name: /test connection/i }));
+
+    await waitFor(() => expect(screen.getByRole('alert')).toBeInTheDocument());
+    expect(screen.getByRole('alert').textContent).toMatch(/could not reach/i);
+
+    // Panel stays open when not reachable
+    expect(screen.getByRole('tab', { name: /local/i })).toBeInTheDocument();
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// Cloud API tab — "Save" saves config + collapses
+// ──────────────────────────────────────────────────────────────────────────
+
+describe('LlmConfigPanel — Save (cloud tab)', () => {
   it('calls set_config with openai-compatible provider when Cloud API tab is active', async () => {
     const setConfig = vi.fn();
     const oncheck = vi.fn().mockResolvedValue(undefined);

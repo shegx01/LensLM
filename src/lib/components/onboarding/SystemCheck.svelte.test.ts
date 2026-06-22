@@ -65,7 +65,7 @@ afterEach(() => {
 });
 
 describe('SystemCheck', () => {
-  it('renders the System check title and all rows from runSystemCheck', async () => {
+  it('renders the System check title and all rows from runSystemCheck (+ synthetic TTS row)', async () => {
     mockIPC((cmd) => {
       if (cmd === 'run_system_check') return ALL_PASS;
     });
@@ -73,6 +73,8 @@ describe('SystemCheck', () => {
     expect(screen.getByText('System check')).toBeInTheDocument();
     await waitFor(() => expect(screen.getByText('Local backend')).toBeInTheDocument());
     expect(screen.getByText('Vector database')).toBeInTheDocument();
+    // Synthetic TTS row is always appended by the component
+    expect(screen.getByText('Text-to-speech')).toBeInTheDocument();
   });
 
   it('enables Continue when no blocking check fails', async () => {
@@ -157,8 +159,9 @@ describe('SystemCheck', () => {
       if (cmd === 'run_system_check') return ALL_PASS;
     });
     render(SystemCheck, { props: { oncomplete: vi.fn() } });
-    // ALL_PASS = 3 pass (backend, llm, disk) + 2 pending (embedding, vector) of 5.
-    await waitFor(() => expect(screen.getByText('3 of 5 checks passed')).toBeInTheDocument());
+    // ALL_PASS = 3 pass (backend, llm, disk) + 2 pending (embedding, vector) from IPC
+    // + 1 pending synthetic TTS row = 3 of 6 total.
+    await waitFor(() => expect(screen.getByText('3 of 6 checks passed')).toBeInTheDocument());
   });
 
   it("a failed row's Retry action re-runs the system check", async () => {

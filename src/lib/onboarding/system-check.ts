@@ -13,7 +13,8 @@ export type CheckId =
   | 'llm_runtime'
   | 'embedding_model'
   | 'vector_database'
-  | 'disk_permissions';
+  | 'disk_permissions'
+  | 'text_to_speech';
 
 export type CheckStatus = 'pass' | 'fail' | 'pending';
 
@@ -58,4 +59,97 @@ export async function detectLlm(baseUrl: string): Promise<LlmDetection> {
 export async function runSystemCheck(): Promise<CheckResult[]> {
   if (!isTauri()) return [];
   return invoke<CheckResult[]>('run_system_check');
+}
+
+// SYNC-CHECK: contract — Rust side to implement invoke('list_tts_voices')
+export interface TtsVoice {
+  id: string;
+  name: string;
+  gender: 'male' | 'female';
+}
+
+// SYNC-CHECK: contract — Rust side to implement invoke('download_tts_engine')
+// and invoke('install_embedding_model', { model: string })
+// These use streaming progress channels — UI polls a progress state.
+
+export type EmbeddingModelId = 'nomic-embed-text' | 'mxbai-embed-large' | 'all-minilm' | 'bge-m3';
+
+export interface EmbeddingModelSpec {
+  id: EmbeddingModelId;
+  name: string;
+  dims: number;
+  sizeMb: number;
+  speed: 'Very fast' | 'Fast' | 'Medium';
+  description: string;
+}
+
+export const EMBEDDING_MODELS: EmbeddingModelSpec[] = [
+  {
+    id: 'nomic-embed-text',
+    name: 'nomic-embed-text',
+    dims: 768,
+    sizeMb: 274,
+    speed: 'Fast',
+    description: 'Best general-purpose. Default recommendation.'
+  },
+  {
+    id: 'mxbai-embed-large',
+    name: 'mxbai-embed-large',
+    dims: 1024,
+    sizeMb: 670,
+    speed: 'Medium',
+    description: 'Higher accuracy, better semantic recall.'
+  },
+  {
+    id: 'all-minilm',
+    name: 'all-minilm',
+    dims: 384,
+    sizeMb: 46,
+    speed: 'Very fast',
+    description: 'Lightweight. Ideal for constrained environments.'
+  },
+  {
+    id: 'bge-m3',
+    name: 'bge-m3',
+    dims: 1024,
+    sizeMb: 1300,
+    speed: 'Medium',
+    description: 'Multilingual. Best for non-English content.'
+  }
+];
+
+/** Install an embedding model. Contract — Rust invoke to be implemented. */
+export async function installEmbeddingModel(
+  model: EmbeddingModelId,
+  onProgress: (pct: number) => void
+): Promise<void> {
+  if (!isTauri()) {
+    // Simulate progress in non-Tauri context for dev/test
+    for (let i = 0; i <= 100; i += 10) {
+      onProgress(i);
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    return;
+  }
+  // Real: invoke('install_embedding_model', { model }) with Channel progress
+  // For now stub — replace with Channel when Rust side is ready
+  await invoke<void>('install_embedding_model', { model });
+}
+
+/** Download TTS engine (Kokoro). Contract — Rust invoke to be implemented. */
+export async function downloadTtsEngine(onProgress: (pct: number) => void): Promise<void> {
+  if (!isTauri()) {
+    for (let i = 0; i <= 100; i += 10) {
+      onProgress(i);
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    return;
+  }
+  await invoke<void>('download_tts_engine');
+}
+
+/** List available TTS voices (Kokoro). Contract — Rust invoke to be implemented. */
+export async function listTtsVoices(): Promise<TtsVoice[]> {
+  if (!isTauri()) return [];
+  return invoke<TtsVoice[]>('list_tts_voices');
 }

@@ -3,53 +3,46 @@
   import LoaderCircle from '@lucide/svelte/icons/loader-circle';
   import ArrowRight from '@lucide/svelte/icons/arrow-right';
   import TriangleAlert from '@lucide/svelte/icons/triangle-alert';
-  import ScanSearch from '@lucide/svelte/icons/scan-search';
+  import Aperture from '@lucide/svelte/icons/aperture';
   import Sun from '@lucide/svelte/icons/sun';
   import Moon from '@lucide/svelte/icons/moon';
   import Monitor from '@lucide/svelte/icons/monitor';
-  import {
-    Card,
-    CardHeader,
-    CardTitle,
-    CardDescription,
-    CardContent,
-    CardFooter
-  } from '$lib/components/ui/card/index.js';
   import { Button } from '$lib/components/ui/button/index.js';
   import SystemCheckRow from '$lib/components/onboarding/SystemCheckRow.svelte';
   import {
     runSystemCheck,
     type CheckResult,
-    type CheckAction
+    type CheckAction,
+    type CheckId
   } from '$lib/onboarding/system-check.js';
   import { completeOnboarding } from '$lib/onboarding/completeOnboarding.js';
   import { setMode, userPrefersMode } from 'mode-watcher';
   import { persistTheme, type Mode } from '$lib/theme/index.js';
 
-  // The first-run system-check screen. State-based: the layout renders this
-  // (instead of the app) while onboarding is incomplete, and flips to the app
-  // when `oncomplete` fires AFTER the flag is durably persisted. No navigation.
   let { oncomplete }: { oncomplete: () => void } = $props();
+
+  // Synthetic TTS row added in the UI layer (Rust returns 5 rows, we add the 6th)
+  const TTS_ROW: CheckResult = {
+    id: 'text_to_speech' as CheckId,
+    label: 'Text-to-speech',
+    status: 'pending',
+    detail: 'Kokoro audio engine — download required',
+    action: 'choose'
+  };
 
   let results = $state<CheckResult[]>([]);
   let loading = $state(true);
   let finishing = $state(false);
-  // Inline error surfaces (no silent failure, no empty card with a live
-  // Continue): `checkError` when the probes themselves failed to run;
-  // `continueError` when persisting onboarding_complete failed.
   let checkError = $state<string | null>(null);
   let continueError = $state<string | null>(null);
 
-  // Continue is blocked ONLY when LocalBackend or DiskPermissions FAIL (plan
-  // change #12 / ADR decision #6). LLM `fail` warns-but-allows; any `pending`
-  // (embedding/vector) never blocks. A failed probe RUN also blocks Continue.
+  // Continue is blocked ONLY when local_backend or disk_permissions FAIL.
   const BLOCKING_IDS = ['local_backend', 'disk_permissions'] as const;
   const blocked = $derived(
     checkError !== null ||
       results.some((r) => (BLOCKING_IDS as readonly string[]).includes(r.id) && r.status === 'fail')
   );
 
-  // Footer summary, verbatim per the design: "{readyCount} of {totalCount} checks passed".
   const readyCount = $derived(results.filter((r) => r.status === 'pass').length);
   const totalCount = $derived(results.length);
 
@@ -57,10 +50,9 @@
     loading = true;
     checkError = null;
     try {
-      results = await runSystemCheck();
+      const raw = await runSystemCheck();
+      results = [...raw, TTS_ROW];
     } catch (err) {
-      // The probes failed to run at all: surface it inline and keep Continue
-      // blocked rather than presenting an empty card with a live button.
       console.error('SystemCheck: runSystemCheck failed', err);
       results = [];
       checkError = 'Could not run the system check. Please retry.';
@@ -73,8 +65,6 @@
     finishing = true;
     continueError = null;
     try {
-      // Persist the flag FIRST (RMW). Only on success do we hand control back to
-      // the layout, which flips to the app. On failure we stay on this screen.
       await completeOnboarding();
       oncomplete();
     } catch (err) {
@@ -85,16 +75,10 @@
     }
   }
 
-  // SystemCheckRow action affordances. `retry` re-runs the whole check. The
-  // `configure`/`choose` actions target Settings, which is not built until a
-  // later milestone — they are rendered disabled (see SystemCheckRow) so we
-  // never ship a dead, silently-no-op button.
   function handleAction(action: CheckAction): void {
     if (action === 'retry') void check();
   }
 
-  // Compact onboarding-local theme toggle: cycles light → dark → system.
-  // Keeps the shared ThemeSwitcher on /showcase untouched.
   const CYCLE: Mode[] = ['light', 'dark', 'system'];
   const CYCLE_ICON = { light: Sun, dark: Moon, system: Monitor } as const;
   const CYCLE_LABEL = { light: 'Light', dark: 'Dark', system: 'System' } as const;
@@ -127,20 +111,26 @@
   </Button>
 </div>
 
-<main class="flex min-h-svh items-center justify-center p-4">
-  <Card class="w-full max-w-lg">
-    <CardHeader class="items-center text-center">
+<main class="flex min-h-svh items-center justify-center p-6">
+  <div class="w-full max-w-lg flex flex-col gap-4">
+    <!-- Header -->
+    <div class="flex flex-col items-center text-center gap-3 pb-2">
       <div
-        class="bg-primary mx-auto mb-2 flex size-12 items-center justify-center rounded-2xl text-primary-foreground"
+        class="bg-primary flex size-14 items-center justify-center rounded-2xl text-primary-foreground shadow-lg"
         aria-hidden="true"
       >
-        <ScanSearch class="size-6" />
+        <Aperture class="size-7" />
       </div>
-      <CardTitle class="text-2xl">System check</CardTitle>
-      <CardDescription>Verifying your local intelligence engine before launch</CardDescription>
-    </CardHeader>
+      <div>
+        <h1 class="text-2xl font-bold text-foreground">System check</h1>
+        <p class="text-muted-foreground text-sm mt-1">
+          Verifying your local intelligence engine before launch
+        </p>
+      </div>
+    </div>
 
-    <CardContent class="flex flex-col gap-3">
+    <!-- Check rows -->
+    <div class="flex flex-col gap-2">
       {#if loading}
         <div
           class="text-muted-foreground flex items-center justify-center gap-2 py-12 text-sm"
@@ -162,9 +152,10 @@
           <SystemCheckRow {result} onaction={handleAction} oncheck={check} />
         {/each}
       {/if}
-    </CardContent>
+    </div>
 
-    <CardFooter class="flex flex-col gap-3 pt-2">
+    <!-- Boxed footer -->
+    <div class="border-border bg-card rounded-xl border p-4 flex flex-col gap-3">
       {#if continueError}
         <p class="text-destructive w-full text-center text-sm" role="alert">{continueError}</p>
       {/if}
@@ -181,6 +172,6 @@
         Continue to setup
         <ArrowRight />
       </Button>
-    </CardFooter>
-  </Card>
+    </div>
+  </div>
 </main>
