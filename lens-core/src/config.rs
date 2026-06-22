@@ -231,8 +231,10 @@ mod tests {
     #[test]
     fn explicit_accent_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let mut config = AppConfig::default();
-        config.accent = "emerald".to_string();
+        let config = AppConfig {
+            accent: "emerald".to_string(),
+            ..AppConfig::default()
+        };
         config.save(dir.path()).unwrap();
         let loaded = AppConfig::load(dir.path()).unwrap();
         assert_eq!(loaded.accent, "emerald");
