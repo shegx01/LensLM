@@ -494,21 +494,30 @@ fn has_cloud_tts(config: &AppConfig) -> bool {
 
 /// Probe 3 — text-to-speech readiness gate.
 ///
-/// PASSES when EITHER the local Kokoro ONNX model is on disk at
-/// `{data_dir}/models/kokoro/model_q8f16.onnx` (the exact path the downloader
-/// writes) OR a cloud TTS provider is configured (see [`has_cloud_tts`]).
+/// PASSES when the user has genuinely COMPLETED TTS setup, via EITHER arm:
+///
+/// - local: the Kokoro ONNX model is on disk at
+///   `{data_dir}/models/kokoro/model_q8f16.onnx` (the exact path the downloader
+///   writes) AND the user has saved both a host and a guest voice
+///   (`config.voices.host` / `config.voices.guest` non-empty). The model file
+///   alone is NOT enough — downloading the engine without choosing voices leaves
+///   TTS unconfigured, so the gate must still `Fail`; OR
+/// - cloud: a cloud TTS provider is configured (see [`has_cloud_tts`]).
+///
 /// Otherwise `Fail` with a `Choose` affordance.
 fn probe_text_to_speech(config: &AppConfig) -> CheckResult {
     let model_path = crate::tts::kokoro_model_path(Path::new(&config.paths.data_dir));
+    let kokoro_on_disk = model_path.is_file();
+    let voices_set = !config.voices.host.is_empty() && !config.voices.guest.is_empty();
 
-    let (status, detail) = if model_path.is_file() {
+    let (status, detail) = if kokoro_on_disk && voices_set {
         (CheckStatus::Pass, "Kokoro audio engine ready".to_string())
     } else if has_cloud_tts(config) {
         (CheckStatus::Pass, "Cloud voice configured".to_string())
     } else {
         (
             CheckStatus::Fail,
-            "No text-to-speech engine configured".to_string(),
+            "Download the engine and choose voices, or connect a cloud provider".to_string(),
         )
     };
 
@@ -861,6 +870,14 @@ mod tests {
         assert!(!is_allowlisted_embedding("llama3:latest", ""));
     }
 
+    /// Test helper: materialize the Kokoro model file at the exact path the
+    /// downloader writes, under `data_dir`.
+    fn write_kokoro_model(data_dir: &Path) {
+        let model_path = crate::tts::kokoro_model_path(data_dir);
+        std::fs::create_dir_all(model_path.parent().unwrap()).unwrap();
+        std::fs::write(&model_path, b"fake-onnx-bytes").unwrap();
+    }
+
     #[test]
     fn text_to_speech_fail_when_nothing_configured() {
         // A fresh data dir has no Kokoro model on disk + no cloud TTS ⇒ Fail.
@@ -872,23 +889,63 @@ mod tests {
         assert_eq!(result.id, CheckId::TextToSpeech);
         assert_eq!(result.status, CheckStatus::Fail);
         assert_eq!(result.action, Some(CheckAction::Choose));
-        assert_eq!(result.detail, "No text-to-speech engine configured");
+        assert_eq!(
+            result.detail,
+            "Download the engine and choose voices, or connect a cloud provider"
+        );
     }
 
     #[test]
-    fn text_to_speech_pass_when_model_present() {
-        // Materialize the model file at the exact path the downloader writes.
+    fn text_to_speech_fail_when_model_present_but_voices_empty() {
+        // The engine file alone does NOT satisfy the gate: without host/guest
+        // voices the user hasn't completed TTS setup, so it must Fail. This is
+        // the readiness-gate tightening — downloading without choosing voices.
         let dir = tempfile::tempdir().unwrap();
-        let model_path = crate::tts::kokoro_model_path(dir.path());
-        std::fs::create_dir_all(model_path.parent().unwrap()).unwrap();
-        std::fs::write(&model_path, b"fake-onnx-bytes").unwrap();
+        write_kokoro_model(dir.path());
 
         let mut config = AppConfig::default();
         config.paths.data_dir = dir.path().display().to_string();
+        // config.voices is empty by default.
+
+        let result = probe_text_to_speech(&config);
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert_eq!(
+            result.detail,
+            "Download the engine and choose voices, or connect a cloud provider"
+        );
+    }
+
+    #[test]
+    fn text_to_speech_pass_when_model_present_and_voices_set() {
+        // Engine on disk AND both voices saved ⇒ local TTS is genuinely ready.
+        let dir = tempfile::tempdir().unwrap();
+        write_kokoro_model(dir.path());
+
+        let mut config = AppConfig::default();
+        config.paths.data_dir = dir.path().display().to_string();
+        config.voices = crate::config::VoiceConfig {
+            host: "am_michael".to_string(),
+            guest: "af_heart".to_string(),
+        };
 
         let result = probe_text_to_speech(&config);
         assert_eq!(result.status, CheckStatus::Pass);
         assert_eq!(result.detail, "Kokoro audio engine ready");
+    }
+
+    #[test]
+    fn text_to_speech_fail_when_voices_set_but_model_absent() {
+        // Voices saved but the engine was never downloaded ⇒ still Fail.
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = AppConfig::default();
+        config.paths.data_dir = dir.path().display().to_string();
+        config.voices = crate::config::VoiceConfig {
+            host: "am_michael".to_string(),
+            guest: "af_heart".to_string(),
+        };
+
+        let result = probe_text_to_speech(&config);
+        assert_eq!(result.status, CheckStatus::Fail);
     }
 
     #[test]

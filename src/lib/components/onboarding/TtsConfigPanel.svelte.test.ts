@@ -142,6 +142,34 @@ describe('TtsConfigPanel — cloud (ElevenLabs)', () => {
     expect(save).not.toBeDisabled();
   });
 
+  it('masks a previously-saved ElevenLabs key: Save disabled initially, enabled after editing', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') {
+        const cfg = baseConfig();
+        return { ...cfg, tts: { provider: 'elevenlabs', api_key: 'sk-saved-eleven' } };
+      }
+      if (cmd === 'set_config') return null;
+    });
+
+    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+    await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
+
+    const keyField = screen.getByLabelText(/api key/i);
+    const save = screen.getByRole('button', { name: /^save$/i });
+
+    // Real key kept out of the DOM; masked placeholder shown.
+    await waitFor(() => expect(keyField).toHaveValue(''));
+    expect(keyField).not.toHaveValue('sk-saved-eleven');
+    expect(keyField).toHaveAttribute('placeholder', expect.stringMatching(/saved/i));
+
+    // Save disabled until the user edits the key.
+    expect(save).toBeDisabled();
+
+    await fireEvent.focus(keyField);
+    await fireEvent.input(keyField, { target: { value: 'sk-new-eleven' } });
+    expect(save).not.toBeDisabled();
+  });
+
   it('surfaces an inline error and does NOT collapse when the save fails', async () => {
     const oncheck = vi.fn().mockResolvedValue(undefined);
     const oncollapse = vi.fn();
@@ -156,5 +184,26 @@ describe('TtsConfigPanel — cloud (ElevenLabs)', () => {
 
     await waitFor(() => expect(screen.getByRole('alert')).toBeInTheDocument());
     expect(oncollapse).not.toHaveBeenCalled();
+  });
+});
+
+describe('TtsConfigPanel — local engine detection', () => {
+  it('skips the download step and shows voices when Kokoro is already on disk', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config')
+        return { ...baseConfig(), voices: { host: 'am_michael', guest: 'af_heart' } };
+      if (cmd === 'kokoro_downloaded') return true;
+      if (cmd === 'list_tts_voices')
+        return [
+          { id: 'am_michael', name: 'Michael', gender: 'male' },
+          { id: 'af_heart', name: 'Heart', gender: 'female' }
+        ];
+    });
+
+    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+
+    // Engine detected on disk → voice selectors render; no "Download Kokoro".
+    await waitFor(() => expect(screen.getByText(/kokoro engine ready/i)).toBeInTheDocument());
+    expect(screen.queryByRole('button', { name: /download kokoro/i })).not.toBeInTheDocument();
   });
 });

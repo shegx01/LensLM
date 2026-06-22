@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
+  import { invoke, isTauri } from '@tauri-apps/api/core';
   import { Input } from '$lib/components/ui/input/index.js';
   import { Button } from '$lib/components/ui/button/index.js';
   import { cn } from '$lib/utils.js';
@@ -8,9 +10,11 @@
   import {
     downloadTtsEngine,
     listTtsVoices,
+    kokoroDownloaded,
     saveTtsProvider,
     type TtsVoice
   } from '$lib/onboarding/system-check.js';
+  import type { AppConfig } from '$lib/theme/types.js';
   import { SELECT_CLASS } from './styles.js';
   import { updateConfig } from '$lib/config.js';
 
@@ -47,6 +51,53 @@
   let cloudApiKey = $state('');
   let savingCloud = $state(false);
   let cloudError = $state<string | null>(null);
+
+  // --- Saved cloud key masking ---
+  // A previously-saved ElevenLabs key is masked, never loaded into the DOM. Save
+  // stays disabled until the user clicks the field to enter a fresh key.
+  let hasSavedKey = $state(false);
+  let editingKey = $state(false);
+
+  // Gate is behaviorally identical to LlmConfigPanel's cloud Save. When NOT
+  // configured (`hasSavedKey` false), the button enables as soon as a non-empty
+  // key is typed and is disabled only while the field is empty. When a key IS
+  // saved, masking engages and re-entry of a fresh non-empty key is required.
+  const cloudSaveDisabled = $derived(
+    savingCloud || (hasSavedKey ? !editingKey || !cloudApiKey.trim() : !cloudApiKey.trim())
+  );
+
+  // On mount, detect a saved ElevenLabs config and mask its key.
+  onMount(async () => {
+    if (!isTauri()) return;
+    try {
+      const cfg = await invoke<AppConfig>('get_config');
+      if (cfg.tts?.provider === 'elevenlabs' && cfg.tts.api_key.trim() !== '') {
+        hasSavedKey = true;
+        cloudApiKey = '';
+      }
+      // If Kokoro is already on disk, skip the download step and go straight to
+      // voice selection — pre-filled from any previously saved host/guest voices.
+      // (The download detection wasn't propagating before: the panel always
+      // showed "Download Kokoro" even when the engine was installed.)
+      if (await kokoroDownloaded()) {
+        downloaded = true;
+        voices = await listTtsVoices();
+        voicesUnavailable = voices.length === 0;
+        maleVoice = cfg.voices?.host || maleVoices[0]?.id || '';
+        femaleVoice = cfg.voices?.guest || femaleVoices[0]?.id || '';
+      }
+    } catch {
+      // Non-fatal: fall back to the default empty Cloud form / download prompt.
+    }
+  });
+
+  // Entering "editing" mode clears the masked field so the user types a fresh key.
+  function startEditingKey(): void {
+    if (hasSavedKey && !editingKey) {
+      editingKey = true;
+      cloudApiKey = '';
+    }
+  }
 
   async function handleDownload(): Promise<void> {
     downloadError = null;
@@ -275,20 +326,25 @@
         id="tts-cloud-key"
         type="password"
         bind:value={cloudApiKey}
-        placeholder="Paste API key…"
+        placeholder={hasSavedKey && !editingKey
+          ? '•••••••••• saved — click to replace'
+          : 'Paste API key…'}
         autocomplete="new-password"
+        onfocus={startEditingKey}
+        oninput={startEditingKey}
       />
+      {#if hasSavedKey && !editingKey}
+        <p class="text-muted-foreground text-[0.72rem] leading-relaxed">
+          A key is already saved. Click the field to replace it.
+        </p>
+      {/if}
     </div>
 
     {#if cloudError}
       <p class="text-destructive text-[0.75rem]" role="alert">{cloudError}</p>
     {/if}
 
-    <Button
-      class="h-10 w-full"
-      onclick={handleSaveCloud}
-      disabled={!cloudApiKey.trim() || savingCloud}
-    >
+    <Button class="h-10 w-full" onclick={handleSaveCloud} disabled={cloudSaveDisabled}>
       {savingCloud ? 'Saving…' : 'Save'}
     </Button>
   </div>

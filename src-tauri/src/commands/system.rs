@@ -142,6 +142,22 @@ pub async fn download_tts_engine(
     .await
 }
 
+/// Returns whether the Kokoro ONNX model is already on disk at
+/// `{app_data_dir}/models/kokoro/...`. Lets the TTS panel skip the download step
+/// and show voice selection when the engine is already installed, instead of
+/// always offering "Download Kokoro".
+///
+/// Invoked as `invoke("kokoro_downloaded")`.
+#[tracing::instrument(skip_all)]
+#[tauri::command]
+pub async fn kokoro_downloaded(app: tauri::AppHandle) -> Result<bool, LensError> {
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| LensError::Io(e.to_string()))?;
+    Ok(data_dir.join(lens_core::KOKORO_MODEL_RELPATH).is_file())
+}
+
 /// Demonstrator that exercises the streaming primitive end to end: emits
 /// `Started`, three `Progress` updates, then `Done` over the channel.
 ///

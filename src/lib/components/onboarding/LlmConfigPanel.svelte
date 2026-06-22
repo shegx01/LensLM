@@ -1,10 +1,13 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
+  import { invoke, isTauri } from '@tauri-apps/api/core';
   import { Input } from '$lib/components/ui/input/index.js';
   import { Button } from '$lib/components/ui/button/index.js';
   import LoaderCircle from '@lucide/svelte/icons/loader-circle';
   import { cn } from '$lib/utils.js';
   import { detectLlm } from '$lib/onboarding/system-check.js';
   import { saveLlmProvider, type LlmProviderTab } from '$lib/onboarding/llm-config.js';
+  import type { AppConfig } from '$lib/theme/types.js';
   import { SELECT_CLASS } from './styles.js';
 
   // Cloud config has no Context Window picker (it's Local-only), so cloud saves
@@ -45,6 +48,19 @@
   // --- Save state (cloud) ---
   let saving = $state(false);
   let saveError = $state<string | null>(null);
+
+  // --- Saved cloud key masking (per-provider) ---
+  // When a cloud config was previously saved with a non-empty key, we DON'T load
+  // the real key into the DOM. We mask it and disable Save until the user clicks
+  // the key field to enter a fresh key. `editingKey` flips on focus/input.
+  //
+  // The saved state is PER-PROVIDER: `savedProviderId` records which card the
+  // saved key belongs to (mapped by base_url on mount). `hasSavedKey` is then
+  // true ONLY when the currently-selected card is that saved one, so the masked
+  // /disabled treatment never bleeds onto other provider cards.
+  let savedProviderId = $state<string | null>(null);
+  let editingKey = $state(false);
+  const hasSavedKey = $derived(cloudProvider === savedProviderId);
 
   const CONTEXT_OPTIONS = [
     { label: '4K', value: 4096, helper: '~3,000 words. For very small models only.' },
@@ -175,11 +191,58 @@
     const p = CLOUD_PROVIDERS.find((p) => p.id === id)!;
     cloudBaseUrl = p.baseUrl;
     cloudModel = p.defaultModel;
+    // Switching cards starts clean: clear any typed/edited key. `hasSavedKey`
+    // recomputes from the derived (true only when `id` is the saved provider).
+    editingKey = false;
+    cloudApiKey = '';
   }
 
   const modelOptions = $derived(
     detectedModels.length > 0 ? detectedModels : localModel ? [localModel] : []
   );
+
+  // Behaviorally identical to TtsConfigPanel's gate. For the SAVED provider we
+  // require re-entry (a fresh non-empty key) since we never load the real key
+  // into the DOM; for any UNSAVED provider the button enables as soon as a
+  // non-empty key is typed and is disabled only while the field is empty.
+  const cloudSaveDisabled = $derived(
+    saving || (hasSavedKey ? !editingKey || !cloudApiKey.trim() : !cloudApiKey.trim())
+  );
+
+  // On mount, pre-fill the Cloud tab from a previously-saved openai-compatible
+  // config (provider/model) but keep the real api_key OUT of the DOM — we only
+  // record that a key exists so the field renders masked and Save stays disabled
+  // until the user re-enters one.
+  onMount(async () => {
+    if (!isTauri()) return;
+    try {
+      const cfg = await invoke<AppConfig>('get_config');
+      const saved = cfg.models?.find(
+        (m) => m.provider === 'openai-compatible' && m.api_key.trim() !== ''
+      );
+      if (!saved) return;
+      // Map the saved entry to a provider card by base_url. Only a recognized
+      // provider gets the per-provider saved/masked treatment; an unmatched
+      // base_url leaves every card in the normal (unsaved) entry state.
+      const match = CLOUD_PROVIDERS.find((p) => p.baseUrl === saved.base_url);
+      if (!match) return;
+      savedProviderId = match.id;
+      cloudProvider = match.id;
+      cloudBaseUrl = saved.base_url || match.baseUrl;
+      cloudModel = saved.model || match.defaultModel;
+      cloudApiKey = '';
+    } catch {
+      // Non-fatal: fall back to the default empty Cloud form.
+    }
+  });
+
+  // Entering "editing" mode clears the masked field so the user types a fresh key.
+  function startEditingKey(): void {
+    if (hasSavedKey && !editingKey) {
+      editingKey = true;
+      cloudApiKey = '';
+    }
+  }
 </script>
 
 <div class="pt-3">
@@ -327,6 +390,24 @@
           </button>
         {/each}
       </div>
+      <!-- Custom override: presets are shortcuts, but many models use sizes
+           outside the list (e.g. 2K, 64K). A value typed here takes priority. -->
+      <div class="mt-2 flex items-center gap-2">
+        <input
+          id="llm-context-custom"
+          type="number"
+          min="256"
+          step="256"
+          value={contextWindow}
+          oninput={(e) => {
+            const v = parseInt(e.currentTarget.value, 10);
+            if (Number.isFinite(v) && v > 0) contextWindow = v;
+          }}
+          aria-label="Custom context window in tokens"
+          class="border-input focus-visible:border-ring focus-visible:ring-ring/50 h-8 w-full rounded-lg border bg-transparent px-2.5 py-1 text-sm transition-colors outline-none focus-visible:ring-3"
+        />
+        <span class="text-muted-foreground shrink-0 text-[0.72rem]">tokens (custom)</span>
+      </div>
       {#if contextHelper}
         <p class="text-muted-foreground text-[0.72rem] leading-relaxed">{contextHelper}</p>
       {/if}
@@ -413,9 +494,18 @@
         id="llm-cloud-key"
         type="password"
         bind:value={cloudApiKey}
-        placeholder="Paste API key…"
+        placeholder={hasSavedKey && !editingKey
+          ? '•••••••••• saved — click to replace'
+          : 'Paste API key…'}
         autocomplete="new-password"
+        onfocus={startEditingKey}
+        oninput={startEditingKey}
       />
+      {#if hasSavedKey && !editingKey}
+        <p class="text-muted-foreground text-[0.72rem] leading-relaxed">
+          A key is already saved. Click the field to replace it.
+        </p>
+      {/if}
     </div>
 
     <!-- BASE URL -->
@@ -449,7 +539,7 @@
     {/if}
 
     <!-- Save button -->
-    <Button class="h-10 w-full" onclick={handleSave} disabled={saving}>
+    <Button class="h-10 w-full" onclick={handleSave} disabled={cloudSaveDisabled}>
       {saving ? 'Saving…' : 'Save'}
     </Button>
   </div>

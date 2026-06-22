@@ -190,6 +190,12 @@ export async function listTtsVoices(): Promise<TtsVoice[]> {
   return invoke<TtsVoice[]>('list_tts_voices');
 }
 
+/** Whether the Kokoro engine is already downloaded on disk (skip the download step). */
+export async function kokoroDownloaded(): Promise<boolean> {
+  if (!isTauri()) return false;
+  return invoke<boolean>('kokoro_downloaded');
+}
+
 // SYNC-CHECK: must match lens-core/src/config.rs TtsConfig.provider
 //
 // The only cloud TTS provider wired today. Kept a string union (not a bare

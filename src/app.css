@@ -296,6 +296,14 @@
   /* Amber — expose as Tailwind color utility (text-amber-500, bg-amber-500/15, etc.) */
   --color-amber-500: var(--amber-500);
   --color-amber-fg: var(--amber-fg);
+
+  /* Brand green — expose the primitives as Tailwind color utilities
+   * (border-green-primary, text-green-primary, bg-green-primary/10, etc.) so the
+   * "Active" embedding card can use the design-system green WITHOUT touching the
+   * accent-driven --primary (which retints to purple/blue). */
+  --color-green-primary: var(--green-primary);
+  --color-green-bright: var(--green-bright);
+  --color-green-fg: var(--green-fg);
 }
 
 @layer base {
