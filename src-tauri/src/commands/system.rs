@@ -1,8 +1,8 @@
 //! System / diagnostic commands.
 
 use lens_core::{
-    ALLOWED_EMBEDDING_MODELS, CheckResult, DownloadProgress, InstallProgress, LensEngine, LensError,
-    LlmDetection, TtsVoice,
+    ALLOWED_EMBEDDING_MODELS, CheckResult, DownloadProgress, InstallProgress, LensEngine,
+    LensError, LlmDetection, TtsVoice,
 };
 use serde::Serialize;
 use tauri::Manager;
