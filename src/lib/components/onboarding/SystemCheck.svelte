@@ -107,7 +107,10 @@
   <!-- Per design: the whole onboarding sits inside ONE outer card (540px,
        14px radius, soft shadow, 36/40/32 padding). The check rows are inner
        surface cards; the footer stays plain (not its own card). -->
-  <Card class="w-full max-w-[540px] gap-4 rounded-[14px] px-10 pt-9 pb-8 shadow-2xl ring-0">
+  <!-- Width chosen so the rows inside (card width − 2×px-10 padding) land at the
+       previous `lg` (512px) and the long descriptions don't truncate. -->
+  <div class="w-full max-w-[592px]">
+    <Card class="w-full gap-4 rounded-[14px] px-10 pt-9 pb-8 shadow-2xl ring-0">
     <!-- Header -->
     <div class="flex flex-col items-center text-center gap-3 pb-2">
       <div
@@ -168,5 +171,6 @@
         <ArrowRight />
       </Button>
     </div>
-  </Card>
+    </Card>
+  </div>
 </main>

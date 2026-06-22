@@ -47,7 +47,7 @@
   }
 </script>
 
-<div class="border-border mt-3 border-t pt-3 flex flex-col gap-3">
+<div class="pt-3 flex flex-col gap-3">
   <!-- Amber warning banner -->
   <div
     class="bg-amber-500/15 border border-amber-500/30 rounded-lg px-3 py-2.5 flex gap-2 items-start"

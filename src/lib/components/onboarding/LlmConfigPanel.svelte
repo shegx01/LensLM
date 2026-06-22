@@ -171,7 +171,7 @@
   );
 </script>
 
-<div class="border-border mt-3 border-t pt-3">
+<div class="pt-3">
   <!-- Segmented tabs: Local | Cloud API -->
   <div
     class="bg-muted flex w-full items-center rounded-lg p-0.5"

@@ -73,7 +73,7 @@
   }
 </script>
 
-<div class="border-border mt-3 border-t pt-3 flex flex-col gap-3">
+<div class="pt-3 flex flex-col gap-3">
   {#if !downloaded}
     <!-- Pre-download: show download button -->
     <div class="flex flex-col gap-2">
