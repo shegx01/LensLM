@@ -11,11 +11,10 @@
   import { Card } from '$lib/components/ui/card/index.js';
   import SystemCheckRow from '$lib/components/onboarding/SystemCheckRow.svelte';
   import { runSystemCheck, type CheckResult } from '$lib/onboarding/system-check.js';
-  import { completeOnboarding } from '$lib/onboarding/completeOnboarding.js';
   import { setMode, userPrefersMode } from 'mode-watcher';
   import { persistTheme, type Mode } from '$lib/theme/index.js';
 
-  let { oncomplete }: { oncomplete: () => void } = $props();
+  let { onadvance }: { onadvance: () => void } = $props();
 
   let results = $state<CheckResult[]>([]);
   let loading = $state(true);
@@ -50,14 +49,16 @@
     }
   }
 
+  // This screen no longer persists anything — it is the first of four steps and
+  // simply advances the layout's step machine. The finishing/continueError
+  // inline-error scaffolding is kept intact for any future per-step failure.
   async function handleContinue(): Promise<void> {
     finishing = true;
     continueError = null;
     try {
-      await completeOnboarding();
-      oncomplete();
+      onadvance();
     } catch (err) {
-      console.error('SystemCheck: completeOnboarding failed', err);
+      console.error('SystemCheck: advance failed', err);
       continueError = 'Could not save your setup. Please try again.';
     } finally {
       finishing = false;

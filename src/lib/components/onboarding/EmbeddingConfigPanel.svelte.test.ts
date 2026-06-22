@@ -2,22 +2,10 @@ import { render, screen, fireEvent, waitFor } from '@testing-library/svelte';
 import { mockIPC, clearMocks } from '@tauri-apps/api/mocks';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AppConfig } from '$lib/theme/types.js';
+import { baseAppConfig } from '$lib/test-fixtures.js';
 import EmbeddingConfigPanel from './EmbeddingConfigPanel.svelte';
 
-function baseConfig(): AppConfig {
-  return {
-    theme: 'dark',
-    accent: 'purple',
-    models: [],
-    endpoints: {},
-    voices: { host: '', guest: '' },
-    tts: { provider: '', api_key: '' },
-    paths: { data_dir: '' },
-    tier_thresholds: { tier1_token_cap: 4000, tier2_token_cap: 16000 },
-    onboarding_complete: false,
-    embedding_model: ''
-  };
-}
+const baseConfig = baseAppConfig;
 
 beforeEach(() => {
   (globalThis as { isTauri?: boolean }).isTauri = true;

@@ -95,9 +95,20 @@
   --blue-600: oklch(0.5418 0.1976 255.53); /* darker blue — dark-mode accent */
   --blue-fg: oklch(0.972 0.012 255); /* near-white on blue */
 
-  /* --- Primitive (amber, warning) --- */
-  --amber-500: oklch(0.7686 0.1647 70.08); /* warning amber */
-  --amber-fg: oklch(0.2 0.05 70); /* text on amber */
+  /* --- Primitive ramp (amber, warning + accent) --- */
+  --amber-500: oklch(0.7196 0.1663 60.32); /* #d97706 — light/base amber */
+  --amber-600: oklch(0.5963 0.1565 53.18); /* #b45309 — darker amber — dark-mode accent */
+  --amber-fg: oklch(1 0 0); /* white on amber */
+
+  /* --- Primitive ramp (rose) --- */
+  --rose-500: oklch(0.5882 0.2219 13.42); /* #e11d48 — light/base rose */
+  --rose-600: oklch(0.5087 0.2134 11.37); /* #be123c — darker rose — dark-mode accent */
+  --rose-fg: oklch(1 0 0); /* white on rose */
+
+  /* --- Primitive ramp (graphite) --- */
+  --graphite-500: oklch(0.4282 0.0096 277.03); /* #52525b — light/base graphite */
+  --graphite-600: oklch(0.3553 0.0089 280.12); /* #3f3f46 — darker graphite — dark-mode accent */
+  --graphite-fg: oklch(1 0 0); /* white on graphite */
 
   /* --- Alpha primitives (for border / input overlays) --- */
   --alpha-border: oklch(0 0 0 / 8%); /* black 8% — light mode border/sidebar-border */
@@ -186,8 +197,11 @@
 /* --- Accent token layer ---
  * Overrides --primary / --ring / sidebar primaries per data-accent attribute.
  * Default (no attribute or data-accent="purple") → purple.
- * data-accent="green" → original brand green.
- * data-accent="blue"  → blue variant.
+ * data-accent="green"    → original brand green.
+ * data-accent="blue"     → blue variant.
+ * data-accent="amber"    → amber variant.
+ * data-accent="rose"     → rose variant.
+ * data-accent="graphite" → graphite variant.
  * Set data-accent on <html> so everything beneath inherits. */
 
 :root,
@@ -247,6 +261,63 @@
   --sidebar-primary: var(--blue-600);
   --sidebar-primary-foreground: var(--blue-fg);
   --sidebar-ring: var(--blue-600);
+}
+
+[data-accent='amber'] {
+  --primary: var(--amber-500);
+  --primary-foreground: var(--amber-fg);
+  --ring: var(--amber-500);
+  --sidebar-primary: var(--amber-500);
+  --sidebar-primary-foreground: var(--amber-fg);
+  --sidebar-ring: var(--amber-500);
+}
+
+.dark[data-accent='amber'],
+[data-accent='amber'] .dark {
+  --primary: var(--amber-600);
+  --primary-foreground: var(--amber-fg);
+  --ring: var(--amber-600);
+  --sidebar-primary: var(--amber-600);
+  --sidebar-primary-foreground: var(--amber-fg);
+  --sidebar-ring: var(--amber-600);
+}
+
+[data-accent='rose'] {
+  --primary: var(--rose-500);
+  --primary-foreground: var(--rose-fg);
+  --ring: var(--rose-500);
+  --sidebar-primary: var(--rose-500);
+  --sidebar-primary-foreground: var(--rose-fg);
+  --sidebar-ring: var(--rose-500);
+}
+
+.dark[data-accent='rose'],
+[data-accent='rose'] .dark {
+  --primary: var(--rose-600);
+  --primary-foreground: var(--rose-fg);
+  --ring: var(--rose-600);
+  --sidebar-primary: var(--rose-600);
+  --sidebar-primary-foreground: var(--rose-fg);
+  --sidebar-ring: var(--rose-600);
+}
+
+[data-accent='graphite'] {
+  --primary: var(--graphite-500);
+  --primary-foreground: var(--graphite-fg);
+  --ring: var(--graphite-500);
+  --sidebar-primary: var(--graphite-500);
+  --sidebar-primary-foreground: var(--graphite-fg);
+  --sidebar-ring: var(--graphite-500);
+}
+
+.dark[data-accent='graphite'],
+[data-accent='graphite'] .dark {
+  --primary: var(--graphite-600);
+  --primary-foreground: var(--graphite-fg);
+  --ring: var(--graphite-600);
+  --sidebar-primary: var(--graphite-600);
+  --sidebar-primary-foreground: var(--graphite-fg);
+  --sidebar-ring: var(--graphite-600);
 }
 
 @theme inline {

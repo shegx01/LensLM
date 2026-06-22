@@ -28,6 +28,7 @@ export type TierThresholds = { tier1_token_cap: number; tier2_token_cap: number 
 export type AppConfig = {
   theme: string;
   accent: string;
+  user_name: string;
   models: ModelConfig[];
   endpoints: Record<string, string>;
   voices: VoiceConfig;
@@ -52,6 +53,7 @@ export function makeConfig(onboardingComplete: boolean): AppConfig {
   return {
     theme: 'dark',
     accent: 'purple',
+    user_name: '',
     models: [],
     endpoints: {},
     voices: { host: '', guest: '' },
@@ -164,6 +166,32 @@ export async function installTauriStub(
                 { id: 'af_heart', name: 'Heart', gender: 'female' },
                 { id: 'am_michael', name: 'Michael', gender: 'male' }
               ]);
+            case 'create_notebook':
+              // Notebook-shaped; the Create notebook screen reads `.id` into the
+              // draft. description/focus_mode are write-only in M1.
+              return Promise.resolve({
+                id: 'nb-e2e-1',
+                title: (args?.title as string) ?? '',
+                description: (args?.description as string | null) ?? null,
+                focus_mode: (args?.focusMode as string | null) ?? null,
+                created_at: '2026-01-01T00:00:00Z'
+              });
+            case 'add_source':
+              // Records-only source row (no ingestion).
+              return Promise.resolve({
+                id: 'src-e2e-1',
+                notebook_id: (args?.notebookId as string) ?? '',
+                kind: 'file',
+                title: (args?.title as string) ?? '',
+                status: 'pending',
+                locator: (args?.locator as string) ?? '',
+                selected: 1
+              });
+            case 'list_sources':
+              return Promise.resolve([]);
+            case 'list_recent_documents':
+              // Empty → the "Suggested from your library" section stays hidden.
+              return Promise.resolve([]);
             default:
               return Promise.resolve(null);
           }

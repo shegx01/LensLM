@@ -63,13 +63,16 @@ async fn migration_is_idempotent_second_run_is_noop() {
         .unwrap();
 
     assert_eq!(count_before, count_after);
-    assert_eq!(count_after, 1, "exactly one migration file applied");
+    assert_eq!(count_after, 2, "both migration files applied");
 }
 
 #[tokio::test]
 async fn notebook_id_is_stored_as_text_not_blob() {
     let engine = LensEngine::for_test().await;
-    let nb = engine.create_notebook("typeof check").await.unwrap();
+    let nb = engine
+        .create_notebook("typeof check", None, None)
+        .await
+        .unwrap();
     let pool = engine.pool().await;
 
     let kind: String = sqlx::query_scalar("SELECT typeof(id) FROM notebooks WHERE id = ?")
@@ -85,7 +88,7 @@ async fn chunk_parent_child_hierarchy() {
     let engine = LensEngine::for_test().await;
     let pool = engine.pool().await;
 
-    let nb = engine.create_notebook("hier").await.unwrap();
+    let nb = engine.create_notebook("hier", None, None).await.unwrap();
     let source_id = Uuid::now_v7().to_string();
     let now = chrono::Utc::now().to_rfc3339();
     sqlx::query(
@@ -153,7 +156,7 @@ async fn enrichment_json_round_trips_and_text_is_unchanged() {
     let engine = LensEngine::for_test().await;
     let pool = engine.pool().await;
 
-    let nb = engine.create_notebook("enrich").await.unwrap();
+    let nb = engine.create_notebook("enrich", None, None).await.unwrap();
     let source_id = Uuid::now_v7().to_string();
     let chunk_id = Uuid::now_v7().to_string();
     let now = chrono::Utc::now().to_rfc3339();
@@ -201,7 +204,7 @@ async fn enrichment_json_round_trips_and_text_is_unchanged() {
 async fn embedding_index_unique_constraint_rejects_duplicates() {
     let engine = LensEngine::for_test().await;
     let pool = engine.pool().await;
-    let nb = engine.create_notebook("embidx").await.unwrap();
+    let nb = engine.create_notebook("embidx", None, None).await.unwrap();
     let now = chrono::Utc::now().to_rfc3339();
 
     let insert = |id: String| {
@@ -243,7 +246,7 @@ async fn embedding_index_unique_constraint_rejects_duplicates() {
 async fn deleting_notebook_cascades_to_children() {
     let engine = LensEngine::for_test().await;
     let pool = engine.pool().await;
-    let nb = engine.create_notebook("cascade").await.unwrap();
+    let nb = engine.create_notebook("cascade", None, None).await.unwrap();
     let now = chrono::Utc::now().to_rfc3339();
 
     let source_id = Uuid::now_v7().to_string();
@@ -289,7 +292,7 @@ async fn cold_init_under_budget_on_empty_temp_db() {
     let engine = LensEngine::init(dir.path()).await.unwrap();
     let elapsed = start.elapsed();
     // Sanity: the engine works.
-    assert_eq!(engine.migration_count().await.unwrap(), 1);
+    assert_eq!(engine.migration_count().await.unwrap(), 2);
     // Generous smoke guard against accidentally-expensive migrations (e.g. a
     // future migration that scans/rewrites large tables on cold start). This is
     // NOT a tight perf benchmark — the wide 2s budget keeps it non-flaky on
@@ -327,4 +330,71 @@ async fn app_config_disk_round_trip_default_and_malformed() {
         matches!(err, lens_core::LensError::Parse(_)),
         "expected Parse, got {err:?}"
     );
+}
+
+#[tokio::test]
+async fn migration_0002_adds_notebook_personalize_columns() {
+    let engine = LensEngine::for_test().await;
+    let pool = engine.pool().await;
+    let rows = sqlx::query("PRAGMA table_info(notebooks)")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    let cols: HashSet<String> = rows
+        .into_iter()
+        .map(|r| r.get::<String, _>("name"))
+        .collect();
+    assert!(
+        cols.contains("description"),
+        "missing notebooks.description"
+    );
+    assert!(cols.contains("focus_mode"), "missing notebooks.focus_mode");
+}
+
+#[tokio::test]
+async fn create_notebook_persists_and_lists_personalize_fields() {
+    let engine = LensEngine::for_test().await;
+
+    // Fields default to None when not supplied.
+    let bare = engine.create_notebook("bare", None, None).await.unwrap();
+    assert_eq!(bare.description, None);
+    assert_eq!(bare.focus_mode, None);
+
+    // Fields round-trip through create + list.
+    let full = engine
+        .create_notebook("full", Some("a blurb"), Some("research"))
+        .await
+        .unwrap();
+    assert_eq!(full.description.as_deref(), Some("a blurb"));
+    assert_eq!(full.focus_mode.as_deref(), Some("research"));
+
+    let listed = engine.list_notebooks().await.unwrap();
+    let got = listed.iter().find(|n| n.id == full.id).unwrap();
+    assert_eq!(got.description.as_deref(), Some("a blurb"));
+    assert_eq!(got.focus_mode.as_deref(), Some("research"));
+}
+
+#[tokio::test]
+async fn add_source_inserts_pending_file_record_and_lists_scoped() {
+    let engine = LensEngine::for_test().await;
+    let nb = engine.create_notebook("nb", None, None).await.unwrap();
+    let other = engine.create_notebook("other", None, None).await.unwrap();
+
+    let src = engine
+        .add_source(&nb.id, "report.pdf", "/abs/report.pdf")
+        .await
+        .unwrap();
+    assert_eq!(src.kind, "file");
+    assert_eq!(src.status, "pending");
+    assert_eq!(src.title, "report.pdf");
+    assert_eq!(src.locator, "/abs/report.pdf");
+    assert_eq!(src.selected, 1);
+    assert_eq!(src.notebook_id, nb.id.to_string());
+
+    let listed = engine.list_sources(&nb.id).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, src.id);
+
+    // list_sources is scoped to its notebook.
+    assert!(engine.list_sources(&other.id).await.unwrap().is_empty());
 }

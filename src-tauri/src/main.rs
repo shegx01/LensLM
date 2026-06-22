@@ -17,6 +17,8 @@ fn main() {
         .init();
 
     tauri::Builder::default()
+        // Native file picker for the onboarding "Add sources" step.
+        .plugin(tauri_plugin_dialog::init())
         // Resolve the OS app-data dir, init the engine (open db + migrate +
         // load config) on it, and store the handle in Tauri managed state.
         .setup(|app| {
@@ -36,7 +38,10 @@ fn main() {
             commands::notebooks::create_notebook,
             commands::notebooks::rename_notebook,
             commands::notebooks::delete_notebook,
+            commands::notebooks::add_source,
+            commands::notebooks::list_sources,
             commands::system::health_check,
+            commands::system::list_recent_documents,
             commands::system::run_system_check,
             commands::system::detect_llm,
             commands::system::list_tts_voices,

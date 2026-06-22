@@ -2,31 +2,12 @@ import { mockIPC, clearMocks } from '@tauri-apps/api/mocks';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { persistTheme, __flushNow, setPersistErrorHandler, PERSIST_DEBOUNCE_MS } from './index.js';
 import type { AppConfig } from './types.js';
+import { fullAppConfig } from '$lib/test-fixtures.js';
 
 // A fully-populated AppConfig so tests can assert the WHOLE struct survives the
 // read-modify-write (only `.theme` should ever change).
 function fullConfig(theme: string): AppConfig {
-  return {
-    theme,
-    accent: 'purple',
-    models: [
-      {
-        provider: 'ollama',
-        base_url: 'http://localhost:11434/v1',
-        model: 'llama3.2:3b',
-        context: 8000,
-        temperature: 0.7,
-        api_key: 'secret-key'
-      }
-    ],
-    endpoints: { local: 'http://localhost:11434' },
-    voices: { host: 'host-voice', guest: 'guest-voice' },
-    tts: { provider: '', api_key: '' },
-    paths: { data_dir: '/Users/x/Library/Application Support/Lens' },
-    tier_thresholds: { tier1_token_cap: 4000, tier2_token_cap: 16000 },
-    onboarding_complete: true,
-    embedding_model: ''
-  };
+  return fullAppConfig({ theme });
 }
 
 beforeEach(() => {

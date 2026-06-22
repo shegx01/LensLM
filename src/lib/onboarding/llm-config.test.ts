@@ -2,13 +2,12 @@ import { mockIPC, clearMocks } from '@tauri-apps/api/mocks';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { saveLlmProvider } from './llm-config.js';
 import type { AppConfig } from '$lib/theme/types.js';
+import { baseAppConfig } from '$lib/test-fixtures.js';
 
 // A base AppConfig carrying an EXISTING ollama model entry so we can assert the
 // upsert REPLACES it (rather than appending a duplicate).
 function configWithOllama(): AppConfig {
-  return {
-    theme: 'dark',
-    accent: 'purple',
+  return baseAppConfig({
     models: [
       {
         provider: 'ollama',
@@ -18,15 +17,8 @@ function configWithOllama(): AppConfig {
         temperature: 0.5,
         api_key: 'stale'
       }
-    ],
-    endpoints: {},
-    voices: { host: '', guest: '' },
-    tts: { provider: '', api_key: '' },
-    paths: { data_dir: '' },
-    tier_thresholds: { tier1_token_cap: 4000, tier2_token_cap: 16000 },
-    onboarding_complete: false,
-    embedding_model: ''
-  };
+    ]
+  });
 }
 
 beforeEach(() => {
