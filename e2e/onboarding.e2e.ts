@@ -20,7 +20,7 @@ test('first run renders the System check screen and all three rows at /', async 
   await expect(page.getByText('Text-to-speech', { exact: true })).toBeVisible();
 });
 
-test('Continue persists onboarding_complete and swaps to the app (no URL change)', async ({
+test('Continue to setup advances to Make it yours WITHOUT completing onboarding', async ({
   page
 }) => {
   await installTauriStub(page, { onboardingComplete: false });
@@ -28,16 +28,45 @@ test('Continue persists onboarding_complete and swaps to the app (no URL change)
   await page.goto('/');
   await expect(page.getByText('System check', { exact: true })).toBeVisible();
 
-  const continueButton = page.getByRole('button', { name: 'Continue' });
-  await expect(continueButton).toBeEnabled();
-  await continueButton.click();
+  // "Continue to setup" now advances the step machine — it no longer persists
+  // onboarding_complete (that moves to the final step).
+  await page.getByRole('button', { name: 'Continue to setup' }).click();
 
-  // completeOnboarding() does a read-modify-write set_config with the flag flipped.
+  await expect(page.getByRole('heading', { name: 'Make it yours' })).toBeVisible();
+  await expect(page.getByText('System check', { exact: true })).toBeHidden();
+
+  // No completion write has happened yet.
+  const calls = await readSetConfigCalls(page);
+  expect(calls).not.toContainEqual(expect.objectContaining({ onboarding_complete: true }));
+});
+
+test('completes the full onboarding walk and swaps to the app (no URL change)', async ({
+  page
+}) => {
+  await installTauriStub(page, { onboardingComplete: false });
+
+  await page.goto('/');
+  await expect(page.getByText('System check', { exact: true })).toBeVisible();
+
+  // Step 1 → Make it yours
+  await page.getByRole('button', { name: 'Continue to setup' }).click();
+  await expect(page.getByRole('heading', { name: 'Make it yours' })).toBeVisible();
+  await page.getByPlaceholder('e.g. Jamie or jdoe').fill('Jamie'); // name is required
+  await page.getByRole('button', { name: 'Continue', exact: true }).click();
+
+  // Step 2 → Create notebook (accent defaults to purple, no selection needed)
+  await expect(page.getByRole('heading', { name: 'Create your first notebook' })).toBeVisible();
+  await page.getByPlaceholder('e.g. Q3 Earnings Research').fill('My Notebook');
+  await page.getByRole('button', { name: /next/i }).click();
+
+  // Step 3 → Add sources → Skip for now completes onboarding
+  await expect(page.getByRole('heading', { name: 'Add sources' })).toBeVisible();
+  await page.getByRole('button', { name: 'Skip for now' }).click();
+
+  // Completion persists onboarding_complete and the app renders in place.
   await expect
     .poll(() => readSetConfigCalls(page))
     .toContainEqual(expect.objectContaining({ onboarding_complete: true }));
-
-  // The onboarding screen disappears and the main app content renders in place.
   await expect(page.getByText('System check', { exact: true })).toBeHidden();
   await expect(page.getByRole('heading', { name: 'Hello World' })).toBeVisible();
 });
