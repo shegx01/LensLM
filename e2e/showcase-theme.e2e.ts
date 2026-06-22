@@ -1,11 +1,13 @@
 import { expect, test } from '@playwright/test';
+import { installTauriStub } from './helpers/tauri-stub';
 
-// Runs against the plain SvelteKit dev server (no Tauri runtime), so the durable
-// AppConfig persistence path is a no-op (isTauri() is false) — that path is
-// covered by the theme unit tests via mockIPC. Here we assert the live UI layer:
-// toggling persists to localStorage (mode-watcher) and survives a reload, which
-// is what the pre-paint app.html script reads to stay FOUC-free.
+// Asserts the live UI theme layer: toggling persists to localStorage (mode-watcher)
+// and survives a reload, which is what the pre-paint app.html script reads to stay
+// FOUC-free. We stub a RETURNING user (onboarding_complete: true) so the root gate
+// renders the routed children (/showcase) instead of failing open to the onboarding
+// SystemCheck screen.
 test('theme toggle on /showcase persists across reload', async ({ page }) => {
+  await installTauriStub(page, { onboardingComplete: true });
   await page.goto('/showcase');
 
   // Force a deterministic starting point, then pick dark.

@@ -1,10 +1,14 @@
 # ARCHITECTURAL INVARIANT: this crate MUST NOT depend on tauri, any windowing/UI
 # crate, or platform-specific GUI libraries. It is the pure, headless engine.
+# M1 EXPLICITLY extends its I/O scope (ADR-M1-001 decision #2) to permit a
+# pure-Rust outbound HTTP client (`reqwest` + `rustls-tls`) used solely for
+# local runtime detection (system-check probes). This widening is deliberate;
+# the no-tauri / no-windowing / no-GUI invariant above still holds in full.
 [package]
 name = "lens-core"
 version.workspace = true
 edition.workspace = true
-description = "LensLM headless engine — pure Rust, no Tauri/windowing/UI dependencies."
+description = "LensLM headless engine — pure Rust, no Tauri/windowing/UI dependencies; a pure-Rust outbound HTTP client (reqwest + rustls-tls) is permitted for local runtime detection."
 # Internal crate, not published to crates.io (no license chosen yet).
 publish = false
 
@@ -20,9 +24,20 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Outbound HTTP client for local runtime detection (system-check probes).
+# `rustls` (reqwest 0.13 renamed `rustls-tls` → `rustls`) keeps us off
+# OpenSSL/native-tls; `default-features = false` drops the default native-tls
+# stack. Pinned to the version already resolved in the lock tree (transitive via
+# Tauri) so no new copy is pulled in.
+reqwest = { version = "=0.13.4", default-features = false, features = [
+    "json",
+    "rustls",
+] }
 
 [dev-dependencies]
 rstest = { workspace = true }
 insta = { workspace = true }
 # Temp-dir DBs for integration tests that need real on-disk files / concurrency.
 tempfile = { workspace = true }
+# In-process HTTP mock server for the LLM/embedding runtime probe tests.
+wiremock = "0.6"

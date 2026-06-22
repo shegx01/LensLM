@@ -1,6 +1,6 @@
 //! System / diagnostic commands.
 
-use lens_core::{LensEngine, LensError};
+use lens_core::{CheckResult, LensEngine, LensError};
 use serde::Serialize;
 
 #[cfg(debug_assertions)]
@@ -27,6 +27,17 @@ pub async fn health_check(engine: tauri::State<'_, LensEngine>) -> Result<Health
         db_ok: true,
         migration_count,
     })
+}
+
+/// Runs all onboarding system probes (engine/DB health, LLM runtime,
+/// embedding model, vector database, disk permissions) and returns the
+/// ordered results for the system-check screen.
+#[tracing::instrument(skip_all)]
+#[tauri::command]
+pub async fn run_system_check(
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<Vec<CheckResult>, LensError> {
+    engine.run_system_check().await
 }
 
 /// Demonstrator that exercises the streaming primitive end to end: emits
@@ -56,6 +67,7 @@ pub async fn stream_demo(channel: Channel<StreamEvent<String>>) -> Result<(), Le
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lens_core::{CheckId, CheckStatus};
     #[cfg(debug_assertions)]
     use std::sync::{Arc, Mutex};
     use tauri::Manager;
@@ -72,6 +84,44 @@ mod tests {
         assert!(status.db_ok);
         // The single 0001_init migration is recorded.
         assert_eq!(status.migration_count, 1);
+    }
+
+    #[tokio::test]
+    async fn run_system_check_returns_five_ordered_checks() {
+        let app = tauri::test::mock_app();
+        app.manage(LensEngine::for_test().await);
+        let engine = app.state::<LensEngine>();
+
+        let checks = run_system_check(engine).await.unwrap();
+
+        // The fixed row order matches the design / engine contract.
+        let ids: Vec<CheckId> = checks.iter().map(|c| c.id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                CheckId::LocalBackend,
+                CheckId::LlmRuntime,
+                CheckId::EmbeddingModel,
+                CheckId::VectorDatabase,
+                CheckId::DiskPermissions,
+            ]
+        );
+
+        let status_of = |id: CheckId| checks.iter().find(|c| c.id == id).unwrap().status;
+
+        // Real probes that must pass in the test environment.
+        assert_eq!(status_of(CheckId::LocalBackend), CheckStatus::Pass);
+        assert_eq!(status_of(CheckId::DiskPermissions), CheckStatus::Pass);
+
+        // The LLM runtime probe is network-dependent; with no Ollama/LM Studio
+        // running it is `Fail`, but we only assert it resolved (not `Pending`)
+        // to stay robust if a runtime happens to be present on the host.
+        let llm = status_of(CheckId::LlmRuntime);
+        assert!(llm == CheckStatus::Fail || llm == CheckStatus::Pass);
+
+        // Embedding + vector are intentionally not wired yet.
+        assert_eq!(status_of(CheckId::EmbeddingModel), CheckStatus::Pending);
+        assert_eq!(status_of(CheckId::VectorDatabase), CheckStatus::Pending);
     }
 
     #[cfg(debug_assertions)]

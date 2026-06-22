@@ -44,11 +44,17 @@ function isValidMode(v: string): v is Mode {
  *
  * Guarded for `ssr=false` and tests-without-Tauri: if not running under Tauri,
  * this is a no-op and the localStorage/pre-paint hint remains the live state.
+ *
+ * Single-read boot (plan change #14): callers that already hold a fresh
+ * AppConfig (e.g. the `+layout` boot gate, which reads `get_config` ONCE to
+ * drive BOTH theme reconciliation AND the onboarding gate) pass it via `cfg` to
+ * skip the internal `get_config` — one IPC round-trip, no double read. When
+ * `cfg` is omitted the original behavior is preserved (own guarded read).
  */
-export async function loadThemeFromConfig(): Promise<void> {
+export async function loadThemeFromConfig(cfg?: AppConfig): Promise<void> {
   if (!isTauri()) return;
   try {
-    const config = await invoke<AppConfig>('get_config');
+    const config = cfg ?? (await invoke<AppConfig>('get_config'));
     const stored = config.theme;
     // `""`/`"system"` → let mode-watcher track the OS by setting "system".
     // Any unrecognised stored value (bad config) → fall back to "system".
