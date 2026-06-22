@@ -24,8 +24,8 @@ pub use system_check::{
     CheckAction, CheckId, CheckResult, CheckStatus, LlmDetection, detect_llm, ollama_base_url,
 };
 pub use tts::{
-    DownloadProgress, Gender, KOKORO_MODEL_RELPATH, KOKORO_MODEL_URL, TtsVoice,
-    download_kokoro_model, list_tts_voices,
+    DownloadProgress, Gender, KOKORO_MODEL_FILENAME, KOKORO_MODEL_RELPATH, KOKORO_MODEL_URL,
+    TtsVoice, download_kokoro_model, kokoro_model_path, list_tts_voices,
 };
 
 /// Re-exported so the integration-test crate can re-run the migrator against a

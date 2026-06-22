@@ -6,10 +6,11 @@
 //! routine that reports progress through a caller-supplied closure. The Tauri
 //! command layer adapts that closure onto a `tauri::ipc::Channel`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::LensError;
 
@@ -19,8 +20,37 @@ use crate::LensError;
 pub const KOKORO_MODEL_URL: &str =
     "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/onnx/model_q8f16.onnx";
 
+/// Bare filename of the Kokoro model on disk (the downloader writes this name).
+pub const KOKORO_MODEL_FILENAME: &str = "model_q8f16.onnx";
+
 /// Relative path (under the app data dir) the Kokoro model is written to.
 pub const KOKORO_MODEL_RELPATH: &str = "models/kokoro/model_q8f16.onnx";
+
+/// Expected SHA256 of `model_q8f16.onnx`, sourced from the HuggingFace LFS
+/// metadata (`lfs.oid`) for
+/// `onnx-community/Kokoro-82M-v1.0-ONNX:onnx/model_q8f16.onnx`. The Git-LFS
+/// `oid` IS the SHA256 of the file content, so it pins the exact bytes we expect
+/// to land on disk. Verified after the download completes (before the
+/// `.part → final` rename) to reject a corrupted or tampered transfer.
+const KOKORO_MODEL_SHA256: Option<&str> =
+    Some("04c658aec1b6008857c2ad10f8c589d4180d0ec427e7e6118ceb487e215c3cd0");
+
+/// Connect timeout for the Kokoro download client. The download itself can take
+/// minutes over a slow link (the model is ~86 MiB), so only the *connect* phase
+/// is bounded; the body stream has no overall deadline.
+const DOWNLOAD_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Resolves the on-disk path of the Kokoro model under `data_dir`.
+///
+/// Single source of truth shared by the system-check TTS probe (existence test)
+/// and any consumer that needs the model location, so the probe and the
+/// downloader can never disagree about where the file lives.
+pub fn kokoro_model_path(data_dir: &Path) -> PathBuf {
+    data_dir
+        .join("models")
+        .join("kokoro")
+        .join(KOKORO_MODEL_FILENAME)
+}
 
 /// Reads the `Content-Length` header as a `u64`, if present and parseable.
 ///
@@ -111,11 +141,33 @@ pub struct DownloadProgress {
 /// progress event is emitted. (A size mismatch — e.g. a truncated prior run —
 /// re-downloads.)
 ///
+/// On completion the downloaded bytes are verified against the pinned
+/// [`KOKORO_MODEL_SHA256`]; a mismatch deletes the partial file and returns a
+/// [`LensError::Network`].
+///
 /// `url` is a parameter rather than a hard-coded constant so tests can point it
 /// at a mock server; production passes [`KOKORO_MODEL_URL`].
 pub async fn download_kokoro_model<F>(
     url: &str,
     dest: &Path,
+    on_progress: F,
+) -> Result<(), LensError>
+where
+    F: FnMut(DownloadProgress),
+{
+    download_kokoro_model_verified(url, dest, KOKORO_MODEL_SHA256, on_progress).await
+}
+
+/// Implementation of [`download_kokoro_model`] with an injectable expected hash.
+///
+/// Separated so tests can exercise the integrity gate with mock-server bytes and
+/// a matching / mismatching hash, while production always passes the pinned
+/// [`KOKORO_MODEL_SHA256`]. When `expected_sha256` is `None`, verification is
+/// skipped entirely.
+async fn download_kokoro_model_verified<F>(
+    url: &str,
+    dest: &Path,
+    expected_sha256: Option<&str>,
     mut on_progress: F,
 ) -> Result<(), LensError>
 where
@@ -124,7 +176,15 @@ where
     // A HEAD probe gives us the expected size for the idempotency check without
     // streaming the (large) body. If the server doesn't support HEAD or omits
     // Content-Length, we fall through to a normal download.
-    let client = reqwest::Client::new();
+    //
+    // A `connect_timeout` bounds the connect phase so a dead/black-hole host
+    // fails fast instead of hanging the onboarding download. We deliberately do
+    // NOT set `redirect::Policy::none()`: HuggingFace `/resolve/` 302-redirects
+    // to a CDN, so the default redirect policy is required for the real download.
+    let client = reqwest::Client::builder()
+        .connect_timeout(DOWNLOAD_CONNECT_TIMEOUT)
+        .build()
+        .map_err(|e| LensError::Network(format!("download client init failed: {e}")))?;
 
     let expected_len = client
         .head(url)
@@ -147,6 +207,10 @@ where
         }
     }
 
+    // TODO(M2): disk-space pre-check — before streaming ~86 MiB, verify the
+    // target volume has enough free space and fail early with a clear error
+    // rather than mid-stream on ENOSPC. Deferred (needs a cross-platform
+    // free-space probe); tracked in the M1 onboarding review notes.
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| LensError::Io(format!("create {}: {e}", parent.display())))?;
@@ -168,16 +232,34 @@ where
     // Write to a temp file in the same dir, then atomically rename on success so
     // a partial download never masquerades as a complete model on disk.
     let tmp = dest.with_extension("part");
-    let mut file = std::fs::File::create(&tmp)
-        .map_err(|e| LensError::Io(format!("create {}: {e}", tmp.display())))?;
+    let mut file = match std::fs::File::create(&tmp) {
+        Ok(file) => file,
+        Err(e) => return Err(LensError::Io(format!("create {}: {e}", tmp.display()))),
+    };
 
+    // Hash the body as it streams so we can verify integrity without a second
+    // pass over the (large) file on disk.
     use std::io::Write;
+    let mut hasher = Sha256::new();
     let mut received: u64 = 0;
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| LensError::Network(format!("download stream error: {e}")))?;
-        file.write_all(&chunk)
-            .map_err(|e| LensError::Io(format!("write {}: {e}", tmp.display())))?;
+        // On ANY streaming/write error, drop the file handle and remove the
+        // `.part` so a truncated download never lingers on disk.
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(e) => {
+                drop(file);
+                let _ = std::fs::remove_file(&tmp);
+                return Err(LensError::Network(format!("download stream error: {e}")));
+            }
+        };
+        if let Err(e) = file.write_all(&chunk) {
+            drop(file);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(LensError::Io(format!("write {}: {e}", tmp.display())));
+        }
+        hasher.update(&chunk);
         received += chunk.len() as u64;
         on_progress(DownloadProgress {
             received,
@@ -185,12 +267,30 @@ where
             done: false,
         });
     }
-    file.flush()
-        .map_err(|e| LensError::Io(format!("flush {}: {e}", tmp.display())))?;
+    if let Err(e) = file.flush() {
+        drop(file);
+        let _ = std::fs::remove_file(&tmp);
+        return Err(LensError::Io(format!("flush {}: {e}", tmp.display())));
+    }
     drop(file);
 
-    std::fs::rename(&tmp, dest)
-        .map_err(|e| LensError::Io(format!("finalize {}: {e}", dest.display())))?;
+    // Integrity gate: compare the streamed digest to the pinned expected hash
+    // (when one is configured). A mismatch means a corrupted or tampered
+    // transfer — delete the `.part` and refuse to finalize.
+    if let Some(expected) = expected_sha256 {
+        let actual = hex_encode(&hasher.finalize());
+        if !actual.eq_ignore_ascii_case(expected) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(LensError::Network(format!(
+                "downloaded model failed integrity check: expected sha256 {expected}, got {actual}"
+            )));
+        }
+    }
+
+    if let Err(e) = std::fs::rename(&tmp, dest) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(LensError::Io(format!("finalize {}: {e}", dest.display())));
+    }
 
     on_progress(DownloadProgress {
         received,
@@ -198,6 +298,16 @@ where
         done: true,
     });
     Ok(())
+}
+
+/// Lowercase-hex encoding of a byte slice (for SHA256 digest comparison).
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 #[cfg(test)]
@@ -252,8 +362,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("models/kokoro/model_q8f16.onnx");
 
+        // Use the no-verification path: this test asserts the streaming/progress
+        // behavior, not the integrity gate (which has dedicated tests below).
         let mut events = Vec::new();
-        download_kokoro_model(&server.uri(), &dest, |p| events.push(p))
+        download_kokoro_model_verified(&server.uri(), &dest, None, |p| events.push(p))
             .await
             .unwrap();
 
@@ -322,5 +434,85 @@ mod tests {
         assert!(matches!(err, LensError::Network(_)));
         // No file left behind on failure.
         assert!(!dest.exists());
+    }
+
+    #[test]
+    fn kokoro_model_path_joins_under_data_dir() {
+        let path = kokoro_model_path(Path::new("/data"));
+        assert!(path.ends_with("models/kokoro/model_q8f16.onnx"));
+        // The probe and the relpath constant must agree on the filename.
+        assert!(KOKORO_MODEL_RELPATH.ends_with(KOKORO_MODEL_FILENAME));
+    }
+
+    #[test]
+    fn pinned_kokoro_sha256_is_present_and_well_formed() {
+        // The pinned hash must be a 64-char lowercase hex SHA256 digest, so a
+        // typo / placeholder can never silently disable the integrity gate.
+        let hash = KOKORO_MODEL_SHA256.expect("Kokoro model sha256 must be pinned");
+        assert_eq!(hash.len(), 64);
+        assert!(hash.bytes().all(|b| b.is_ascii_hexdigit()));
+    }
+
+    /// Helper: lowercase-hex SHA256 of `bytes`, matching the digest the download
+    /// path computes over the streamed body.
+    fn sha256_hex(bytes: &[u8]) -> String {
+        hex_encode(&Sha256::digest(bytes))
+    }
+
+    /// Serves known bytes from a mock server; with a MATCHING expected hash the
+    /// download succeeds and the file is finalized at `dest`.
+    #[tokio::test]
+    async fn download_succeeds_when_hash_matches() {
+        let body = vec![42u8; 4096];
+        let expected = sha256_hex(&body);
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(200).insert_header("content-length", "4096"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("models/kokoro/model_q8f16.onnx");
+
+        download_kokoro_model_verified(&server.uri(), &dest, Some(&expected), |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        // No leftover `.part` after a clean finalize.
+        assert!(!dest.with_extension("part").exists());
+    }
+
+    /// Serves known bytes that DO NOT match the expected hash: the download must
+    /// return a `Network` error, leave no finalized file, and clean up `.part`.
+    #[tokio::test]
+    async fn download_fails_and_cleans_up_when_hash_mismatches() {
+        let body = vec![42u8; 4096];
+        let wrong_hash = sha256_hex(b"some other content entirely");
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(200).insert_header("content-length", "4096"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("models/kokoro/model_q8f16.onnx");
+
+        let err = download_kokoro_model_verified(&server.uri(), &dest, Some(&wrong_hash), |_| {})
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, LensError::Network(_)));
+        // Integrity failure must not finalize the model and must remove `.part`.
+        assert!(!dest.exists());
+        assert!(!dest.with_extension("part").exists());
     }
 }
