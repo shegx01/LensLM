@@ -8,9 +8,7 @@
   import { Card } from '$lib/components/ui/card/index.js';
   import { Button } from '$lib/components/ui/button/index.js';
   import { cn } from '$lib/utils.js';
-  import { slide } from 'svelte/transition';
-  import { expoOut } from 'svelte/easing';
-  import { fadeRise } from '$lib/motion/index.js';
+  import { expandFade } from '$lib/motion/index.js';
   import type { CheckResult, CheckAction } from '$lib/onboarding/system-check.js';
   import LlmConfigPanel from './LlmConfigPanel.svelte';
   import EmbeddingConfigPanel from './EmbeddingConfigPanel.svelte';
@@ -145,28 +143,26 @@
   </div>
 
   <!-- Inline expansion panels: lazy-mounted, so collapsed content stays out of
-       the DOM + keyboard focus order (a11y). `slide` animates the height fluidly
-       on both open AND close; `fadeRise` adds a subtle motion fade on the content. -->
+       the DOM + keyboard focus order (a11y). One coordinated height+opacity
+       tween (expandFade) animates open AND close — no competing animations. -->
   {#if isExpandable && expanded}
-    <div transition:slide={{ duration: 280, easing: expoOut }}>
-      <div use:fadeRise={{ y: 4, duration: 0.3 }}>
-        {#if result.id === 'llm_runtime'}
-          <LlmConfigPanel
-            oncheck={oncheck ?? (() => Promise.resolve())}
-            oncollapse={() => (expanded = false)}
-          />
-        {:else if result.id === 'embedding_model'}
-          <EmbeddingConfigPanel
-            oncheck={oncheck ?? (() => Promise.resolve())}
-            oncollapse={() => (expanded = false)}
-          />
-        {:else if result.id === 'text_to_speech'}
-          <TtsConfigPanel
-            oncheck={oncheck ?? (() => Promise.resolve())}
-            oncollapse={() => (expanded = false)}
-          />
-        {/if}
-      </div>
+    <div transition:expandFade>
+      {#if result.id === 'llm_runtime'}
+        <LlmConfigPanel
+          oncheck={oncheck ?? (() => Promise.resolve())}
+          oncollapse={() => (expanded = false)}
+        />
+      {:else if result.id === 'embedding_model'}
+        <EmbeddingConfigPanel
+          oncheck={oncheck ?? (() => Promise.resolve())}
+          oncollapse={() => (expanded = false)}
+        />
+      {:else if result.id === 'text_to_speech'}
+        <TtsConfigPanel
+          oncheck={oncheck ?? (() => Promise.resolve())}
+          oncollapse={() => (expanded = false)}
+        />
+      {/if}
     </div>
   {/if}
 </Card>

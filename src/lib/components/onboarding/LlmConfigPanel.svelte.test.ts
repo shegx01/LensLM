@@ -357,4 +357,49 @@ describe('LlmConfigPanel — Save (cloud tab)', () => {
       )
     );
   });
+
+  it('forwards a custom model id entered in the Cloud Model field', async () => {
+    const setConfig = vi.fn();
+    const oncheck = vi.fn().mockResolvedValue(undefined);
+
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return baseConfig();
+      if (cmd === 'set_config') {
+        setConfig(args);
+        return null;
+      }
+    });
+
+    render(SystemCheckRow, { props: { result: llmRow(), oncheck } });
+
+    // Expand and switch to the Cloud API tab.
+    await fireEvent.click(screen.getByRole('button', { name: /configure/i }));
+    await waitFor(() =>
+      expect(screen.getByRole('tab', { name: /cloud api/i })).toBeInTheDocument()
+    );
+    await fireEvent.click(screen.getByRole('tab', { name: /cloud api/i }));
+
+    // Override the seeded default with a model the app shipped without. (Both the
+    // Local and Cloud panels label a field "Model", so target the cloud input.)
+    const modelField = screen.getByLabelText('Model', { selector: '#llm-cloud-model' });
+    await fireEvent.input(modelField, { target: { value: 'gpt-5-turbo' } });
+
+    await fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+    // The user's model id must reach set_config, not the hardcoded default.
+    await waitFor(() =>
+      expect(setConfig).toHaveBeenCalledWith(
+        expect.objectContaining({
+          config: expect.objectContaining({
+            models: expect.arrayContaining([
+              expect.objectContaining({
+                provider: 'openai-compatible',
+                model: 'gpt-5-turbo'
+              })
+            ])
+          })
+        })
+      )
+    );
+  });
 });

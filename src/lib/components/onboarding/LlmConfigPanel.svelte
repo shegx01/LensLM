@@ -38,6 +38,9 @@
   let cloudProvider = $state<'openai' | 'anthropic' | 'google'>('openai');
   let cloudBaseUrl = $state('https://api.openai.com/v1');
   let cloudApiKey = $state('');
+  // User-editable model id (seeded from the provider default, like the Local
+  // tab's model field). 'gpt-4o' matches the initial 'openai' provider.
+  let cloudModel = $state('gpt-4o');
 
   // --- Save state (cloud) ---
   let saving = $state(false);
@@ -59,25 +62,29 @@
     }
   ] as const;
 
+  // `models` is the card subtitle only — keep it a generic family name (not
+  // specific versions like "GPT-4o") so we don't have to ship a UI update every
+  // time a provider releases a new model. `defaultModel` is the actual id sent
+  // to the API and can be refined independently.
   const CLOUD_PROVIDERS = [
     {
       id: 'openai' as const,
       name: 'OpenAI',
-      models: 'GPT-4o, GPT-4',
+      models: 'GPT Models',
       defaultModel: 'gpt-4o',
       baseUrl: 'https://api.openai.com/v1'
     },
     {
       id: 'anthropic' as const,
       name: 'Anthropic',
-      models: 'Claude 3.5',
+      models: 'Claude Models',
       defaultModel: 'claude-3-5-sonnet-latest',
       baseUrl: 'https://api.anthropic.com/v1'
     },
     {
       id: 'google' as const,
       name: 'Google',
-      models: 'Gemini 1.5',
+      models: 'Gemini Models',
       defaultModel: 'gemini-1.5-pro',
       baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai'
     }
@@ -86,6 +93,8 @@
   const contextHelper = $derived(
     CONTEXT_OPTIONS.find((o) => o.value === contextWindow)?.helper ?? ''
   );
+
+  const selectedProvider = $derived(CLOUD_PROVIDERS.find((p) => p.id === cloudProvider)!);
 
   // Auto-detect: probe the current endpoint and populate the model list.
   async function handleAutoDetect(): Promise<void> {
@@ -147,7 +156,8 @@
       await saveLlmProvider({
         provider: 'openai-compatible',
         base_url: cloudBaseUrl || provider.baseUrl,
-        model: provider.defaultModel,
+        // User's chosen model id; fall back to the provider default if cleared.
+        model: cloudModel.trim() || provider.defaultModel,
         api_key: cloudApiKey,
         context: CLOUD_DEFAULT_CONTEXT
       });
@@ -164,6 +174,7 @@
     cloudProvider = id;
     const p = CLOUD_PROVIDERS.find((p) => p.id === id)!;
     cloudBaseUrl = p.baseUrl;
+    cloudModel = p.defaultModel;
   }
 
   const modelOptions = $derived(
@@ -366,6 +377,28 @@
           <p class="text-[0.7rem] text-muted-foreground mt-0.5">{provider.models}</p>
         </button>
       {/each}
+    </div>
+
+    <!-- MODEL -->
+    <div class="flex flex-col gap-1.5">
+      <label
+        for="llm-cloud-model"
+        class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase"
+      >
+        Model
+      </label>
+      <Input
+        id="llm-cloud-model"
+        type="text"
+        bind:value={cloudModel}
+        placeholder={selectedProvider.defaultModel}
+        autocomplete="off"
+        spellcheck={false}
+      />
+      <p class="text-muted-foreground text-[0.72rem] leading-relaxed">
+        The exact model id to use (e.g. {selectedProvider.defaultModel}). Enter any model your
+        provider supports — no need to wait for an app update when a new one ships.
+      </p>
     </div>
 
     <!-- API KEY -->

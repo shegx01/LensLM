@@ -1,14 +1,18 @@
-// Project motion primitives, built on the `motion` engine (framer-motion's
-// vanilla `animate`/`inView`). We use the imperative API via Svelte actions
-// rather than the declarative `<motion.div>` wrapper, because that wrapper
-// ships uncompiled TS `.svelte` files that our Vite 8 / rolldown bundler can't
-// process. The actions below give the same fade/rise/stagger entrances and
-// build cleanly.
+// Project animation toolkit. Two kinds of primitive live here:
+//   • Svelte actions built on the `motion` engine (framer-motion's vanilla
+//     `animate`/`inView`) — for mount/scroll entrances on persistent elements.
+//     We use the imperative API, not the `<motion.div>` wrapper, because that
+//     wrapper ships uncompiled TS `.svelte` files our Vite 8 / rolldown bundler
+//     can't process.
+//   • Svelte transitions — for conditionally-rendered ({#if}) content, where a
+//     single coordinated tween (and proper outro-before-unmount) matters.
 //
-// SYNC-CHECK: keep params here in sync with any callers (see usages of
-// `use:fadeRise`). Add new shared transitions to this module, not inline.
+// SYNC-CHECK: add new shared transitions/actions here, never inline in a
+// component, so timing/easing stays consistent across the app.
 
 import type { Action } from 'svelte/action';
+import type { TransitionConfig } from 'svelte/transition';
+import { cubicOut } from 'svelte/easing';
 import { animate, inView } from 'motion';
 
 const REDUCE_MOTION_QUERY = '(prefers-reduced-motion: reduce)';
@@ -84,3 +88,39 @@ export const fadeRise: Action<HTMLElement, FadeRiseParams | undefined> = (
     }
   };
 };
+
+export interface ExpandFadeParams {
+  /** Duration in ms. Default 300. */
+  duration?: number;
+  /** Easing function. Default cubicOut (smooth decelerate, no flat tail). */
+  easing?: (t: number) => number;
+}
+
+/**
+ * Svelte transition for conditionally-rendered ({#if}) content: expand/collapse
+ * by animating height AND opacity in ONE coordinated tween. Doing both in a
+ * single transition (rather than a height `slide` + a separate opacity action)
+ * is what makes it smooth — there are no competing animations on nested nodes
+ * to desync. Lazy-mounted, so collapsed content stays out of the DOM + focus
+ * order (a11y). Honors the OS "reduce motion" setting (snaps, no animation).
+ *
+ *   {#if open}
+ *     <div transition:expandFade>…panel…</div>
+ *   {/if}
+ */
+export function expandFade(
+  node: HTMLElement,
+  { duration = 300, easing = cubicOut }: ExpandFadeParams = {}
+): TransitionConfig {
+  if (prefersReducedMotion()) return { duration: 0 };
+
+  const height = node.scrollHeight;
+  // Opacity reaches full a little before height does, so the content is solid
+  // as the panel finishes opening (and clears early as it closes).
+  return {
+    duration,
+    easing,
+    css: (t) =>
+      `overflow: hidden; height: ${t * height}px; opacity: ${Math.min(1, t * 1.4)};`
+  };
+}
