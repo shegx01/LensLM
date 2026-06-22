@@ -15,7 +15,9 @@
         "title": "LensLM",
         "label": "main",
         "width": 1024,
-        "height": 768
+        "height": 1024,
+        "minWidth": 725,
+        "minHeight": 725
       }
     ],
     "security": {
