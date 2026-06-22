@@ -5,10 +5,10 @@ import type { CheckResult } from '$lib/onboarding/system-check.js';
 
 function row(over: Partial<CheckResult>): CheckResult {
   return {
-    id: 'local_backend',
-    label: 'Local backend',
+    id: 'llm_runtime',
+    label: 'LLM runtime',
     status: 'pass',
-    detail: 'In-process engine ready',
+    detail: 'Ollama 0.3.2 detected',
     action: null,
     ...over
   };
@@ -24,7 +24,7 @@ function badge(container: HTMLElement): HTMLElement {
 describe('SystemCheckRow', () => {
   it('renders a Pass row with the green primary badge treatment', () => {
     const { container } = render(SystemCheckRow, { props: { result: row({ status: 'pass' }) } });
-    expect(screen.getByText('Local backend')).toBeInTheDocument();
+    expect(screen.getByText('LLM runtime')).toBeInTheDocument();
     const b = badge(container);
     expect(b.className).toContain('text-primary');
     expect(b.className).toContain('bg-primary/15');
@@ -47,43 +47,14 @@ describe('SystemCheckRow', () => {
     expect(screen.getByRole('button', { name: /choose/i })).toBeInTheDocument();
   });
 
-  it('renders a Pending row visually DISTINCT from Pass (muted, not green)', () => {
-    const { container } = render(SystemCheckRow, {
-      props: {
-        result: row({
-          id: 'vector_database',
-          label: 'Vector database',
-          status: 'pending',
-          detail: 'Built-in · set up automatically when you add your first source',
-          action: null
-        })
-      }
-    });
-    const b = badge(container);
-    // HARD REQUIREMENT (plan change #13): Pending must NOT use the Pass treatment.
-    expect(b.className).not.toContain('text-primary');
-    expect(b.className).not.toContain('bg-primary');
-    // It uses the muted/neutral treatment instead.
-    expect(b.className).toContain('text-muted-foreground');
-    expect(b.className).toContain('bg-muted');
-  });
-
-  it('renders a live, enabled Retry action that fires onaction', async () => {
-    const onaction = vi.fn();
-    render(SystemCheckRow, {
-      props: { result: row({ status: 'fail', action: 'retry' }), onaction }
-    });
-    const btn = screen.getByRole('button', { name: /retry/i });
-    expect(btn).not.toBeDisabled();
-    await fireEvent.click(btn);
-    expect(onaction).toHaveBeenCalledWith('retry');
-  });
-
   it('renders configure DISABLED on non-expandable rows (Available in Settings), never a dead no-op', async () => {
     const onaction = vi.fn();
-    // configure on local_backend (not llm_runtime) → disabled
+    // configure on text_to_speech (only expandable via `choose`, not `configure`) → disabled
     render(SystemCheckRow, {
-      props: { result: row({ id: 'local_backend', status: 'fail', action: 'configure' }), onaction }
+      props: {
+        result: row({ id: 'text_to_speech', status: 'fail', action: 'configure' }),
+        onaction
+      }
     });
     const cfg = screen.getByRole('button', { name: /configure/i });
     expect(cfg).toBeDisabled();
@@ -94,14 +65,14 @@ describe('SystemCheckRow', () => {
 
   it('embedding_model + choose is expandable (enabled), not disabled', async () => {
     render(SystemCheckRow, {
-      props: { result: row({ id: 'embedding_model', status: 'pending', action: 'choose' }) }
+      props: { result: row({ id: 'embedding_model', status: 'fail', action: 'choose' }) }
     });
     const choose = screen.getByRole('button', { name: /choose/i });
     expect(choose).not.toBeDisabled();
     expect(choose).not.toHaveAttribute('title', 'Available in Settings');
   });
 
-  it('falls back to a neutral (non-Pass) treatment for an unknown status', () => {
+  it('falls back to the Fail (non-Pass) treatment for an unknown status', () => {
     const { container } = render(SystemCheckRow, {
       props: {
         // Force a value outside the CheckStatus union to exercise the fallback.
@@ -109,24 +80,25 @@ describe('SystemCheckRow', () => {
       }
     });
     const b = badge(container);
+    // The fallback is the Fail view — never the green Pass treatment.
     expect(b.className).not.toContain('text-primary');
     expect(b.className).not.toContain('bg-primary');
-    expect(b.className).toContain('text-muted-foreground');
-    expect(b.className).toContain('bg-muted');
+    expect(b.className).toContain('text-destructive');
+    expect(b.className).toContain('bg-destructive');
   });
 
-  it('Pending detail copy carries NO internal milestone vocabulary', () => {
+  it('detail copy carries NO internal milestone vocabulary', () => {
     render(SystemCheckRow, {
       props: {
         result: row({
-          id: 'vector_database',
-          status: 'pending',
-          detail: 'Built-in · set up automatically when you add your first source',
-          action: null
+          id: 'embedding_model',
+          status: 'fail',
+          detail: 'No embedding model installed',
+          action: 'choose'
         })
       }
     });
-    const detail = screen.getByText(/set up automatically/i);
+    const detail = screen.getByText(/no embedding model installed/i);
     expect(detail.textContent).not.toMatch(/\bM\d\b/i);
     expect(detail.textContent?.toLowerCase()).not.toContain('milestone');
   });

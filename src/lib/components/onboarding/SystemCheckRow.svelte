@@ -1,13 +1,12 @@
 <script lang="ts">
   import Check from '@lucide/svelte/icons/check';
   import X from '@lucide/svelte/icons/x';
-  import Clock from '@lucide/svelte/icons/clock';
   import ChevronDown from '@lucide/svelte/icons/chevron-down';
   import ChevronUp from '@lucide/svelte/icons/chevron-up';
-  import RefreshCw from '@lucide/svelte/icons/refresh-cw';
   import { Card } from '$lib/components/ui/card/index.js';
   import { Button } from '$lib/components/ui/button/index.js';
   import { cn } from '$lib/utils.js';
+  import { expandFade } from '$lib/motion/index.js';
   import type { CheckResult, CheckAction } from '$lib/onboarding/system-check.js';
   import LlmConfigPanel from './LlmConfigPanel.svelte';
   import EmbeddingConfigPanel from './EmbeddingConfigPanel.svelte';
@@ -24,9 +23,9 @@
     oncheck?: () => Promise<void>;
   } = $props();
 
-  // Status → icon-badge treatment. Pending is DELIBERATELY distinct from Pass
-  // (plan change #13, HARD GATE): a muted/neutral clock on a muted surface with
-  // muted-foreground text — never the green `text-primary`/`bg-primary` of Pass.
+  // Status → icon-badge treatment. Each row is a binary readiness gate: Pass
+  // (green primary) or Fail (destructive). An unknown status falls back to the
+  // Fail treatment so an unexpected value can never masquerade as a Pass.
   const STATUS = {
     pass: {
       icon: Check,
@@ -37,24 +36,18 @@
       icon: X,
       badgeClass: 'bg-destructive/15 text-destructive',
       labelClass: 'text-destructive'
-    },
-    pending: {
-      icon: Clock,
-      badgeClass: 'bg-muted text-muted-foreground',
-      labelClass: ''
     }
   } as const;
 
-  // Neutral fallback for any status outside the known union.
-  const FALLBACK_VIEW = STATUS.pending;
+  // Safe fallback for any status outside the known union — never the Pass view.
+  const FALLBACK_VIEW = STATUS.fail;
 
   const view = $derived(STATUS[result.status] ?? FALLBACK_VIEW);
   const StatusIcon = $derived(view.icon);
 
   const ACTION_LABEL: Record<CheckAction, string> = {
     configure: 'Configure',
-    choose: 'Choose',
-    retry: 'Retry'
+    choose: 'Choose'
   };
 
   // Expandable rows:
@@ -67,9 +60,9 @@
       (result.id === 'text_to_speech' && result.action === 'choose')
   );
 
-  // `retry` is always live. Expandable rows are available (they expand inline).
-  // All other configure/choose actions are disabled (Settings not built yet).
-  const isAvailable = (action: CheckAction): boolean => action === 'retry' || isExpandable;
+  // Expandable rows are available (they expand inline). All other
+  // configure/choose actions are disabled (Settings not built yet).
+  const available = $derived(isExpandable);
 
   let expanded = $state(false);
 
@@ -77,15 +70,15 @@
     expanded = !expanded;
   }
 
-  const needsEmphasis = $derived(result.status === 'fail' || result.action !== null);
-
+  // Uniform border on every row (the Card default ring). Per design, a failed
+  // or actionable row is differentiated ONLY by its icon badge + label color,
+  // never by a heavier border — so no per-row ring override here.
+  //
   // Always column-stretch so the header row's layout is IDENTICAL whether
   // collapsed or expanded — clicking the action button only reveals the panel
   // below, it never reflows the header (no button "jump"). gap-0: the panels
   // bring their own top border/padding.
-  const cardClass = $derived(
-    cn('flex-col items-stretch gap-0 px-4 py-3', needsEmphasis && 'ring-foreground/20')
-  );
+  const cardClass = 'flex-col items-stretch gap-0 px-4 py-3';
 </script>
 
 <Card size="sm" class={cardClass}>
@@ -108,7 +101,6 @@
 
     {#if result.action}
       {@const action = result.action}
-      {@const available = isAvailable(action)}
       <Button
         variant="outline"
         size="sm"
@@ -126,14 +118,8 @@
         }}
       >
         {ACTION_LABEL[action]}
-        {#if action === 'retry'}
-          <RefreshCw />
-        {:else if isExpandable}
-          {#if expanded}
-            <ChevronUp />
-          {:else}
-            <ChevronDown />
-          {/if}
+        {#if isExpandable && expanded}
+          <ChevronUp />
         {:else}
           <ChevronDown />
         {/if}
@@ -141,23 +127,27 @@
     {/if}
   </div>
 
-  <!-- Inline expansion panels -->
+  <!-- Inline expansion panels: lazy-mounted, so collapsed content stays out of
+       the DOM + keyboard focus order (a11y). One coordinated height+opacity
+       tween (expandFade) animates open AND close — no competing animations. -->
   {#if isExpandable && expanded}
-    {#if result.id === 'llm_runtime'}
-      <LlmConfigPanel
-        oncheck={oncheck ?? (() => Promise.resolve())}
-        oncollapse={() => (expanded = false)}
-      />
-    {:else if result.id === 'embedding_model'}
-      <EmbeddingConfigPanel
-        oncheck={oncheck ?? (() => Promise.resolve())}
-        oncollapse={() => (expanded = false)}
-      />
-    {:else if result.id === 'text_to_speech'}
-      <TtsConfigPanel
-        oncheck={oncheck ?? (() => Promise.resolve())}
-        oncollapse={() => (expanded = false)}
-      />
-    {/if}
+    <div transition:expandFade>
+      {#if result.id === 'llm_runtime'}
+        <LlmConfigPanel
+          oncheck={oncheck ?? (() => Promise.resolve())}
+          oncollapse={() => (expanded = false)}
+        />
+      {:else if result.id === 'embedding_model'}
+        <EmbeddingConfigPanel
+          oncheck={oncheck ?? (() => Promise.resolve())}
+          oncollapse={() => (expanded = false)}
+        />
+      {:else if result.id === 'text_to_speech'}
+        <TtsConfigPanel
+          oncheck={oncheck ?? (() => Promise.resolve())}
+          oncollapse={() => (expanded = false)}
+        />
+      {/if}
+    </div>
   {/if}
 </Card>

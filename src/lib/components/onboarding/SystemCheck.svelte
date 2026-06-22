@@ -8,12 +8,9 @@
   import Moon from '@lucide/svelte/icons/moon';
   import Monitor from '@lucide/svelte/icons/monitor';
   import { Button } from '$lib/components/ui/button/index.js';
+  import { Card } from '$lib/components/ui/card/index.js';
   import SystemCheckRow from '$lib/components/onboarding/SystemCheckRow.svelte';
-  import {
-    runSystemCheck,
-    type CheckResult,
-    type CheckAction
-  } from '$lib/onboarding/system-check.js';
+  import { runSystemCheck, type CheckResult } from '$lib/onboarding/system-check.js';
   import { completeOnboarding } from '$lib/onboarding/completeOnboarding.js';
   import { setMode, userPrefersMode } from 'mode-watcher';
   import { persistTheme, type Mode } from '$lib/theme/index.js';
@@ -26,11 +23,11 @@
   let checkError = $state<string | null>(null);
   let continueError = $state<string | null>(null);
 
-  // Continue is blocked ONLY when local_backend or disk_permissions FAIL.
-  const BLOCKING_IDS = ['local_backend', 'disk_permissions'] as const;
+  // Every check is now a real readiness gate: Continue is blocked unless ALL
+  // three rows pass. An empty result set (still loading / nothing returned) or a
+  // check error also keeps it blocked.
   const blocked = $derived(
-    checkError !== null ||
-      results.some((r) => (BLOCKING_IDS as readonly string[]).includes(r.id) && r.status === 'fail')
+    checkError !== null || results.length === 0 || !results.every((r) => r.status === 'pass')
   );
 
   const readyCount = $derived(results.filter((r) => r.status === 'pass').length);
@@ -40,8 +37,9 @@
     loading = true;
     checkError = null;
     try {
-      // run_system_check now returns all six rows (including text_to_speech) from
-      // the backend; render them directly. Re-checks flip the TTS row pass↔pending.
+      // run_system_check returns the three readiness gates (llm_runtime,
+      // embedding_model, text_to_speech) from the backend; render them directly.
+      // Re-checks (after a Configure/Choose save) flip a row's pass↔fail status.
       results = await runSystemCheck();
     } catch (err) {
       console.error('SystemCheck: runSystemCheck failed', err);
@@ -64,10 +62,6 @@
     } finally {
       finishing = false;
     }
-  }
-
-  function handleAction(action: CheckAction): void {
-    if (action === 'retry') void check();
   }
 
   const CYCLE: Mode[] = ['light', 'dark', 'system'];
@@ -103,66 +97,73 @@
 </div>
 
 <main class="flex min-h-svh items-center justify-center p-6">
-  <div class="w-full max-w-lg flex flex-col gap-4">
-    <!-- Header -->
-    <div class="flex flex-col items-center text-center gap-3 pb-2">
-      <div
-        class="bg-primary flex size-14 items-center justify-center rounded-2xl text-primary-foreground shadow-lg"
-        aria-hidden="true"
-      >
-        <Aperture class="size-7" />
-      </div>
-      <div>
-        <h1 class="text-2xl font-bold text-foreground">System check</h1>
-        <p class="text-muted-foreground text-sm mt-1">
-          Verifying your local intelligence engine before launch
-        </p>
-      </div>
-    </div>
-
-    <!-- Check rows -->
-    <div class="flex flex-col gap-2">
-      {#if loading}
+  <!-- Per design: the whole onboarding sits inside ONE outer card (540px,
+       14px radius, soft shadow, 36/40/32 padding). The check rows are inner
+       surface cards; the footer stays plain (not its own card). -->
+  <!-- Width chosen so the rows inside (card width − 2×px-10 padding) land at the
+       previous `lg` (512px) and the long descriptions don't truncate. -->
+  <div class="w-full max-w-[592px]">
+    <Card class="w-full gap-4 rounded-[14px] px-10 pt-9 pb-8 shadow-2xl ring-0">
+      <!-- Header -->
+      <div class="flex flex-col items-center text-center gap-3 pb-2">
         <div
-          class="text-muted-foreground flex items-center justify-center gap-2 py-12 text-sm"
-          aria-live="polite"
+          class="bg-primary flex size-14 items-center justify-center rounded-2xl text-primary-foreground shadow-lg"
+          aria-hidden="true"
         >
-          <LoaderCircle class="size-4 animate-spin" />
-          Checking your system…
+          <Aperture class="size-7" />
         </div>
-      {:else if checkError}
-        <div
-          class="text-destructive flex items-center justify-center gap-2 py-12 text-center text-sm"
-          role="alert"
-        >
-          <TriangleAlert class="size-4 shrink-0" />
-          {checkError}
+        <div>
+          <h1 class="text-2xl font-bold text-foreground">System check</h1>
+          <p class="text-muted-foreground text-sm mt-1">
+            Verifying your local intelligence engine before launch
+          </p>
         </div>
-      {:else}
-        {#each results as result (result.id)}
-          <SystemCheckRow {result} onaction={handleAction} oncheck={check} />
-        {/each}
-      {/if}
-    </div>
+      </div>
 
-    <!-- Footer: summary + Continue, NOT in a card (plain layout) -->
-    <div class="flex flex-col gap-3 pt-1">
-      {#if continueError}
-        <p class="text-destructive w-full text-center text-sm" role="alert">{continueError}</p>
-      {/if}
-      {#if !loading && !checkError}
-        <p class="text-muted-foreground w-full text-center text-[0.6875rem]">
-          {readyCount} of {totalCount} checks passed
-        </p>
-      {/if}
-      <Button
-        class="h-11 w-full"
-        onclick={handleContinue}
-        disabled={loading || finishing || blocked}
-      >
-        Continue to setup
-        <ArrowRight />
-      </Button>
-    </div>
+      <!-- Check rows -->
+      <div class="flex flex-col gap-2">
+        {#if loading}
+          <div
+            class="text-muted-foreground flex items-center justify-center gap-2 py-12 text-sm"
+            aria-live="polite"
+          >
+            <LoaderCircle class="size-4 animate-spin" />
+            Checking your system…
+          </div>
+        {:else if checkError}
+          <div
+            class="text-destructive flex items-center justify-center gap-2 py-12 text-center text-sm"
+            role="alert"
+          >
+            <TriangleAlert class="size-4 shrink-0" />
+            {checkError}
+          </div>
+        {:else}
+          {#each results as result (result.id)}
+            <SystemCheckRow {result} oncheck={check} />
+          {/each}
+        {/if}
+      </div>
+
+      <!-- Footer: summary + Continue, NOT in a card (plain layout) -->
+      <div class="flex flex-col gap-3 pt-1">
+        {#if continueError}
+          <p class="text-destructive w-full text-center text-sm" role="alert">{continueError}</p>
+        {/if}
+        {#if !loading && !checkError}
+          <p class="text-muted-foreground w-full text-center text-[0.6875rem]">
+            {readyCount} of {totalCount} checks passed
+          </p>
+        {/if}
+        <Button
+          class="h-11 w-full"
+          onclick={handleContinue}
+          disabled={loading || finishing || blocked}
+        >
+          Continue to setup
+          <ArrowRight />
+        </Button>
+      </div>
+    </Card>
   </div>
 </main>

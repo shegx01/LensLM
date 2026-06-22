@@ -21,7 +21,8 @@ pub use embedding::{InstallProgress, pull_embedding_model};
 pub use error::LensError;
 pub use notebooks::{Notebook, NotebookId};
 pub use system_check::{
-    CheckAction, CheckId, CheckResult, CheckStatus, LlmDetection, detect_llm, ollama_base_url,
+    ALLOWED_EMBEDDING_MODELS, CheckAction, CheckId, CheckResult, CheckStatus, LlmDetection,
+    detect_llm, ollama_base_url,
 };
 pub use tts::{
     DownloadProgress, Gender, KOKORO_MODEL_FILENAME, KOKORO_MODEL_RELPATH, KOKORO_MODEL_URL,
@@ -147,26 +148,22 @@ impl LensEngine {
         Ok(count)
     }
 
-    /// Runs all first-run system-check probes concurrently and returns the
-    /// ordered results (LocalBackend, LlmRuntime, EmbeddingModel,
-    /// VectorDatabase, DiskPermissions).
+    /// Runs the three first-run system-check probes and returns the ordered
+    /// results (LlmRuntime, EmbeddingModel, TextToSpeech). The LLM-runtime probe
+    /// runs first, the embedding probe reuses its outcome, then the TTS probe.
     ///
-    /// Probes that detect an expected-absent subsystem return a `Fail`/`Pending`
-    /// status rather than an `Err`; this method therefore returns `Ok` unless an
+    /// Probes that detect an expected-absent subsystem return a `Fail` status
+    /// rather than an `Err`; this method therefore returns `Ok` unless an
     /// unexpected internal failure occurs. (Today all probe paths are infallible,
     /// but the `Result` signature is the frozen contract for future probes.)
     #[tracing::instrument(skip_all)]
     pub async fn run_system_check(&self) -> Result<Vec<CheckResult>, LensError> {
-        // Clone config + pool under the read guard, then DROP the guard before
-        // running the probes. The probes issue multi-second HTTP requests; doing
-        // so while holding the read guard would block any concurrent writer
-        // (`set_config`) for the whole probe window. Both clones are cheap (the
-        // pool is an internal `Arc`).
-        let (config, db) = {
-            let inner = self.read().await;
-            (inner.config.clone(), inner.db.clone())
-        };
-        Ok(system_check::run_system_check(&config, &db).await)
+        // Clone config under the read guard, then DROP the guard before running
+        // the probes. The probes issue multi-second HTTP requests; doing so while
+        // holding the read guard would block any concurrent writer (`set_config`)
+        // for the whole probe window. The clone is cheap.
+        let config = self.read().await.config.clone();
+        Ok(system_check::run_system_check(&config).await)
     }
 
     /// Lists all live (non-trashed) notebooks, newest first.

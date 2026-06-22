@@ -19,6 +19,12 @@ export interface VoiceConfig {
   guest: string;
 }
 
+// SYNC-CHECK: must match lens-core/src/config.rs TtsConfig — update both together.
+export interface TtsConfig {
+  provider: string;
+  api_key: string;
+}
+
 export interface PathConfig {
   data_dir: string;
 }
@@ -34,6 +40,8 @@ export interface AppConfig {
   models: ModelConfig[];
   endpoints: Record<string, string>;
   voices: VoiceConfig;
+  // SYNC-CHECK: must match lens-core/src/config.rs AppConfig.tts (default empty).
+  tts: TtsConfig;
   paths: PathConfig;
   tier_thresholds: TierThresholds;
   onboarding_complete: boolean;

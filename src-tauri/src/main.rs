@@ -42,6 +42,7 @@ fn main() {
             commands::system::list_tts_voices,
             commands::system::install_embedding_model,
             commands::system::download_tts_engine,
+            commands::system::kokoro_downloaded,
             // Dev-only streaming demonstrator; absent from the release surface.
             #[cfg(debug_assertions)]
             commands::system::stream_demo,

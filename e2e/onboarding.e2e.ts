@@ -1,13 +1,13 @@
 import { expect, test } from '@playwright/test';
 import { installTauriStub, readSetConfigCalls } from './helpers/tauri-stub.js';
 
-// First-run onboarding e2e (M1, plan §6) — STATE-BASED, race-free.
+// First-run onboarding e2e — STATE-BASED, race-free.
 //
 // Onboarding is a first-run STATE, not a route: the layout conditionally renders
 // the SystemCheck screen vs. the app, with NO navigation. These tests therefore
 // assert RENDERED STATE at '/', never URLs — there is no goto()/redirect to race.
 
-test('first run renders the System check screen and all six rows at /', async ({ page }) => {
+test('first run renders the System check screen and all three rows at /', async ({ page }) => {
   await installTauriStub(page, { onboardingComplete: false });
 
   await page.goto('/');
@@ -15,12 +15,8 @@ test('first run renders the System check screen and all six rows at /', async ({
   // The layout reads get_config (onboarding_complete=false) and renders the
   // SystemCheck component in place — same URL, no redirect.
   await expect(page.getByText('System check', { exact: true })).toBeVisible();
-  await expect(page.getByText('Local backend', { exact: true })).toBeVisible();
   await expect(page.getByText('LLM runtime', { exact: true })).toBeVisible();
   await expect(page.getByText('Embedding model', { exact: true })).toBeVisible();
-  await expect(page.getByText('Vector database', { exact: true })).toBeVisible();
-  await expect(page.getByText('Disk permissions', { exact: true })).toBeVisible();
-  // 6th row (text_to_speech) now returned by the backend run_system_check.
   await expect(page.getByText('Text-to-speech', { exact: true })).toBeVisible();
 });
 

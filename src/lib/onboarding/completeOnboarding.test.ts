@@ -21,6 +21,7 @@ function fullConfig(onboarding_complete: boolean): AppConfig {
     ],
     endpoints: { local: 'http://localhost:11434' },
     voices: { host: 'host-voice', guest: 'guest-voice' },
+    tts: { provider: '', api_key: '' },
     paths: { data_dir: '/Users/x/Library/Application Support/Lens' },
     tier_thresholds: { tier1_token_cap: 4000, tier2_token_cap: 16000 },
     onboarding_complete,
