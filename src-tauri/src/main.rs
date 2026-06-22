@@ -39,6 +39,9 @@ fn main() {
             commands::system::health_check,
             commands::system::run_system_check,
             commands::system::detect_llm,
+            commands::system::list_tts_voices,
+            commands::system::install_embedding_model,
+            commands::system::download_tts_engine,
             // Dev-only streaming demonstrator; absent from the release surface.
             #[cfg(debug_assertions)]
             commands::system::stream_demo,

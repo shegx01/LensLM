@@ -1,9 +1,10 @@
 //! System / diagnostic commands.
 
-use lens_core::{CheckResult, LensEngine, LensError, LlmDetection};
+use lens_core::{
+    CheckResult, DownloadProgress, InstallProgress, LensEngine, LensError, LlmDetection, TtsVoice,
+};
 use serde::Serialize;
-
-#[cfg(debug_assertions)]
+use tauri::Manager;
 use tauri::ipc::Channel;
 
 #[cfg(debug_assertions)]
@@ -70,6 +71,67 @@ fn sanitize_url_for_log(raw: &str) -> String {
     // Drop any userinfo before an '@'.
     let host_port = authority.rsplit_once('@').map_or(authority, |(_, hp)| hp);
     format!("{scheme}://{host_port}")
+}
+
+/// Returns the static Kokoro voice catalog (5 female + 5 male) for the TTS
+/// onboarding panel. Invoked as `invoke("list_tts_voices")`.
+#[tracing::instrument(skip_all)]
+#[tauri::command]
+pub async fn list_tts_voices() -> Result<Vec<TtsVoice>, LensError> {
+    Ok(lens_core::list_tts_voices())
+}
+
+/// Installs an embedding model by streaming Ollama's `POST /api/pull`.
+///
+/// Each NDJSON status line from Ollama is forwarded to the frontend as an
+/// [`InstallProgress`] over the `on_progress` channel. The target runtime is the
+/// configured Ollama base URL (same resolution as the system-check probe). If
+/// Ollama is unreachable the command returns an `Err` for the UI to surface.
+///
+/// Invoked as `invoke("install_embedding_model", { model, onProgress })` where
+/// `onProgress` is a `Channel<InstallProgress>`.
+#[tracing::instrument(skip(on_progress, engine), fields(model = %model))]
+#[tauri::command]
+pub async fn install_embedding_model(
+    model: String,
+    on_progress: Channel<InstallProgress>,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<(), LensError> {
+    let base_url = lens_core::ollama_base_url(&engine.config().await);
+    lens_core::pull_embedding_model(&base_url, &model, |progress| {
+        // A send failure means the frontend dropped the channel; log and keep
+        // going (the pull itself is unaffected and will still complete).
+        if let Err(e) = on_progress.send(progress) {
+            tracing::warn!("install_embedding_model: progress channel send failed: {e}");
+        }
+    })
+    .await
+}
+
+/// Downloads the Kokoro ONNX engine to `{app_data_dir}/models/kokoro/`,
+/// streaming [`DownloadProgress`] over the `on_progress` channel. Idempotent: a
+/// complete file already on disk emits a single `done` event without
+/// re-downloading.
+///
+/// Invoked as `invoke("download_tts_engine", { onProgress })` where `onProgress`
+/// is a `Channel<DownloadProgress>`.
+#[tracing::instrument(skip_all)]
+#[tauri::command]
+pub async fn download_tts_engine(
+    on_progress: Channel<DownloadProgress>,
+    app: tauri::AppHandle,
+) -> Result<(), LensError> {
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| LensError::Io(e.to_string()))?;
+    let dest = data_dir.join(lens_core::KOKORO_MODEL_RELPATH);
+    lens_core::download_kokoro_model(lens_core::KOKORO_MODEL_URL, &dest, |progress| {
+        if let Err(e) = on_progress.send(progress) {
+            tracing::warn!("download_tts_engine: progress channel send failed: {e}");
+        }
+    })
+    .await
 }
 
 /// Demonstrator that exercises the streaming primitive end to end: emits
@@ -175,6 +237,23 @@ mod tests {
         // Embedding + vector are intentionally not wired yet.
         assert_eq!(status_of(CheckId::EmbeddingModel), CheckStatus::Pending);
         assert_eq!(status_of(CheckId::VectorDatabase), CheckStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn list_tts_voices_returns_male_and_female_sets() {
+        use lens_core::Gender;
+        let voices = list_tts_voices().await.unwrap();
+        assert_eq!(voices.len(), 10);
+        assert_eq!(
+            voices.iter().filter(|v| v.gender == Gender::Female).count(),
+            5
+        );
+        assert_eq!(
+            voices.iter().filter(|v| v.gender == Gender::Male).count(),
+            5
+        );
+        assert!(voices.iter().any(|v| v.id == "af_heart"));
+        assert!(voices.iter().any(|v| v.id == "am_onyx"));
     }
 
     #[cfg(debug_assertions)]

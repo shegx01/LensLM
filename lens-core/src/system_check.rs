@@ -312,7 +312,10 @@ fn probe_client() -> reqwest::Client {
 }
 
 /// Resolves the configured Ollama base URL, defaulting to localhost.
-fn ollama_base_url(config: &AppConfig) -> String {
+///
+/// Public so the embedding-model install command can target the SAME runtime
+/// the system-check probe detected, rather than re-deriving the URL.
+pub fn ollama_base_url(config: &AppConfig) -> String {
     provider_base_url(config, "ollama").unwrap_or_else(|| DEFAULT_OLLAMA_BASE_URL.to_string())
 }
 

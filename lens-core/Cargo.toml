@@ -32,7 +32,12 @@ tracing = { workspace = true }
 reqwest = { version = "=0.13.4", default-features = false, features = [
     "json",
     "rustls",
+    # `stream` exposes `Response::bytes_stream`, used by the embedding-model pull
+    # (NDJSON) and the Kokoro model download to report progress as bytes arrive.
+    "stream",
 ] }
+# Stream combinators (`StreamExt::next`) for consuming `reqwest`'s byte stream.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 rstest = { workspace = true }

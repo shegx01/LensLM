@@ -10,14 +10,23 @@
 
 pub mod config;
 pub(crate) mod db;
+pub mod embedding;
 pub mod error;
 pub mod notebooks;
 pub mod system_check;
+pub mod tts;
 
 pub use config::AppConfig;
+pub use embedding::{InstallProgress, pull_embedding_model};
 pub use error::LensError;
 pub use notebooks::{Notebook, NotebookId};
-pub use system_check::{CheckAction, CheckId, CheckResult, CheckStatus, LlmDetection, detect_llm};
+pub use system_check::{
+    CheckAction, CheckId, CheckResult, CheckStatus, LlmDetection, detect_llm, ollama_base_url,
+};
+pub use tts::{
+    DownloadProgress, Gender, KOKORO_MODEL_RELPATH, KOKORO_MODEL_URL, TtsVoice,
+    download_kokoro_model, list_tts_voices,
+};
 
 /// Re-exported so the integration-test crate can re-run the migrator against a
 /// pool obtained via [`LensEngine::pool`] without exposing the rest of the
