@@ -613,11 +613,12 @@ mod tests {
 
     #[tokio::test]
     async fn aggregate_falls_back_to_lmstudio_via_seam() {
-        // Ollama is down (dead URL), but a configured LM Studio seam answers 200
-        // on /v1/models ⇒ the aggregate LLM probe reports Pass via the fallback.
-        let ollama = MockServer::start().await;
-        let dead_ollama = ollama.uri();
-        drop(ollama);
+        // Ollama is down, but a configured LM Studio seam answers 200 on
+        // /v1/models ⇒ the aggregate LLM probe reports Pass via the fallback.
+        // Use a fixed always-refused port (1) rather than a dropped MockServer's
+        // port — the freed port can be rebound by a parallel test's Ollama mock
+        // and serve /api/version, flaking the `!ollama_up` assertion on CI.
+        let dead_ollama = "http://127.0.0.1:1".to_string();
 
         let lmstudio = MockServer::start().await;
         Mock::given(method("GET"))
