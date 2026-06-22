@@ -30,10 +30,13 @@ export interface TierThresholds {
 
 export interface AppConfig {
   theme: string;
+  accent: string;
   models: ModelConfig[];
   endpoints: Record<string, string>;
   voices: VoiceConfig;
   paths: PathConfig;
   tier_thresholds: TierThresholds;
   onboarding_complete: boolean;
+  // SYNC-CHECK: must match lens-core/src/config.rs AppConfig.embedding_model (default "").
+  embedding_model: string;
 }

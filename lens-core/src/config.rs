@@ -16,7 +16,11 @@ use crate::LensError;
 const CONFIG_FILE_NAME: &str = "config.json";
 
 /// Per-provider model endpoint configuration (LLM or embedding backend).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+///
+/// `Debug` is implemented MANUALLY (not derived) so the `api_key` is never
+/// echoed verbatim into logs / panic messages: it is redacted to `"***"` when
+/// present and shown as `""` when empty. See the `impl Debug` below.
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModelConfig {
     /// Provider identifier (e.g. `"ollama"`, `"openai"`).
     pub provider: String,
@@ -35,6 +39,23 @@ pub struct ModelConfig {
     /// stopgap. Migrating secrets into the OS keychain is deferred to M2; do not
     /// rely on this field being secure at rest.
     pub api_key: String,
+}
+
+impl std::fmt::Debug for ModelConfig {
+    /// Redacts `api_key` so a secret can never leak through a `{:?}` format (logs,
+    /// panic messages, tracing). A non-empty key prints as `"***"`; an empty key
+    /// prints as `""`. All other fields are shown verbatim.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let api_key = if self.api_key.is_empty() { "" } else { "***" };
+        f.debug_struct("ModelConfig")
+            .field("provider", &self.provider)
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("context", &self.context)
+            .field("temperature", &self.temperature)
+            .field("api_key", &api_key)
+            .finish()
+    }
 }
 
 /// Host/guest voice identifiers used by the (future) TTS subsystem.
@@ -72,15 +93,36 @@ impl Default for TierThresholds {
     }
 }
 
+/// Default accent token name. Drives the `[data-accent]` token layer in the UI.
+const DEFAULT_ACCENT: &str = "purple";
+
+/// The serde default for [`AppConfig::accent`]: configs written before the
+/// `accent` field existed (or with it omitted) deserialize to `"purple"` rather
+/// than the empty string, so the persisted accent always resolves to a real
+/// token name.
+fn default_accent() -> String {
+    DEFAULT_ACCENT.to_string()
+}
+
 /// Top-level application configuration.
 ///
 /// Loaded from / saved to `{data_dir}/config.json`. A missing file yields
 /// [`AppConfig::default`] (and is written back); a malformed file yields
 /// [`LensError::Parse`] rather than panicking.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppConfig {
     /// UI theme name (e.g. `"system"`, `"light"`, `"dark"`).
     pub theme: String,
+    /// UI accent token name (drives the `[data-accent]` layer). Defaults to
+    /// `"purple"`; an absent field in an older `config.json` reads back as
+    /// `"purple"` via [`default_accent`].
+    #[serde(default = "default_accent")]
+    pub accent: String,
+    /// Selected embedding model id (e.g. `"nomic-embed-text"`). Empty when the
+    /// user has not yet chosen one. Defaults to `""`; an absent field in an older
+    /// `config.json` reads back as `""` via `#[serde(default)]`.
+    #[serde(default)]
+    pub embedding_model: String,
     /// Configured chat/inference models keyed by role.
     pub models: Vec<ModelConfig>,
     /// Arbitrary named endpoints (label -> URL).
@@ -93,6 +135,22 @@ pub struct AppConfig {
     pub tier_thresholds: TierThresholds,
     /// Whether first-run onboarding has completed.
     pub onboarding_complete: bool,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            theme: String::default(),
+            accent: default_accent(),
+            embedding_model: String::default(),
+            models: Vec::default(),
+            endpoints: BTreeMap::default(),
+            voices: VoiceConfig::default(),
+            paths: PathConfig::default(),
+            tier_thresholds: TierThresholds::default(),
+            onboarding_complete: false,
+        }
+    }
 }
 
 impl AppConfig {
@@ -167,5 +225,113 @@ impl AppConfig {
     #[cfg(not(unix))]
     fn restrict_permissions(_path: &Path) -> Result<(), LensError> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_config_debug_redacts_api_key() {
+        let cfg = ModelConfig {
+            provider: "openai".to_string(),
+            base_url: "https://api.openai.com".to_string(),
+            model: "gpt-4".to_string(),
+            context: 8192,
+            temperature: 0.2,
+            api_key: "sk-supersecret-token-value".to_string(),
+        };
+        let debug = format!("{cfg:?}");
+        // The secret must never appear in the Debug output.
+        assert!(!debug.contains("sk-supersecret-token-value"));
+        assert!(!debug.contains("supersecret"));
+        // Redaction marker present; other fields still visible.
+        assert!(debug.contains("***"));
+        assert!(debug.contains("openai"));
+        assert!(debug.contains("gpt-4"));
+    }
+
+    #[test]
+    fn model_config_debug_shows_empty_api_key_as_empty() {
+        let cfg = ModelConfig {
+            provider: "ollama".to_string(),
+            ..ModelConfig::default()
+        };
+        let debug = format!("{cfg:?}");
+        // An empty key is shown as "" (not redacted to ***).
+        assert!(debug.contains("api_key: \"\""));
+        assert!(!debug.contains("***"));
+    }
+
+    #[test]
+    fn default_accent_is_purple() {
+        assert_eq!(AppConfig::default().accent, "purple");
+    }
+
+    #[test]
+    fn missing_accent_deserializes_to_purple() {
+        // A config.json written before the `accent` field existed has no
+        // `accent` key; it must read back as the default rather than failing.
+        let json = r#"{
+            "theme": "dark",
+            "models": [],
+            "endpoints": {},
+            "voices": { "host": "", "guest": "" },
+            "paths": { "data_dir": "" },
+            "tier_thresholds": { "tier1_token_cap": 4000, "tier2_token_cap": 16000 },
+            "onboarding_complete": true
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.accent, "purple");
+        assert_eq!(config.theme, "dark");
+    }
+
+    #[test]
+    fn default_embedding_model_is_empty() {
+        assert_eq!(AppConfig::default().embedding_model, "");
+    }
+
+    #[test]
+    fn missing_embedding_model_deserializes_to_empty() {
+        // A config.json written before the `embedding_model` field existed has no
+        // `embedding_model` key; it must read back as the empty string (the serde
+        // default) rather than failing to deserialize (backward compatibility).
+        let json = r#"{
+            "theme": "dark",
+            "accent": "purple",
+            "models": [],
+            "endpoints": {},
+            "voices": { "host": "", "guest": "" },
+            "paths": { "data_dir": "" },
+            "tier_thresholds": { "tier1_token_cap": 4000, "tier2_token_cap": 16000 },
+            "onboarding_complete": true
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.embedding_model, "");
+    }
+
+    #[test]
+    fn explicit_embedding_model_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = AppConfig {
+            embedding_model: "nomic-embed-text".to_string(),
+            ..AppConfig::default()
+        };
+        config.save(dir.path()).unwrap();
+        let loaded = AppConfig::load(dir.path()).unwrap();
+        assert_eq!(loaded.embedding_model, "nomic-embed-text");
+    }
+
+    #[test]
+    fn explicit_accent_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = AppConfig {
+            accent: "emerald".to_string(),
+            ..AppConfig::default()
+        };
+        config.save(dir.path()).unwrap();
+        let loaded = AppConfig::load(dir.path()).unwrap();
+        assert_eq!(loaded.accent, "emerald");
     }
 }

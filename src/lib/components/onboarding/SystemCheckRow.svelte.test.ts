@@ -79,25 +79,26 @@ describe('SystemCheckRow', () => {
     expect(onaction).toHaveBeenCalledWith('retry');
   });
 
-  it('renders configure/choose DISABLED (Available in Settings), never a dead no-op', async () => {
+  it('renders configure DISABLED on non-expandable rows (Available in Settings), never a dead no-op', async () => {
     const onaction = vi.fn();
-    const { unmount } = render(SystemCheckRow, {
-      props: { result: row({ status: 'fail', action: 'configure' }), onaction }
+    // configure on local_backend (not llm_runtime) → disabled
+    render(SystemCheckRow, {
+      props: { result: row({ id: 'local_backend', status: 'fail', action: 'configure' }), onaction }
     });
     const cfg = screen.getByRole('button', { name: /configure/i });
     expect(cfg).toBeDisabled();
     expect(cfg).toHaveAttribute('title', 'Available in Settings');
-    // A disabled button must not invoke onaction even if a click is dispatched.
     await fireEvent.click(cfg);
     expect(onaction).not.toHaveBeenCalled();
-    unmount();
+  });
 
+  it('embedding_model + choose is expandable (enabled), not disabled', async () => {
     render(SystemCheckRow, {
       props: { result: row({ id: 'embedding_model', status: 'pending', action: 'choose' }) }
     });
     const choose = screen.getByRole('button', { name: /choose/i });
-    expect(choose).toBeDisabled();
-    expect(choose).toHaveAttribute('title', 'Available in Settings');
+    expect(choose).not.toBeDisabled();
+    expect(choose).not.toHaveAttribute('title', 'Available in Settings');
   });
 
   it('falls back to a neutral (non-Pass) treatment for an unknown status', () => {

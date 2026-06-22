@@ -7,7 +7,7 @@ import { installTauriStub, readSetConfigCalls } from './helpers/tauri-stub.js';
 // the SystemCheck screen vs. the app, with NO navigation. These tests therefore
 // assert RENDERED STATE at '/', never URLs — there is no goto()/redirect to race.
 
-test('first run renders the System check screen and all five rows at /', async ({ page }) => {
+test('first run renders the System check screen and all six rows at /', async ({ page }) => {
   await installTauriStub(page, { onboardingComplete: false });
 
   await page.goto('/');
@@ -20,6 +20,8 @@ test('first run renders the System check screen and all five rows at /', async (
   await expect(page.getByText('Embedding model', { exact: true })).toBeVisible();
   await expect(page.getByText('Vector database', { exact: true })).toBeVisible();
   await expect(page.getByText('Disk permissions', { exact: true })).toBeVisible();
+  // 6th row (text_to_speech) now returned by the backend run_system_check.
+  await expect(page.getByText('Text-to-speech', { exact: true })).toBeVisible();
 });
 
 test('Continue persists onboarding_complete and swaps to the app (no URL change)', async ({

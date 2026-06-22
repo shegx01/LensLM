@@ -3,20 +3,30 @@
   import X from '@lucide/svelte/icons/x';
   import Clock from '@lucide/svelte/icons/clock';
   import ChevronDown from '@lucide/svelte/icons/chevron-down';
+  import ChevronUp from '@lucide/svelte/icons/chevron-up';
   import RefreshCw from '@lucide/svelte/icons/refresh-cw';
   import { Card } from '$lib/components/ui/card/index.js';
   import { Button } from '$lib/components/ui/button/index.js';
   import { cn } from '$lib/utils.js';
   import type { CheckResult, CheckAction } from '$lib/onboarding/system-check.js';
+  import LlmConfigPanel from './LlmConfigPanel.svelte';
+  import EmbeddingConfigPanel from './EmbeddingConfigPanel.svelte';
+  import TtsConfigPanel from './TtsConfigPanel.svelte';
 
-  let { result, onaction }: { result: CheckResult; onaction?: (action: CheckAction) => void } =
-    $props();
+  let {
+    result,
+    onaction,
+    oncheck
+  }: {
+    result: CheckResult;
+    onaction?: (action: CheckAction) => void;
+    /** Re-run the parent system check (for config panel's Save / Test). */
+    oncheck?: () => Promise<void>;
+  } = $props();
 
   // Status → icon-badge treatment. Pending is DELIBERATELY distinct from Pass
   // (plan change #13, HARD GATE): a muted/neutral clock on a muted surface with
   // muted-foreground text — never the green `text-primary`/`bg-primary` of Pass.
-  // This is load-bearing for the honesty thesis (pre-mortem #2): a future flip
-  // to green must be visually and test-detectable.
   const STATUS = {
     pass: {
       icon: Check,
@@ -35,70 +45,119 @@
     }
   } as const;
 
-  // Neutral fallback for any status outside the known union (defensive against a
-  // future/garbled IPC value): reuse the muted Pending treatment — NEVER the
-  // Pass green — and avoid an `undefined`-class crash. Sharing the Pending view
-  // is deliberate: an unknown status reads as "not affirmatively healthy".
+  // Neutral fallback for any status outside the known union.
   const FALLBACK_VIEW = STATUS.pending;
 
   const view = $derived(STATUS[result.status] ?? FALLBACK_VIEW);
   const StatusIcon = $derived(view.icon);
 
-  // Action button copy + icon (Configure/Choose carry a chevron like the design;
-  // Retry carries a refresh glyph).
   const ACTION_LABEL: Record<CheckAction, string> = {
     configure: 'Configure',
     choose: 'Choose',
     retry: 'Retry'
   };
 
-  // `configure`/`choose` open Settings, which is not built until a later
-  // milestone. We render them DISABLED with an explanatory tooltip rather than
-  // shipping a button that silently does nothing. `retry` is live (it re-runs
-  // the check via the parent's `onaction`).
-  const isAvailable = (action: CheckAction): boolean => action === 'retry';
+  // Expandable rows:
+  //   llm_runtime  + configure → LlmConfigPanel
+  //   embedding_model + choose → EmbeddingConfigPanel
+  //   text_to_speech  + choose → TtsConfigPanel
+  const isExpandable = $derived(
+    (result.id === 'llm_runtime' && result.action === 'configure') ||
+      (result.id === 'embedding_model' && result.action === 'choose') ||
+      (result.id === 'text_to_speech' && result.action === 'choose')
+  );
 
-  // Attention rows (fail status OR a row with an action affordance) get a
-  // subtly stronger ring to match the design mock — token-based only.
-  // Pass/Pending rows keep the Card default (ring-foreground/10).
+  // `retry` is always live. Expandable rows are available (they expand inline).
+  // All other configure/choose actions are disabled (Settings not built yet).
+  const isAvailable = (action: CheckAction): boolean => action === 'retry' || isExpandable;
+
+  let expanded = $state(false);
+
+  function toggleExpanded(): void {
+    expanded = !expanded;
+  }
+
   const needsEmphasis = $derived(result.status === 'fail' || result.action !== null);
+
+  // Always column-stretch so the header row's layout is IDENTICAL whether
+  // collapsed or expanded — clicking the action button only reveals the panel
+  // below, it never reflows the header (no button "jump"). gap-0: the panels
+  // bring their own top border/padding.
+  const cardClass = $derived(
+    cn('flex-col items-stretch gap-0 px-4 py-3', needsEmphasis && 'ring-foreground/20')
+  );
 </script>
 
-<Card
-  size="sm"
-  class={cn('flex-row items-center gap-3 px-4 py-3', needsEmphasis && 'ring-foreground/20')}
->
-  <span
-    class={cn(
-      'flex size-8 shrink-0 items-center justify-center rounded-full [&_svg]:size-4',
-      view.badgeClass
-    )}
-    aria-hidden="true"
-  >
-    <StatusIcon />
-  </span>
+<Card size="sm" class={cardClass}>
+  <!-- Row header: always visible; w-full + identical layout in both states -->
+  <div class="flex w-full items-center gap-3">
+    <span
+      class={cn(
+        'flex size-8 shrink-0 items-center justify-center rounded-full [&_svg]:size-4',
+        view.badgeClass
+      )}
+      aria-hidden="true"
+    >
+      <StatusIcon />
+    </span>
 
-  <div class="min-w-0 flex-1">
-    <p class={cn('truncate text-sm font-bold', view.labelClass)}>{result.label}</p>
-    <p class="text-muted-foreground truncate text-[0.8rem]">{result.detail}</p>
+    <div class="min-w-0 flex-1">
+      <p class={cn('truncate text-sm font-bold', view.labelClass)}>{result.label}</p>
+      <p class="text-muted-foreground truncate text-[0.8rem]">{result.detail}</p>
+    </div>
+
+    {#if result.action}
+      {@const action = result.action}
+      {@const available = isAvailable(action)}
+      <Button
+        variant="outline"
+        size="sm"
+        class="shrink-0"
+        disabled={!available}
+        title={available ? undefined : 'Available in Settings'}
+        aria-expanded={isExpandable ? expanded : undefined}
+        onclick={() => {
+          if (!available) return;
+          if (isExpandable) {
+            toggleExpanded();
+          } else {
+            onaction?.(action);
+          }
+        }}
+      >
+        {ACTION_LABEL[action]}
+        {#if action === 'retry'}
+          <RefreshCw />
+        {:else if isExpandable}
+          {#if expanded}
+            <ChevronUp />
+          {:else}
+            <ChevronDown />
+          {/if}
+        {:else}
+          <ChevronDown />
+        {/if}
+      </Button>
+    {/if}
   </div>
 
-  {#if result.action}
-    {@const action = result.action}
-    {@const available = isAvailable(action)}
-    <Button
-      variant="outline"
-      size="sm"
-      disabled={!available}
-      title={available ? undefined : 'Available in Settings'}
-      onclick={() => available && onaction?.(action)}
-    >
-      {ACTION_LABEL[action]}
-      {#if action === 'retry'}
-        <RefreshCw />
-      {:else}
-        <ChevronDown />
-      {/if}
-    </Button>
+  <!-- Inline expansion panels -->
+  {#if isExpandable && expanded}
+    {#if result.id === 'llm_runtime'}
+      <LlmConfigPanel
+        oncheck={oncheck ?? (() => Promise.resolve())}
+        oncollapse={() => (expanded = false)}
+      />
+    {:else if result.id === 'embedding_model'}
+      <EmbeddingConfigPanel
+        oncheck={oncheck ?? (() => Promise.resolve())}
+        oncollapse={() => (expanded = false)}
+      />
+    {:else if result.id === 'text_to_speech'}
+      <TtsConfigPanel
+        oncheck={oncheck ?? (() => Promise.resolve())}
+        oncollapse={() => (expanded = false)}
+      />
+    {/if}
   {/if}
 </Card>
