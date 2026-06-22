@@ -246,7 +246,7 @@
       </div>
     {:else}
       <!-- Post-download: voice selectors -->
-      <div class="flex items-center gap-2 text-[0.78rem] text-primary">
+      <div class="flex items-center gap-2 text-[0.78rem] text-primary" role="status">
         <CircleCheck class="size-4" />
         Kokoro engine ready
       </div>

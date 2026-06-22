@@ -366,7 +366,7 @@
     <div class="flex flex-col gap-1.5">
       <div class="flex items-baseline gap-1">
         <label
-          for="llm-context-window"
+          for="llm-context-custom"
           class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase"
         >
           Context Window
@@ -401,10 +401,10 @@
           value={contextWindow}
           oninput={(e) => {
             const v = parseInt(e.currentTarget.value, 10);
-            if (Number.isFinite(v) && v > 0) contextWindow = v;
+            if (Number.isFinite(v) && v >= 256) contextWindow = v;
           }}
           aria-label="Custom context window in tokens"
-          class="border-input focus-visible:border-ring focus-visible:ring-ring/50 h-8 w-full rounded-lg border bg-transparent px-2.5 py-1 text-sm transition-colors outline-none focus-visible:ring-3"
+          class="border-input focus-visible:border-ring focus-visible:ring-ring/50 dark:bg-input/30 placeholder:text-muted-foreground h-8 w-full min-w-0 rounded-lg border bg-transparent px-2.5 py-1 text-base transition-colors outline-none focus-visible:ring-3 md:text-sm"
         />
         <span class="text-muted-foreground shrink-0 text-[0.72rem]">tokens (custom)</span>
       </div>

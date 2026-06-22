@@ -934,6 +934,24 @@ mod tests {
     }
 
     #[test]
+    fn text_to_speech_fail_when_only_one_voice_set() {
+        // Engine on disk but only the host voice saved (guest empty) ⇒ Fail.
+        // Guards the AND-conjunction: a single voice must NOT satisfy the gate.
+        let dir = tempfile::tempdir().unwrap();
+        write_kokoro_model(dir.path());
+
+        let mut config = AppConfig::default();
+        config.paths.data_dir = dir.path().display().to_string();
+        config.voices = crate::config::VoiceConfig {
+            host: "am_michael".to_string(),
+            guest: String::new(),
+        };
+
+        let result = probe_text_to_speech(&config);
+        assert_eq!(result.status, CheckStatus::Fail);
+    }
+
+    #[test]
     fn text_to_speech_fail_when_voices_set_but_model_absent() {
         // Voices saved but the engine was never downloaded ⇒ still Fail.
         let dir = tempfile::tempdir().unwrap();
