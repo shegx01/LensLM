@@ -27,7 +27,11 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 # Block on async engine init inside the synchronous `.setup` closure.
 tokio = { workspace = true }
+# Native file picker for the onboarding "Add sources" step (Tauri 2.x plugin).
+tauri-plugin-dialog = "2"
 
 [dev-dependencies]
 # The `test` feature (mock runtime) is unioned in only for test builds.
 tauri = { version = "2", features = ["test"] }
+# Temp dirs for the recent-documents scan test.
+tempfile = { workspace = true }

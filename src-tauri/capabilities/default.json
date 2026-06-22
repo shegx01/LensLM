@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Default capability set granted to the main LensLM window.",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "dialog:allow-open"]
 }

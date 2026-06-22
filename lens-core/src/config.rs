@@ -150,6 +150,12 @@ pub struct AppConfig {
     /// `"purple"` via [`default_accent`].
     #[serde(default = "default_accent")]
     pub accent: String,
+    /// User-supplied display name captured during onboarding ("Make it yours").
+    /// Defaults to `""`; an absent field in an older `config.json` reads back as
+    /// `""` via `#[serde(default)]` (forward compatibility, mirroring the
+    /// `accent`/[`default_accent`] pattern above).
+    #[serde(default)]
+    pub user_name: String,
     /// Selected embedding model id (e.g. `"nomic-embed-text"`). Empty when the
     /// user has not yet chosen one. Defaults to `""`; an absent field in an older
     /// `config.json` reads back as `""` via `#[serde(default)]`.
@@ -179,6 +185,7 @@ impl Default for AppConfig {
         Self {
             theme: String::default(),
             accent: default_accent(),
+            user_name: String::default(),
             embedding_model: String::default(),
             models: Vec::default(),
             endpoints: BTreeMap::default(),
@@ -323,6 +330,43 @@ mod tests {
         let config: AppConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.accent, "purple");
         assert_eq!(config.theme, "dark");
+    }
+
+    #[test]
+    fn default_user_name_is_empty() {
+        assert_eq!(AppConfig::default().user_name, "");
+    }
+
+    #[test]
+    fn missing_user_name_deserializes_to_empty() {
+        // A config.json written before the `user_name` field existed has no
+        // `user_name` key; it must read back as the empty string (the serde
+        // default) rather than failing to deserialize (forward compatibility).
+        let json = r#"{
+            "theme": "dark",
+            "accent": "purple",
+            "embedding_model": "",
+            "models": [],
+            "endpoints": {},
+            "voices": { "host": "", "guest": "" },
+            "paths": { "data_dir": "" },
+            "tier_thresholds": { "tier1_token_cap": 4000, "tier2_token_cap": 16000 },
+            "onboarding_complete": true
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.user_name, "");
+    }
+
+    #[test]
+    fn explicit_user_name_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = AppConfig {
+            user_name: "Jamie".to_string(),
+            ..AppConfig::default()
+        };
+        config.save(dir.path()).unwrap();
+        let loaded = AppConfig::load(dir.path()).unwrap();
+        assert_eq!(loaded.user_name, "Jamie");
     }
 
     #[test]

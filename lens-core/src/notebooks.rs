@@ -74,6 +74,31 @@ impl fmt::Display for NotebookId {
     }
 }
 
+/// A source row, returned across the IPC boundary.
+///
+/// In M1 sources are inert *records* only: the onboarding "Add sources" step
+/// inserts file rows with `status = "pending"`, and M4 ingestion later picks up
+/// the pending rows to parse/enrich/embed. No parsing/embedding happens here.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, sqlx::FromRow)]
+pub struct Source {
+    /// UUIDv7 primary key, stored as TEXT.
+    pub id: String,
+    /// Owning notebook id.
+    pub notebook_id: String,
+    /// Source kind. Always `"file"` in M1.
+    pub kind: String,
+    /// Display title (the file name).
+    pub title: String,
+    /// Ingestion status. Always `"pending"` in M1 (awaiting M4 ingestion).
+    pub status: String,
+    /// Absolute file path.
+    pub locator: String,
+    /// Whether the source is selected for retrieval (`1` = selected).
+    pub selected: i64,
+    /// RFC3339 creation timestamp.
+    pub created_at: String,
+}
+
 /// A notebook row, returned across the IPC boundary.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Notebook {
@@ -81,6 +106,12 @@ pub struct Notebook {
     pub id: NotebookId,
     /// Display title.
     pub title: String,
+    /// Optional free-text description captured during onboarding. Write-only in
+    /// M1 (no read/edit surface yet); M3 extends it. `None` when unset.
+    pub description: Option<String>,
+    /// Optional focus mode (`"research"` | `"coding"` | `"notes"`) captured
+    /// during onboarding. Write-only in M1; M3 extends it. `None` when unset.
+    pub focus_mode: Option<String>,
     /// RFC3339 creation timestamp.
     pub created_at: String,
     /// RFC3339 last-update timestamp.
@@ -124,7 +155,7 @@ impl<'a> NotebookRepo<'a> {
     /// Lists all live (non-trashed) notebooks, newest first.
     pub async fn list(&self) -> Result<Vec<Notebook>, LensError> {
         let rows = sqlx::query_as::<_, Notebook>(
-            "SELECT id, title, created_at, updated_at, trashed_at \
+            "SELECT id, title, description, focus_mode, created_at, updated_at, trashed_at \
              FROM notebooks WHERE trashed_at IS NULL ORDER BY created_at DESC",
         )
         .fetch_all(self.pool)
@@ -135,16 +166,27 @@ impl<'a> NotebookRepo<'a> {
     /// Creates a notebook with a freshly-minted UUIDv7 id and returns it.
     ///
     /// The title is trimmed and validated (non-empty, length-capped).
-    pub async fn create(&self, title: &str) -> Result<Notebook, LensError> {
+    /// `description` and `focus_mode` are optional onboarding fields persisted
+    /// verbatim (write-only in M1); pass `None` to leave them unset.
+    pub async fn create(
+        &self,
+        title: &str,
+        description: Option<&str>,
+        focus_mode: Option<&str>,
+    ) -> Result<Notebook, LensError> {
         let title = validate_title(title)?;
+        let description = description.map(str::to_string);
+        let focus_mode = focus_mode.map(str::to_string);
         let id = NotebookId::new();
         let now = chrono::Utc::now().to_rfc3339();
         sqlx::query(
-            "INSERT INTO notebooks (id, title, created_at, updated_at, trashed_at) \
-             VALUES (?, ?, ?, ?, NULL)",
+            "INSERT INTO notebooks (id, title, description, focus_mode, created_at, updated_at, trashed_at) \
+             VALUES (?, ?, ?, ?, ?, ?, NULL)",
         )
         .bind(&id)
         .bind(&title)
+        .bind(&description)
+        .bind(&focus_mode)
         .bind(&now)
         .bind(&now)
         .execute(self.pool)
@@ -152,6 +194,8 @@ impl<'a> NotebookRepo<'a> {
         Ok(Notebook {
             id,
             title,
+            description,
+            focus_mode,
             created_at: now.clone(),
             updated_at: now,
             trashed_at: None,
@@ -184,6 +228,55 @@ impl<'a> NotebookRepo<'a> {
             return Err(LensError::Validation(format!("no notebook with id {id}")));
         }
         Ok(())
+    }
+
+    /// Inserts a file source *record* (M1 onboarding "Add sources").
+    ///
+    /// The row is inert: `kind = "file"`, `status = "pending"`, `selected = 1`,
+    /// `locator` = the absolute file path. NO parsing/embedding/chunking happens
+    /// here — M4 ingestion picks up the `pending` row later. Returns the inserted
+    /// [`Source`].
+    pub async fn add_source(
+        &self,
+        notebook_id: &NotebookId,
+        title: &str,
+        locator: &str,
+    ) -> Result<Source, LensError> {
+        let id = Uuid::now_v7().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO sources (id, notebook_id, kind, title, status, locator, selected, created_at) \
+             VALUES (?, ?, 'file', ?, 'pending', ?, 1, ?)",
+        )
+        .bind(&id)
+        .bind(notebook_id)
+        .bind(title)
+        .bind(locator)
+        .bind(&now)
+        .execute(self.pool)
+        .await?;
+        Ok(Source {
+            id,
+            notebook_id: notebook_id.to_string(),
+            kind: "file".to_string(),
+            title: title.to_string(),
+            status: "pending".to_string(),
+            locator: locator.to_string(),
+            selected: 1,
+            created_at: now,
+        })
+    }
+
+    /// Lists all sources for a notebook, newest first.
+    pub async fn list_sources(&self, notebook_id: &NotebookId) -> Result<Vec<Source>, LensError> {
+        let rows = sqlx::query_as::<_, Source>(
+            "SELECT id, notebook_id, kind, title, status, locator, selected, created_at \
+             FROM sources WHERE notebook_id = ? ORDER BY created_at DESC",
+        )
+        .bind(notebook_id)
+        .fetch_all(self.pool)
+        .await?;
+        Ok(rows)
     }
 }
 

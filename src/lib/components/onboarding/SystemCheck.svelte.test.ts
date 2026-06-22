@@ -62,7 +62,7 @@ describe('SystemCheck', () => {
     mockIPC((cmd) => {
       if (cmd === 'run_system_check') return ALL_PASS;
     });
-    render(SystemCheck, { props: { oncomplete: vi.fn() } });
+    render(SystemCheck, { props: { onadvance: vi.fn() } });
     expect(screen.getByText('System check')).toBeInTheDocument();
     await waitFor(() => expect(screen.getByText('LLM runtime')).toBeInTheDocument());
     expect(screen.getByText('Embedding model')).toBeInTheDocument();
@@ -73,7 +73,7 @@ describe('SystemCheck', () => {
     mockIPC((cmd) => {
       if (cmd === 'run_system_check') return ALL_PASS;
     });
-    render(SystemCheck, { props: { oncomplete: vi.fn() } });
+    render(SystemCheck, { props: { onadvance: vi.fn() } });
     const cont = screen.getByRole('button', { name: 'Continue to setup' });
     await waitFor(() => expect(cont).not.toBeDisabled());
   });
@@ -82,7 +82,7 @@ describe('SystemCheck', () => {
     mockIPC((cmd) => {
       if (cmd === 'run_system_check') return ttsFail();
     });
-    render(SystemCheck, { props: { oncomplete: vi.fn() } });
+    render(SystemCheck, { props: { onadvance: vi.fn() } });
     await waitFor(() => expect(screen.getByText('Text-to-speech')).toBeInTheDocument());
     expect(screen.getByRole('button', { name: 'Continue to setup' })).toBeDisabled();
   });
@@ -91,67 +91,35 @@ describe('SystemCheck', () => {
     mockIPC((cmd) => {
       if (cmd === 'run_system_check') return allFail();
     });
-    render(SystemCheck, { props: { oncomplete: vi.fn() } });
+    render(SystemCheck, { props: { onadvance: vi.fn() } });
     await waitFor(() => expect(screen.getByText('LLM runtime')).toBeInTheDocument());
     expect(screen.getByRole('button', { name: 'Continue to setup' })).toBeDisabled();
   });
 
-  it('persists then calls oncomplete when Continue is clicked', async () => {
-    const oncomplete = vi.fn();
+  it('advances (does NOT persist) when Continue is clicked', async () => {
+    const onadvance = vi.fn();
     const setConfig = vi.fn();
     mockIPC((cmd, args) => {
       if (cmd === 'run_system_check') return ALL_PASS;
-      if (cmd === 'get_config') {
-        return {
-          theme: 'dark',
-          accent: 'purple',
-          models: [],
-          endpoints: {},
-          voices: { host: '', guest: '' },
-          tts: { provider: '', api_key: '' },
-          paths: { data_dir: '' },
-          tier_thresholds: { tier1_token_cap: 4000, tier2_token_cap: 16000 },
-          onboarding_complete: false,
-          embedding_model: ''
-        };
-      }
       if (cmd === 'set_config') {
         setConfig(args);
         return null;
       }
     });
-    render(SystemCheck, { props: { oncomplete } });
+    render(SystemCheck, { props: { onadvance } });
     const cont = screen.getByRole('button', { name: 'Continue to setup' });
     await waitFor(() => expect(cont).not.toBeDisabled());
     await fireEvent.click(cont);
-    await waitFor(() => expect(oncomplete).toHaveBeenCalledOnce());
-    // The flag was persisted (RMW) before oncomplete fired.
-    expect(setConfig).toHaveBeenCalledWith(
-      expect.objectContaining({
-        config: expect.objectContaining({ onboarding_complete: true })
-      })
-    );
-  });
-
-  it('surfaces an inline error and does NOT call oncomplete when persistence fails', async () => {
-    const oncomplete = vi.fn();
-    mockIPC((cmd) => {
-      if (cmd === 'run_system_check') return ALL_PASS;
-      if (cmd === 'get_config') throw new Error('disk full');
-    });
-    render(SystemCheck, { props: { oncomplete } });
-    const cont = screen.getByRole('button', { name: 'Continue to setup' });
-    await waitFor(() => expect(cont).not.toBeDisabled());
-    await fireEvent.click(cont);
-    await waitFor(() => expect(screen.getByText(/could not save your setup/i)).toBeInTheDocument());
-    expect(oncomplete).not.toHaveBeenCalled();
+    await waitFor(() => expect(onadvance).toHaveBeenCalledOnce());
+    // This step no longer persists onboarding_complete — it only advances.
+    expect(setConfig).not.toHaveBeenCalled();
   });
 
   it('shows an inline error and blocks Continue when the check itself fails', async () => {
     mockIPC((cmd) => {
       if (cmd === 'run_system_check') throw new Error('probe boom');
     });
-    render(SystemCheck, { props: { oncomplete: vi.fn() } });
+    render(SystemCheck, { props: { onadvance: vi.fn() } });
     await waitFor(() =>
       expect(screen.getByText(/could not run the system check/i)).toBeInTheDocument()
     );
@@ -162,7 +130,7 @@ describe('SystemCheck', () => {
     mockIPC((cmd) => {
       if (cmd === 'run_system_check') return allFail();
     });
-    const { unmount } = render(SystemCheck, { props: { oncomplete: vi.fn() } });
+    const { unmount } = render(SystemCheck, { props: { onadvance: vi.fn() } });
     await waitFor(() => expect(screen.getByText('0 of 3 checks passed')).toBeInTheDocument());
     unmount();
 
@@ -170,7 +138,7 @@ describe('SystemCheck', () => {
     mockIPC((cmd) => {
       if (cmd === 'run_system_check') return ALL_PASS;
     });
-    render(SystemCheck, { props: { oncomplete: vi.fn() } });
+    render(SystemCheck, { props: { onadvance: vi.fn() } });
     await waitFor(() => expect(screen.getByText('3 of 3 checks passed')).toBeInTheDocument());
   });
 });

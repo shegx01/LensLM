@@ -11,6 +11,21 @@ use tauri::ipc::Channel;
 #[cfg(debug_assertions)]
 use crate::stream::{StreamEvent, send_event};
 
+/// A recent document suggested for the onboarding "Add sources" step.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RecentDocument {
+    /// Absolute file path.
+    pub path: String,
+    /// File name (with extension).
+    pub name: String,
+    /// Lowercased extension without the dot (`pdf` | `docx` | `txt` | `md`).
+    pub ext: String,
+    /// File size in bytes.
+    pub size: u64,
+    /// Last-modified time as a Unix timestamp (seconds), or `0` if unavailable.
+    pub mtime: u64,
+}
+
 /// Result of a [`health_check`]: DB reachable + applied migration count.
 #[derive(Debug, Clone, Serialize)]
 pub struct HealthStatus {
@@ -158,6 +173,86 @@ pub async fn kokoro_downloaded(app: tauri::AppHandle) -> Result<bool, LensError>
     Ok(data_dir.join(lens_core::KOKORO_MODEL_RELPATH).is_file())
 }
 
+/// Allowed document extensions (lowercased, no dot) for recent-doc suggestions.
+const RECENT_DOC_EXTS: [&str; 4] = ["pdf", "docx", "txt", "md"];
+
+/// Maximum number of recent-document suggestions returned.
+const RECENT_DOC_CAP: usize = 8;
+
+/// Shallowly scans `~/Documents`, `~/Downloads`, `~/Desktop` for `pdf|docx|txt|md`
+/// files, returning up to [`RECENT_DOC_CAP`] sorted by mtime descending.
+///
+/// BEST-EFFORT by contract: any failure (missing `$HOME`, unreadable directory,
+/// macOS TCC permission denial, …) is swallowed and yields fewer (or zero)
+/// results — this command NEVER returns an `Err`. The UI hides the "Suggested
+/// from your library" section when the list is empty.
+///
+/// Invoked as `invoke("list_recent_documents")`.
+#[tracing::instrument(skip_all)]
+#[tauri::command]
+pub async fn list_recent_documents() -> Result<Vec<RecentDocument>, LensError> {
+    // NOTE: Unix/macOS path assumptions (HOME-based dirs / '/' separator); revisit for Windows.
+    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+        return Ok(Vec::new());
+    };
+    let dirs = [
+        home.join("Documents"),
+        home.join("Downloads"),
+        home.join("Desktop"),
+    ];
+    Ok(scan_recent_documents(&dirs))
+}
+
+/// Pure, testable core of [`list_recent_documents`]: shallow-scans `dirs` for
+/// allowed-extension files, sorts by mtime desc, and caps at [`RECENT_DOC_CAP`].
+/// Every error is best-effort-ignored (the scan continues), never propagated.
+fn scan_recent_documents(dirs: &[std::path::PathBuf]) -> Vec<RecentDocument> {
+    let mut docs: Vec<RecentDocument> = Vec::new();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue; // unreadable / missing dir → skip (best-effort)
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(ext) = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+            else {
+                continue;
+            };
+            if !RECENT_DOC_EXTS.contains(&ext.as_str()) {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            docs.push(RecentDocument {
+                path: path.display().to_string(),
+                name: name.to_string(),
+                ext,
+                size: meta.len(),
+                mtime,
+            });
+        }
+    }
+    docs.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+    docs.truncate(RECENT_DOC_CAP);
+    docs
+}
+
 /// Demonstrator that exercises the streaming primitive end to end: emits
 /// `Started`, three `Progress` updates, then `Done` over the channel.
 ///
@@ -212,6 +307,46 @@ mod tests {
         assert_eq!(sanitize_url_for_log("not-a-url"), "<redacted>");
     }
 
+    #[test]
+    fn scan_recent_documents_filters_sorts_and_caps() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // Allowed extensions in mixed case + a disallowed one + a subdir (ignored).
+        std::fs::write(root.join("a.pdf"), b"a").unwrap();
+        std::fs::write(root.join("b.MD"), b"b").unwrap();
+        std::fs::write(root.join("c.docx"), b"c").unwrap();
+        std::fs::write(root.join("d.txt"), b"d").unwrap();
+        std::fs::write(root.join("ignore.zip"), b"z").unwrap();
+        std::fs::create_dir(root.join("sub")).unwrap();
+
+        let docs = scan_recent_documents(&[root.to_path_buf()]);
+        // Four allowed files; the .zip and the directory are excluded.
+        assert_eq!(docs.len(), 4);
+        let exts: std::collections::HashSet<String> = docs.iter().map(|d| d.ext.clone()).collect();
+        assert_eq!(
+            exts,
+            ["pdf", "md", "docx", "txt"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        );
+        // Extensions are lowercased even when the file used upper-case.
+        assert!(docs.iter().any(|d| d.name == "b.MD" && d.ext == "md"));
+        // Sorted by mtime descending.
+        for w in docs.windows(2) {
+            assert!(w[0].mtime >= w[1].mtime);
+        }
+    }
+
+    #[test]
+    fn scan_recent_documents_missing_dir_is_empty_not_error() {
+        let docs = scan_recent_documents(&[std::path::PathBuf::from(
+            "/nonexistent/lens/recent/scan/path",
+        )]);
+        assert!(docs.is_empty());
+    }
+
     #[tokio::test]
     async fn health_check_reports_db_ok_and_migrations() {
         let app = tauri::test::mock_app();
@@ -220,8 +355,8 @@ mod tests {
 
         let status = health_check(engine).await.unwrap();
         assert!(status.db_ok);
-        // The single 0001_init migration is recorded.
-        assert_eq!(status.migration_count, 1);
+        // Both migrations (0001_init, 0002_notebook_personalize) are recorded.
+        assert_eq!(status.migration_count, 2);
     }
 
     #[tokio::test]

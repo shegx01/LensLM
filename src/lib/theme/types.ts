@@ -37,6 +37,8 @@ export interface TierThresholds {
 export interface AppConfig {
   theme: string;
   accent: string;
+  // SYNC-CHECK: must match lens-core/src/config.rs AppConfig.user_name (default "").
+  user_name: string;
   models: ModelConfig[];
   endpoints: Record<string, string>;
   voices: VoiceConfig;

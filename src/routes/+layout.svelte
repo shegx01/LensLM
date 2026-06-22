@@ -5,7 +5,12 @@
   import { invoke, isTauri } from '@tauri-apps/api/core';
   import { loadThemeFromConfig } from '$lib/theme/index.js';
   import type { AppConfig } from '$lib/theme/types.js';
+  import { ACCENT_IDS } from '$lib/theme/accents.js';
   import SystemCheck from '$lib/components/onboarding/SystemCheck.svelte';
+  import MakeItYours from '$lib/components/onboarding/MakeItYours.svelte';
+  import CreateNotebook from '$lib/components/onboarding/CreateNotebook.svelte';
+  import AddSources from '$lib/components/onboarding/AddSources.svelte';
+  import { draft, resetDraft } from '$lib/components/onboarding/onboarding-state.svelte.js';
 
   let { children } = $props();
 
@@ -16,6 +21,14 @@
   // SystemCheck screen vs. the app — no navigation, no router race.
   let booting = $state(true);
   let onboardingComplete = $state(false);
+
+  // WITHIN the !onboardingComplete branch, this drives which onboarding screen
+  // renders. It deliberately has NO 'app'/'complete' value: `onboardingComplete`
+  // (the boolean, driven by cfg.onboarding_complete) remains the SOLE gate
+  // between onboarding and the app, preserving the FOUC-free hold-render.
+  let onboardingStep = $state<'system-check' | 'make-it-yours' | 'create-notebook' | 'add-sources'>(
+    'system-check'
+  );
 
   // First paint is handled by the pre-paint script in app.html (FOUC-free under
   // ssr=false). ModeWatcher owns runtime toggling only. On mount we do ONE
@@ -41,12 +54,14 @@
       // picker UI lands in a later milestone, so we only apply here). Validate
       // against the known accents so a hand-edited/unknown value can't drop us
       // into an undefined token state — fall back to 'purple'.
-      const ACCENTS = ['purple', 'green', 'blue'];
-      document.documentElement.dataset.accent = ACCENTS.includes(cfg.accent)
-        ? cfg.accent
-        : 'purple';
-      // ...and the onboarding gate.
+      const accent = (ACCENT_IDS as readonly string[]).includes(cfg.accent) ? cfg.accent : 'purple';
+      document.documentElement.dataset.accent = accent;
+      // ...the onboarding gate...
       onboardingComplete = cfg.onboarding_complete;
+      // ...and seed the draft store from persisted values so the personalize
+      // screens start from what's already saved (validated accent, not raw cfg).
+      draft.userName = cfg.user_name ?? '';
+      draft.accent = accent;
     } catch (err) {
       // Fail OPEN: a config read error must not trap the user past onboarding.
       // `onboardingComplete` stays false → the SystemCheck screen renders.
@@ -56,12 +71,14 @@
     }
   }
 
-  // SystemCheck has already durably persisted onboarding_complete (RMW) by the
-  // time it fires `oncomplete`; flipping the reactive flag swaps the render to
-  // the app. On a persistence failure SystemCheck surfaces an inline error and
-  // does NOT call this, so we stay on the onboarding screen.
+  // The final onboarding screen (AddSources) has already durably persisted
+  // onboarding_complete (RMW) by the time it fires `oncomplete`; flipping the
+  // reactive flag swaps the render to the app, then we clear the draft singleton
+  // so a future re-arm starts clean. On a persistence failure the final screen
+  // surfaces an inline error and does NOT call this, so we stay in onboarding.
   function handleOnboardingComplete(): void {
     onboardingComplete = true;
+    resetDraft();
   }
 </script>
 
@@ -74,7 +91,24 @@
   <!-- Hold render until the single config read resolves so the app never
        flashes before the first-run onboarding decision (anti-FOUC boot gate). -->
 {:else if !onboardingComplete}
-  <SystemCheck oncomplete={handleOnboardingComplete} />
+  {#if onboardingStep === 'system-check'}
+    <SystemCheck onadvance={() => (onboardingStep = 'make-it-yours')} />
+  {:else if onboardingStep === 'make-it-yours'}
+    <MakeItYours
+      onadvance={() => (onboardingStep = 'create-notebook')}
+      onback={() => (onboardingStep = 'system-check')}
+    />
+  {:else if onboardingStep === 'create-notebook'}
+    <CreateNotebook
+      onadvance={() => (onboardingStep = 'add-sources')}
+      onback={() => (onboardingStep = 'make-it-yours')}
+    />
+  {:else if onboardingStep === 'add-sources'}
+    <AddSources
+      oncomplete={handleOnboardingComplete}
+      onback={() => (onboardingStep = 'create-notebook')}
+    />
+  {/if}
 {:else}
   {@render children?.()}
 {/if}

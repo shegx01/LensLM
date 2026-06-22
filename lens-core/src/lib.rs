@@ -19,7 +19,7 @@ pub mod tts;
 pub use config::AppConfig;
 pub use embedding::{InstallProgress, pull_embedding_model};
 pub use error::LensError;
-pub use notebooks::{Notebook, NotebookId};
+pub use notebooks::{Notebook, NotebookId, Source};
 pub use system_check::{
     ALLOWED_EMBEDDING_MODELS, CheckAction, CheckId, CheckResult, CheckStatus, LlmDetection,
     detect_llm, ollama_base_url,
@@ -173,11 +173,40 @@ impl LensEngine {
         NotebookRepo::new(&pool).list().await
     }
 
-    /// Creates a notebook with the given (validated) title and returns it.
+    /// Creates a notebook with the given (validated) title and optional
+    /// onboarding `description`/`focus_mode`, and returns it.
     #[tracing::instrument(skip_all)]
-    pub async fn create_notebook(&self, title: &str) -> Result<Notebook, LensError> {
+    pub async fn create_notebook(
+        &self,
+        title: &str,
+        description: Option<&str>,
+        focus_mode: Option<&str>,
+    ) -> Result<Notebook, LensError> {
         let pool = self.pool().await;
-        NotebookRepo::new(&pool).create(title).await
+        NotebookRepo::new(&pool)
+            .create(title, description, focus_mode)
+            .await
+    }
+
+    /// Inserts a file source record for a notebook (M1 onboarding). Returns it.
+    #[tracing::instrument(skip_all)]
+    pub async fn add_source(
+        &self,
+        notebook_id: &NotebookId,
+        title: &str,
+        locator: &str,
+    ) -> Result<Source, LensError> {
+        let pool = self.pool().await;
+        NotebookRepo::new(&pool)
+            .add_source(notebook_id, title, locator)
+            .await
+    }
+
+    /// Lists all sources for a notebook, newest first.
+    #[tracing::instrument(skip_all)]
+    pub async fn list_sources(&self, notebook_id: &NotebookId) -> Result<Vec<Source>, LensError> {
+        let pool = self.pool().await;
+        NotebookRepo::new(&pool).list_sources(notebook_id).await
     }
 
     /// Renames a notebook, bumping `updated_at`.
