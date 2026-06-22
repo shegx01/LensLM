@@ -111,66 +111,66 @@
        previous `lg` (512px) and the long descriptions don't truncate. -->
   <div class="w-full max-w-[592px]">
     <Card class="w-full gap-4 rounded-[14px] px-10 pt-9 pb-8 shadow-2xl ring-0">
-    <!-- Header -->
-    <div class="flex flex-col items-center text-center gap-3 pb-2">
-      <div
-        class="bg-primary flex size-14 items-center justify-center rounded-2xl text-primary-foreground shadow-lg"
-        aria-hidden="true"
-      >
-        <Aperture class="size-7" />
-      </div>
-      <div>
-        <h1 class="text-2xl font-bold text-foreground">System check</h1>
-        <p class="text-muted-foreground text-sm mt-1">
-          Verifying your local intelligence engine before launch
-        </p>
-      </div>
-    </div>
-
-    <!-- Check rows -->
-    <div class="flex flex-col gap-2">
-      {#if loading}
+      <!-- Header -->
+      <div class="flex flex-col items-center text-center gap-3 pb-2">
         <div
-          class="text-muted-foreground flex items-center justify-center gap-2 py-12 text-sm"
-          aria-live="polite"
+          class="bg-primary flex size-14 items-center justify-center rounded-2xl text-primary-foreground shadow-lg"
+          aria-hidden="true"
         >
-          <LoaderCircle class="size-4 animate-spin" />
-          Checking your system…
+          <Aperture class="size-7" />
         </div>
-      {:else if checkError}
-        <div
-          class="text-destructive flex items-center justify-center gap-2 py-12 text-center text-sm"
-          role="alert"
-        >
-          <TriangleAlert class="size-4 shrink-0" />
-          {checkError}
+        <div>
+          <h1 class="text-2xl font-bold text-foreground">System check</h1>
+          <p class="text-muted-foreground text-sm mt-1">
+            Verifying your local intelligence engine before launch
+          </p>
         </div>
-      {:else}
-        {#each results as result (result.id)}
-          <SystemCheckRow {result} onaction={handleAction} oncheck={check} />
-        {/each}
-      {/if}
-    </div>
+      </div>
 
-    <!-- Footer: summary + Continue, NOT in a card (plain layout) -->
-    <div class="flex flex-col gap-3 pt-1">
-      {#if continueError}
-        <p class="text-destructive w-full text-center text-sm" role="alert">{continueError}</p>
-      {/if}
-      {#if !loading && !checkError}
-        <p class="text-muted-foreground w-full text-center text-[0.6875rem]">
-          {readyCount} of {totalCount} checks passed
-        </p>
-      {/if}
-      <Button
-        class="h-11 w-full"
-        onclick={handleContinue}
-        disabled={loading || finishing || blocked}
-      >
-        Continue to setup
-        <ArrowRight />
-      </Button>
-    </div>
+      <!-- Check rows -->
+      <div class="flex flex-col gap-2">
+        {#if loading}
+          <div
+            class="text-muted-foreground flex items-center justify-center gap-2 py-12 text-sm"
+            aria-live="polite"
+          >
+            <LoaderCircle class="size-4 animate-spin" />
+            Checking your system…
+          </div>
+        {:else if checkError}
+          <div
+            class="text-destructive flex items-center justify-center gap-2 py-12 text-center text-sm"
+            role="alert"
+          >
+            <TriangleAlert class="size-4 shrink-0" />
+            {checkError}
+          </div>
+        {:else}
+          {#each results as result (result.id)}
+            <SystemCheckRow {result} onaction={handleAction} oncheck={check} />
+          {/each}
+        {/if}
+      </div>
+
+      <!-- Footer: summary + Continue, NOT in a card (plain layout) -->
+      <div class="flex flex-col gap-3 pt-1">
+        {#if continueError}
+          <p class="text-destructive w-full text-center text-sm" role="alert">{continueError}</p>
+        {/if}
+        {#if !loading && !checkError}
+          <p class="text-muted-foreground w-full text-center text-[0.6875rem]">
+            {readyCount} of {totalCount} checks passed
+          </p>
+        {/if}
+        <Button
+          class="h-11 w-full"
+          onclick={handleContinue}
+          disabled={loading || finishing || blocked}
+        >
+          Continue to setup
+          <ArrowRight />
+        </Button>
+      </div>
     </Card>
   </div>
 </main>

@@ -46,10 +46,7 @@ const EASE_OUT: [number, number, number, number] = [0.16, 1, 0.3, 1];
  *
  *   <div use:fadeRise={{ delay: i * 0.06 }}>…</div>
  */
-export const fadeRise: Action<HTMLElement, FadeRiseParams | undefined> = (
-  node,
-  params
-) => {
+export const fadeRise: Action<HTMLElement, FadeRiseParams | undefined> = (node, params) => {
   const { y = 8, duration = 0.4, delay = 0, whenInView = false } = params ?? {};
 
   // Snap straight to visible (no animation) when the user asked for reduced
@@ -120,7 +117,6 @@ export function expandFade(
   return {
     duration,
     easing,
-    css: (t) =>
-      `overflow: hidden; height: ${t * height}px; opacity: ${Math.min(1, t * 1.4)};`
+    css: (t) => `overflow: hidden; height: ${t * height}px; opacity: ${Math.min(1, t * 1.4)};`
   };
 }
