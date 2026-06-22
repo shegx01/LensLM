@@ -79,17 +79,18 @@
 
   const needsEmphasis = $derived(result.status === 'fail' || result.action !== null);
 
+  // Always column-stretch so the header row's layout is IDENTICAL whether
+  // collapsed or expanded — clicking the action button only reveals the panel
+  // below, it never reflows the header (no button "jump"). gap-0: the panels
+  // bring their own top border/padding.
   const cardClass = $derived(
-    cn(
-      expanded ? 'flex-col items-stretch gap-0 px-4 py-3' : 'flex-row items-center gap-3 px-4 py-3',
-      needsEmphasis && 'ring-foreground/20'
-    )
+    cn('flex-col items-stretch gap-0 px-4 py-3', needsEmphasis && 'ring-foreground/20')
   );
 </script>
 
 <Card size="sm" class={cardClass}>
-  <!-- Row header: always visible -->
-  <div class={cn('flex items-center gap-3', expanded && 'w-full')}>
+  <!-- Row header: always visible; w-full + identical layout in both states -->
+  <div class="flex w-full items-center gap-3">
     <span
       class={cn(
         'flex size-8 shrink-0 items-center justify-center rounded-full [&_svg]:size-4',
@@ -111,6 +112,7 @@
       <Button
         variant="outline"
         size="sm"
+        class="shrink-0"
         disabled={!available}
         title={available ? undefined : 'Available in Settings'}
         aria-expanded={isExpandable ? expanded : undefined}

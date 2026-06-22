@@ -145,8 +145,8 @@
       {/if}
     </div>
 
-    <!-- Boxed footer -->
-    <div class="border-border bg-card rounded-xl border p-4 flex flex-col gap-3">
+    <!-- Footer: summary + Continue, NOT in a card (plain layout) -->
+    <div class="flex flex-col gap-3 pt-1">
       {#if continueError}
         <p class="text-destructive w-full text-center text-sm" role="alert">{continueError}</p>
       {/if}
