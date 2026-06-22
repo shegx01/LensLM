@@ -7,18 +7,13 @@
 // of an action is `null`, never a string.
 
 import { Channel, invoke, isTauri } from '@tauri-apps/api/core';
+import { updateConfig } from '$lib/config.js';
 
-export type CheckId =
-  | 'local_backend'
-  | 'llm_runtime'
-  | 'embedding_model'
-  | 'vector_database'
-  | 'disk_permissions'
-  | 'text_to_speech';
+export type CheckId = 'llm_runtime' | 'embedding_model' | 'text_to_speech';
 
-export type CheckStatus = 'pass' | 'fail' | 'pending';
+export type CheckStatus = 'pass' | 'fail';
 
-export type CheckAction = 'configure' | 'choose' | 'retry';
+export type CheckAction = 'configure' | 'choose';
 
 /** One row in the system-check screen. Frozen IPC contract — see header. */
 export interface CheckResult {
@@ -102,6 +97,9 @@ export interface EmbeddingModelSpec {
   description: string;
 }
 
+// SYNC-CHECK: the `id`s here must stay in lockstep with the single source of
+// truth `ALLOWED_EMBEDDING_MODELS` in lens-core/src/system_check.rs (the install
+// allowlist). Adding/removing a model means editing the Rust slice too.
 export const EMBEDDING_MODELS: EmbeddingModelSpec[] = [
   {
     id: 'nomic-embed-text',
@@ -190,4 +188,28 @@ export async function downloadTtsEngine(onProgress: (pct: number) => void): Prom
 export async function listTtsVoices(): Promise<TtsVoice[]> {
   if (!isTauri()) return [];
   return invoke<TtsVoice[]>('list_tts_voices');
+}
+
+// SYNC-CHECK: must match lens-core/src/config.rs TtsConfig.provider
+//
+// The only cloud TTS provider wired today. Kept a string union (not a bare
+// string) so the panel + the readiness gate agree on the exact provider id the
+// Rust `has_cloud_tts` check matches (`"elevenlabs"`).
+export type TtsProvider = 'elevenlabs';
+
+/**
+ * Persist the cloud text-to-speech provider config via the standard client-side
+ * read-modify-write over `config.tts` (same `updateConfig` pattern as
+ * `saveLlmProvider` and the embedding/voice saves). This only STORES the config
+ * so the TTS readiness gate can pass — actual cloud synthesis is a later
+ * milestone. Guarded for non-Tauri contexts (a no-op inside `updateConfig`).
+ */
+export async function saveTtsProvider(input: {
+  provider: TtsProvider;
+  apiKey: string;
+}): Promise<void> {
+  await updateConfig((cfg) => ({
+    ...cfg,
+    tts: { provider: input.provider, api_key: input.apiKey }
+  }));
 }

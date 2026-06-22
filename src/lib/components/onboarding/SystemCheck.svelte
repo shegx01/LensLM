@@ -10,11 +10,7 @@
   import { Button } from '$lib/components/ui/button/index.js';
   import { Card } from '$lib/components/ui/card/index.js';
   import SystemCheckRow from '$lib/components/onboarding/SystemCheckRow.svelte';
-  import {
-    runSystemCheck,
-    type CheckResult,
-    type CheckAction
-  } from '$lib/onboarding/system-check.js';
+  import { runSystemCheck, type CheckResult } from '$lib/onboarding/system-check.js';
   import { completeOnboarding } from '$lib/onboarding/completeOnboarding.js';
   import { setMode, userPrefersMode } from 'mode-watcher';
   import { persistTheme, type Mode } from '$lib/theme/index.js';
@@ -27,11 +23,11 @@
   let checkError = $state<string | null>(null);
   let continueError = $state<string | null>(null);
 
-  // Continue is blocked ONLY when local_backend or disk_permissions FAIL.
-  const BLOCKING_IDS = ['local_backend', 'disk_permissions'] as const;
+  // Every check is now a real readiness gate: Continue is blocked unless ALL
+  // three rows pass. An empty result set (still loading / nothing returned) or a
+  // check error also keeps it blocked.
   const blocked = $derived(
-    checkError !== null ||
-      results.some((r) => (BLOCKING_IDS as readonly string[]).includes(r.id) && r.status === 'fail')
+    checkError !== null || results.length === 0 || !results.every((r) => r.status === 'pass')
   );
 
   const readyCount = $derived(results.filter((r) => r.status === 'pass').length);
@@ -41,8 +37,9 @@
     loading = true;
     checkError = null;
     try {
-      // run_system_check now returns all six rows (including text_to_speech) from
-      // the backend; render them directly. Re-checks flip the TTS row pass↔pending.
+      // run_system_check returns the three readiness gates (llm_runtime,
+      // embedding_model, text_to_speech) from the backend; render them directly.
+      // Re-checks (after a Configure/Choose save) flip a row's pass↔fail status.
       results = await runSystemCheck();
     } catch (err) {
       console.error('SystemCheck: runSystemCheck failed', err);
@@ -65,10 +62,6 @@
     } finally {
       finishing = false;
     }
-  }
-
-  function handleAction(action: CheckAction): void {
-    if (action === 'retry') void check();
   }
 
   const CYCLE: Mode[] = ['light', 'dark', 'system'];
@@ -147,7 +140,7 @@
           </div>
         {:else}
           {#each results as result (result.id)}
-            <SystemCheckRow {result} onaction={handleAction} oncheck={check} />
+            <SystemCheckRow {result} oncheck={check} />
           {/each}
         {/if}
       </div>

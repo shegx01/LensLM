@@ -1,7 +1,8 @@
 //! System / diagnostic commands.
 
 use lens_core::{
-    CheckResult, DownloadProgress, InstallProgress, LensEngine, LensError, LlmDetection, TtsVoice,
+    ALLOWED_EMBEDDING_MODELS, CheckResult, DownloadProgress, InstallProgress, LensEngine, LensError,
+    LlmDetection, TtsVoice,
 };
 use serde::Serialize;
 use tauri::Manager;
@@ -30,9 +31,8 @@ pub async fn health_check(engine: tauri::State<'_, LensEngine>) -> Result<Health
     })
 }
 
-/// Runs all onboarding system probes (engine/DB health, LLM runtime,
-/// embedding model, vector database, disk permissions) and returns the
-/// ordered results for the system-check screen.
+/// Runs the three onboarding readiness gates (LLM runtime, embedding model,
+/// text-to-speech) and returns the ordered results for the system-check screen.
 #[tracing::instrument(skip_all)]
 #[tauri::command]
 pub async fn run_system_check(
@@ -80,17 +80,6 @@ fn sanitize_url_for_log(raw: &str) -> String {
 pub async fn list_tts_voices() -> Result<Vec<TtsVoice>, LensError> {
     Ok(lens_core::list_tts_voices())
 }
-
-/// Allowlist of embedding model ids the UI may install. Validating the incoming
-/// `model` against this set (before it reaches the Ollama `POST /api/pull`)
-/// keeps an arbitrary, attacker-influenced string out of the pull request —
-/// defense-in-depth against a tampered IPC call coaxing an unexpected pull.
-const ALLOWED_EMBEDDING_MODELS: &[&str] = &[
-    "nomic-embed-text",
-    "mxbai-embed-large",
-    "all-minilm",
-    "bge-m3",
-];
 
 /// Installs an embedding model by streaming Ollama's `POST /api/pull`.
 ///
@@ -220,7 +209,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_system_check_returns_six_ordered_checks() {
+    async fn run_system_check_returns_three_ordered_checks() {
         let app = tauri::test::mock_app();
         app.manage(LensEngine::for_test().await);
         let engine = app.state::<LensEngine>();
@@ -232,32 +221,29 @@ mod tests {
         assert_eq!(
             ids,
             vec![
-                CheckId::LocalBackend,
                 CheckId::LlmRuntime,
                 CheckId::EmbeddingModel,
-                CheckId::VectorDatabase,
                 CheckId::TextToSpeech,
-                CheckId::DiskPermissions,
             ]
         );
 
         let status_of = |id: CheckId| checks.iter().find(|c| c.id == id).unwrap().status;
 
-        // Real probes that must pass in the test environment.
-        assert_eq!(status_of(CheckId::LocalBackend), CheckStatus::Pass);
-        assert_eq!(status_of(CheckId::DiskPermissions), CheckStatus::Pass);
-
-        // The LLM runtime probe is network-dependent; with no Ollama/LM Studio
-        // running it is `Fail`, but we only assert it resolved (not `Pending`)
-        // to stay robust if a runtime happens to be present on the host.
-        let llm = status_of(CheckId::LlmRuntime);
-        assert!(llm == CheckStatus::Fail || llm == CheckStatus::Pass);
-
-        // Embedding + vector are intentionally not wired yet. The TTS engine is
-        // not downloaded in the test environment, so it is Pending.
-        assert_eq!(status_of(CheckId::EmbeddingModel), CheckStatus::Pending);
-        assert_eq!(status_of(CheckId::VectorDatabase), CheckStatus::Pending);
-        assert_eq!(status_of(CheckId::TextToSpeech), CheckStatus::Pending);
+        // All three are now real readiness gates whose outcome depends on the
+        // host (a local runtime / installed embed model / downloaded Kokoro model
+        // may or may not be present). We assert each resolved to a binary
+        // Pass/Fail — never `Pending` (the old advisory state is gone).
+        for id in [
+            CheckId::LlmRuntime,
+            CheckId::EmbeddingModel,
+            CheckId::TextToSpeech,
+        ] {
+            let status = status_of(id);
+            assert!(
+                status == CheckStatus::Pass || status == CheckStatus::Fail,
+                "{id:?} must be a binary gate, got {status:?}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -1,25 +1,24 @@
-//! First-run system check: honest probes of the local intelligence stack.
+//! First-run system check: honest readiness gates for the local intelligence stack.
 //!
 //! This module defines the FROZEN IPC contract ([`CheckResult`]) returned by
-//! [`crate::LensEngine::run_system_check`], plus the six probes that populate
+//! [`crate::LensEngine::run_system_check`], plus the three probes that populate
 //! it. The contract is consumed verbatim by the Tauri command layer and mirrored
 //! in the Svelte UI; do not reshape it without updating every mirror.
 //!
-//! Design honesty rule: a probe NEVER paints a green check for a subsystem that
-//! does not exist yet. Subsystems that are wired in a later milestone (embeddings,
-//! the vector database) report [`CheckStatus::Pending`] with product-facing copy.
-//! Internal milestone vocabulary (e.g. "M4") lives ONLY in code comments — never
-//! in a user-facing `detail` string. (Embeddings + the vector DB are wired in M4.)
+//! Each of the three checks (LLM runtime, embedding model, text-to-speech) is a
+//! real readiness GATE: it reports [`CheckStatus::Pass`] only when the subsystem
+//! is genuinely usable (a local runtime is reachable OR an equivalent cloud
+//! provider is configured), and [`CheckStatus::Fail`] otherwise. The frontend
+//! disables "Continue to setup" until all three pass.
 //!
 //! Probes never surface an expected-absent subsystem as a [`crate::LensError`]:
-//! absence is a `Fail`/`Pending` status. `LensError` is reserved for genuinely
-//! unexpected failures.
+//! absence is a `Fail` status. `LensError` is reserved for genuinely unexpected
+//! failures.
 
 use std::path::Path;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use sqlx::SqlitePool;
 
 use crate::config::AppConfig;
 
@@ -31,8 +30,15 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434";
 /// Default LM Studio OpenAI-compatible base URL.
 const DEFAULT_LMSTUDIO_BASE_URL: &str = "http://localhost:1234";
-/// Sentinel file used to verify the app data directory is writable.
-const WRITE_SENTINEL_NAME: &str = ".lens_write_test";
+/// Allowlisted embedding model ids the embedding-model gate accepts. Single
+/// source of truth: the Tauri install command imports this same slice, and the
+/// UI's `EMBEDDING_MODELS` list mirrors it (see the SYNC-CHECK there).
+pub const ALLOWED_EMBEDDING_MODELS: &[&str] = &[
+    "nomic-embed-text",
+    "mxbai-embed-large",
+    "all-minilm",
+    "bge-m3",
+];
 /// Upper bound on a probe response body we will buffer + deserialize. A version
 /// string or a model list is tiny; this cap (1 MiB) is defense-in-depth so a
 /// malicious/misconfigured endpoint can't stream an unbounded body into memory.
@@ -40,7 +46,7 @@ const MAX_PROBE_BODY_BYTES: usize = 1024 * 1024;
 
 /// Status of a single system-check row.
 ///
-/// Serializes lowercase: `pass` | `fail` | `pending`.
+/// Serializes lowercase: `pass` | `fail`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckStatus {
@@ -48,26 +54,18 @@ pub enum CheckStatus {
     Pass,
     /// The subsystem is expected but absent / unhealthy.
     Fail,
-    /// The subsystem is intentionally not wired yet (set up later, automatically).
-    Pending,
 }
 
 /// Stable identifier for each system-check row. Drives UI row ordering/mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckId {
-    /// In-process engine + database health.
-    LocalBackend,
-    /// Local LLM runtime (Ollama / LM Studio) detection.
+    /// Local LLM runtime (Ollama / LM Studio) or a configured cloud provider.
     LlmRuntime,
-    /// Embedding model availability (advisory).
+    /// Embedding model availability (allowlisted model installed / configured).
     EmbeddingModel,
-    /// Vector database (built-in, set up automatically later).
-    VectorDatabase,
-    /// Text-to-speech (Kokoro) engine availability.
+    /// Text-to-speech: local Kokoro engine on disk or a configured cloud provider.
     TextToSpeech,
-    /// App-data-directory write permissions.
-    DiskPermissions,
 }
 
 /// Optional UI affordance attached to a check row.
@@ -81,8 +79,6 @@ pub enum CheckAction {
     Configure,
     /// Choose among options (e.g. pick an embedding model).
     Choose,
-    /// Retry the probe.
-    Retry,
 }
 
 /// One row in the system-check screen.
@@ -94,9 +90,9 @@ pub enum CheckAction {
 pub struct CheckResult {
     /// Stable row identifier.
     pub id: CheckId,
-    /// Human-readable row label, e.g. "Local backend".
+    /// Human-readable row label, e.g. "LLM runtime".
     pub label: String,
-    /// Pass / fail / pending.
+    /// Pass / fail.
     pub status: CheckStatus,
     /// Product-facing detail copy. NO internal milestone vocabulary.
     pub detail: String,
@@ -257,15 +253,6 @@ struct OllamaVersion {
 struct OllamaTagModel {
     #[serde(default)]
     name: String,
-    #[serde(default)]
-    details: Option<OllamaModelDetails>,
-}
-
-/// Model details carried by an Ollama tag entry.
-#[derive(Debug, Deserialize)]
-struct OllamaModelDetails {
-    #[serde(default)]
-    family: Option<String>,
 }
 
 /// Shape of Ollama's `GET /api/tags` response.
@@ -275,8 +262,8 @@ struct OllamaTags {
     models: Vec<OllamaTagModel>,
 }
 
-/// Outcome of probing the local LLM runtime, shared between the LLM-runtime row
-/// and the (advisory) embedding-model row so the latter can reuse the tags fetch.
+/// Outcome of probing the local LLM runtime, shared between the LLM-runtime gate
+/// and the embedding-model gate so the latter can reuse the Ollama tags fetch.
 struct LlmRuntimeProbe {
     /// The completed LLM-runtime check row.
     result: CheckResult,
@@ -343,36 +330,15 @@ fn provider_base_url(config: &AppConfig, provider: &str) -> Option<String> {
         .map(|m| m.base_url.trim_end_matches('/').to_string())
 }
 
-/// Probe 1 — in-process engine / database health.
-///
-/// The engine is already constructed, so we only verify the database answers.
-/// No port string is reported: there is no separate service. Takes a cloned
-/// pool (cheap `Arc` clone) so the caller can drop the engine read guard before
-/// running this against the clone.
-async fn probe_local_backend(db: &SqlitePool) -> CheckResult {
-    let healthy = sqlx::query_scalar::<_, i64>("SELECT 1")
-        .fetch_one(db)
-        .await
-        .map(|one| one == 1)
-        .unwrap_or(false);
-
-    if healthy {
-        CheckResult {
-            id: CheckId::LocalBackend,
-            label: "Local backend".to_string(),
-            status: CheckStatus::Pass,
-            detail: "In-process engine ready".to_string(),
-            action: None,
-        }
-    } else {
-        CheckResult {
-            id: CheckId::LocalBackend,
-            label: "Local backend".to_string(),
-            status: CheckStatus::Fail,
-            detail: "Engine database unavailable".to_string(),
-            action: Some(CheckAction::Retry),
-        }
-    }
+/// Returns `true` when `config.models` carries a usable cloud LLM entry: an
+/// `openai-compatible` provider with a non-empty `api_key` AND `model`. This is
+/// the cloud arm of the LLM-runtime gate (the local arm is runtime detection).
+fn has_cloud_llm(config: &AppConfig) -> bool {
+    config.models.iter().any(|m| {
+        m.provider.eq_ignore_ascii_case("openai-compatible")
+            && !m.api_key.is_empty()
+            && !m.model.is_empty()
+    })
 }
 
 /// Detects Ollama via the shared [`probe_ollama_endpoint`] probe, taking just the
@@ -395,13 +361,17 @@ async fn detect_lmstudio(client: &reqwest::Client, base_url: &str) -> bool {
     !probe_openai_endpoint(client, base_url).await.is_empty()
 }
 
-/// Probe 2 — local LLM runtime detection.
+/// Probe 1 — LLM runtime readiness gate.
 ///
-/// Probes Ollama (`/api/version`) and LM Studio (`/v1/models`) CONCURRENTLY via
-/// [`tokio::join!`] so the total wall-clock is one timeout window (connect 1s +
-/// read 2s ⇒ ≤ 2.5s budget), NOT the ~4s of two sequential probes. A clean
-/// connect/timeout failure on both is a `Fail` "not detected", never a
-/// [`crate::LensError`].
+/// PASSES when EITHER a local runtime is reachable OR a cloud provider is
+/// configured:
+///
+/// - local: Ollama (`/api/version`) or LM Studio (`/v1/models`), probed
+///   CONCURRENTLY via [`tokio::join!`] so the wall-clock is one timeout window
+///   (connect 1s + read 2s), NOT the ~4s of two sequential probes; OR
+/// - cloud: a usable `openai-compatible` entry (see [`has_cloud_llm`]).
+///
+/// Otherwise `Fail`. A clean connect/timeout failure is not a [`crate::LensError`].
 async fn probe_llm_runtime(config: &AppConfig) -> LlmRuntimeProbe {
     let client = probe_client();
     let ollama_base = ollama_base_url(config);
@@ -413,27 +383,35 @@ async fn probe_llm_runtime(config: &AppConfig) -> LlmRuntimeProbe {
     );
 
     let ollama_up = ollama_version.is_some();
+    let cloud_ok = has_cloud_llm(config);
 
-    let result = match (ollama_version, lmstudio_up) {
-        (Some(version), _) => CheckResult {
+    let result = match (ollama_version, lmstudio_up, cloud_ok) {
+        (Some(version), _, _) => CheckResult {
             id: CheckId::LlmRuntime,
             label: "LLM runtime".to_string(),
             status: CheckStatus::Pass,
             detail: format!("Ollama {version} detected"),
             action: Some(CheckAction::Configure),
         },
-        (None, true) => CheckResult {
+        (None, true, _) => CheckResult {
             id: CheckId::LlmRuntime,
             label: "LLM runtime".to_string(),
             status: CheckStatus::Pass,
             detail: "LM Studio detected".to_string(),
             action: Some(CheckAction::Configure),
         },
-        (None, false) => CheckResult {
+        (None, false, true) => CheckResult {
+            id: CheckId::LlmRuntime,
+            label: "LLM runtime".to_string(),
+            status: CheckStatus::Pass,
+            detail: "Cloud provider configured".to_string(),
+            action: Some(CheckAction::Configure),
+        },
+        (None, false, false) => CheckResult {
             id: CheckId::LlmRuntime,
             label: "LLM runtime".to_string(),
             status: CheckStatus::Fail,
-            detail: "No local LLM runtime detected".to_string(),
+            detail: "No LLM runtime detected or configured".to_string(),
             action: Some(CheckAction::Configure),
         },
     };
@@ -445,40 +423,52 @@ async fn probe_llm_runtime(config: &AppConfig) -> LlmRuntimeProbe {
     }
 }
 
-/// Probe 3 — embedding model availability (advisory).
+/// Returns `true` when an Ollama model name matches an allowlisted embedding
+/// model (e.g. `"nomic-embed-text:latest"` matches `"nomic-embed-text"`) OR the
+/// user's configured `embedding_model`. Matches on the bare name (ignoring an
+/// `:tag` suffix), case-insensitively.
+fn is_allowlisted_embedding(installed_name: &str, configured: &str) -> bool {
+    let bare = installed_name
+        .split_once(':')
+        .map_or(installed_name, |(name, _tag)| name)
+        .to_ascii_lowercase();
+    ALLOWED_EMBEDDING_MODELS
+        .iter()
+        .any(|m| m.eq_ignore_ascii_case(&bare))
+        || (!configured.is_empty() && configured.eq_ignore_ascii_case(&bare))
+}
+
+/// Probe 2 — embedding-model readiness gate.
 ///
-/// If Ollama is up, fetch `/api/tags` and look for an embed-capable model (name
-/// contains "embed", or details.family is a known embedding family). Present ⇒
-/// `Pass`. Absent-but-Ollama-up ⇒ `Pending` (set up automatically later). Ollama
-/// down ⇒ `Pending` (connect a runtime first). NEVER `Fail` — embeddings are not
-/// an M1 deliverable. (Internal: wired in M4; keep "M4" out of `detail`.)
-async fn probe_embedding_model(client: &reqwest::Client, runtime: &LlmRuntimeProbe) -> CheckResult {
+/// PASSES only when the user has an allowlisted embedding model installed: with
+/// Ollama up, fetch `/api/tags` and match each model's bare name against the
+/// allowlist (or the configured `embedding_model`). If Ollama is unreachable, or
+/// no matching model is installed, the gate `Fail`s with a `Choose` affordance.
+async fn probe_embedding_model(
+    client: &reqwest::Client,
+    runtime: &LlmRuntimeProbe,
+    config: &AppConfig,
+) -> CheckResult {
     let label = "Embedding model".to_string();
+    let fail = || CheckResult {
+        id: CheckId::EmbeddingModel,
+        label: label.clone(),
+        status: CheckStatus::Fail,
+        detail: "No embedding model installed".to_string(),
+        action: Some(CheckAction::Choose),
+    };
 
     if !runtime.ollama_up {
-        return CheckResult {
-            id: CheckId::EmbeddingModel,
-            label,
-            status: CheckStatus::Pending,
-            detail: "Set up automatically after connecting an LLM runtime".to_string(),
-            action: None,
-        };
+        return fail();
     }
 
     let url = format!("{}/api/tags", runtime.ollama_base_url);
     let found = get_json_capped::<OllamaTags>(client, &url)
         .await
         .map(|tags| {
-            tags.models.iter().any(|m| {
-                let name = m.name.to_ascii_lowercase();
-                let family = m
-                    .details
-                    .as_ref()
-                    .and_then(|d| d.family.as_deref())
-                    .unwrap_or("")
-                    .to_ascii_lowercase();
-                name.contains("embed") || matches!(family.as_str(), "bert" | "nomic-bert")
-            })
+            tags.models
+                .iter()
+                .any(|m| is_allowlisted_embedding(&m.name, &config.embedding_model))
         })
         .unwrap_or(false);
 
@@ -487,134 +477,76 @@ async fn probe_embedding_model(client: &reqwest::Client, runtime: &LlmRuntimePro
             id: CheckId::EmbeddingModel,
             label,
             status: CheckStatus::Pass,
-            detail: "Embedding model available".to_string(),
-            action: None,
-        }
-    } else {
-        CheckResult {
-            id: CheckId::EmbeddingModel,
-            label,
-            status: CheckStatus::Pending,
-            detail: "Set up automatically when you add your first source".to_string(),
+            detail: "Embedding model installed".to_string(),
             action: Some(CheckAction::Choose),
         }
+    } else {
+        fail()
     }
 }
 
-/// Probe 4 — vector database (static `Pending`).
-///
-/// The built-in vector store is set up automatically with the first source; we
-/// do NOT pull or initialize it during onboarding. Always `Pending`, no action.
-/// (Internal: M4 flips this to `Pass`; keep "M4" out of `detail`.)
-fn probe_vector_database() -> CheckResult {
-    CheckResult {
-        id: CheckId::VectorDatabase,
-        label: "Vector database".to_string(),
-        status: CheckStatus::Pending,
-        detail: "Built-in (LanceDB) · set up automatically when you add your first source"
-            .to_string(),
-        action: None,
-    }
+/// Returns `true` when a usable cloud TTS provider is configured: ElevenLabs
+/// with a non-empty `api_key`. This is the cloud arm of the TTS gate (the local
+/// arm is the Kokoro-model-on-disk check).
+fn has_cloud_tts(config: &AppConfig) -> bool {
+    config.tts.provider.eq_ignore_ascii_case("elevenlabs") && !config.tts.api_key.is_empty()
 }
 
-/// Probe 5 — text-to-speech (Kokoro) engine availability.
+/// Probe 3 — text-to-speech readiness gate.
 ///
-/// A real, honest probe: the Kokoro ONNX model is ~86 MiB and is downloaded on
-/// demand, so we test for the model file on disk at
+/// PASSES when EITHER the local Kokoro ONNX model is on disk at
 /// `{data_dir}/models/kokoro/model_q8f16.onnx` (the exact path the downloader
-/// writes). Present ⇒ `Pass`; absent ⇒ `Pending` with a "download required"
-/// affordance. Never `Fail` — an absent engine is an expected pre-download state,
-/// not an error.
+/// writes) OR a cloud TTS provider is configured (see [`has_cloud_tts`]).
+/// Otherwise `Fail` with a `Choose` affordance.
 fn probe_text_to_speech(config: &AppConfig) -> CheckResult {
     let model_path = crate::tts::kokoro_model_path(Path::new(&config.paths.data_dir));
 
-    if model_path.is_file() {
-        CheckResult {
-            id: CheckId::TextToSpeech,
-            label: "Text-to-speech".to_string(),
-            status: CheckStatus::Pass,
-            detail: "Kokoro audio engine ready".to_string(),
-            action: Some(CheckAction::Choose),
-        }
+    let (status, detail) = if model_path.is_file() {
+        (CheckStatus::Pass, "Kokoro audio engine ready".to_string())
+    } else if has_cloud_tts(config) {
+        (CheckStatus::Pass, "Cloud voice configured".to_string())
     } else {
-        CheckResult {
-            id: CheckId::TextToSpeech,
-            label: "Text-to-speech".to_string(),
-            status: CheckStatus::Pending,
-            detail: "Kokoro audio engine — download required".to_string(),
-            action: Some(CheckAction::Choose),
-        }
+        (
+            CheckStatus::Fail,
+            "No text-to-speech engine configured".to_string(),
+        )
+    };
+
+    CheckResult {
+        id: CheckId::TextToSpeech,
+        label: "Text-to-speech".to_string(),
+        status,
+        detail,
+        action: Some(CheckAction::Choose),
     }
 }
 
-/// Probe 6 — app-data-directory write permissions.
+/// Runs the three system-check probes and returns them in the fixed row order:
+/// LlmRuntime, EmbeddingModel, TextToSpeech.
 ///
-/// Writes then deletes a sentinel file in the configured data directory. Success
-/// ⇒ `Pass` with the resolved path; failure ⇒ `Fail` with a retry affordance.
-async fn probe_disk_permissions(config: &AppConfig) -> CheckResult {
-    let label = "Disk permissions".to_string();
-    let data_dir = config.paths.data_dir.clone();
-
-    match write_test_sentinel(Path::new(&data_dir)) {
-        Ok(()) => CheckResult {
-            id: CheckId::DiskPermissions,
-            label,
-            status: CheckStatus::Pass,
-            detail: data_dir,
-            action: None,
-        },
-        Err(_) => CheckResult {
-            id: CheckId::DiskPermissions,
-            label,
-            status: CheckStatus::Fail,
-            detail: "Cannot write to app data directory".to_string(),
-            action: Some(CheckAction::Retry),
-        },
-    }
-}
-
-/// Writes and removes a sentinel file in `dir`, proving it is writable.
-fn write_test_sentinel(dir: &Path) -> std::io::Result<()> {
-    let path = dir.join(WRITE_SENTINEL_NAME);
-    std::fs::write(&path, b"lens-write-test")?;
-    std::fs::remove_file(&path)
-}
-
-/// Runs all six system-check probes concurrently and returns them in the fixed
-/// row order: LocalBackend, LlmRuntime, EmbeddingModel, VectorDatabase,
-/// TextToSpeech, DiskPermissions.
+/// The probes run SEQUENTIALLY here: the LLM-runtime probe first (it concurrently
+/// probes Ollama + LM Studio internally), then the embedding-model probe — which
+/// REUSES the LLM probe's Ollama outcome (`ollama_up` + base URL), so it must run
+/// after it — and finally the synchronous text-to-speech probe (a filesystem +
+/// config check, no I/O). The dominant cost is the single bounded LLM timeout
+/// window.
 ///
-/// Probes run via [`tokio::join!`] so the wall-clock cost is roughly the slowest
-/// probe (the bounded LLM timeout window), not the sum of all probes.
-///
-/// Takes a `&AppConfig` + `&SqlitePool` rather than the engine handle: the
-/// caller clones both cheaply under the engine read guard and DROPS the guard
-/// before calling here, so the multi-second HTTP probes never hold the engine
-/// lock (which would block concurrent `get_config`/`set_config`).
-pub(crate) async fn run_system_check(config: &AppConfig, db: &SqlitePool) -> Vec<CheckResult> {
+/// Takes a `&AppConfig` — the caller clones it cheaply under the engine read
+/// guard and DROPS the guard before calling here, so the multi-second HTTP
+/// probes never hold the engine lock (which would block concurrent
+/// `get_config`/`set_config`).
+pub(crate) async fn run_system_check(config: &AppConfig) -> Vec<CheckResult> {
     let embed_client = probe_client();
 
     // The embedding probe reuses the LLM-runtime outcome, so it is awaited after
-    // the LLM probe within this future; the other three run truly concurrently.
-    let llm_and_embed = async {
-        let runtime = probe_llm_runtime(config).await;
-        let embedding = probe_embedding_model(&embed_client, &runtime).await;
-        (runtime.result, embedding)
-    };
-
-    let (local_backend, (llm_runtime, embedding_model), disk_permissions) = tokio::join!(
-        probe_local_backend(db),
-        llm_and_embed,
-        probe_disk_permissions(config),
-    );
+    // the LLM probe within this future.
+    let runtime = probe_llm_runtime(config).await;
+    let embedding_model = probe_embedding_model(&embed_client, &runtime, config).await;
 
     vec![
-        local_backend,
-        llm_runtime,
+        runtime.result,
         embedding_model,
-        probe_vector_database(),
         probe_text_to_speech(config),
-        disk_permissions,
     ]
 }
 
@@ -722,15 +654,84 @@ mod tests {
         // the freed ephemeral port can be re-bound by a concurrent test's mock
         // server, which then answers 200 and flips this to Pass (observed in CI).
         // Nothing binds 127.0.0.1:1, so the connection is deterministically
-        // refused → both runtimes absent → Fail.
+        // refused → both runtimes absent + no cloud configured → Fail.
         let dead_url = "http://127.0.0.1:1";
         let config = config_with_runtimes(dead_url, dead_url);
         let probe = probe_llm_runtime(&config).await;
 
         assert_eq!(probe.result.status, CheckStatus::Fail);
         assert!(!probe.ollama_up);
-        assert_eq!(probe.result.detail, "No local LLM runtime detected");
+        assert_eq!(probe.result.detail, "No LLM runtime detected or configured");
         assert_eq!(probe.result.action, Some(CheckAction::Configure));
+    }
+
+    #[tokio::test]
+    async fn llm_runtime_pass_when_cloud_provider_configured() {
+        // No local runtime reachable, but a usable openai-compatible cloud entry
+        // (provider + api_key + model) satisfies the gate.
+        let dead_url = "http://127.0.0.1:1";
+        let mut config = config_with_runtimes(dead_url, dead_url);
+        config.models.push(ModelConfig {
+            provider: "openai-compatible".to_string(),
+            base_url: "https://api.openai.com/v1".to_string(),
+            model: "gpt-4o".to_string(),
+            api_key: "sk-cloud".to_string(),
+            ..ModelConfig::default()
+        });
+
+        let probe = probe_llm_runtime(&config).await;
+        assert_eq!(probe.result.status, CheckStatus::Pass);
+        assert_eq!(probe.result.detail, "Cloud provider configured");
+    }
+
+    #[test]
+    fn has_cloud_llm_requires_key_and_model() {
+        // Missing api_key ⇒ not usable.
+        let mut config = AppConfig::default();
+        config.models.push(ModelConfig {
+            provider: "openai-compatible".to_string(),
+            model: "gpt-4o".to_string(),
+            ..ModelConfig::default()
+        });
+        assert!(!has_cloud_llm(&config));
+
+        // Missing model ⇒ not usable.
+        config.models[0].model = String::new();
+        config.models[0].api_key = "sk-cloud".to_string();
+        assert!(!has_cloud_llm(&config));
+
+        // Both present ⇒ usable.
+        config.models[0].model = "gpt-4o".to_string();
+        assert!(has_cloud_llm(&config));
+    }
+
+    #[test]
+    fn has_cloud_tts_requires_elevenlabs_and_key() {
+        // Empty api_key ⇒ not usable, even with the right provider.
+        let mut config = AppConfig::default();
+        config.tts = crate::config::TtsConfig {
+            provider: "elevenlabs".to_string(),
+            api_key: String::new(),
+        };
+        assert!(!has_cloud_tts(&config));
+
+        // Wrong provider + a valid key ⇒ not usable.
+        config.tts = crate::config::TtsConfig {
+            provider: "openai".to_string(),
+            api_key: "sk-key".to_string(),
+        };
+        assert!(!has_cloud_tts(&config));
+
+        // Mixed-case "ElevenLabs" + key ⇒ usable (provider match is case-insensitive).
+        config.tts = crate::config::TtsConfig {
+            provider: "ElevenLabs".to_string(),
+            api_key: "sk-key".to_string(),
+        };
+        assert!(has_cloud_tts(&config));
+
+        // Canonical "elevenlabs" + key ⇒ usable.
+        config.tts.provider = "elevenlabs".to_string();
+        assert!(has_cloud_tts(&config));
     }
 
     #[tokio::test]
@@ -783,7 +784,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn embedding_pass_when_embed_model_present() {
+    async fn embedding_pass_when_allowlisted_model_present() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/tags"))
@@ -795,18 +796,21 @@ mod tests {
 
         let client = probe_client();
         let runtime = LlmRuntimeProbe {
-            result: probe_local_backend_placeholder(),
+            result: llm_runtime_placeholder(),
             ollama_up: true,
             ollama_base_url: server.uri(),
         };
-        let result = probe_embedding_model(&client, &runtime).await;
+        let result = probe_embedding_model(&client, &runtime, &AppConfig::default()).await;
 
         assert_eq!(result.status, CheckStatus::Pass);
-        assert!(!result.detail.contains("M4"));
+        assert_eq!(result.action, Some(CheckAction::Choose));
+        assert_eq!(result.detail, "Embedding model installed");
     }
 
     #[tokio::test]
-    async fn embedding_pending_when_no_embed_model() {
+    async fn embedding_fail_when_no_allowlisted_model() {
+        // An installed-but-not-allowlisted model (e.g. a chat model) does NOT
+        // satisfy the gate.
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/tags"))
@@ -818,52 +822,57 @@ mod tests {
 
         let client = probe_client();
         let runtime = LlmRuntimeProbe {
-            result: probe_local_backend_placeholder(),
+            result: llm_runtime_placeholder(),
             ollama_up: true,
             ollama_base_url: server.uri(),
         };
-        let result = probe_embedding_model(&client, &runtime).await;
+        let result = probe_embedding_model(&client, &runtime, &AppConfig::default()).await;
 
-        assert_eq!(result.status, CheckStatus::Pending);
+        assert_eq!(result.status, CheckStatus::Fail);
         assert_eq!(result.action, Some(CheckAction::Choose));
-        assert!(!result.detail.contains("M4"));
+        assert_eq!(result.detail, "No embedding model installed");
     }
 
     #[tokio::test]
-    async fn embedding_pending_when_ollama_down() {
+    async fn embedding_fail_when_ollama_down() {
         let client = probe_client();
         let runtime = LlmRuntimeProbe {
-            result: probe_local_backend_placeholder(),
+            result: llm_runtime_placeholder(),
             ollama_up: false,
             ollama_base_url: DEFAULT_OLLAMA_BASE_URL.to_string(),
         };
-        let result = probe_embedding_model(&client, &runtime).await;
+        let result = probe_embedding_model(&client, &runtime, &AppConfig::default()).await;
 
-        assert_eq!(result.status, CheckStatus::Pending);
-        assert!(!result.detail.contains("M4"));
+        assert_eq!(result.status, CheckStatus::Fail);
     }
 
     #[test]
-    fn vector_database_is_always_pending() {
-        let result = probe_vector_database();
-        assert_eq!(result.status, CheckStatus::Pending);
-        assert_eq!(result.action, None);
-        assert!(!result.detail.contains("M4"));
-        assert!(result.detail.contains("LanceDB"));
+    fn allowlisted_embedding_matches_bare_name_and_config() {
+        // Tagged allowlist name matches its bare form.
+        assert!(is_allowlisted_embedding("nomic-embed-text:latest", ""));
+        assert!(is_allowlisted_embedding("BGE-M3", ""));
+        // A non-allowlisted name only matches when it equals the configured id.
+        assert!(!is_allowlisted_embedding("my-custom-embed:latest", ""));
+        assert!(is_allowlisted_embedding(
+            "my-custom-embed:latest",
+            "my-custom-embed"
+        ));
+        // A non-embed chat model never matches.
+        assert!(!is_allowlisted_embedding("llama3:latest", ""));
     }
 
     #[test]
-    fn text_to_speech_pending_when_model_absent() {
-        // A fresh data dir has no Kokoro model on disk ⇒ Pending + Choose.
+    fn text_to_speech_fail_when_nothing_configured() {
+        // A fresh data dir has no Kokoro model on disk + no cloud TTS ⇒ Fail.
         let dir = tempfile::tempdir().unwrap();
         let mut config = AppConfig::default();
         config.paths.data_dir = dir.path().display().to_string();
 
         let result = probe_text_to_speech(&config);
         assert_eq!(result.id, CheckId::TextToSpeech);
-        assert_eq!(result.status, CheckStatus::Pending);
+        assert_eq!(result.status, CheckStatus::Fail);
         assert_eq!(result.action, Some(CheckAction::Choose));
-        assert_eq!(result.detail, "Kokoro audio engine — download required");
+        assert_eq!(result.detail, "No text-to-speech engine configured");
     }
 
     #[test]
@@ -882,29 +891,24 @@ mod tests {
         assert_eq!(result.detail, "Kokoro audio engine ready");
     }
 
-    #[tokio::test]
-    async fn disk_permissions_pass_on_writable_dir() {
+    #[test]
+    fn text_to_speech_pass_when_cloud_configured() {
+        // No local model on disk, but an ElevenLabs cloud key satisfies the gate.
         let dir = tempfile::tempdir().unwrap();
         let mut config = AppConfig::default();
         config.paths.data_dir = dir.path().display().to_string();
+        config.tts = crate::config::TtsConfig {
+            provider: "elevenlabs".to_string(),
+            api_key: "sk-elevenlabs".to_string(),
+        };
 
-        let result = probe_disk_permissions(&config).await;
+        let result = probe_text_to_speech(&config);
         assert_eq!(result.status, CheckStatus::Pass);
-        assert_eq!(result.detail, dir.path().display().to_string());
+        assert_eq!(result.detail, "Cloud voice configured");
     }
 
     #[tokio::test]
-    async fn disk_permissions_fail_on_missing_dir() {
-        let mut config = AppConfig::default();
-        config.paths.data_dir = "/nonexistent/lens/data/dir/that/should/not/exist".to_string();
-
-        let result = probe_disk_permissions(&config).await;
-        assert_eq!(result.status, CheckStatus::Fail);
-        assert_eq!(result.action, Some(CheckAction::Retry));
-    }
-
-    #[tokio::test]
-    async fn run_system_check_returns_six_rows_in_order() {
+    async fn run_system_check_returns_three_rows_in_order() {
         let engine = crate::LensEngine::for_test().await;
         let dir = tempfile::tempdir().unwrap();
         {
@@ -917,25 +921,11 @@ mod tests {
         assert_eq!(
             ids,
             vec![
-                CheckId::LocalBackend,
                 CheckId::LlmRuntime,
                 CheckId::EmbeddingModel,
-                CheckId::VectorDatabase,
                 CheckId::TextToSpeech,
-                CheckId::DiskPermissions,
             ]
         );
-        // No user-facing detail leaks internal milestone vocabulary.
-        for r in &results {
-            assert!(
-                !r.detail.contains("M4"),
-                "detail for {:?} leaked milestone vocab: {}",
-                r.id,
-                r.detail
-            );
-        }
-        // Local backend is healthy for a migrated test engine.
-        assert_eq!(results[0].status, CheckStatus::Pass);
     }
 
     /// Snapshot the exact serde wire-format of `CheckResult`. Locks the FROZEN
@@ -965,17 +955,17 @@ mod tests {
     #[test]
     fn check_result_no_action_serializes_null() {
         let result = CheckResult {
-            id: CheckId::VectorDatabase,
-            label: "Vector database".to_string(),
-            status: CheckStatus::Pending,
+            id: CheckId::EmbeddingModel,
+            label: "Embedding model".to_string(),
+            status: CheckStatus::Fail,
             detail: "Built-in".to_string(),
             action: None,
         };
         insta::assert_json_snapshot!(result, @r#"
         {
-          "id": "vector_database",
-          "label": "Vector database",
-          "status": "pending",
+          "id": "embedding_model",
+          "label": "Embedding model",
+          "status": "fail",
           "detail": "Built-in",
           "action": null
         }
@@ -984,7 +974,7 @@ mod tests {
 
     /// Test helper: a throwaway `CheckResult` to fill the unused `result` field
     /// of an `LlmRuntimeProbe` fixture in the embedding-probe tests.
-    fn probe_local_backend_placeholder() -> CheckResult {
+    fn llm_runtime_placeholder() -> CheckResult {
         CheckResult {
             id: CheckId::LlmRuntime,
             label: "LLM runtime".to_string(),
