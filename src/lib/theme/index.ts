@@ -17,6 +17,7 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { setMode } from 'mode-watcher';
 import type { AppConfig } from './types.js';
+import { updateConfig } from '$lib/config.js';
 
 // mode-watcher's `Mode` union is not re-exported from the package root, so we
 // mirror it locally (matches `modes = ["dark", "light", "system"]` upstream).
@@ -89,11 +90,8 @@ export function setPersistErrorHandler(handler: PersistErrorHandler | null): voi
  * reverted, so we never silently diverge the durable store from the UI.
  */
 async function flush(theme: string): Promise<void> {
-  if (!isTauri()) return;
   try {
-    const current = await invoke<AppConfig>('get_config');
-    const next: AppConfig = { ...current, theme };
-    await invoke<void>('set_config', { config: next });
+    await updateConfig((current) => ({ ...current, theme }));
   } catch (err) {
     console.error('persistTheme: failed to write AppConfig.theme', err);
     onError?.(err);

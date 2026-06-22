@@ -37,4 +37,6 @@ export interface AppConfig {
   paths: PathConfig;
   tier_thresholds: TierThresholds;
   onboarding_complete: boolean;
+  // SYNC-CHECK: must match lens-core/src/config.rs AppConfig.embedding_model (default "").
+  embedding_model: string;
 }

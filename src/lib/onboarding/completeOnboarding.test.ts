@@ -23,7 +23,8 @@ function fullConfig(onboarding_complete: boolean): AppConfig {
     voices: { host: 'host-voice', guest: 'guest-voice' },
     paths: { data_dir: '/Users/x/Library/Application Support/Lens' },
     tier_thresholds: { tier1_token_cap: 4000, tier2_token_cap: 16000 },
-    onboarding_complete
+    onboarding_complete,
+    embedding_model: ''
   };
 }
 

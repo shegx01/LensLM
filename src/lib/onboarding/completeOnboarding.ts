@@ -12,17 +12,14 @@
 // NO navigation. Keeping these helpers persistence-only makes them testable
 // without a router and reusable from a settings/showcase reset entry.
 
-import { invoke, isTauri } from '@tauri-apps/api/core';
-import type { AppConfig } from '$lib/theme/types.js';
+import { updateConfig } from '$lib/config.js';
 
 /**
  * Read-modify-write `onboarding_complete` while preserving every other field.
  * Guarded for `ssr=false` / tests-without-Tauri: a no-op when not under Tauri.
  */
 async function setOnboardingComplete(complete: boolean): Promise<void> {
-  if (!isTauri()) return;
-  const cfg = await invoke<AppConfig>('get_config');
-  await invoke<void>('set_config', { config: { ...cfg, onboarding_complete: complete } });
+  await updateConfig((cfg) => ({ ...cfg, onboarding_complete: complete }));
 }
 
 /**
