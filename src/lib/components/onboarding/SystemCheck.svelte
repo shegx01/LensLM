@@ -8,6 +8,7 @@
   import Moon from '@lucide/svelte/icons/moon';
   import Monitor from '@lucide/svelte/icons/monitor';
   import { Button } from '$lib/components/ui/button/index.js';
+  import { Card } from '$lib/components/ui/card/index.js';
   import SystemCheckRow from '$lib/components/onboarding/SystemCheckRow.svelte';
   import {
     runSystemCheck,
@@ -103,7 +104,10 @@
 </div>
 
 <main class="flex min-h-svh items-center justify-center p-6">
-  <div class="w-full max-w-lg flex flex-col gap-4">
+  <!-- Per design: the whole onboarding sits inside ONE outer card (540px,
+       14px radius, soft shadow, 36/40/32 padding). The check rows are inner
+       surface cards; the footer stays plain (not its own card). -->
+  <Card class="w-full max-w-[540px] gap-4 rounded-[14px] px-10 pt-9 pb-8 shadow-2xl ring-0">
     <!-- Header -->
     <div class="flex flex-col items-center text-center gap-3 pb-2">
       <div
@@ -164,5 +168,5 @@
         <ArrowRight />
       </Button>
     </div>
-  </div>
+  </Card>
 </main>
