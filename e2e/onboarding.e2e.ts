@@ -20,7 +20,7 @@ test('first run renders the System check screen and all six rows at /', async ({
   await expect(page.getByText('Embedding model', { exact: true })).toBeVisible();
   await expect(page.getByText('Vector database', { exact: true })).toBeVisible();
   await expect(page.getByText('Disk permissions', { exact: true })).toBeVisible();
-  // Synthetic 6th row added by the UI layer
+  // 6th row (text_to_speech) now returned by the backend run_system_check.
   await expect(page.getByText('Text-to-speech', { exact: true })).toBeVisible();
 });
 

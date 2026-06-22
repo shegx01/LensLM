@@ -12,23 +12,13 @@
   import {
     runSystemCheck,
     type CheckResult,
-    type CheckAction,
-    type CheckId
+    type CheckAction
   } from '$lib/onboarding/system-check.js';
   import { completeOnboarding } from '$lib/onboarding/completeOnboarding.js';
   import { setMode, userPrefersMode } from 'mode-watcher';
   import { persistTheme, type Mode } from '$lib/theme/index.js';
 
   let { oncomplete }: { oncomplete: () => void } = $props();
-
-  // Synthetic TTS row added in the UI layer (Rust returns 5 rows, we add the 6th)
-  const TTS_ROW: CheckResult = {
-    id: 'text_to_speech' as CheckId,
-    label: 'Text-to-speech',
-    status: 'pending',
-    detail: 'Kokoro audio engine — download required',
-    action: 'choose'
-  };
 
   let results = $state<CheckResult[]>([]);
   let loading = $state(true);
@@ -50,8 +40,9 @@
     loading = true;
     checkError = null;
     try {
-      const raw = await runSystemCheck();
-      results = [...raw, TTS_ROW];
+      // run_system_check now returns all six rows (including text_to_speech) from
+      // the backend; render them directly. Re-checks flip the TTS row pass↔pending.
+      results = await runSystemCheck();
     } catch (err) {
       console.error('SystemCheck: runSystemCheck failed', err);
       results = [];
@@ -160,7 +151,7 @@
         <p class="text-destructive w-full text-center text-sm" role="alert">{continueError}</p>
       {/if}
       {#if !loading && !checkError}
-        <p class="text-muted-foreground w-full text-center text-[11px]">
+        <p class="text-muted-foreground w-full text-center text-[0.6875rem]">
           {readyCount} of {totalCount} checks passed
         </p>
       {/if}

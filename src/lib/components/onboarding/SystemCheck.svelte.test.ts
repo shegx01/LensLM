@@ -39,6 +39,13 @@ const ALL_PASS: CheckResult[] = [
     status: 'pass',
     detail: '~/Library/Application Support/Lens',
     action: null
+  },
+  {
+    id: 'text_to_speech',
+    label: 'Text-to-speech',
+    status: 'pending',
+    detail: 'Kokoro audio engine — download required',
+    action: 'choose'
   }
 ];
 
@@ -65,7 +72,7 @@ afterEach(() => {
 });
 
 describe('SystemCheck', () => {
-  it('renders the System check title and all rows from runSystemCheck (+ synthetic TTS row)', async () => {
+  it('renders the System check title and all six rows returned by runSystemCheck', async () => {
     mockIPC((cmd) => {
       if (cmd === 'run_system_check') return ALL_PASS;
     });
@@ -73,7 +80,7 @@ describe('SystemCheck', () => {
     expect(screen.getByText('System check')).toBeInTheDocument();
     await waitFor(() => expect(screen.getByText('Local backend')).toBeInTheDocument());
     expect(screen.getByText('Vector database')).toBeInTheDocument();
-    // Synthetic TTS row is always appended by the component
+    // The TTS row now comes from the backend (6th row), not synthesized by the UI.
     expect(screen.getByText('Text-to-speech')).toBeInTheDocument();
   });
 
@@ -109,7 +116,8 @@ describe('SystemCheck', () => {
           voices: { host: '', guest: '' },
           paths: { data_dir: '' },
           tier_thresholds: { tier1_token_cap: 4000, tier2_token_cap: 16000 },
-          onboarding_complete: false
+          onboarding_complete: false,
+          embedding_model: ''
         };
       }
       if (cmd === 'set_config') {
@@ -160,8 +168,8 @@ describe('SystemCheck', () => {
       if (cmd === 'run_system_check') return ALL_PASS;
     });
     render(SystemCheck, { props: { oncomplete: vi.fn() } });
-    // ALL_PASS = 3 pass (backend, llm, disk) + 2 pending (embedding, vector) from IPC
-    // + 1 pending synthetic TTS row = 3 of 6 total.
+    // ALL_PASS (6 backend rows) = 3 pass (backend, llm, disk) + 3 pending
+    // (embedding, vector, text_to_speech) → 3 of 6.
     await waitFor(() => expect(screen.getByText('3 of 6 checks passed')).toBeInTheDocument());
   });
 

@@ -33,6 +33,7 @@ export type AppConfig = {
   paths: PathConfig;
   tier_thresholds: TierThresholds;
   onboarding_complete: boolean;
+  embedding_model: string;
 };
 
 // SYNC-CHECK: must match src/lib/onboarding/system-check.ts CheckResult
@@ -54,15 +55,17 @@ export function makeConfig(onboardingComplete: boolean): AppConfig {
     voices: { host: '', guest: '' },
     paths: { data_dir: '' },
     tier_thresholds: { tier1_token_cap: 4000, tier2_token_cap: 16000 },
-    onboarding_complete: onboardingComplete
+    onboarding_complete: onboardingComplete,
+    embedding_model: ''
   };
 }
 
 /**
- * Five rows mirroring the frozen CheckResult contract (snake_case ids, lowercase
- * statuses). A deliberate mix of pass / fail / pending exercises icon + action
- * rendering. local_backend + disk_permissions stay `pass` so Continue is NOT
- * blocked (gating predicate, plan change #12).
+ * Six rows mirroring the frozen CheckResult contract (snake_case ids, lowercase
+ * statuses) — the backend now returns text_to_speech too. A deliberate mix of
+ * pass / fail / pending exercises icon + action rendering. local_backend +
+ * disk_permissions stay `pass` so Continue is NOT blocked (gating predicate,
+ * plan change #12).
  */
 export const DEFAULT_CHECKS: CheckResult[] = [
   {
@@ -99,6 +102,13 @@ export const DEFAULT_CHECKS: CheckResult[] = [
     status: 'pass',
     detail: '/tmp/lens',
     action: null
+  },
+  {
+    id: 'text_to_speech',
+    label: 'Text-to-speech',
+    status: 'pending',
+    detail: 'Kokoro audio engine — download required',
+    action: 'choose'
   }
 ];
 
