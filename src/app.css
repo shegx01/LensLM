@@ -90,6 +90,11 @@
   --purple-600: oklch(0.4773 0.2225 286.79); /* #5d33d0 */
   --purple-fg: oklch(0.9725 0.012 286.8); /* near-white on purple */
 
+  /* --- Primitive ramp (blue) --- */
+  --blue-500: oklch(0.6231 0.188 255.53); /* light/base blue */
+  --blue-600: oklch(0.5418 0.1976 255.53); /* darker blue — dark-mode accent */
+  --blue-fg: oklch(0.972 0.012 255); /* near-white on blue */
+
   /* --- Primitive (amber, warning) --- */
   --amber-500: oklch(0.7686 0.1647 70.08); /* warning amber */
   --amber-fg: oklch(0.2 0.05 70); /* text on amber */
@@ -226,14 +231,22 @@
 }
 
 [data-accent='blue'] {
-  --blue-500: oklch(0.6231 0.188 255.53);
-  --blue-fg: oklch(0.972 0.012 255);
   --primary: var(--blue-500);
   --primary-foreground: var(--blue-fg);
   --ring: var(--blue-500);
   --sidebar-primary: var(--blue-500);
   --sidebar-primary-foreground: var(--blue-fg);
   --sidebar-ring: var(--blue-500);
+}
+
+.dark[data-accent='blue'],
+[data-accent='blue'] .dark {
+  --primary: var(--blue-600);
+  --primary-foreground: var(--blue-fg);
+  --ring: var(--blue-600);
+  --sidebar-primary: var(--blue-600);
+  --sidebar-primary-foreground: var(--blue-fg);
+  --sidebar-ring: var(--blue-600);
 }
 
 @theme inline {

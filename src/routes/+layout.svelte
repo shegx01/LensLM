@@ -38,8 +38,13 @@
       // Single read drives theme reconciliation...
       await loadThemeFromConfig(cfg);
       // ...the persisted accent (drives the [data-accent] token layer; the
-      // picker UI lands in a later milestone, so we only apply here)...
-      document.documentElement.dataset.accent = cfg.accent || 'purple';
+      // picker UI lands in a later milestone, so we only apply here). Validate
+      // against the known accents so a hand-edited/unknown value can't drop us
+      // into an undefined token state — fall back to 'purple'.
+      const ACCENTS = ['purple', 'green', 'blue'];
+      document.documentElement.dataset.accent = ACCENTS.includes(cfg.accent)
+        ? cfg.accent
+        : 'purple';
       // ...and the onboarding gate.
       onboardingComplete = cfg.onboarding_complete;
     } catch (err) {
