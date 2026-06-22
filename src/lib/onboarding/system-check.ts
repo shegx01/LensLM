@@ -6,7 +6,7 @@
 // (NO `CheckAction::None` variant) maps to `action: ... | null` here — absence
 // of an action is `null`, never a string.
 
-import { invoke, isTauri } from '@tauri-apps/api/core';
+import { Channel, invoke, isTauri } from '@tauri-apps/api/core';
 
 export type CheckId =
   | 'local_backend'
@@ -68,9 +68,28 @@ export interface TtsVoice {
   gender: 'male' | 'female';
 }
 
-// SYNC-CHECK: contract — Rust side to implement invoke('download_tts_engine')
-// and invoke('install_embedding_model', { model: string })
-// These use streaming progress channels — UI polls a progress state.
+// SYNC-CHECK: must match lens-core/src/embedding.rs InstallProgress
+//
+// One progress event from `install_embedding_model`. Mirrors the NDJSON status
+// lines Ollama emits during `POST /api/pull`: `status` is its own string (e.g.
+// "pulling manifest", "downloading", "success"); `completed`/`total` are the
+// per-layer byte counters (absent on status-only lines).
+export interface InstallProgress {
+  status: string;
+  completed: number | null;
+  total: number | null;
+}
+
+// SYNC-CHECK: must match lens-core/src/tts.rs DownloadProgress
+//
+// One progress event from `download_tts_engine`. `received` is bytes written so
+// far, `total` is the advertised Content-Length (or null), `done` flips true on
+// the final event (including the idempotent already-present fast path).
+export interface DownloadProgress {
+  received: number;
+  total: number | null;
+  done: boolean;
+}
 
 export type EmbeddingModelId = 'nomic-embed-text' | 'mxbai-embed-large' | 'all-minilm' | 'bge-m3';
 
@@ -118,34 +137,53 @@ export const EMBEDDING_MODELS: EmbeddingModelSpec[] = [
   }
 ];
 
-/** Install an embedding model. Contract — Rust invoke to be implemented. */
+/** Clamp a 0..1 ratio to an integer 0..100 percentage. */
+function toPct(completed: number | null, total: number | null): number | null {
+  if (completed === null || total === null || total <= 0) return null;
+  return Math.min(100, Math.max(0, Math.round((completed / total) * 100)));
+}
+
+/**
+ * Install an embedding model via the real `install_embedding_model` command,
+ * streaming Ollama pull progress over a {@link Channel}. The panel-facing
+ * `onProgress(pct)` is fed a 0–100 percentage derived from the byte counters
+ * (held at the last known value on status-only lines that carry no counters).
+ *
+ * Outside Tauri (component tests / `vite dev`) this is a no-op that resolves
+ * immediately — there is no native backend and no fake progress to simulate.
+ */
 export async function installEmbeddingModel(
   model: EmbeddingModelId,
   onProgress: (pct: number) => void
 ): Promise<void> {
-  if (!isTauri()) {
-    // Simulate progress in non-Tauri context for dev/test
-    for (let i = 0; i <= 100; i += 10) {
-      onProgress(i);
-      await new Promise((r) => setTimeout(r, 50));
-    }
-    return;
-  }
-  // Real: invoke('install_embedding_model', { model }) with Channel progress
-  // For now stub — replace with Channel when Rust side is ready
-  await invoke<void>('install_embedding_model', { model });
+  if (!isTauri()) return;
+  const channel = new Channel<InstallProgress>();
+  let lastPct = 0;
+  channel.onmessage = (p) => {
+    const pct = toPct(p.completed, p.total);
+    if (pct !== null) lastPct = pct;
+    onProgress(lastPct);
+  };
+  await invoke<void>('install_embedding_model', { model, onProgress: channel });
 }
 
-/** Download TTS engine (Kokoro). Contract — Rust invoke to be implemented. */
+/**
+ * Download the Kokoro TTS engine via the real `download_tts_engine` command,
+ * streaming byte progress over a {@link Channel}. The panel-facing
+ * `onProgress(pct)` is fed a 0–100 percentage from `received/total`; when the
+ * total is unknown we surface the terminal `done` event as 100.
+ *
+ * Outside Tauri this is a no-op that resolves immediately.
+ */
 export async function downloadTtsEngine(onProgress: (pct: number) => void): Promise<void> {
-  if (!isTauri()) {
-    for (let i = 0; i <= 100; i += 10) {
-      onProgress(i);
-      await new Promise((r) => setTimeout(r, 50));
-    }
-    return;
-  }
-  await invoke<void>('download_tts_engine');
+  if (!isTauri()) return;
+  const channel = new Channel<DownloadProgress>();
+  channel.onmessage = (p) => {
+    const pct = toPct(p.received, p.total);
+    if (pct !== null) onProgress(pct);
+    else if (p.done) onProgress(100);
+  };
+  await invoke<void>('download_tts_engine', { onProgress: channel });
 }
 
 /** List available TTS voices (Kokoro). Contract — Rust invoke to be implemented. */

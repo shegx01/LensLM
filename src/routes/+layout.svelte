@@ -37,6 +37,9 @@
       const cfg = await invoke<AppConfig>('get_config');
       // Single read drives theme reconciliation...
       await loadThemeFromConfig(cfg);
+      // ...the persisted accent (drives the [data-accent] token layer; the
+      // picker UI lands in a later milestone, so we only apply here)...
+      document.documentElement.dataset.accent = cfg.accent || 'purple';
       // ...and the onboarding gate.
       onboardingComplete = cfg.onboarding_complete;
     } catch (err) {

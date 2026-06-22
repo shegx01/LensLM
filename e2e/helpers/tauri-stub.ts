@@ -26,6 +26,7 @@ export type PathConfig = { data_dir: string };
 export type TierThresholds = { tier1_token_cap: number; tier2_token_cap: number };
 export type AppConfig = {
   theme: string;
+  accent: string;
   models: ModelConfig[];
   endpoints: Record<string, string>;
   voices: VoiceConfig;
@@ -47,6 +48,7 @@ export type CheckResult = {
 export function makeConfig(onboardingComplete: boolean): AppConfig {
   return {
     theme: 'dark',
+    accent: 'purple',
     models: [],
     endpoints: {},
     voices: { host: '', guest: '' },
@@ -145,12 +147,31 @@ export async function installTauriStub(
               // Default stub: not reachable (safe — no local server in CI).
               // Override via page.addInitScript if a test needs a reachable stub.
               return Promise.resolve({ reachable: false, version: null, models: [] });
-            case 'install_embedding_model':
+            case 'install_embedding_model': {
+              // Real command streams InstallProgress { status, completed, total }
+              // over a Channel passed as `onProgress`. In the stub the arg is the
+              // live Channel instance (not yet IPC-serialized), so we drive its
+              // onmessage directly to exercise the progress path, then resolve.
+              const ch = args?.onProgress as { onmessage?: (m: unknown) => void } | undefined;
+              ch?.onmessage?.({ status: 'pulling manifest', completed: null, total: null });
+              ch?.onmessage?.({ status: 'downloading', completed: 5000, total: 10000 });
+              ch?.onmessage?.({ status: 'success', completed: 10000, total: 10000 });
               return Promise.resolve(null);
-            case 'download_tts_engine':
+            }
+            case 'download_tts_engine': {
+              // Real command streams DownloadProgress { received, total, done }.
+              const ch = args?.onProgress as { onmessage?: (m: unknown) => void } | undefined;
+              ch?.onmessage?.({ received: 0, total: 90000000, done: false });
+              ch?.onmessage?.({ received: 45000000, total: 90000000, done: false });
+              ch?.onmessage?.({ received: 90000000, total: 90000000, done: true });
               return Promise.resolve(null);
+            }
             case 'list_tts_voices':
-              return Promise.resolve([]);
+              // Mirror the real Kokoro catalog shape (TtsVoice { id, name, gender }).
+              return Promise.resolve([
+                { id: 'af_heart', name: 'Heart', gender: 'female' },
+                { id: 'am_michael', name: 'Michael', gender: 'male' }
+              ]);
             default:
               return Promise.resolve(null);
           }

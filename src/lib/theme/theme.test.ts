@@ -8,6 +8,7 @@ import type { AppConfig } from './types.js';
 function fullConfig(theme: string): AppConfig {
   return {
     theme,
+    accent: 'purple',
     models: [
       {
         provider: 'ollama',

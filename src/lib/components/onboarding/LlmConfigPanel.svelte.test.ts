@@ -22,6 +22,7 @@ function llmRow(over: Partial<CheckResult> = {}): CheckResult {
 function baseConfig() {
   return {
     theme: 'dark',
+    accent: 'purple',
     models: [],
     endpoints: {},
     voices: { host: '', guest: '' },

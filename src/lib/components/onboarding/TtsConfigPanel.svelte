@@ -89,7 +89,7 @@
       </p>
       <div class="flex items-center justify-between text-[0.75rem] text-muted-foreground">
         <span>Kokoro-82M</span>
-        <span>~330 MB · CPU · Fast</span>
+        <span>~86 MB · CPU · Fast</span>
       </div>
 
       {#if downloadProgress !== null && downloadProgress < 100}

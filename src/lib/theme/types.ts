@@ -30,6 +30,7 @@ export interface TierThresholds {
 
 export interface AppConfig {
   theme: string;
+  accent: string;
   models: ModelConfig[];
   endpoints: Record<string, string>;
   voices: VoiceConfig;

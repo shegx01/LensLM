@@ -103,6 +103,7 @@ describe('SystemCheck', () => {
       if (cmd === 'get_config') {
         return {
           theme: 'dark',
+          accent: 'purple',
           models: [],
           endpoints: {},
           voices: { host: '', guest: '' },

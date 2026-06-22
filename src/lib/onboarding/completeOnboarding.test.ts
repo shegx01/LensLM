@@ -8,6 +8,7 @@ import type { AppConfig } from '$lib/theme/types.js';
 function fullConfig(onboarding_complete: boolean): AppConfig {
   return {
     theme: 'dark',
+    accent: 'purple',
     models: [
       {
         provider: 'ollama',
