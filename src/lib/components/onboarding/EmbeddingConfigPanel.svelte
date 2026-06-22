@@ -9,6 +9,7 @@
     installEmbeddingModel,
     type EmbeddingModelId
   } from '$lib/onboarding/system-check.js';
+  import { updateConfig } from '$lib/config.js';
 
   let {
     oncheck,
@@ -34,6 +35,9 @@
       });
       installProgress = 100;
       installed = true;
+      // Persist the chosen embedding model so the backend TTS/embedding check and
+      // later source-add flow know which model is bound to this notebook's store.
+      await updateConfig((cfg) => ({ ...cfg, embedding_model: selectedModel }));
       await oncheck();
       oncollapse();
     } catch (err) {

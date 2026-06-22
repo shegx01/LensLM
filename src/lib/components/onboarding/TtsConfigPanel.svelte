@@ -5,8 +5,8 @@
   import CircleCheck from '@lucide/svelte/icons/circle-check';
   import Download from '@lucide/svelte/icons/download';
   import { downloadTtsEngine, listTtsVoices, type TtsVoice } from '$lib/onboarding/system-check.js';
-  import { invoke, isTauri } from '@tauri-apps/api/core';
-  import type { AppConfig } from '$lib/theme/types.js';
+  import { SELECT_CLASS } from './styles.js';
+  import { updateConfig } from '$lib/config.js';
 
   let {
     oncheck,
@@ -27,6 +27,9 @@
   let femaleVoice = $state('');
   let savingVoices = $state(false);
   let saveError = $state<string | null>(null);
+  // True once a download completed but listTtsVoices() returned nothing — we
+  // surface an inline error and disable Save rather than persisting fake IDs.
+  let voicesUnavailable = $state(false);
 
   const maleVoices = $derived(voices.filter((v) => v.gender === 'male'));
   const femaleVoices = $derived(voices.filter((v) => v.gender === 'female'));
@@ -40,17 +43,10 @@
       });
       downloadProgress = 100;
       downloaded = true;
-      // Load available voices
+      // Load available voices from the engine. No stubs: if the catalog comes
+      // back empty the engine isn't really available, so we flag it.
       voices = await listTtsVoices();
-      if (voices.length === 0) {
-        // Stub voices for non-Tauri dev
-        voices = [
-          { id: 'kokoro_male_1', name: 'Oliver', gender: 'male' },
-          { id: 'kokoro_male_2', name: 'Ethan', gender: 'male' },
-          { id: 'kokoro_female_1', name: 'Emma', gender: 'female' },
-          { id: 'kokoro_female_2', name: 'Aria', gender: 'female' }
-        ];
-      }
+      voicesUnavailable = voices.length === 0;
       if (maleVoices.length > 0) maleVoice = maleVoices[0].id;
       if (femaleVoices.length > 0) femaleVoice = femaleVoices[0].id;
     } catch (err) {
@@ -63,12 +59,10 @@
     savingVoices = true;
     saveError = null;
     try {
-      if (isTauri()) {
-        const cfg = await invoke<AppConfig>('get_config');
-        await invoke<void>('set_config', {
-          config: { ...cfg, voices: { host: maleVoice, guest: femaleVoice } }
-        });
-      }
+      await updateConfig((cfg) => ({
+        ...cfg,
+        voices: { host: maleVoice, guest: femaleVoice }
+      }));
       await oncheck();
       oncollapse();
     } catch (err) {
@@ -130,49 +124,51 @@
       Kokoro engine ready
     </div>
 
-    <!-- Male voice selector -->
-    <div class="flex flex-col gap-1.5">
-      <label
-        for="tts-male-voice"
-        class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase"
-      >
-        Host voice (male)
-      </label>
-      <select
-        id="tts-male-voice"
-        bind:value={maleVoice}
-        class="border-input bg-transparent dark:bg-input/30 focus-visible:border-ring focus-visible:ring-ring/50 h-8 w-full min-w-0 rounded-lg border px-2.5 py-1 text-sm outline-none transition-colors focus-visible:ring-3 text-foreground"
-      >
-        {#each maleVoices as voice (voice.id)}
-          <option value={voice.id}>{voice.name}</option>
-        {/each}
-      </select>
-    </div>
+    {#if voicesUnavailable}
+      <p class="text-destructive text-[0.75rem]" role="alert">
+        Couldn't load voices — is the engine installed?
+      </p>
+    {:else}
+      <!-- Male voice selector -->
+      <div class="flex flex-col gap-1.5">
+        <label
+          for="tts-male-voice"
+          class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase"
+        >
+          Host voice (male)
+        </label>
+        <select id="tts-male-voice" bind:value={maleVoice} class={SELECT_CLASS}>
+          {#each maleVoices as voice (voice.id)}
+            <option value={voice.id}>{voice.name}</option>
+          {/each}
+        </select>
+      </div>
 
-    <!-- Female voice selector -->
-    <div class="flex flex-col gap-1.5">
-      <label
-        for="tts-female-voice"
-        class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase"
-      >
-        Co-host voice (female)
-      </label>
-      <select
-        id="tts-female-voice"
-        bind:value={femaleVoice}
-        class="border-input bg-transparent dark:bg-input/30 focus-visible:border-ring focus-visible:ring-ring/50 h-8 w-full min-w-0 rounded-lg border px-2.5 py-1 text-sm outline-none transition-colors focus-visible:ring-3 text-foreground"
-      >
-        {#each femaleVoices as voice (voice.id)}
-          <option value={voice.id}>{voice.name}</option>
-        {/each}
-      </select>
-    </div>
+      <!-- Female voice selector -->
+      <div class="flex flex-col gap-1.5">
+        <label
+          for="tts-female-voice"
+          class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase"
+        >
+          Co-host voice (female)
+        </label>
+        <select id="tts-female-voice" bind:value={femaleVoice} class={SELECT_CLASS}>
+          {#each femaleVoices as voice (voice.id)}
+            <option value={voice.id}>{voice.name}</option>
+          {/each}
+        </select>
+      </div>
+    {/if}
 
     {#if saveError}
       <p class="text-destructive text-[0.75rem]" role="alert">{saveError}</p>
     {/if}
 
-    <Button class="h-10 w-full" onclick={handleSaveVoices} disabled={savingVoices}>
+    <Button
+      class="h-10 w-full"
+      onclick={handleSaveVoices}
+      disabled={savingVoices || voicesUnavailable}
+    >
       {savingVoices ? 'Saving…' : 'Save voice settings'}
     </Button>
   {/if}
