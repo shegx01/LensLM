@@ -1,7 +1,7 @@
 //! First-run system check: honest probes of the local intelligence stack.
 //!
 //! This module defines the FROZEN IPC contract ([`CheckResult`]) returned by
-//! [`crate::LensEngine::run_system_check`], plus the five probes that populate
+//! [`crate::LensEngine::run_system_check`], plus the six probes that populate
 //! it. The contract is consumed verbatim by the Tauri command layer and mirrored
 //! in the Svelte UI; do not reshape it without updating every mirror.
 //!
@@ -64,6 +64,8 @@ pub enum CheckId {
     EmbeddingModel,
     /// Vector database (built-in, set up automatically later).
     VectorDatabase,
+    /// Text-to-speech (Kokoro) engine availability.
+    TextToSpeech,
     /// App-data-directory write permissions.
     DiskPermissions,
 }
@@ -515,7 +517,37 @@ fn probe_vector_database() -> CheckResult {
     }
 }
 
-/// Probe 5 — app-data-directory write permissions.
+/// Probe 5 — text-to-speech (Kokoro) engine availability.
+///
+/// A real, honest probe: the Kokoro ONNX model is ~86 MiB and is downloaded on
+/// demand, so we test for the model file on disk at
+/// `{data_dir}/models/kokoro/model_q8f16.onnx` (the exact path the downloader
+/// writes). Present ⇒ `Pass`; absent ⇒ `Pending` with a "download required"
+/// affordance. Never `Fail` — an absent engine is an expected pre-download state,
+/// not an error.
+fn probe_text_to_speech(config: &AppConfig) -> CheckResult {
+    let model_path = crate::tts::kokoro_model_path(Path::new(&config.paths.data_dir));
+
+    if model_path.is_file() {
+        CheckResult {
+            id: CheckId::TextToSpeech,
+            label: "Text-to-speech".to_string(),
+            status: CheckStatus::Pass,
+            detail: "Kokoro audio engine ready".to_string(),
+            action: Some(CheckAction::Choose),
+        }
+    } else {
+        CheckResult {
+            id: CheckId::TextToSpeech,
+            label: "Text-to-speech".to_string(),
+            status: CheckStatus::Pending,
+            detail: "Kokoro audio engine — download required".to_string(),
+            action: Some(CheckAction::Choose),
+        }
+    }
+}
+
+/// Probe 6 — app-data-directory write permissions.
 ///
 /// Writes then deletes a sentinel file in the configured data directory. Success
 /// ⇒ `Pass` with the resolved path; failure ⇒ `Fail` with a retry affordance.
@@ -548,9 +580,9 @@ fn write_test_sentinel(dir: &Path) -> std::io::Result<()> {
     std::fs::remove_file(&path)
 }
 
-/// Runs all five system-check probes concurrently and returns them in the fixed
+/// Runs all six system-check probes concurrently and returns them in the fixed
 /// row order: LocalBackend, LlmRuntime, EmbeddingModel, VectorDatabase,
-/// DiskPermissions.
+/// TextToSpeech, DiskPermissions.
 ///
 /// Probes run via [`tokio::join!`] so the wall-clock cost is roughly the slowest
 /// probe (the bounded LLM timeout window), not the sum of all probes.
@@ -581,6 +613,7 @@ pub(crate) async fn run_system_check(config: &AppConfig, db: &SqlitePool) -> Vec
         llm_runtime,
         embedding_model,
         probe_vector_database(),
+        probe_text_to_speech(config),
         disk_permissions,
     ]
 }
@@ -819,6 +852,36 @@ mod tests {
         assert!(result.detail.contains("LanceDB"));
     }
 
+    #[test]
+    fn text_to_speech_pending_when_model_absent() {
+        // A fresh data dir has no Kokoro model on disk ⇒ Pending + Choose.
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = AppConfig::default();
+        config.paths.data_dir = dir.path().display().to_string();
+
+        let result = probe_text_to_speech(&config);
+        assert_eq!(result.id, CheckId::TextToSpeech);
+        assert_eq!(result.status, CheckStatus::Pending);
+        assert_eq!(result.action, Some(CheckAction::Choose));
+        assert_eq!(result.detail, "Kokoro audio engine — download required");
+    }
+
+    #[test]
+    fn text_to_speech_pass_when_model_present() {
+        // Materialize the model file at the exact path the downloader writes.
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = crate::tts::kokoro_model_path(dir.path());
+        std::fs::create_dir_all(model_path.parent().unwrap()).unwrap();
+        std::fs::write(&model_path, b"fake-onnx-bytes").unwrap();
+
+        let mut config = AppConfig::default();
+        config.paths.data_dir = dir.path().display().to_string();
+
+        let result = probe_text_to_speech(&config);
+        assert_eq!(result.status, CheckStatus::Pass);
+        assert_eq!(result.detail, "Kokoro audio engine ready");
+    }
+
     #[tokio::test]
     async fn disk_permissions_pass_on_writable_dir() {
         let dir = tempfile::tempdir().unwrap();
@@ -841,7 +904,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_system_check_returns_five_rows_in_order() {
+    async fn run_system_check_returns_six_rows_in_order() {
         let engine = crate::LensEngine::for_test().await;
         let dir = tempfile::tempdir().unwrap();
         {
@@ -858,6 +921,7 @@ mod tests {
                 CheckId::LlmRuntime,
                 CheckId::EmbeddingModel,
                 CheckId::VectorDatabase,
+                CheckId::TextToSpeech,
                 CheckId::DiskPermissions,
             ]
         );

@@ -81,12 +81,26 @@ pub async fn list_tts_voices() -> Result<Vec<TtsVoice>, LensError> {
     Ok(lens_core::list_tts_voices())
 }
 
+/// Allowlist of embedding model ids the UI may install. Validating the incoming
+/// `model` against this set (before it reaches the Ollama `POST /api/pull`)
+/// keeps an arbitrary, attacker-influenced string out of the pull request —
+/// defense-in-depth against a tampered IPC call coaxing an unexpected pull.
+const ALLOWED_EMBEDDING_MODELS: &[&str] = &[
+    "nomic-embed-text",
+    "mxbai-embed-large",
+    "all-minilm",
+    "bge-m3",
+];
+
 /// Installs an embedding model by streaming Ollama's `POST /api/pull`.
 ///
 /// Each NDJSON status line from Ollama is forwarded to the frontend as an
 /// [`InstallProgress`] over the `on_progress` channel. The target runtime is the
 /// configured Ollama base URL (same resolution as the system-check probe). If
 /// Ollama is unreachable the command returns an `Err` for the UI to surface.
+///
+/// `model` is validated against [`ALLOWED_EMBEDDING_MODELS`]; anything else is
+/// rejected with a [`LensError::Validation`] before any network call.
 ///
 /// Invoked as `invoke("install_embedding_model", { model, onProgress })` where
 /// `onProgress` is a `Channel<InstallProgress>`.
@@ -97,6 +111,11 @@ pub async fn install_embedding_model(
     on_progress: Channel<InstallProgress>,
     engine: tauri::State<'_, LensEngine>,
 ) -> Result<(), LensError> {
+    if !ALLOWED_EMBEDDING_MODELS.contains(&model.as_str()) {
+        return Err(LensError::Validation(format!(
+            "unsupported embedding model: {model}"
+        )));
+    }
     let base_url = lens_core::ollama_base_url(&engine.config().await);
     lens_core::pull_embedding_model(&base_url, &model, |progress| {
         // A send failure means the frontend dropped the channel; log and keep
@@ -165,7 +184,6 @@ mod tests {
     #[cfg(debug_assertions)]
     use std::sync::{Arc, Mutex};
     use tauri::Manager;
-    #[cfg(debug_assertions)]
     use tauri::ipc::Channel;
 
     #[test]
@@ -202,7 +220,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_system_check_returns_five_ordered_checks() {
+    async fn run_system_check_returns_six_ordered_checks() {
         let app = tauri::test::mock_app();
         app.manage(LensEngine::for_test().await);
         let engine = app.state::<LensEngine>();
@@ -218,6 +236,7 @@ mod tests {
                 CheckId::LlmRuntime,
                 CheckId::EmbeddingModel,
                 CheckId::VectorDatabase,
+                CheckId::TextToSpeech,
                 CheckId::DiskPermissions,
             ]
         );
@@ -234,9 +253,26 @@ mod tests {
         let llm = status_of(CheckId::LlmRuntime);
         assert!(llm == CheckStatus::Fail || llm == CheckStatus::Pass);
 
-        // Embedding + vector are intentionally not wired yet.
+        // Embedding + vector are intentionally not wired yet. The TTS engine is
+        // not downloaded in the test environment, so it is Pending.
         assert_eq!(status_of(CheckId::EmbeddingModel), CheckStatus::Pending);
         assert_eq!(status_of(CheckId::VectorDatabase), CheckStatus::Pending);
+        assert_eq!(status_of(CheckId::TextToSpeech), CheckStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn install_embedding_model_rejects_unlisted_model() {
+        let app = tauri::test::mock_app();
+        app.manage(LensEngine::for_test().await);
+        let engine = app.state::<LensEngine>();
+
+        // A model id outside the allowlist must be rejected with a Validation
+        // error BEFORE any network call (no Ollama is running in the test env).
+        let channel = Channel::new(|_: tauri::ipc::InvokeResponseBody| Ok(()));
+        let err = install_embedding_model("rm -rf /".to_string(), channel, engine)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LensError::Validation(_)));
     }
 
     #[tokio::test]
