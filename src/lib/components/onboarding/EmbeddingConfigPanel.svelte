@@ -157,10 +157,7 @@
             onclick={() => {
               if (!isActive && !isInstalled) selectedModel = model.id;
             }}
-            class={cn(
-              'min-w-0 flex-1 text-left',
-              (isActive || isInstalled) && 'cursor-default'
-            )}
+            class={cn('min-w-0 flex-1 text-left', (isActive || isInstalled) && 'cursor-default')}
           >
             <p class="text-sm font-semibold text-foreground">{model.name}</p>
             <p class="text-[0.75rem] text-muted-foreground mt-0.5">
