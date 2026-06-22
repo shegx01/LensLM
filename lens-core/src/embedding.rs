@@ -10,6 +10,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::LensError;
 
+/// Connect timeout for the Ollama pull client. Bounds only the connect phase —
+/// the NDJSON pull stream itself may run for minutes on a large model.
+const PULL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Progress for an embedding-model pull. Frozen IPC contract — mirrored in the
 /// Svelte client as `{ status, completed, total }`.
 ///
@@ -62,7 +66,15 @@ where
 {
     let base_url = base_url.trim_end_matches('/');
     let url = format!("{base_url}/api/pull");
-    let client = reqwest::Client::new();
+    // Bound the connect phase so an unreachable Ollama (dead port / black-hole
+    // host) fails fast instead of hanging the install. The pull body itself can
+    // stream for minutes (large layers), so only the connect phase is bounded;
+    // this client targets the LOCAL Ollama runtime so no redirect policy change
+    // is needed.
+    let client = reqwest::Client::builder()
+        .connect_timeout(PULL_CONNECT_TIMEOUT)
+        .build()
+        .map_err(|e| LensError::Network(format!("Ollama pull client init failed: {e}")))?;
 
     let resp = client
         .post(&url)
