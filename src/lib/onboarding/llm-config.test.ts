@@ -23,7 +23,8 @@ function configWithOllama(): AppConfig {
     voices: { host: '', guest: '' },
     paths: { data_dir: '' },
     tier_thresholds: { tier1_token_cap: 4000, tier2_token_cap: 16000 },
-    onboarding_complete: false
+    onboarding_complete: false,
+    embedding_model: ''
   };
 }
 
@@ -53,7 +54,8 @@ describe('saveLlmProvider (upsert into models[])', () => {
       provider: 'ollama',
       base_url: 'http://new-host:11434',
       model: 'new-model',
-      api_key: ''
+      api_key: '',
+      context: 16384
     });
 
     expect(written).not.toBeNull();
@@ -69,5 +71,28 @@ describe('saveLlmProvider (upsert into models[])', () => {
     // The stale fields from the previous entry are gone.
     expect(w.models[0].base_url).not.toBe('http://old-host:11434');
     expect(w.models[0].model).not.toBe('old-model');
+  });
+
+  it('persists the supplied context window (no longer hardcoded to 8192)', async () => {
+    const stored = configWithOllama();
+    let written: AppConfig | null = null;
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return stored;
+      if (cmd === 'set_config') {
+        written = (args as { config: AppConfig }).config;
+        return undefined;
+      }
+    });
+
+    await saveLlmProvider({
+      provider: 'ollama',
+      base_url: 'http://new-host:11434',
+      model: 'new-model',
+      api_key: '',
+      context: 32768
+    });
+
+    const w = written as unknown as AppConfig;
+    expect(w.models[0].context).toBe(32768);
   });
 });
