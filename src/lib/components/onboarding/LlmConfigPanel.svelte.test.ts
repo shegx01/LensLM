@@ -28,7 +28,8 @@ function baseConfig() {
     voices: { host: '', guest: '' },
     paths: { data_dir: '' },
     tier_thresholds: { tier1_token_cap: 4000, tier2_token_cap: 16000 },
-    onboarding_complete: false
+    onboarding_complete: false,
+    embedding_model: ''
   };
 }
 
@@ -183,6 +184,42 @@ describe('LlmConfigPanel — Test connection (local tab)', () => {
     await waitFor(() => expect(oncheck).toHaveBeenCalledOnce());
   });
 
+  it('persists the picked context window (default 8192) — not a stale hardcode', async () => {
+    const setConfig = vi.fn();
+    const oncheck = vi.fn().mockResolvedValue(undefined);
+
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return baseConfig();
+      if (cmd === 'set_config') {
+        setConfig(args);
+        return null;
+      }
+      if (cmd === 'detect_llm') return { reachable: true, version: 'Ollama 0.3.2', models: [] };
+    });
+
+    render(SystemCheckRow, { props: { result: llmRow(), oncheck } });
+    await fireEvent.click(screen.getByRole('button', { name: /configure/i }));
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: /test connection/i })).toBeInTheDocument()
+    );
+
+    // Pick the 32K context option.
+    await fireEvent.click(screen.getByRole('button', { name: '32K' }));
+    await fireEvent.click(screen.getByRole('button', { name: /test connection/i }));
+
+    await waitFor(() =>
+      expect(setConfig).toHaveBeenCalledWith(
+        expect.objectContaining({
+          config: expect.objectContaining({
+            models: expect.arrayContaining([
+              expect.objectContaining({ provider: 'ollama', context: 32768 })
+            ])
+          })
+        })
+      )
+    );
+  });
+
   it('surfaces a connection error inline and does NOT collapse on IPC failure', async () => {
     const oncheck = vi.fn().mockResolvedValue(undefined);
 
@@ -264,7 +301,10 @@ describe('LlmConfigPanel — Save (cloud tab)', () => {
           config: expect.objectContaining({
             models: expect.arrayContaining([
               expect.objectContaining({
-                provider: 'openai-compatible'
+                provider: 'openai-compatible',
+                // Real OpenAI API model id (default provider), not a derived slug.
+                model: 'gpt-4o',
+                context: 128000
               })
             ])
           })

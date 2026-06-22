@@ -1,9 +1,15 @@
 <script lang="ts">
   import { Input } from '$lib/components/ui/input/index.js';
   import { Button } from '$lib/components/ui/button/index.js';
+  import LoaderCircle from '@lucide/svelte/icons/loader-circle';
   import { cn } from '$lib/utils.js';
   import { detectLlm } from '$lib/onboarding/system-check.js';
   import { saveLlmProvider, type LlmProviderTab } from '$lib/onboarding/llm-config.js';
+  import { SELECT_CLASS } from './styles.js';
+
+  // Cloud config has no Context Window picker (it's Local-only), so cloud saves
+  // persist a sensible large default that covers modern hosted models.
+  const CLOUD_DEFAULT_CONTEXT = 128000;
 
   let {
     oncheck,
@@ -58,18 +64,21 @@
       id: 'openai' as const,
       name: 'OpenAI',
       models: 'GPT-4o, GPT-4',
+      defaultModel: 'gpt-4o',
       baseUrl: 'https://api.openai.com/v1'
     },
     {
       id: 'anthropic' as const,
       name: 'Anthropic',
       models: 'Claude 3.5',
+      defaultModel: 'claude-3-5-sonnet-latest',
       baseUrl: 'https://api.anthropic.com/v1'
     },
     {
       id: 'google' as const,
       name: 'Google',
       models: 'Gemini 1.5',
+      defaultModel: 'gemini-1.5-pro',
       baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai'
     }
   ] as const;
@@ -111,7 +120,8 @@
         provider: 'ollama',
         base_url: localEndpoint,
         model: localModel,
-        api_key: ''
+        api_key: '',
+        context: contextWindow
       });
       const result = await detectLlm(localEndpoint);
       if (result.reachable) {
@@ -137,8 +147,9 @@
       await saveLlmProvider({
         provider: 'openai-compatible',
         base_url: cloudBaseUrl || provider.baseUrl,
-        model: provider.models.split(',')[0].trim().toLowerCase().replace(/\s/g, '-'),
-        api_key: cloudApiKey
+        model: provider.defaultModel,
+        api_key: cloudApiKey,
+        context: CLOUD_DEFAULT_CONTEXT
       });
       await oncheck();
       oncollapse();
@@ -260,14 +271,7 @@
         Model
       </label>
       {#if modelOptions.length > 1}
-        <select
-          id="llm-model-local"
-          bind:value={localModel}
-          class={cn(
-            'border-input bg-transparent dark:bg-input/30 focus-visible:border-ring focus-visible:ring-ring/50 h-8 w-full min-w-0 rounded-lg border px-2.5 py-1 text-sm outline-none transition-colors focus-visible:ring-3',
-            'text-foreground'
-          )}
-        >
+        <select id="llm-model-local" bind:value={localModel} class={SELECT_CLASS}>
           {#each modelOptions as m (m)}
             <option value={m}>{m}</option>
           {/each}
@@ -327,20 +331,7 @@
     <!-- Test connection button -->
     <Button class="h-10 w-full" onclick={handleTestConnection} disabled={testStatus === 'testing'}>
       {#if testStatus === 'testing'}
-        <svg
-          class="size-4 animate-spin"
-          xmlns="http://www.w3.org/2000/svg"
-          fill="none"
-          viewBox="0 0 24 24"
-        >
-          <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"
-          ></circle>
-          <path
-            class="opacity-75"
-            fill="currentColor"
-            d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
-          ></path>
-        </svg>
+        <LoaderCircle class="size-4 animate-spin" />
         Testing…
       {:else}
         Test connection
