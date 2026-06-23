@@ -501,9 +501,13 @@ mod tests {
 
         // Add N sources -> count == N.
         for i in 0..3 {
-            repo.add_source(&nb.id, &format!("file{i}.pdf"), &format!("/abs/file{i}.pdf"))
-                .await
-                .unwrap();
+            repo.add_source(
+                &nb.id,
+                &format!("file{i}.pdf"),
+                &format!("/abs/file{i}.pdf"),
+            )
+            .await
+            .unwrap();
         }
         let summaries = repo.list_with_counts().await.unwrap();
         assert_eq!(summaries.len(), 1);
@@ -585,8 +589,12 @@ mod tests {
         let pool = test_pool().await;
         let repo = NotebookRepo::new(&pool);
         let nb = repo.create("Notebook", None, None).await.unwrap();
-        repo.add_source(&nb.id, "a.pdf", "/abs/a.pdf").await.unwrap();
-        repo.add_source(&nb.id, "b.pdf", "/abs/b.pdf").await.unwrap();
+        repo.add_source(&nb.id, "a.pdf", "/abs/a.pdf")
+            .await
+            .unwrap();
+        repo.add_source(&nb.id, "b.pdf", "/abs/b.pdf")
+            .await
+            .unwrap();
         repo.trash(&nb.id).await.unwrap();
 
         let trashed = repo.list_trashed_with_counts().await.unwrap();
@@ -599,7 +607,9 @@ mod tests {
         let pool = test_pool().await;
         let repo = NotebookRepo::new(&pool);
         let nb = repo.create("Notebook", None, None).await.unwrap();
-        repo.add_source(&nb.id, "a.pdf", "/abs/a.pdf").await.unwrap();
+        repo.add_source(&nb.id, "a.pdf", "/abs/a.pdf")
+            .await
+            .unwrap();
         repo.trash(&nb.id).await.unwrap();
 
         repo.purge(&nb.id).await.unwrap();
