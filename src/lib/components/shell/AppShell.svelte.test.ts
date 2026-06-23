@@ -56,11 +56,11 @@ describe('AppShell.svelte', () => {
     expect(grid.className).toContain('grid-cols-[256px_1fr_320px]');
   });
 
-  it('grid uses the 88px collapsed left column when sidebarCollapsed is true', async () => {
+  it('grid uses the 104px collapsed left column when sidebarCollapsed is true', async () => {
     notebookStore.sidebarCollapsed = true;
     const { container } = render(AppShell);
     const grid = container.querySelector('div.grid') as HTMLElement;
-    expect(grid.className).toContain('grid-cols-[88px_1fr_320px]');
+    expect(grid.className).toContain('grid-cols-[104px_1fr_320px]');
   });
 
   it('collapsed rail shows the icon-only layout (no hover behaviour)', () => {

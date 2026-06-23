@@ -26,14 +26,13 @@
 
   const activeNotebook = $derived(notebookStore.activeNotebook);
 
-  // Left grid column width is driven ONLY by the persisted collapse state:
-  // expanded = 256px, collapsed icon rail = 88px. Hover NEVER changes this — the
-  // collapsed flyout (SidebarRail) expands as an absolute overlay over the centre
-  // content, so the centre/right regions never reflow on hover. 88px is wide
-  // enough that the floating panel (m-2/8px left gutter → inner edge ≈ x8) clears
-  // the native traffic lights.
+  // Left grid column width is driven by the persisted collapse state: expanded =
+  // 256px, collapsed icon rail = 104px. The collapsed width must comfortably fit
+  // the native macOS traffic-light cluster (~62px wide): 104px column − 2×8px
+  // (m-2) gutter = 88px panel (window-x 8→96), so the cluster (positioned at x:20,
+  // i.e. a 12px left inset) clears both walls with ~14px right margin.
   const gridCols = $derived(
-    notebookStore.sidebarCollapsed ? 'grid-cols-[88px_1fr_320px]' : 'grid-cols-[256px_1fr_320px]'
+    notebookStore.sidebarCollapsed ? 'grid-cols-[104px_1fr_320px]' : 'grid-cols-[256px_1fr_320px]'
   );
 
   // ---------------------------------------------------------------------------
