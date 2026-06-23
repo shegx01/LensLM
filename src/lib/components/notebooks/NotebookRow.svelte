@@ -3,7 +3,11 @@
   import Trash2 from '@lucide/svelte/icons/trash-2';
   import { cn } from '$lib/utils.js';
   import type { NotebookSummary } from '$lib/notebooks/types.js';
-  import { notebookAccentClass, formatRelativeTime } from '$lib/notebooks/index.js';
+  import {
+    notebookAccentClass,
+    formatRelativeTime,
+    formatSourceCount
+  } from '$lib/notebooks/index.js';
   import {
     renameNotebookAction,
     trashNotebookAction,
@@ -34,6 +38,10 @@
   let renaming = $state(false);
   let draft = $state('');
   let inputEl = $state<HTMLInputElement | null>(null);
+  // Re-entrancy guard: Enter sets `renaming=false`, which unmounts the input and
+  // fires its `onblur` → a second `commitRename()`. This flag swallows that
+  // second call so the rename IPC fires exactly once.
+  let committing = false;
 
   function startRename(): void {
     draft = notebook.title;
@@ -48,11 +56,17 @@
   }
 
   async function commitRename(): Promise<void> {
-    const trimmed = draft.trim();
-    if (trimmed && trimmed !== notebook.title) {
-      await renameNotebookAction(notebook.id, trimmed);
+    if (committing) return;
+    committing = true;
+    try {
+      const trimmed = draft.trim();
+      if (trimmed && trimmed !== notebook.title) {
+        await renameNotebookAction(notebook.id, trimmed);
+      }
+      renaming = false;
+    } finally {
+      committing = false;
     }
-    renaming = false;
   }
 
   function handleTitleDblClick(e: MouseEvent): void {
@@ -73,9 +87,7 @@
   // Derived display values
   // ---------------------------------------------------------------------------
 
-  const sourceLabel = $derived(
-    notebook.source_count === 1 ? '1 source' : `${notebook.source_count} sources`
-  );
+  const sourceLabel = $derived(formatSourceCount(notebook.source_count));
   const relTime = $derived(formatRelativeTime(notebook.updated_at));
   const accentClass = $derived(notebookAccentClass(notebook.id));
 </script>

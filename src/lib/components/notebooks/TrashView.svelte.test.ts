@@ -55,7 +55,8 @@ vi.mock('$lib/notebooks/index.js', () => ({
   resetNotebookStore: mockResetStore,
   // Passthrough utilities
   notebookAccentClass: (_id: string) => 'nb-purple',
-  formatRelativeTime: (_iso: string) => '2d ago'
+  formatRelativeTime: (_iso: string) => '2d ago',
+  formatSourceCount: (count: number) => (count === 1 ? '1 source' : `${count} sources`)
 }));
 
 import TrashView from './TrashView.svelte';

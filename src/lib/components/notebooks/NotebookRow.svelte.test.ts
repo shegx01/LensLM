@@ -26,7 +26,8 @@ vi.mock('$lib/notebooks/index.js', () => ({
   resetNotebookStore: mockResetStore,
   // Passthrough utilities — use real implementations
   notebookAccentClass: (id: string) => `nb-purple`,
-  formatRelativeTime: (_iso: string) => '1h ago'
+  formatRelativeTime: (_iso: string) => '1h ago',
+  formatSourceCount: (count: number) => (count === 1 ? '1 source' : `${count} sources`)
 }));
 
 import NotebookRow from './NotebookRow.svelte';
@@ -112,6 +113,9 @@ describe('NotebookRow (expanded)', () => {
     await waitFor(() =>
       expect(screen.queryByRole('textbox', { name: /rename notebook/i })).not.toBeInTheDocument()
     );
+    // Re-entrancy guard: Enter unmounts the input, which fires onblur → a second
+    // commitRename(); the guard must swallow it so the rename IPC fires once.
+    expect(mockRenameAction).toHaveBeenCalledTimes(1);
   });
 
   it('Esc in rename input cancels without calling renameNotebookAction', async () => {

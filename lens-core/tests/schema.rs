@@ -270,7 +270,9 @@ async fn purging_notebook_cascades_to_children() {
         .unwrap();
 
     // `purge_notebook` is the hard-delete path; `delete_notebook` now soft-deletes
-    // (no cascade), so cascade behavior is asserted against purge.
+    // (no cascade), so cascade behavior is asserted against purge. Purge only
+    // accepts trashed notebooks, so trash it first.
+    engine.trash_notebook(&nb.id).await.unwrap();
     engine.purge_notebook(&nb.id).await.unwrap();
 
     let src_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sources WHERE notebook_id = ?")

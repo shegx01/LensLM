@@ -27,9 +27,14 @@
 <script lang="ts">
   import SearchIcon from '@lucide/svelte/icons/search';
   import ChevronRight from '@lucide/svelte/icons/chevron-right';
-  import { notebookStore, selectNotebook } from '$lib/notebooks/notebooks-state.svelte.js';
-  import { notebookAccentClass } from '$lib/notebooks/notebook-color.js';
-  import { formatRelativeTime } from '$lib/notebooks/format-time.js';
+  import BookOpen from '@lucide/svelte/icons/book-open';
+  import {
+    notebookStore,
+    selectNotebook,
+    notebookAccentClass,
+    formatRelativeTime,
+    formatSourceCount
+  } from '$lib/notebooks/index.js';
 
   // ---------------------------------------------------------------------------
   // Local state
@@ -180,14 +185,6 @@
       close();
     }
   }
-
-  // ---------------------------------------------------------------------------
-  // Result row helpers
-  // ---------------------------------------------------------------------------
-
-  function sourceLabel(count: number): string {
-    return count === 1 ? '1 source' : `${count} sources`;
-  }
 </script>
 
 {#if notebookStore.paletteOpen}
@@ -306,34 +303,7 @@
                   ].join(' ')}
                   aria-hidden="true"
                 >
-                  <!-- Book icon shape — fill=currentColor so it inherits --nb-fg. -->
-                  <svg
-                    width="16"
-                    height="16"
-                    viewBox="0 0 16 16"
-                    fill="none"
-                    xmlns="http://www.w3.org/2000/svg"
-                    aria-hidden="true"
-                  >
-                    <rect
-                      x="3"
-                      y="2"
-                      width="9"
-                      height="12"
-                      rx="1.5"
-                      fill="currentColor"
-                      opacity="0.85"
-                    />
-                    <rect
-                      x="3"
-                      y="2"
-                      width="1.5"
-                      height="12"
-                      rx="0.75"
-                      fill="currentColor"
-                      opacity="0.5"
-                    />
-                  </svg>
+                  <BookOpen class="size-4" />
                 </div>
 
                 <!-- Title + subtitle -->
@@ -342,7 +312,9 @@
                     {notebook.title}
                   </div>
                   <div class="truncate text-[12px] text-muted-foreground leading-snug mt-0.5">
-                    {sourceLabel(notebook.source_count)} · {formatRelativeTime(notebook.updated_at)}
+                    {formatSourceCount(notebook.source_count)} · {formatRelativeTime(
+                      notebook.updated_at
+                    )}
                   </div>
                 </div>
 

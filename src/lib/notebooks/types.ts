@@ -5,7 +5,7 @@
 // `source_count` to `NotebookSummary` (returned by list commands via JOIN+COUNT)
 // while `Notebook` stays the plain row struct (returned by create/rename).
 
-/** Constrainted set of notebook focus modes — mirrors the Rust `FocusMode` enum values. */
+/** Constrained set of notebook focus modes — mirrors the Rust `FocusMode` enum values. */
 export type FocusMode = 'research' | 'coding' | 'notes';
 
 // SYNC-CHECK: must match lens-core/src/notebooks.rs Notebook struct (around line 103)

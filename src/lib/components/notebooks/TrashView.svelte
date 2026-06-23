@@ -11,7 +11,8 @@
     restoreNotebookAction,
     purgeNotebookAction,
     notebookAccentClass,
-    formatRelativeTime
+    formatRelativeTime,
+    formatSourceCount
   } from '$lib/notebooks/index.js';
   import { Button } from '$lib/components/ui/button/index.js';
   import { ScrollArea } from '$lib/components/ui/scroll-area/index.js';
@@ -71,14 +72,6 @@
   onMount(() => {
     void loadTrashed();
   });
-
-  // ---------------------------------------------------------------------------
-  // Derived display helpers
-  // ---------------------------------------------------------------------------
-
-  function sourcesLabel(count: number): string {
-    return count === 1 ? '1 source' : `${count} sources`;
-  }
 </script>
 
 <!--
@@ -155,7 +148,7 @@
                   {notebook.title}
                 </p>
                 <p class="truncate text-xs leading-tight text-muted-foreground mt-0.5">
-                  {sourcesLabel(notebook.source_count)} · trashed {relTime}
+                  {formatSourceCount(notebook.source_count)} · trashed {relTime}
                 </p>
               </div>
 

@@ -103,9 +103,11 @@
   }
 
   function handleKeydown(e: KeyboardEvent): void {
+    // Let Enter insert a newline in the DESCRIPTION textarea instead of submitting.
+    if ((e.target as HTMLElement)?.tagName === 'TEXTAREA') return;
     if (e.key === 'Enter' && canSubmit) {
       e.preventDefault();
-      handleCreate();
+      void handleCreate();
     }
   }
 

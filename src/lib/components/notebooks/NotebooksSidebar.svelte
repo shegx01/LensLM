@@ -17,7 +17,7 @@
   import ThemeSwitcher from '$lib/components/ThemeSwitcher.svelte';
   import NotebookRow from '$lib/components/notebooks/NotebookRow.svelte';
   import AccountFooter from '$lib/components/notebooks/AccountFooter.svelte';
-  import { notebookStore, openTrash } from '$lib/notebooks/index.js';
+  import { notebookStore, openTrash, getInitials } from '$lib/notebooks/index.js';
 
   /**
    * Callback fired when the user clicks "New notebook".
@@ -365,17 +365,7 @@
               'cursor-pointer border-0'
             )}
           >
-            {#if userName}
-              {userName
-                .trim()
-                .split(/\s+/)
-                .filter(Boolean)
-                .slice(0, 2)
-                .map((w) => w[0].toUpperCase())
-                .join('')}
-            {:else}
-              ?
-            {/if}
+            {getInitials(userName)}
           </TooltipTrigger>
           <TooltipContent side="right">{userName || 'Account'}</TooltipContent>
         </Tooltip>

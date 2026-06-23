@@ -229,19 +229,21 @@ impl<'a> NotebookRepo<'a> {
         let rows = sqlx::query(query).fetch_all(self.pool).await?;
         let summaries = rows
             .into_iter()
-            .map(|row| NotebookSummary {
-                notebook: Notebook {
-                    id: NotebookId::from(row.get::<String, _>("id")),
-                    title: row.get("title"),
-                    description: row.get("description"),
-                    focus_mode: row.get("focus_mode"),
-                    created_at: row.get("created_at"),
-                    updated_at: row.get("updated_at"),
-                    trashed_at: row.get("trashed_at"),
-                },
-                source_count: row.get("source_count"),
+            .map(|row| {
+                Ok(NotebookSummary {
+                    notebook: Notebook {
+                        id: NotebookId::from(row.try_get::<String, _>("id")?),
+                        title: row.try_get("title")?,
+                        description: row.try_get("description")?,
+                        focus_mode: row.try_get("focus_mode")?,
+                        created_at: row.try_get("created_at")?,
+                        updated_at: row.try_get("updated_at")?,
+                        trashed_at: row.try_get("trashed_at")?,
+                    },
+                    source_count: row.try_get("source_count")?,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, LensError>>()?;
         Ok(summaries)
     }
 
@@ -363,14 +365,19 @@ impl<'a> NotebookRepo<'a> {
 
     /// Permanently deletes a notebook. Child rows cascade via `ON DELETE CASCADE`.
     ///
-    /// This is the only hard-delete path (used by "Delete forever").
+    /// This is the only hard-delete path (used by "Delete forever"). Only affects
+    /// trashed notebooks (`trashed_at IS NOT NULL`); purging a live or unknown
+    /// notebook affects 0 rows and returns a validation error, so a live notebook
+    /// can never be hard-deleted without first being trashed.
     pub async fn purge(&self, id: &NotebookId) -> Result<(), LensError> {
-        let result = sqlx::query("DELETE FROM notebooks WHERE id = ?")
+        let result = sqlx::query("DELETE FROM notebooks WHERE id = ? AND trashed_at IS NOT NULL")
             .bind(id)
             .execute(self.pool)
             .await?;
         if result.rows_affected() == 0 {
-            return Err(LensError::Validation(format!("no notebook with id {id}")));
+            return Err(LensError::Validation(format!(
+                "no trashed notebook with id {id}"
+            )));
         }
         Ok(())
     }
@@ -606,6 +613,24 @@ mod tests {
             repo.purge(&nb.id).await,
             Err(LensError::Validation(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn purge_live_notebook_errors() {
+        let pool = test_pool().await;
+        let repo = NotebookRepo::new(&pool);
+        let nb = repo.create("Notebook", None, None).await.unwrap();
+
+        // Purging a LIVE (non-trashed) notebook must be rejected and must NOT
+        // hard-delete the row.
+        assert!(matches!(
+            repo.purge(&nb.id).await,
+            Err(LensError::Validation(_))
+        ));
+        // The notebook still exists in the live list.
+        let live = repo.list_with_counts().await.unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].notebook.id, nb.id);
     }
 
     #[tokio::test]

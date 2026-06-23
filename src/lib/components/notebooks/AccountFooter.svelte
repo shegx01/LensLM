@@ -2,6 +2,7 @@
   import ChevronUp from '@lucide/svelte/icons/chevron-up';
   import Settings from '@lucide/svelte/icons/settings';
   import { cn } from '$lib/utils.js';
+  import { getInitials } from '$lib/notebooks/index.js';
   import ThemeSwitcher from '$lib/components/ThemeSwitcher.svelte';
   import {
     Tooltip,
@@ -23,15 +24,7 @@
   // Derived initials
   // ---------------------------------------------------------------------------
 
-  const initials = $derived(
-    userName
-      .trim()
-      .split(/\s+/)
-      .filter(Boolean)
-      .slice(0, 2)
-      .map((word) => word[0].toUpperCase())
-      .join('') || '?'
-  );
+  const initials = $derived(getInitials(userName));
 
   // ---------------------------------------------------------------------------
   // Popover open state

@@ -36,7 +36,9 @@ let viewMode = $state<'notebook' | 'trash'>('notebook'); // center pane view
 let sidebarCollapsed = $state(false); // session-only; localStorage deferred to follow-up
 let paletteOpen = $state(false); // command palette visibility
 let paletteQuery = $state(''); // search query (palette-scoped, reset on close)
+// TODO(M9): single `loading` boolean flickers under concurrent/compound actions — replace with a counter when wiring loading UI.
 let loading = $state(false);
+// TODO(M9): `error` is written but not yet surfaced in UI (polished error states are M9).
 let error = $state<string | null>(null); // transient; polished surfacing deferred to M9
 
 // ---------------------------------------------------------------------------
@@ -127,6 +129,7 @@ export const notebookStore = {
 
 /** Fetch all non-trashed notebooks and populate the store. */
 export async function loadNotebooks(): Promise<void> {
+  error = null;
   loading = true;
   try {
     notebooks = await listNotebooks();
@@ -140,6 +143,7 @@ export async function loadNotebooks(): Promise<void> {
 
 /** Fetch all trashed notebooks and populate the trashed list. */
 export async function loadTrashed(): Promise<void> {
+  error = null;
   loading = true;
   try {
     trashedNotebooks = await listTrashed();
@@ -157,6 +161,7 @@ export async function createNotebookAction(
   description?: string | null,
   focusMode?: string | null
 ): Promise<void> {
+  error = null;
   loading = true;
   try {
     const created = await createNotebook(title, description, focusMode);
@@ -173,6 +178,7 @@ export async function createNotebookAction(
 
 /** Rename a notebook and refresh the list. */
 export async function renameNotebookAction(id: string, title: string): Promise<void> {
+  error = null;
   loading = true;
   try {
     await renameNotebook(id, title);
@@ -190,6 +196,7 @@ export async function renameNotebookAction(id: string, title: string): Promise<v
  * `activeNotebookId` if the trashed notebook was the active one.
  */
 export async function trashNotebookAction(id: string): Promise<void> {
+  error = null;
   loading = true;
   try {
     await trashNotebook(id);
@@ -208,6 +215,7 @@ export async function trashNotebookAction(id: string): Promise<void> {
 
 /** Restore a trashed notebook. Refreshes both lists. */
 export async function restoreNotebookAction(id: string): Promise<void> {
+  error = null;
   loading = true;
   try {
     await restoreNotebook(id);
@@ -223,6 +231,7 @@ export async function restoreNotebookAction(id: string): Promise<void> {
 
 /** Permanently delete a trashed notebook. Refreshes the trashed list. */
 export async function purgeNotebookAction(id: string): Promise<void> {
+  error = null;
   loading = true;
   try {
     await purgeNotebook(id);
@@ -236,12 +245,14 @@ export async function purgeNotebookAction(id: string): Promise<void> {
 }
 
 /**
- * Select a notebook by id and switch viewMode to 'notebook'.
- * Closes the command palette if open.
+ * Select a notebook by id, switch viewMode to 'notebook', and close the command
+ * palette. Setting `paletteOpen = false` is idempotent, so calling this when the
+ * palette is already closed is harmless.
  */
 export function selectNotebook(id: string): void {
   activeNotebookId = id;
   viewMode = 'notebook';
+  paletteOpen = false;
 }
 
 /**

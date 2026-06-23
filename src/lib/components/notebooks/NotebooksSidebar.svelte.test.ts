@@ -62,6 +62,15 @@ vi.mock('$lib/notebooks/index.js', () => ({
   resetNotebookStore: mockResetStore,
   notebookAccentClass: () => 'nb-purple',
   formatRelativeTime: () => '1w ago',
+  formatSourceCount: (count: number) => (count === 1 ? '1 source' : `${count} sources`),
+  getInitials: (name: string) =>
+    name
+      .trim()
+      .split(/\s+/)
+      .filter(Boolean)
+      .slice(0, 2)
+      .map((w) => w[0].toUpperCase())
+      .join('') || '?',
   renameNotebookAction: vi.fn().mockResolvedValue(undefined),
   trashNotebookAction: vi.fn().mockResolvedValue(undefined)
 }));
