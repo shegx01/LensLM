@@ -217,7 +217,7 @@
       <!-- ------------------------------------------------------------------ -->
       <!-- Search header                                                        -->
       <!-- ------------------------------------------------------------------ -->
-      <div class="flex items-center gap-3 border-b border-border px-4 py-3">
+      <div class="flex items-center gap-3 px-4 py-3">
         <SearchIcon class="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
 
         <input
@@ -253,7 +253,7 @@
       <!-- ------------------------------------------------------------------ -->
       <!-- Results body                                                         -->
       <!-- ------------------------------------------------------------------ -->
-      <div class="flex-1 overflow-y-auto min-h-0">
+      <div class="flex-1 overflow-y-auto min-h-0 border-t border-border">
         {#if results.length === 0}
           <!-- Empty state -->
           <div class="px-4 py-8 text-center text-[13px] text-muted-foreground">

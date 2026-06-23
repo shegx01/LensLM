@@ -32,7 +32,7 @@ let notebooks = $state<NotebookSummary[]>([]);
 let trashedNotebooks = $state<NotebookSummary[]>([]);
 let activeNotebookId = $state<string | null>(null); // session-only
 let activeTab = $state<'chat' | 'notes'>('chat'); // session-only
-let viewMode = $state<'notebook' | 'trash'>('notebook'); // center pane view
+let trashOpen = $state(false); // Trash modal visibility (centered dialog)
 let sidebarCollapsed = $state(false); // session-only; localStorage deferred to follow-up
 let paletteOpen = $state(false); // command palette visibility
 let paletteQuery = $state(''); // search query (palette-scoped, reset on close)
@@ -84,11 +84,11 @@ export const notebookStore = {
   set activeTab(tab: 'chat' | 'notes') {
     activeTab = tab;
   },
-  get viewMode() {
-    return viewMode;
+  get trashOpen() {
+    return trashOpen;
   },
-  set viewMode(mode: 'notebook' | 'trash') {
-    viewMode = mode;
+  set trashOpen(v: boolean) {
+    trashOpen = v;
   },
   get sidebarCollapsed() {
     return sidebarCollapsed;
@@ -167,7 +167,6 @@ export async function createNotebookAction(
     const created = await createNotebook(title, description, focusMode);
     await loadNotebooks();
     activeNotebookId = created.id;
-    viewMode = 'notebook';
   } catch (err) {
     console.error('createNotebookAction: failed', err);
     error = String(err);
@@ -245,21 +244,21 @@ export async function purgeNotebookAction(id: string): Promise<void> {
 }
 
 /**
- * Select a notebook by id, switch viewMode to 'notebook', and close the command
- * palette. Setting `paletteOpen = false` is idempotent, so calling this when the
- * palette is already closed is harmless.
+ * Select a notebook by id and close the command palette. The center pane is
+ * driven by `activeNotebook`, so no view-mode switch is needed. Setting
+ * `paletteOpen = false` is idempotent, so calling this when the palette is
+ * already closed is harmless.
  */
 export function selectNotebook(id: string): void {
   activeNotebookId = id;
-  viewMode = 'notebook';
   paletteOpen = false;
 }
 
 /**
- * Switch to the Trash view in the center pane and load the trashed list.
+ * Open the Trash modal and load the trashed list.
  */
 export async function openTrash(): Promise<void> {
-  viewMode = 'trash';
+  trashOpen = true;
   await loadTrashed();
 }
 
@@ -273,7 +272,7 @@ export function resetNotebookStore(): void {
   trashedNotebooks = [];
   activeNotebookId = null;
   activeTab = 'chat';
-  viewMode = 'notebook';
+  trashOpen = false;
   sidebarCollapsed = false;
   paletteOpen = false;
   paletteQuery = '';

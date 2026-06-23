@@ -7,7 +7,7 @@
 //   - "Delete forever" button opens a confirm dialog
 //   - confirming the dialog calls purgeNotebookAction with the correct id
 //   - canceling the dialog does NOT call purgeNotebookAction
-//   - back affordance sets viewMode to 'notebook'
+//   - the modal renders when trashOpen is true; the × close sets trashOpen=false
 //
 // Mocks the $lib/notebooks barrel so no Tauri IPC occurs.
 // The real bits-ui Dialog component is used for the confirm flow; its portal
@@ -22,7 +22,7 @@ const { storeProxy, mockRestoreAction, mockPurgeAction, mockLoadTrashed, mockRes
   vi.hoisted(() => {
     const state = {
       trashedNotebooks: [] as import('$lib/notebooks/types.js').NotebookSummary[],
-      viewMode: 'trash' as 'notebook' | 'trash'
+      trashOpen: true
     };
 
     return {
@@ -41,11 +41,11 @@ vi.mock('$lib/notebooks/index.js', () => ({
       get trashedNotebooks() {
         return storeProxy.trashedNotebooks;
       },
-      get viewMode() {
-        return storeProxy.viewMode;
+      get trashOpen() {
+        return storeProxy.trashOpen;
       },
-      set viewMode(v: 'notebook' | 'trash') {
-        storeProxy.viewMode = v;
+      set trashOpen(v: boolean) {
+        storeProxy.trashOpen = v;
       }
     };
   },
@@ -82,7 +82,7 @@ function makeNotebook(overrides?: Partial<NotebookSummary>): NotebookSummary {
 
 beforeEach(() => {
   storeProxy.trashedNotebooks = [];
-  storeProxy.viewMode = 'trash';
+  storeProxy.trashOpen = true;
   mockRestoreAction.mockClear();
   mockPurgeAction.mockClear();
   mockLoadTrashed.mockClear();
@@ -165,6 +165,9 @@ describe('TrashView — Restore action', () => {
 });
 
 describe('TrashView — Delete forever (confirm dialog)', () => {
+  // The Trash modal and the confirm dialog are BOTH shadcn Dialogs, so once the
+  // confirm opens there are two role="dialog" nodes in the DOM. We scope confirm
+  // assertions to `[data-confirm-dialog]` to disambiguate.
   it('clicking "Delete forever" opens the confirm dialog', async () => {
     storeProxy.trashedNotebooks = [makeNotebook({ title: 'Old Research Notes' })];
     render(TrashView);
@@ -172,8 +175,9 @@ describe('TrashView — Delete forever (confirm dialog)', () => {
       name: /delete Old Research Notes forever/i
     });
     await fireEvent.click(deleteBtn);
-    // Dialog should be visible — bits-ui renders into a portal in document.body
-    await waitFor(() => expect(screen.getByRole('dialog')).toBeInTheDocument());
+    await waitFor(() =>
+      expect(document.querySelector('[data-confirm-dialog]')).toBeInTheDocument()
+    );
   });
 
   it('confirm dialog contains the notebook title', async () => {
@@ -182,7 +186,9 @@ describe('TrashView — Delete forever (confirm dialog)', () => {
     await fireEvent.click(
       screen.getByRole('button', { name: /delete Old Research Notes forever/i })
     );
-    const dialog = await waitFor(() => screen.getByRole('dialog'));
+    const dialog = await waitFor(
+      () => document.querySelector('[data-confirm-dialog]') as HTMLElement
+    );
     expect(dialog).toHaveTextContent(/Old Research Notes/);
   });
 
@@ -191,11 +197,11 @@ describe('TrashView — Delete forever (confirm dialog)', () => {
     render(TrashView);
 
     await fireEvent.click(screen.getByRole('button', { name: /delete Old Notes forever/i }));
-    await waitFor(() => screen.getByRole('dialog'));
+    await waitFor(() =>
+      expect(document.querySelector('[data-confirm-dialog]')).toBeInTheDocument()
+    );
 
-    const confirmBtn =
-      (document.querySelector('[data-confirm-purge-btn]') as HTMLElement) ??
-      screen.getByRole('button', { name: /delete forever/i });
+    const confirmBtn = document.querySelector('[data-confirm-purge-btn]') as HTMLElement;
     await fireEvent.click(confirmBtn);
 
     await waitFor(() => expect(mockPurgeAction).toHaveBeenCalledWith('nb-trash-001'));
@@ -208,12 +214,16 @@ describe('TrashView — Delete forever (confirm dialog)', () => {
     await fireEvent.click(
       screen.getByRole('button', { name: /delete Old Research Notes forever/i })
     );
-    await waitFor(() => screen.getByRole('dialog'));
+    await waitFor(() =>
+      expect(document.querySelector('[data-confirm-dialog]')).toBeInTheDocument()
+    );
 
     const cancelBtn = document.querySelector('[data-cancel-btn]') as HTMLElement;
     await fireEvent.click(cancelBtn);
 
-    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    await waitFor(() =>
+      expect(document.querySelector('[data-confirm-dialog]')).not.toBeInTheDocument()
+    );
     expect(mockPurgeAction).not.toHaveBeenCalled();
   });
 
@@ -222,27 +232,39 @@ describe('TrashView — Delete forever (confirm dialog)', () => {
     render(TrashView);
 
     await fireEvent.click(screen.getByRole('button', { name: /delete .* forever/i }));
-    await waitFor(() => screen.getByRole('dialog'));
+    await waitFor(() =>
+      expect(document.querySelector('[data-confirm-dialog]')).toBeInTheDocument()
+    );
 
     const cancelBtn = document.querySelector('[data-cancel-btn]') as HTMLElement;
     await fireEvent.click(cancelBtn);
 
-    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    await waitFor(() =>
+      expect(document.querySelector('[data-confirm-dialog]')).not.toBeInTheDocument()
+    );
   });
 });
 
-describe('TrashView — back affordance', () => {
-  it('clicking the back button sets viewMode to "notebook"', async () => {
+describe('TrashView — modal visibility', () => {
+  it('renders the Trash modal when trashOpen is true', async () => {
+    storeProxy.trashOpen = true;
     render(TrashView);
-    const backBtn = screen.getByRole('button', { name: /back to notebooks/i });
-    await fireEvent.click(backBtn);
-    expect(storeProxy.viewMode).toBe('notebook');
+    await waitFor(() => expect(screen.getByText('Trash')).toBeInTheDocument());
+    expect(screen.getByText('Deleted notebooks, sources and notes')).toBeInTheDocument();
   });
-});
 
-describe('TrashView — mount behavior', () => {
-  it('calls loadTrashed on mount', () => {
+  it('does NOT render the Trash modal when trashOpen is false', () => {
+    storeProxy.trashOpen = false;
     render(TrashView);
-    expect(mockLoadTrashed).toHaveBeenCalledOnce();
+    expect(screen.queryByText('Deleted notebooks, sources and notes')).not.toBeInTheDocument();
+  });
+
+  it('the × close button sets trashOpen to false', async () => {
+    storeProxy.trashOpen = true;
+    render(TrashView);
+    await waitFor(() => screen.getByText('Trash'));
+    const closeBtn = screen.getByRole('button', { name: /close/i });
+    await fireEvent.click(closeBtn);
+    await waitFor(() => expect(storeProxy.trashOpen).toBe(false));
   });
 });

@@ -157,10 +157,12 @@ describe('NotebookTopBar', () => {
       expect(screen.getByRole('group', { name: /view toggle/i })).toBeInTheDocument();
     });
 
-    it('the bar element carries data-tauri-drag-region', () => {
+    it('the outer bar row carries data-tauri-drag-region (the floating pill itself does not)', () => {
       render(NotebookTopBar);
       const toolbar = screen.getByRole('toolbar', { name: /notebook toolbar/i });
-      expect(toolbar).toHaveAttribute('data-tauri-drag-region');
+      // The floating pill is interactive and is NOT a drag region; its parent row is.
+      expect(toolbar).not.toHaveAttribute('data-tauri-drag-region');
+      expect(toolbar.parentElement).toHaveAttribute('data-tauri-drag-region');
     });
   });
 

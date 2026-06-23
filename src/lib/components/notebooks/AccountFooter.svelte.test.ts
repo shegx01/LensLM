@@ -93,6 +93,23 @@ describe('AccountFooter', () => {
     await waitFor(() => expect(screen.queryByRole('menu')).not.toBeInTheDocument());
   });
 
+  it('closes the menu on an outside pointerdown', async () => {
+    render(AccountFooter, { props: { userName: 'Jamie' } });
+    await fireEvent.click(screen.getByRole('button', { name: /account menu/i }));
+    await waitFor(() => screen.getByRole('menu'));
+    // A pointerdown anywhere outside the menu container must dismiss it.
+    await fireEvent.pointerDown(document.body);
+    await waitFor(() => expect(screen.queryByRole('menu')).not.toBeInTheDocument());
+  });
+
+  it('keeps the menu open on a pointerdown inside it', async () => {
+    render(AccountFooter, { props: { userName: 'Jamie' } });
+    await fireEvent.click(screen.getByRole('button', { name: /account menu/i }));
+    const menu = await waitFor(() => screen.getByRole('menu'));
+    await fireEvent.pointerDown(menu);
+    expect(screen.getByRole('menu')).toBeInTheDocument();
+  });
+
   it('contains a Switch theme entry in the menu', async () => {
     render(AccountFooter, { props: { userName: 'Jamie' } });
     await fireEvent.click(screen.getByRole('button', { name: /account menu/i }));

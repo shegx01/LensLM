@@ -1,18 +1,23 @@
 <script lang="ts">
-  // NotebookTopBar — center pane top chrome.
+  // NotebookTopBar — floating pill header for the center pane (Apple Music style).
   //
   // Renders only when `notebookStore.activeNotebook` is non-null; AppShell
   // decides when to mount this component, but we guard internally too.
   //
-  // Layout (per middle_content header.png):
-  //   [drag region — fills remaining left space] [title] [Chat|Notes pill] [Share] [Settings]
+  // Layout (per design source "Floating pill header — top right"):
+  //   Outer row: right-aligned (justify-end), padding 10px 12px 2px — sits on the
+  //   window drag region so the window stays draggable from the empty top area.
+  //   The pill itself is an inline-flex rounded-full elevated surface (bg-popover)
+  //   with a soft drop shadow, reading as a floating control over the canvas.
   //
-  // The entire bar background carries `data-tauri-drag-region` so the window
-  // is still draggable by the transparent left portion. The right-aligned
-  // interactive cluster is NOT a drag target (its pointer events are normal).
+  //   Inside the pill, in order:
+  //     [title span] [Chat|Notes segmented] [Share circle] [Settings circle]
   //
   // Chat|Notes is real state via `notebookStore.activeTab` ('chat'|'notes').
   // Share + Settings are honestly disabled with "Available soon" tooltips (M8+).
+  //
+  // The outer row carries `data-tauri-drag-region`; the pill is interactive and is
+  // NOT a drag region (native Tauri: interactive children receive pointer events).
 
   import Share2 from '@lucide/svelte/icons/share-2';
   import Settings from '@lucide/svelte/icons/settings';
@@ -35,49 +40,41 @@
 </script>
 
 <!--
-  Full-width bar, height matches `--titlebar-h` (28px) so it aligns with the
-  sidebar and right-rail drag bars.
-
-  `data-tauri-drag-region` is on the container: the left transparent portion
-  is the drag zone; the right cluster sits inside a flex child that does NOT
-  propagate the drag event (native Tauri behaviour — interactive elements
-  within a drag-region container naturally receive pointer events first).
+  Outer drag row — right-aligned. `data-tauri-drag-region` lets the window be
+  dragged by the empty space to the left of the pill. The pill is interactive
+  and intentionally NOT a drag region.
 -->
 {#if activeNotebook}
-  <div
-    role="toolbar"
-    data-tauri-drag-region
-    class="flex h-[var(--titlebar-h)] w-full shrink-0 items-center"
-    aria-label="Notebook toolbar"
-  >
-    <!-- Left: empty drag region — fills all remaining space -->
-    <div data-tauri-drag-region class="flex-1"></div>
-
-    <!-- Right: interactive cluster — NOT a drag region -->
-    <div class="flex shrink-0 items-center gap-2 pr-3">
-      <!-- Notebook title -->
+  <div data-tauri-drag-region class="flex shrink-0 justify-end px-3 pt-2.5 pb-0.5">
+    <!-- Floating pill — elevated surface (bg-popover) with a soft drop shadow -->
+    <div
+      role="toolbar"
+      aria-label="Notebook toolbar"
+      class="inline-flex items-center gap-[3px] rounded-full bg-popover py-1 pr-1 pl-3.5 shadow-[0_4px_16px_rgba(0,0,0,0.12)]"
+    >
+      <!-- Notebook title — lives inside the pill (not large/bold) -->
       <span
-        class="max-w-[200px] truncate text-sm font-bold text-foreground"
+        class="max-w-[180px] truncate pr-1.5 text-xs font-semibold tracking-[-0.1px] text-popover-foreground"
         title={activeNotebook.title}
       >
         {activeNotebook.title}
       </span>
 
-      <!-- Chat | Notes segmented toggle (rounded-full pill) -->
       <TooltipProvider>
+        <!-- Chat | Notes segmented toggle -->
         <div
           role="group"
           aria-label="View toggle"
-          class="flex items-center rounded-full border border-border bg-muted p-0.5"
+          class="flex items-center gap-px rounded-full bg-muted p-0.5"
         >
           <button
             type="button"
             role="tab"
             aria-selected={activeTab === 'chat'}
             aria-controls="notebook-tab-panel"
-            class="rounded-full px-3 py-0.5 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring
+            class="h-[26px] rounded-full px-[13px] text-[11px] font-semibold transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring
               {activeTab === 'chat'
-              ? 'bg-primary text-primary-foreground shadow-sm'
+              ? 'bg-popover text-popover-foreground shadow-sm'
               : 'text-muted-foreground hover:text-foreground'}"
             onclick={() => setTab('chat')}
           >
@@ -88,9 +85,9 @@
             role="tab"
             aria-selected={activeTab === 'notes'}
             aria-controls="notebook-tab-panel"
-            class="rounded-full px-3 py-0.5 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring
+            class="h-[26px] rounded-full px-[13px] text-[11px] font-semibold transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring
               {activeTab === 'notes'
-              ? 'bg-primary text-primary-foreground shadow-sm'
+              ? 'bg-popover text-popover-foreground shadow-sm'
               : 'text-muted-foreground hover:text-foreground'}"
             onclick={() => setTab('notes')}
           >
@@ -98,31 +95,33 @@
           </button>
         </div>
 
-        <!-- Share button — disabled, "Available soon" -->
+        <!-- Share — circular icon button, disabled, "Available soon" -->
         <Tooltip>
           <TooltipTrigger>
             <Button
               variant="ghost"
-              size="icon-sm"
+              size="icon"
               disabled
+              class="size-[30px] rounded-full"
               aria-label="Share notebook (available soon)"
             >
-              <Share2 class="size-4" />
+              <Share2 class="size-[13px]" />
             </Button>
           </TooltipTrigger>
           <TooltipContent side="bottom">Available soon</TooltipContent>
         </Tooltip>
 
-        <!-- Settings gear — disabled, "Available soon" -->
+        <!-- Settings gear — circular icon button, disabled, "Available soon" -->
         <Tooltip>
           <TooltipTrigger>
             <Button
               variant="ghost"
-              size="icon-sm"
+              size="icon"
               disabled
+              class="size-[30px] rounded-full"
               aria-label="Notebook settings (available soon)"
             >
-              <Settings class="size-4" />
+              <Settings class="size-[13px]" />
             </Button>
           </TooltipTrigger>
           <TooltipContent side="bottom">Available soon</TooltipContent>

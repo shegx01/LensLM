@@ -101,11 +101,13 @@ describe('resetNotebookStore', () => {
     notebookStore.activeNotebookId = 'nb-001';
     notebookStore.sidebarCollapsed = true;
     notebookStore.paletteOpen = true;
+    notebookStore.trashOpen = true;
 
     resetNotebookStore();
 
     expect(notebookStore.notebooks).toHaveLength(0);
     expect(notebookStore.activeNotebookId).toBeNull();
+    expect(notebookStore.trashOpen).toBe(false);
     expect(notebookStore.sidebarCollapsed).toBe(false);
     expect(notebookStore.paletteOpen).toBe(false);
     expect(notebookStore.paletteQuery).toBe('');
@@ -160,7 +162,6 @@ describe('createNotebookAction', () => {
 
     expect(notebookStore.notebooks).toHaveLength(1);
     expect(notebookStore.activeNotebookId).toBe('nb-new');
-    expect(notebookStore.viewMode).toBe('notebook');
   });
 
   it('sets loading to false after success', async () => {
@@ -284,13 +285,10 @@ describe('purgeNotebookAction', () => {
 // ---------------------------------------------------------------------------
 
 describe('selectNotebook', () => {
-  it('sets activeNotebookId and switches viewMode to notebook', () => {
-    notebookStore.viewMode = 'trash';
-
+  it('sets activeNotebookId', () => {
     selectNotebook('nb-abc');
 
     expect(notebookStore.activeNotebookId).toBe('nb-abc');
-    expect(notebookStore.viewMode).toBe('notebook');
   });
 });
 
@@ -299,13 +297,13 @@ describe('selectNotebook', () => {
 // ---------------------------------------------------------------------------
 
 describe('openTrash', () => {
-  it('sets viewMode to trash and loads trashed notebooks', async () => {
+  it('opens the Trash modal and loads trashed notebooks', async () => {
     const trashed = makeNotebookSummary({ id: 'nb-trashed', trashed_at: new Date().toISOString() });
     vi.mocked(listTrashed).mockResolvedValue([trashed]);
 
     await openTrash();
 
-    expect(notebookStore.viewMode).toBe('trash');
+    expect(notebookStore.trashOpen).toBe(true);
     expect(notebookStore.trashedNotebooks).toHaveLength(1);
   });
 });

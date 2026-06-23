@@ -1,13 +1,10 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
-  import ArrowLeft from '@lucide/svelte/icons/arrow-left';
   import BookOpen from '@lucide/svelte/icons/book-open';
   import Trash2 from '@lucide/svelte/icons/trash-2';
   import RotateCcw from '@lucide/svelte/icons/rotate-ccw';
   import { cn } from '$lib/utils.js';
   import {
     notebookStore,
-    loadTrashed,
     restoreNotebookAction,
     purgeNotebookAction,
     notebookAccentClass,
@@ -24,6 +21,16 @@
     DialogFooter,
     DialogDescription
   } from '$lib/components/ui/dialog/index.js';
+
+  // ---------------------------------------------------------------------------
+  // Modal open state — driven by the shared store flag (`trashOpen`).
+  // ---------------------------------------------------------------------------
+
+  const trashOpen = $derived(notebookStore.trashOpen);
+
+  function closeTrash(): void {
+    notebookStore.trashOpen = false;
+  }
 
   // ---------------------------------------------------------------------------
   // Confirm-dialog state — one pending purge at a time
@@ -60,129 +67,128 @@
     pendingPurgeId = null;
     await purgeNotebookAction(id);
   }
-
-  function goBack(): void {
-    notebookStore.viewMode = 'notebook';
-  }
-
-  // ---------------------------------------------------------------------------
-  // Load trashed list on mount
-  // ---------------------------------------------------------------------------
-
-  onMount(() => {
-    void loadTrashed();
-  });
 </script>
 
 <!--
-  TrashView — center-pane content for viewMode === 'trash'.
-  Lists trashed notebooks with Restore and Delete-forever actions.
-  Delete-forever requires explicit confirmation via a Dialog (no AlertDialog
-  primitive exists; we compose Dialog + destructive Button directly, per plan §Risk).
+  TrashView — centered modal dialog (per design source "Trash" modal).
+  Opens when `notebookStore.trashOpen` is true; loaded via `openTrash()`.
+  Header: small trash icon + "Trash" title + subtitle, with the shadcn close
+  (×) affordance top-right. Body lists trashed notebooks with Restore +
+  Delete-forever (confirm). Empty state = centered trash icon + copy.
 -->
-<div class="flex h-full flex-col">
-  <!-- ── Header ────────────────────────────────────────────────────────────── -->
-  <div class="flex shrink-0 items-center gap-3 border-b border-border px-6 py-4" data-trash-header>
-    <Button
-      variant="ghost"
-      size="icon-sm"
-      onclick={goBack}
-      aria-label="Back to notebooks"
-      data-back-btn
-    >
-      <ArrowLeft class="size-4" />
-    </Button>
-
-    <div class="min-w-0 flex-1">
-      <h1 class="text-base font-semibold text-foreground">Trash</h1>
-      <p class="text-xs text-muted-foreground">Restore notebooks or delete them permanently</p>
-    </div>
-  </div>
-
-  <!-- ── Body ─────────────────────────────────────────────────────────────── -->
-  <ScrollArea class="min-h-0 flex-1">
-    <div class="px-4 py-3" data-trash-list>
-      {#if notebookStore.trashedNotebooks.length === 0}
-        <!-- Empty state -->
+<Dialog
+  open={trashOpen}
+  onOpenChange={(v) => {
+    if (!v) closeTrash();
+  }}
+>
+  <DialogContent
+    class="flex max-h-[640px] flex-col gap-0 overflow-hidden p-0 sm:max-w-[520px]"
+    data-trash-modal
+  >
+    <!-- ── Header ──────────────────────────────────────────────────────────── -->
+    <DialogHeader class="shrink-0 space-y-0 px-6 pt-6 pb-4 text-left" data-trash-header>
+      <div class="flex items-center gap-2.5">
         <div
-          class="flex flex-col items-center justify-center gap-3 py-16 text-center"
-          data-empty-state
+          class="flex size-[30px] shrink-0 items-center justify-center rounded-[9px] bg-muted text-muted-foreground"
+          aria-hidden="true"
         >
-          <div
-            class="flex size-12 items-center justify-center rounded-xl bg-muted/60 text-muted-foreground"
-          >
-            <Trash2 class="size-6" />
-          </div>
-          <p class="text-sm font-medium text-muted-foreground">Trash is empty</p>
+          <Trash2 class="size-3.5" />
         </div>
-      {:else}
-        <ul role="list" class="flex flex-col gap-1">
-          {#each notebookStore.trashedNotebooks as notebook (notebook.id)}
-            {@const accentClass = notebookAccentClass(notebook.id)}
-            {@const relTime = notebook.trashed_at ? formatRelativeTime(notebook.trashed_at) : ''}
+        <div class="min-w-0">
+          <DialogTitle class="text-base font-bold tracking-[-0.3px] text-foreground"
+            >Trash</DialogTitle
+          >
+          <DialogDescription class="mt-px text-[11px] text-muted-foreground">
+            Deleted notebooks, sources and notes
+          </DialogDescription>
+        </div>
+      </div>
+    </DialogHeader>
 
-            <li
-              class={cn(
-                'flex items-center gap-3 rounded-lg px-3 py-3',
-                'hover:bg-muted/40 transition-colors'
-              )}
-              data-trash-row
+    <!-- ── Body ────────────────────────────────────────────────────────────── -->
+    <ScrollArea class="min-h-0 flex-1">
+      <div class="px-6 pb-4" data-trash-list>
+        {#if notebookStore.trashedNotebooks.length === 0}
+          <!-- Empty state -->
+          <div class="flex flex-col items-center gap-0 py-12 text-center" data-empty-state>
+            <div
+              class="mb-3.5 flex size-11 items-center justify-center rounded-xl bg-muted text-muted-foreground"
+              aria-hidden="true"
             >
-              <!-- Color icon -->
-              <div
-                class={cn(
-                  'flex size-9 shrink-0 items-center justify-center rounded-lg',
-                  accentClass
-                )}
-                aria-hidden="true"
+              <Trash2 class="size-5" />
+            </div>
+            <p class="mb-1 text-sm font-semibold text-muted-foreground">Trash is empty</p>
+            <p class="text-xs text-muted-foreground">Deleted items will appear here</p>
+          </div>
+        {:else}
+          <ul role="list" class="flex flex-col gap-1">
+            {#each notebookStore.trashedNotebooks as notebook (notebook.id)}
+              {@const accentClass = notebookAccentClass(notebook.id)}
+              {@const relTime = notebook.trashed_at ? formatRelativeTime(notebook.trashed_at) : ''}
+
+              <li
+                class={cn('flex items-center gap-2.5 rounded-[10px] bg-muted/60 px-3 py-2.5')}
+                data-trash-row
               >
-                <BookOpen class="size-4" />
-              </div>
-
-              <!-- Title + subtitle -->
-              <div class="min-w-0 flex-1">
-                <p
-                  class="truncate text-sm font-medium leading-tight text-foreground"
-                  title={notebook.title}
+                <!-- Color icon -->
+                <div
+                  class={cn(
+                    'flex size-8 shrink-0 items-center justify-center rounded-lg opacity-70',
+                    accentClass
+                  )}
+                  aria-hidden="true"
                 >
-                  {notebook.title}
-                </p>
-                <p class="truncate text-xs leading-tight text-muted-foreground mt-0.5">
-                  {formatSourceCount(notebook.source_count)} · trashed {relTime}
-                </p>
-              </div>
+                  <BookOpen class="size-3.5" />
+                </div>
 
-              <!-- Actions -->
-              <div class="flex shrink-0 items-center gap-1.5">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onclick={() => void restoreNotebookAction(notebook.id)}
-                  aria-label={`Restore ${notebook.title}`}
-                  data-restore-btn
-                >
-                  <RotateCcw class="size-3.5" />
-                  Restore
-                </Button>
+                <!-- Title + subtitle -->
+                <div class="min-w-0 flex-1">
+                  <p
+                    class="truncate text-[13px] font-semibold leading-tight text-foreground"
+                    title={notebook.title}
+                  >
+                    {notebook.title}
+                  </p>
+                  <p class="mt-0.5 truncate text-[10px] leading-tight text-muted-foreground">
+                    {formatSourceCount(notebook.source_count)} · trashed {relTime}
+                  </p>
+                </div>
 
-                <Button
-                  variant="destructive"
-                  size="sm"
-                  onclick={() => openConfirm(notebook.id)}
-                  aria-label={`Delete ${notebook.title} forever`}
-                  data-delete-forever-btn
-                >
-                  <Trash2 class="size-3.5" />
-                  Delete forever
-                </Button>
-              </div>
-            </li>
-          {/each}
-        </ul>
-      {/if}
-    </div>
-  </ScrollArea>
-</div>
+                <!-- Actions -->
+                <div class="flex shrink-0 items-center gap-1">
+                  <Button
+                    variant="default"
+                    size="sm"
+                    class="h-7 rounded-lg px-2.5 text-[11px] font-semibold"
+                    onclick={() => void restoreNotebookAction(notebook.id)}
+                    aria-label={`Restore ${notebook.title}`}
+                    data-restore-btn
+                  >
+                    <RotateCcw class="size-3" />
+                    Restore
+                  </Button>
+
+                  <Button
+                    variant="destructive"
+                    size="sm"
+                    class="h-7 rounded-lg px-2.5 text-[11px] font-semibold"
+                    onclick={() => openConfirm(notebook.id)}
+                    aria-label={`Delete ${notebook.title} forever`}
+                    data-delete-forever-btn
+                  >
+                    <Trash2 class="size-3" />
+                    Delete
+                  </Button>
+                </div>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+      </div>
+    </ScrollArea>
+  </DialogContent>
+</Dialog>
 
 <!-- ── Confirm purge Dialog ──────────────────────────────────────────────────
   There is no AlertDialog primitive — built from Dialog + destructive Button.

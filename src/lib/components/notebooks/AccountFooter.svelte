@@ -49,6 +49,20 @@
       open = false;
     }
   }
+
+  // Dismiss on any click/tap outside the menu. `focusout` alone misses clicks on
+  // non-focusable regions (e.g. the canvas/main pane), so we listen for pointerdown
+  // on the document (capture phase) while open and close when the target is outside.
+  $effect(() => {
+    if (!open) return;
+    function onPointerDown(e: PointerEvent): void {
+      if (containerEl && !containerEl.contains(e.target as Node)) {
+        open = false;
+      }
+    }
+    document.addEventListener('pointerdown', onPointerDown, true);
+    return () => document.removeEventListener('pointerdown', onPointerDown, true);
+  });
 </script>
 
 <!--
@@ -77,9 +91,14 @@
       open && 'bg-sidebar-accent/60'
     )}
   >
-    <!-- Initials avatar -->
+    <!-- Initials avatar — neutral fill + 1px inset ring + subtle outer shadow -->
     <div
-      class="flex size-7 shrink-0 items-center justify-center rounded-full bg-sidebar-primary text-sidebar-primary-foreground text-xs font-semibold"
+      class={cn(
+        'flex size-[27px] shrink-0 items-center justify-center rounded-full',
+        'bg-muted text-sidebar-foreground/80 text-[9px] font-bold',
+        'ring-1 ring-inset ring-border',
+        'shadow-[0_1px_3px_rgba(0,0,0,0.16)]'
+      )}
       aria-hidden="true"
     >
       {initials}
@@ -121,6 +140,9 @@
           <TooltipContent side="right">Available soon</TooltipContent>
         </Tooltip>
       </TooltipProvider>
+
+      <!-- Hairline divider between item groups (design: 1px srchRowBdr, margin:4px 6px) -->
+      <div class="mx-1.5 my-1 h-px bg-border" role="separator" aria-hidden="true"></div>
 
       <!-- Switch theme — real, embeds ThemeCycleButton as a menu row -->
       <div

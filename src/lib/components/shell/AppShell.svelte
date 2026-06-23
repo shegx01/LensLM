@@ -25,7 +25,6 @@
   // ---------------------------------------------------------------------------
 
   const collapsed = $derived(notebookStore.sidebarCollapsed);
-  const viewMode = $derived(notebookStore.viewMode);
   const activeNotebook = $derived(notebookStore.activeNotebook);
 
   // Left grid column width: expanded ≈ 256px, collapsed icon rail ≈ 72px
@@ -101,12 +100,12 @@
     <NotebooksSidebar onnewnotebook={() => (createOpen = true)} {userName} />
   </aside>
 
-  <!-- CENTER: workspace on the canvas — top drag bar, then state-driven content -->
+  <!-- CENTER: workspace on the canvas — top drag bar, then state-driven content.
+       The floating pill header (NotebookTopBar) sits within the top area; Trash
+       is a centered modal (mounted at shell root), not a center-pane view. -->
   <main class="flex flex-col overflow-hidden">
     <div data-tauri-drag-region class="h-[var(--titlebar-h)] shrink-0"></div>
-    {#if viewMode === 'trash'}
-      <TrashView />
-    {:else if activeNotebook}
+    {#if activeNotebook}
       <NotebookTopBar />
       <!-- Empty content region — chat/notes fill this in M5/M6. -->
       <div class="flex flex-1 flex-col overflow-hidden"></div>
@@ -131,4 +130,5 @@
 
 <!-- Overlays mounted at shell root -->
 <CommandPalette />
+<TrashView />
 <NotebookCreateDialog open={createOpen} onOpenChange={(v) => (createOpen = v)} />

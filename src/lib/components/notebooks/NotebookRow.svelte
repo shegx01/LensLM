@@ -1,6 +1,6 @@
 <script lang="ts">
   import BookOpen from '@lucide/svelte/icons/book-open';
-  import Trash2 from '@lucide/svelte/icons/trash-2';
+  import Trash from '@lucide/svelte/icons/trash';
   import { cn } from '$lib/utils.js';
   import type { NotebookSummary } from '$lib/notebooks/types.js';
   import {
@@ -182,13 +182,14 @@
         void trashNotebookAction(notebook.id);
       }}
       class={cn(
-        'ml-auto flex size-6 shrink-0 items-center justify-center rounded opacity-0',
-        'text-sidebar-foreground/40 transition-opacity hover:text-destructive',
+        'ml-1.5 flex size-[22px] shrink-0 items-center justify-center rounded-[5px] opacity-0',
+        'bg-transparent text-sidebar-foreground/40 transition-all',
+        'hover:bg-destructive/15 hover:text-destructive',
         'group-hover:opacity-100',
         active && 'opacity-100'
       )}
     >
-      <Trash2 class="size-3.5" />
+      <Trash class="size-3.5" />
     </button>
   </div>
 {/if}

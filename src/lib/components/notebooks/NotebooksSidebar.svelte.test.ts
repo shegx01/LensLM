@@ -2,7 +2,8 @@
 //
 // Covers: renders rows with title/count/time, search trigger opens palette,
 // collapse toggle flips sidebar state, "Sign out" is NOT present.
-// Mocks the $lib/notebooks module and ThemeCycleButton to isolate the component.
+// Mocks the $lib/notebooks module, mode-watcher, and $lib/theme to isolate the
+// component (the brand-row theme-cycle button is inlined and uses these).
 
 import { render, screen, fireEvent, waitFor } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -75,9 +76,18 @@ vi.mock('$lib/notebooks/index.js', () => ({
   trashNotebookAction: vi.fn().mockResolvedValue(undefined)
 }));
 
-// Stub ThemeCycleButton to avoid mode-watcher IPC in tests
-vi.mock('$lib/components/ThemeCycleButton.svelte', () => ({
-  default: function ThemeCycleButtonStub() {}
+// Mock mode-watcher + $lib/theme so the inlined brand-row theme-cycle button
+// is deterministic and never performs IPC/localStorage writes in tests.
+const mockUserPrefersMode = vi.hoisted(() => ({
+  current: 'system' as 'light' | 'dark' | 'system'
+}));
+const mockSetMode = vi.hoisted(() => vi.fn());
+vi.mock('mode-watcher', () => ({
+  userPrefersMode: mockUserPrefersMode,
+  setMode: mockSetMode
+}));
+vi.mock('$lib/theme/index.js', () => ({
+  persistTheme: vi.fn()
 }));
 
 import NotebooksSidebar from './NotebooksSidebar.svelte';
