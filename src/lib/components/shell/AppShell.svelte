@@ -93,11 +93,10 @@
     gridCols
   ].join(' ')}
 >
-  <!-- LEFT: floating sidebar rail. SidebarRail owns the collapse / hover-flyout
-       logic: the grid cell width above is fixed by sidebarCollapsed (88 / 256px),
-       and when collapsed, hovering floats an expanded panel OVER the centre as an
-       absolute overlay — the centre/right content never moves. Native traffic
-       lights overlay the panel's top drag row. -->
+  <!-- LEFT: floating sidebar rail — a normal-flow panel in the left grid column.
+       Collapse / expand is driven by the toggle button only (no hover/flyout):
+       the grid column width above follows sidebarCollapsed (104 / 256px) and
+       animates. Native traffic lights overlay the panel's top drag row. -->
   <SidebarRail onnewnotebook={() => (createOpen = true)} {userName} />
 
   <!-- CENTER: workspace on the canvas — top drag bar, then state-driven content.

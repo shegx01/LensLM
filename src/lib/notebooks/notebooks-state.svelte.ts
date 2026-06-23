@@ -22,7 +22,7 @@ import {
   listTrashed,
   purgeNotebook
 } from './ipc.js';
-import type { NotebookSummary } from './types.js';
+import type { Notebook, NotebookSummary } from './types.js';
 
 // ---------------------------------------------------------------------------
 // Module-level reactive state
@@ -127,12 +127,24 @@ export const notebookStore = {
 // CRUD actions (exported top-level functions)
 // ---------------------------------------------------------------------------
 
+// Internal refresh helpers. These ONLY fetch + assign; they do NOT manage the
+// loading/error lifecycle so that compound actions can own a single
+// loading/error scope and run both refreshes concurrently without one wiping
+// the other's error or flickering `loading`.
+async function refreshNotebooks(): Promise<void> {
+  notebooks = await listNotebooks();
+}
+
+async function refreshTrashed(): Promise<void> {
+  trashedNotebooks = await listTrashed();
+}
+
 /** Fetch all non-trashed notebooks and populate the store. */
 export async function loadNotebooks(): Promise<void> {
   error = null;
   loading = true;
   try {
-    notebooks = await listNotebooks();
+    await refreshNotebooks();
   } catch (err) {
     console.error('loadNotebooks: failed', err);
     error = String(err);
@@ -146,7 +158,7 @@ export async function loadTrashed(): Promise<void> {
   error = null;
   loading = true;
   try {
-    trashedNotebooks = await listTrashed();
+    await refreshTrashed();
   } catch (err) {
     console.error('loadTrashed: failed', err);
     error = String(err);
@@ -155,21 +167,27 @@ export async function loadTrashed(): Promise<void> {
   }
 }
 
-/** Create a notebook, refresh the list, and auto-select the new notebook. */
+/**
+ * Create a notebook, refresh the list, and auto-select the new notebook.
+ * Returns the created `Notebook` on success, or `null` on failure (with the
+ * store `error` field set) so callers can distinguish success from failure.
+ */
 export async function createNotebookAction(
   title: string,
   description?: string | null,
   focusMode?: string | null
-): Promise<void> {
+): Promise<Notebook | null> {
   error = null;
   loading = true;
   try {
     const created = await createNotebook(title, description, focusMode);
-    await loadNotebooks();
+    await refreshNotebooks();
     activeNotebookId = created.id;
+    return created;
   } catch (err) {
     console.error('createNotebookAction: failed', err);
     error = String(err);
+    return null;
   } finally {
     loading = false;
   }
@@ -181,7 +199,7 @@ export async function renameNotebookAction(id: string, title: string): Promise<v
   loading = true;
   try {
     await renameNotebook(id, title);
-    await loadNotebooks();
+    await refreshNotebooks();
   } catch (err) {
     console.error('renameNotebookAction: failed', err);
     error = String(err);
@@ -202,8 +220,7 @@ export async function trashNotebookAction(id: string): Promise<void> {
     if (activeNotebookId === id) {
       activeNotebookId = null;
     }
-    await loadNotebooks();
-    await loadTrashed();
+    await Promise.all([refreshNotebooks(), refreshTrashed()]);
   } catch (err) {
     console.error('trashNotebookAction: failed', err);
     error = String(err);
@@ -218,8 +235,7 @@ export async function restoreNotebookAction(id: string): Promise<void> {
   loading = true;
   try {
     await restoreNotebook(id);
-    await loadNotebooks();
-    await loadTrashed();
+    await Promise.all([refreshNotebooks(), refreshTrashed()]);
   } catch (err) {
     console.error('restoreNotebookAction: failed', err);
     error = String(err);
@@ -228,13 +244,13 @@ export async function restoreNotebookAction(id: string): Promise<void> {
   }
 }
 
-/** Permanently delete a trashed notebook. Refreshes the trashed list. */
+/** Permanently delete a trashed notebook. Refreshes both lists. */
 export async function purgeNotebookAction(id: string): Promise<void> {
   error = null;
   loading = true;
   try {
     await purgeNotebook(id);
-    await loadTrashed();
+    await Promise.all([refreshNotebooks(), refreshTrashed()]);
   } catch (err) {
     console.error('purgeNotebookAction: failed', err);
     error = String(err);
@@ -245,13 +261,15 @@ export async function purgeNotebookAction(id: string): Promise<void> {
 
 /**
  * Select a notebook by id and close the command palette. The center pane is
- * driven by `activeNotebook`, so no view-mode switch is needed. Setting
- * `paletteOpen = false` is idempotent, so calling this when the palette is
- * already closed is harmless.
+ * driven by `activeNotebook`, so no view-mode switch is needed. Closing the
+ * palette mirrors the `notebookStore.paletteOpen` setter semantics (clears the
+ * query too) so a stale palette query can't linger. Idempotent when the palette
+ * is already closed.
  */
 export function selectNotebook(id: string): void {
   activeNotebookId = id;
   paletteOpen = false;
+  paletteQuery = '';
 }
 
 /**

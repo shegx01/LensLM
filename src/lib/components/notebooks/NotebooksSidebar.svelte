@@ -37,9 +37,9 @@
      */
     userName?: string;
     /**
-     * EFFECTIVE collapsed layout, supplied by AppShell (persisted-collapsed AND
-     * not hover-expanded). When omitted, falls back to the store's
-     * `sidebarCollapsed` so existing direct usage/tests keep working.
+     * EFFECTIVE collapsed layout, supplied by AppShell. When omitted, falls back
+     * to the store's `sidebarCollapsed` so existing direct usage/tests keep
+     * working.
      */
     collapsed?: boolean;
   } = $props();
@@ -50,7 +50,7 @@
 
   const notebooks = $derived(notebookStore.notebooks);
   const activeId = $derived(notebookStore.activeNotebookId);
-  // Use the prop when provided (AppShell's hover-aware effective state),
+  // Use the prop when provided (AppShell's effective collapsed state),
   // otherwise fall back to the persisted store value.
   const collapsed = $derived(collapsedProp ?? notebookStore.sidebarCollapsed);
   const trashCount = $derived(notebookStore.trashCount);

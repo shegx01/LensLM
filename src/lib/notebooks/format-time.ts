@@ -29,11 +29,3 @@ export function formatRelativeTime(isoString: string, now: number = Date.now()):
   if (diffWeeks < 5) return `${diffWeeks}w ago`;
   return `${diffMonths}mo ago`;
 }
-
-/**
- * Format a source count as a pluralized label: `"1 source"` for exactly one,
- * `"N sources"` otherwise (including zero).
- */
-export function formatSourceCount(count: number): string {
-  return count === 1 ? '1 source' : `${count} sources`;
-}

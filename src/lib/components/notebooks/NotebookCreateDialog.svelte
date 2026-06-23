@@ -35,7 +35,7 @@
     DialogDescription
   } from '$lib/components/ui/dialog/index.js';
   import { cn } from '$lib/utils.js';
-  import { createNotebookAction } from '$lib/notebooks/index.js';
+  import { createNotebookAction, notebookStore } from '$lib/notebooks/index.js';
   import type { FocusMode } from '$lib/notebooks/types.js';
 
   // ---------------------------------------------------------------------------
@@ -93,10 +93,18 @@
     submitting = true;
     formError = null;
     try {
-      await createNotebookAction(name.trim(), description.trim() || null, focusMode);
+      const created = await createNotebookAction(
+        name.trim(),
+        description.trim() || null,
+        focusMode
+      );
+      if (!created) {
+        // Action caught the failure internally and set the store error; surface
+        // it inline and keep the dialog open so the user can retry.
+        formError = notebookStore.error ?? 'Could not create the notebook.';
+        return;
+      }
       onOpenChange(false);
-    } catch (err) {
-      formError = err instanceof Error ? err.message : String(err);
     } finally {
       submitting = false;
     }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { formatRelativeTime, formatSourceCount } from './format-time.js';
+import { formatRelativeTime } from './format-time.js';
 
 /** Build an ISO string that is `deltaMs` milliseconds before `now`. */
 function ago(now: number, deltaMs: number): string {
@@ -99,20 +99,5 @@ describe('formatRelativeTime', () => {
     it('returns empty string for an invalid date string', () => {
       expect(formatRelativeTime('not-a-date', NOW)).toBe('');
     });
-  });
-});
-
-describe('formatSourceCount', () => {
-  it('returns singular "1 source" for exactly one', () => {
-    expect(formatSourceCount(1)).toBe('1 source');
-  });
-
-  it('returns plural "0 sources" for zero', () => {
-    expect(formatSourceCount(0)).toBe('0 sources');
-  });
-
-  it('returns plural "N sources" for more than one', () => {
-    expect(formatSourceCount(3)).toBe('3 sources');
-    expect(formatSourceCount(42)).toBe('42 sources');
   });
 });

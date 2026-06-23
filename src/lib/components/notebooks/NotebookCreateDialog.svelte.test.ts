@@ -12,16 +12,39 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // ── Hoisted mocks ─────────────────────────────────────────────────────────────
 
-const { mockCreate } = vi.hoisted(() => ({
+import type { Notebook } from '$lib/notebooks/types.js';
+
+const { mockCreate, storeState } = vi.hoisted(() => ({
   mockCreate:
-    vi.fn<(title: string, description: string | null, focusMode: string | null) => Promise<void>>()
+    vi.fn<
+      (
+        title: string,
+        description: string | null,
+        focusMode: string | null
+      ) => Promise<Notebook | null>
+    >(),
+  // Minimal stand-in for the reactive store; `handleCreate` reads `.error`
+  // when the action returns null.
+  storeState: { error: null as string | null }
 }));
 
 vi.mock('$lib/notebooks/index.js', () => ({
-  createNotebookAction: mockCreate
+  createNotebookAction: mockCreate,
+  notebookStore: storeState
 }));
 
 import NotebookCreateDialog from './NotebookCreateDialog.svelte';
+
+/** A throwaway created-notebook fixture for the success path. */
+const CREATED: Notebook = {
+  id: 'nb-new',
+  title: 'New',
+  description: null,
+  focus_mode: 'research',
+  created_at: new Date().toISOString(),
+  updated_at: new Date().toISOString(),
+  trashed_at: null
+};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -40,7 +63,8 @@ function renderDialog(overrides: { open?: boolean; onOpenChange?: (v: boolean) =
 
 beforeEach(() => {
   mockCreate.mockReset();
-  mockCreate.mockResolvedValue(undefined);
+  mockCreate.mockResolvedValue(CREATED);
+  storeState.error = null;
 });
 
 afterEach(() => {
@@ -215,8 +239,11 @@ describe('NotebookCreateDialog — Create action', () => {
     await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
   });
 
-  it('shows inline error and keeps dialog open when createNotebookAction rejects', async () => {
-    mockCreate.mockRejectedValue(new Error('IPC failure'));
+  it('shows the store error inline and keeps dialog open when createNotebookAction returns null', async () => {
+    // The action catches IPC failures internally, sets the store error, and
+    // returns null; the dialog surfaces that error and stays open.
+    mockCreate.mockResolvedValue(null);
+    storeState.error = 'IPC failure';
     const onOpenChange = vi.fn();
     render(NotebookCreateDialog, { props: { open: true, onOpenChange } });
     await fireEvent.input(screen.getByLabelText(/name/i), { target: { value: 'Test' } });
@@ -224,6 +251,18 @@ describe('NotebookCreateDialog — Create action', () => {
     await waitFor(() => expect(screen.getByRole('alert')).toBeInTheDocument());
     expect(screen.getByText(/IPC failure/i)).toBeInTheDocument();
     // Dialog should remain open (onOpenChange not called with false)
+    expect(onOpenChange).not.toHaveBeenCalledWith(false);
+  });
+
+  it('falls back to a generic inline error when the action returns null with no store error', async () => {
+    mockCreate.mockResolvedValue(null);
+    storeState.error = null;
+    const onOpenChange = vi.fn();
+    render(NotebookCreateDialog, { props: { open: true, onOpenChange } });
+    await fireEvent.input(screen.getByLabelText(/name/i), { target: { value: 'Test' } });
+    await fireEvent.click(screen.getByRole('button', { name: /create notebook/i }));
+    await waitFor(() => expect(screen.getByRole('alert')).toBeInTheDocument());
+    expect(screen.getByText(/could not create the notebook/i)).toBeInTheDocument();
     expect(onOpenChange).not.toHaveBeenCalledWith(false);
   });
 });
