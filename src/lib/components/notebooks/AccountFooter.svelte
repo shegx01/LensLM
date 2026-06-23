@@ -54,7 +54,7 @@
   // non-focusable regions (e.g. the canvas/main pane), so we listen for pointerdown
   // on the document (capture phase) while open and close when the target is outside.
   $effect(() => {
-    if (!open) return;
+    if (!open || typeof document === 'undefined') return;
     function onPointerDown(e: PointerEvent): void {
       if (containerEl && !containerEl.contains(e.target as Node)) {
         open = false;

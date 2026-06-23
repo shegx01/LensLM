@@ -70,12 +70,16 @@
   // ---------------------------------------------------------------------------
 
   $effect(() => {
+    // $effect is deferred (microtask); if it flushes after the component/jsdom is
+    // torn down, the bare `document` global may be gone — guard it.
+    if (typeof document === 'undefined') return;
     if (notebookStore.paletteOpen) {
       previouslyFocusedEl = document.activeElement;
-      // Defer focus until the DOM is painted.
-      requestAnimationFrame(() => {
+      // Defer focus until the DOM is painted; cancel if we tear down first.
+      const raf = requestAnimationFrame(() => {
         searchInput?.focus();
       });
+      return () => cancelAnimationFrame(raf);
     } else {
       // Restore focus to the element that was focused before the palette opened.
       if (previouslyFocusedEl && 'focus' in previouslyFocusedEl) {
