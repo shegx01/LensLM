@@ -20,17 +20,31 @@
   /** User display name (AppConfig.user_name) for the sidebar account footer. */
   let userName = $state('');
 
+  /**
+   * Ephemeral hover flag for the left rail. When the rail is persisted-collapsed
+   * and the pointer is over it, the rail temporarily expands so titles are
+   * readable/actionable. Never written to the store — only the collapse button
+   * toggles the persisted `sidebarCollapsed`.
+   */
+  let railHover = $state(false);
+
   // ---------------------------------------------------------------------------
   // Reactive reads from the shared store
   // ---------------------------------------------------------------------------
 
-  const collapsed = $derived(notebookStore.sidebarCollapsed);
+  // EFFECTIVE collapsed state: persisted-collapsed AND not hover-expanded. Drives
+  // both the grid column width and the sidebar's internal layout, so hovering a
+  // collapsed rail widens it in place to the full expanded layout.
+  const collapsed = $derived(notebookStore.sidebarCollapsed && !railHover);
   const activeNotebook = $derived(notebookStore.activeNotebook);
 
-  // Left grid column width: expanded ≈ 256px, collapsed icon rail ≈ 72px
-  // (wide enough for the native traffic lights). Animated via grid-template-columns.
+  // Left grid column width: expanded ≈ 256px, collapsed icon rail ≈ 88px (wide
+  // enough that the floating panel — m-2/8px left gutter → inner edge ≈ x80 —
+  // clears the native traffic lights' right edge ≈ x72). Animated via
+  // grid-template-columns. Uses the EFFECTIVE collapsed state so a hovered
+  // collapsed rail expands to 256px.
   const gridCols = $derived(
-    collapsed ? 'grid-cols-[72px_1fr_320px]' : 'grid-cols-[256px_1fr_320px]'
+    collapsed ? 'grid-cols-[88px_1fr_320px]' : 'grid-cols-[256px_1fr_320px]'
   );
 
   // ---------------------------------------------------------------------------
@@ -96,8 +110,10 @@
        component owns its own internal layout (expanded vs collapsed). -->
   <aside
     class="m-2 flex flex-col overflow-hidden rounded-xl border border-sidebar-border bg-sidebar text-sidebar-foreground shadow-sm"
+    onpointerenter={() => (railHover = true)}
+    onpointerleave={() => (railHover = false)}
   >
-    <NotebooksSidebar onnewnotebook={() => (createOpen = true)} {userName} />
+    <NotebooksSidebar {collapsed} onnewnotebook={() => (createOpen = true)} {userName} />
   </aside>
 
   <!-- CENTER: workspace on the canvas — top drag bar, then state-driven content.

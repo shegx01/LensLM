@@ -194,24 +194,23 @@ describe('NotebooksSidebar (expanded)', () => {
 });
 
 describe('NotebooksSidebar (collapsed)', () => {
-  beforeEach(() => {
-    storeProxy.sidebarCollapsed = true;
-  });
-
+  // Collapsed layout is now driven by the `collapsed` prop (AppShell supplies the
+  // hover-aware effective state). Pass `collapsed={true}` explicitly.
   it('renders expand button in collapsed state', () => {
-    render(NotebooksSidebar);
+    render(NotebooksSidebar, { props: { collapsed: true } });
     expect(screen.getByRole('button', { name: /expand sidebar/i })).toBeInTheDocument();
   });
 
   it('collapse toggle flips sidebarCollapsed to false (expanding)', async () => {
-    render(NotebooksSidebar);
+    storeProxy.sidebarCollapsed = true;
+    render(NotebooksSidebar, { props: { collapsed: true } });
     const expandBtn = screen.getByRole('button', { name: /expand sidebar/i });
     await fireEvent.click(expandBtn);
     expect(storeProxy.sidebarCollapsed).toBe(false);
   });
 
   it('icon-only search trigger opens palette', async () => {
-    render(NotebooksSidebar);
+    render(NotebooksSidebar, { props: { collapsed: true } });
     const searchBtn = screen.getByRole('button', { name: /search notebooks/i });
     await fireEvent.click(searchBtn);
     expect(storeProxy.paletteOpen).toBe(true);
@@ -219,14 +218,39 @@ describe('NotebooksSidebar (collapsed)', () => {
 
   it('renders notebook color icons (collapsed NotebookRow) for each notebook', () => {
     storeProxy.notebooks = [makeNotebook('nb-1', 'Alpha'), makeNotebook('nb-2', 'Beta')];
-    render(NotebooksSidebar);
+    render(NotebooksSidebar, { props: { collapsed: true } });
     // Collapsed rows render as buttons with the notebook title as aria-label
     expect(screen.getByRole('button', { name: 'Alpha' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Beta' })).toBeInTheDocument();
   });
 
   it('does NOT render "Sign out" in collapsed mode', () => {
-    render(NotebooksSidebar);
+    render(NotebooksSidebar, { props: { collapsed: true } });
     expect(screen.queryByText(/sign out/i)).not.toBeInTheDocument();
+  });
+});
+
+describe('NotebooksSidebar (collapsed prop fallback)', () => {
+  // Without the `collapsed` prop, layout falls back to the store's
+  // `sidebarCollapsed` — preserves existing direct usage.
+  it('falls back to store sidebarCollapsed when collapsed prop is omitted', () => {
+    storeProxy.sidebarCollapsed = true;
+    render(NotebooksSidebar);
+    expect(screen.getByRole('button', { name: /expand sidebar/i })).toBeInTheDocument();
+  });
+
+  it('store-expanded layout when prop omitted and sidebarCollapsed is false', () => {
+    storeProxy.sidebarCollapsed = false;
+    render(NotebooksSidebar);
+    // Expanded layout shows the "Notebooks" section label.
+    expect(screen.getByText('Notebooks')).toBeInTheDocument();
+  });
+
+  it('prop overrides the store (collapsed=false while store is collapsed)', () => {
+    storeProxy.sidebarCollapsed = true;
+    render(NotebooksSidebar, { props: { collapsed: false } });
+    // Effective layout follows the prop → expanded.
+    expect(screen.getByText('Notebooks')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /collapse sidebar/i })).toBeInTheDocument();
   });
 });

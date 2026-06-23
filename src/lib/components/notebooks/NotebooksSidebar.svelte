@@ -31,7 +31,8 @@
    */
   let {
     onnewnotebook,
-    userName = ''
+    userName = '',
+    collapsed: collapsedProp
   }: {
     onnewnotebook?: () => void;
     /**
@@ -39,6 +40,12 @@
      * AppShell wires this from `config.user_name`.
      */
     userName?: string;
+    /**
+     * EFFECTIVE collapsed layout, supplied by AppShell (persisted-collapsed AND
+     * not hover-expanded). When omitted, falls back to the store's
+     * `sidebarCollapsed` so existing direct usage/tests keep working.
+     */
+    collapsed?: boolean;
   } = $props();
 
   // ---------------------------------------------------------------------------
@@ -47,7 +54,9 @@
 
   const notebooks = $derived(notebookStore.notebooks);
   const activeId = $derived(notebookStore.activeNotebookId);
-  const collapsed = $derived(notebookStore.sidebarCollapsed);
+  // Use the prop when provided (AppShell's hover-aware effective state),
+  // otherwise fall back to the persisted store value.
+  const collapsed = $derived(collapsedProp ?? notebookStore.sidebarCollapsed);
   const trashCount = $derived(notebookStore.trashCount);
 
   function toggleCollapse(): void {
@@ -250,9 +259,7 @@
       </button>
     </div>
 
-    <Separator class="bg-sidebar-border/60" />
-
-    <!-- Account footer -->
+    <!-- Account footer (no divider above it — the footer is a continuous block per design) -->
     <div class="px-1.5 pb-2 pt-1">
       <AccountFooter {userName} />
     </div>
