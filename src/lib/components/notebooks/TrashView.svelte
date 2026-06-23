@@ -211,7 +211,8 @@
       </DialogDescription>
     </DialogHeader>
 
-    <DialogFooter class="gap-2 sm:gap-2">
+    <!-- No divider: neutralise DialogFooter's baked-in border-t + muted bg. -->
+    <DialogFooter class="mx-0 mb-0 gap-2 border-t-0 bg-transparent p-0 pt-2 sm:gap-2">
       <Button variant="outline" size="sm" onclick={closeConfirm} data-cancel-btn>Cancel</Button>
       <Button
         variant="destructive"
