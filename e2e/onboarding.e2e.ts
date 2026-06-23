@@ -68,7 +68,7 @@ test('completes the full onboarding walk and swaps to the app (no URL change)', 
     .poll(() => readSetConfigCalls(page))
     .toContainEqual(expect.objectContaining({ onboarding_complete: true }));
   await expect(page.getByText('System check', { exact: true })).toBeHidden();
-  await expect(page.getByRole('heading', { name: 'Hello World' })).toBeVisible();
+  await expect(page.getByText('Your workspace')).toBeVisible();
 });
 
 test('returning user sees the app immediately, never the System check', async ({ page }) => {
@@ -76,6 +76,6 @@ test('returning user sees the app immediately, never the System check', async ({
 
   await page.goto('/');
 
-  await expect(page.getByRole('heading', { name: 'Hello World' })).toBeVisible();
+  await expect(page.getByText('Your workspace')).toBeVisible();
   await expect(page.getByText('System check', { exact: true })).toBeHidden();
 });

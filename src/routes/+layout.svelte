@@ -87,6 +87,12 @@
      Runtime onMount reconciliation via loadThemeFromConfig still runs normally. -->
 <ModeWatcher disableHeadScriptInjection />
 
+<!-- Window chrome: the macOS title bar uses titleBarStyle "Overlay" (tauri.conf),
+     so the NATIVE traffic lights float over full-bleed content at the top-left and
+     handle close/minimize/zoom on every surface. No custom window-control buttons
+     are needed; draggability is provided by per-region drag bars (AppShell) and the
+     native transparent title-bar zone (onboarding's empty top). -->
+
 {#if booting}
   <!-- Hold render until the single config read resolves so the app never
        flashes before the first-run onboarding decision (anti-FOUC boot gate). -->
