@@ -76,6 +76,17 @@ describe('NotebookCreateDialog — field rendering', () => {
     expect(screen.getByRole('button', { name: /create notebook/i })).toBeInTheDocument();
   });
 
+  it('renders the custom circular Close button', () => {
+    renderDialog();
+    expect(screen.getByRole('button', { name: /^close$/i })).toBeInTheDocument();
+  });
+
+  it('renders the header title and subtitle', () => {
+    renderDialog();
+    expect(screen.getByText('New notebook')).toBeInTheDocument();
+    expect(screen.getByText(/create a new knowledge space/i)).toBeInTheDocument();
+  });
+
   it('does NOT render when open is false', () => {
     renderDialog({ open: false });
     // Dialog portal content should not be present
@@ -231,5 +242,11 @@ describe('NotebookCreateDialog — Cancel', () => {
     await fireEvent.input(screen.getByLabelText(/name/i), { target: { value: 'Test' } });
     await fireEvent.click(screen.getByRole('button', { name: /cancel/i }));
     expect(mockCreate).not.toHaveBeenCalled();
+  });
+
+  it('custom Close button calls onOpenChange(false)', async () => {
+    const { onOpenChange } = renderDialog();
+    await fireEvent.click(screen.getByRole('button', { name: /^close$/i }));
+    expect(onOpenChange).toHaveBeenCalledWith(false);
   });
 });

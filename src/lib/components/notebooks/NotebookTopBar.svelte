@@ -1,9 +1,9 @@
 <script lang="ts">
   // NotebookTopBar — floating pill header for the center pane (Apple Music style).
   //
-  // ALWAYS rendered (the header stays visible even with no notebook selected, so
-  // share + settings remain reachable). The title + Chat/Notes segmented toggle
-  // are notebook-contextual and appear only when `activeNotebook` is non-null.
+  // ALWAYS rendered (the header stays visible even with no notebook selected).
+  // The Chat/Notes tabs + share + settings are always shown; only the notebook
+  // title is contextual (rendered only when `activeNotebook` is non-null).
   //
   // Layout (per design source "Floating pill header — top right"):
   //   Outer row: right-aligned (justify-end), padding 10px 12px 2px — sits on the
@@ -45,11 +45,6 @@
   dragged by the empty space to the left of the pill. The pill is interactive
   and intentionally NOT a drag region.
 -->
-<!--
-  The pill is ALWAYS rendered (the header must be visible without a notebook
-  selected, so share/settings stay reachable). The title + Chat/Notes segmented
-  toggle are notebook-contextual and only appear when a notebook is active.
--->
 <div data-tauri-drag-region class="flex shrink-0 justify-end px-3 pt-2.5 pb-0.5">
   <!-- Floating pill — elevated surface (bg-popover) with a soft drop shadow -->
   <div
@@ -70,41 +65,39 @@
     {/if}
 
     <TooltipProvider>
-      {#if activeNotebook}
-        <!-- Chat | Notes segmented toggle -->
-        <div
-          role="group"
-          aria-label="View toggle"
-          class="flex items-center gap-px rounded-full bg-muted p-0.5"
-        >
-          <button
-            type="button"
-            role="tab"
-            aria-selected={activeTab === 'chat'}
-            aria-controls="notebook-tab-panel"
-            class="h-[26px] rounded-full px-[13px] text-[11px] font-semibold transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring
+      <!-- Chat | Notes segmented toggle — always present in the header -->
+      <div
+        role="group"
+        aria-label="View toggle"
+        class="flex items-center gap-px rounded-full bg-muted p-0.5"
+      >
+        <button
+          type="button"
+          role="tab"
+          aria-selected={activeTab === 'chat'}
+          aria-controls="notebook-tab-panel"
+          class="h-[26px] rounded-full px-[13px] text-[11px] font-semibold transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring
               {activeTab === 'chat'
-              ? 'bg-popover text-popover-foreground shadow-sm'
-              : 'text-muted-foreground hover:text-foreground'}"
-            onclick={() => setTab('chat')}
-          >
-            Chat
-          </button>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={activeTab === 'notes'}
-            aria-controls="notebook-tab-panel"
-            class="h-[26px] rounded-full px-[13px] text-[11px] font-semibold transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring
+            ? 'bg-popover text-popover-foreground shadow-sm'
+            : 'text-muted-foreground hover:text-foreground'}"
+          onclick={() => setTab('chat')}
+        >
+          Chat
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={activeTab === 'notes'}
+          aria-controls="notebook-tab-panel"
+          class="h-[26px] rounded-full px-[13px] text-[11px] font-semibold transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring
               {activeTab === 'notes'
-              ? 'bg-popover text-popover-foreground shadow-sm'
-              : 'text-muted-foreground hover:text-foreground'}"
-            onclick={() => setTab('notes')}
-          >
-            Notes
-          </button>
-        </div>
-      {/if}
+            ? 'bg-popover text-popover-foreground shadow-sm'
+            : 'text-muted-foreground hover:text-foreground'}"
+          onclick={() => setTab('notes')}
+        >
+          Notes
+        </button>
+      </div>
 
       <!-- Share — circular icon button, disabled, "Available soon" -->
       <Tooltip>
@@ -113,7 +106,7 @@
             variant="ghost"
             size="icon"
             disabled
-            class="size-[30px] rounded-full"
+            class="size-[30px] rounded-full bg-muted text-muted-foreground hover:bg-muted/70"
             aria-label="Share notebook (available soon)"
           >
             <Share2 class="size-[13px]" />
@@ -129,7 +122,7 @@
             variant="ghost"
             size="icon"
             disabled
-            class="size-[30px] rounded-full"
+            class="size-[30px] rounded-full bg-muted text-muted-foreground hover:bg-muted/70"
             aria-label="Notebook settings (available soon)"
           >
             <Settings class="size-[13px]" />

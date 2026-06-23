@@ -102,8 +102,7 @@
     class={cn(
       'flex size-9 shrink-0 items-center justify-center rounded-lg transition-all',
       'hover:ring-2 hover:ring-sidebar-ring/40',
-      accentClass,
-      active && 'ring-2 ring-sidebar-ring'
+      active ? 'bg-primary text-primary-foreground ring-2 ring-sidebar-ring' : accentClass
     )}
   >
     <BookOpen class="size-4" />
@@ -131,9 +130,13 @@
       active && 'bg-sidebar-accent text-sidebar-accent-foreground'
     )}
   >
-    <!-- Color icon square -->
+    <!-- Color icon square — flips to the accent when this notebook is selected
+         (design: `grad: active ? var(--acc)`), a clear selected indicator. -->
     <div
-      class={cn('flex size-8 shrink-0 items-center justify-center rounded-lg', accentClass)}
+      class={cn(
+        'flex size-8 shrink-0 items-center justify-center rounded-lg',
+        active ? 'bg-primary text-primary-foreground' : accentClass
+      )}
       aria-hidden="true"
     >
       <BookOpen class="size-4" />

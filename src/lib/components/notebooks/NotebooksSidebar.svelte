@@ -206,16 +206,17 @@
 
     <!-- Bottom actions: New notebook + Trash -->
     <div class="px-1.5 py-1.5 flex flex-col gap-0.5">
-      <!-- New notebook button — ghost/transparent, parent-colored (no distinct fill) -->
+      <!-- New notebook button — surface-raised fill (c.newBg), matches the
+           search input above the list. Subtle raised button, no border. -->
       <button
         type="button"
         aria-label="New notebook"
         data-new-notebook-btn
         onclick={handleNewNotebook}
         class={cn(
-          'flex w-full items-center justify-center gap-1.5 rounded-[10px] px-2 h-[33px]',
-          'bg-transparent text-sidebar-foreground text-[0.8125rem] font-semibold',
-          'hover:opacity-70 transition-opacity cursor-pointer outline-none',
+          'flex h-[33px] w-full items-center justify-center gap-1.5 rounded-[10px] px-2',
+          'bg-surface-raised text-[12px] font-semibold text-sidebar-foreground',
+          'cursor-pointer border-0 outline-none transition-opacity hover:opacity-80',
           'focus-visible:ring-2 focus-visible:ring-sidebar-ring'
         )}
       >
