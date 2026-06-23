@@ -104,9 +104,11 @@
        The floating pill header (NotebookTopBar) sits within the top area; Trash
        is a centered modal (mounted at shell root), not a center-pane view. -->
   <main class="flex flex-col overflow-hidden">
-    <div data-tauri-drag-region class="h-[var(--titlebar-h)] shrink-0"></div>
+    <!-- Floating pill header — always present (its full-width outer row is the
+         window drag region); the pill shows the title + Chat/Notes only when a
+         notebook is active, and always exposes share + settings. -->
+    <NotebookTopBar />
     {#if activeNotebook}
-      <NotebookTopBar />
       <!-- Empty content region — chat/notes fill this in M5/M6. -->
       <div class="flex flex-1 flex-col overflow-hidden"></div>
     {:else}

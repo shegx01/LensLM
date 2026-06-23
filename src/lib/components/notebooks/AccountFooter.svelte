@@ -141,9 +141,6 @@
         </Tooltip>
       </TooltipProvider>
 
-      <!-- Hairline divider between item groups (design: 1px srchRowBdr, margin:4px 6px) -->
-      <div class="mx-1.5 my-1 h-px bg-border" role="separator" aria-hidden="true"></div>
-
       <!-- Switch theme — real, embeds ThemeCycleButton as a menu row -->
       <div
         role="menuitem"

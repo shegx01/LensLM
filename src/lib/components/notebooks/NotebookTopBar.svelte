@@ -1,8 +1,9 @@
 <script lang="ts">
   // NotebookTopBar — floating pill header for the center pane (Apple Music style).
   //
-  // Renders only when `notebookStore.activeNotebook` is non-null; AppShell
-  // decides when to mount this component, but we guard internally too.
+  // ALWAYS rendered (the header stays visible even with no notebook selected, so
+  // share + settings remain reachable). The title + Chat/Notes segmented toggle
+  // are notebook-contextual and appear only when `activeNotebook` is non-null.
   //
   // Layout (per design source "Floating pill header — top right"):
   //   Outer row: right-aligned (justify-end), padding 10px 12px 2px — sits on the
@@ -44,14 +45,21 @@
   dragged by the empty space to the left of the pill. The pill is interactive
   and intentionally NOT a drag region.
 -->
-{#if activeNotebook}
-  <div data-tauri-drag-region class="flex shrink-0 justify-end px-3 pt-2.5 pb-0.5">
-    <!-- Floating pill — elevated surface (bg-popover) with a soft drop shadow -->
-    <div
-      role="toolbar"
-      aria-label="Notebook toolbar"
-      class="inline-flex items-center gap-[3px] rounded-full bg-popover py-1 pr-1 pl-3.5 shadow-[0_4px_16px_rgba(0,0,0,0.12)]"
-    >
+<!--
+  The pill is ALWAYS rendered (the header must be visible without a notebook
+  selected, so share/settings stay reachable). The title + Chat/Notes segmented
+  toggle are notebook-contextual and only appear when a notebook is active.
+-->
+<div data-tauri-drag-region class="flex shrink-0 justify-end px-3 pt-2.5 pb-0.5">
+  <!-- Floating pill — elevated surface (bg-popover) with a soft drop shadow -->
+  <div
+    role="toolbar"
+    aria-label="Notebook toolbar"
+    class="inline-flex items-center gap-[3px] rounded-full bg-popover py-1 pr-1 shadow-[0_4px_16px_rgba(0,0,0,0.12)] {activeNotebook
+      ? 'pl-3.5'
+      : 'pl-1'}"
+  >
+    {#if activeNotebook}
       <!-- Notebook title — lives inside the pill (not large/bold) -->
       <span
         class="max-w-[180px] truncate pr-1.5 text-xs font-semibold tracking-[-0.1px] text-popover-foreground"
@@ -59,8 +67,10 @@
       >
         {activeNotebook.title}
       </span>
+    {/if}
 
-      <TooltipProvider>
+    <TooltipProvider>
+      {#if activeNotebook}
         <!-- Chat | Notes segmented toggle -->
         <div
           role="group"
@@ -94,39 +104,39 @@
             Notes
           </button>
         </div>
+      {/if}
 
-        <!-- Share — circular icon button, disabled, "Available soon" -->
-        <Tooltip>
-          <TooltipTrigger>
-            <Button
-              variant="ghost"
-              size="icon"
-              disabled
-              class="size-[30px] rounded-full"
-              aria-label="Share notebook (available soon)"
-            >
-              <Share2 class="size-[13px]" />
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent side="bottom">Available soon</TooltipContent>
-        </Tooltip>
+      <!-- Share — circular icon button, disabled, "Available soon" -->
+      <Tooltip>
+        <TooltipTrigger>
+          <Button
+            variant="ghost"
+            size="icon"
+            disabled
+            class="size-[30px] rounded-full"
+            aria-label="Share notebook (available soon)"
+          >
+            <Share2 class="size-[13px]" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent side="bottom">Available soon</TooltipContent>
+      </Tooltip>
 
-        <!-- Settings gear — circular icon button, disabled, "Available soon" -->
-        <Tooltip>
-          <TooltipTrigger>
-            <Button
-              variant="ghost"
-              size="icon"
-              disabled
-              class="size-[30px] rounded-full"
-              aria-label="Notebook settings (available soon)"
-            >
-              <Settings class="size-[13px]" />
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent side="bottom">Available soon</TooltipContent>
-        </Tooltip>
-      </TooltipProvider>
-    </div>
+      <!-- Settings gear — circular icon button, disabled, "Available soon" -->
+      <Tooltip>
+        <TooltipTrigger>
+          <Button
+            variant="ghost"
+            size="icon"
+            disabled
+            class="size-[30px] rounded-full"
+            aria-label="Notebook settings (available soon)"
+          >
+            <Settings class="size-[13px]" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent side="bottom">Available soon</TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
   </div>
-{/if}
+</div>

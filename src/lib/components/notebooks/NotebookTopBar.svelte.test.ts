@@ -167,13 +167,15 @@ describe('NotebookTopBar', () => {
   });
 
   describe('when no notebook is active', () => {
-    it('renders nothing (empty output) when activeNotebook is null', () => {
+    it('still renders the pill (header is always visible) but omits the title and tabs', () => {
       mockStore._setActiveNotebook(null);
       render(NotebookTopBar);
-      // No title, no tab buttons, no share/settings
-      expect(screen.queryByRole('toolbar')).not.toBeInTheDocument();
+      // The header/pill is always present so share + settings stay reachable...
+      expect(screen.getByRole('toolbar', { name: /notebook toolbar/i })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /share/i })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /settings/i })).toBeInTheDocument();
+      // ...but the notebook-contextual title + Chat/Notes tabs are hidden.
       expect(screen.queryByRole('tab')).not.toBeInTheDocument();
-      expect(screen.queryByRole('button', { name: /share/i })).not.toBeInTheDocument();
     });
   });
 });
