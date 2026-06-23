@@ -8,13 +8,28 @@
   import { cn } from '$lib/utils.js';
 
   /**
-   * Optional class string merged onto the trigger button.
-   * Callers use this to vary sizing/positioning:
-   *   - Onboarding (SystemCheck): class="size-9 rounded-lg"
-   *   - Sidebar header: no override (defaults to Button size="icon")
-   *   - Account footer: no override (call cycleTheme from outside)
+   * Single cycling theme button: click advances light → dark → system → light.
+   * Renders in two visual contexts via the `variant` prop:
+   *
+   *   - `outline` (default): the shadcn outline icon button. Used by onboarding
+   *     (SystemCheck, `class="size-9 rounded-lg"`) and the account-footer menu row
+   *     (which passes a ghost-style class override).
+   *   - `bare`: a borderless 26px `bg-muted` circle with a 14px glyph, matching
+   *     the sidebar brand-row collapse button. No shadcn Button wrapper — a plain
+   *     <button> so the circle chrome is exact.
+   *
+   * `class` is merged onto the trigger in both variants. `iconClass` overrides the
+   * glyph size (defaults: 16px outline, 14px bare).
    */
-  let { class: className = '' }: { class?: string } = $props();
+  let {
+    class: className = '',
+    variant = 'outline',
+    iconClass
+  }: {
+    class?: string;
+    variant?: 'outline' | 'bare';
+    iconClass?: string;
+  } = $props();
 
   const CYCLE: Mode[] = ['light', 'dark', 'system'];
 
@@ -26,6 +41,8 @@
 
   const currentMode = $derived(userPrefersMode.current ?? 'system');
   const meta = $derived(CYCLE_META[currentMode]);
+  const ariaLabel = $derived(`Theme: ${meta.label} — click to switch to ${meta.next}`);
+  const glyphClass = $derived(iconClass ?? (variant === 'bare' ? 'size-3.5' : 'size-4'));
 
   function cycleTheme(): void {
     const idx = CYCLE.indexOf(currentMode);
@@ -36,21 +53,39 @@
 </script>
 
 <!--
-  Single cycling icon button: click advances light→dark→system→light.
-  The icon reflects the CURRENT mode; aria-label names the current mode
-  and the next mode so screen-reader users know what clicking will do.
-  Accepts an optional `class` prop to override size/shape for different
-  placement contexts (e.g. onboarding, sidebar header, footer menu).
+  The icon reflects the CURRENT mode; aria-label names the current mode and the
+  next mode so screen-reader users know what clicking will do.
 -->
-<Button
-  variant="outline"
-  size="icon"
-  aria-label={`Theme: ${meta.label} — click to switch to ${meta.next}`}
-  onclick={cycleTheme}
-  class={cn(className)}
->
-  {#key currentMode}
-    {@const Icon = meta.icon}
-    <Icon class="size-4" />
-  {/key}
-</Button>
+{#if variant === 'bare'}
+  <button
+    type="button"
+    aria-label={ariaLabel}
+    data-theme-cycle-btn
+    onclick={cycleTheme}
+    class={cn(
+      'flex size-[26px] shrink-0 items-center justify-center rounded-full',
+      'bg-muted text-sidebar-foreground/70 hover:text-sidebar-foreground hover:opacity-60',
+      'cursor-pointer border-0 transition-opacity',
+      'outline-none focus-visible:ring-2 focus-visible:ring-sidebar-ring',
+      className
+    )}
+  >
+    {#key currentMode}
+      {@const Icon = meta.icon}
+      <Icon class={glyphClass} />
+    {/key}
+  </button>
+{:else}
+  <Button
+    variant="outline"
+    size="icon"
+    aria-label={ariaLabel}
+    onclick={cycleTheme}
+    class={cn(className)}
+  >
+    {#key currentMode}
+      {@const Icon = meta.icon}
+      <Icon class={glyphClass} />
+    {/key}
+  </Button>
+{/if}

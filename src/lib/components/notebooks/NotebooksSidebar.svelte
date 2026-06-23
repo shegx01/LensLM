@@ -5,12 +5,8 @@
   import Search from '@lucide/svelte/icons/search';
   import Plus from '@lucide/svelte/icons/plus';
   import Trash from '@lucide/svelte/icons/trash';
-  import Sun from '@lucide/svelte/icons/sun';
-  import Moon from '@lucide/svelte/icons/moon';
-  import Monitor from '@lucide/svelte/icons/monitor';
-  import { setMode, userPrefersMode } from 'mode-watcher';
-  import { persistTheme, type Mode } from '$lib/theme/index.js';
   import { cn } from '$lib/utils.js';
+  import ThemeCycleButton from '$lib/components/ThemeCycleButton.svelte';
   import { ScrollArea } from '$lib/components/ui/scroll-area/index.js';
   import { Separator } from '$lib/components/ui/separator/index.js';
   import {
@@ -70,30 +66,6 @@
   function handleNewNotebook(): void {
     onnewnotebook?.();
   }
-
-  // ---------------------------------------------------------------------------
-  // Theme cycle (inlined here so the brand-row button can be a 26px circle with
-  // the SAME glyph size as the collapse button — design fidelity. The cycle
-  // logic mirrors ThemeCycleButton: light → dark → system → light.)
-  // ---------------------------------------------------------------------------
-
-  const THEME_CYCLE: Mode[] = ['light', 'dark', 'system'];
-  const THEME_META: Record<Mode, { icon: typeof Sun; label: string; next: string }> = {
-    light: { icon: Sun, label: 'Light', next: 'Dark' },
-    dark: { icon: Moon, label: 'Dark', next: 'System' },
-    system: { icon: Monitor, label: 'System', next: 'Light' }
-  };
-
-  const currentMode = $derived(userPrefersMode.current ?? 'system');
-  const themeMeta = $derived(THEME_META[currentMode]);
-  const ThemeIcon = $derived(themeMeta.icon);
-
-  function cycleTheme(): void {
-    const idx = THEME_CYCLE.indexOf(currentMode);
-    const next = THEME_CYCLE[(idx + 1) % THEME_CYCLE.length];
-    setMode(next);
-    persistTheme(next);
-  }
 </script>
 
 <!--
@@ -125,22 +97,7 @@
       <span class="flex-1 text-base font-semibold text-sidebar-foreground">Lens</span>
 
       <!-- Theme switcher — 26px modeBg circle, matches the collapse button -->
-      <button
-        type="button"
-        aria-label={`Theme: ${themeMeta.label} — click to switch to ${themeMeta.next}`}
-        data-theme-cycle-btn
-        onclick={cycleTheme}
-        class={cn(
-          'flex size-[26px] shrink-0 items-center justify-center rounded-full',
-          'bg-muted text-sidebar-foreground/70 hover:opacity-60 hover:text-sidebar-foreground',
-          'transition-opacity cursor-pointer border-0',
-          'focus-visible:ring-2 focus-visible:ring-sidebar-ring outline-none'
-        )}
-      >
-        {#key currentMode}
-          <ThemeIcon class="size-3.5" />
-        {/key}
-      </button>
+      <ThemeCycleButton variant="bare" />
 
       <!-- Collapse button — 26px modeBg circle, matches the theme switcher -->
       <TooltipProvider>

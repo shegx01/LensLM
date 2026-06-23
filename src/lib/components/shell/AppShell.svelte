@@ -3,7 +3,7 @@
   import { onMount } from 'svelte';
   import { invoke, isTauri } from '@tauri-apps/api/core';
   import type { AppConfig } from '$lib/theme/types.js';
-  import NotebooksSidebar from '$lib/components/notebooks/NotebooksSidebar.svelte';
+  import SidebarRail from '$lib/components/shell/SidebarRail.svelte';
   import NotebookTopBar from '$lib/components/notebooks/NotebookTopBar.svelte';
   import TrashView from '$lib/components/notebooks/TrashView.svelte';
   import CommandPalette from '$lib/components/notebooks/CommandPalette.svelte';
@@ -20,31 +20,20 @@
   /** User display name (AppConfig.user_name) for the sidebar account footer. */
   let userName = $state('');
 
-  /**
-   * Ephemeral hover flag for the left rail. When the rail is persisted-collapsed
-   * and the pointer is over it, the rail temporarily expands so titles are
-   * readable/actionable. Never written to the store — only the collapse button
-   * toggles the persisted `sidebarCollapsed`.
-   */
-  let railHover = $state(false);
-
   // ---------------------------------------------------------------------------
   // Reactive reads from the shared store
   // ---------------------------------------------------------------------------
 
-  // EFFECTIVE collapsed state: persisted-collapsed AND not hover-expanded. Drives
-  // both the grid column width and the sidebar's internal layout, so hovering a
-  // collapsed rail widens it in place to the full expanded layout.
-  const collapsed = $derived(notebookStore.sidebarCollapsed && !railHover);
   const activeNotebook = $derived(notebookStore.activeNotebook);
 
-  // Left grid column width: expanded ≈ 256px, collapsed icon rail ≈ 88px (wide
-  // enough that the floating panel — m-2/8px left gutter → inner edge ≈ x80 —
-  // clears the native traffic lights' right edge ≈ x72). Animated via
-  // grid-template-columns. Uses the EFFECTIVE collapsed state so a hovered
-  // collapsed rail expands to 256px.
+  // Left grid column width is driven ONLY by the persisted collapse state:
+  // expanded = 256px, collapsed icon rail = 88px. Hover NEVER changes this — the
+  // collapsed flyout (SidebarRail) expands as an absolute overlay over the centre
+  // content, so the centre/right regions never reflow on hover. 88px is wide
+  // enough that the floating panel (m-2/8px left gutter → inner edge ≈ x8) clears
+  // the native traffic lights.
   const gridCols = $derived(
-    collapsed ? 'grid-cols-[88px_1fr_320px]' : 'grid-cols-[256px_1fr_320px]'
+    notebookStore.sidebarCollapsed ? 'grid-cols-[88px_1fr_320px]' : 'grid-cols-[256px_1fr_320px]'
   );
 
   // ---------------------------------------------------------------------------
@@ -105,16 +94,12 @@
     gridCols
   ].join(' ')}
 >
-  <!-- LEFT: floating sidebar panel — equal gutter on all sides, rounded, border +
-       tiny shadow; native traffic lights overlay the top drag row. The sidebar
-       component owns its own internal layout (expanded vs collapsed). -->
-  <aside
-    class="m-2 flex flex-col overflow-hidden rounded-xl border border-sidebar-border bg-sidebar text-sidebar-foreground shadow-sm"
-    onpointerenter={() => (railHover = true)}
-    onpointerleave={() => (railHover = false)}
-  >
-    <NotebooksSidebar {collapsed} onnewnotebook={() => (createOpen = true)} {userName} />
-  </aside>
+  <!-- LEFT: floating sidebar rail. SidebarRail owns the collapse / hover-flyout
+       logic: the grid cell width above is fixed by sidebarCollapsed (88 / 256px),
+       and when collapsed, hovering floats an expanded panel OVER the centre as an
+       absolute overlay — the centre/right content never moves. Native traffic
+       lights overlay the panel's top drag row. -->
+  <SidebarRail onnewnotebook={() => (createOpen = true)} {userName} />
 
   <!-- CENTER: workspace on the canvas — top drag bar, then state-driven content.
        The floating pill header (NotebookTopBar) sits within the top area; Trash

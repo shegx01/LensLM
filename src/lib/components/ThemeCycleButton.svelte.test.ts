@@ -105,4 +105,42 @@ describe('ThemeCycleButton', () => {
     render(ThemeCycleButton);
     expect(screen.getByRole('button')).toBeInTheDocument();
   });
+
+  // ── Variant rendering — must work in both placement contexts ────────────────
+
+  it('outline variant renders the onboarding size-9 rounded-lg button', () => {
+    render(ThemeCycleButton, { props: { variant: 'outline', class: 'size-9 rounded-lg' } });
+    const btn = screen.getByRole('button');
+    expect(btn.className).toContain('size-9');
+    expect(btn.className).toContain('rounded-lg');
+  });
+
+  it('bare variant renders the sidebar 26px circle (bg-muted, rounded-full)', () => {
+    render(ThemeCycleButton, { props: { variant: 'bare' } });
+    const btn = screen.getByRole('button');
+    expect(btn.className).toContain('size-[26px]');
+    expect(btn.className).toContain('rounded-full');
+    expect(btn.className).toContain('bg-muted');
+  });
+
+  it('bare variant carries the data-theme-cycle-btn hook', () => {
+    const { container } = render(ThemeCycleButton, { props: { variant: 'bare' } });
+    expect(container.querySelector('[data-theme-cycle-btn]')).not.toBeNull();
+  });
+
+  it('bare variant cycles light → dark → system on repeated clicks', async () => {
+    mockUserPrefersMode.current = 'light';
+    render(ThemeCycleButton, { props: { variant: 'bare' } });
+    await fireEvent.click(screen.getByRole('button'));
+    expect(mockSetMode).toHaveBeenCalledWith('dark');
+    expect(mockPersistTheme).toHaveBeenCalledWith('dark');
+  });
+
+  it('bare variant aria-label names current and next mode', () => {
+    mockUserPrefersMode.current = 'dark';
+    render(ThemeCycleButton, { props: { variant: 'bare' } });
+    const label = screen.getByRole('button').getAttribute('aria-label') ?? '';
+    expect(label).toMatch(/dark/i);
+    expect(label).toMatch(/system/i);
+  });
 });
