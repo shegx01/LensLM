@@ -117,6 +117,12 @@
   /* --- Radius scale --- */
   --radius: 0.75rem; /* 12px base */
 
+  /* --- App-shell title-bar / drag-bar height (single source of truth) ---
+     The macOS title bar uses titleBarStyle "Overlay" (native traffic lights over
+     full-bleed content). AppShell gives each region a top drag bar of THIS height
+     so the window is movable by its top edge, aligned with the traffic lights. */
+  --titlebar-h: 1.75rem; /* 28px — matches the macOS title-bar height */
+
   /* --- Semantic tokens — LIGHT (shadcn names → primitives) --- */
   --background: var(--neutral-0);
   --foreground: var(--neutral-850);
