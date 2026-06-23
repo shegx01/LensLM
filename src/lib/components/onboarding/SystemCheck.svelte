@@ -4,15 +4,11 @@
   import ArrowRight from '@lucide/svelte/icons/arrow-right';
   import TriangleAlert from '@lucide/svelte/icons/triangle-alert';
   import Aperture from '@lucide/svelte/icons/aperture';
-  import Sun from '@lucide/svelte/icons/sun';
-  import Moon from '@lucide/svelte/icons/moon';
-  import Monitor from '@lucide/svelte/icons/monitor';
   import { Button } from '$lib/components/ui/button/index.js';
   import { Card } from '$lib/components/ui/card/index.js';
   import SystemCheckRow from '$lib/components/onboarding/SystemCheckRow.svelte';
   import { runSystemCheck, type CheckResult } from '$lib/onboarding/system-check.js';
-  import { setMode, userPrefersMode } from 'mode-watcher';
-  import { persistTheme, type Mode } from '$lib/theme/index.js';
+  import ThemeSwitcher from '$lib/components/ThemeSwitcher.svelte';
 
   let { onadvance }: { onadvance: () => void } = $props();
 
@@ -65,36 +61,13 @@
     }
   }
 
-  const CYCLE: Mode[] = ['light', 'dark', 'system'];
-  const CYCLE_ICON = { light: Sun, dark: Moon, system: Monitor } as const;
-  const CYCLE_LABEL = { light: 'Light', dark: 'Dark', system: 'System' } as const;
-
-  const currentMode = $derived(userPrefersMode.current ?? 'system');
-  const NextIcon = $derived(CYCLE_ICON[currentMode]);
-  const nextLabel = $derived(CYCLE_LABEL[currentMode]);
-
-  function cycleTheme(): void {
-    const idx = CYCLE.indexOf(currentMode);
-    const next = CYCLE[(idx + 1) % CYCLE.length];
-    setMode(next);
-    persistTheme(next);
-  }
-
   onMount(() => {
     void check();
   });
 </script>
 
 <div class="absolute top-4 right-4 z-10">
-  <Button
-    variant="outline"
-    size="icon"
-    aria-label={`Theme: ${nextLabel}`}
-    onclick={cycleTheme}
-    class="size-9 rounded-lg"
-  >
-    <NextIcon class="size-4" />
-  </Button>
+  <ThemeSwitcher class="size-9 rounded-lg" />
 </div>
 
 <main class="flex min-h-svh items-center justify-center p-6">

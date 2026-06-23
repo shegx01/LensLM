@@ -326,6 +326,101 @@
   --sidebar-ring: var(--graphite-600);
 }
 
+/* ---------------------------------------------------------------------------
+ * Notebook icon palette — decorative per-notebook hue classes.
+ *
+ * Applied by notebookAccentClass() as `nb-{accent}` (e.g. `nb-purple`).
+ * These are independent of the user's [data-accent] selection — they never
+ * override semantic tokens and are never overridden by data-accent.
+ *
+ * Each class defines two custom properties consumed by the icon container:
+ *   --nb-bg  — soft tinted background (low-alpha hue over the surface)
+ *   --nb-fg  — brighter hue for the glyph / icon inside
+ *
+ * Background tint: color-mix blends the hue primitive at ~15 % into transparent
+ * so it reads as a gentle wash. In dark mode the mix percentage is raised to
+ * ~20 % because the dark surface absorbs chroma; the -600 step (darker/richer)
+ * is used so the tint still reads against --neutral-900.
+ * Glyph: the -500 step in light mode (high contrast on white); the brighter
+ * -500 step again in dark (luminance is sufficient against the tinted dark bg).
+ * For green we use --green-primary-aa / --green-primary to match the ramp.
+ * For graphite the glyph shifts to --neutral-100 in dark so it stays legible.
+ * ------------------------------------------------------------------------- */
+
+/* Self-applying: the class drives both the container tint and the glyph color.
+ * Dark mode only re-declares --nb-bg/--nb-fg below, so these resolve correctly. */
+.nb-purple,
+.nb-green,
+.nb-blue,
+.nb-amber,
+.nb-rose,
+.nb-graphite {
+  background-color: var(--nb-bg);
+  color: var(--nb-fg);
+}
+
+/* -- light mode ----------------------------------------------------------- */
+.nb-purple {
+  --nb-bg: color-mix(in oklch, var(--purple-500) 15%, transparent);
+  --nb-fg: var(--purple-500);
+}
+
+.nb-green {
+  --nb-bg: color-mix(in oklch, var(--green-primary-aa) 15%, transparent);
+  --nb-fg: var(--green-primary-aa);
+}
+
+.nb-blue {
+  --nb-bg: color-mix(in oklch, var(--blue-500) 15%, transparent);
+  --nb-fg: var(--blue-500);
+}
+
+.nb-amber {
+  --nb-bg: color-mix(in oklch, var(--amber-500) 15%, transparent);
+  --nb-fg: var(--amber-500);
+}
+
+.nb-rose {
+  --nb-bg: color-mix(in oklch, var(--rose-500) 15%, transparent);
+  --nb-fg: var(--rose-500);
+}
+
+.nb-graphite {
+  --nb-bg: color-mix(in oklch, var(--graphite-500) 15%, transparent);
+  --nb-fg: var(--graphite-500);
+}
+
+/* -- dark mode ------------------------------------------------------------ */
+.dark .nb-purple {
+  --nb-bg: color-mix(in oklch, var(--purple-600) 20%, transparent);
+  --nb-fg: var(--purple-500);
+}
+
+.dark .nb-green {
+  --nb-bg: color-mix(in oklch, var(--green-primary) 20%, transparent);
+  --nb-fg: var(--green-bright);
+}
+
+.dark .nb-blue {
+  --nb-bg: color-mix(in oklch, var(--blue-600) 20%, transparent);
+  --nb-fg: var(--blue-500);
+}
+
+.dark .nb-amber {
+  --nb-bg: color-mix(in oklch, var(--amber-600) 20%, transparent);
+  --nb-fg: var(--amber-500);
+}
+
+.dark .nb-rose {
+  --nb-bg: color-mix(in oklch, var(--rose-600) 20%, transparent);
+  --nb-fg: var(--rose-500);
+}
+
+.dark .nb-graphite {
+  --nb-bg: color-mix(in oklch, var(--graphite-600) 20%, transparent);
+  --nb-fg: var(--neutral-100);
+}
+
 @theme inline {
   /* Proxima Nova with a system-stack fallback (used while woff2 swaps in / if a
    * weight is unavailable). Maps to the `font-sans` utility + the default body. */
