@@ -24,7 +24,7 @@ vi.mock('$lib/theme/index.js', () => ({
 }));
 
 // Import after mocks so the component picks up the mocked modules.
-import ThemeSwitcher from './ThemeSwitcher.svelte';
+import ThemeCycleButton from './ThemeCycleButton.svelte';
 
 beforeEach(() => {
   mockUserPrefersMode.current = 'system';
@@ -36,15 +36,15 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe('ThemeSwitcher', () => {
+describe('ThemeCycleButton', () => {
   it('renders a single button', () => {
-    render(ThemeSwitcher);
+    render(ThemeCycleButton);
     expect(screen.getByRole('button')).toBeInTheDocument();
   });
 
   it('aria-label includes current mode (System) and next mode (Light)', () => {
     mockUserPrefersMode.current = 'system';
-    render(ThemeSwitcher);
+    render(ThemeCycleButton);
     const btn = screen.getByRole('button');
     expect(btn.getAttribute('aria-label')).toMatch(/system/i);
     expect(btn.getAttribute('aria-label')).toMatch(/light/i);
@@ -52,7 +52,7 @@ describe('ThemeSwitcher', () => {
 
   it('aria-label includes current mode (Light) and next mode (Dark)', () => {
     mockUserPrefersMode.current = 'light';
-    render(ThemeSwitcher);
+    render(ThemeCycleButton);
     const btn = screen.getByRole('button');
     expect(btn.getAttribute('aria-label')).toMatch(/light/i);
     expect(btn.getAttribute('aria-label')).toMatch(/dark/i);
@@ -60,7 +60,7 @@ describe('ThemeSwitcher', () => {
 
   it('aria-label includes current mode (Dark) and next mode (System)', () => {
     mockUserPrefersMode.current = 'dark';
-    render(ThemeSwitcher);
+    render(ThemeCycleButton);
     const btn = screen.getByRole('button');
     expect(btn.getAttribute('aria-label')).toMatch(/dark/i);
     expect(btn.getAttribute('aria-label')).toMatch(/system/i);
@@ -68,7 +68,7 @@ describe('ThemeSwitcher', () => {
 
   it('clicking calls setMode and persistTheme with the next mode (system → light)', async () => {
     mockUserPrefersMode.current = 'system';
-    render(ThemeSwitcher);
+    render(ThemeCycleButton);
     await fireEvent.click(screen.getByRole('button'));
     expect(mockSetMode).toHaveBeenCalledOnce();
     expect(mockSetMode).toHaveBeenCalledWith('light');
@@ -78,7 +78,7 @@ describe('ThemeSwitcher', () => {
 
   it('clicking cycles light → dark', async () => {
     mockUserPrefersMode.current = 'light';
-    render(ThemeSwitcher);
+    render(ThemeCycleButton);
     await fireEvent.click(screen.getByRole('button'));
     expect(mockSetMode).toHaveBeenCalledWith('dark');
     expect(mockPersistTheme).toHaveBeenCalledWith('dark');
@@ -86,14 +86,14 @@ describe('ThemeSwitcher', () => {
 
   it('clicking cycles dark → system', async () => {
     mockUserPrefersMode.current = 'dark';
-    render(ThemeSwitcher);
+    render(ThemeCycleButton);
     await fireEvent.click(screen.getByRole('button'));
     expect(mockSetMode).toHaveBeenCalledWith('system');
     expect(mockPersistTheme).toHaveBeenCalledWith('system');
   });
 
   it('accepts a class prop and forwards it to the button', () => {
-    render(ThemeSwitcher, { props: { class: 'size-9 rounded-lg' } });
+    render(ThemeCycleButton, { props: { class: 'size-9 rounded-lg' } });
     const btn = screen.getByRole('button');
     // class prop is merged via cn() onto the button element.
     expect(btn.className).toContain('size-9');
@@ -102,7 +102,7 @@ describe('ThemeSwitcher', () => {
 
   it('works without a class prop (default rendering)', () => {
     // Should not throw and should render a single button.
-    render(ThemeSwitcher);
+    render(ThemeCycleButton);
     expect(screen.getByRole('button')).toBeInTheDocument();
   });
 });

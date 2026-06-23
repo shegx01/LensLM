@@ -11,6 +11,6 @@ test('home page renders the app shell for a returning user', async ({ page }) =>
   await page.goto('/');
   // The app shell replaced the old Hello World scaffold: three structural regions.
   await expect(page.getByText('Your workspace')).toBeVisible();
-  await expect(page.getByText('Notebooks')).toBeVisible();
+  await expect(page.getByText('Notebooks', { exact: true })).toBeVisible();
   await expect(page.getByText(/sources & studio/i)).toBeVisible();
 });

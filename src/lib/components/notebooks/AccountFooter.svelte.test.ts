@@ -6,9 +6,9 @@
 import { render, screen, fireEvent, waitFor } from '@testing-library/svelte';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-// Stub ThemeSwitcher (avoids mode-watcher interaction in tests)
-vi.mock('$lib/components/ThemeSwitcher.svelte', () => ({
-  default: function ThemeSwitcherStub() {}
+// Stub ThemeCycleButton (avoids mode-watcher interaction in tests)
+vi.mock('$lib/components/ThemeCycleButton.svelte', () => ({
+  default: function ThemeCycleButtonStub() {}
 }));
 
 // Stub mode-watcher to prevent missing ESM module error in happy-dom

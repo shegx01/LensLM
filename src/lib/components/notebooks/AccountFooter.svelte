@@ -3,7 +3,7 @@
   import Settings from '@lucide/svelte/icons/settings';
   import { cn } from '$lib/utils.js';
   import { getInitials } from '$lib/notebooks/index.js';
-  import ThemeSwitcher from '$lib/components/ThemeSwitcher.svelte';
+  import ThemeCycleButton from '$lib/components/ThemeCycleButton.svelte';
   import {
     Tooltip,
     TooltipContent,
@@ -122,7 +122,7 @@
         </Tooltip>
       </TooltipProvider>
 
-      <!-- Switch theme — real, embeds ThemeSwitcher as a menu row -->
+      <!-- Switch theme — real, embeds ThemeCycleButton as a menu row -->
       <div
         role="menuitem"
         data-switch-theme-item
@@ -135,8 +135,8 @@
           }
         }}
       >
-        <!-- Embed ThemeSwitcher as a ghost button; suppress its border via class override -->
-        <ThemeSwitcher
+        <!-- Embed ThemeCycleButton as a ghost button; suppress its border via class override -->
+        <ThemeCycleButton
           class="size-6 rounded-md border-0 bg-transparent shadow-none hover:bg-transparent"
         />
         <span class="text-sm text-sidebar-foreground">Switch theme</span>

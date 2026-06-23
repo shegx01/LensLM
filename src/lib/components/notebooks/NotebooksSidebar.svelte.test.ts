@@ -2,7 +2,7 @@
 //
 // Covers: renders rows with title/count/time, search trigger opens palette,
 // collapse toggle flips sidebar state, "Sign out" is NOT present.
-// Mocks the $lib/notebooks module and ThemeSwitcher to isolate the component.
+// Mocks the $lib/notebooks module and ThemeCycleButton to isolate the component.
 
 import { render, screen, fireEvent, waitFor } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -75,9 +75,9 @@ vi.mock('$lib/notebooks/index.js', () => ({
   trashNotebookAction: vi.fn().mockResolvedValue(undefined)
 }));
 
-// Stub ThemeSwitcher to avoid mode-watcher IPC in tests
-vi.mock('$lib/components/ThemeSwitcher.svelte', () => ({
-  default: function ThemeSwitcherStub() {}
+// Stub ThemeCycleButton to avoid mode-watcher IPC in tests
+vi.mock('$lib/components/ThemeCycleButton.svelte', () => ({
+  default: function ThemeCycleButtonStub() {}
 }));
 
 import NotebooksSidebar from './NotebooksSidebar.svelte';

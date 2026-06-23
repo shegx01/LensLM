@@ -14,7 +14,7 @@
     TooltipTrigger,
     TooltipProvider
   } from '$lib/components/ui/tooltip/index.js';
-  import ThemeSwitcher from '$lib/components/ThemeSwitcher.svelte';
+  import ThemeCycleButton from '$lib/components/ThemeCycleButton.svelte';
   import NotebookRow from '$lib/components/notebooks/NotebookRow.svelte';
   import AccountFooter from '$lib/components/notebooks/AccountFooter.svelte';
   import { notebookStore, openTrash, getInitials } from '$lib/notebooks/index.js';
@@ -88,7 +88,7 @@
       <span class="flex-1 text-base font-semibold text-sidebar-foreground">Lens</span>
 
       <!-- Theme switcher -->
-      <ThemeSwitcher
+      <ThemeCycleButton
         class="size-7 border-0 bg-transparent shadow-none hover:bg-sidebar-accent/60 rounded-md"
       />
 

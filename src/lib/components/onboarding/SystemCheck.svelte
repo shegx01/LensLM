@@ -8,7 +8,7 @@
   import { Card } from '$lib/components/ui/card/index.js';
   import SystemCheckRow from '$lib/components/onboarding/SystemCheckRow.svelte';
   import { runSystemCheck, type CheckResult } from '$lib/onboarding/system-check.js';
-  import ThemeSwitcher from '$lib/components/ThemeSwitcher.svelte';
+  import ThemeCycleButton from '$lib/components/ThemeCycleButton.svelte';
 
   let { onadvance }: { onadvance: () => void } = $props();
 
@@ -67,7 +67,7 @@
 </script>
 
 <div class="absolute top-4 right-4 z-10">
-  <ThemeSwitcher class="size-9 rounded-lg" />
+  <ThemeCycleButton class="size-9 rounded-lg" />
 </div>
 
 <main class="flex min-h-svh items-center justify-center p-6">
