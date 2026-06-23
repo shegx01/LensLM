@@ -110,6 +110,26 @@
   --graphite-600: oklch(0.3553 0.0089 280.12); /* #3f3f46 — darker graphite — dark-mode accent */
   --graphite-fg: oklch(1 0 0); /* white on graphite */
 
+  /* --- Decorative ramps (notebook-icon palette only — not [data-accent]) ---
+   * Same -500 (light glyph) / -600 (dark-tint base) split as the accent ramps;
+   * -bright is a lighter step used for the dark-mode glyph so it stays vivid
+   * against the tinted dark surface. Reference hex noted for tuning. */
+  --teal-500: oklch(0.6231 0.1095 187.21); /* #0d9488 — light/base teal */
+  --teal-600: oklch(0.5402 0.0961 186.89); /* #0f766e — darker teal — dark-tint base */
+  --teal-bright: oklch(0.7227 0.1226 184.7); /* #14b8a6 — dark-mode glyph */
+
+  --orange-500: oklch(0.6644 0.1956 41.07); /* #ea580c — light/base orange */
+  --orange-600: oklch(0.5917 0.1955 38); /* #c2410c — darker orange — dark-tint base */
+  --orange-bright: oklch(0.7549 0.166 53.65); /* #fb923c — dark-mode glyph */
+
+  --pink-500: oklch(0.5916 0.2233 4.39); /* #db2777 — light/base pink */
+  --pink-600: oklch(0.5252 0.2178 3.91); /* #be185d — darker pink — dark-tint base */
+  --pink-bright: oklch(0.6979 0.1888 3.45); /* #ec4899 — dark-mode glyph */
+
+  --indigo-500: oklch(0.5106 0.2301 277.02); /* #4f46e5 — light/base indigo */
+  --indigo-600: oklch(0.4585 0.2202 277.27); /* #4338ca — darker indigo — dark-tint base */
+  --indigo-bright: oklch(0.6233 0.1888 281.16); /* #818cf8 — dark-mode glyph */
+
   /* --- Alpha primitives (for border / input overlays) --- */
   --alpha-border: oklch(0 0 0 / 8%); /* black 8% — light mode border/sidebar-border */
   --alpha-input: oklch(0 0 0 / 10%); /* black 10% — light mode input */
@@ -352,8 +372,12 @@
 .nb-purple,
 .nb-green,
 .nb-blue,
+.nb-teal,
 .nb-amber,
+.nb-orange,
 .nb-rose,
+.nb-pink,
+.nb-indigo,
 .nb-graphite {
   background-color: var(--nb-bg);
   color: var(--nb-fg);
@@ -390,6 +414,26 @@
   --nb-fg: var(--graphite-500);
 }
 
+.nb-teal {
+  --nb-bg: color-mix(in oklch, var(--teal-500) 15%, transparent);
+  --nb-fg: var(--teal-500);
+}
+
+.nb-orange {
+  --nb-bg: color-mix(in oklch, var(--orange-500) 15%, transparent);
+  --nb-fg: var(--orange-500);
+}
+
+.nb-pink {
+  --nb-bg: color-mix(in oklch, var(--pink-500) 15%, transparent);
+  --nb-fg: var(--pink-500);
+}
+
+.nb-indigo {
+  --nb-bg: color-mix(in oklch, var(--indigo-500) 15%, transparent);
+  --nb-fg: var(--indigo-500);
+}
+
 /* -- dark mode ------------------------------------------------------------ */
 .dark .nb-purple {
   --nb-bg: color-mix(in oklch, var(--purple-600) 20%, transparent);
@@ -419,6 +463,26 @@
 .dark .nb-graphite {
   --nb-bg: color-mix(in oklch, var(--graphite-600) 20%, transparent);
   --nb-fg: var(--neutral-100);
+}
+
+.dark .nb-teal {
+  --nb-bg: color-mix(in oklch, var(--teal-600) 20%, transparent);
+  --nb-fg: var(--teal-bright);
+}
+
+.dark .nb-orange {
+  --nb-bg: color-mix(in oklch, var(--orange-600) 20%, transparent);
+  --nb-fg: var(--orange-bright);
+}
+
+.dark .nb-pink {
+  --nb-bg: color-mix(in oklch, var(--pink-600) 20%, transparent);
+  --nb-fg: var(--pink-bright);
+}
+
+.dark .nb-indigo {
+  --nb-bg: color-mix(in oklch, var(--indigo-600) 20%, transparent);
+  --nb-fg: var(--indigo-bright);
 }
 
 @theme inline {

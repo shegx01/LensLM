@@ -23,6 +23,7 @@ import {
   purgeNotebook
 } from './ipc.js';
 import type { Notebook, NotebookSummary } from './types.js';
+import { NOTEBOOK_PALETTE, notebookAccentClass } from './notebook-color.js';
 
 // ---------------------------------------------------------------------------
 // Module-level reactive state
@@ -54,6 +55,23 @@ const paletteResults = $derived(
 const activeNotebook = $derived(notebooks.find((n) => n.id === activeNotebookId) ?? null);
 
 const trashCount = $derived(trashedNotebooks.length);
+
+// Rank-based decorative color assignment.
+//
+// Notebooks are sorted by `id` ASCENDING (UUIDv7 ids are creation-ordered, so
+// this is creation order) and assigned `NOTEBOOK_PALETTE[rank % length]`. This
+// guarantees the first 10 notebooks get 10 DISTINCT hues — no birthday-paradox
+// collisions like the old hash-into-6 approach. The map is stable when
+// notebooks are appended; it only reshuffles ranks after a deletion, which is
+// acceptable for a decorative cue.
+const notebookColorMap = $derived.by(() => {
+  const map = new Map<string, string>();
+  const sorted = [...notebooks].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  sorted.forEach((n, i) => {
+    map.set(n.id, `nb-${NOTEBOOK_PALETTE[i % NOTEBOOK_PALETTE.length]}`);
+  });
+  return map;
+});
 
 // ---------------------------------------------------------------------------
 // Exported store object (getter/setter pairs — project pattern)
@@ -270,6 +288,18 @@ export function selectNotebook(id: string): void {
   activeNotebookId = id;
   paletteOpen = false;
   paletteQuery = '';
+}
+
+/**
+ * Return the decorative `nb-{hue}` class for a notebook id.
+ *
+ * For LIVE notebooks this is the rank-based, collision-free assignment from
+ * {@link notebookColorMap}. For ids not in the live set (e.g. trashed notebooks
+ * rendered in TrashView), it falls back to the pure hash {@link notebookAccentClass}
+ * so the call never crashes and still yields a stable, distinct-ish hue.
+ */
+export function notebookColorClass(id: string): string {
+  return notebookColorMap.get(id) ?? notebookAccentClass(id);
 }
 
 /**

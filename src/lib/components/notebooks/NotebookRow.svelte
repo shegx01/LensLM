@@ -4,7 +4,7 @@
   import { cn } from '$lib/utils.js';
   import type { NotebookSummary } from '$lib/notebooks/types.js';
   import {
-    notebookAccentClass,
+    notebookColorClass,
     formatRelativeTime,
     formatSourceCount
   } from '$lib/notebooks/index.js';
@@ -89,7 +89,7 @@
 
   const sourceLabel = $derived(formatSourceCount(notebook.source_count));
   const relTime = $derived(formatRelativeTime(notebook.updated_at));
-  const accentClass = $derived(notebookAccentClass(notebook.id));
+  const accentClass = $derived(notebookColorClass(notebook.id));
 </script>
 
 {#if collapsed}
@@ -116,9 +116,12 @@
     aria-pressed={active}
     onclick={() => !renaming && selectNotebook(notebook.id)}
     onkeydown={(e) => {
+      // While renaming, the inline input owns the keyboard — don't let the row's
+      // Space/Enter "select" handler swallow the space (and other) keystrokes.
+      if (renaming) return;
       if (e.key === 'Enter' || e.key === ' ') {
         e.preventDefault();
-        if (!renaming) selectNotebook(notebook.id);
+        selectNotebook(notebook.id);
       }
     }}
     data-notebook-row

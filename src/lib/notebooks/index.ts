@@ -19,5 +19,6 @@ export {
   restoreNotebookAction,
   purgeNotebookAction,
   selectNotebook,
-  openTrash
+  openTrash,
+  notebookColorClass
 } from './notebooks-state.svelte.js';

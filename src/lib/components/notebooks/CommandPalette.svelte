@@ -31,7 +31,7 @@
   import {
     notebookStore,
     selectNotebook,
-    notebookAccentClass,
+    notebookColorClass,
     formatRelativeTime,
     formatSourceCount
   } from '$lib/notebooks/index.js';
@@ -281,7 +281,7 @@
           <ul id="palette-results" role="listbox" aria-label="Notebook results" class="px-2 pb-2">
             {#each results as notebook, i (notebook.id)}
               {@const isHighlighted = i === highlightedIndex}
-              {@const accentCls = notebookAccentClass(notebook.id)}
+              {@const accentCls = notebookColorClass(notebook.id)}
               <li
                 id="palette-result-{notebook.id}"
                 data-result-index={i}

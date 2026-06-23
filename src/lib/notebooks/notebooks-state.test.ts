@@ -16,8 +16,10 @@ import {
   restoreNotebookAction,
   purgeNotebookAction,
   selectNotebook,
-  openTrash
+  openTrash,
+  notebookColorClass
 } from './notebooks-state.svelte.js';
+import { NOTEBOOK_PALETTE, notebookAccentClass } from './notebook-color.js';
 
 // ---------------------------------------------------------------------------
 // Mock the IPC layer
@@ -361,6 +363,64 @@ describe('renameNotebookAction', () => {
 
     expect(renameNotebook).toHaveBeenCalledWith('nb-001', 'Renamed');
     expect(notebookStore.notebooks[0].title).toBe('Renamed');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// notebookColorClass — rank-based decorative assignment
+// ---------------------------------------------------------------------------
+
+describe('notebookColorClass (rank-based)', () => {
+  // Helper: build N notebooks with ascending ids (UUIDv7-like ordering).
+  function ascendingIds(n: number): NotebookSummary[] {
+    return Array.from({ length: n }, (_, i) =>
+      makeNotebookSummary({ id: `018f4c7e-0000-7b00-0000-${String(i).padStart(12, '0')}` })
+    );
+  }
+
+  it('assigns 10 DISTINCT classes to the first 10 notebooks', async () => {
+    vi.mocked(listNotebooks).mockResolvedValue(ascendingIds(10));
+    await loadNotebooks();
+
+    const classes = notebookStore.notebooks.map((n) => notebookColorClass(n.id));
+    expect(new Set(classes).size).toBe(10);
+    // Every palette hue is represented exactly once.
+    expect(new Set(classes)).toEqual(new Set(NOTEBOOK_PALETTE.map((p) => `nb-${p}`)));
+  });
+
+  it('wraps the 11th notebook back to the first palette hue', async () => {
+    vi.mocked(listNotebooks).mockResolvedValue(ascendingIds(11));
+    await loadNotebooks();
+
+    const sorted = [...notebookStore.notebooks].sort((a, b) => (a.id < b.id ? -1 : 1));
+    const first = notebookColorClass(sorted[0].id);
+    const eleventh = notebookColorClass(sorted[10].id);
+    expect(eleventh).toBe(first); // 10 % 10 === 0
+  });
+
+  it('is stable on append: existing ranks do not shift when a later id is added', async () => {
+    vi.mocked(listNotebooks).mockResolvedValue(ascendingIds(3));
+    await loadNotebooks();
+    const before = notebookStore.notebooks.map((n) => [n.id, notebookColorClass(n.id)] as const);
+
+    // Append a notebook with a strictly greater id (UUIDv7 = creation-ordered).
+    vi.mocked(listNotebooks).mockResolvedValue([
+      ...ascendingIds(3),
+      makeNotebookSummary({ id: '018f4c7e-0000-7b00-0000-zzzzzzzzzzzz' })
+    ]);
+    await loadNotebooks();
+
+    for (const [id, cls] of before) {
+      expect(notebookColorClass(id)).toBe(cls);
+    }
+  });
+
+  it('falls back to the pure hash for ids not in the live set', async () => {
+    vi.mocked(listNotebooks).mockResolvedValue(ascendingIds(2));
+    await loadNotebooks();
+
+    const trashedId = 'not-in-live-set-trashed';
+    expect(notebookColorClass(trashedId)).toBe(notebookAccentClass(trashedId));
   });
 });
 

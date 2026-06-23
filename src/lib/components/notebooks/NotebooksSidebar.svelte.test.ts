@@ -61,6 +61,7 @@ vi.mock('$lib/notebooks/index.js', () => ({
   openTrash: mockOpenTrash,
   selectNotebook: mockSelectNotebook,
   resetNotebookStore: mockResetStore,
+  notebookColorClass: () => 'nb-purple',
   notebookAccentClass: () => 'nb-purple',
   formatRelativeTime: () => '1w ago',
   formatSourceCount: (count: number) => (count === 1 ? '1 source' : `${count} sources`),

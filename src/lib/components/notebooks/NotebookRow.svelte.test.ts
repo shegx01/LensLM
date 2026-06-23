@@ -25,7 +25,8 @@ vi.mock('$lib/notebooks/index.js', () => ({
   trashNotebookAction: mockTrashAction,
   resetNotebookStore: mockResetStore,
   // Passthrough utilities — use real implementations
-  notebookAccentClass: (id: string) => `nb-purple`,
+  notebookColorClass: (_id: string) => `nb-purple`,
+  notebookAccentClass: (_id: string) => `nb-purple`,
   formatRelativeTime: (_iso: string) => '1h ago',
   formatSourceCount: (count: number) => (count === 1 ? '1 source' : `${count} sources`)
 }));
@@ -116,6 +117,30 @@ describe('NotebookRow (expanded)', () => {
     // Re-entrancy guard: Enter unmounts the input, which fires onblur → a second
     // commitRename(); the guard must swallow it so the rename IPC fires once.
     expect(mockRenameAction).toHaveBeenCalledTimes(1);
+  });
+
+  it('rename input keeps spaces (row keydown does not swallow Space while renaming)', async () => {
+    // Regression: the row's keydown handler previously fired on Space/Enter and
+    // preventDefault'd while the inline input was focused, swallowing the space.
+    // The handler now returns early when `renaming`, so spaces reach the input
+    // and Enter commits the spaced title verbatim (after trim).
+    render(NotebookRow, { props: { notebook: makeNotebook(), active: false } });
+    const title = screen.getByText('Test Notebook');
+    await fireEvent.dblClick(title);
+    const input = screen.getByRole('textbox', { name: /rename notebook/i }) as HTMLInputElement;
+
+    // Simulate the Space keystroke being dispatched at the input (which bubbles
+    // to the row) followed by the resulting value containing a space.
+    await fireEvent.keyDown(input, { key: ' ' });
+    await fireEvent.input(input, { target: { value: 'My Notebook Two' } });
+
+    // The space must survive — it is not stripped/swallowed by the row handler.
+    expect(input.value).toBe('My Notebook Two');
+    expect(input.value).toContain(' ');
+
+    // Enter commits the spaced title via renameNotebookAction.
+    await fireEvent.keyDown(input, { key: 'Enter' });
+    await waitFor(() => expect(mockRenameAction).toHaveBeenCalledWith('nb-001', 'My Notebook Two'));
   });
 
   it('Esc in rename input cancels without calling renameNotebookAction', async () => {
