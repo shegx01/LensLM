@@ -36,7 +36,7 @@
   // ---------------------------------------------------------------------------
   // Collapse — mirrors the left rail's sidebarCollapsed (store field
   // rightRailCollapsed). The AppShell grid's THIRD column width follows this
-  // value (320px expanded / 56px collapsed icon strip) and animates.
+  // value (320px expanded / 104px collapsed icon strip, matching the left rail) and animates.
   // ---------------------------------------------------------------------------
 
   const collapsed = $derived(notebookStore.rightRailCollapsed);
