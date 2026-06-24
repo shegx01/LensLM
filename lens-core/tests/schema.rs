@@ -243,7 +243,7 @@ async fn embedding_index_unique_constraint_rejects_duplicates() {
 }
 
 #[tokio::test]
-async fn deleting_notebook_cascades_to_children() {
+async fn purging_notebook_cascades_to_children() {
     let engine = LensEngine::for_test().await;
     let pool = engine.pool().await;
     let nb = engine.create_notebook("cascade", None, None).await.unwrap();
@@ -269,7 +269,11 @@ async fn deleting_notebook_cascades_to_children() {
         .await
         .unwrap();
 
-    engine.delete_notebook(&nb.id).await.unwrap();
+    // `purge_notebook` is the hard-delete path; `delete_notebook` now soft-deletes
+    // (no cascade), so cascade behavior is asserted against purge. Purge only
+    // accepts trashed notebooks, so trash it first.
+    engine.trash_notebook(&nb.id).await.unwrap();
+    engine.purge_notebook(&nb.id).await.unwrap();
 
     let src_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sources WHERE notebook_id = ?")
         .bind(&nb.id)

@@ -19,7 +19,7 @@ pub mod tts;
 pub use config::AppConfig;
 pub use embedding::{InstallProgress, pull_embedding_model};
 pub use error::LensError;
-pub use notebooks::{Notebook, NotebookId, Source};
+pub use notebooks::{Notebook, NotebookId, NotebookSummary, Source};
 pub use system_check::{
     ALLOWED_EMBEDDING_MODELS, CheckAction, CheckId, CheckResult, CheckStatus, LlmDetection,
     detect_llm, ollama_base_url,
@@ -173,6 +173,22 @@ impl LensEngine {
         NotebookRepo::new(&pool).list().await
     }
 
+    /// Lists all live (non-trashed) notebooks with their source counts, newest
+    /// `created_at` first.
+    #[tracing::instrument(skip_all)]
+    pub async fn list_notebooks_with_counts(&self) -> Result<Vec<NotebookSummary>, LensError> {
+        let pool = self.pool().await;
+        NotebookRepo::new(&pool).list_with_counts().await
+    }
+
+    /// Lists all trashed notebooks with their source counts, newest `trashed_at`
+    /// first.
+    #[tracing::instrument(skip_all)]
+    pub async fn list_trashed_with_counts(&self) -> Result<Vec<NotebookSummary>, LensError> {
+        let pool = self.pool().await;
+        NotebookRepo::new(&pool).list_trashed_with_counts().await
+    }
+
     /// Creates a notebook with the given (validated) title and optional
     /// onboarding `description`/`focus_mode`, and returns it.
     #[tracing::instrument(skip_all)]
@@ -216,10 +232,35 @@ impl LensEngine {
         NotebookRepo::new(&pool).rename(id, title).await
     }
 
-    /// Hard-deletes a notebook. Child rows cascade via `ON DELETE CASCADE`.
+    /// Soft-deletes a notebook (backward-compat alias for `trash_notebook`).
+    ///
+    /// Historically a hard delete; M3 reframes deletion as a recoverable
+    /// soft-delete via `trashed_at`. `purge_notebook` is now the sole hard delete.
+    #[deprecated(note = "Use trash_notebook() directly; kept for backward compat")]
     #[tracing::instrument(skip_all)]
     pub async fn delete_notebook(&self, id: &NotebookId) -> Result<(), LensError> {
+        self.trash_notebook(id).await
+    }
+
+    /// Soft-deletes a notebook: sets `trashed_at` and bumps `updated_at`.
+    #[tracing::instrument(skip_all)]
+    pub async fn trash_notebook(&self, id: &NotebookId) -> Result<(), LensError> {
         let pool = self.pool().await;
-        NotebookRepo::new(&pool).delete(id).await
+        NotebookRepo::new(&pool).trash(id).await
+    }
+
+    /// Restores a trashed notebook: clears `trashed_at` and bumps `updated_at`.
+    #[tracing::instrument(skip_all)]
+    pub async fn restore_notebook(&self, id: &NotebookId) -> Result<(), LensError> {
+        let pool = self.pool().await;
+        NotebookRepo::new(&pool).restore(id).await
+    }
+
+    /// Permanently deletes a notebook. Child rows cascade via `ON DELETE CASCADE`.
+    /// This is the sole hard-delete path (used by "Delete forever").
+    #[tracing::instrument(skip_all)]
+    pub async fn purge_notebook(&self, id: &NotebookId) -> Result<(), LensError> {
+        let pool = self.pool().await;
+        NotebookRepo::new(&pool).purge(id).await
     }
 }

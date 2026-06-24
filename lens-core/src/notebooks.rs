@@ -120,6 +120,25 @@ pub struct Notebook {
     pub trashed_at: Option<String>,
 }
 
+/// A notebook list response with its maintained source count.
+///
+/// This is the API/response shape (distinct from the pure [`Notebook`] row
+/// struct), used by `list_with_counts` / `list_trashed_with_counts`. It does NOT
+/// derive `sqlx::FromRow`: `source_count` is a `COUNT(...)` aggregate that has no
+/// column on the `notebooks` table, so the list queries map rows manually.
+///
+/// `#[serde(flatten)]` hoists the inner `Notebook`'s fields to the top level, so
+/// the wire shape is `{id, title, description, focus_mode, created_at,
+/// updated_at, trashed_at, source_count}` — the TS `NotebookSummary` mirror.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NotebookSummary {
+    /// The underlying notebook row (its fields are flattened into the response).
+    #[serde(flatten)]
+    pub notebook: Notebook,
+    /// Number of sources belonging to this notebook (`COUNT` of `sources`).
+    pub source_count: i64,
+}
+
 /// Validates and normalizes a user-supplied notebook title.
 ///
 /// Trims surrounding whitespace, rejects empty/whitespace-only input, and caps
@@ -163,6 +182,71 @@ impl<'a> NotebookRepo<'a> {
         Ok(rows)
     }
 
+    /// Lists all live (non-trashed) notebooks with their source counts, newest
+    /// `created_at` first.
+    ///
+    /// Uses a `LEFT JOIN` + `GROUP BY` so notebooks with zero sources still
+    /// appear (with `source_count = 0`). Maps each row manually because
+    /// `NotebookSummary::source_count` is a `COUNT(...)` aggregate with no
+    /// backing column, so `query_as::<_, Notebook>` cannot populate it.
+    pub async fn list_with_counts(&self) -> Result<Vec<NotebookSummary>, LensError> {
+        self.list_summaries(
+            "SELECT n.id, n.title, n.description, n.focus_mode, n.created_at, n.updated_at, \
+                    n.trashed_at, COALESCE(COUNT(s.id), 0) AS source_count \
+             FROM notebooks n \
+             LEFT JOIN sources s ON s.notebook_id = n.id \
+             WHERE n.trashed_at IS NULL \
+             GROUP BY n.id \
+             ORDER BY n.created_at DESC",
+        )
+        .await
+    }
+
+    /// Lists all trashed notebooks with their source counts, newest
+    /// `trashed_at` first.
+    pub async fn list_trashed_with_counts(&self) -> Result<Vec<NotebookSummary>, LensError> {
+        self.list_summaries(
+            "SELECT n.id, n.title, n.description, n.focus_mode, n.created_at, n.updated_at, \
+                    n.trashed_at, COALESCE(COUNT(s.id), 0) AS source_count \
+             FROM notebooks n \
+             LEFT JOIN sources s ON s.notebook_id = n.id \
+             WHERE n.trashed_at IS NOT NULL \
+             GROUP BY n.id \
+             ORDER BY n.trashed_at DESC",
+        )
+        .await
+    }
+
+    /// Runs a `NotebookSummary` list query and maps each row by column name.
+    ///
+    /// Shared by [`list_with_counts`](Self::list_with_counts) and
+    /// [`list_trashed_with_counts`](Self::list_trashed_with_counts), which differ
+    /// only in their `WHERE`/`ORDER BY`. The `SELECT` projection must expose the
+    /// columns `id, title, description, focus_mode, created_at, updated_at,
+    /// trashed_at, source_count` in any order.
+    async fn list_summaries(&self, query: &str) -> Result<Vec<NotebookSummary>, LensError> {
+        use sqlx::Row;
+        let rows = sqlx::query(query).fetch_all(self.pool).await?;
+        let summaries = rows
+            .into_iter()
+            .map(|row| {
+                Ok(NotebookSummary {
+                    notebook: Notebook {
+                        id: NotebookId::from(row.try_get::<String, _>("id")?),
+                        title: row.try_get("title")?,
+                        description: row.try_get("description")?,
+                        focus_mode: row.try_get("focus_mode")?,
+                        created_at: row.try_get("created_at")?,
+                        updated_at: row.try_get("updated_at")?,
+                        trashed_at: row.try_get("trashed_at")?,
+                    },
+                    source_count: row.try_get("source_count")?,
+                })
+            })
+            .collect::<Result<Vec<_>, LensError>>()?;
+        Ok(summaries)
+    }
+
     /// Creates a notebook with a freshly-minted UUIDv7 id and returns it.
     ///
     /// The title is trimmed and validated (non-empty, length-capped).
@@ -203,29 +287,97 @@ impl<'a> NotebookRepo<'a> {
     }
 
     /// Renames a notebook, bumping `updated_at`. The title is validated.
+    ///
+    /// The `AND trashed_at IS NULL` guard is defense-in-depth: the UI never
+    /// exposes renaming a trashed notebook, but the clause prevents misuse via a
+    /// direct IPC call.
     pub async fn rename(&self, id: &NotebookId, title: &str) -> Result<(), LensError> {
         let title = validate_title(title)?;
         let now = chrono::Utc::now().to_rfc3339();
-        let result = sqlx::query("UPDATE notebooks SET title = ?, updated_at = ? WHERE id = ?")
-            .bind(&title)
-            .bind(&now)
-            .bind(id)
-            .execute(self.pool)
-            .await?;
+        let result = sqlx::query(
+            "UPDATE notebooks SET title = ?, updated_at = ? WHERE id = ? AND trashed_at IS NULL",
+        )
+        .bind(&title)
+        .bind(&now)
+        .bind(id)
+        .execute(self.pool)
+        .await?;
         if result.rows_affected() == 0 {
             return Err(LensError::Validation(format!("no notebook with id {id}")));
         }
         Ok(())
     }
 
-    /// Hard-deletes a notebook. Child rows cascade via `ON DELETE CASCADE`.
+    /// Soft-deletes a notebook: an alias for [`trash`](Self::trash).
+    ///
+    /// Historically this was a hard `DELETE`; M3 reframes deletion as a recoverable
+    /// soft-delete via `trashed_at`. [`purge`](Self::purge) is now the sole
+    /// hard-delete path.
+    #[deprecated(note = "Use trash() directly; kept for backward compat")]
     pub async fn delete(&self, id: &NotebookId) -> Result<(), LensError> {
-        let result = sqlx::query("DELETE FROM notebooks WHERE id = ?")
+        self.trash(id).await
+    }
+
+    /// Soft-deletes a notebook: sets `trashed_at` to now and bumps `updated_at`.
+    ///
+    /// Only affects live notebooks (`trashed_at IS NULL`); trashing an already
+    /// trashed or unknown notebook affects 0 rows and returns a validation error.
+    pub async fn trash(&self, id: &NotebookId) -> Result<(), LensError> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let result = sqlx::query(
+            "UPDATE notebooks SET trashed_at = ?, updated_at = ? \
+             WHERE id = ? AND trashed_at IS NULL",
+        )
+        .bind(&now)
+        .bind(&now)
+        .bind(id)
+        .execute(self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(LensError::Validation(format!(
+                "no live notebook with id {id}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Restores a trashed notebook: clears `trashed_at` and bumps `updated_at`.
+    ///
+    /// Only affects trashed notebooks (`trashed_at IS NOT NULL`); restoring a live
+    /// or unknown notebook affects 0 rows and returns a validation error.
+    pub async fn restore(&self, id: &NotebookId) -> Result<(), LensError> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let result = sqlx::query(
+            "UPDATE notebooks SET trashed_at = NULL, updated_at = ? \
+             WHERE id = ? AND trashed_at IS NOT NULL",
+        )
+        .bind(&now)
+        .bind(id)
+        .execute(self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(LensError::Validation(format!(
+                "no trashed notebook with id {id}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Permanently deletes a notebook. Child rows cascade via `ON DELETE CASCADE`.
+    ///
+    /// This is the only hard-delete path (used by "Delete forever"). Only affects
+    /// trashed notebooks (`trashed_at IS NOT NULL`); purging a live or unknown
+    /// notebook affects 0 rows and returns a validation error, so a live notebook
+    /// can never be hard-deleted without first being trashed.
+    pub async fn purge(&self, id: &NotebookId) -> Result<(), LensError> {
+        let result = sqlx::query("DELETE FROM notebooks WHERE id = ? AND trashed_at IS NOT NULL")
             .bind(id)
             .execute(self.pool)
             .await?;
         if result.rows_affected() == 0 {
-            return Err(LensError::Validation(format!("no notebook with id {id}")));
+            return Err(LensError::Validation(format!(
+                "no trashed notebook with id {id}"
+            )));
         }
         Ok(())
     }
@@ -316,5 +468,235 @@ mod tests {
         assert_eq!(&*id, "abc");
         assert_eq!(id.to_string(), "abc");
         assert_eq!(id.as_str(), "abc");
+    }
+
+    /// Spins up a fully-migrated in-memory pool for repo tests.
+    async fn test_pool() -> SqlitePool {
+        let pool = crate::db::open_in_memory_pool()
+            .await
+            .expect("in-memory pool should open");
+        crate::db::run_migrations(&pool)
+            .await
+            .expect("migrations should apply to a fresh in-memory db");
+        pool
+    }
+
+    #[tokio::test]
+    async fn list_with_counts_empty() {
+        let pool = test_pool().await;
+        let repo = NotebookRepo::new(&pool);
+        assert!(repo.list_with_counts().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn source_count_correct_after_add() {
+        let pool = test_pool().await;
+        let repo = NotebookRepo::new(&pool);
+        let nb = repo.create("Notebook", None, None).await.unwrap();
+
+        // No sources yet -> count is 0.
+        let summaries = repo.list_with_counts().await.unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].source_count, 0);
+
+        // Add N sources -> count == N.
+        for i in 0..3 {
+            repo.add_source(
+                &nb.id,
+                &format!("file{i}.pdf"),
+                &format!("/abs/file{i}.pdf"),
+            )
+            .await
+            .unwrap();
+        }
+        let summaries = repo.list_with_counts().await.unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].source_count, 3);
+        assert_eq!(summaries[0].notebook.id, nb.id);
+    }
+
+    #[tokio::test]
+    async fn list_with_counts_only_live_newest_first() {
+        let pool = test_pool().await;
+        let repo = NotebookRepo::new(&pool);
+        let first = repo.create("First", None, None).await.unwrap();
+        let second = repo.create("Second", None, None).await.unwrap();
+
+        let summaries = repo.list_with_counts().await.unwrap();
+        // Newest created_at first.
+        assert_eq!(summaries[0].notebook.id, second.id);
+        assert_eq!(summaries[1].notebook.id, first.id);
+    }
+
+    #[tokio::test]
+    async fn create_rename_roundtrip() {
+        let pool = test_pool().await;
+        let repo = NotebookRepo::new(&pool);
+        let nb = repo.create("Original", None, None).await.unwrap();
+        repo.rename(&nb.id, "Renamed").await.unwrap();
+        let summaries = repo.list_with_counts().await.unwrap();
+        assert_eq!(summaries[0].notebook.title, "Renamed");
+    }
+
+    #[tokio::test]
+    async fn trash_and_restore_roundtrip() {
+        let pool = test_pool().await;
+        let repo = NotebookRepo::new(&pool);
+        let nb = repo.create("Notebook", None, None).await.unwrap();
+
+        repo.trash(&nb.id).await.unwrap();
+        // Disappears from live list, appears in trashed list.
+        assert!(repo.list_with_counts().await.unwrap().is_empty());
+        let trashed = repo.list_trashed_with_counts().await.unwrap();
+        assert_eq!(trashed.len(), 1);
+        assert_eq!(trashed[0].notebook.id, nb.id);
+        assert!(trashed[0].notebook.trashed_at.is_some());
+
+        repo.restore(&nb.id).await.unwrap();
+        // Returns to live list, gone from trashed list.
+        let live = repo.list_with_counts().await.unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].notebook.id, nb.id);
+        assert!(live[0].notebook.trashed_at.is_none());
+        assert!(repo.list_trashed_with_counts().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn trash_already_trashed_errors() {
+        let pool = test_pool().await;
+        let repo = NotebookRepo::new(&pool);
+        let nb = repo.create("Notebook", None, None).await.unwrap();
+        repo.trash(&nb.id).await.unwrap();
+        assert!(matches!(
+            repo.trash(&nb.id).await,
+            Err(LensError::Validation(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn restore_non_trashed_errors() {
+        let pool = test_pool().await;
+        let repo = NotebookRepo::new(&pool);
+        let nb = repo.create("Notebook", None, None).await.unwrap();
+        assert!(matches!(
+            repo.restore(&nb.id).await,
+            Err(LensError::Validation(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn list_trashed_with_counts_carries_source_count() {
+        let pool = test_pool().await;
+        let repo = NotebookRepo::new(&pool);
+        let nb = repo.create("Notebook", None, None).await.unwrap();
+        repo.add_source(&nb.id, "a.pdf", "/abs/a.pdf")
+            .await
+            .unwrap();
+        repo.add_source(&nb.id, "b.pdf", "/abs/b.pdf")
+            .await
+            .unwrap();
+        repo.trash(&nb.id).await.unwrap();
+
+        let trashed = repo.list_trashed_with_counts().await.unwrap();
+        assert_eq!(trashed.len(), 1);
+        assert_eq!(trashed[0].source_count, 2);
+    }
+
+    #[tokio::test]
+    async fn purge_removes_permanently() {
+        let pool = test_pool().await;
+        let repo = NotebookRepo::new(&pool);
+        let nb = repo.create("Notebook", None, None).await.unwrap();
+        repo.add_source(&nb.id, "a.pdf", "/abs/a.pdf")
+            .await
+            .unwrap();
+        repo.trash(&nb.id).await.unwrap();
+
+        repo.purge(&nb.id).await.unwrap();
+        // Gone from both lists.
+        assert!(repo.list_with_counts().await.unwrap().is_empty());
+        assert!(repo.list_trashed_with_counts().await.unwrap().is_empty());
+        // Child sources cascaded.
+        assert!(repo.list_sources(&nb.id).await.unwrap().is_empty());
+        // Purging again errors (no rows).
+        assert!(matches!(
+            repo.purge(&nb.id).await,
+            Err(LensError::Validation(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn purge_live_notebook_errors() {
+        let pool = test_pool().await;
+        let repo = NotebookRepo::new(&pool);
+        let nb = repo.create("Notebook", None, None).await.unwrap();
+
+        // Purging a LIVE (non-trashed) notebook must be rejected and must NOT
+        // hard-delete the row.
+        assert!(matches!(
+            repo.purge(&nb.id).await,
+            Err(LensError::Validation(_))
+        ));
+        // The notebook still exists in the live list.
+        let live = repo.list_with_counts().await.unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].notebook.id, nb.id);
+    }
+
+    #[tokio::test]
+    async fn delete_is_now_soft() {
+        let pool = test_pool().await;
+        let repo = NotebookRepo::new(&pool);
+        let nb = repo.create("Notebook", None, None).await.unwrap();
+
+        // The deprecated `delete` now soft-deletes (sets trashed_at).
+        #[allow(deprecated)]
+        repo.delete(&nb.id).await.unwrap();
+        assert!(repo.list_with_counts().await.unwrap().is_empty());
+        let trashed = repo.list_trashed_with_counts().await.unwrap();
+        assert_eq!(trashed.len(), 1);
+        assert!(trashed[0].notebook.trashed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn notebook_summary_serde_round_trip() {
+        let summary = NotebookSummary {
+            notebook: Notebook {
+                id: NotebookId::from("nb-1"),
+                title: "Title".to_string(),
+                description: Some("desc".to_string()),
+                focus_mode: Some("research".to_string()),
+                created_at: "2026-06-23T00:00:00+00:00".to_string(),
+                updated_at: "2026-06-23T00:00:00+00:00".to_string(),
+                trashed_at: None,
+            },
+            source_count: 5,
+        };
+
+        let value = serde_json::to_value(&summary).unwrap();
+        let obj = value.as_object().expect("serializes to a JSON object");
+
+        // The top-level key set must be EXACTLY these — `serde(flatten)` hoists
+        // the Notebook fields to the top level. Guards the TS contract against
+        // accidental field additions or flatten collisions.
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "created_at",
+                "description",
+                "focus_mode",
+                "id",
+                "source_count",
+                "title",
+                "trashed_at",
+                "updated_at",
+            ]
+        );
+
+        // Round-trips back to an equal value.
+        let back: NotebookSummary = serde_json::from_value(value).unwrap();
+        assert_eq!(back, summary);
     }
 }

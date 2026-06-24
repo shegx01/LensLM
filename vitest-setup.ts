@@ -1,6 +1,15 @@
 import '@testing-library/jest-dom/vitest';
 import { randomFillSync } from 'node:crypto';
-import { beforeAll, beforeEach } from 'vitest';
+import { afterEach, beforeAll, beforeEach } from 'vitest';
+
+// Drain pending macrotasks + microtasks AFTER each test so deferred callbacks
+// (component focus `setTimeout(…, 0)`, Svelte transition `onfinish` microtasks,
+// bits-ui focus/scroll-lock restore, etc.) run WHILE happy-dom's `document` still
+// exists. Otherwise they fire after the environment tears down → an unhandled
+// "ReferenceError: document is not defined" that non-deterministically fails CI.
+afterEach(async () => {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+});
 
 // happy-dom v20 exposes `localStorage` but its `getItem`/`setItem` are not
 // callable in this context, which breaks mode-watcher — it captures the
@@ -49,6 +58,17 @@ if (typeof Element !== 'undefined' && typeof Element.prototype.animate !== 'func
     return animation as unknown as Animation;
   };
 }
+
+// happy-dom backs `requestAnimationFrame` with a timer, so a rAF scheduled during
+// a test (CommandPalette focus, bits-ui Dialog focus/scroll-lock restore on close,
+// etc.) can fire AFTER the DOM is torn down → "ReferenceError: document is not
+// defined" surfaces as an unhandled error and fails the run. Run rAF callbacks
+// synchronously (while the DOM still exists) to make teardown deterministic.
+globalThis.requestAnimationFrame = ((cb: FrameRequestCallback): number => {
+  cb(0);
+  return 0;
+}) as typeof globalThis.requestAnimationFrame;
+globalThis.cancelAnimationFrame = (() => {}) as typeof globalThis.cancelAnimationFrame;
 
 // `@tauri-apps/api/mocks`' mockIPC needs `window.crypto.getRandomValues`, which
 // is not guaranteed in the simulated DOM. Polyfill it only if it's missing.

@@ -1,14 +1,14 @@
 //! Notebook commands. Thin pass-throughs to `lens-core`; full CRUD UI is M3.
 
-use lens_core::{LensEngine, LensError, Notebook, NotebookId, Source};
+use lens_core::{LensEngine, LensError, Notebook, NotebookId, NotebookSummary, Source};
 
-/// Lists live (non-trashed) notebooks, newest first.
+/// Lists live (non-trashed) notebooks with their source counts, newest first.
 #[tracing::instrument(skip_all)]
 #[tauri::command]
 pub async fn list_notebooks(
     engine: tauri::State<'_, LensEngine>,
-) -> Result<Vec<Notebook>, LensError> {
-    engine.list_notebooks().await
+) -> Result<Vec<NotebookSummary>, LensError> {
+    engine.list_notebooks_with_counts().await
 }
 
 /// Creates a notebook with the given title and optional onboarding
@@ -62,14 +62,56 @@ pub async fn rename_notebook(
     engine.rename_notebook(&NotebookId::from(id), &title).await
 }
 
-/// Deletes a notebook (child rows cascade).
+/// Soft-deletes a notebook (backward-compat alias for `trash_notebook`).
+///
+/// Sets `trashed_at` rather than hard-deleting; the notebook is recoverable from
+/// Trash. `purge_notebook` is the only permanent delete.
 #[tracing::instrument(skip_all)]
 #[tauri::command]
 pub async fn delete_notebook(
     id: String,
     engine: tauri::State<'_, LensEngine>,
 ) -> Result<(), LensError> {
-    engine.delete_notebook(&NotebookId::from(id)).await
+    engine.trash_notebook(&NotebookId::from(id)).await
+}
+
+/// Soft-deletes a notebook: sets `trashed_at`, bumps `updated_at`. Recoverable.
+#[tracing::instrument(skip_all)]
+#[tauri::command]
+pub async fn trash_notebook(
+    id: String,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<(), LensError> {
+    engine.trash_notebook(&NotebookId::from(id)).await
+}
+
+/// Restores a trashed notebook: clears `trashed_at`, bumps `updated_at`.
+#[tracing::instrument(skip_all)]
+#[tauri::command]
+pub async fn restore_notebook(
+    id: String,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<(), LensError> {
+    engine.restore_notebook(&NotebookId::from(id)).await
+}
+
+/// Lists trashed notebooks with their source counts, newest-trashed first.
+#[tracing::instrument(skip_all)]
+#[tauri::command]
+pub async fn list_trashed(
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<Vec<NotebookSummary>, LensError> {
+    engine.list_trashed_with_counts().await
+}
+
+/// Permanently deletes a notebook (child rows cascade). Used by "Delete forever".
+#[tracing::instrument(skip_all)]
+#[tauri::command]
+pub async fn purge_notebook(
+    id: String,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<(), LensError> {
+    engine.purge_notebook(&NotebookId::from(id)).await
 }
 
 #[cfg(test)]
@@ -92,7 +134,7 @@ mod tests {
 
         let listed = list_notebooks(engine).await.unwrap();
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].id, created.id);
+        assert_eq!(listed[0].notebook.id, created.id);
     }
 
     #[tokio::test]
@@ -113,8 +155,8 @@ mod tests {
         assert_eq!(created.focus_mode.as_deref(), Some("research"));
 
         let listed = list_notebooks(engine).await.unwrap();
-        assert_eq!(listed[0].description.as_deref(), Some("My notes"));
-        assert_eq!(listed[0].focus_mode.as_deref(), Some("research"));
+        assert_eq!(listed[0].notebook.description.as_deref(), Some("My notes"));
+        assert_eq!(listed[0].notebook.focus_mode.as_deref(), Some("research"));
     }
 
     #[tokio::test]
@@ -159,7 +201,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rename_then_delete() {
+    async fn rename_then_delete_is_soft() {
         let app = tauri::test::mock_app();
         app.manage(LensEngine::for_test().await);
         let engine = app.state::<LensEngine>();
@@ -171,11 +213,82 @@ mod tests {
             .await
             .unwrap();
         let listed = list_notebooks(engine.clone()).await.unwrap();
-        assert_eq!(listed[0].title, "Renamed");
+        assert_eq!(listed[0].notebook.title, "Renamed");
 
+        // `delete_notebook` is now a soft-delete: the notebook leaves the live
+        // list but appears in the trashed list (recoverable).
         delete_notebook(nb.id.to_string(), engine.clone())
             .await
             .unwrap();
-        assert!(list_notebooks(engine).await.unwrap().is_empty());
+        assert!(list_notebooks(engine.clone()).await.unwrap().is_empty());
+        let trashed = list_trashed(engine).await.unwrap();
+        assert_eq!(trashed.len(), 1);
+        assert_eq!(trashed[0].notebook.id, nb.id);
+        assert!(trashed[0].notebook.trashed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn list_notebooks_includes_source_count() {
+        let app = tauri::test::mock_app();
+        app.manage(LensEngine::for_test().await);
+        let engine = app.state::<LensEngine>();
+
+        let nb = create_notebook("NB".into(), None, None, engine.clone())
+            .await
+            .unwrap();
+
+        // Zero sources -> count is 0.
+        let listed = list_notebooks(engine.clone()).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].source_count, 0);
+
+        // Add two sources -> count is 2.
+        for i in 0..2 {
+            add_source(
+                nb.id.to_string(),
+                format!("file{i}.pdf"),
+                format!("/abs/file{i}.pdf"),
+                engine.clone(),
+            )
+            .await
+            .unwrap();
+        }
+        let listed = list_notebooks(engine).await.unwrap();
+        assert_eq!(listed[0].source_count, 2);
+    }
+
+    #[tokio::test]
+    async fn trash_restore_purge_lifecycle() {
+        let app = tauri::test::mock_app();
+        app.manage(LensEngine::for_test().await);
+        let engine = app.state::<LensEngine>();
+
+        let nb = create_notebook("NB".into(), None, None, engine.clone())
+            .await
+            .unwrap();
+
+        // Trash: leaves live list, enters trashed list.
+        trash_notebook(nb.id.to_string(), engine.clone())
+            .await
+            .unwrap();
+        assert!(list_notebooks(engine.clone()).await.unwrap().is_empty());
+        assert_eq!(list_trashed(engine.clone()).await.unwrap().len(), 1);
+
+        // Restore: returns to live list, leaves trashed list.
+        restore_notebook(nb.id.to_string(), engine.clone())
+            .await
+            .unwrap();
+        assert_eq!(list_notebooks(engine.clone()).await.unwrap().len(), 1);
+        assert!(list_trashed(engine.clone()).await.unwrap().is_empty());
+
+        // Trash again, then purge: gone from both lists.
+        trash_notebook(nb.id.to_string(), engine.clone())
+            .await
+            .unwrap();
+        purge_notebook(nb.id.to_string(), engine.clone())
+            .await
+            .unwrap();
+        assert!(list_notebooks(engine.clone()).await.unwrap().is_empty());
+        assert!(list_trashed(engine).await.unwrap().is_empty());
     }
 }
