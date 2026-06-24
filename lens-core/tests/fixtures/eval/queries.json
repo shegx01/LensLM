@@ -1,0 +1,25 @@
+[
+  {
+    "query": "How do plants turn sunlight into sugar?",
+    "gold_chunk_ids": [
+      "f8ac843d3f5ef78470402f04caa85873ca806ef63041c5af9fe7b558ca1fea7c",
+      "21c0f323b39439d4bb1ed2d1d7624aeb664dfdc8c5c36b4dc74fd72ed6a14b83"
+    ]
+  },
+  {
+    "query": "What does the borrow checker enforce in Rust?",
+    "gold_chunk_ids": ["4abcc9351536904a73aaf8f747958a59ce8a0d77790041dfd17c428d9646d806"]
+  },
+  {
+    "query": "When do the largest tides happen?",
+    "gold_chunk_ids": ["86f8128d66d7937846570efa830ffee5ff63daf39a2dad7c774b0ccf08c351a7"]
+  },
+  {
+    "query": "How much pressure does an espresso machine use?",
+    "gold_chunk_ids": ["376fdf81d18724f917db9c58087a1ff9bb5364080639a84e7a1150437fdd5517"]
+  },
+  {
+    "query": "Where does the Calvin cycle take place?",
+    "gold_chunk_ids": ["21c0f323b39439d4bb1ed2d1d7624aeb664dfdc8c5c36b4dc74fd72ed6a14b83"]
+  }
+]

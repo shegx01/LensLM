@@ -329,7 +329,7 @@ mod tests {
             ["pdf", "md", "docx", "txt"]
                 .iter()
                 .map(|s| s.to_string())
-                .collect()
+                .collect::<std::collections::HashSet<String>>()
         );
         // Extensions are lowercased even when the file used upper-case.
         assert!(docs.iter().any(|d| d.name == "b.MD" && d.ext == "md"));

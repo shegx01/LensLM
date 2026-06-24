@@ -1,6 +1,11 @@
 //! Notebook commands. Thin pass-throughs to `lens-core`; full CRUD UI is M3.
 
-use lens_core::{LensEngine, LensError, Notebook, NotebookId, NotebookSummary, Source};
+use lens_core::{
+    IngestProgress, LensEngine, LensError, Notebook, NotebookId, NotebookSummary, Source,
+};
+use tauri::ipc::Channel;
+
+use crate::stream::{StreamEvent, send_event};
 
 /// Lists live (non-trashed) notebooks with their source counts, newest first.
 #[tracing::instrument(skip_all)]
@@ -49,6 +54,85 @@ pub async fn list_sources(
     engine: tauri::State<'_, LensEngine>,
 ) -> Result<Vec<Source>, LensError> {
     engine.list_sources(&NotebookId::from(notebook_id)).await
+}
+
+/// Inserts a managed text/markdown source (paste-text or `.md`/`.txt` content),
+/// writing the text to a managed file and inserting a `queued` row. `kind` must
+/// be `"text"` or `"markdown"`. Returns the inserted source.
+#[tracing::instrument(skip(text, engine))]
+#[tauri::command]
+pub async fn add_text_source(
+    notebook_id: String,
+    title: String,
+    text: String,
+    kind: String,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<Source, LensError> {
+    engine
+        .add_text_source(&NotebookId::from(notebook_id), &title, &text, &kind)
+        .await
+}
+
+/// Toggles a source's `selected` flag (persisted across reloads).
+#[tracing::instrument(skip(engine))]
+#[tauri::command]
+pub async fn set_source_selected(
+    source_id: String,
+    selected: bool,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<(), LensError> {
+    engine.set_source_selected(&source_id, selected).await
+}
+
+/// Ingests a queued source end-to-end (parse → chunk → embed → index),
+/// streaming progress over `on_progress` as `StreamEvent<IngestProgress>`.
+///
+/// Emits `Started`, then a `Progress { done, total }` plus a `Chunk` carrying
+/// the per-phase [`IngestProgress`] for each pipeline phase, then `Done` on
+/// success or `Failed(LensError)` on failure (the source is left in `error`).
+///
+/// Invoked as `invoke("ingest_source", { sourceId, onProgress })` where
+/// `onProgress` is a `Channel<StreamEvent<IngestProgress>>`.
+#[tracing::instrument(skip(on_progress, engine))]
+#[tauri::command]
+pub async fn ingest_source(
+    source_id: String,
+    on_progress: Channel<StreamEvent<IngestProgress>>,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<(), LensError> {
+    // A send failure means the frontend dropped the channel; log and keep going
+    // (the ingest itself is unaffected and will still complete).
+    if let Err(e) = send_event(&on_progress, StreamEvent::Started) {
+        tracing::warn!("ingest_source: started event send failed: {e}");
+    }
+
+    let result = engine
+        .ingest_source(&source_id, |progress| {
+            let done = progress.done;
+            let total = progress.total;
+            if let Err(e) = send_event(&on_progress, StreamEvent::Chunk(progress)) {
+                tracing::warn!("ingest_source: progress chunk send failed: {e}");
+            }
+            if let Err(e) = send_event(&on_progress, StreamEvent::Progress { done, total }) {
+                tracing::warn!("ingest_source: progress event send failed: {e}");
+            }
+        })
+        .await;
+
+    match &result {
+        Ok(()) => {
+            if let Err(e) = send_event(&on_progress, StreamEvent::Done) {
+                tracing::warn!("ingest_source: done event send failed: {e}");
+            }
+        }
+        Err(err) => {
+            if let Err(e) = send_event(&on_progress, StreamEvent::Failed(err.clone())) {
+                tracing::warn!("ingest_source: failed event send failed: {e}");
+            }
+        }
+    }
+
+    result
 }
 
 /// Renames a notebook.

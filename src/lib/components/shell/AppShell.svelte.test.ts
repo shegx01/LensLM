@@ -16,6 +16,14 @@ vi.mock('$lib/notebooks/ipc.js', () => ({
   purgeNotebook: vi.fn()
 }));
 
+vi.mock('$lib/sources/ipc.js', () => ({
+  listSources: vi.fn().mockResolvedValue([]),
+  addTextSource: vi.fn(),
+  addFileSource: vi.fn(),
+  ingestSource: vi.fn(),
+  setSourceSelected: vi.fn()
+}));
+
 vi.mock('@tauri-apps/api/core', () => ({
   isTauri: () => false,
   invoke: vi.fn()
@@ -39,8 +47,8 @@ describe('AppShell.svelte', () => {
     // Centre: empty state (no active notebook).
     expect(screen.getByText('Your workspace')).toBeInTheDocument();
     expect(screen.getByText(/select or create a notebook/i)).toBeInTheDocument();
-    // Right rail: M4 seam unchanged.
-    expect(screen.getByText(/sources & studio/i)).toBeInTheDocument();
+    // Right rail: SourcesRail now renders "Sources" heading.
+    expect(screen.getByText('Sources')).toBeInTheDocument();
   });
 
   it('uses semantic landmarks for the regions', () => {

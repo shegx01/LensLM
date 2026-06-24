@@ -9,6 +9,7 @@
   import CommandPalette from '$lib/components/notebooks/CommandPalette.svelte';
   import NotebookCreateDialog from '$lib/components/notebooks/NotebookCreateDialog.svelte';
   import { notebookStore, loadNotebooks } from '$lib/notebooks/index.js';
+  import SourcesRail from '$lib/components/sources/SourcesRail.svelte';
 
   // ---------------------------------------------------------------------------
   // Local state
@@ -119,13 +120,9 @@
     {/if}
   </main>
 
-  <!-- RIGHT: sources & studio rail — flush panel with a hairline divider; M4 fills -->
+  <!-- RIGHT: sources rail — flush panel with a hairline divider; filled by M4 SourcesRail -->
   <aside class="flex flex-col overflow-hidden border-l border-border bg-card text-card-foreground">
-    <div data-tauri-drag-region class="flex h-[var(--titlebar-h)] items-center px-4">
-      <span class="text-xs font-medium tracking-wide text-muted-foreground uppercase"
-        >Sources &amp; Studio</span
-      >
-    </div>
+    <SourcesRail />
   </aside>
 </div>
 

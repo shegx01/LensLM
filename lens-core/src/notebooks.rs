@@ -8,6 +8,7 @@
 
 use std::fmt;
 use std::ops::Deref;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -74,6 +75,28 @@ impl fmt::Display for NotebookId {
     }
 }
 
+/// Source ingestion status values (the `sources.status` column).
+///
+/// Single source of truth for the status string literals used across the ingest
+/// pipeline, the engine, and the crash-recovery path. The lifecycle is
+/// `queued → parsing → embedding → indexed` (or `error` on failure). `pending`
+/// is the legacy status [`NotebookRepo::add_source`] writes for inert M1 file
+/// records (awaiting M4 ingestion).
+pub(crate) mod source_status {
+    /// Inert M1 file record awaiting M4 ingestion.
+    pub const PENDING: &str = "pending";
+    /// Queued for ingestion (the M4 managed-text entry state).
+    pub const QUEUED: &str = "queued";
+    /// Parse phase in progress (transient — reset to `error` on crash recovery).
+    pub const PARSING: &str = "parsing";
+    /// Embed phase in progress (transient — reset to `error` on crash recovery).
+    pub const EMBEDDING: &str = "embedding";
+    /// Fully ingested and indexed.
+    pub const INDEXED: &str = "indexed";
+    /// Ingestion failed (terminal until re-ingest).
+    pub const ERROR: &str = "error";
+}
+
 /// A source row, returned across the IPC boundary.
 ///
 /// In M1 sources are inert *records* only: the onboarding "Add sources" step
@@ -95,6 +118,13 @@ pub struct Source {
     pub locator: String,
     /// Whether the source is selected for retrieval (`1` = selected).
     pub selected: i64,
+    /// Total token count of the source text, populated by M4 ingestion.
+    /// `None` until the source has been ingested.
+    pub token_count: Option<i64>,
+    /// SHA-256 of the canonical source text, populated by M4 ingestion.
+    /// Used to short-circuit re-ingest when the content is unchanged. `None`
+    /// until the source has been ingested.
+    pub content_hash: Option<String>,
     /// RFC3339 creation timestamp.
     pub created_at: String,
 }
@@ -398,11 +428,12 @@ impl<'a> NotebookRepo<'a> {
         let now = chrono::Utc::now().to_rfc3339();
         sqlx::query(
             "INSERT INTO sources (id, notebook_id, kind, title, status, locator, selected, created_at) \
-             VALUES (?, ?, 'file', ?, 'pending', ?, 1, ?)",
+             VALUES (?, ?, 'file', ?, ?, ?, 1, ?)",
         )
         .bind(&id)
         .bind(notebook_id)
         .bind(title)
+        .bind(source_status::PENDING)
         .bind(locator)
         .bind(&now)
         .execute(self.pool)
@@ -412,17 +443,145 @@ impl<'a> NotebookRepo<'a> {
             notebook_id: notebook_id.to_string(),
             kind: "file".to_string(),
             title: title.to_string(),
-            status: "pending".to_string(),
+            status: source_status::PENDING.to_string(),
             locator: locator.to_string(),
             selected: 1,
+            token_count: None,
+            content_hash: None,
             created_at: now,
         })
+    }
+
+    /// Inserts a managed text/markdown source for M4 ingestion.
+    ///
+    /// Writes the verbatim `text` to a managed file
+    /// `{data_dir}/sources/{id}.{ext}` (ext from `kind`: `text` → `txt`,
+    /// `markdown` → `md`), then inserts a `sources` row with `kind ∈
+    /// {"text","markdown"}`, `status = "queued"`, `selected = 1`, and `locator`
+    /// = that managed file path. Returns the inserted [`Source`] (`token_count`
+    /// and `content_hash` are `NULL` until ingestion populates them).
+    pub async fn add_text_source(
+        &self,
+        data_dir: &Path,
+        notebook_id: &NotebookId,
+        title: &str,
+        text: &str,
+        kind: &str,
+    ) -> Result<Source, LensError> {
+        let ext = match kind {
+            "text" => "txt",
+            "markdown" => "md",
+            other => {
+                return Err(LensError::Validation(format!(
+                    "unknown text source kind: {other:?}; expected \"text\" or \"markdown\""
+                )));
+            }
+        };
+        let id = Uuid::now_v7().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // Write the canonical text to the managed sources dir so `locator` stays
+        // a path (no new migration / no inline content column).
+        let sources_dir = data_dir.join("sources");
+        std::fs::create_dir_all(&sources_dir)
+            .map_err(|e| LensError::Io(format!("{}: {e}", sources_dir.display())))?;
+        let path = sources_dir.join(format!("{id}.{ext}"));
+        std::fs::write(&path, text)
+            .map_err(|e| LensError::Io(format!("{}: {e}", path.display())))?;
+        let locator = path.display().to_string();
+
+        sqlx::query(
+            "INSERT INTO sources (id, notebook_id, kind, title, status, locator, selected, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
+        )
+        .bind(&id)
+        .bind(notebook_id)
+        .bind(kind)
+        .bind(title)
+        .bind(source_status::QUEUED)
+        .bind(&locator)
+        .bind(&now)
+        .execute(self.pool)
+        .await?;
+
+        Ok(Source {
+            id,
+            notebook_id: notebook_id.to_string(),
+            kind: kind.to_string(),
+            title: title.to_string(),
+            status: source_status::QUEUED.to_string(),
+            locator,
+            selected: 1,
+            token_count: None,
+            content_hash: None,
+            created_at: now,
+        })
+    }
+
+    /// Toggles a source's `selected` flag (persisted). Errors if no row matches.
+    pub async fn set_source_selected(&self, id: &str, selected: bool) -> Result<(), LensError> {
+        let result = sqlx::query("UPDATE sources SET selected = ? WHERE id = ?")
+            .bind(selected as i64)
+            .bind(id)
+            .execute(self.pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(LensError::Validation(format!("no source with id {id}")));
+        }
+        Ok(())
+    }
+
+    /// Sets a source's ingestion `status` (e.g. `queued`/`parsing`/`embedding`/
+    /// `indexed`/`error`). Errors if no row matches.
+    pub async fn update_source_status(&self, id: &str, status: &str) -> Result<(), LensError> {
+        let result = sqlx::query("UPDATE sources SET status = ? WHERE id = ?")
+            .bind(status)
+            .bind(id)
+            .execute(self.pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(LensError::Validation(format!("no source with id {id}")));
+        }
+        Ok(())
+    }
+
+    /// Populates a source's post-ingest metadata (`token_count`,
+    /// `content_hash`). Errors if no row matches.
+    pub async fn update_source_metadata(
+        &self,
+        id: &str,
+        token_count: i64,
+        content_hash: &str,
+    ) -> Result<(), LensError> {
+        let result =
+            sqlx::query("UPDATE sources SET token_count = ?, content_hash = ? WHERE id = ?")
+                .bind(token_count)
+                .bind(content_hash)
+                .bind(id)
+                .execute(self.pool)
+                .await?;
+        if result.rows_affected() == 0 {
+            return Err(LensError::Validation(format!("no source with id {id}")));
+        }
+        Ok(())
+    }
+
+    /// Fetches a single source row by id, if it exists.
+    pub async fn get_source(&self, id: &str) -> Result<Option<Source>, LensError> {
+        let row = sqlx::query_as::<_, Source>(
+            "SELECT id, notebook_id, kind, title, status, locator, selected, token_count, content_hash, created_at \
+             FROM sources WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(self.pool)
+        .await?;
+        Ok(row)
     }
 
     /// Lists all sources for a notebook, newest first.
     pub async fn list_sources(&self, notebook_id: &NotebookId) -> Result<Vec<Source>, LensError> {
         let rows = sqlx::query_as::<_, Source>(
-            "SELECT id, notebook_id, kind, title, status, locator, selected, created_at \
+            "SELECT id, notebook_id, kind, title, status, locator, selected, token_count, content_hash, created_at \
              FROM sources WHERE notebook_id = ? ORDER BY created_at DESC",
         )
         .bind(notebook_id)

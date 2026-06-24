@@ -8,17 +8,24 @@
 //! defines no domain entities itself: [`LensEngine`] is a thin handle that
 //! exposes the pool via [`LensEngine::pool`] and delegates to the repos.
 
+pub mod chunk;
 pub mod config;
 pub(crate) mod db;
+pub mod embedder;
 pub mod embedding;
 pub mod error;
+pub mod ingest;
 pub mod notebooks;
+pub mod parse;
 pub mod system_check;
 pub mod tts;
+pub mod vector_store;
 
 pub use config::AppConfig;
+pub use embedder::{CountingEmbedder, EMBED_DIM, EMBED_MODEL_ID, Embedder, FastembedEmbedder};
 pub use embedding::{InstallProgress, pull_embedding_model};
 pub use error::LensError;
+pub use ingest::{IngestProgress, ingest_source, resolve_nomic_tokenizer};
 pub use notebooks::{Notebook, NotebookId, NotebookSummary, Source};
 pub use system_check::{
     ALLOWED_EMBEDDING_MODELS, CheckAction, CheckId, CheckResult, CheckStatus, LlmDetection,
@@ -28,6 +35,7 @@ pub use tts::{
     DownloadProgress, Gender, KOKORO_MODEL_FILENAME, KOKORO_MODEL_RELPATH, KOKORO_MODEL_URL,
     TtsVoice, download_kokoro_model, kokoro_model_path, list_tts_voices,
 };
+pub use vector_store::{LanceVectorStore, VectorStore};
 
 /// Re-exported so the integration-test crate can re-run the migrator against a
 /// pool obtained via [`LensEngine::pool`] without exposing the rest of the
@@ -38,9 +46,22 @@ use std::path::Path;
 use std::sync::Arc;
 
 use sqlx::SqlitePool;
-use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use tokio::sync::{OnceCell, RwLock, RwLockReadGuard, RwLockWriteGuard, Semaphore};
 
 use crate::notebooks::NotebookRepo;
+
+/// Lowercase-hex encoding of a byte slice.
+///
+/// Single source of truth for the `write!("{b:02x}")` digest-formatting loop
+/// shared by the ingest content-hash and the TTS integrity gate.
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
 
 /// Mutable engine resources live here: the database connection pool and the
 /// loaded application configuration.
@@ -63,6 +84,14 @@ pub struct LensEngineInner {
 #[derive(Clone)]
 pub struct LensEngine {
     inner: Arc<RwLock<LensEngineInner>>,
+    /// Lazily-constructed, shared embedding model (Decision D1 / M2).
+    ///
+    /// Lives OUTSIDE the `RwLock` so a model load never serializes DB reads.
+    /// Built exactly once via [`LensEngine::embedder`]'s `get_or_try_init`.
+    embedder: Arc<OnceCell<Arc<dyn Embedder>>>,
+    /// Single-permit gate serializing ingest runs (the ONNX session is
+    /// single-threaded; concurrent `embed()` calls must not overlap).
+    ingest_lock: Arc<Semaphore>,
 }
 
 impl LensEngine {
@@ -79,11 +108,24 @@ impl LensEngine {
             .map_err(|e| LensError::Io(format!("{}: {e}", data_dir.display())))?;
         let db = db::open_pool(data_dir).await?;
         db::run_migrations(&db).await?;
+        // Crash-recovery path: a process that died mid-ingest leaves a source
+        // stuck in a transient `parsing`/`embedding` status with no running task
+        // to advance it. Reset those to `error` once at startup so the UI can
+        // surface them as re-ingestable rather than spinning forever. Terminal
+        // states (`queued`/`indexed`/`error`/`pending`) are untouched.
+        sqlx::query("UPDATE sources SET status = ? WHERE status IN (?, ?)")
+            .bind(notebooks::source_status::ERROR)
+            .bind(notebooks::source_status::PARSING)
+            .bind(notebooks::source_status::EMBEDDING)
+            .execute(&db)
+            .await?;
         let mut config = AppConfig::load(data_dir)?;
         config.paths.data_dir = data_dir.display().to_string();
         tracing::info!("engine initialized");
         Ok(Self {
             inner: Arc::new(RwLock::new(LensEngineInner { db, config })),
+            embedder: Arc::new(OnceCell::new()),
+            ingest_lock: Arc::new(Semaphore::new(1)),
         })
     }
 
@@ -105,6 +147,8 @@ impl LensEngine {
                 db,
                 config: AppConfig::default(),
             })),
+            embedder: Arc::new(OnceCell::new()),
+            ingest_lock: Arc::new(Semaphore::new(1)),
         }
     }
 
@@ -223,6 +267,104 @@ impl LensEngine {
     pub async fn list_sources(&self, notebook_id: &NotebookId) -> Result<Vec<Source>, LensError> {
         let pool = self.pool().await;
         NotebookRepo::new(&pool).list_sources(notebook_id).await
+    }
+
+    /// Inserts a managed text/markdown source: writes `text` to a managed file
+    /// under `{data_dir}/sources/` and inserts a `queued` `sources` row.
+    /// `kind` must be `"text"` or `"markdown"`. Returns the inserted source.
+    #[tracing::instrument(skip(self, text))]
+    pub async fn add_text_source(
+        &self,
+        notebook_id: &NotebookId,
+        title: &str,
+        text: &str,
+        kind: &str,
+    ) -> Result<Source, LensError> {
+        let data_dir = self.data_dir().await;
+        let pool = self.pool().await;
+        NotebookRepo::new(&pool)
+            .add_text_source(&data_dir, notebook_id, title, text, kind)
+            .await
+    }
+
+    /// Toggles a source's `selected` flag (persisted). `true` = selected.
+    #[tracing::instrument(skip(self))]
+    pub async fn set_source_selected(&self, id: &str, selected: bool) -> Result<(), LensError> {
+        let pool = self.pool().await;
+        NotebookRepo::new(&pool)
+            .set_source_selected(id, selected)
+            .await
+    }
+
+    /// Ingests a queued source end-to-end (parse → chunk → embed → index),
+    /// streaming progress through `on_progress`.
+    #[tracing::instrument(skip(self, on_progress))]
+    pub async fn ingest_source(
+        &self,
+        source_id: &str,
+        on_progress: impl FnMut(crate::ingest::IngestProgress),
+    ) -> Result<(), LensError> {
+        crate::ingest::ingest_source(self, source_id, on_progress).await
+    }
+
+    /// Returns the resolved data directory from the loaded config.
+    pub(crate) async fn data_dir(&self) -> std::path::PathBuf {
+        std::path::PathBuf::from(self.read().await.config.paths.data_dir.clone())
+    }
+
+    /// Test-only accessor for the resolved data directory (the `pub(crate)`
+    /// [`data_dir`](Self::data_dir) is not reachable from the integration-test
+    /// crate). Gated behind `test-util` so it is absent from production builds.
+    #[cfg(feature = "test-util")]
+    pub async fn data_dir_for_test(&self) -> std::path::PathBuf {
+        self.data_dir().await
+    }
+
+    /// Borrows the single-permit ingest semaphore (Decision D1 / M2).
+    pub(crate) fn ingest_lock(&self) -> &Arc<Semaphore> {
+        &self.ingest_lock
+    }
+
+    /// Test-only seam: pre-fills the embedder `OnceCell` with a caller-supplied
+    /// [`Embedder`] so integration tests can inject a `CountingEmbedder` (and so
+    /// avoid the ~130 MB `FastembedEmbedder` model download).
+    ///
+    /// Gated behind the `test-util` feature so it is NEVER present in a
+    /// production build. Returns `Err` if the embedder was already initialized
+    /// (e.g. a prior `ingest_source` already lazily constructed the real model).
+    ///
+    /// The injected embedder is shared exactly like the lazily-constructed one,
+    /// so the cached-once AC (`load_count == 1` across two ingests) and the
+    /// concurrency AC (`in_flight` never exceeds `1`) are both observable through
+    /// the same `Arc` the pipeline reuses.
+    #[cfg(feature = "test-util")]
+    pub fn set_embedder_for_test(&self, embedder: Arc<dyn Embedder>) -> Result<(), LensError> {
+        self.embedder
+            .set(embedder)
+            .map_err(|_| LensError::Internal("embedder already initialized".into()))
+    }
+
+    /// Lazily constructs (once) and returns the shared embedding model.
+    ///
+    /// The first caller builds a [`FastembedEmbedder`] over `{data_dir}/models/
+    /// fastembed/` (a ~130 MB ONNX session, with a one-time HuggingFace download
+    /// on a cold cache); subsequent callers reuse the cached `Arc`. The
+    /// construction runs under [`tokio::task::spawn_blocking`] because fastembed
+    /// init is synchronous and CPU/IO-heavy.
+    pub(crate) async fn embedder(&self) -> Result<Arc<dyn Embedder>, LensError> {
+        self.embedder
+            .get_or_try_init(|| async {
+                let data_dir = self.data_dir().await;
+                let embedder =
+                    tokio::task::spawn_blocking(move || FastembedEmbedder::new(&data_dir))
+                        .await
+                        .map_err(|e| {
+                            LensError::Model(format!("embedder init task panicked: {e}"))
+                        })??;
+                Ok::<Arc<dyn Embedder>, LensError>(Arc::new(embedder))
+            })
+            .await
+            .cloned()
     }
 
     /// Renames a notebook, bumping `updated_at`.

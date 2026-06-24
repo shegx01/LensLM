@@ -37,6 +37,10 @@ pub enum LensError {
     /// A network operation failed.
     #[error("network error: {0}")]
     Network(String),
+
+    /// A vector-store (LanceDB / Arrow) operation failed.
+    #[error("vector store error: {0}")]
+    Vector(String),
 }
 
 // Manual `From` mappings (NOT `#[from]`): source error types are not `Serialize`

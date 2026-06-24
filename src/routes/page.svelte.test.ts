@@ -15,6 +15,14 @@ vi.mock('$lib/notebooks/ipc.js', () => ({
   purgeNotebook: vi.fn()
 }));
 
+vi.mock('$lib/sources/ipc.js', () => ({
+  listSources: vi.fn().mockResolvedValue([]),
+  addTextSource: vi.fn(),
+  addFileSource: vi.fn(),
+  ingestSource: vi.fn(),
+  setSourceSelected: vi.fn()
+}));
+
 vi.mock('@tauri-apps/api/core', () => ({
   isTauri: () => false,
   invoke: vi.fn()
@@ -36,7 +44,7 @@ describe('+page.svelte', () => {
     expect(screen.queryByRole('heading', { name: /hello world/i })).not.toBeInTheDocument();
     // Left rail sidebar, centre workspace, right rail are all present.
     expect(screen.getByText('Notebooks')).toBeInTheDocument();
-    expect(screen.getByText(/sources & studio/i)).toBeInTheDocument();
+    expect(screen.getByText('Sources')).toBeInTheDocument();
     expect(screen.getByText('Your workspace')).toBeInTheDocument();
   });
 });
