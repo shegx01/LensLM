@@ -127,6 +127,8 @@ pub struct Source {
     pub content_hash: Option<String>,
     /// RFC3339 creation timestamp.
     pub created_at: String,
+    /// RFC3339 soft-delete timestamp, or `None` if live.
+    pub trashed_at: Option<String>,
 }
 
 /// A notebook row, returned across the IPC boundary.
@@ -449,6 +451,7 @@ impl<'a> NotebookRepo<'a> {
             token_count: None,
             content_hash: None,
             created_at: now,
+            trashed_at: None,
         })
     }
 
@@ -515,14 +518,55 @@ impl<'a> NotebookRepo<'a> {
             token_count: None,
             content_hash: None,
             created_at: now,
+            trashed_at: None,
         })
     }
 
-    /// Hard-deletes a source row by id. Errors if no row matches.
+    /// Soft-deletes a source: sets `trashed_at` to now.
+    ///
+    /// Only affects live sources (`trashed_at IS NULL`); trashing an already
+    /// trashed or unknown source affects 0 rows and returns a validation error.
+    pub async fn trash_source(&self, id: &str) -> Result<(), LensError> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let result =
+            sqlx::query("UPDATE sources SET trashed_at = ? WHERE id = ? AND trashed_at IS NULL")
+                .bind(&now)
+                .bind(id)
+                .execute(self.pool)
+                .await?;
+        if result.rows_affected() == 0 {
+            return Err(LensError::Validation(format!(
+                "no live source with id {id}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Restores a trashed source: clears `trashed_at`.
+    ///
+    /// Only affects trashed sources (`trashed_at IS NOT NULL`); restoring a live
+    /// or unknown source affects 0 rows and returns a validation error.
+    pub async fn restore_source(&self, id: &str) -> Result<(), LensError> {
+        let result = sqlx::query(
+            "UPDATE sources SET trashed_at = NULL WHERE id = ? AND trashed_at IS NOT NULL",
+        )
+        .bind(id)
+        .execute(self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(LensError::Validation(format!(
+                "no trashed source with id {id}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Permanently deletes a source row by id. Errors if no row matches.
     ///
     /// Callers are responsible for removing any associated Lance vectors before
-    /// calling this (Lance before SQLite ordering).
-    pub async fn delete_source(&self, id: &str) -> Result<(), LensError> {
+    /// calling this (Lance before SQLite ordering). Child `chunks` rows cascade
+    /// via `ON DELETE CASCADE`.
+    pub async fn purge_source(&self, id: &str) -> Result<(), LensError> {
         let result = sqlx::query("DELETE FROM sources WHERE id = ?")
             .bind(id)
             .execute(self.pool)
@@ -581,10 +625,11 @@ impl<'a> NotebookRepo<'a> {
         Ok(())
     }
 
-    /// Fetches a single source row by id, if it exists.
+    /// Fetches a single source row by id, if it exists (including trashed).
     pub async fn get_source(&self, id: &str) -> Result<Option<Source>, LensError> {
         let row = sqlx::query_as::<_, Source>(
-            "SELECT id, notebook_id, kind, title, status, locator, selected, token_count, content_hash, created_at \
+            "SELECT id, notebook_id, kind, title, status, locator, selected, token_count, \
+             content_hash, created_at, trashed_at \
              FROM sources WHERE id = ?",
         )
         .bind(id)
@@ -593,11 +638,12 @@ impl<'a> NotebookRepo<'a> {
         Ok(row)
     }
 
-    /// Lists all sources for a notebook, newest first.
+    /// Lists all live (non-trashed) sources for a notebook, newest first.
     pub async fn list_sources(&self, notebook_id: &NotebookId) -> Result<Vec<Source>, LensError> {
         let rows = sqlx::query_as::<_, Source>(
-            "SELECT id, notebook_id, kind, title, status, locator, selected, token_count, content_hash, created_at \
-             FROM sources WHERE notebook_id = ? ORDER BY created_at DESC",
+            "SELECT id, notebook_id, kind, title, status, locator, selected, token_count, \
+             content_hash, created_at, trashed_at \
+             FROM sources WHERE notebook_id = ? AND trashed_at IS NULL ORDER BY created_at DESC",
         )
         .bind(notebook_id)
         .fetch_all(self.pool)

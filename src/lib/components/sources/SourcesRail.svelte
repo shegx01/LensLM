@@ -15,7 +15,12 @@
   import PanelRightClose from '@lucide/svelte/icons/panel-right-close';
   import Headphones from '@lucide/svelte/icons/headphones';
   import { cn } from '$lib/utils.js';
-  import { sourcesStore, toggleSelected, removeSource } from '$lib/sources/sources-state.svelte.js';
+  import {
+    sourcesStore,
+    toggleSelected,
+    removeSource,
+    undoRemove
+  } from '$lib/sources/sources-state.svelte.js';
   import { notebookStore } from '$lib/notebooks/index.js';
   import type { SourceStatus } from '$lib/sources/types.js';
   import AddSourcesModal from './AddSourcesModal.svelte';
@@ -385,23 +390,29 @@
               </div>
             </div>
 
-            <!-- Right-side affordance: status dot normally; trash on hover.
-                 The status dot fades out on hover; the trash button fades in.
-                 Both are zero-size on the layout axis — shrink-0 so they don't
-                 push the content column. -webkit-app-region: no-drag on the button
-                 prevents the titlebar drag region from swallowing the click. -->
-            <div class="relative mt-1 shrink-0 flex size-[16px] items-center justify-center">
-              <!-- Status dot — fades on group-hover -->
+            <!-- Right-side affordance: fixed-width 20px reserved slot.
+                 Status dot is visible by default; on row hover/focus the dot
+                 fades out and the trash button fades in — occupying the same
+                 slot so they never overlap. The trash button is sized to 20px
+                 (matching the reserved slot) so there is no layout shift.
+                 -webkit-app-region: no-drag on the button prevents the titlebar
+                 drag region from swallowing the click. -->
+            <div
+              class="relative mt-1 flex size-5 shrink-0 items-center justify-center"
+              aria-label="Status: {statusDotLabel(status)}"
+            >
+              <!-- Status dot — fades out on group-hover, invisible when trash is shown -->
               <span
                 class={cn(
-                  'absolute block size-[7px] rounded-full transition-opacity duration-150 group-hover:opacity-0',
+                  'pointer-events-none absolute block size-[7px] rounded-full transition-opacity duration-150 group-hover:opacity-0',
                   statusDotClass(status)
                 )}
-                title={statusDotLabel(status)}
-                aria-label="Status: {statusDotLabel(status)}"
+                aria-hidden="true"
               ></span>
 
-              <!-- Delete button — invisible by default, appears on hover/focus -->
+              <!-- Delete button — invisible by default, fades in on hover/focus.
+                   Sized to fill the same 20px reserved slot as the dot wrapper
+                   so there is zero layout collision. -->
               <button
                 type="button"
                 aria-label="Delete source"
@@ -411,8 +422,8 @@
                   void removeSource(source.id);
                 }}
                 class={cn(
-                  'absolute flex size-[22px] -translate-x-[3px] -translate-y-[3px] items-center justify-center rounded-[5px]',
-                  'opacity-0 transition-all duration-150',
+                  'absolute flex size-5 items-center justify-center rounded-[5px]',
+                  'opacity-0 transition-opacity duration-150',
                   'bg-transparent text-muted-foreground/40',
                   'hover:bg-destructive/15 hover:text-destructive',
                   'focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
@@ -428,6 +439,29 @@
       </ul>
     {/if}
   </div>
+
+  <!-- Undo bar — shown transiently after a soft-delete. Pinned above Studio.
+       Auto-dismisses via the store's 6 s timeout; "Undo" button calls undoRemove().
+       Built inline (no toast primitive exists) using tokens only. no-drag. -->
+  {#if sourcesStore.recentlyTrashed}
+    <div
+      class="mx-2 mb-1.5 flex shrink-0 items-center justify-between gap-2 rounded-lg border border-border bg-muted/60 px-3 py-2 text-xs shadow-sm"
+      role="status"
+      aria-live="polite"
+      aria-label="Source moved to trash"
+      style="-webkit-app-region: no-drag;"
+    >
+      <span class="truncate text-muted-foreground">Source moved to trash</span>
+      <button
+        type="button"
+        onclick={() => void undoRemove()}
+        class="shrink-0 rounded-[5px] px-2 py-0.5 text-xs font-semibold text-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        style="-webkit-app-region: no-drag;"
+      >
+        Undo
+      </button>
+    </div>
+  {/if}
 
   <!-- Studio (bottom) — visual shell, own capped scroll. -->
   <StudioPanel {selectedCount} {totalCount} />

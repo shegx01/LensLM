@@ -75,11 +75,19 @@ export async function setSourceSelected(sourceId: string, selected: boolean): Pr
 }
 
 /**
- * Permanently delete a source by id.
+ * Move a source to the trash (soft-delete).
  * Returns outside a Tauri host (test isolation — callers rely on the store's optimistic remove).
- * The Rust command `delete_source` is added in a parallel milestone commit.
  */
-export async function deleteSource(sourceId: string): Promise<void> {
+export async function trashSource(sourceId: string): Promise<void> {
   if (!isTauri()) return;
-  return invoke<void>('delete_source', { sourceId });
+  return invoke<void>('trash_source', { sourceId });
+}
+
+/**
+ * Restore a previously-trashed source by id.
+ * Returns outside a Tauri host (test isolation).
+ */
+export async function restoreSource(sourceId: string): Promise<void> {
+  if (!isTauri()) return;
+  return invoke<void>('restore_source', { sourceId });
 }

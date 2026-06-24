@@ -46,10 +46,20 @@
 
   // ---------------------------------------------------------------------------
   // Study tools — visual shell only (all disabled). TODO(M6) wire to Notes.
+  //
+  // Layout: Study Guide is the "hero" tool and spans a full row on its own
+  // (matching the shot1 reference). The remaining tools fill a 2-col grid below.
   // ---------------------------------------------------------------------------
 
-  const studyTools: Array<{ label: string; sub: string; icon: Component }> = [
-    { label: 'Study Guide', sub: 'Key terms & review Qs', icon: BookOpen },
+  /** The hero tool — rendered full-width above the grid. */
+  const heroTool: { label: string; sub: string; icon: Component } = {
+    label: 'Study Guide',
+    sub: 'Key terms & review Qs',
+    icon: BookOpen
+  };
+
+  /** The remaining tools — rendered in a 2-column grid. */
+  const gridTools: Array<{ label: string; sub: string; icon: Component }> = [
     { label: 'Briefing Doc', sub: 'One-page summary', icon: FileText },
     { label: 'Report', sub: 'Structured write-up', icon: FileChartColumn },
     { label: 'Slide Deck', sub: 'Presentation outline', icon: Presentation },
@@ -112,27 +122,51 @@
     </p>
   </div>
 
-  <!-- Study tools — 2-col grid, all disabled with a "coming soon" affordance. -->
-  <div class="grid grid-cols-2 gap-1.5" aria-label="Study tools">
-    {#each studyTools as tool (tool.label)}
-      <button
-        type="button"
-        class="flex items-center gap-2 rounded-lg border border-border bg-card px-2.5 py-2 text-left opacity-60 transition-opacity disabled:cursor-not-allowed"
-        disabled
-        aria-label="{tool.label} (coming soon)"
-        title="Coming soon"
-        style="-webkit-app-region: no-drag;"
-      >
-        <tool.icon class="size-[14px] shrink-0 text-muted-foreground" strokeWidth={1.75} />
-        <span class="min-w-0">
-          <span class="block truncate text-xs font-semibold leading-tight text-foreground"
-            >{tool.label}</span
-          >
-          <span class="block truncate text-[0.6875rem] leading-tight text-muted-foreground/70"
-            >{tool.sub}</span
-          >
-        </span>
-      </button>
-    {/each}
+  <!-- Study tools — Study Guide hero (full row) + 2-col grid for the rest.
+       Per shot1: Study Guide spans the full width as the first item. -->
+  <div aria-label="Study tools">
+    <!-- Hero tool: Study Guide — full-width button -->
+    <button
+      type="button"
+      class="mb-1.5 flex w-full items-center gap-2 rounded-lg border border-border bg-card px-2.5 py-2 text-left opacity-60 transition-opacity disabled:cursor-not-allowed"
+      disabled
+      aria-label="{heroTool.label} (coming soon)"
+      title="Coming soon"
+      style="-webkit-app-region: no-drag;"
+    >
+      <heroTool.icon class="size-[14px] shrink-0 text-muted-foreground" strokeWidth={1.75} />
+      <span class="min-w-0">
+        <span class="block truncate text-xs font-semibold leading-tight text-foreground"
+          >{heroTool.label}</span
+        >
+        <span class="block truncate text-[0.6875rem] leading-tight text-muted-foreground/70"
+          >{heroTool.sub}</span
+        >
+      </span>
+    </button>
+
+    <!-- Remaining tools — 2-col grid -->
+    <div class="grid grid-cols-2 gap-1.5">
+      {#each gridTools as tool (tool.label)}
+        <button
+          type="button"
+          class="flex items-center gap-2 rounded-lg border border-border bg-card px-2.5 py-2 text-left opacity-60 transition-opacity disabled:cursor-not-allowed"
+          disabled
+          aria-label="{tool.label} (coming soon)"
+          title="Coming soon"
+          style="-webkit-app-region: no-drag;"
+        >
+          <tool.icon class="size-[14px] shrink-0 text-muted-foreground" strokeWidth={1.75} />
+          <span class="min-w-0">
+            <span class="block truncate text-xs font-semibold leading-tight text-foreground"
+              >{tool.label}</span
+            >
+            <span class="block truncate text-[0.6875rem] leading-tight text-muted-foreground/70"
+              >{tool.sub}</span
+            >
+          </span>
+        </button>
+      {/each}
+    </div>
   </div>
 </section>

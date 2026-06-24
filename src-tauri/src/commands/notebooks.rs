@@ -73,15 +73,36 @@ pub async fn add_text_source(
         .await
 }
 
+/// Soft-deletes a source: sets `trashed_at` to now. Keeps chunks + Lance
+/// vectors so the source can be restored. Errors if missing or already trashed.
+#[tracing::instrument(skip(engine))]
+#[tauri::command]
+pub async fn trash_source(
+    source_id: String,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<(), LensError> {
+    engine.trash_source(&source_id).await
+}
+
+/// Restores a trashed source: clears `trashed_at`. Errors if live or missing.
+#[tracing::instrument(skip(engine))]
+#[tauri::command]
+pub async fn restore_source(
+    source_id: String,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<(), LensError> {
+    engine.restore_source(&source_id).await
+}
+
 /// Permanently deletes a source: drops its Lance vectors then removes the
 /// `sources` row. Errors if the source does not exist.
 #[tracing::instrument(skip(engine))]
 #[tauri::command]
-pub async fn delete_source(
+pub async fn purge_source(
     source_id: String,
     engine: tauri::State<'_, LensEngine>,
 ) -> Result<(), LensError> {
-    engine.delete_source(&source_id).await
+    engine.purge_source(&source_id).await
 }
 
 /// Toggles a source's `selected` flag (persisted across reloads).

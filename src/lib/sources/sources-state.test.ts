@@ -11,7 +11,8 @@ import {
   loadSources,
   ingest,
   toggleSelected,
-  removeSource
+  removeSource,
+  undoRemove
 } from './sources-state.svelte.js';
 
 // ---------------------------------------------------------------------------
@@ -24,7 +25,8 @@ vi.mock('./ipc.js', () => ({
   addFileSource: vi.fn(),
   ingestSource: vi.fn(),
   setSourceSelected: vi.fn(),
-  deleteSource: vi.fn()
+  trashSource: vi.fn(),
+  restoreSource: vi.fn()
 }));
 
 // Mock @tauri-apps/api/core so the $effect.root auto-refresh does not error.
@@ -44,7 +46,7 @@ vi.mock('$lib/notebooks/notebooks-state.svelte.js', () => ({
 }));
 
 // Import the mocked functions so we can configure return values per test.
-import { listSources, ingestSource, setSourceSelected, deleteSource } from './ipc.js';
+import { listSources, ingestSource, setSourceSelected, trashSource, restoreSource } from './ipc.js';
 import type { Source } from './types.js';
 
 // ---------------------------------------------------------------------------
@@ -312,7 +314,7 @@ describe('ingest', () => {
 });
 
 // ---------------------------------------------------------------------------
-// removeSource — optimistic delete with revert-on-failure
+// removeSource — soft-delete (trash) with optimistic remove + undo stash
 // ---------------------------------------------------------------------------
 
 describe('removeSource', () => {
@@ -322,7 +324,7 @@ describe('removeSource', () => {
       makeSource({ id: 'src-002' })
     ]);
     await loadSources('nb-001');
-    vi.mocked(deleteSource).mockResolvedValue(undefined);
+    vi.mocked(trashSource).mockResolvedValue(undefined);
 
     await removeSource('src-001');
 
@@ -330,20 +332,30 @@ describe('removeSource', () => {
     expect(sourcesStore.sources[0].id).toBe('src-002');
   });
 
-  it('calls deleteSource with the correct sourceId', async () => {
+  it('calls trashSource with the correct sourceId', async () => {
     vi.mocked(listSources).mockResolvedValue([makeSource({ id: 'src-001' })]);
     await loadSources('nb-001');
-    vi.mocked(deleteSource).mockResolvedValue(undefined);
+    vi.mocked(trashSource).mockResolvedValue(undefined);
 
     await removeSource('src-001');
 
-    expect(deleteSource).toHaveBeenCalledWith('src-001');
+    expect(trashSource).toHaveBeenCalledWith('src-001');
   });
 
-  it('reverts the optimistic remove when deleteSource fails', async () => {
+  it('sets recentlyTrashed to true after a successful soft-delete', async () => {
     vi.mocked(listSources).mockResolvedValue([makeSource({ id: 'src-001' })]);
     await loadSources('nb-001');
-    vi.mocked(deleteSource).mockRejectedValue(new Error('DB error'));
+    vi.mocked(trashSource).mockResolvedValue(undefined);
+
+    await removeSource('src-001');
+
+    expect(sourcesStore.recentlyTrashed).toBe(true);
+  });
+
+  it('reverts the optimistic remove when trashSource fails', async () => {
+    vi.mocked(listSources).mockResolvedValue([makeSource({ id: 'src-001' })]);
+    await loadSources('nb-001');
+    vi.mocked(trashSource).mockRejectedValue(new Error('DB error'));
     const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
     await removeSource('src-001');
@@ -355,13 +367,118 @@ describe('removeSource', () => {
     consoleSpy.mockRestore();
   });
 
+  it('does not set recentlyTrashed when trashSource fails', async () => {
+    vi.mocked(listSources).mockResolvedValue([makeSource({ id: 'src-001' })]);
+    await loadSources('nb-001');
+    vi.mocked(trashSource).mockRejectedValue(new Error('DB error'));
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await removeSource('src-001');
+
+    expect(sourcesStore.recentlyTrashed).toBe(false);
+    consoleSpy.mockRestore();
+  });
+
   it('is a no-op for an unknown sourceId', async () => {
     vi.mocked(listSources).mockResolvedValue([makeSource({ id: 'src-001' })]);
     await loadSources('nb-001');
 
     await removeSource('src-unknown');
 
-    expect(deleteSource).not.toHaveBeenCalled();
+    expect(trashSource).not.toHaveBeenCalled();
     expect(sourcesStore.sources).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// undoRemove — re-inserts at original index + calls restoreSource
+// ---------------------------------------------------------------------------
+
+describe('undoRemove', () => {
+  it('is a no-op when there is nothing to undo', async () => {
+    vi.mocked(restoreSource).mockResolvedValue(undefined);
+
+    await undoRemove();
+
+    expect(restoreSource).not.toHaveBeenCalled();
+  });
+
+  it('re-inserts the source at its original list index', async () => {
+    vi.mocked(listSources).mockResolvedValue([
+      makeSource({ id: 'src-001' }),
+      makeSource({ id: 'src-002' }),
+      makeSource({ id: 'src-003' })
+    ]);
+    await loadSources('nb-001');
+    vi.mocked(trashSource).mockResolvedValue(undefined);
+    vi.mocked(restoreSource).mockResolvedValue(undefined);
+
+    // Remove the middle item (index 1)
+    await removeSource('src-002');
+    expect(sourcesStore.sources).toHaveLength(2);
+
+    // Undo — should re-insert src-002 at index 1
+    await undoRemove();
+
+    expect(sourcesStore.sources).toHaveLength(3);
+    expect(sourcesStore.sources[1].id).toBe('src-002');
+  });
+
+  it('calls restoreSource with the correct sourceId', async () => {
+    vi.mocked(listSources).mockResolvedValue([makeSource({ id: 'src-001' })]);
+    await loadSources('nb-001');
+    vi.mocked(trashSource).mockResolvedValue(undefined);
+    vi.mocked(restoreSource).mockResolvedValue(undefined);
+
+    await removeSource('src-001');
+    await undoRemove();
+
+    expect(restoreSource).toHaveBeenCalledWith('src-001');
+  });
+
+  it('clears recentlyTrashed after a successful undo', async () => {
+    vi.mocked(listSources).mockResolvedValue([makeSource({ id: 'src-001' })]);
+    await loadSources('nb-001');
+    vi.mocked(trashSource).mockResolvedValue(undefined);
+    vi.mocked(restoreSource).mockResolvedValue(undefined);
+
+    await removeSource('src-001');
+    expect(sourcesStore.recentlyTrashed).toBe(true);
+
+    await undoRemove();
+
+    expect(sourcesStore.recentlyTrashed).toBe(false);
+  });
+
+  it('reverts the re-insert when restoreSource fails', async () => {
+    vi.mocked(listSources).mockResolvedValue([makeSource({ id: 'src-001' })]);
+    await loadSources('nb-001');
+    vi.mocked(trashSource).mockResolvedValue(undefined);
+    vi.mocked(restoreSource).mockRejectedValue(new Error('restore failed'));
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await removeSource('src-001');
+    await undoRemove();
+
+    // Re-insert was reverted — list should be empty again
+    expect(sourcesStore.sources).toHaveLength(0);
+    expect(sourcesStore.error).toBeTruthy();
+    consoleSpy.mockRestore();
+  });
+
+  it('re-inserts the first item (index 0) correctly after removal', async () => {
+    vi.mocked(listSources).mockResolvedValue([
+      makeSource({ id: 'src-001' }),
+      makeSource({ id: 'src-002' })
+    ]);
+    await loadSources('nb-001');
+    vi.mocked(trashSource).mockResolvedValue(undefined);
+    vi.mocked(restoreSource).mockResolvedValue(undefined);
+
+    await removeSource('src-001');
+    await undoRemove();
+
+    expect(sourcesStore.sources[0].id).toBe('src-001');
+    expect(sourcesStore.sources[1].id).toBe('src-002');
   });
 });

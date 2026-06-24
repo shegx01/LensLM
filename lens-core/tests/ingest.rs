@@ -972,15 +972,15 @@ fn real_model_cosine_self_similarity_and_prefixing() {
 }
 
 // ===========================================================================
-// delete_source: removes SQLite row + Lance vectors (Lance before SQLite)
+// Source soft-delete (trash / restore / purge)
 // ===========================================================================
 
-/// AC: `delete_source` wipes the source row, its chunks, and its Lance vectors.
+/// AC: `purge_source` wipes the source row, its chunks, and its Lance vectors.
 /// Calling it a second time returns a validation error (not found).
 #[tokio::test]
-async fn delete_source_removes_rows_and_vectors() {
+async fn purge_source_removes_rows_and_vectors() {
     if !tokenizer_available().await {
-        eprintln!("skipping delete_source_removes_rows_and_vectors: no tokenizer (offline)");
+        eprintln!("skipping purge_source_removes_rows_and_vectors: no tokenizer (offline)");
         return;
     }
     let (_dir, engine) = inject_counting_engine().await;
@@ -988,14 +988,14 @@ async fn delete_source_removes_rows_and_vectors() {
 
     // 1. Create notebook + text source.
     let nb = engine
-        .create_notebook("delete-src-nb", None, None)
+        .create_notebook("purge-src-nb", None, None)
         .await
         .unwrap();
     let src = engine
         .add_text_source(
             &nb.id,
-            "to-delete",
-            "# Delete me\n\nBody text that will be ingested and then deleted.\n",
+            "to-purge",
+            "# Purge me\n\nBody text that will be ingested and then purged.\n",
             "markdown",
         )
         .await
@@ -1007,45 +1007,212 @@ async fn delete_source_removes_rows_and_vectors() {
     // 3. Assert source indexed, chunks > 0, vectors > 0.
     assert_eq!(engine_source_status(&engine, &src.id).await, "indexed");
     let chunks_before = count_chunks(&engine, &src.id).await;
-    assert!(chunks_before > 0, "chunks must exist before delete");
+    assert!(chunks_before > 0, "chunks must exist before purge");
     let vecs_before = vector_row_count(&data_dir, &nb.id.to_string(), &src.id).await;
-    assert!(vecs_before > 0, "vectors must exist before delete");
+    assert!(vecs_before > 0, "vectors must exist before purge");
 
-    // 4. Delete the source — must succeed.
+    // 4. Purge the source — must succeed.
     engine
-        .delete_source(&src.id)
+        .purge_source(&src.id)
         .await
-        .expect("delete_source should succeed");
+        .expect("purge_source should succeed");
 
-    // 5. get_source returns None.
+    // 5. Source row gone.
     let pool = engine.pool().await;
     let row = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sources WHERE id = ?")
         .bind(&src.id)
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(row, 0, "source row must be gone after delete");
+    assert_eq!(row, 0, "source row must be gone after purge");
 
-    // 6. Chunk rows gone.
+    // 6. Chunk rows gone (cascade).
     assert_eq!(
         count_chunks(&engine, &src.id).await,
         0,
-        "chunk rows must be removed"
+        "chunk rows must be removed after purge"
     );
 
     // 7. Lance vectors gone.
     assert_eq!(
         vector_row_count(&data_dir, &nb.id.to_string(), &src.id).await,
         0,
-        "Lance vectors must be removed"
+        "Lance vectors must be removed after purge"
     );
 
-    // 8. Second delete returns Err (not found).
-    let second = engine.delete_source(&src.id).await;
+    // 8. Second purge returns Err (not found).
+    let second = engine.purge_source(&src.id).await;
     assert!(
         second.is_err(),
-        "deleting a non-existent source must return an error"
+        "purging a non-existent source must return an error"
     );
+}
+
+/// AC: `trash_source` sets `trashed_at` and the source is EXCLUDED from
+/// `list_sources`, but chunks and Lance vectors are preserved.
+#[tokio::test]
+async fn trash_source_hides_from_list_keeps_data() {
+    if !tokenizer_available().await {
+        eprintln!("skipping trash_source_hides_from_list_keeps_data: no tokenizer (offline)");
+        return;
+    }
+    let (_dir, engine) = inject_counting_engine().await;
+    let data_dir = engine.data_dir_for_test().await;
+
+    let nb = engine
+        .create_notebook("trash-src-nb", None, None)
+        .await
+        .unwrap();
+    let src = engine
+        .add_text_source(
+            &nb.id,
+            "to-trash",
+            "# Trash me\n\nBody text that will be trashed but not purged.\n",
+            "markdown",
+        )
+        .await
+        .unwrap();
+
+    // Ingest so chunks + vectors exist.
+    engine.ingest_source(&src.id, |_p| {}).await.unwrap();
+    let chunks_before = count_chunks(&engine, &src.id).await;
+    assert!(chunks_before > 0, "chunks must exist before trash");
+    let vecs_before = vector_row_count(&data_dir, &nb.id.to_string(), &src.id).await;
+    assert!(vecs_before > 0, "vectors must exist before trash");
+
+    // Source visible before trash.
+    let live = engine.list_sources(&nb.id).await.unwrap();
+    assert_eq!(live.len(), 1, "source visible before trash");
+
+    // Trash the source — must succeed.
+    engine
+        .trash_source(&src.id)
+        .await
+        .expect("trash_source should succeed");
+
+    // Source is no longer visible in list_sources.
+    let after = engine.list_sources(&nb.id).await.unwrap();
+    assert!(
+        after.is_empty(),
+        "trashed source must not appear in list_sources"
+    );
+
+    // trashed_at is set in the DB.
+    let pool = engine.pool().await;
+    let trashed_at =
+        sqlx::query_scalar::<_, Option<String>>("SELECT trashed_at FROM sources WHERE id = ?")
+            .bind(&src.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        trashed_at.is_some(),
+        "trashed_at must be set after trash_source"
+    );
+
+    // Chunks and vectors are STILL present (soft-delete keeps data).
+    assert_eq!(
+        count_chunks(&engine, &src.id).await,
+        chunks_before,
+        "chunks must survive trash (soft-delete)"
+    );
+    assert_eq!(
+        vector_row_count(&data_dir, &nb.id.to_string(), &src.id).await,
+        vecs_before,
+        "vectors must survive trash (soft-delete)"
+    );
+}
+
+/// AC: `restore_source` clears `trashed_at` and the source reappears in
+/// `list_sources`.
+#[tokio::test]
+async fn restore_source_reappears_in_list() {
+    let (_dir, engine) = file_engine().await;
+
+    let nb = engine
+        .create_notebook("restore-src-nb", None, None)
+        .await
+        .unwrap();
+    let src = engine
+        .add_text_source(&nb.id, "to-restore", "Just some text.", "text")
+        .await
+        .unwrap();
+
+    // Trash then restore.
+    engine.trash_source(&src.id).await.unwrap();
+    assert!(
+        engine.list_sources(&nb.id).await.unwrap().is_empty(),
+        "source must be hidden after trash"
+    );
+
+    engine.restore_source(&src.id).await.unwrap();
+    let live = engine.list_sources(&nb.id).await.unwrap();
+    assert_eq!(live.len(), 1, "source must reappear after restore");
+    assert!(
+        live[0].trashed_at.is_none(),
+        "trashed_at must be cleared after restore"
+    );
+}
+
+/// AC: trashing an already-trashed source errors; restoring a live source errors.
+#[tokio::test]
+async fn trash_and_restore_idempotency_errors() {
+    let (_dir, engine) = file_engine().await;
+
+    let nb = engine
+        .create_notebook("idem-src-nb", None, None)
+        .await
+        .unwrap();
+    let src = engine
+        .add_text_source(&nb.id, "idem", "Idempotency test.", "text")
+        .await
+        .unwrap();
+
+    // Restoring a live source must fail.
+    let err = engine.restore_source(&src.id).await;
+    assert!(err.is_err(), "restoring a live source must fail");
+
+    // Trash once — OK.
+    engine.trash_source(&src.id).await.unwrap();
+
+    // Trashing again must fail.
+    let err2 = engine.trash_source(&src.id).await;
+    assert!(
+        err2.is_err(),
+        "trashing an already-trashed source must fail"
+    );
+}
+
+/// AC: purging a never-ingested source (no Lance vectors) is a clean no-op for
+/// the vector store — the SQL row is removed without error.
+#[tokio::test]
+async fn purge_source_without_vectors_is_clean() {
+    let (_dir, engine) = file_engine().await;
+
+    let nb = engine
+        .create_notebook("purge-no-vec-nb", None, None)
+        .await
+        .unwrap();
+    let src = engine
+        .add_text_source(&nb.id, "no-vectors", "No ingest yet.", "text")
+        .await
+        .unwrap();
+
+    // Purge without any prior ingest — must succeed (vector store handles missing
+    // table gracefully).
+    engine
+        .purge_source(&src.id)
+        .await
+        .expect("purge of a never-ingested source must succeed");
+
+    // Row is gone.
+    let pool = engine.pool().await;
+    let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sources WHERE id = ?")
+        .bind(&src.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0, "source row must be gone after purge");
 }
 
 /// AC (real model, end-to-end): ingest a real text source with the real

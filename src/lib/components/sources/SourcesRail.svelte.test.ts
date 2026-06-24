@@ -36,6 +36,7 @@ import type { Source } from '$lib/sources/types.js';
 
 const { mockSourcesStore, mockNotebookStore } = vi.hoisted(() => {
   let _sources: Source[] = [];
+  let _recentlyTrashed = false;
 
   const mockSourcesStore = {
     get sources() {
@@ -48,8 +49,14 @@ const { mockSourcesStore, mockNotebookStore } = vi.hoisted(() => {
       return null;
     },
     set error(_: string | null) {},
+    get recentlyTrashed() {
+      return _recentlyTrashed;
+    },
     _setSources(s: Source[]) {
       _sources = s;
+    },
+    _setRecentlyTrashed(v: boolean) {
+      _recentlyTrashed = v;
     }
   };
 
@@ -82,6 +89,7 @@ vi.mock('$lib/sources/sources-state.svelte.js', () => ({
   ingest: vi.fn().mockResolvedValue(undefined),
   toggleSelected: vi.fn().mockResolvedValue(undefined),
   removeSource: vi.fn().mockResolvedValue(undefined),
+  undoRemove: vi.fn().mockResolvedValue(undefined),
   resetSourcesStore: vi.fn()
 }));
 
@@ -91,7 +99,8 @@ vi.mock('$lib/sources/ipc.js', () => ({
   addFileSource: vi.fn().mockResolvedValue({ id: 'src-new', status: 'pending' }),
   ingestSource: vi.fn().mockResolvedValue(undefined),
   setSourceSelected: vi.fn().mockResolvedValue(undefined),
-  deleteSource: vi.fn().mockResolvedValue(undefined)
+  trashSource: vi.fn().mockResolvedValue(undefined),
+  restoreSource: vi.fn().mockResolvedValue(undefined)
 }));
 
 vi.mock('$lib/notebooks/notebooks-state.svelte.js', () => ({
@@ -110,7 +119,7 @@ vi.mock('@tauri-apps/plugin-dialog', () => ({
 // Import components after mocks.
 import SourcesRail from './SourcesRail.svelte';
 import AddSourcesModal from './AddSourcesModal.svelte';
-import { removeSource } from '$lib/sources/sources-state.svelte.js';
+import { removeSource, undoRemove } from '$lib/sources/sources-state.svelte.js';
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -139,11 +148,13 @@ function makeSource(overrides?: Partial<Source>): Source {
 beforeEach(() => {
   vi.clearAllMocks();
   mockSourcesStore._setSources([]);
+  mockSourcesStore._setRecentlyTrashed(false);
   mockNotebookStore._setRightRailCollapsed(false);
 });
 
 afterEach(() => {
   mockSourcesStore._setSources([]);
+  mockSourcesStore._setRecentlyTrashed(false);
   mockNotebookStore._setRightRailCollapsed(false);
 });
 
@@ -345,6 +356,52 @@ describe('SourcesRail — delete button', () => {
   it('delete button is NOT rendered in the empty state', () => {
     render(SourcesRail);
     expect(screen.queryByRole('button', { name: /delete source/i })).not.toBeInTheDocument();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Undo bar — shown after soft-delete while recentlyTrashed is true
+// ---------------------------------------------------------------------------
+
+describe('SourcesRail — Undo bar', () => {
+  it('is not visible when recentlyTrashed is false', () => {
+    render(SourcesRail);
+    expect(screen.queryByText('Source moved to trash')).not.toBeInTheDocument();
+  });
+
+  it('appears when recentlyTrashed is true', () => {
+    mockSourcesStore._setRecentlyTrashed(true);
+    render(SourcesRail);
+    expect(screen.getByText('Source moved to trash')).toBeInTheDocument();
+  });
+
+  it('renders an "Undo" button when recentlyTrashed is true', () => {
+    mockSourcesStore._setRecentlyTrashed(true);
+    render(SourcesRail);
+    expect(screen.getByRole('button', { name: /^undo$/i })).toBeInTheDocument();
+  });
+
+  it('clicking the Undo button calls undoRemove', async () => {
+    mockSourcesStore._setRecentlyTrashed(true);
+    render(SourcesRail);
+    await fireEvent.click(screen.getByRole('button', { name: /^undo$/i }));
+    expect(undoRemove).toHaveBeenCalledOnce();
+  });
+
+  it('Undo bar has -webkit-app-region: no-drag on the outer element', () => {
+    mockSourcesStore._setRecentlyTrashed(true);
+    const { container } = render(SourcesRail);
+    const bar = container.querySelector('[role="status"]') as HTMLElement;
+    expect(bar).not.toBeNull();
+    expect(bar.getAttribute('style') ?? '').toContain('-webkit-app-region: no-drag');
+  });
+
+  it('Undo bar is not visible in the collapsed state', () => {
+    mockSourcesStore._setRecentlyTrashed(true);
+    mockNotebookStore._setRightRailCollapsed(true);
+    render(SourcesRail);
+    // Collapsed strip has no source list section — Undo bar is in the expanded layout only.
+    expect(screen.queryByText('Source moved to trash')).not.toBeInTheDocument();
   });
 });
 

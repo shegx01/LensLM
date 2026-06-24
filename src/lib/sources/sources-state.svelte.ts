@@ -9,7 +9,7 @@
 // ERROR HANDLING: try/catch on every action; console.error on failure; transient
 // `error` field for future surfacing. Polished error UI is M9 scope.
 
-import { listSources, ingestSource, setSourceSelected, deleteSource } from './ipc.js';
+import { listSources, ingestSource, setSourceSelected, trashSource, restoreSource } from './ipc.js';
 import type { Source, SourceStatus, StreamEvent, IngestProgress } from './types.js';
 import { notebookStore } from '$lib/notebooks/notebooks-state.svelte.js';
 
@@ -22,6 +22,19 @@ let sources = $state<Source[]>([]);
 let loading = $state(false);
 // TODO(M9): `error` is written but not yet surfaced in UI (polished error states are M9).
 let error = $state<string | null>(null); // transient; polished surfacing deferred to M9
+
+// ---------------------------------------------------------------------------
+// Recently-trashed stash — holds the last soft-deleted source + its original
+// list index so undoRemove() can re-insert it at the right position.
+// ---------------------------------------------------------------------------
+
+interface TrashStash {
+  source: Source;
+  index: number;
+  timeoutId: ReturnType<typeof setTimeout>;
+}
+
+let trashStash = $state<TrashStash | null>(null);
 
 // ---------------------------------------------------------------------------
 // Exported store object (getter/setter pairs — project pattern)
@@ -39,6 +52,10 @@ export const sourcesStore = {
   },
   set error(e: string | null) {
     error = e;
+  },
+  /** Whether a soft-deleted source is currently pending undo (drives the Undo bar). */
+  get recentlyTrashed(): boolean {
+    return trashStash !== null;
   }
 };
 
@@ -134,29 +151,78 @@ export async function toggleSelected(sourceId: string): Promise<void> {
   }
 }
 
+/** How long (ms) the Undo bar is shown before the stash is cleared. */
+const TRASH_UNDO_TTL_MS = 6_000;
+
 /**
- * Permanently remove a source. Optimistic: the row is removed from local state
- * immediately, then the IPC call is awaited. On failure the row is restored and
- * `error` is set — same pattern as `toggleSelected`.
+ * Soft-delete a source (move to trash). Optimistic: the row is removed from
+ * local state immediately, then the IPC `trash_source` command is awaited.
+ * On failure the row is restored and `error` is set.
  *
- * NotebookLM-style inline delete: no confirm dialog required.
+ * A "recently trashed" stash is held for TRASH_UNDO_TTL_MS so the caller
+ * (SourcesRail) can render an Undo bar. Initiating another delete clears
+ * the previous stash immediately.
  */
 export async function removeSource(sourceId: string): Promise<void> {
   const snapshot = sources.find((s) => s.id === sourceId);
   if (!snapshot) return;
+  const originalIndex = sources.indexOf(snapshot);
+
+  // Clear any pre-existing stash + its timeout before starting a new one.
+  if (trashStash !== null) {
+    clearTimeout(trashStash.timeoutId);
+    trashStash = null;
+  }
+
   // Optimistic remove
   sources = sources.filter((s) => s.id !== sourceId);
+
   try {
-    await deleteSource(sourceId);
+    await trashSource(sourceId);
+
+    // Stash for undo — auto-clears after TTL.
+    const timeoutId = setTimeout(() => {
+      trashStash = null;
+    }, TRASH_UNDO_TTL_MS);
+    trashStash = { source: snapshot, index: originalIndex, timeoutId };
   } catch (err) {
-    // Revert on failure — re-insert at original position
-    const idx = sources.findIndex((s) => s.created_at < snapshot.created_at);
-    if (idx === -1) {
+    // Revert on failure — re-insert at original position.
+    if (originalIndex >= sources.length) {
       sources = [...sources, snapshot];
     } else {
-      sources = [...sources.slice(0, idx), snapshot, ...sources.slice(idx)];
+      sources = [...sources.slice(0, originalIndex), snapshot, ...sources.slice(originalIndex)];
     }
     console.error('removeSource: failed for source', sourceId, err);
+    error = String(err);
+  }
+}
+
+/**
+ * Undo the most recent soft-delete. Calls `restore_source` IPC and re-inserts
+ * the source at its original list position. Clears the stash on success.
+ * No-op if there is nothing to undo.
+ */
+export async function undoRemove(): Promise<void> {
+  if (trashStash === null) return;
+  const { source, index, timeoutId } = trashStash;
+
+  // Clear the timeout so the stash doesn't auto-expire mid-flight.
+  clearTimeout(timeoutId);
+  trashStash = null;
+
+  // Optimistic re-insert at original index.
+  if (index >= sources.length) {
+    sources = [...sources, source];
+  } else {
+    sources = [...sources.slice(0, index), source, ...sources.slice(index)];
+  }
+
+  try {
+    await restoreSource(source.id);
+  } catch (err) {
+    // Revert the optimistic re-insert.
+    sources = sources.filter((s) => s.id !== source.id);
+    console.error('undoRemove: failed for source', source.id, err);
     error = String(err);
   }
 }
@@ -170,6 +236,10 @@ export function resetSourcesStore(): void {
   sources = [];
   loading = false;
   error = null;
+  if (trashStash !== null) {
+    clearTimeout(trashStash.timeoutId);
+    trashStash = null;
+  }
 }
 
 // ---------------------------------------------------------------------------

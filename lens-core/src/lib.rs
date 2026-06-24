@@ -287,11 +287,28 @@ impl LensEngine {
             .await
     }
 
-    /// Permanently deletes a source: drops its Lance vectors first (Lance before
-    /// SQLite ordering), then removes the `sources` row. Errors if the source
-    /// does not exist.
+    /// Soft-deletes a source: sets `trashed_at` to now. Keeps all chunks and
+    /// Lance vectors so the source can be restored. Errors if the source is
+    /// missing or already trashed.
     #[tracing::instrument(skip(self))]
-    pub async fn delete_source(&self, source_id: &str) -> Result<(), LensError> {
+    pub async fn trash_source(&self, source_id: &str) -> Result<(), LensError> {
+        let pool = self.pool().await;
+        NotebookRepo::new(&pool).trash_source(source_id).await
+    }
+
+    /// Restores a trashed source: clears `trashed_at`. Errors if the source is
+    /// live (not trashed) or does not exist.
+    #[tracing::instrument(skip(self))]
+    pub async fn restore_source(&self, source_id: &str) -> Result<(), LensError> {
+        let pool = self.pool().await;
+        NotebookRepo::new(&pool).restore_source(source_id).await
+    }
+
+    /// Permanently deletes a source: drops its Lance vectors first (Lance before
+    /// SQLite ordering), then removes the `sources` row. Child `chunks` rows
+    /// cascade. Errors if the source does not exist.
+    #[tracing::instrument(skip(self))]
+    pub async fn purge_source(&self, source_id: &str) -> Result<(), LensError> {
         let pool = self.pool().await;
         let data_dir = self.data_dir().await;
         let source = NotebookRepo::new(&pool)
@@ -302,7 +319,7 @@ impl LensEngine {
         store
             .drop_source(&source.notebook_id, EMBED_MODEL_ID, EMBED_DIM, source_id)
             .await?;
-        NotebookRepo::new(&pool).delete_source(source_id).await
+        NotebookRepo::new(&pool).purge_source(source_id).await
     }
 
     /// Toggles a source's `selected` flag (persisted). `true` = selected.
