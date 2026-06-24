@@ -154,6 +154,17 @@ fn model_slug(model: &str) -> String {
 }
 
 /// Resolves the physical LanceDB table name for a logical coordinate.
+///
+/// **`dim` is intentionally absent from the physical name** even though it is part
+/// of the *logical* key `(notebook, model, dim)`. Phase 1 relies on the invariant
+/// `model ⇒ dim` (the only registered model, `nomic-embed-text-v1.5`, is fixed at
+/// [`VECTOR_DIM`] = 768), so `vec__{notebook}__{model_slug}` uniquely identifies a
+/// table. The table-resolution path ([`LanceVectorStore::ensure_table`]) carries a
+/// `debug_assert_eq!(dim, VECTOR_DIM, …)` guard documenting this assumption.
+///
+/// If a future model is ever registered at *two* dims, two logical registry rows
+/// would collide on this one physical table name — at that point the scheme MUST
+/// be extended to include `dim` (e.g. `vec__{notebook}__{model_slug}__{dim}`).
 fn table_name(notebook: &str, model: &str) -> String {
     format!("vec__{notebook}__{}", model_slug(model))
 }
@@ -464,6 +475,18 @@ impl LanceVectorStore {
         model: &str,
         dim: usize,
     ) -> Result<Table, LensError> {
+        // PHASE-1 INVARIANT (see `table_name`): the physical table name omits
+        // `dim` and relies on `model ⇒ dim`. The only registered model is fixed
+        // at `VECTOR_DIM`, so a `dim` other than that would silently resolve to a
+        // table built for a different dimension. Guard it here at the resolution
+        // path; registering a second dim for the same model must first extend the
+        // table-name scheme to include `dim`.
+        debug_assert_eq!(
+            dim, VECTOR_DIM,
+            "table_name omits dim and relies on model⇒dim (Phase 1): a second dim \
+             for the same model must extend the table-name scheme to include dim"
+        );
+
         let conn = self.connect().await?;
         let name = table_name(notebook, model);
 

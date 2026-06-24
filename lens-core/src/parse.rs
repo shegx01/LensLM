@@ -3,8 +3,8 @@
 //! Converts raw source text into a flat `Vec<Block>` where every block carries:
 //! * The verbatim source bytes (`text`), slice-verified against `char_start..char_end`.
 //! * The heading trail (`section_path`) in force at that point in the document.
-//! * A semantic label (`block_type`): `"heading"`, `"paragraph"`, `"code"`, or
-//!   `"list_item"`.
+//! * A semantic label (`block_type`): `"heading"`, `"paragraph"`, `"code"`,
+//!   `"list_item"`, `"table"`, or `"html"`.
 //!
 //! **Byte-identity invariant:** for every returned block,
 //! `src[block.char_start..block.char_end] == block.text` must hold byte-for-byte.
@@ -52,6 +52,10 @@ pub(crate) mod block_type {
     pub const CODE: &str = "code";
     /// A single list item.
     pub const LIST_ITEM: &str = "list_item";
+    /// A GFM table, emitted as one block carrying the raw table markdown.
+    pub const TABLE: &str = "table";
+    /// A raw HTML block, emitted verbatim.
+    pub const HTML: &str = "html";
 }
 
 /// A bounded, semantically-labelled span within a source document.
@@ -236,7 +240,14 @@ fn build_section_path(stack: &[Option<String>; 6]) -> String {
 enum BlockContext {
     Paragraph,
     CodeBlock,
-    ListItem,
+    /// A list item. `emitted` flips to `true` once the item's own-text block has
+    /// been pushed. An item with a nested sublist emits its own text *at the
+    /// start of that sublist* (so it precedes the nested items in document order,
+    /// B2); a leaf item emits at `End(Item)`. The own-text span always excludes
+    /// any nested list (it ends at the first nested `Tag::List` start).
+    ListItem {
+        emitted: bool,
+    },
     /// The heading level is recorded on the `TagEnd::Heading` event, not stored
     /// here — this variant exists only to identify the open-heading context.
     Heading,
@@ -252,6 +263,22 @@ enum BlockContext {
 /// `block.text = src[start..end].trim()` — the actual stored `text` equals
 /// `src[char_start..char_end]`.  We re-anchor `char_start/char_end` to the trimmed
 /// span so the invariant is exact.
+///
+/// # Tables (B1)
+/// A GFM table's cell text is inline (not wrapped in `Paragraph`), so without a
+/// dedicated arm it would hit the `_ => {}` catch-all and be lost entirely. We
+/// emit the **whole table** as ONE `"table"` block whose `text` is the raw table
+/// markdown `src[table_range]` (byte-identical — never linearised, which would
+/// break byte-identity), then swallow every inner table event via `table_depth`
+/// until `End(Table)` so cell text never pollutes another arm.
+///
+/// # Nested list items (B2)
+/// `into_offset_iter` gives an outer `Item` a range spanning its nested sublist.
+/// Slicing that whole range would duplicate the inner item's text in the outer
+/// block and emit it out of reading order. Instead each item emits only its
+/// **own** text: the span from the item start to the start of its first nested
+/// `Tag::List` (or to `End(Item)` if none), so blocks come out in document order
+/// with no duplication.
 fn parse_markdown(src: &str) -> Vec<Block> {
     let parser = Parser::new_ext(src, Options::all()).into_offset_iter();
 
@@ -260,8 +287,23 @@ fn parse_markdown(src: &str) -> Vec<Block> {
     let mut heading_stack: [Option<String>; 6] = Default::default();
     // Stack of (context, byte_start, section_path at open time).
     let mut ctx_stack: Vec<(BlockContext, usize, String)> = Vec::new();
+    // Depth of open `Tag::Table`s. While > 0 we swallow every event (the whole
+    // table was already emitted as one block at `Start(Table)`), so inner
+    // TableHead/TableRow/TableCell + their inline text never reach another arm.
+    let mut table_depth: usize = 0;
 
     for (event, range) in parser {
+        // Inside a table everything is already captured by the single table
+        // block; only track table nesting and drop all other events.
+        if table_depth > 0 {
+            match event {
+                Event::Start(Tag::Table(_)) => table_depth += 1,
+                Event::End(TagEnd::Table) => table_depth -= 1,
+                _ => {}
+            }
+            continue;
+        }
+
         match event {
             // ── Opening tags ──────────────────────────────────────────────
             Event::Start(Tag::Paragraph) => {
@@ -274,7 +316,59 @@ fn parse_markdown(src: &str) -> Vec<Block> {
             }
             Event::Start(Tag::Item) => {
                 let path = build_section_path(&heading_stack);
-                ctx_stack.push((BlockContext::ListItem, range.start, path));
+                ctx_stack.push((BlockContext::ListItem { emitted: false }, range.start, path));
+            }
+            Event::Start(Tag::List(_)) => {
+                // A list opening directly inside an item is that item's first
+                // nested sublist. Emit the enclosing item's OWN text NOW — span
+                // from the item start to this nested-list start — so the outer
+                // block precedes its nested items in document order (B2), then
+                // mark it emitted so `End(Item)` won't emit it again. Only the
+                // first nested list triggers this (later siblings see emitted=true).
+                if let Some((BlockContext::ListItem { emitted }, byte_start, path)) =
+                    ctx_stack.last_mut()
+                    && !*emitted
+                {
+                    *emitted = true;
+                    let (byte_start, path) = (*byte_start, path.clone());
+                    emit_block(
+                        src,
+                        block_type::LIST_ITEM,
+                        &path,
+                        byte_start,
+                        range.start,
+                        &mut blocks,
+                    );
+                }
+            }
+            Event::Start(Tag::Table(_)) => {
+                // Emit the WHOLE table as one block (raw markdown, byte-identical)
+                // then swallow all inner events until `End(Table)` (B1).
+                let path = build_section_path(&heading_stack);
+                emit_block(
+                    src,
+                    block_type::TABLE,
+                    &path,
+                    range.start,
+                    range.end,
+                    &mut blocks,
+                );
+                table_depth += 1;
+            }
+            Event::Start(Tag::HtmlBlock) => {
+                // Emit the raw HTML block verbatim as one `"html"` block (B3). The
+                // `Start..End` range covers the whole block, so a single slice is
+                // byte-identical; the inner `Event::Html` text events that follow
+                // fall through the `_ => {}` arm and are not re-emitted.
+                let path = build_section_path(&heading_stack);
+                emit_block(
+                    src,
+                    block_type::HTML,
+                    &path,
+                    range.start,
+                    range.end,
+                    &mut blocks,
+                );
             }
             Event::Start(Tag::Heading { .. }) => {
                 let path = build_section_path(&heading_stack);
@@ -309,16 +403,22 @@ fn parse_markdown(src: &str) -> Vec<Block> {
                 }
             }
             Event::End(TagEnd::Item) => {
-                if let Some((BlockContext::ListItem, byte_start, path)) = ctx_stack.pop() {
-                    let byte_end = range.end;
-                    emit_block(
-                        src,
-                        block_type::LIST_ITEM,
-                        &path,
-                        byte_start,
-                        byte_end,
-                        &mut blocks,
-                    );
+                if let Some((BlockContext::ListItem { emitted }, byte_start, path)) =
+                    ctx_stack.pop()
+                {
+                    // A leaf item (no nested list) emits its full span here; an
+                    // item with a nested sublist already emitted its own text at
+                    // the sublist start (B2), so skip it to avoid duplication.
+                    if !emitted {
+                        emit_block(
+                            src,
+                            block_type::LIST_ITEM,
+                            &path,
+                            byte_start,
+                            range.end,
+                            &mut blocks,
+                        );
+                    }
                 }
             }
             Event::End(TagEnd::Heading(level)) => {
@@ -643,5 +743,138 @@ mod tests {
         let src = "# 日本語\n\nこんにちは 🦀 world\n";
         let blocks = parse_blocks(src, SourceKind::Markdown);
         assert_byte_identity(src, &blocks);
+    }
+
+    /// B1 — GFM table content must not be silently dropped. A 2-column table is
+    /// emitted as exactly ONE `"table"` block whose raw markdown contains every
+    /// cell's text. Demonstrates the content-loss bug on the old `_ => {}` arm.
+    #[test]
+    fn markdown_gfm_table_emitted_as_one_block() {
+        let src = "# T\n\n\
+                   | Fruit | Color |\n\
+                   | ----- | ----- |\n\
+                   | Apple | Red |\n\
+                   | Lime | Green |\n\n\
+                   After table.\n";
+        let blocks = parse_blocks(src, SourceKind::Markdown);
+        assert_byte_identity(src, &blocks);
+
+        let tables: Vec<&Block> = blocks.iter().filter(|b| b.block_type == "table").collect();
+        assert_eq!(tables.len(), 1, "exactly one table block");
+        let t = tables[0];
+        // Every cell's content survives in the single table block.
+        for cell in ["Fruit", "Color", "Apple", "Red", "Lime", "Green"] {
+            assert!(
+                t.text.contains(cell),
+                "table block lost cell {cell:?}; text = {:?}",
+                t.text
+            );
+        }
+        // section_path is the active heading trail.
+        assert_eq!(t.section_path, "T");
+        // The table events must not pollute other arms: no cell text leaks into a
+        // paragraph/list_item block.
+        for b in &blocks {
+            if b.block_type != "table" {
+                for cell in ["Fruit", "Apple", "Lime", "Green"] {
+                    assert!(
+                        !b.text.contains(cell),
+                        "cell {cell:?} leaked into a {} block: {:?}",
+                        b.block_type,
+                        b.text
+                    );
+                }
+            }
+        }
+    }
+
+    /// B2 — nested list items must each emit their OWN text only, in document
+    /// order, with no duplication. Demonstrates the outer-includes-inner +
+    /// out-of-order double-emit bug on the old per-Item slice.
+    #[test]
+    fn markdown_nested_list_no_duplication_in_order() {
+        let src = "- outer\n  - inner\n";
+        let blocks = parse_blocks(src, SourceKind::Markdown);
+        assert_byte_identity(src, &blocks);
+
+        let items: Vec<&Block> = blocks
+            .iter()
+            .filter(|b| b.block_type == "list_item")
+            .collect();
+        assert_eq!(items.len(), 2, "exactly two list_item blocks");
+
+        // "inner" appears in EXACTLY one block (the inner one).
+        let inner_count = items.iter().filter(|b| b.text.contains("inner")).count();
+        assert_eq!(inner_count, 1, "'inner' must appear in exactly one block");
+
+        // The outer block must NOT contain the inner text (no duplication).
+        let outer = items
+            .iter()
+            .find(|b| b.text.contains("outer"))
+            .expect("an outer block exists");
+        assert!(
+            !outer.text.contains("inner"),
+            "outer list_item must not include nested 'inner' text; got {:?}",
+            outer.text
+        );
+
+        // Document order: the outer block precedes the inner block.
+        let outer_idx = items.iter().position(|b| b.text.contains("outer")).unwrap();
+        let inner_idx = items.iter().position(|b| b.text.contains("inner")).unwrap();
+        assert!(
+            outer_idx < inner_idx,
+            "outer list_item must come before inner in document order"
+        );
+    }
+
+    /// B3 — a raw HTML block is captured verbatim as one `"html"` block.
+    #[test]
+    fn markdown_html_block_captured() {
+        let src = "# H\n\n<div class=\"note\">\n  <p>Raw HTML body.</p>\n</div>\n\nAfter.\n";
+        let blocks = parse_blocks(src, SourceKind::Markdown);
+        assert_byte_identity(src, &blocks);
+
+        let html: Vec<&Block> = blocks.iter().filter(|b| b.block_type == "html").collect();
+        assert_eq!(html.len(), 1, "exactly one html block");
+        assert!(html[0].text.contains("<div"), "html block keeps the markup");
+        assert!(
+            html[0].text.contains("Raw HTML body."),
+            "html block keeps inner content"
+        );
+        assert_eq!(html[0].section_path, "H");
+    }
+
+    /// Deeper nesting still emits one block per item, no duplication, in order.
+    #[test]
+    fn markdown_nested_list_three_levels() {
+        let src = "- a\n  - b\n    - c\n";
+        let blocks = parse_blocks(src, SourceKind::Markdown);
+        assert_byte_identity(src, &blocks);
+
+        let items: Vec<&Block> = blocks
+            .iter()
+            .filter(|b| b.block_type == "list_item")
+            .collect();
+        assert_eq!(items.len(), 3, "one block per item");
+        // Each item's own block ends with its marker letter and does NOT contain
+        // any deeper letter (no parent includes its children's text).
+        let block_for = |letter: char| -> &Block {
+            items
+                .iter()
+                .copied()
+                .find(|b| b.text.trim_end().ends_with(letter))
+                .unwrap_or_else(|| panic!("a block ending in {letter:?}"))
+        };
+        let a = block_for('a');
+        let b = block_for('b');
+        let c = block_for('c');
+        assert!(
+            !a.text.contains('b') && !a.text.contains('c'),
+            "a excludes b,c"
+        );
+        assert!(!b.text.contains('c'), "b excludes c");
+        // Document order a < b < c.
+        let pos = |target: &Block| items.iter().position(|x| std::ptr::eq(*x, target)).unwrap();
+        assert!(pos(a) < pos(b) && pos(b) < pos(c), "document order a<b<c");
     }
 }
