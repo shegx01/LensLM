@@ -401,10 +401,13 @@
               class="relative mt-1 flex size-5 shrink-0 items-center justify-center"
               aria-label="Status: {statusDotLabel(status)}"
             >
-              <!-- Status dot — fades out on group-hover, invisible when trash is shown -->
+              <!-- Status dot — fades out on group-hover, invisible when trash is shown.
+                   group-hover:animate-none stops the in-progress `animate-pulse`
+                   keyframes from re-driving opacity (which would otherwise bleed the
+                   pulsing dot through under the trash icon). -->
               <span
                 class={cn(
-                  'pointer-events-none absolute block size-[7px] rounded-full transition-opacity duration-150 group-hover:opacity-0',
+                  'pointer-events-none absolute block size-[7px] rounded-full transition-opacity duration-150 group-hover:animate-none group-hover:opacity-0',
                   statusDotClass(status)
                 )}
                 aria-hidden="true"
