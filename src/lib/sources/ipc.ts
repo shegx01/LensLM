@@ -73,3 +73,13 @@ export async function setSourceSelected(sourceId: string, selected: boolean): Pr
   if (!isTauri()) throw new Error('setSourceSelected: not running under Tauri');
   return invoke<void>('set_source_selected', { sourceId, selected });
 }
+
+/**
+ * Permanently delete a source by id.
+ * Returns outside a Tauri host (test isolation — callers rely on the store's optimistic remove).
+ * The Rust command `delete_source` is added in a parallel milestone commit.
+ */
+export async function deleteSource(sourceId: string): Promise<void> {
+  if (!isTauri()) return;
+  return invoke<void>('delete_source', { sourceId });
+}

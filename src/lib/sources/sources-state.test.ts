@@ -10,7 +10,8 @@ import {
   resetSourcesStore,
   loadSources,
   ingest,
-  toggleSelected
+  toggleSelected,
+  removeSource
 } from './sources-state.svelte.js';
 
 // ---------------------------------------------------------------------------
@@ -22,7 +23,8 @@ vi.mock('./ipc.js', () => ({
   addTextSource: vi.fn(),
   addFileSource: vi.fn(),
   ingestSource: vi.fn(),
-  setSourceSelected: vi.fn()
+  setSourceSelected: vi.fn(),
+  deleteSource: vi.fn()
 }));
 
 // Mock @tauri-apps/api/core so the $effect.root auto-refresh does not error.
@@ -42,7 +44,7 @@ vi.mock('$lib/notebooks/notebooks-state.svelte.js', () => ({
 }));
 
 // Import the mocked functions so we can configure return values per test.
-import { listSources, ingestSource, setSourceSelected } from './ipc.js';
+import { listSources, ingestSource, setSourceSelected, deleteSource } from './ipc.js';
 import type { Source } from './types.js';
 
 // ---------------------------------------------------------------------------
@@ -306,5 +308,60 @@ describe('ingest', () => {
     expect(sourcesStore.sources[0].status).toBe('error');
     expect(sourcesStore.error).toBeTruthy();
     consoleSpy.mockRestore();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// removeSource — optimistic delete with revert-on-failure
+// ---------------------------------------------------------------------------
+
+describe('removeSource', () => {
+  it('removes the row from sources immediately (optimistic)', async () => {
+    vi.mocked(listSources).mockResolvedValue([
+      makeSource({ id: 'src-001' }),
+      makeSource({ id: 'src-002' })
+    ]);
+    await loadSources('nb-001');
+    vi.mocked(deleteSource).mockResolvedValue(undefined);
+
+    await removeSource('src-001');
+
+    expect(sourcesStore.sources).toHaveLength(1);
+    expect(sourcesStore.sources[0].id).toBe('src-002');
+  });
+
+  it('calls deleteSource with the correct sourceId', async () => {
+    vi.mocked(listSources).mockResolvedValue([makeSource({ id: 'src-001' })]);
+    await loadSources('nb-001');
+    vi.mocked(deleteSource).mockResolvedValue(undefined);
+
+    await removeSource('src-001');
+
+    expect(deleteSource).toHaveBeenCalledWith('src-001');
+  });
+
+  it('reverts the optimistic remove when deleteSource fails', async () => {
+    vi.mocked(listSources).mockResolvedValue([makeSource({ id: 'src-001' })]);
+    await loadSources('nb-001');
+    vi.mocked(deleteSource).mockRejectedValue(new Error('DB error'));
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await removeSource('src-001');
+
+    // Row should be restored after failure
+    expect(sourcesStore.sources).toHaveLength(1);
+    expect(sourcesStore.sources[0].id).toBe('src-001');
+    expect(sourcesStore.error).toBeTruthy();
+    consoleSpy.mockRestore();
+  });
+
+  it('is a no-op for an unknown sourceId', async () => {
+    vi.mocked(listSources).mockResolvedValue([makeSource({ id: 'src-001' })]);
+    await loadSources('nb-001');
+
+    await removeSource('src-unknown');
+
+    expect(deleteSource).not.toHaveBeenCalled();
+    expect(sourcesStore.sources).toHaveLength(1);
   });
 });

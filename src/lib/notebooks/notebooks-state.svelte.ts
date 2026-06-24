@@ -35,6 +35,7 @@ let activeNotebookId = $state<string | null>(null); // session-only
 let activeTab = $state<'chat' | 'notes'>('chat'); // session-only
 let trashOpen = $state(false); // Trash modal visibility (centered dialog)
 let sidebarCollapsed = $state(false); // session-only; localStorage deferred to follow-up
+let rightRailCollapsed = $state(false); // session-only; persisted same way as sidebarCollapsed
 let paletteOpen = $state(false); // command palette visibility
 let paletteQuery = $state(''); // search query (palette-scoped, reset on close)
 // TODO(M9): single `loading` boolean flickers under concurrent/compound actions — replace with a counter when wiring loading UI.
@@ -113,6 +114,12 @@ export const notebookStore = {
   },
   set sidebarCollapsed(v: boolean) {
     sidebarCollapsed = v;
+  },
+  get rightRailCollapsed() {
+    return rightRailCollapsed;
+  },
+  set rightRailCollapsed(v: boolean) {
+    rightRailCollapsed = v;
   },
   get paletteOpen() {
     return paletteOpen;
@@ -322,6 +329,7 @@ export function resetNotebookStore(): void {
   activeTab = 'chat';
   trashOpen = false;
   sidebarCollapsed = false;
+  rightRailCollapsed = false;
   paletteOpen = false;
   paletteQuery = '';
   loading = false;

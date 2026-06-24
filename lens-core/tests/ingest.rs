@@ -971,6 +971,83 @@ fn real_model_cosine_self_similarity_and_prefixing() {
     );
 }
 
+// ===========================================================================
+// delete_source: removes SQLite row + Lance vectors (Lance before SQLite)
+// ===========================================================================
+
+/// AC: `delete_source` wipes the source row, its chunks, and its Lance vectors.
+/// Calling it a second time returns a validation error (not found).
+#[tokio::test]
+async fn delete_source_removes_rows_and_vectors() {
+    if !tokenizer_available().await {
+        eprintln!("skipping delete_source_removes_rows_and_vectors: no tokenizer (offline)");
+        return;
+    }
+    let (_dir, engine) = inject_counting_engine().await;
+    let data_dir = engine.data_dir_for_test().await;
+
+    // 1. Create notebook + text source.
+    let nb = engine
+        .create_notebook("delete-src-nb", None, None)
+        .await
+        .unwrap();
+    let src = engine
+        .add_text_source(
+            &nb.id,
+            "to-delete",
+            "# Delete me\n\nBody text that will be ingested and then deleted.\n",
+            "markdown",
+        )
+        .await
+        .unwrap();
+
+    // 2. Ingest so Lance vectors exist.
+    engine.ingest_source(&src.id, |_p| {}).await.unwrap();
+
+    // 3. Assert source indexed, chunks > 0, vectors > 0.
+    assert_eq!(engine_source_status(&engine, &src.id).await, "indexed");
+    let chunks_before = count_chunks(&engine, &src.id).await;
+    assert!(chunks_before > 0, "chunks must exist before delete");
+    let vecs_before = vector_row_count(&data_dir, &nb.id.to_string(), &src.id).await;
+    assert!(vecs_before > 0, "vectors must exist before delete");
+
+    // 4. Delete the source — must succeed.
+    engine
+        .delete_source(&src.id)
+        .await
+        .expect("delete_source should succeed");
+
+    // 5. get_source returns None.
+    let pool = engine.pool().await;
+    let row = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sources WHERE id = ?")
+        .bind(&src.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(row, 0, "source row must be gone after delete");
+
+    // 6. Chunk rows gone.
+    assert_eq!(
+        count_chunks(&engine, &src.id).await,
+        0,
+        "chunk rows must be removed"
+    );
+
+    // 7. Lance vectors gone.
+    assert_eq!(
+        vector_row_count(&data_dir, &nb.id.to_string(), &src.id).await,
+        0,
+        "Lance vectors must be removed"
+    );
+
+    // 8. Second delete returns Err (not found).
+    let second = engine.delete_source(&src.id).await;
+    assert!(
+        second.is_err(),
+        "deleting a non-existent source must return an error"
+    );
+}
+
 /// AC (real model, end-to-end): ingest a real text source with the real
 /// embedder and assert it reaches `indexed` and search returns its chunks.
 #[tokio::test]

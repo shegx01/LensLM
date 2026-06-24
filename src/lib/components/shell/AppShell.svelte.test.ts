@@ -96,4 +96,25 @@ describe('AppShell.svelte', () => {
     expect(grid.className).toContain('grid-cols-[256px_1fr_320px]');
     expect(screen.getByText('Notebooks')).toBeInTheDocument();
   });
+
+  it('grid uses the 56px collapsed RIGHT column when rightRailCollapsed is true', () => {
+    notebookStore.rightRailCollapsed = true;
+    const { container } = render(AppShell);
+    const grid = container.querySelector('div.grid') as HTMLElement;
+    expect(grid.className).toContain('grid-cols-[256px_1fr_56px]');
+  });
+
+  it('grid uses the 320px expanded RIGHT column by default', () => {
+    const { container } = render(AppShell);
+    const grid = container.querySelector('div.grid') as HTMLElement;
+    expect(grid.className).toContain('grid-cols-[256px_1fr_320px]');
+  });
+
+  it('both rails collapsed yields the 104px/56px grid', () => {
+    notebookStore.sidebarCollapsed = true;
+    notebookStore.rightRailCollapsed = true;
+    const { container } = render(AppShell);
+    const grid = container.querySelector('div.grid') as HTMLElement;
+    expect(grid.className).toContain('grid-cols-[104px_1fr_56px]');
+  });
 });

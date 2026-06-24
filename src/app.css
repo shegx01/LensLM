@@ -542,6 +542,19 @@
   --color-green-fg: var(--green-fg);
 }
 
+/* ---------------------------------------------------------------------------
+ * no-scrollbar — hide the scrollbar chrome while keeping the element scrollable.
+ * Used by the M4 right-rail Sources list + Studio panel so overflow scrolls
+ * without a visible track. Firefox uses scrollbar-width; WebKit/Blink uses the
+ * pseudo-element.
+ * ------------------------------------------------------------------------- */
+@utility no-scrollbar {
+  scrollbar-width: none;
+  &::-webkit-scrollbar {
+    display: none;
+  }
+}
+
 @layer base {
   * {
     @apply border-border outline-ring/50;

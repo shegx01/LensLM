@@ -32,9 +32,21 @@
   // the native macOS traffic-light cluster (~62px wide): 104px column − 2×8px
   // (m-2) gutter = 88px panel (window-x 8→96), so the cluster (positioned at x:20,
   // i.e. a 12px left inset) clears both walls with ~14px right margin.
-  const gridCols = $derived(
-    notebookStore.sidebarCollapsed ? 'grid-cols-[104px_1fr_320px]' : 'grid-cols-[256px_1fr_320px]'
-  );
+  // Both rails are independently collapsible: the LEFT column (sidebar) is
+  // 256px → 104px; the RIGHT column (sources rail) is 320px → 56px icon strip.
+  // Both transitions animate via the grid-template-columns transition below.
+  //
+  // The four combinations are spelled out as STATIC class literals (not built by
+  // interpolation) so Tailwind v4's static extractor emits each grid-cols rule —
+  // a templated `grid-cols-[${l}_1fr_${r}]` would never be generated.
+  const gridCols = $derived.by(() => {
+    const left = notebookStore.sidebarCollapsed;
+    const right = notebookStore.rightRailCollapsed;
+    if (left && right) return 'grid-cols-[104px_1fr_56px]';
+    if (left && !right) return 'grid-cols-[104px_1fr_320px]';
+    if (!left && right) return 'grid-cols-[256px_1fr_56px]';
+    return 'grid-cols-[256px_1fr_320px]';
+  });
 
   // ---------------------------------------------------------------------------
   // Global ⌘K handler (Step 4.10) — macOS-first / metaKey only for M3.

@@ -518,6 +518,21 @@ impl<'a> NotebookRepo<'a> {
         })
     }
 
+    /// Hard-deletes a source row by id. Errors if no row matches.
+    ///
+    /// Callers are responsible for removing any associated Lance vectors before
+    /// calling this (Lance before SQLite ordering).
+    pub async fn delete_source(&self, id: &str) -> Result<(), LensError> {
+        let result = sqlx::query("DELETE FROM sources WHERE id = ?")
+            .bind(id)
+            .execute(self.pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(LensError::Validation(format!("no source with id {id}")));
+        }
+        Ok(())
+    }
+
     /// Toggles a source's `selected` flag (persisted). Errors if no row matches.
     pub async fn set_source_selected(&self, id: &str, selected: bool) -> Result<(), LensError> {
         let result = sqlx::query("UPDATE sources SET selected = ? WHERE id = ?")

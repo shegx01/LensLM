@@ -1,373 +1,437 @@
 <!-- SourcesRail fills the 320px right <aside> in AppShell.
-     Displays all sources for the active notebook with per-source status pills,
-     an "Add source" control (file picker + paste-text dialog), and a counter badge.
+     Header: accent rounded-square icon · "Sources" · selected/total counter · secondary icon · "+" add.
+     Source rows: accent checkbox · doc icon · truncated title · type badge · metadata · status dot.
+     "Add sources" opens the tabbed AddSourcesModal.
+     macOS drag region: header row = data-tauri-drag-region; every interactive child has
+     style="-webkit-app-region: no-drag;" so window-drag and button-click don't conflict.
      All colours are CSS-variable tokens — no hardcoded hex. -->
 <script lang="ts">
-  import { open as openDialog } from '@tauri-apps/plugin-dialog';
-  import { isTauri } from '@tauri-apps/api/core';
-  import Plus from '@lucide/svelte/icons/plus';
   import File from '@lucide/svelte/icons/file';
+  import FileText from '@lucide/svelte/icons/file-text';
   import Check from '@lucide/svelte/icons/check';
-  import X from '@lucide/svelte/icons/x';
+  import Plus from '@lucide/svelte/icons/plus';
+  import Trash from '@lucide/svelte/icons/trash';
+  import PanelRight from '@lucide/svelte/icons/panel-right';
+  import PanelRightClose from '@lucide/svelte/icons/panel-right-close';
+  import Headphones from '@lucide/svelte/icons/headphones';
   import { cn } from '$lib/utils.js';
-  import { Button } from '$lib/components/ui/button/index.js';
-  import {
-    sourcesStore,
-    loadSources,
-    ingest,
-    toggleSelected
-  } from '$lib/sources/sources-state.svelte.js';
-  import { addFileSource, addTextSource } from '$lib/sources/ipc.js';
-  import { notebookStore } from '$lib/notebooks/notebooks-state.svelte.js';
+  import { sourcesStore, toggleSelected, removeSource } from '$lib/sources/sources-state.svelte.js';
+  import { notebookStore } from '$lib/notebooks/index.js';
   import type { SourceStatus } from '$lib/sources/types.js';
+  import AddSourcesModal from './AddSourcesModal.svelte';
+  import StudioPanel from './StudioPanel.svelte';
 
   // ---------------------------------------------------------------------------
   // Local state
   // ---------------------------------------------------------------------------
 
-  /** Controls the "Add source" dropdown menu visibility */
-  let menuOpen = $state(false);
+  /** Controls the "Add sources" modal */
+  let modalOpen = $state(false);
 
-  /** Controls the paste-text dialog visibility */
-  let pasteDialogOpen = $state(false);
+  // ---------------------------------------------------------------------------
+  // Collapse — mirrors the left rail's sidebarCollapsed (store field
+  // rightRailCollapsed). The AppShell grid's THIRD column width follows this
+  // value (320px expanded / 56px collapsed icon strip) and animates.
+  // ---------------------------------------------------------------------------
 
-  /** Paste-text dialog fields */
-  let pasteTitle = $state('');
-  let pasteText = $state('');
-  let pasteError = $state<string | null>(null);
-  let pasteSubmitting = $state(false);
+  const collapsed = $derived(notebookStore.rightRailCollapsed);
+
+  function toggleCollapse(): void {
+    notebookStore.rightRailCollapsed = !notebookStore.rightRailCollapsed;
+  }
 
   // ---------------------------------------------------------------------------
   // Derived
   // ---------------------------------------------------------------------------
 
-  const activeNotebookId = $derived(notebookStore.activeNotebookId);
   const sources = $derived(sourcesStore.sources);
-  const sourceCount = $derived(sources.length);
+  const totalCount = $derived(sources.length);
+  const selectedCount = $derived(sources.filter((s) => s.selected === 1).length);
 
   // ---------------------------------------------------------------------------
-  // Status pill helpers — token-only colours
+  // Type badge helpers
   // ---------------------------------------------------------------------------
 
-  function statusPillClass(status: SourceStatus): string {
-    switch (status) {
-      case 'indexed':
-        return 'bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300';
-      case 'parsing':
-        return 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300';
-      case 'embedding':
-        return 'bg-violet-100 text-violet-700 dark:bg-violet-900/40 dark:text-violet-300';
-      case 'queued':
-      case 'pending':
-        return 'bg-muted text-muted-foreground';
-      case 'error':
-        return 'bg-destructive/10 text-destructive dark:bg-destructive/20';
+  /**
+   * Derive a short type badge from the source's kind + locator/title.
+   * This is display-only — purely informational.
+   */
+  function typeBadge(kind: string, locator: string, title: string): string {
+    // kind 'url' → 'URL'
+    if (kind === 'url') return 'URL';
+
+    // Derive from locator extension first, then fall back to title
+    const path = locator || title || '';
+    const ext = path.split('.').pop()?.toLowerCase() ?? '';
+
+    switch (ext) {
+      case 'pdf':
+        return 'PDF';
+      case 'docx':
+      case 'doc':
+        return 'DOCX';
+      case 'rtf':
+        return 'RTF';
+      case 'odt':
+        return 'ODT';
+      case 'epub':
+        return 'EPUB';
+      case 'md':
+      case 'markdown':
+        return 'MD';
+      case 'txt':
+        return 'TXT';
+      case 'xlsx':
+        return 'XLSX';
+      case 'xls':
+        return 'XLS';
+      case 'csv':
+        return 'CSV';
+      case 'json':
+        return 'JSON';
+      case 'jsonl':
+        return 'JSONL';
+      case 'yaml':
+      case 'yml':
+        return 'YAML';
+      case 'xml':
+        return 'XML';
+      case 'pptx':
+      case 'ppt':
+        return 'PPTX';
+      case 'mp3':
+      case 'wav':
+      case 'm4a':
+      case 'flac':
+      case 'ogg':
+      case 'aac':
+      case 'opus':
+        return 'AUDIO';
+      case 'mp4':
+      case 'mov':
+      case 'webm':
+        return 'VIDEO';
       default:
-        return 'bg-muted text-muted-foreground';
+        // For text/paste sources with no extension
+        if (kind === 'text') return 'TXT';
+        return 'FILE';
     }
   }
 
-  function statusLabel(status: SourceStatus): string {
+  /**
+   * Derive a human-readable metadata line.
+   * Phase 1: for text/md sources we typically only have token_count.
+   * Show token count if available; otherwise gracefully omit.
+   */
+  // TODO(M6): extract typeBadge + metaLine to src/lib/sources/format.ts when Studio reuses badges.
+  function metaLine(tokenCount: number | null): string {
+    if (tokenCount !== null && tokenCount > 0) {
+      // Approximate word count from tokens (~0.75 words/token)
+      const approxWords = Math.round(tokenCount * 0.75);
+      if (approxWords >= 1000) {
+        return `~${(approxWords / 1000).toFixed(1)}k words`;
+      }
+      return `~${approxWords} words`;
+    }
+    return '';
+  }
+
+  // ---------------------------------------------------------------------------
+  // Status dot helpers
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Map SourceStatus to a dot color class.
+   * indexed → green, error → destructive/red, queued/pending/parsing/embedding → amber (pulsing)
+   */
+  function statusDotClass(status: SourceStatus): string {
+    switch (status) {
+      case 'indexed':
+        return 'bg-green-primary';
+      case 'error':
+        return 'bg-destructive';
+      case 'parsing':
+      case 'embedding':
+      case 'queued':
+      case 'pending':
+        return 'bg-amber-500 animate-pulse';
+      default:
+        return 'bg-muted-foreground/40';
+    }
+  }
+
+  function statusDotLabel(status: SourceStatus): string {
     switch (status) {
       case 'indexed':
         return 'Indexed';
+      case 'error':
+        return 'Error';
       case 'parsing':
-        return 'Parsing…';
+        return 'Parsing';
       case 'embedding':
-        return 'Embedding…';
+        return 'Embedding';
       case 'queued':
         return 'Queued';
       case 'pending':
         return 'Pending';
-      case 'error':
-        return 'Error';
       default:
         return status;
     }
   }
-
-  // ---------------------------------------------------------------------------
-  // File picker
-  // ---------------------------------------------------------------------------
-
-  async function browseFile(): Promise<void> {
-    menuOpen = false;
-    if (!isTauri() || !activeNotebookId) return;
-    try {
-      const selected = await openDialog({
-        multiple: false,
-        filters: [{ name: 'Documents', extensions: ['md', 'txt'] }]
-      });
-      if (!selected) return;
-      const path = Array.isArray(selected) ? selected[0] : selected;
-      const name = path.split('/').pop() ?? path;
-      const source = await addFileSource(activeNotebookId, name, path);
-      await loadSources(activeNotebookId);
-      void ingest(source.id);
-    } catch (err) {
-      console.error('SourcesRail: browseFile failed', err);
-    }
-  }
-
-  // ---------------------------------------------------------------------------
-  // Paste-text dialog
-  // ---------------------------------------------------------------------------
-
-  function openPasteDialog(): void {
-    menuOpen = false;
-    pasteTitle = '';
-    pasteText = '';
-    pasteError = null;
-    pasteSubmitting = false;
-    pasteDialogOpen = true;
-  }
-
-  function closePasteDialog(): void {
-    pasteDialogOpen = false;
-  }
-
-  async function submitPaste(): Promise<void> {
-    if (!activeNotebookId) return;
-    if (!pasteTitle.trim()) {
-      pasteError = 'Please enter a title.';
-      return;
-    }
-    if (!pasteText.trim()) {
-      pasteError = 'Please paste some text.';
-      return;
-    }
-    pasteError = null;
-    pasteSubmitting = true;
-    try {
-      const source = await addTextSource(
-        activeNotebookId,
-        pasteTitle.trim(),
-        pasteText.trim(),
-        'text'
-      );
-      pasteDialogOpen = false;
-      await loadSources(activeNotebookId);
-      void ingest(source.id);
-    } catch (err) {
-      pasteError = 'Could not add source. Please try again.';
-      console.error('SourcesRail: submitPaste failed', err);
-    } finally {
-      pasteSubmitting = false;
-    }
-  }
 </script>
 
-<!-- Right aside header: drag region with "Sources" title + counter badge + Add button -->
-<div data-tauri-drag-region class="flex h-[var(--titlebar-h)] shrink-0 items-center gap-2 px-4">
-  <span class="flex-1 text-xs font-semibold tracking-wide text-foreground">Sources</span>
-  {#if sourceCount > 0}
-    <span
-      class="inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-muted px-1.5 text-[10px] font-semibold text-muted-foreground"
-    >
-      {sourceCount}
-    </span>
-  {/if}
+{#if collapsed}
+  <!-- ──────────────────────────────────────────────────────────────────────
+       COLLAPSED ICON STRIP — mirrors the left rail's minimized vibe (shot5).
+       Sources icon + count badge near the top; Studio/headphones icon near the
+       bottom. The top drag bar stays a drag region; every button is no-drag.
+  ────────────────────────────────────────────────────────────────────────── -->
+  <!-- Top drag bar — h-14 matches the left rail's traffic-lights spacer -->
+  <div data-tauri-drag-region class="flex h-14 shrink-0 items-center justify-center"></div>
 
-  <!-- Add source button + dropdown -->
-  <div class="relative">
-    <Button
-      variant="ghost"
-      class="h-[26px] w-[26px] rounded-md p-0 text-muted-foreground hover:bg-muted hover:text-foreground"
-      onclick={() => (menuOpen = !menuOpen)}
+  <div class="flex flex-1 flex-col items-center gap-1.5 px-1.5 pt-1.5">
+    <!-- Expand button — no-drag -->
+    <button
+      type="button"
+      data-right-rail-collapse-btn
+      aria-label="Expand sources"
+      title="Expand sources"
+      onclick={toggleCollapse}
+      class="flex size-8 items-center justify-center rounded-lg border-0 bg-transparent text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+      style="-webkit-app-region: no-drag;"
+    >
+      <PanelRight class="size-4" strokeWidth={2} />
+    </button>
+
+    <div class="my-1 h-px w-6 bg-border"></div>
+
+    <!-- Sources icon with count badge — no-drag -->
+    <button
+      type="button"
+      aria-label="Sources ({totalCount})"
+      title="Sources"
+      onclick={toggleCollapse}
+      class="relative flex size-8 items-center justify-center rounded-lg border-0 bg-primary/10 text-primary transition-colors hover:bg-primary/15"
+      style="-webkit-app-region: no-drag;"
+    >
+      <FileText class="size-4" strokeWidth={2} />
+      {#if totalCount > 0}
+        <span
+          class="absolute -top-0.5 -right-0.5 flex size-3.5 items-center justify-center rounded-full bg-primary text-[0.5rem] font-bold text-primary-foreground"
+          aria-hidden="true"
+        >
+          {totalCount > 9 ? '9+' : totalCount}
+        </span>
+      {/if}
+    </button>
+
+    <!-- Add source — no-drag -->
+    <button
+      type="button"
       aria-label="Add source"
-      aria-expanded={menuOpen}
+      title="Add source"
+      onclick={() => (modalOpen = true)}
+      class="flex size-8 items-center justify-center rounded-lg border-0 bg-transparent text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+      style="-webkit-app-region: no-drag;"
     >
-      <Plus class="size-[14px]" strokeWidth={2} />
-    </Button>
+      <Plus class="size-4" strokeWidth={2.5} />
+    </button>
 
-    {#if menuOpen}
-      <!-- Click-away backdrop -->
-      <button
-        class="fixed inset-0 z-10 cursor-default"
-        aria-hidden="true"
-        onclick={() => (menuOpen = false)}
-        tabindex="-1"
-        type="button"
-      ></button>
-      <!-- Dropdown menu -->
-      <div
-        class="absolute right-0 top-full z-20 mt-1 w-44 overflow-hidden rounded-lg border border-border bg-popover py-1 shadow-lg"
-        role="menu"
+    <div class="flex-1"></div>
+
+    <!-- Studio / headphones icon near the bottom — no-drag -->
+    <button
+      type="button"
+      aria-label="Studio"
+      title="Studio"
+      onclick={toggleCollapse}
+      class="mb-2 flex size-8 items-center justify-center rounded-lg border-0 bg-transparent text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+      style="-webkit-app-region: no-drag;"
+    >
+      <Headphones class="size-4" strokeWidth={2} />
+    </button>
+  </div>
+{:else}
+  <!-- ──────────────────────────────────────────────────────────────────────
+       EXPANDED LAYOUT — Sources (flex-1) on top, Studio (capped) on the bottom.
+  ────────────────────────────────────────────────────────────────────────── -->
+
+  <!-- Rail header — h-14 matches the left rail's traffic-lights spacer height (56px),
+       giving equal vertical breathing room top and bottom. data-tauri-drag-region on the
+       outer wrapper; all interactive children carry -webkit-app-region: no-drag. -->
+  <div data-tauri-drag-region class="flex h-14 shrink-0 items-center gap-2 px-3">
+    <!-- Collapse toggle (mirrors the left rail) — no-drag -->
+    <button
+      type="button"
+      data-right-rail-collapse-btn
+      aria-label="Collapse sources"
+      title="Collapse sources"
+      onclick={toggleCollapse}
+      class="flex size-[26px] shrink-0 items-center justify-center rounded-full bg-muted text-muted-foreground/70 transition-colors hover:opacity-60 hover:text-foreground"
+      style="-webkit-app-region: no-drag;"
+    >
+      <PanelRightClose class="size-3.5" strokeWidth={2} />
+    </button>
+
+    <!-- Panel header — deliberately one notch below the app brand ("Lens",
+         text-base) and the centered notebook title, so this reads as a panel
+         label, not a competing app/page title. -->
+    <span class="flex-1 text-sm font-semibold text-foreground">Sources</span>
+
+    <!-- selected/total counter -->
+    {#if totalCount > 0}
+      <span
+        class="inline-flex h-[18px] min-w-[30px] items-center justify-center rounded-full bg-muted px-1.5 text-xs font-semibold tabular-nums text-muted-foreground"
+        aria-label="{selectedCount} of {totalCount} sources selected"
+        style="-webkit-app-region: no-drag;"
       >
-        <button
-          class="flex w-full items-center gap-2.5 px-3 py-2 text-left text-[12px] font-medium text-popover-foreground hover:bg-muted"
-          onclick={browseFile}
-          type="button"
-          role="menuitem"
+        {selectedCount}/{totalCount}
+      </span>
+    {/if}
+
+    <!-- Add source button — no-drag -->
+    <button
+      class="flex size-[26px] shrink-0 items-center justify-center rounded-full bg-muted text-foreground transition-colors hover:opacity-80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      type="button"
+      aria-label="Add source"
+      onclick={() => (modalOpen = true)}
+      style="-webkit-app-region: no-drag;"
+    >
+      <Plus class="size-3.5" strokeWidth={2.5} />
+    </button>
+  </div>
+
+  <!-- Hairline divider -->
+  <div class="shrink-0 border-t border-border"></div>
+
+  <!-- Scrollable source list — flex-1, hidden scrollbar (no-scrollbar utility). -->
+  <div data-sources-scroll class="no-scrollbar flex min-h-0 flex-1 flex-col overflow-y-auto">
+    {#if sources.length === 0}
+      <!-- Empty state -->
+      <div class="flex flex-1 flex-col items-center justify-center gap-2 px-4 py-12">
+        <div
+          class="flex size-10 items-center justify-center rounded-xl bg-muted"
+          aria-hidden="true"
         >
-          <File class="size-[13px] shrink-0 text-muted-foreground" strokeWidth={1.75} />
-          Browse file…
-        </button>
+          <FileText class="size-4 text-muted-foreground/40" strokeWidth={1.5} />
+        </div>
+        <p class="mt-1 text-center text-[12px] font-semibold text-foreground">No sources yet</p>
+        <p class="text-center text-[11px] text-muted-foreground/60 leading-relaxed max-w-[180px]">
+          Add a file or paste text to ground this notebook.
+        </p>
         <button
-          class="flex w-full items-center gap-2.5 px-3 py-2 text-left text-[12px] font-medium text-popover-foreground hover:bg-muted"
-          onclick={openPasteDialog}
+          class="mt-2 flex items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-[12px] font-semibold text-primary-foreground transition-opacity hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           type="button"
-          role="menuitem"
+          aria-label="Add first source"
+          onclick={() => (modalOpen = true)}
         >
-          <Plus class="size-[13px] shrink-0 text-muted-foreground" strokeWidth={1.75} />
-          Paste text…
+          <Plus class="size-[11px]" strokeWidth={2.5} />
+          Add source
         </button>
       </div>
-    {/if}
-  </div>
-</div>
+    {:else}
+      <ul class="flex flex-col gap-px p-2" role="list" aria-label="Sources">
+        {#each sources as source (source.id)}
+          {@const badge = typeBadge(source.kind, source.locator, source.title)}
+          {@const meta = metaLine(source.token_count)}
+          {@const status = source.status as SourceStatus}
+          <li
+            class="group flex items-start gap-2.5 rounded-lg px-2.5 py-2.5 transition-colors duration-100 hover:bg-muted/50"
+          >
+            <!-- Accent checkbox — no-drag -->
+            <button
+              class={cn(
+                'mt-0.5 flex size-[16px] shrink-0 cursor-pointer items-center justify-center rounded-[4px] transition-all duration-[130ms] border',
+                source.selected === 1
+                  ? 'border-primary bg-primary'
+                  : 'border-border bg-transparent hover:border-primary/60'
+              )}
+              onclick={() => void toggleSelected(source.id)}
+              type="button"
+              aria-label={source.selected === 1
+                ? `Deselect source ${source.title}`
+                : `Select source ${source.title}`}
+              aria-pressed={source.selected === 1}
+            >
+              {#if source.selected === 1}
+                <Check class="size-[9px] text-primary-foreground" strokeWidth={3} />
+              {/if}
+            </button>
 
-<!-- Divider -->
-<div class="shrink-0 border-t border-border"></div>
-
-<!-- Scrollable source list -->
-<div class="flex flex-1 flex-col overflow-y-auto">
-  {#if sources.length === 0}
-    <!-- Empty state -->
-    <div class="flex flex-1 flex-col items-center justify-center gap-2 px-4 py-10">
-      <File class="size-8 text-muted-foreground/30" strokeWidth={1.25} />
-      <p class="text-center text-[12px] font-medium text-muted-foreground">No sources yet</p>
-      <p class="text-center text-[11px] text-muted-foreground/60">
-        Add a file or paste text to ground this notebook.
-      </p>
-    </div>
-  {:else}
-    <ul class="flex flex-col gap-px p-2">
-      {#each sources as source (source.id)}
-        <li
-          class="group flex items-center gap-2.5 rounded-lg px-2.5 py-2 hover:bg-muted/50 transition-colors duration-100"
-        >
-          <!-- File icon -->
-          <div class="flex size-7 shrink-0 items-center justify-center rounded-[6px] bg-muted">
-            <File class="size-3 text-muted-foreground" strokeWidth={1.75} />
-          </div>
-
-          <!-- Title + status -->
-          <div class="min-w-0 flex-1">
-            <div class="truncate text-[12px] font-medium text-foreground">
-              {source.title}
+            <!-- Document icon tile -->
+            <div
+              class="flex size-[28px] shrink-0 items-center justify-center rounded-[6px] bg-muted"
+              aria-hidden="true"
+            >
+              <File class="size-[13px] text-muted-foreground" strokeWidth={1.75} />
             </div>
-            <div class="mt-[2px]">
+
+            <!-- Content: title + badge + meta — type scale matches left rail notebook rows -->
+            <div class="min-w-0 flex-1">
+              <div class="truncate text-sm font-medium leading-tight text-foreground">
+                {source.title}
+              </div>
+              <div class="mt-0.5 flex items-center gap-1.5 flex-wrap">
+                <!-- Type badge -->
+                <span
+                  class="inline-flex items-center rounded-[4px] bg-muted px-[5px] py-px text-[0.6875rem] font-semibold uppercase tracking-wide text-muted-foreground"
+                >
+                  {badge}
+                </span>
+                <!-- Metadata line (word/page count) -->
+                {#if meta}
+                  <span class="text-xs text-muted-foreground/50">{meta}</span>
+                {/if}
+              </div>
+            </div>
+
+            <!-- Right-side affordance: status dot normally; trash on hover.
+                 The status dot fades out on hover; the trash button fades in.
+                 Both are zero-size on the layout axis — shrink-0 so they don't
+                 push the content column. -webkit-app-region: no-drag on the button
+                 prevents the titlebar drag region from swallowing the click. -->
+            <div class="relative mt-1 shrink-0 flex size-[16px] items-center justify-center">
+              <!-- Status dot — fades on group-hover -->
               <span
                 class={cn(
-                  'inline-flex items-center rounded-[4px] px-[6px] py-[1px] text-[10px] font-semibold',
-                  statusPillClass(source.status as SourceStatus)
+                  'absolute block size-[7px] rounded-full transition-opacity duration-150 group-hover:opacity-0',
+                  statusDotClass(status)
                 )}
+                title={statusDotLabel(status)}
+                aria-label="Status: {statusDotLabel(status)}"
+              ></span>
+
+              <!-- Delete button — invisible by default, appears on hover/focus -->
+              <button
+                type="button"
+                aria-label="Delete source"
+                data-delete-source-btn
+                onclick={(e) => {
+                  e.stopPropagation();
+                  void removeSource(source.id);
+                }}
+                class={cn(
+                  'absolute flex size-[22px] -translate-x-[3px] -translate-y-[3px] items-center justify-center rounded-[5px]',
+                  'opacity-0 transition-all duration-150',
+                  'bg-transparent text-muted-foreground/40',
+                  'hover:bg-destructive/15 hover:text-destructive',
+                  'focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+                  'group-hover:opacity-100'
+                )}
+                style="-webkit-app-region: no-drag;"
               >
-                {statusLabel(source.status as SourceStatus)}
-              </span>
+                <Trash class="size-3" strokeWidth={2} />
+              </button>
             </div>
-          </div>
-
-          <!-- Select / deselect toggle -->
-          <button
-            class={cn(
-              'flex size-[18px] shrink-0 cursor-pointer items-center justify-center rounded-[5px] transition-all duration-[130ms] border',
-              source.selected === 1
-                ? 'border-primary bg-primary'
-                : 'border-border bg-transparent hover:border-muted-foreground'
-            )}
-            onclick={() => void toggleSelected(source.id)}
-            type="button"
-            aria-label={source.selected === 1
-              ? `Deselect source ${source.title}`
-              : `Select source ${source.title}`}
-            aria-pressed={source.selected === 1}
-          >
-            {#if source.selected === 1}
-              <Check class="size-[11px] text-primary-foreground" strokeWidth={3} />
-            {/if}
-          </button>
-        </li>
-      {/each}
-    </ul>
-  {/if}
-</div>
-
-<!-- Paste-text dialog -->
-{#if pasteDialogOpen}
-  <!-- Modal backdrop -->
-  <div
-    class="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm"
-    role="dialog"
-    aria-modal="true"
-    aria-label="Add text source"
-  >
-    <div
-      class="w-full max-w-md rounded-xl border border-border bg-card p-6 shadow-2xl"
-      role="document"
-    >
-      <!-- Dialog header -->
-      <div class="mb-4 flex items-center justify-between">
-        <h2 class="text-[15px] font-semibold text-foreground">Paste text</h2>
-        <button
-          class="flex size-7 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
-          onclick={closePasteDialog}
-          type="button"
-          aria-label="Close"
-        >
-          <X class="size-[14px]" strokeWidth={2} />
-        </button>
-      </div>
-
-      <!-- Title input -->
-      <div class="mb-3">
-        <label
-          class="mb-1 block text-[11px] font-semibold uppercase tracking-wide text-muted-foreground"
-          for="paste-title"
-        >
-          Title
-        </label>
-        <input
-          id="paste-title"
-          class="w-full rounded-md border border-border bg-background px-3 py-2 text-[13px] text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:ring-2 focus:ring-ring"
-          type="text"
-          placeholder="My notes…"
-          bind:value={pasteTitle}
-          disabled={pasteSubmitting}
-        />
-      </div>
-
-      <!-- Text area -->
-      <div class="mb-4">
-        <label
-          class="mb-1 block text-[11px] font-semibold uppercase tracking-wide text-muted-foreground"
-          for="paste-text"
-        >
-          Content
-        </label>
-        <textarea
-          id="paste-text"
-          class="h-[160px] w-full resize-none rounded-md border border-border bg-background px-3 py-2 text-[13px] text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:ring-2 focus:ring-ring"
-          placeholder="Paste or type your text here…"
-          bind:value={pasteText}
-          disabled={pasteSubmitting}
-        ></textarea>
-      </div>
-
-      <!-- Error -->
-      {#if pasteError}
-        <p class="mb-3 text-[12px] text-destructive" role="alert">{pasteError}</p>
-      {/if}
-
-      <!-- Actions -->
-      <div class="flex justify-end gap-2">
-        <Button
-          variant="outline"
-          class="h-[36px] text-[13px]"
-          onclick={closePasteDialog}
-          disabled={pasteSubmitting}
-        >
-          Cancel
-        </Button>
-        <Button
-          class="h-[36px] text-[13px] font-semibold"
-          onclick={submitPaste}
-          disabled={pasteSubmitting || !pasteTitle.trim() || !pasteText.trim()}
-        >
-          {pasteSubmitting ? 'Adding…' : 'Add source'}
-        </Button>
-      </div>
-    </div>
+          </li>
+        {/each}
+      </ul>
+    {/if}
   </div>
+
+  <!-- Studio (bottom) — visual shell, own capped scroll. -->
+  <StudioPanel {selectedCount} {totalCount} />
 {/if}
+
+<!-- Add sources modal (tabbed) -->
+<AddSourcesModal open={modalOpen} onclose={() => (modalOpen = false)} />

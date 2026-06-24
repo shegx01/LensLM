@@ -73,6 +73,17 @@ pub async fn add_text_source(
         .await
 }
 
+/// Permanently deletes a source: drops its Lance vectors then removes the
+/// `sources` row. Errors if the source does not exist.
+#[tracing::instrument(skip(engine))]
+#[tauri::command]
+pub async fn delete_source(
+    source_id: String,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<(), LensError> {
+    engine.delete_source(&source_id).await
+}
+
 /// Toggles a source's `selected` flag (persisted across reloads).
 #[tracing::instrument(skip(engine))]
 #[tauri::command]

@@ -287,6 +287,24 @@ impl LensEngine {
             .await
     }
 
+    /// Permanently deletes a source: drops its Lance vectors first (Lance before
+    /// SQLite ordering), then removes the `sources` row. Errors if the source
+    /// does not exist.
+    #[tracing::instrument(skip(self))]
+    pub async fn delete_source(&self, source_id: &str) -> Result<(), LensError> {
+        let pool = self.pool().await;
+        let data_dir = self.data_dir().await;
+        let source = NotebookRepo::new(&pool)
+            .get_source(source_id)
+            .await?
+            .ok_or_else(|| LensError::Validation(format!("no source with id {source_id}")))?;
+        let store = crate::vector_store::LanceVectorStore::new(&data_dir, pool.clone());
+        store
+            .drop_source(&source.notebook_id, EMBED_MODEL_ID, EMBED_DIM, source_id)
+            .await?;
+        NotebookRepo::new(&pool).delete_source(source_id).await
+    }
+
     /// Toggles a source's `selected` flag (persisted). `true` = selected.
     #[tracing::instrument(skip(self))]
     pub async fn set_source_selected(&self, id: &str, selected: bool) -> Result<(), LensError> {

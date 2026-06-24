@@ -9,7 +9,7 @@
 // ERROR HANDLING: try/catch on every action; console.error on failure; transient
 // `error` field for future surfacing. Polished error UI is M9 scope.
 
-import { listSources, ingestSource, setSourceSelected } from './ipc.js';
+import { listSources, ingestSource, setSourceSelected, deleteSource } from './ipc.js';
 import type { Source, SourceStatus, StreamEvent, IngestProgress } from './types.js';
 import { notebookStore } from '$lib/notebooks/notebooks-state.svelte.js';
 
@@ -130,6 +130,33 @@ export async function toggleSelected(sourceId: string): Promise<void> {
     // Revert on failure
     sources = sources.map((s) => (s.id === sourceId ? { ...s, selected: current.selected } : s));
     console.error('toggleSelected: failed for source', sourceId, err);
+    error = String(err);
+  }
+}
+
+/**
+ * Permanently remove a source. Optimistic: the row is removed from local state
+ * immediately, then the IPC call is awaited. On failure the row is restored and
+ * `error` is set — same pattern as `toggleSelected`.
+ *
+ * NotebookLM-style inline delete: no confirm dialog required.
+ */
+export async function removeSource(sourceId: string): Promise<void> {
+  const snapshot = sources.find((s) => s.id === sourceId);
+  if (!snapshot) return;
+  // Optimistic remove
+  sources = sources.filter((s) => s.id !== sourceId);
+  try {
+    await deleteSource(sourceId);
+  } catch (err) {
+    // Revert on failure — re-insert at original position
+    const idx = sources.findIndex((s) => s.created_at < snapshot.created_at);
+    if (idx === -1) {
+      sources = [...sources, snapshot];
+    } else {
+      sources = [...sources.slice(0, idx), snapshot, ...sources.slice(idx)];
+    }
+    console.error('removeSource: failed for source', sourceId, err);
     error = String(err);
   }
 }
