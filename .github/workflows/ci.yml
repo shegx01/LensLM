@@ -31,6 +31,8 @@ jobs:
 
       # Tauri v2 needs the WebKitGTK stack to compile src-tauri (and thus the
       # workspace test build, which includes the bridge crate).
+      # `protobuf-compiler` (protoc) is required by `lance-encoding` (transitive
+      # via lancedb, M4) whose build script compiles .proto files with prost.
       - name: Install Tauri Linux system dependencies
         run: |
           sudo apt-get update
@@ -43,6 +45,7 @@ jobs:
             libssl-dev \
             patchelf \
             build-essential \
+            protobuf-compiler \
             curl wget file
 
       # The toolchain (1.94.1 + clippy + rustfmt) is pinned by rust-toolchain.toml;

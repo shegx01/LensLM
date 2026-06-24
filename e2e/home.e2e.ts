@@ -12,5 +12,7 @@ test('home page renders the app shell for a returning user', async ({ page }) =>
   // The app shell replaced the old Hello World scaffold: three structural regions.
   await expect(page.getByText('Your workspace')).toBeVisible();
   await expect(page.getByText('Notebooks', { exact: true })).toBeVisible();
-  await expect(page.getByText(/sources & studio/i)).toBeVisible();
+  // M4 replaced the static "Sources & Studio" placeholder with the SourcesRail,
+  // whose header is "Sources".
+  await expect(page.getByText('Sources', { exact: true })).toBeVisible();
 });
