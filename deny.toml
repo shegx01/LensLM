@@ -36,6 +36,11 @@ allow = [
   "CC0-1.0",
   "BSL-1.0",
   "CDLA-Permissive-2.0",
+  # NCSA (Univ. of Illinois/NCSA Open Source License) — OSI-approved, FSF
+  # Free/Libre, BSD/MIT-family permissive. Pulled transitively via
+  # `libfuzzer-sys` (a fuzzing harness, `(MIT OR Apache-2.0) AND NCSA`) in the
+  # M4 lancedb/datafusion/ort dependency tree. Commercial-safe.
+  "NCSA",
 ]
 confidence-threshold = 0.8
 # The workspace's own crates (lens-core, lenslm) are marked `publish = false` and

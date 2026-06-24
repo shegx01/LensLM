@@ -15,6 +15,22 @@ publish = false
 [lints]
 workspace = true
 
+# Retrieval-quality eval harness (M4 Phase 1, Group g). Ingests the fixture
+# corpus under `tests/fixtures/eval/` into a temp LanceDB, runs canned queries,
+# prints top-5 chunk ids + snippets, and computes recall@5 against a documented
+# baseline floor. Downloads the nomic model on first run (network required).
+[[bin]]
+name = "eval"
+path = "src/bin/eval.rs"
+
+[features]
+# Exposes test-only seams on the public API (e.g. `LensEngine::set_embedder_for_test`,
+# which pre-fills the embedder `OnceCell` with a caller-supplied `Arc<dyn Embedder>`
+# so integration tests can inject a `CountingEmbedder` and avoid the ~130 MB model
+# download). Enabled automatically for this crate's own test/bench builds via the
+# `dev-dependencies` self-edge below; never enabled in a production build.
+test-util = []
+
 [dependencies]
 serde = { workspace = true }
 thiserror = { workspace = true }
@@ -42,10 +58,44 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # version already resolved in the lock tree (transitive) so no new copy is added.
 sha2 = "=0.10.9"
 
+# --- M4 Source Grounding (Phase 1) ---
+# Local embeddings: nomic-embed-text-v1.5 (768d) via ONNX. fastembed transitively
+# pins `ort = =2.0.0-rc.12` (download-binaries default → onnxruntime bundled, no
+# system install). This is the FIRST `ort` in the workspace (Kokoro is download-only).
+fastembed = "5.17.2"
+# Embedded vector store. lancedb 0.30.0 pins Arrow 58 — every arrow crate below
+# MUST match that major or the binary hits an ABI break (verify: `cargo tree -d`).
+lancedb = "0.30.0"
+arrow-array = "58"
+arrow-schema = "58"
+# Layout-aware Markdown parsing → bounded blocks. 0.13.4 fixes a TightParagraph
+# panic that fires on arbitrary user Markdown.
+pulldown-cmark = "0.13.4"
+# HF tokenizer (the SAME impl fastembed uses internally) for 512/128 chunk sizing.
+tokenizers = "0.22"
+# async fn in the VectorStore trait.
+async-trait = "0.1"
+# Temp dir for the `eval` binary's throwaway LanceDB corpus. (Also a dev-dep for
+# the integration tests; declaring it here makes it available to the bin target.)
+tempfile = { workspace = true }
+
 [dev-dependencies]
+# Self-edge: enables the `test-util` feature for this crate's own test/bench
+# builds (unit + integration), so `LensEngine::set_embedder_for_test` is in scope
+# for `tests/ingest.rs` without ever turning the feature on for production builds.
+lens-core = { path = ".", features = ["test-util"] }
 rstest = { workspace = true }
 insta = { workspace = true }
 # Temp-dir DBs for integration tests that need real on-disk files / concurrency.
 tempfile = { workspace = true }
 # In-process HTTP mock server for the LLM/embedding runtime probe tests.
 wiremock = "0.6"
+# Direct LanceDB reads in the ingest integration tests (orphan-vector assertions
+# in the re-ingest/wipe test). Pinned to the same versions the lib already
+# resolves so no second copy is pulled into the lock tree.
+lancedb = "0.30.0"
+arrow-array = "58"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# Tokenizer download fallback for tokenizer-dependent tests when offline cache
+# is absent (same version the lib resolves).
+reqwest = { version = "=0.13.4", default-features = false, features = ["json", "rustls", "stream"] }

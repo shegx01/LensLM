@@ -278,7 +278,7 @@ where
     // (when one is configured). A mismatch means a corrupted or tampered
     // transfer — delete the `.part` and refuse to finalize.
     if let Some(expected) = expected_sha256 {
-        let actual = hex_encode(&hasher.finalize());
+        let actual = crate::hex_encode(&hasher.finalize());
         if !actual.eq_ignore_ascii_case(expected) {
             let _ = std::fs::remove_file(&tmp);
             return Err(LensError::Network(format!(
@@ -298,16 +298,6 @@ where
         done: true,
     });
     Ok(())
-}
-
-/// Lowercase-hex encoding of a byte slice (for SHA256 digest comparison).
-fn hex_encode(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(out, "{b:02x}");
-    }
-    out
 }
 
 #[cfg(test)]
@@ -456,7 +446,7 @@ mod tests {
     /// Helper: lowercase-hex SHA256 of `bytes`, matching the digest the download
     /// path computes over the streamed body.
     fn sha256_hex(bytes: &[u8]) -> String {
-        hex_encode(&Sha256::digest(bytes))
+        crate::hex_encode(&Sha256::digest(bytes))
     }
 
     /// Serves known bytes from a mock server; with a MATCHING expected hash the

@@ -63,7 +63,7 @@ async fn migration_is_idempotent_second_run_is_noop() {
         .unwrap();
 
     assert_eq!(count_before, count_after);
-    assert_eq!(count_after, 2, "both migration files applied");
+    assert_eq!(count_after, 3, "all migration files applied");
 }
 
 #[tokio::test]
@@ -93,7 +93,7 @@ async fn chunk_parent_child_hierarchy() {
     let now = chrono::Utc::now().to_rfc3339();
     sqlx::query(
         "INSERT INTO sources (id, notebook_id, kind, title, status, locator, created_at) \
-         VALUES (?, ?, 'text', 't', 'ready', 'loc', ?)",
+         VALUES (?, ?, 'text', 't', 'indexed', 'loc', ?)",
     )
     .bind(&source_id)
     .bind(&nb.id)
@@ -162,7 +162,7 @@ async fn enrichment_json_round_trips_and_text_is_unchanged() {
     let now = chrono::Utc::now().to_rfc3339();
     sqlx::query(
         "INSERT INTO sources (id, notebook_id, kind, title, status, locator, created_at) \
-         VALUES (?, ?, 'text', 't', 'ready', 'loc', ?)",
+         VALUES (?, ?, 'text', 't', 'indexed', 'loc', ?)",
     )
     .bind(&source_id)
     .bind(&nb.id)
@@ -215,7 +215,7 @@ async fn embedding_index_unique_constraint_rejects_duplicates() {
             sqlx::query(
                 "INSERT INTO embedding_index \
                  (id, notebook_id, model, dim, prefix_convention, lance_table_name, status, created_at) \
-                 VALUES (?, ?, 'bge-m3', 1024, 'query:', 'vec__nb__bge', 'ready', ?)",
+                 VALUES (?, ?, 'bge-m3', 1024, 'query:', 'vec__nb__bge', 'active', ?)",
             )
             .bind(id)
             .bind(nb_id)
@@ -252,7 +252,7 @@ async fn purging_notebook_cascades_to_children() {
     let source_id = Uuid::now_v7().to_string();
     sqlx::query(
         "INSERT INTO sources (id, notebook_id, kind, title, status, locator, created_at) \
-         VALUES (?, ?, 'text', 't', 'ready', 'loc', ?)",
+         VALUES (?, ?, 'text', 't', 'indexed', 'loc', ?)",
     )
     .bind(&source_id)
     .bind(&nb.id)
@@ -289,6 +289,93 @@ async fn purging_notebook_cascades_to_children() {
     assert_eq!(note_count, 0, "notes should cascade-delete");
 }
 
+/// Lists the LanceDB table names under `{data_dir}/lancedb`.
+async fn lance_table_names(data_dir: &std::path::Path) -> HashSet<String> {
+    let root = data_dir.join("lancedb");
+    let conn = lancedb::connect(root.to_string_lossy().as_ref())
+        .execute()
+        .await
+        .unwrap();
+    conn.table_names()
+        .execute()
+        .await
+        .unwrap()
+        .into_iter()
+        .collect()
+}
+
+/// AC (CRITICAL): `purge_notebook` drops the per-notebook Lance table so it is
+/// not orphaned on disk forever. Seeds a registered Lance table via the public
+/// vector-store API, purges the notebook, and asserts the table is gone.
+#[tokio::test]
+async fn purge_notebook_drops_lance_table() {
+    use lens_core::vector_store::{VectorRow, VectorStore};
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = LensEngine::init(dir.path()).await.unwrap();
+    let data_dir = dir.path();
+
+    let nb = engine
+        .create_notebook("purge-lance", None, None)
+        .await
+        .unwrap();
+
+    // Seed a real, registered Lance table for this notebook by adding a vector
+    // row through the public store API (this also inserts the embedding_index
+    // registry row, mirroring an ingest).
+    let pool = engine.pool().await;
+    let store = lens_core::LanceVectorStore::new(data_dir, pool.clone());
+    store
+        .add(
+            nb.id.as_str(),
+            lens_core::EMBED_MODEL_ID,
+            lens_core::EMBED_DIM,
+            vec![VectorRow {
+                chunk_id: Uuid::now_v7().to_string(),
+                source_id: Uuid::now_v7().to_string(),
+                notebook_id: nb.id.to_string(),
+                level: 0,
+                vector: vec![0.0; lens_core::EMBED_DIM],
+            }],
+        )
+        .await
+        .unwrap();
+
+    // The Lance table and its registry row now exist.
+    let before = lance_table_names(data_dir).await;
+    assert_eq!(
+        before.len(),
+        1,
+        "exactly one Lance table seeded: {before:?}"
+    );
+    let idx_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM embedding_index WHERE notebook_id = ?")
+            .bind(&nb.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(idx_count, 1, "embedding_index row registered");
+
+    // Purge requires a trashed notebook.
+    engine.trash_notebook(&nb.id).await.unwrap();
+    engine.purge_notebook(&nb.id).await.unwrap();
+
+    // The Lance table must be gone (no orphan on disk), and the registry row
+    // cascaded away with the notebook.
+    let after = lance_table_names(data_dir).await;
+    assert!(
+        after.is_empty(),
+        "Lance table must be dropped by purge_notebook, found: {after:?}"
+    );
+    let idx_after: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM embedding_index WHERE notebook_id = ?")
+            .bind(&nb.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(idx_after, 0, "embedding_index row cascaded away");
+}
+
 #[tokio::test]
 async fn cold_init_under_budget_on_empty_temp_db() {
     let dir = tempfile::tempdir().unwrap();
@@ -296,7 +383,7 @@ async fn cold_init_under_budget_on_empty_temp_db() {
     let engine = LensEngine::init(dir.path()).await.unwrap();
     let elapsed = start.elapsed();
     // Sanity: the engine works.
-    assert_eq!(engine.migration_count().await.unwrap(), 2);
+    assert_eq!(engine.migration_count().await.unwrap(), 3);
     // Generous smoke guard against accidentally-expensive migrations (e.g. a
     // future migration that scans/rewrites large tables on cold start). This is
     // NOT a tight perf benchmark — the wide 2s budget keeps it non-flaky on

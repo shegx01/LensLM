@@ -102,6 +102,7 @@ describe('resetNotebookStore', () => {
     await loadNotebooks();
     notebookStore.activeNotebookId = 'nb-001';
     notebookStore.sidebarCollapsed = true;
+    notebookStore.rightRailCollapsed = true;
     notebookStore.paletteOpen = true;
     notebookStore.trashOpen = true;
 
@@ -111,6 +112,7 @@ describe('resetNotebookStore', () => {
     expect(notebookStore.activeNotebookId).toBeNull();
     expect(notebookStore.trashOpen).toBe(false);
     expect(notebookStore.sidebarCollapsed).toBe(false);
+    expect(notebookStore.rightRailCollapsed).toBe(false);
     expect(notebookStore.paletteOpen).toBe(false);
     expect(notebookStore.paletteQuery).toBe('');
     expect(notebookStore.loading).toBe(false);
@@ -121,6 +123,16 @@ describe('resetNotebookStore', () => {
 // ---------------------------------------------------------------------------
 // loadNotebooks
 // ---------------------------------------------------------------------------
+
+describe('rightRailCollapsed', () => {
+  it('defaults to false and round-trips through the setter', () => {
+    expect(notebookStore.rightRailCollapsed).toBe(false);
+    notebookStore.rightRailCollapsed = true;
+    expect(notebookStore.rightRailCollapsed).toBe(true);
+    notebookStore.rightRailCollapsed = false;
+    expect(notebookStore.rightRailCollapsed).toBe(false);
+  });
+});
 
 describe('loadNotebooks', () => {
   it('populates notebooks from listNotebooks()', async () => {

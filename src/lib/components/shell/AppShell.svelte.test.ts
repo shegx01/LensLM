@@ -16,6 +16,14 @@ vi.mock('$lib/notebooks/ipc.js', () => ({
   purgeNotebook: vi.fn()
 }));
 
+vi.mock('$lib/sources/ipc.js', () => ({
+  listSources: vi.fn().mockResolvedValue([]),
+  addTextSource: vi.fn(),
+  addFileSource: vi.fn(),
+  ingestSource: vi.fn(),
+  setSourceSelected: vi.fn()
+}));
+
 vi.mock('@tauri-apps/api/core', () => ({
   isTauri: () => false,
   invoke: vi.fn()
@@ -39,8 +47,8 @@ describe('AppShell.svelte', () => {
     // Centre: empty state (no active notebook).
     expect(screen.getByText('Your workspace')).toBeInTheDocument();
     expect(screen.getByText(/select or create a notebook/i)).toBeInTheDocument();
-    // Right rail: M4 seam unchanged.
-    expect(screen.getByText(/sources & studio/i)).toBeInTheDocument();
+    // Right rail: SourcesRail now renders "Sources" heading.
+    expect(screen.getByText('Sources')).toBeInTheDocument();
   });
 
   it('uses semantic landmarks for the regions', () => {
@@ -87,5 +95,26 @@ describe('AppShell.svelte', () => {
     const grid = container.querySelector('div.grid') as HTMLElement;
     expect(grid.className).toContain('grid-cols-[256px_1fr_320px]');
     expect(screen.getByText('Notebooks')).toBeInTheDocument();
+  });
+
+  it('grid uses the 104px collapsed RIGHT column (matches left) when rightRailCollapsed is true', () => {
+    notebookStore.rightRailCollapsed = true;
+    const { container } = render(AppShell);
+    const grid = container.querySelector('div.grid') as HTMLElement;
+    expect(grid.className).toContain('grid-cols-[256px_1fr_104px]');
+  });
+
+  it('grid uses the 320px expanded RIGHT column by default', () => {
+    const { container } = render(AppShell);
+    const grid = container.querySelector('div.grid') as HTMLElement;
+    expect(grid.className).toContain('grid-cols-[256px_1fr_320px]');
+  });
+
+  it('both rails collapsed yields the symmetric 104px/104px grid', () => {
+    notebookStore.sidebarCollapsed = true;
+    notebookStore.rightRailCollapsed = true;
+    const { container } = render(AppShell);
+    const grid = container.querySelector('div.grid') as HTMLElement;
+    expect(grid.className).toContain('grid-cols-[104px_1fr_104px]');
   });
 });

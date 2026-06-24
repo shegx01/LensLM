@@ -1,0 +1,49 @@
+---
+source: lens-core/tests/ingest.rs
+assertion_line: 150
+expression: shape
+---
+[
+    (
+        0,
+        "",
+        "heading",
+        "A",
+    ),
+    (
+        1,
+        "A",
+        "paragraph",
+        "Content directly under A.",
+    ),
+    (
+        1,
+        "A",
+        "heading",
+        "B",
+    ),
+    (
+        2,
+        "A > B",
+        "paragraph",
+        "Content directly under B.",
+    ),
+    (
+        2,
+        "A > B",
+        "heading",
+        "C",
+    ),
+    (
+        3,
+        "A > B > C",
+        "paragraph",
+        "Content under C.",
+    ),
+    (
+        3,
+        "A > B > C",
+        "code",
+        "```rust\nfn main() {}\n```",
+    ),
+]

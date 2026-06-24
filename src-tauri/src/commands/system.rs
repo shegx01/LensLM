@@ -329,7 +329,7 @@ mod tests {
             ["pdf", "md", "docx", "txt"]
                 .iter()
                 .map(|s| s.to_string())
-                .collect()
+                .collect::<std::collections::HashSet<String>>()
         );
         // Extensions are lowercased even when the file used upper-case.
         assert!(docs.iter().any(|d| d.name == "b.MD" && d.ext == "md"));
@@ -356,7 +356,7 @@ mod tests {
         let status = health_check(engine).await.unwrap();
         assert!(status.db_ok);
         // Both migrations (0001_init, 0002_notebook_personalize) are recorded.
-        assert_eq!(status.migration_count, 2);
+        assert_eq!(status.migration_count, 3);
     }
 
     #[tokio::test]

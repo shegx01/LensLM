@@ -8,17 +8,24 @@
 //! defines no domain entities itself: [`LensEngine`] is a thin handle that
 //! exposes the pool via [`LensEngine::pool`] and delegates to the repos.
 
+pub mod chunk;
 pub mod config;
 pub(crate) mod db;
+pub mod embedder;
 pub mod embedding;
 pub mod error;
+pub mod ingest;
 pub mod notebooks;
+pub mod parse;
 pub mod system_check;
 pub mod tts;
+pub mod vector_store;
 
 pub use config::AppConfig;
+pub use embedder::{CountingEmbedder, EMBED_DIM, EMBED_MODEL_ID, Embedder, FastembedEmbedder};
 pub use embedding::{InstallProgress, pull_embedding_model};
 pub use error::LensError;
+pub use ingest::{IngestProgress, ingest_source, resolve_nomic_tokenizer};
 pub use notebooks::{Notebook, NotebookId, NotebookSummary, Source};
 pub use system_check::{
     ALLOWED_EMBEDDING_MODELS, CheckAction, CheckId, CheckResult, CheckStatus, LlmDetection,
@@ -28,6 +35,7 @@ pub use tts::{
     DownloadProgress, Gender, KOKORO_MODEL_FILENAME, KOKORO_MODEL_RELPATH, KOKORO_MODEL_URL,
     TtsVoice, download_kokoro_model, kokoro_model_path, list_tts_voices,
 };
+pub use vector_store::{LanceVectorStore, VectorStore};
 
 /// Re-exported so the integration-test crate can re-run the migrator against a
 /// pool obtained via [`LensEngine::pool`] without exposing the rest of the
@@ -38,9 +46,23 @@ use std::path::Path;
 use std::sync::Arc;
 
 use sqlx::SqlitePool;
-use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use tokenizers::Tokenizer;
+use tokio::sync::{OnceCell, RwLock, RwLockReadGuard, RwLockWriteGuard, Semaphore};
 
 use crate::notebooks::NotebookRepo;
+
+/// Lowercase-hex encoding of a byte slice.
+///
+/// Single source of truth for the `write!("{b:02x}")` digest-formatting loop
+/// shared by the ingest content-hash and the TTS integrity gate.
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
 
 /// Mutable engine resources live here: the database connection pool and the
 /// loaded application configuration.
@@ -60,9 +82,44 @@ pub struct LensEngineInner {
 /// Cloning shares the same underlying state (`Arc`). Mutations go through an
 /// async-aware `RwLock` so guards can be safely held across `.await` points —
 /// this is the interior mutability Tauri's immutable `State<T>` requires.
+///
+/// # Concurrency invariants (load-bearing)
+///
+/// * **Single ingest at a time.** Every ingest run holds the single-permit
+///   [`ingest_lock`](Self::ingest_lock) semaphore for its whole duration (the
+///   ONNX session is single-threaded; concurrent `embed()` must not overlap).
+/// * **Destructive deletes take `ingest_lock`.** [`purge_source`](Self::purge_source)
+///   and [`purge_notebook`](Self::purge_notebook) acquire the same permit across
+///   their cross-store (Lance-then-SQLite) deletes, so a destructive wipe can
+///   never interleave a live ingest of the same source/notebook and leave orphan
+///   Lance rows. [`trash_source`](Self::trash_source) /
+///   [`restore_source`](Self::restore_source) are flag-only (no cross-store
+///   mutation) and are intentionally lock-free.
+/// * **One app instance per data dir.** There is NO cross-process lock; correct
+///   operation assumes a single process owns a given `data_dir` at a time.
+/// * **Trashed-source vectors stay in Lance.** Trashing a source leaves its Lance
+///   vectors in place so it can be restored; retrieval MUST therefore exclude
+///   trashed sources at query time (an M5 obligation).
 #[derive(Clone)]
 pub struct LensEngine {
     inner: Arc<RwLock<LensEngineInner>>,
+    /// Lazily-constructed, shared embedding model (Decision D1 / M2).
+    ///
+    /// Lives OUTSIDE the `RwLock` so a model load never serializes DB reads.
+    /// Built exactly once via [`LensEngine::embedder`]'s `get_or_try_init`.
+    embedder: Arc<OnceCell<Arc<dyn Embedder>>>,
+    /// Lazily-resolved, shared nomic tokenizer (parallel to `embedder`).
+    ///
+    /// The nomic `tokenizer.json` is a multi-MB file; resolving it per-ingest
+    /// re-reads and re-parses it from disk every time. Cache it once here —
+    /// built exactly once via [`LensEngine::tokenizer`]'s `get_or_try_init`
+    /// using the shared [`resolve_nomic_tokenizer`] resolver — and reuse the
+    /// `Arc` across ingests. Lives OUTSIDE the `RwLock` for the same reason as
+    /// `embedder`: a resolve/download must never serialize DB reads.
+    tokenizer: Arc<OnceCell<Arc<Tokenizer>>>,
+    /// Single-permit gate serializing ingest runs (the ONNX session is
+    /// single-threaded; concurrent `embed()` calls must not overlap).
+    ingest_lock: Arc<Semaphore>,
 }
 
 impl LensEngine {
@@ -79,11 +136,25 @@ impl LensEngine {
             .map_err(|e| LensError::Io(format!("{}: {e}", data_dir.display())))?;
         let db = db::open_pool(data_dir).await?;
         db::run_migrations(&db).await?;
+        // Crash-recovery path: a process that died mid-ingest leaves a source
+        // stuck in a transient `parsing`/`embedding` status with no running task
+        // to advance it. Reset those to `error` once at startup so the UI can
+        // surface them as re-ingestable rather than spinning forever. Terminal
+        // states (`queued`/`indexed`/`error`/`pending`) are untouched.
+        sqlx::query("UPDATE sources SET status = ? WHERE status IN (?, ?)")
+            .bind(notebooks::source_status::ERROR)
+            .bind(notebooks::source_status::PARSING)
+            .bind(notebooks::source_status::EMBEDDING)
+            .execute(&db)
+            .await?;
         let mut config = AppConfig::load(data_dir)?;
         config.paths.data_dir = data_dir.display().to_string();
         tracing::info!("engine initialized");
         Ok(Self {
             inner: Arc::new(RwLock::new(LensEngineInner { db, config })),
+            embedder: Arc::new(OnceCell::new()),
+            tokenizer: Arc::new(OnceCell::new()),
+            ingest_lock: Arc::new(Semaphore::new(1)),
         })
     }
 
@@ -105,6 +176,9 @@ impl LensEngine {
                 db,
                 config: AppConfig::default(),
             })),
+            embedder: Arc::new(OnceCell::new()),
+            tokenizer: Arc::new(OnceCell::new()),
+            ingest_lock: Arc::new(Semaphore::new(1)),
         }
     }
 
@@ -225,6 +299,171 @@ impl LensEngine {
         NotebookRepo::new(&pool).list_sources(notebook_id).await
     }
 
+    /// Inserts a managed text/markdown source: writes `text` to a managed file
+    /// under `{data_dir}/sources/` and inserts a `queued` `sources` row.
+    /// `kind` must be `"text"` or `"markdown"`. Returns the inserted source.
+    #[tracing::instrument(skip(self, text))]
+    pub async fn add_text_source(
+        &self,
+        notebook_id: &NotebookId,
+        title: &str,
+        text: &str,
+        kind: &str,
+    ) -> Result<Source, LensError> {
+        let data_dir = self.data_dir().await;
+        let pool = self.pool().await;
+        NotebookRepo::new(&pool)
+            .add_text_source(&data_dir, notebook_id, title, text, kind)
+            .await
+    }
+
+    /// Soft-deletes a source: sets `trashed_at` to now. Keeps all chunks and
+    /// Lance vectors so the source can be restored. Errors if the source is
+    /// missing or already trashed.
+    #[tracing::instrument(skip(self))]
+    pub async fn trash_source(&self, source_id: &str) -> Result<(), LensError> {
+        let pool = self.pool().await;
+        NotebookRepo::new(&pool).trash_source(source_id).await
+    }
+
+    /// Restores a trashed source: clears `trashed_at`. Errors if the source is
+    /// live (not trashed) or does not exist.
+    #[tracing::instrument(skip(self))]
+    pub async fn restore_source(&self, source_id: &str) -> Result<(), LensError> {
+        let pool = self.pool().await;
+        NotebookRepo::new(&pool).restore_source(source_id).await
+    }
+
+    /// Permanently deletes a source: drops its Lance vectors first (Lance before
+    /// SQLite ordering), then removes the `sources` row. Child `chunks` rows
+    /// cascade. Errors if the source does not exist or is not trashed.
+    ///
+    /// Holds the `ingest_lock` permit across the whole cross-store delete so a
+    /// destructive wipe cannot interleave a live ingest of the same source (which
+    /// would otherwise re-insert vectors after the drop, leaving orphans). See
+    /// the module-level concurrency invariants on [`LensEngine`].
+    #[tracing::instrument(skip(self))]
+    pub async fn purge_source(&self, source_id: &str) -> Result<(), LensError> {
+        let _permit = self
+            .ingest_lock()
+            .acquire()
+            .await
+            .map_err(|e| LensError::Internal(format!("ingest semaphore closed: {e}")))?;
+        let pool = self.pool().await;
+        let data_dir = self.data_dir().await;
+        let source = NotebookRepo::new(&pool)
+            .get_source(source_id)
+            .await?
+            .ok_or_else(|| LensError::Validation(format!("no source with id {source_id}")))?;
+        let store = crate::vector_store::LanceVectorStore::new(&data_dir, pool.clone());
+        store
+            .drop_source(&source.notebook_id, EMBED_MODEL_ID, EMBED_DIM, source_id)
+            .await?;
+        NotebookRepo::new(&pool).purge_source(source_id).await?;
+        // Best-effort: remove the managed source file so "Delete forever" does
+        // not leak it on disk. A missing file (already gone) is not an error.
+        remove_managed_source_file(&source.locator);
+        Ok(())
+    }
+
+    /// Toggles a source's `selected` flag (persisted). `true` = selected.
+    #[tracing::instrument(skip(self))]
+    pub async fn set_source_selected(&self, id: &str, selected: bool) -> Result<(), LensError> {
+        let pool = self.pool().await;
+        NotebookRepo::new(&pool)
+            .set_source_selected(id, selected)
+            .await
+    }
+
+    /// Ingests a queued source end-to-end (parse → chunk → embed → index),
+    /// streaming progress through `on_progress`.
+    #[tracing::instrument(skip(self, on_progress))]
+    pub async fn ingest_source(
+        &self,
+        source_id: &str,
+        on_progress: impl FnMut(crate::ingest::IngestProgress),
+    ) -> Result<(), LensError> {
+        crate::ingest::ingest_source(self, source_id, on_progress).await
+    }
+
+    /// Returns the resolved data directory from the loaded config.
+    pub(crate) async fn data_dir(&self) -> std::path::PathBuf {
+        std::path::PathBuf::from(self.read().await.config.paths.data_dir.clone())
+    }
+
+    /// Test-only accessor for the resolved data directory (the `pub(crate)`
+    /// [`data_dir`](Self::data_dir) is not reachable from the integration-test
+    /// crate). Gated behind `test-util` so it is absent from production builds.
+    #[cfg(feature = "test-util")]
+    pub async fn data_dir_for_test(&self) -> std::path::PathBuf {
+        self.data_dir().await
+    }
+
+    /// Borrows the single-permit ingest semaphore (Decision D1 / M2).
+    pub(crate) fn ingest_lock(&self) -> &Arc<Semaphore> {
+        &self.ingest_lock
+    }
+
+    /// Test-only seam: pre-fills the embedder `OnceCell` with a caller-supplied
+    /// [`Embedder`] so integration tests can inject a `CountingEmbedder` (and so
+    /// avoid the ~130 MB `FastembedEmbedder` model download).
+    ///
+    /// Gated behind the `test-util` feature so it is NEVER present in a
+    /// production build. Returns `Err` if the embedder was already initialized
+    /// (e.g. a prior `ingest_source` already lazily constructed the real model).
+    ///
+    /// The injected embedder is shared exactly like the lazily-constructed one,
+    /// so the cached-once AC (`load_count == 1` across two ingests) and the
+    /// concurrency AC (`in_flight` never exceeds `1`) are both observable through
+    /// the same `Arc` the pipeline reuses.
+    #[cfg(feature = "test-util")]
+    pub fn set_embedder_for_test(&self, embedder: Arc<dyn Embedder>) -> Result<(), LensError> {
+        self.embedder
+            .set(embedder)
+            .map_err(|_| LensError::Internal("embedder already initialized".into()))
+    }
+
+    /// Lazily constructs (once) and returns the shared embedding model.
+    ///
+    /// The first caller builds a [`FastembedEmbedder`] over `{data_dir}/models/
+    /// fastembed/` (a ~130 MB ONNX session, with a one-time HuggingFace download
+    /// on a cold cache); subsequent callers reuse the cached `Arc`. The
+    /// construction runs under [`tokio::task::spawn_blocking`] because fastembed
+    /// init is synchronous and CPU/IO-heavy.
+    pub(crate) async fn embedder(&self) -> Result<Arc<dyn Embedder>, LensError> {
+        self.embedder
+            .get_or_try_init(|| async {
+                let data_dir = self.data_dir().await;
+                let embedder =
+                    tokio::task::spawn_blocking(move || FastembedEmbedder::new(&data_dir))
+                        .await
+                        .map_err(|e| {
+                            LensError::Model(format!("embedder init task panicked: {e}"))
+                        })??;
+                Ok::<Arc<dyn Embedder>, LensError>(Arc::new(embedder))
+            })
+            .await
+            .cloned()
+    }
+
+    /// Lazily resolves (once) and returns the shared nomic tokenizer.
+    ///
+    /// The first caller resolves the nomic `tokenizer.json` via the shared
+    /// [`resolve_nomic_tokenizer`] resolver (locating a cached copy or
+    /// downloading it once); subsequent callers reuse the cached `Arc`. This
+    /// mirrors [`LensEngine::embedder`] so the multi-MB tokenizer is parsed
+    /// from disk exactly once per engine rather than on every ingest.
+    pub(crate) async fn tokenizer(&self) -> Result<Arc<Tokenizer>, LensError> {
+        self.tokenizer
+            .get_or_try_init(|| async {
+                let data_dir = self.data_dir().await;
+                let tokenizer = resolve_nomic_tokenizer(&data_dir).await?;
+                Ok::<Arc<Tokenizer>, LensError>(Arc::new(tokenizer))
+            })
+            .await
+            .cloned()
+    }
+
     /// Renames a notebook, bumping `updated_at`.
     #[tracing::instrument(skip_all)]
     pub async fn rename_notebook(&self, id: &NotebookId, title: &str) -> Result<(), LensError> {
@@ -258,9 +497,59 @@ impl LensEngine {
 
     /// Permanently deletes a notebook. Child rows cascade via `ON DELETE CASCADE`.
     /// This is the sole hard-delete path (used by "Delete forever").
+    ///
+    /// Drops the notebook's per-notebook Lance tables FIRST (Lance before SQLite,
+    /// mirroring [`purge_source`](Self::purge_source)): the SQLite delete cascades
+    /// the `embedding_index` rows away, so unless the Lance tables are dropped
+    /// beforehand they would be orphaned on disk forever (no registry row left to
+    /// find them by). A crash between the Lance drop and the SQLite commit is
+    /// benign — a re-purge re-drops the (already-gone) tables idempotently.
+    ///
+    /// Holds the `ingest_lock` permit across the whole cross-store delete so a
+    /// destructive wipe cannot interleave a live ingest into the same notebook.
+    /// See the module-level concurrency invariants on [`LensEngine`].
     #[tracing::instrument(skip_all)]
     pub async fn purge_notebook(&self, id: &NotebookId) -> Result<(), LensError> {
+        let _permit = self
+            .ingest_lock()
+            .acquire()
+            .await
+            .map_err(|e| LensError::Internal(format!("ingest semaphore closed: {e}")))?;
         let pool = self.pool().await;
-        NotebookRepo::new(&pool).purge(id).await
+        let data_dir = self.data_dir().await;
+        // Capture every source locator (live AND trashed) BEFORE the cascade
+        // deletes the `sources` rows, so the managed source files can be removed
+        // afterwards rather than leaked on disk forever.
+        let locators: Vec<String> =
+            sqlx::query_scalar("SELECT locator FROM sources WHERE notebook_id = ?")
+                .bind(id.as_str())
+                .fetch_all(&pool)
+                .await?;
+        // Lance-first: drop the per-notebook tables BEFORE the SQLite delete
+        // cascades the `embedding_index` rows that name them.
+        let store = crate::vector_store::LanceVectorStore::new(&data_dir, pool.clone());
+        store.drop_notebook_tables(id.as_str()).await?;
+        NotebookRepo::new(&pool).purge(id).await?;
+        // Best-effort: remove the managed source files. A missing file (e.g. an
+        // M1 `file` record whose locator points outside the managed dir, or an
+        // already-deleted file) is ignored — purge must not fail on it.
+        for locator in &locators {
+            remove_managed_source_file(locator);
+        }
+        Ok(())
+    }
+}
+
+/// Best-effort removal of a managed source file, ignoring a missing file.
+///
+/// Used by the purge paths to reclaim `{data_dir}/sources/{id}.{ext}` files
+/// written by `add_text_source`. A `NotFound` is silently ignored (the file may
+/// already be gone, or the locator may point at an external file an M1 `file`
+/// record references); any other error is logged but never fails the purge.
+fn remove_managed_source_file(locator: &str) {
+    match std::fs::remove_file(locator) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!(locator, "failed to remove managed source file: {e}"),
     }
 }

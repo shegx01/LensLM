@@ -8,18 +8,15 @@
 
 use lens_core::LensError;
 use serde::{Deserialize, Serialize};
-#[cfg(debug_assertions)]
 use tauri::ipc::Channel;
 
 /// One event in a stream. `T` is the per-chunk payload type (e.g. `String` for
 /// LLM tokens). Serializes as `{"type": <snake_case variant>, "data": <payload>}`
 /// for data-carrying variants, and `{"type": <variant>}` for unit variants.
 ///
-/// This is foundational streaming scaffolding. In release builds its only M0
-/// consumer (`stream_demo`) is gated out, so the type is unused until the first
-/// real streaming command lands in M1 — hence the release-only `dead_code`
-/// exemption (it is exercised by tests and the dev-only demo in debug builds).
-#[cfg_attr(not(debug_assertions), allow(dead_code))]
+/// This is foundational streaming scaffolding. As of M4 it is release-surface:
+/// the `ingest_source` command streams `StreamEvent<IngestProgress>` in both
+/// debug and release builds, so the type is no longer dead code in release.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum StreamEvent<T> {
@@ -44,9 +41,8 @@ pub enum StreamEvent<T> {
 /// [`LensError::Internal`] so callers can use `?`. Centralizes the otherwise
 /// repeated `.map_err(|e| LensError::Internal(e.to_string()))` boilerplate.
 ///
-/// Gated to `debug_assertions` alongside its only current caller (`stream_demo`);
-/// the gate lifts as soon as a release-surface streaming command lands.
-#[cfg(debug_assertions)]
+/// Release-surface as of M4: called by `ingest_source` (and the dev-only
+/// `stream_demo`).
 pub fn send_event<T: Serialize + Clone>(
     channel: &Channel<StreamEvent<T>>,
     event: StreamEvent<T>,

@@ -32,15 +32,3 @@ export interface NotebookSummary {
   trashed_at: string | null;
   source_count: number;
 }
-
-// SYNC-CHECK: must match lens-core/src/notebooks.rs Source struct (around line 82)
-export interface Source {
-  id: string;
-  notebook_id: string;
-  kind: string;
-  title: string;
-  status: string;
-  locator: string;
-  selected: number;
-  created_at: string;
-}
