@@ -359,7 +359,11 @@ impl LensEngine {
         store
             .drop_source(&source.notebook_id, EMBED_MODEL_ID, EMBED_DIM, source_id)
             .await?;
-        NotebookRepo::new(&pool).purge_source(source_id).await
+        NotebookRepo::new(&pool).purge_source(source_id).await?;
+        // Best-effort: remove the managed source file so "Delete forever" does
+        // not leak it on disk. A missing file (already gone) is not an error.
+        remove_managed_source_file(&source.locator);
+        Ok(())
     }
 
     /// Toggles a source's `selected` flag (persisted). `true` = selected.
@@ -513,10 +517,39 @@ impl LensEngine {
             .map_err(|e| LensError::Internal(format!("ingest semaphore closed: {e}")))?;
         let pool = self.pool().await;
         let data_dir = self.data_dir().await;
+        // Capture every source locator (live AND trashed) BEFORE the cascade
+        // deletes the `sources` rows, so the managed source files can be removed
+        // afterwards rather than leaked on disk forever.
+        let locators: Vec<String> =
+            sqlx::query_scalar("SELECT locator FROM sources WHERE notebook_id = ?")
+                .bind(id.as_str())
+                .fetch_all(&pool)
+                .await?;
         // Lance-first: drop the per-notebook tables BEFORE the SQLite delete
         // cascades the `embedding_index` rows that name them.
         let store = crate::vector_store::LanceVectorStore::new(&data_dir, pool.clone());
         store.drop_notebook_tables(id.as_str()).await?;
-        NotebookRepo::new(&pool).purge(id).await
+        NotebookRepo::new(&pool).purge(id).await?;
+        // Best-effort: remove the managed source files. A missing file (e.g. an
+        // M1 `file` record whose locator points outside the managed dir, or an
+        // already-deleted file) is ignored — purge must not fail on it.
+        for locator in &locators {
+            remove_managed_source_file(locator);
+        }
+        Ok(())
+    }
+}
+
+/// Best-effort removal of a managed source file, ignoring a missing file.
+///
+/// Used by the purge paths to reclaim `{data_dir}/sources/{id}.{ext}` files
+/// written by `add_text_source`. A `NotFound` is silently ignored (the file may
+/// already be gone, or the locator may point at an external file an M1 `file`
+/// record references); any other error is logged but never fails the purge.
+fn remove_managed_source_file(locator: &str) {
+    match std::fs::remove_file(locator) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!(locator, "failed to remove managed source file: {e}"),
     }
 }

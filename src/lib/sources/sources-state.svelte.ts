@@ -69,6 +69,22 @@ export const sourcesStore = {
   }
 };
 
+/**
+ * Cancel all pending trash auto-clear timers and drain the queue.
+ *
+ * Call from a component's `onDestroy` (or equivalent) so orphan timers cannot
+ * fire after the component unmounts and mutate state that belongs to a
+ * different notebook session. Without this, a 6 s timer armed just before
+ * navigation fires after the rail unmounts and silently clears a trashQueue
+ * entry for a different notebook's session.
+ */
+export function disposeTrashTimers(): void {
+  for (const entry of trashQueue) {
+    clearTimeout(entry.timeoutId);
+  }
+  trashQueue = [];
+}
+
 // ---------------------------------------------------------------------------
 // Actions (exported top-level functions)
 // ---------------------------------------------------------------------------
@@ -97,7 +113,10 @@ export async function loadSources(notebookId: string): Promise<void> {
  */
 export function addSourceLocal(source: Source): void {
   if (sources.some((s) => s.id === source.id)) return;
-  sources = [...sources, source];
+  // Prepend so the optimistic row appears at the top, matching backend newest-first ordering
+  // (ORDER BY created_at DESC). Without this the row appears at the bottom and then jumps
+  // to the top when loadSources reconciles — a visible flicker on the row the user just created.
+  sources = [source, ...sources];
 }
 
 /**
@@ -294,7 +313,11 @@ export function resetSourcesStore(): void {
 // When `activeNotebookId` changes, reload sources for the new notebook.
 // Uses Svelte 5 `$effect.root` so this runs outside a component lifecycle.
 
-$effect.root(() => {
+/**
+ * Dispose function returned by `$effect.root`. Exposed so tests (and future
+ * teardown paths) can stop the auto-refresh effect cleanly.
+ */
+export const disposeAutoRefresh: () => void = $effect.root(() => {
   $effect(() => {
     const id = notebookStore.activeNotebookId;
     if (id) {

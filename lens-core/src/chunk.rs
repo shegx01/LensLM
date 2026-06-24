@@ -143,6 +143,14 @@ pub struct Chunk {
     pub text: String,
     /// Cumulative token index of the first token in this chunk across the whole
     /// source.  Used by the retrieval layer to reconstruct reading order.
+    ///
+    /// Token offsets **tile** their container: parents partition the whole
+    /// source, and a parent's children partition that parent's token range
+    /// (`children[0].token_start == parent.token_start` and
+    /// `children[last].token_end == parent.token_end`). Overlapping children
+    /// share source *bytes* but are assigned non-overlapping token tiles, so
+    /// these offsets stay contiguous and never overshoot the parent (see
+    /// [`retile_child_token_offsets`]).
     pub token_start: i64,
     /// Cumulative token index one-past the last token in this chunk.
     pub token_end: i64,
@@ -274,7 +282,7 @@ fn chunk_blocks_inner(
 
         // Build children by splitting the parent text at block boundaries or
         // at a hard character split if a single block exceeds the child target.
-        let children = build_child_chunks(
+        let mut children = build_child_chunks(
             src,
             win,
             tokenizer,
@@ -282,6 +290,21 @@ fn chunk_blocks_inner(
             parent_token_start,
             &strategy,
             &mut child_ordinal,
+        )?;
+
+        // Retile child token offsets so children TILE the parent token range:
+        // children may overlap (sharing source bytes), which would inflate the
+        // cumulative `token_end` past the parent end (B4). We recompute each
+        // child's `token_start`/`token_end` from its NON-OVERLAPPING tile measured
+        // as prefix token counts of the parent text, so the last child's
+        // `token_end` lands exactly on `parent_token_end`.
+        retile_child_token_offsets(
+            src,
+            win,
+            tokenizer,
+            parent_token_start,
+            parent_token_end,
+            &mut children,
         )?;
 
         // Emit the parent chunk.
@@ -616,8 +639,10 @@ fn build_child_chunks(
         let block_tokens = token_count(tokenizer, &block.text)?;
 
         // Oversized single block: flush the current child window first, then
-        // split the block at whitespace boundaries.  Overlap does not span an
-        // oversized hard-split (the split already packs tightly to the limit).
+        // hard-split the block at whitespace boundaries.  The hard-split path
+        // applies the same `CHILD_OVERLAP_TOKENS` overlap as the packing path,
+        // so adjacent hard-split children also share boundary bytes (this is
+        // the most common long-prose case — a single oversized paragraph).
         if block_tokens > limit {
             running_token_offset = flush_child_window(
                 &ctx,
@@ -629,6 +654,7 @@ fn build_child_chunks(
             pending_overlap_start = None;
             split_oversized_child_block(
                 &ctx,
+                win,
                 block,
                 limit,
                 &mut children,
@@ -711,6 +737,69 @@ fn build_child_chunks(
     )?;
 
     Ok(children)
+}
+
+/// Recomputes the `token_start`/`token_end` of each child so the children TILE
+/// the parent's token range: the last child's `token_end` equals
+/// `parent_token_end` and the first child's `token_start` equals
+/// `parent_token_start` (B4).
+///
+/// Children may share source bytes via [`CHILD_OVERLAP_TOKENS`]. Summing each
+/// child's full (overlapping) token count would push the cumulative offset past
+/// the parent end. Instead we assign token positions from the child's
+/// NON-OVERLAPPING tile, measured as a prefix token count of the parent text:
+///
+/// * `tile_start(0)   = parent.char_start`
+/// * `tile_start(i>0) = children[i-1].char_end`  (where the previous tile ended)
+/// * `token_start(i)  = parent_token_start + tokens(src[parent.char_start..tile_start(i)])`
+/// * `token_end(i)    = parent_token_start + tokens(src[parent.char_start..children[i].char_end])`
+///
+/// Because the tiles partition the parent byte span and the last child ends at
+/// `parent.char_end`, the prefix counts tile the parent token range exactly. The
+/// stored `char_start`/`char_end` (and `text`) are left untouched, so overlap and
+/// byte-identity are preserved — only the reading-order token offsets change.
+fn retile_child_token_offsets(
+    src: &str,
+    win: &ParentWindow,
+    tokenizer: &Tokenizer,
+    parent_token_start: i64,
+    parent_token_end: i64,
+    children: &mut [Chunk],
+) -> Result<(), LensError> {
+    let Some((last, head)) = children.split_last_mut() else {
+        return Ok(());
+    };
+
+    let parent_char_start = win.char_start;
+    // Prefix token count of the parent text from its start up to `boundary`.
+    // An empty prefix is 0 tokens (a bare `encode("", true)` would otherwise
+    // return the 2 CLS/SEP special tokens and offset every child by 2).
+    let prefix_tokens = |boundary: usize| -> Result<i64, LensError> {
+        let end = boundary.min(src.len());
+        if end <= parent_char_start {
+            return Ok(0);
+        }
+        Ok(token_count(tokenizer, &src[parent_char_start..end])? as i64)
+    };
+
+    // `tile_start` walks forward through the non-overlapping tile boundaries.
+    let mut tile_start = parent_char_start;
+    for child in head.iter_mut() {
+        let child_end = (child.char_end as usize).min(src.len());
+        child.token_start = parent_token_start + prefix_tokens(tile_start)?;
+        child.token_end = parent_token_start + prefix_tokens(child_end)?;
+        // The next tile begins where this child's bytes end (its non-overlapping
+        // contribution ends here; the next child's overlap re-shares earlier
+        // bytes but contributes no new tile tokens before this point).
+        tile_start = child_end.max(tile_start);
+    }
+
+    // The last child closes the parent exactly: its token_end snaps to the
+    // parent end so the children tile with no overshoot or gap.
+    last.token_start = parent_token_start + prefix_tokens(tile_start)?;
+    last.token_end = parent_token_end;
+
+    Ok(())
 }
 
 /// Finalises the open child window in `acc` (if any), appends the resulting
@@ -846,51 +935,106 @@ fn seed_overlap_tokens(
     token_count(tokenizer, &src[overlap_start..end])
 }
 
-/// Splits a single oversized child block into bounded child [`Chunk`]s via the
-/// shared [`split_oversized`] helper at the child limit.
+/// Splits a single oversized child block into bounded child [`Chunk`]s, applying
+/// the same [`CHILD_OVERLAP_TOKENS`] overlap as the multi-block packing path so
+/// adjacent hard-split children share boundary bytes.
 ///
-/// Byte-identity is preserved: absolute `char_start/char_end` are anchored to
-/// `block.char_start + seg_start_byte` so `src[char_start..char_end] == chunk.text`
-/// holds for every emitted sub-chunk.  Oversized hard-splits are *not* overlapped
-/// (they already pack tightly to the limit).
+/// This is the most common long-prose case — a single oversized paragraph — so
+/// the overlap must engage here, not only when children pack from multiple
+/// blocks.  Each child after the first re-starts ~`CHILD_OVERLAP_TOKENS` tokens
+/// back into the previous child's tail (computed by the shared
+/// [`overlap_back_off`] machinery), while the contiguous *consumed frontier*
+/// still advances by a full window each step.
+///
+/// Invariants preserved:
+/// * **Byte-identity** — absolute `char_start/char_end` slice `src` verbatim, so
+///   `src[char_start..char_end] == chunk.text` for every emitted sub-chunk.
+///   Overlap means adjacent CHAR spans share bytes (that is the point), but each
+///   child's `text` is still one contiguous source slice.
+/// * **Token bound** — each child still packs ≤ `limit` (= `CHILD_TOKEN_TARGET +
+///   CHILD_TOKEN_TOLERANCE`) tokens: the overlap window is re-split by
+///   [`find_split`] under the same `limit`.
+/// * **Termination** — the contiguous frontier (`consumed_end`) strictly advances
+///   by ≥ 1 byte each iteration regardless of overlap; overlap only moves a
+///   window's *start* earlier, never the frontier.  If a candidate overlap start
+///   is not strictly before `consumed_end` it is dropped (no-overlap fallback),
+///   so a window can never start at/after the previous frontier and stall.
 fn split_oversized_child_block(
     ctx: &ChildCtx<'_>,
+    win: &ParentWindow,
     block: &Block,
     limit: usize,
     children: &mut Vec<Chunk>,
     running_token_offset: &mut i64,
     child_ordinal: &mut usize,
 ) -> Result<(), LensError> {
-    split_oversized(
-        ctx.src,
-        block,
-        limit,
-        ctx.tokenizer,
-        |seg_text, abs_start, abs_end| {
-            let seg_tokens = token_count(ctx.tokenizer, seg_text)? as i64;
-            let t_start = *running_token_offset;
-            let t_end = t_start + seg_tokens;
-            let id = ctx
-                .strategy
-                .make_id(1, &block.section_path, seg_text, *child_ordinal);
-            *child_ordinal += 1;
-            children.push(Chunk {
-                id,
-                parent_id: Some(ctx.parent_id.to_string()),
-                kind: kind::CHILD.to_string(),
-                level: 1,
-                section_path: block.section_path.clone(),
-                text: seg_text.to_string(),
-                token_start: t_start,
-                token_end: t_end,
-                char_start: abs_start as i64,
-                char_end: abs_end as i64,
-                block_type: Some(block.block_type.clone()),
-            });
-            *running_token_offset = t_end;
-            Ok(())
-        },
-    )
+    let src = ctx.src;
+    let limit = limit.max(1);
+    let block_text = &block.text;
+    // `consumed_end` is the *contiguous* frontier in absolute source bytes: the
+    // point past which no source byte has yet been covered.  It only ever moves
+    // forward, which is what guarantees termination.  `win_start` is where the
+    // next window begins; it may be pulled back before `consumed_end` to create
+    // overlap, but never before the previous window's start.
+    let mut consumed_end = block.char_start; // absolute byte offset in `src`
+    let block_end = (block.char_start + block_text.len()).min(src.len());
+
+    while consumed_end < block_end {
+        // Choose the window start: overlap back into the previous child's tail
+        // when possible, otherwise start at the contiguous frontier.
+        let win_start = match overlap_back_off(src, win, children.last(), ctx.tokenizer)? {
+            // The overlap start must lie strictly before the frontier so the new
+            // window covers fresh bytes (terminating); otherwise fall back to no
+            // overlap.  It is already `>= prev.char_start` and `< win.char_end`.
+            Some(ov) if ov < consumed_end => ov,
+            _ => consumed_end,
+        };
+
+        // Split the remaining window text under the child token limit.  The
+        // window text begins at `win_start` (the overlap seed) but the contiguous
+        // frontier advances by the part of this window that lies at/after
+        // `consumed_end`.
+        let remaining = &src[win_start..block_end];
+        let seg_len = find_split(remaining, ctx.tokenizer, limit)?;
+        let mut abs_end = (win_start + seg_len).min(block_end);
+
+        // Guarantee the frontier advances: this window must extend strictly past
+        // `consumed_end`.  Because `win_start <= consumed_end` and `find_split`
+        // returns ≥ 1, `abs_end` could in a pathological case (a tiny overlap
+        // segment whose token budget is exhausted by the overlap tail itself)
+        // land at/before `consumed_end`.  Force at least one fresh byte.
+        if abs_end <= consumed_end {
+            abs_end = (consumed_end + 1).min(block_end);
+        }
+
+        let seg_text = &src[win_start..abs_end];
+        let seg_tokens = token_count(ctx.tokenizer, seg_text)? as i64;
+        let t_start = *running_token_offset;
+        let t_end = t_start + seg_tokens;
+        let id = ctx
+            .strategy
+            .make_id(1, &block.section_path, seg_text, *child_ordinal);
+        *child_ordinal += 1;
+        children.push(Chunk {
+            id,
+            parent_id: Some(ctx.parent_id.to_string()),
+            kind: kind::CHILD.to_string(),
+            level: 1,
+            section_path: block.section_path.clone(),
+            text: seg_text.to_string(),
+            token_start: t_start,
+            token_end: t_end,
+            char_start: win_start as i64,
+            char_end: abs_end as i64,
+            block_type: Some(block.block_type.clone()),
+        });
+        *running_token_offset = t_end;
+
+        // Advance the contiguous frontier (strictly forward — termination).
+        consumed_end = abs_end;
+    }
+
+    Ok(())
 }
 
 /// Returns the byte offset (within `text`) at which to split to stay under
@@ -1101,11 +1245,53 @@ mod tests {
         );
 
         // At least one adjacent child pair must share source bytes (overlap):
-        // child[n+1].char_start < child[n].char_end.
-        let overlapped = children.windows(2).any(|w| w[1].char_start < w[0].char_end);
+        // child[n+1].char_start < child[n].char_end. This single-block fixture
+        // is hard-split, so this asserts the hard-split path applies overlap.
+        let mut saw_overlap = false;
+        for w in children.windows(2) {
+            let prev = w[0];
+            let next = w[1];
+            let prev_start = prev.char_start as usize;
+            let prev_end = prev.char_end as usize;
+            let next_start = next.char_start as usize;
+
+            // Windows must always make forward progress (termination): the next
+            // child starts after the previous one and ends past it.
+            assert!(
+                next_start > prev_start,
+                "child must advance: next.char_start {next_start} <= prev.char_start {prev_start}"
+            );
+            assert!(
+                next.char_end as usize > prev_end,
+                "child end must advance: {} <= {prev_end}",
+                next.char_end as usize
+            );
+
+            if next_start < prev_end {
+                saw_overlap = true;
+                // The shared region must be BYTE-IDENTICAL on both sides: the
+                // bytes `src[next.char_start..prev.char_end]` are exactly the
+                // matching tail of the previous child's text (and the matching
+                // head of the next child's text). This is the whole point of
+                // overlap — the boundary concept appears intact in both children.
+                let shared = &src[next_start..prev_end];
+                let tail_off = next_start - prev_start; // offset into prev.text
+                assert_eq!(
+                    shared,
+                    &prev.text[tail_off..],
+                    "shared bytes must equal the previous child's tail"
+                );
+                let head_len = prev_end - next_start; // length of overlap in next
+                assert_eq!(
+                    shared,
+                    &next.text[..head_len],
+                    "shared bytes must equal the next child's head"
+                );
+            }
+        }
         assert!(
-            overlapped,
-            "expected at least one overlapping adjacent child pair"
+            saw_overlap,
+            "expected at least one overlapping adjacent child pair with shared boundary bytes"
         );
 
         // Every child still respects the token bound.
@@ -1237,6 +1423,54 @@ mod tests {
             assert!(
                 parent_ids.contains(pid),
                 "child parent_id not in parent set"
+            );
+        }
+    }
+
+    /// B4 — children must TILE their parent's token range: the last child's
+    /// `token_end` must equal the parent's `token_end`. Before the fix, child
+    /// overlap inflated cumulative offsets so the last child overshot the parent
+    /// end (parent 0..480 but children reaching ~544).
+    #[test]
+    fn children_tile_parent_token_range() {
+        let tok = match load_tokenizer() {
+            Some(t) => t,
+            None => return,
+        };
+
+        // One long single-block paragraph that fits in a parent but spans several
+        // overlapping children (the case where overlap inflated offsets).
+        let mut src = String::from("# Doc\n\n");
+        for i in 0..220 {
+            src.push_str(&format!("token{i} "));
+        }
+        let blocks = parse_blocks(&src, SourceKind::Markdown);
+        let chunks = chunk_blocks(&src, &blocks, &tok).unwrap();
+        assert_byte_identity(&src, &chunks);
+
+        // Group children under each parent and assert the last child of each
+        // parent ends exactly at the parent's token_end (perfect tiling), and the
+        // first child starts at the parent's token_start.
+        let parents: Vec<&Chunk> = chunks.iter().filter(|c| c.level == 0).collect();
+        assert!(!parents.is_empty(), "expected at least one parent");
+
+        for p in &parents {
+            let kids: Vec<&Chunk> = chunks
+                .iter()
+                .filter(|c| c.level == 1 && c.parent_id.as_deref() == Some(p.id.as_str()))
+                .collect();
+            assert!(!kids.is_empty(), "parent {} should have children", p.id);
+            assert_eq!(
+                kids.first().unwrap().token_start,
+                p.token_start,
+                "first child token_start must equal parent token_start"
+            );
+            assert_eq!(
+                kids.last().unwrap().token_end,
+                p.token_end,
+                "last child token_end ({}) must equal parent token_end ({}) — children must tile the parent token range",
+                kids.last().unwrap().token_end,
+                p.token_end
             );
         }
     }

@@ -240,11 +240,17 @@ fn build_section_path(stack: &[Option<String>; 6]) -> String {
 enum BlockContext {
     Paragraph,
     CodeBlock,
-    /// A list item. `emitted` flips to `true` once the item's own-text block has
-    /// been pushed. An item with a nested sublist emits its own text *at the
-    /// start of that sublist* (so it precedes the nested items in document order,
-    /// B2); a leaf item emits at `End(Item)`. The own-text span always excludes
-    /// any nested list (it ends at the first nested `Tag::List` start).
+    /// A list item. `emitted` flips to `true` once the item's own-text has been
+    /// accounted for — either by emitting the leading own-text slice at the
+    /// item's FIRST block-level child (nested list / table / html block / code
+    /// block / wrapped paragraph), or by `End(Item)` emitting the whole span for
+    /// a tight leaf item with no block-level child. The own-text slice is always
+    /// clamped to the byte BEFORE the first block-level child so a block child is
+    /// never re-included in the item span (B2 loose-list & table-in-item fix).
+    ///
+    /// A loose item's own text is itself a `Paragraph` child, which the paragraph
+    /// arm emits — so the clamped leading slice there is just the bare marker
+    /// (empty after trim) and is skipped (B5).
     ListItem {
         emitted: bool,
     },
@@ -304,6 +310,22 @@ fn parse_markdown(src: &str) -> Vec<Block> {
             continue;
         }
 
+        // Any block-level child opening directly inside an open list item is that
+        // item's FIRST block-level child iff the item has not yet emitted. Emit
+        // the item's leading own-text — clamped to the byte BEFORE this child — so
+        // a list / table / html / code / paragraph child is never re-included in
+        // the item span, fixing loose-list duplication (B1), table-in-item
+        // double-emit (B2), and bare-marker artifacts (B5). The leading slice is
+        // skipped when it is empty or only a list marker after trimming.
+        if matches!(
+            event,
+            Event::Start(
+                Tag::Paragraph | Tag::CodeBlock(_) | Tag::List(_) | Tag::Table(_) | Tag::HtmlBlock
+            )
+        ) {
+            emit_item_own_text_before_child(src, &mut ctx_stack, range.start, &mut blocks);
+        }
+
         match event {
             // ── Opening tags ──────────────────────────────────────────────
             Event::Start(Tag::Paragraph) => {
@@ -319,27 +341,10 @@ fn parse_markdown(src: &str) -> Vec<Block> {
                 ctx_stack.push((BlockContext::ListItem { emitted: false }, range.start, path));
             }
             Event::Start(Tag::List(_)) => {
-                // A list opening directly inside an item is that item's first
-                // nested sublist. Emit the enclosing item's OWN text NOW — span
-                // from the item start to this nested-list start — so the outer
-                // block precedes its nested items in document order (B2), then
-                // mark it emitted so `End(Item)` won't emit it again. Only the
-                // first nested list triggers this (later siblings see emitted=true).
-                if let Some((BlockContext::ListItem { emitted }, byte_start, path)) =
-                    ctx_stack.last_mut()
-                    && !*emitted
-                {
-                    *emitted = true;
-                    let (byte_start, path) = (*byte_start, path.clone());
-                    emit_block(
-                        src,
-                        block_type::LIST_ITEM,
-                        &path,
-                        byte_start,
-                        range.start,
-                        &mut blocks,
-                    );
-                }
+                // The nested list itself emits nothing here — the enclosing item's
+                // own text (if any) was already emitted above, clamped to this
+                // list's start. Nested items emit via their own `Start(Item)` /
+                // child / `End(Item)` flow.
             }
             Event::Start(Tag::Table(_)) => {
                 // Emit the WHOLE table as one block (raw markdown, byte-identical)
@@ -406,18 +411,22 @@ fn parse_markdown(src: &str) -> Vec<Block> {
                 if let Some((BlockContext::ListItem { emitted }, byte_start, path)) =
                     ctx_stack.pop()
                 {
-                    // A leaf item (no nested list) emits its full span here; an
-                    // item with a nested sublist already emitted its own text at
-                    // the sublist start (B2), so skip it to avoid duplication.
-                    if !emitted {
-                        emit_block(
-                            src,
-                            block_type::LIST_ITEM,
-                            &path,
-                            byte_start,
-                            range.end,
-                            &mut blocks,
-                        );
+                    // A tight leaf item (no block-level child) emits its full span
+                    // here; an item that had a block-level child already emitted
+                    // its leading own-text clamped to that child (B1/B2), so skip
+                    // it. Drop a bare-marker span (B5).
+                    if !emitted && byte_start < range.end {
+                        let raw = &src[byte_start..range.end];
+                        if !is_blank_or_marker(raw.trim()) {
+                            emit_block(
+                                src,
+                                block_type::LIST_ITEM,
+                                &path,
+                                byte_start,
+                                range.end,
+                                &mut blocks,
+                            );
+                        }
                     }
                 }
             }
@@ -462,6 +471,70 @@ fn parse_markdown(src: &str) -> Vec<Block> {
     }
 
     blocks
+}
+
+/// If the innermost open context is a list item that has not yet emitted its
+/// own-text, emit the item's leading own-text — the span from the item start to
+/// `child_start` (the byte at which its first block-level child begins) — and
+/// mark the item emitted. The leading slice is dropped when it is empty or only
+/// a list marker (`-`, `*`, `+`, or `N.` / `N)`) after trimming (B5), so an item
+/// whose only content is a nested list never produces a bare-marker block.
+///
+/// This is the single clamp point for list-item own-text: every block-level
+/// child (paragraph, code, nested list, table, html block) routes through here
+/// before being handled, so the item span never re-includes a block child —
+/// fixing loose-list duplication and table-in-item double-emit.
+fn emit_item_own_text_before_child(
+    src: &str,
+    ctx_stack: &mut [(BlockContext, usize, String)],
+    child_start: usize,
+    blocks: &mut Vec<Block>,
+) {
+    if let Some((BlockContext::ListItem { emitted }, byte_start, path)) = ctx_stack.last_mut()
+        && !*emitted
+    {
+        *emitted = true;
+        let byte_start = *byte_start;
+        let path = path.clone();
+        if byte_start < child_start {
+            let raw = &src[byte_start..child_start];
+            if !is_blank_or_marker(raw.trim()) {
+                emit_block(
+                    src,
+                    block_type::LIST_ITEM,
+                    &path,
+                    byte_start,
+                    child_start,
+                    blocks,
+                );
+            }
+        }
+    }
+}
+
+/// Returns `true` when `s` is empty or consists solely of a single leading list
+/// marker (`-`, `*`, `+`, or an ordered marker like `1.` / `2)`) with no real
+/// own-text — used to skip bare-marker `list_item` artifacts (B5).
+fn is_blank_or_marker(s: &str) -> bool {
+    if s.is_empty() {
+        return true;
+    }
+    // Bullet markers.
+    if matches!(s, "-" | "*" | "+") {
+        return true;
+    }
+    // Ordered markers: digits followed by a single `.` or `)`.
+    let mut chars = s.chars();
+    let mut saw_digit = false;
+    for c in chars.by_ref() {
+        if c.is_ascii_digit() {
+            saw_digit = true;
+        } else {
+            return saw_digit && (c == '.' || c == ')') && chars.next().is_none();
+        }
+    }
+    // All digits, no terminator → not a marker on its own.
+    false
 }
 
 /// Emits a `Block` for a completed container tag.
@@ -538,15 +611,26 @@ fn locate_in_src(
 ///
 /// Strips leading `#` characters and surrounding whitespace to obtain the
 /// heading content as it appears in the document (e.g. `## My Heading` →
-/// `"My Heading"`).  This is a best-effort approach that works for the common
-/// ATX-style headings that `pulldown_cmark` emits in offset ranges; setext
-/// headings are handled by the fallback trim.
+/// `"My Heading"`).
+///
+/// Setext headings (a title line followed by a `===`/`---` underline) are
+/// detected and narrowed to the title line only — the underline (and the
+/// newline before it) is excluded (B3). Returning the title sub-slice keeps
+/// byte-identity exact: `locate_in_src` finds it as a contiguous span of `src`,
+/// so the heading block's `char_start..char_end` covers exactly the title text
+/// and the polluted underline never propagates into `section_path`.
 ///
 /// An ATX *closing* `#` sequence is only valid when preceded by whitespace
 /// (CommonMark §4.2): `## A #` closes to `"A"`, but `# C#` is NOT a closing
 /// marker and must stay `"C#"`. We therefore only strip a trailing `#` run when
 /// it is preceded by whitespace (or is the entire remaining content).
 fn extract_heading_text(raw: &str) -> &str {
+    // Setext: the raw range is `title\n  underline\n` where `underline` is a run
+    // of `=` or `-`. Narrow to the title line (everything before the underline).
+    if let Some(title) = setext_title(raw) {
+        return title;
+    }
+
     // ATX headings start with one or more '#' characters followed by whitespace.
     // Trim trailing whitespace first so any ATX closing `#` run sits at the very
     // end of the slice (the raw range may carry a trailing newline).
@@ -561,6 +645,35 @@ fn extract_heading_text(raw: &str) -> &str {
     } else {
         stripped
     }
+}
+
+/// If `raw` is a setext heading (`title` line followed by a `===` or `---`
+/// underline line), returns the trimmed title line. Returns `None` for ATX
+/// headings or anything that is not a recognisable setext shape.
+///
+/// The returned slice is a contiguous sub-slice of `raw` (hence of `src`), so
+/// the caller's `locate_in_src` recovers an exact byte span — preserving
+/// byte-identity for the narrowed heading block.
+fn setext_title(raw: &str) -> Option<&str> {
+    // Collect non-empty lines with their trimmed forms.
+    let mut lines: Vec<&str> = raw.lines().filter(|l| !l.trim().is_empty()).collect();
+    // Need at least a title and an underline.
+    if lines.len() < 2 {
+        return None;
+    }
+    let underline = lines.pop()?.trim();
+    if underline.is_empty() {
+        return None;
+    }
+    let is_setext_underline = underline.chars().all(|c| c == '=')
+        || (underline.chars().all(|c| c == '-') && !underline.is_empty());
+    if !is_setext_underline {
+        return None;
+    }
+    // The title is the first remaining content line, trimmed. A setext title is a
+    // single line in CommonMark; use the first non-empty line.
+    let title = lines.first()?.trim();
+    if title.is_empty() { None } else { Some(title) }
 }
 
 /// Removes a trailing ATX closing `#` run from `s` iff it is a valid closing
@@ -842,6 +955,151 @@ mod tests {
             "html block keeps inner content"
         );
         assert_eq!(html[0].section_path, "H");
+    }
+
+    /// B2-loose — a loose list (blank line between items) wraps each item's
+    /// own-text in a `Paragraph`. The `Paragraph` arm already emits that text, so
+    /// the item must NOT re-emit a spanning slice at the nested-list start or at
+    /// `End(Item)`. Repro: "a" must appear in exactly one block, not two.
+    #[test]
+    fn markdown_loose_list_item_own_text_not_duplicated() {
+        let src = "- a\n\n  - b\n\n  trailing\n";
+        let blocks = parse_blocks(src, SourceKind::Markdown);
+        assert_byte_identity(src, &blocks);
+
+        // The loose item's own-text "a" must appear in exactly one block. The bug
+        // emits it twice: once as the wrapped paragraph "a" and again as the
+        // spanning re-slice "- a" at the nested-list start.
+        let a_count = blocks
+            .iter()
+            .filter(|b| b.text == "a" || b.text == "- a")
+            .count();
+        assert_eq!(
+            a_count, 1,
+            "loose item own-text duplicated across blocks: {:#?}",
+            blocks
+        );
+
+        // No block may span both the item's own-text and the nested item text.
+        for b in &blocks {
+            assert!(
+                !(b.text.contains("a") && b.text.contains("b") && b.text.contains("trailing")),
+                "a block spans the whole loose item (duplication): {:?}",
+                b.text
+            );
+        }
+    }
+
+    /// B2-table — a list item containing a table must emit the table exactly once
+    /// (via the `Table` arm), and the item own-text must clamp to the table start
+    /// so `End(Item)` does not re-emit the whole item span (which would duplicate
+    /// the raw table markdown).
+    #[test]
+    fn markdown_table_in_list_item_not_double_emitted() {
+        let src = "- item\n\n  | A | B |\n  | - | - |\n  | 1 | 2 |\n";
+        let blocks = parse_blocks(src, SourceKind::Markdown);
+        assert_byte_identity(src, &blocks);
+
+        let tables: Vec<&Block> = blocks.iter().filter(|b| b.block_type == "table").collect();
+        assert_eq!(
+            tables.len(),
+            1,
+            "exactly one table block; got {:#?}",
+            blocks
+        );
+
+        // Cell content must live only in the table block, never in a list_item.
+        for b in &blocks {
+            if b.block_type != "table" {
+                for cell in ["A", "B", "1", "2"] {
+                    // Allow incidental single-char overlap only outside table cells:
+                    // the bug manifests as the FULL table markdown (pipes) leaking
+                    // into the item span, so assert no pipe-delimited row leaks.
+                    let _ = cell;
+                }
+                assert!(
+                    !b.text.contains("| 1 | 2 |"),
+                    "table markdown leaked into a {} block: {:?}",
+                    b.block_type,
+                    b.text
+                );
+            }
+        }
+    }
+
+    /// B5 — an item whose only own-text is whitespace plus a list marker must NOT
+    /// emit a bare "-" `list_item` block.
+    #[test]
+    fn markdown_bare_marker_own_text_skipped() {
+        let src = "- \n  - x\n";
+        let blocks = parse_blocks(src, SourceKind::Markdown);
+        assert_byte_identity(src, &blocks);
+
+        for b in &blocks {
+            assert_ne!(
+                b.text, "-",
+                "emitted a bare list-marker artifact block: {:#?}",
+                blocks
+            );
+        }
+        // "x" (the only real content) must still be present exactly once.
+        let x_count = blocks.iter().filter(|b| b.text.contains('x')).count();
+        assert_eq!(x_count, 1, "nested 'x' should appear exactly once");
+    }
+
+    /// B3-setext — a setext heading's text must be the title line only (the
+    /// `===`/`---` underline must be excluded), and that clean text must propagate
+    /// into descendants' section_path. Byte-identity must still hold.
+    #[test]
+    fn markdown_setext_heading_clean_text_and_section_path() {
+        let src = "My Heading\n==========\n\nbody\n";
+        let blocks = parse_blocks(src, SourceKind::Markdown);
+        assert_byte_identity(src, &blocks);
+
+        let heading = blocks
+            .iter()
+            .find(|b| b.block_type == "heading")
+            .expect("setext heading should exist");
+        assert_eq!(
+            heading.text, "My Heading",
+            "setext heading text must exclude the underline"
+        );
+
+        // No newline or '=' may appear in any heading text or section_path.
+        for b in &blocks {
+            if b.block_type == "heading" {
+                assert!(
+                    !b.text.contains('\n') && !b.text.contains('='),
+                    "heading text polluted: {:?}",
+                    b.text
+                );
+            }
+            assert!(
+                !b.section_path.contains('\n') && !b.section_path.contains('='),
+                "section_path polluted for {:?}: {:?}",
+                b.block_type,
+                b.section_path
+            );
+        }
+
+        let body = blocks
+            .iter()
+            .find(|b| b.block_type == "paragraph" && b.text == "body")
+            .expect("body paragraph should exist");
+        assert_eq!(body.section_path, "My Heading");
+    }
+
+    /// Setext H2 (`---` underline) must be handled identically.
+    #[test]
+    fn markdown_setext_h2_clean_text() {
+        let src = "Subtitle\n--------\n\nbody\n";
+        let blocks = parse_blocks(src, SourceKind::Markdown);
+        assert_byte_identity(src, &blocks);
+        let heading = blocks
+            .iter()
+            .find(|b| b.block_type == "heading")
+            .expect("setext h2 should exist");
+        assert_eq!(heading.text, "Subtitle");
     }
 
     /// Deeper nesting still emits one block per item, no duplication, in order.

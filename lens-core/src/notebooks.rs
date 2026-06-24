@@ -471,6 +471,16 @@ impl<'a> NotebookRepo<'a> {
         text: &str,
         kind: &str,
     ) -> Result<Source, LensError> {
+        // Phase-1 OOM guard: reject an oversized paste before writing it to disk
+        // and queueing it for ingest (the ingest pipeline enforces the same cap
+        // after reading any file path). See [`crate::ingest::MAX_SOURCE_BYTES`].
+        if text.len() > crate::ingest::MAX_SOURCE_BYTES {
+            return Err(LensError::Validation(format!(
+                "source text is {} bytes, exceeding the {}-byte limit",
+                text.len(),
+                crate::ingest::MAX_SOURCE_BYTES
+            )));
+        }
         let ext = match kind {
             "text" => "txt",
             "markdown" => "md",

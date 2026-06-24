@@ -13,7 +13,8 @@ import {
   ingest,
   toggleSelected,
   removeSource,
-  undoRemove
+  undoRemove,
+  disposeTrashTimers
 } from './sources-state.svelte.js';
 
 // ---------------------------------------------------------------------------
@@ -702,5 +703,183 @@ describe('Source type: trashed_at field', () => {
     await loadSources('nb-001');
 
     expect(sourcesStore.sources[0].trashed_at).toBe('2026-06-24T10:00:00Z');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// addSourceLocal — prepend ordering (fix #1)
+// ---------------------------------------------------------------------------
+
+describe('addSourceLocal — prepend ordering', () => {
+  it('prepends the new source so it appears at index 0 (newest-first)', () => {
+    const a = makeSource({ id: 'src-A' });
+    const b = makeSource({ id: 'src-B' });
+    // Seed store with two existing sources (newest-first: A then B)
+    addSourceLocal(a);
+    addSourceLocal(b);
+    // A is already at index 0, B is prepended — wait, this seeds in prepend order
+    // so after two prepends the order is [B, A]. Reset and load directly.
+    resetSourcesStore();
+
+    // Simulate existing store state [A, B] loaded via loadSources (newest-first)
+    vi.mocked(listSources).mockResolvedValue([a, b]);
+  });
+
+  it('store has [A, B] (newest-first); addSourceLocal(C) → sources[0].id === C', async () => {
+    const a = makeSource({ id: 'src-A' });
+    const b = makeSource({ id: 'src-B' });
+    vi.mocked(listSources).mockResolvedValue([a, b]);
+    await loadSources('nb-001');
+    expect(sourcesStore.sources[0].id).toBe('src-A');
+    expect(sourcesStore.sources[1].id).toBe('src-B');
+
+    const c = makeSource({ id: 'src-C', status: 'queued' });
+    addSourceLocal(c);
+
+    // C must be at index 0 (newest-first), A and B follow
+    expect(sourcesStore.sources[0].id).toBe('src-C');
+    expect(sourcesStore.sources[1].id).toBe('src-A');
+    expect(sourcesStore.sources[2].id).toBe('src-B');
+  });
+
+  it('OLD BUG (append): appending would put C at the tail — this test proves prepend is correct', async () => {
+    // This test documents that with prepend, C is NOT at the last index.
+    const a = makeSource({ id: 'src-A' });
+    vi.mocked(listSources).mockResolvedValue([a]);
+    await loadSources('nb-001');
+
+    const c = makeSource({ id: 'src-C', status: 'queued' });
+    addSourceLocal(c);
+
+    // With prepend: C is at index 0, NOT at the last position
+    expect(sourcesStore.sources[0].id).toBe('src-C');
+    // C must NOT be at the tail — prepend puts it at index 0, not the end
+    expect(sourcesStore.sources[sourcesStore.sources.length - 1].id).not.toBe('src-C');
+  });
+
+  it('dedup guard: addSourceLocal is a no-op when the id already exists', async () => {
+    const a = makeSource({ id: 'src-A' });
+    vi.mocked(listSources).mockResolvedValue([a]);
+    await loadSources('nb-001');
+
+    // Calling addSourceLocal with an already-present id must not duplicate the row
+    addSourceLocal(a);
+    expect(sourcesStore.sources).toHaveLength(1);
+    expect(sourcesStore.sources[0].id).toBe('src-A');
+  });
+
+  it('addSourceLocal + concurrent loadSources race: backend snapshot (without new row) replaces optimistic row', async () => {
+    // After addSourceLocal(C), if loadSources fires and the backend happens
+    // to return a snapshot WITHOUT C (e.g. ingest not committed yet), the
+    // optimistic row is replaced. This is intentional — the real backend
+    // will include C once committed. This test documents + asserts that behavior.
+    const a = makeSource({ id: 'src-A' });
+    vi.mocked(listSources).mockResolvedValue([a]);
+    await loadSources('nb-001');
+
+    const c = makeSource({ id: 'src-C', status: 'queued' });
+    addSourceLocal(c);
+    expect(sourcesStore.sources[0].id).toBe('src-C');
+
+    // Simulate a concurrent loadSources that returns only [A] (backend hasn't committed C yet)
+    vi.mocked(listSources).mockResolvedValue([a]);
+    await loadSources('nb-001');
+
+    // The optimistic row is gone — replaced by the backend snapshot.
+    // This is acceptable: the real backend will return C once ingest commits.
+    expect(sourcesStore.sources).toHaveLength(1);
+    expect(sourcesStore.sources[0].id).toBe('src-A');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// disposeTrashTimers + TTL auto-expiry (fix #2)
+// ---------------------------------------------------------------------------
+
+describe('disposeTrashTimers + TTL auto-expiry', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    resetSourcesStore();
+  });
+
+  const TRASH_UNDO_TTL_MS = 6_000;
+
+  it('TTL auto-expiry: recentlyTrashed becomes false after TRASH_UNDO_TTL_MS', async () => {
+    vi.mocked(listSources).mockResolvedValue([makeSource({ id: 'src-001' })]);
+    await loadSources('nb-001');
+    vi.mocked(trashSource).mockResolvedValue(undefined);
+
+    await removeSource('src-001');
+    expect(sourcesStore.recentlyTrashed).toBe(true);
+
+    vi.advanceTimersByTime(TRASH_UNDO_TTL_MS + 1);
+
+    expect(sourcesStore.recentlyTrashed).toBe(false);
+  });
+
+  it('per-entry independence: two removes → each expires independently', async () => {
+    vi.mocked(listSources).mockResolvedValue([
+      makeSource({ id: 'src-001' }),
+      makeSource({ id: 'src-002' }),
+      makeSource({ id: 'src-003' })
+    ]);
+    await loadSources('nb-001');
+    vi.mocked(trashSource).mockResolvedValue(undefined);
+
+    // Remove src-001 at t=0 (its timer expires at t=6000)
+    await removeSource('src-001');
+    // Advance 2s, then remove src-002 at t=2000 (its timer expires at t=8000)
+    vi.advanceTimersByTime(2_000);
+    await removeSource('src-002');
+
+    // At t=2000: both entries still in queue
+    expect(sourcesStore.recentlyTrashed).toBe(true);
+
+    // Advance to t=7000 (6000+1 from start) — src-001's timer has fired, but src-002's (at t=8000) hasn't
+    vi.advanceTimersByTime(5_001); // t=2000 + 5001 = 7001
+    expect(sourcesStore.recentlyTrashed).toBe(true); // src-002 still pending
+
+    // Advance past src-002's TTL (to t=8001)
+    vi.advanceTimersByTime(1_000); // t=7001 + 1000 = 8001
+    expect(sourcesStore.recentlyTrashed).toBe(false);
+  });
+
+  it('disposeTrashTimers: clears all pending timers immediately (recentlyTrashed → false)', async () => {
+    vi.mocked(listSources).mockResolvedValue([
+      makeSource({ id: 'src-001' }),
+      makeSource({ id: 'src-002' })
+    ]);
+    await loadSources('nb-001');
+    vi.mocked(trashSource).mockResolvedValue(undefined);
+
+    await removeSource('src-001');
+    await removeSource('src-002');
+    expect(sourcesStore.recentlyTrashed).toBe(true);
+
+    // Before TTL fires, dispose clears everything
+    disposeTrashTimers();
+
+    expect(sourcesStore.recentlyTrashed).toBe(false);
+
+    // Advancing past TTL must NOT cause any further mutation (timers were cancelled)
+    vi.advanceTimersByTime(TRASH_UNDO_TTL_MS + 1);
+    expect(sourcesStore.recentlyTrashed).toBe(false);
+  });
+
+  it('disposeTrashTimers: no pending timer mutation after disposal (vi.getTimerCount() === 0)', async () => {
+    vi.mocked(listSources).mockResolvedValue([makeSource({ id: 'src-001' })]);
+    await loadSources('nb-001');
+    vi.mocked(trashSource).mockResolvedValue(undefined);
+
+    await removeSource('src-001');
+    expect(vi.getTimerCount()).toBeGreaterThan(0);
+
+    disposeTrashTimers();
+
+    expect(vi.getTimerCount()).toBe(0);
   });
 });

@@ -90,7 +90,8 @@ vi.mock('$lib/sources/sources-state.svelte.js', () => ({
   toggleSelected: vi.fn().mockResolvedValue(undefined),
   removeSource: vi.fn().mockResolvedValue(undefined),
   undoRemove: vi.fn().mockResolvedValue(undefined),
-  resetSourcesStore: vi.fn()
+  resetSourcesStore: vi.fn(),
+  disposeTrashTimers: vi.fn()
 }));
 
 vi.mock('$lib/sources/ipc.js', () => ({
@@ -119,7 +120,7 @@ vi.mock('@tauri-apps/plugin-dialog', () => ({
 // Import components after mocks.
 import SourcesRail from './SourcesRail.svelte';
 import AddSourcesModal from './AddSourcesModal.svelte';
-import { removeSource, undoRemove } from '$lib/sources/sources-state.svelte.js';
+import { removeSource, undoRemove, disposeTrashTimers } from '$lib/sources/sources-state.svelte.js';
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -389,6 +390,15 @@ describe('SourcesRail — Undo bar', () => {
     expect(undoRemove).toHaveBeenCalledOnce();
   });
 
+  it('clicking the Undo button passes activeNotebookId to undoRemove (fix #3)', async () => {
+    // activeNotebookId is 'nb-001' in the mock — undoRemove must receive it so
+    // the canonical loadSources reconcile actually runs after restore.
+    mockSourcesStore._setRecentlyTrashed(true);
+    render(SourcesRail);
+    await fireEvent.click(screen.getByRole('button', { name: /^undo$/i }));
+    expect(undoRemove).toHaveBeenCalledWith('nb-001');
+  });
+
   it('Undo bar has -webkit-app-region: no-drag on the outer element', () => {
     mockSourcesStore._setRecentlyTrashed(true);
     const { container } = render(SourcesRail);
@@ -403,6 +413,19 @@ describe('SourcesRail — Undo bar', () => {
     render(SourcesRail);
     // Collapsed strip has no source list section — Undo bar is in the expanded layout only.
     expect(screen.queryByText('Source moved to trash')).not.toBeInTheDocument();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// onDestroy — disposeTrashTimers wiring (fix #2)
+// ---------------------------------------------------------------------------
+
+describe('SourcesRail — onDestroy disposeTrashTimers wiring', () => {
+  it('disposeTrashTimers is called when the component is unmounted', () => {
+    const { unmount } = render(SourcesRail);
+    expect(disposeTrashTimers).not.toHaveBeenCalled();
+    unmount();
+    expect(disposeTrashTimers).toHaveBeenCalledOnce();
   });
 });
 

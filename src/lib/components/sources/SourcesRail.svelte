@@ -15,11 +15,13 @@
   import PanelRightClose from '@lucide/svelte/icons/panel-right-close';
   import Headphones from '@lucide/svelte/icons/headphones';
   import { cn } from '$lib/utils.js';
+  import { onDestroy } from 'svelte';
   import {
     sourcesStore,
     toggleSelected,
     removeSource,
-    undoRemove
+    undoRemove,
+    disposeTrashTimers
   } from '$lib/sources/sources-state.svelte.js';
   import { notebookStore } from '$lib/notebooks/index.js';
   import type { SourceStatus } from '$lib/sources/types.js';
@@ -40,6 +42,11 @@
   // ---------------------------------------------------------------------------
 
   const collapsed = $derived(notebookStore.rightRailCollapsed);
+
+  // Clear all pending trash-undo timers when the rail unmounts (e.g. notebook
+  // switch). Without this, orphan timers fire after unmount and mutate trashQueue
+  // state belonging to a different notebook session.
+  onDestroy(disposeTrashTimers);
 
   function toggleCollapse(): void {
     notebookStore.rightRailCollapsed = !notebookStore.rightRailCollapsed;
@@ -457,7 +464,7 @@
       <span class="truncate text-muted-foreground">Source moved to trash</span>
       <button
         type="button"
-        onclick={() => void undoRemove()}
+        onclick={() => void undoRemove(notebookStore.activeNotebookId ?? undefined)}
         class="shrink-0 rounded-[5px] px-2 py-0.5 text-xs font-semibold text-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
         style="-webkit-app-region: no-drag;"
       >

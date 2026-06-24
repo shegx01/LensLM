@@ -1223,6 +1223,81 @@ async fn purge_source_without_vectors_is_clean() {
     assert_eq!(count, 0, "source row must be gone after purge");
 }
 
+/// AC (disk leak): `purge_source` removes the managed
+/// `{data_dir}/sources/{id}.ext` file written by `add_text_source` so "Delete
+/// forever" does not leak it. No ingest needed — the file exists from
+/// `add_text_source` alone.
+#[tokio::test]
+async fn purge_source_removes_managed_file() {
+    let (_dir, engine) = file_engine().await;
+    let nb = engine
+        .create_notebook("purge-file-nb", None, None)
+        .await
+        .unwrap();
+    let src = engine
+        .add_text_source(&nb.id, "doc", "Some managed body text.", "text")
+        .await
+        .unwrap();
+
+    // The managed file exists right after add_text_source.
+    let path = std::path::PathBuf::from(&src.locator);
+    assert!(
+        path.exists(),
+        "managed source file should exist after add_text_source: {}",
+        src.locator
+    );
+
+    // Trash then purge — purge requires a trashed source.
+    engine.trash_source(&src.id).await.unwrap();
+    engine.purge_source(&src.id).await.unwrap();
+
+    // The managed file is gone.
+    assert!(
+        !path.exists(),
+        "managed source file must be removed by purge_source: {}",
+        src.locator
+    );
+}
+
+/// AC (disk leak, notebook): `purge_notebook` removes the managed source files
+/// of all its sources (live and trashed) so a notebook "Delete forever" does not
+/// leak them.
+#[tokio::test]
+async fn purge_notebook_removes_managed_source_files() {
+    let (_dir, engine) = file_engine().await;
+    let nb = engine
+        .create_notebook("purge-nb-files", None, None)
+        .await
+        .unwrap();
+    let live = engine
+        .add_text_source(&nb.id, "live", "Live source body.", "text")
+        .await
+        .unwrap();
+    let trashed = engine
+        .add_text_source(&nb.id, "trashed", "Trashed source body.", "markdown")
+        .await
+        .unwrap();
+    // Trash one source so the notebook holds both a live and a trashed source.
+    engine.trash_source(&trashed.id).await.unwrap();
+
+    let live_path = std::path::PathBuf::from(&live.locator);
+    let trashed_path = std::path::PathBuf::from(&trashed.locator);
+    assert!(live_path.exists() && trashed_path.exists());
+
+    // Trash then purge the notebook.
+    engine.trash_notebook(&nb.id).await.unwrap();
+    engine.purge_notebook(&nb.id).await.unwrap();
+
+    assert!(
+        !live_path.exists(),
+        "live source's managed file must be removed by purge_notebook"
+    );
+    assert!(
+        !trashed_path.exists(),
+        "trashed source's managed file must be removed by purge_notebook"
+    );
+}
+
 /// AC (real model, end-to-end): ingest a real text source with the real
 /// embedder and assert it reaches `indexed` and search returns its chunks.
 #[tokio::test]
@@ -1259,4 +1334,224 @@ async fn real_model_end_to_end_ingest_and_search() {
         .await
         .unwrap();
     assert!(!hits.is_empty(), "real-model search returns hits");
+}
+
+// ===========================================================================
+// Ingest robustness: size cap, empty-doc short-circuit, batch seam, tables
+// ===========================================================================
+
+/// AC (size cap): `add_text_source` with text larger than
+/// [`MAX_SOURCE_BYTES`](lens_core::ingest::MAX_SOURCE_BYTES) is rejected with a
+/// `Validation` error before anything is written/queued.
+#[tokio::test]
+async fn add_text_source_rejects_oversized_input() {
+    let (_dir, engine) = file_engine().await;
+    let nb = engine
+        .create_notebook("oversize-nb", None, None)
+        .await
+        .unwrap();
+
+    // One byte over the cap.
+    let huge = "x".repeat(lens_core::ingest::MAX_SOURCE_BYTES + 1);
+    let err = engine.add_text_source(&nb.id, "huge", &huge, "text").await;
+    assert!(
+        matches!(err, Err(lens_core::LensError::Validation(_))),
+        "oversized paste must be rejected with Validation, got {err:?}"
+    );
+
+    // Exactly at the cap is accepted (boundary).
+    let ok = "y".repeat(lens_core::ingest::MAX_SOURCE_BYTES);
+    assert!(
+        engine
+            .add_text_source(&nb.id, "at-cap", &ok, "text")
+            .await
+            .is_ok(),
+        "input exactly at the cap must be accepted"
+    );
+}
+
+/// AC (empty-doc short-circuit): ingesting an empty/whitespace-only source
+/// reaches `indexed` with `token_count == 0` and zero chunks — WITHOUT loading
+/// the embedder.
+///
+/// The "embedder not loaded" property is proven structurally: this test uses a
+/// bare `file_engine()` (NO injected test embedder) and does NOT set
+/// `LENS_RUN_MODEL_TESTS`, so if the pipeline tried to load the embedder it
+/// would attempt the ~130 MB `FastembedEmbedder` download — the short-circuit is
+/// what keeps this offline-clean. Chunking still needs the tokenizer, so the
+/// test skips when no tokenizer is reachable.
+#[tokio::test]
+async fn empty_doc_indexes_without_loading_embedder() {
+    if !tokenizer_available().await {
+        eprintln!("skipping empty_doc_indexes_without_loading_embedder: no tokenizer (offline)");
+        return;
+    }
+    // NOTE: deliberately NO embedder injection — the short-circuit must avoid the
+    // embedder load entirely.
+    let (_dir, engine) = file_engine().await;
+    let nb = engine
+        .create_notebook("empty-nb", None, None)
+        .await
+        .unwrap();
+    let src = engine
+        .add_text_source(&nb.id, "empty", "   \n\t\n  \n", "text")
+        .await
+        .unwrap();
+
+    let mut phases: Vec<String> = Vec::new();
+    engine
+        .ingest_source(&src.id, |p: IngestProgress| phases.push(p.phase))
+        .await
+        .expect("empty-doc ingest should succeed without an embedder");
+
+    // Status indexed, token_count 0, zero chunks.
+    assert_eq!(engine_source_status(&engine, &src.id).await, "indexed");
+    assert_eq!(
+        count_chunks(&engine, &src.id).await,
+        0,
+        "empty doc produces zero chunks"
+    );
+    let pool = engine.pool().await;
+    let token_count =
+        sqlx::query_scalar::<_, Option<i64>>("SELECT token_count FROM sources WHERE id = ?")
+            .bind(&src.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(token_count, Some(0), "empty doc has token_count 0");
+
+    // The pipeline reached `done` but never entered `embedding`/`indexing`.
+    assert_eq!(phases.last().map(String::as_str), Some("done"));
+    assert!(
+        !phases.iter().any(|p| p == "embedding"),
+        "empty doc must not emit an embedding phase: {phases:?}"
+    );
+}
+
+/// AC (>60-chunk batch seam): a document large enough to produce ≥61 chunks
+/// spans more than one `CHUNK_INSERT_BATCH` (60). After ingest every child's
+/// `parent_id` resolves to a real parent row (the FK holds across the batch
+/// seam) and `token_start` is globally non-decreasing across parents.
+#[tokio::test]
+async fn ingest_spans_chunk_insert_batch_seam() {
+    if !tokenizer_available().await {
+        eprintln!("skipping ingest_spans_chunk_insert_batch_seam: no tokenizer (offline)");
+        return;
+    }
+    let (_dir, engine) = inject_counting_engine().await;
+
+    // Build a large doc so the chunker emits ≥61 chunks (parents + children).
+    // Parents pack ~512 tokens then split into ~128-token children, so a single
+    // parent window yields several rows; we need enough total prose to span many
+    // parent windows AND clear the 60-row insert batch. ~250 substantial
+    // paragraphs is a comfortable margin.
+    let mut doc = String::new();
+    for i in 0..250 {
+        doc.push_str(&format!(
+            "# Section {i}\n\nParagraph {i}: the quick brown fox jumps over the lazy dog while \
+             contemplating the nature of section number {i} and its many distinct sentences. \
+             Here is a second sentence for section {i} with additional prose. And a third \
+             sentence to make section {i} a substantial, tokenizable chunk of real text.\n\n"
+        ));
+    }
+    let nb = engine.create_notebook("seam-nb", None, None).await.unwrap();
+    let src = engine
+        .add_text_source(&nb.id, "big", &doc, "markdown")
+        .await
+        .unwrap();
+    engine.ingest_source(&src.id, |_p| {}).await.unwrap();
+    assert_eq!(engine_source_status(&engine, &src.id).await, "indexed");
+
+    // (a) chunk count spans more than one insert batch.
+    let total = count_chunks(&engine, &src.id).await;
+    assert!(
+        total >= 61,
+        "expected ≥61 chunks to cross the 60-row insert batch, got {total}"
+    );
+
+    // Pull (id, parent_id, level, token_start) for all chunks.
+    let pool = engine.pool().await;
+    let rows = sqlx::query(
+        "SELECT id, parent_id, level, token_start FROM chunks WHERE source_id = ? ORDER BY rowid",
+    )
+    .bind(&src.id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
+    let ids: std::collections::HashSet<String> =
+        rows.iter().map(|r| r.get::<String, _>("id")).collect();
+
+    // (b) every child's parent_id resolves to an existing row.
+    for r in &rows {
+        if let Some(parent_id) = r.get::<Option<String>, _>("parent_id") {
+            assert!(
+                ids.contains(&parent_id),
+                "child parent_id {parent_id} has no matching parent row (FK broken across batch seam)"
+            );
+        }
+    }
+
+    // (c) parent token_start values are globally non-decreasing (in insert order).
+    let mut last_parent_start: i64 = i64::MIN;
+    for r in &rows {
+        if r.get::<i64, _>("level") == 0 {
+            let start = r.get::<i64, _>("token_start");
+            assert!(
+                start >= last_parent_start,
+                "parent token_start went backwards: {start} < {last_parent_start}"
+            );
+            last_parent_start = start;
+        }
+    }
+}
+
+/// AC (table ingest-level): a GFM table flows through parse → chunk → insert and
+/// lands as a `table` chunk row whose text carries the cell values.
+#[tokio::test]
+async fn ingest_preserves_gfm_table_block() {
+    if !tokenizer_available().await {
+        eprintln!("skipping ingest_preserves_gfm_table_block: no tokenizer (offline)");
+        return;
+    }
+    let (_dir, engine) = inject_counting_engine().await;
+    let nb = engine
+        .create_notebook("table-nb", None, None)
+        .await
+        .unwrap();
+    // The GFM table from the spec leads the document so it is the FIRST block of
+    // the first parent window — parents pack by token budget and carry the FIRST
+    // block's `block_type`, so a leading table yields a `table`-typed chunk. The
+    // trailing filler just gives the rest of the doc some body; it does not change
+    // what the assertion checks: a `table` chunk carrying the cell values.
+    let filler = "the quick brown fox jumps over the lazy dog. ".repeat(20);
+    let doc = format!("| A | B |\n| - | - |\n| x | y |\n\n{filler}");
+    let src = engine
+        .add_text_source(&nb.id, "t", &doc, "markdown")
+        .await
+        .unwrap();
+    engine.ingest_source(&src.id, |_p| {}).await.unwrap();
+    assert_eq!(engine_source_status(&engine, &src.id).await, "indexed");
+
+    let total = count_chunks(&engine, &src.id).await;
+    assert!(total > 0, "table doc must produce chunks");
+
+    // A `table` chunk row exists whose text contains the cell values.
+    let pool = engine.pool().await;
+    let table_texts: Vec<String> =
+        sqlx::query_scalar("SELECT text FROM chunks WHERE source_id = ? AND block_type = 'table'")
+            .bind(&src.id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert!(
+        !table_texts.is_empty(),
+        "expected at least one chunk row with block_type 'table'"
+    );
+    assert!(
+        table_texts
+            .iter()
+            .any(|t| t.contains('x') && t.contains('y')),
+        "table chunk text must carry the cell values, got {table_texts:?}"
+    );
 }

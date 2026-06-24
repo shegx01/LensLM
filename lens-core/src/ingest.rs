@@ -75,6 +75,18 @@ const TOKENIZER_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// bound peak memory while keeping the ONNX session warm.
 const EMBED_BATCH: usize = 32;
 
+/// Maximum accepted source size, in bytes (Phase-1 OOM guard).
+///
+/// A source larger than this is rejected up front with [`LensError::Validation`]
+/// rather than read fully into memory, chunked (each chunk owning a `String`
+/// copy), and accumulated as `VectorRow`s before a single `store.add` — a path
+/// whose peak memory is O(total text + total vectors). This is a coarse cap, not
+/// streaming: bounded-memory streaming inserts are a documented Phase-2
+/// follow-up. The cap is enforced in two places: [`add_text_source`](crate::LensEngine::add_text_source)
+/// (the paste path, against `text.len()`) and at the top of the ingest pipeline
+/// after the file read (any file path, against the read length).
+pub const MAX_SOURCE_BYTES: usize = 10 * 1024 * 1024;
+
 /// Ingest progress phase labels (the [`IngestProgress::phase`] string values).
 ///
 /// Single source of truth for the phase literals streamed to the progress sink,
@@ -196,6 +208,17 @@ async fn run_ingest(
     let text = std::fs::read_to_string(&source.locator)
         .map_err(|e| LensError::Io(format!("read source {}: {e}", source.locator)))?;
 
+    // ── Size guard (Phase-1 OOM cap) ──────────────────────────────────────
+    // Bound peak memory: reject an oversized source before it is chunked +
+    // embedded + accumulated. Also covers any file path (not just managed
+    // pastes), which `add_text_source` cannot pre-check.
+    if text.len() > MAX_SOURCE_BYTES {
+        return Err(LensError::Validation(format!(
+            "source is {} bytes, exceeding the {MAX_SOURCE_BYTES}-byte ingest limit",
+            text.len()
+        )));
+    }
+
     // ── Compute content hash + short-circuit unchanged indexed sources ────
     let content_hash = sha256_hex(text.as_bytes());
     if source.status == crate::notebooks::source_status::INDEXED
@@ -268,6 +291,23 @@ async fn run_ingest(
     // NOTE: `&mut tx` coerces to `&mut SqliteConnection` via `Transaction`'s
     // `DerefMut`; the helpers take `&mut SqliteConnection` so they run inside
     // this transaction rather than against the pool directly.
+
+    // ── Empty-doc short-circuit ───────────────────────────────────────────
+    // An empty/whitespace-only source produces zero chunks. There is nothing to
+    // embed, so skip the embedder load entirely: loading it would force the
+    // ~130 MB model download/init just to embed nothing, and a download failure
+    // would flip a trivially-indexable empty source to `error`. The cross-store
+    // wipe above already cleared any prior chunks/vectors, so this finalizes the
+    // source as an empty-but-indexed row (token_count 0) and emits `done`.
+    if chunks.is_empty() {
+        let repo = crate::notebooks::NotebookRepo::new(&pool);
+        repo.update_source_metadata(source_id, 0, &content_hash)
+            .await?;
+        repo.update_source_status(source_id, crate::notebooks::source_status::INDEXED)
+            .await?;
+        on_progress(IngestProgress::new(ingest_phase::DONE, 1, Some(1)));
+        return Ok(());
+    }
 
     // ── EMBED ─────────────────────────────────────────────────────────────
     {
