@@ -117,6 +117,15 @@ pub trait VectorStore: Send + Sync {
         dim: usize,
         source_id: &str,
     ) -> Result<(), LensError>;
+
+    /// Drops the physical Lance tables named in `table_names`, ignoring any that
+    /// do not exist (idempotent — a re-purge re-drops nothing).
+    ///
+    /// Used by the notebook hard-delete path: a purge looks up the notebook's
+    /// `embedding_index` rows (which carry the physical `lance_table_name`) and
+    /// drops each table BEFORE the SQLite delete cascades those registry rows
+    /// away, so the per-notebook Lance tables are never orphaned on disk.
+    async fn drop_tables(&self, table_names: &[String]) -> Result<(), LensError>;
 }
 
 /// Slugifies a model id into a filesystem/table-safe token.
@@ -289,6 +298,23 @@ impl EmbeddingIndexRepo {
         Ok(row)
     }
 
+    /// Returns every physical `lance_table_name` registered for `notebook`.
+    ///
+    /// Used by the notebook hard-delete path to discover which Lance tables to
+    /// drop before the SQLite delete cascades the registry rows away.
+    async fn lance_table_names_for_notebook(
+        &self,
+        notebook: &str,
+    ) -> Result<Vec<String>, LensError> {
+        let names = sqlx::query_scalar::<_, String>(
+            "SELECT lance_table_name FROM embedding_index WHERE notebook_id = ?",
+        )
+        .bind(notebook)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(names)
+    }
+
     /// Updates the `status` of an existing registry row (Phase-4 model-switch
     /// lifecycle: `active`/`building`/`stale`). Errors if no row matches.
     ///
@@ -365,6 +391,21 @@ impl LanceVectorStore {
             root: data_dir.join("lancedb"),
             registry: EmbeddingIndexRepo::new(pool),
         }
+    }
+
+    /// Drops every per-notebook Lance table registered for `notebook`.
+    ///
+    /// Resolves the notebook's physical `lance_table_name`s via the owned
+    /// registry, then drops each table (missing tables are a no-op). Used by the
+    /// notebook hard-delete path (`LensEngine::purge_notebook`) BEFORE the SQLite
+    /// delete so the cascade that removes the `embedding_index` rows can never
+    /// orphan a Lance table on disk.
+    pub async fn drop_notebook_tables(&self, notebook: &str) -> Result<(), LensError> {
+        let names = self
+            .registry
+            .lance_table_names_for_notebook(notebook)
+            .await?;
+        self.drop_tables(&names).await
     }
 
     /// Opens a LanceDB connection at the store root.
@@ -588,6 +629,34 @@ impl VectorStore for LanceVectorStore {
             .delete(format!("source_id = '{}'", escape_lance_literal(source_id)).as_str())
             .await
             .map_err(|e| LensError::Vector(format!("lancedb delete failed: {e}")))?;
+        Ok(())
+    }
+
+    async fn drop_tables(&self, table_names: &[String]) -> Result<(), LensError> {
+        if table_names.is_empty() {
+            return Ok(());
+        }
+        let conn = self.connect().await?;
+        // Snapshot the live table set once and guard each drop with an existence
+        // check: lancedb 0.30's `drop_table` errors on a missing table, but the
+        // purge path must be idempotent (a crash between Lance-drop and the
+        // SQLite commit means a re-purge re-drops the same names), so a missing
+        // table is treated as a no-op.
+        let existing = conn
+            .table_names()
+            .execute()
+            .await
+            .map_err(|e| LensError::Vector(format!("lancedb table_names failed: {e}")))?;
+        for name in table_names {
+            if !existing.iter().any(|t| t == name) {
+                continue;
+            }
+            // Empty namespace path = root namespace, matching how
+            // `create_empty_table(...).execute()` registers these tables.
+            conn.drop_table(name.as_str(), &[])
+                .await
+                .map_err(|e| LensError::Vector(format!("lancedb drop_table failed: {e}")))?;
+        }
         Ok(())
     }
 }

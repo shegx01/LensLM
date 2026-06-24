@@ -19,6 +19,7 @@ export interface Source {
   created_at: string;
   token_count: number | null;
   content_hash: string | null;
+  trashed_at: string | null;
 }
 
 // SYNC-CHECK: must match lens-core/src/ingest.rs IngestProgress struct

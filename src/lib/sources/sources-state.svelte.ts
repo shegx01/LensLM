@@ -24,17 +24,27 @@ let loading = $state(false);
 let error = $state<string | null>(null); // transient; polished surfacing deferred to M9
 
 // ---------------------------------------------------------------------------
-// Recently-trashed stash — holds the last soft-deleted source + its original
-// list index so undoRemove() can re-insert it at the right position.
+// Recently-trashed stash — QUEUE of soft-deleted sources.
+//
+// Each entry records the source, the id of the source that preceded it at
+// trash time (prevSiblingId), and its own auto-clear timeout. This allows
+// multiple in-window deletes to be each independently undoable (LIFO).
+//
+// Re-insertion strategy: on undo, reconcile via loadSources(activeNotebookId)
+// so the list always reflects the backend's canonical ordering. The optimistic
+// re-insert before the await keeps the UI responsive, but a successful
+// restoreSource is always followed by a canonical reload.
 // ---------------------------------------------------------------------------
 
-interface TrashStash {
+interface TrashEntry {
   source: Source;
-  index: number;
+  /** id of the source that was immediately before this one when it was trashed; null if it was at index 0. */
+  prevSiblingId: string | null;
   timeoutId: ReturnType<typeof setTimeout>;
 }
 
-let trashStash = $state<TrashStash | null>(null);
+// LIFO queue — newest entry at the tail. undoRemove() pops from the tail.
+let trashQueue = $state<TrashEntry[]>([]);
 
 // ---------------------------------------------------------------------------
 // Exported store object (getter/setter pairs — project pattern)
@@ -53,9 +63,9 @@ export const sourcesStore = {
   set error(e: string | null) {
     error = e;
   },
-  /** Whether a soft-deleted source is currently pending undo (drives the Undo bar). */
+  /** Whether any soft-deleted source is currently pending undo (drives the Undo bar). */
   get recentlyTrashed(): boolean {
-    return trashStash !== null;
+    return trashQueue.length > 0;
   }
 };
 
@@ -75,6 +85,19 @@ export async function loadSources(notebookId: string): Promise<void> {
   } finally {
     loading = false;
   }
+}
+
+/**
+ * Optimistically insert a source into the store WITHOUT a round-trip to the
+ * backend. Called immediately after addFileSource/addTextSource returns so
+ * the row exists in the store before ingest progress events arrive.
+ *
+ * If a source with the same id already exists (e.g. a concurrent loadSources
+ * already reconciled), this is a no-op.
+ */
+export function addSourceLocal(source: Source): void {
+  if (sources.some((s) => s.id === source.id)) return;
+  sources = [...sources, source];
 }
 
 /**
@@ -104,20 +127,26 @@ function phaseToStatus(phase: string): SourceStatus {
   }
 }
 
+function updateSourceStatus(sourceId: string, status: SourceStatus): void {
+  // Mutate in place by index — avoids replacing the whole array on every
+  // progress event (prevents full-list re-renders / derived recomputes per tick).
+  const i = sources.findIndex((s) => s.id === sourceId);
+  if (i >= 0) sources[i] = { ...sources[i], status };
+}
+
 export async function ingest(sourceId: string): Promise<void> {
   function handleEvent(e: StreamEvent<IngestProgress>): void {
     if (e.type === 'chunk' && e.data) {
       // 'chunk' carries IngestProgress { phase, done, total } — update row status.
-      const status = phaseToStatus(e.data.phase);
-      sources = sources.map((s) => (s.id === sourceId ? { ...s, status } : s));
+      updateSourceStatus(sourceId, phaseToStatus(e.data.phase));
     } else if (e.type === 'progress') {
       // 'progress' carries only { done, total } — no phase; reserved for future progress bar.
     } else if (e.type === 'done') {
-      sources = sources.map((s) => (s.id === sourceId ? { ...s, status: 'indexed' } : s));
+      updateSourceStatus(sourceId, 'indexed');
     } else if (e.type === 'failed') {
-      sources = sources.map((s) => (s.id === sourceId ? { ...s, status: 'error' } : s));
+      updateSourceStatus(sourceId, 'error');
     } else if (e.type === 'started') {
-      sources = sources.map((s) => (s.id === sourceId ? { ...s, status: 'parsing' } : s));
+      updateSourceStatus(sourceId, 'parsing');
     }
   }
 
@@ -125,7 +154,7 @@ export async function ingest(sourceId: string): Promise<void> {
     await ingestSource(sourceId, handleEvent);
   } catch (err) {
     console.error('ingest: failed for source', sourceId, err);
-    sources = sources.map((s) => (s.id === sourceId ? { ...s, status: 'error' } : s));
+    updateSourceStatus(sourceId, 'error');
     error = String(err);
   }
 }
@@ -151,7 +180,7 @@ export async function toggleSelected(sourceId: string): Promise<void> {
   }
 }
 
-/** How long (ms) the Undo bar is shown before the stash is cleared. */
+/** How long (ms) the Undo bar is shown before a stash entry is cleared. */
 const TRASH_UNDO_TTL_MS = 6_000;
 
 /**
@@ -159,20 +188,18 @@ const TRASH_UNDO_TTL_MS = 6_000;
  * local state immediately, then the IPC `trash_source` command is awaited.
  * On failure the row is restored and `error` is set.
  *
- * A "recently trashed" stash is held for TRASH_UNDO_TTL_MS so the caller
- * (SourcesRail) can render an Undo bar. Initiating another delete clears
- * the previous stash immediately.
+ * A "recently trashed" entry is pushed onto trashQueue for TRASH_UNDO_TTL_MS
+ * so the caller (SourcesRail) can render an Undo bar. Multiple in-window
+ * deletes each get their own queue entry and independent timeout — no entry
+ * is discarded by a subsequent delete.
  */
 export async function removeSource(sourceId: string): Promise<void> {
   const snapshot = sources.find((s) => s.id === sourceId);
   if (!snapshot) return;
-  const originalIndex = sources.indexOf(snapshot);
 
-  // Clear any pre-existing stash + its timeout before starting a new one.
-  if (trashStash !== null) {
-    clearTimeout(trashStash.timeoutId);
-    trashStash = null;
-  }
+  // Capture the id of the preceding sibling for identity-anchored re-insertion.
+  const idx = sources.indexOf(snapshot);
+  const prevSiblingId = idx > 0 ? sources[idx - 1].id : null;
 
   // Optimistic remove
   sources = sources.filter((s) => s.id !== sourceId);
@@ -180,17 +207,17 @@ export async function removeSource(sourceId: string): Promise<void> {
   try {
     await trashSource(sourceId);
 
-    // Stash for undo — auto-clears after TTL.
+    // Push a new queue entry — auto-removes itself after TTL.
     const timeoutId = setTimeout(() => {
-      trashStash = null;
+      trashQueue = trashQueue.filter((e) => e.source.id !== sourceId);
     }, TRASH_UNDO_TTL_MS);
-    trashStash = { source: snapshot, index: originalIndex, timeoutId };
+    trashQueue = [...trashQueue, { source: snapshot, prevSiblingId, timeoutId }];
   } catch (err) {
     // Revert on failure — re-insert at original position.
-    if (originalIndex >= sources.length) {
+    if (idx >= sources.length) {
       sources = [...sources, snapshot];
     } else {
-      sources = [...sources.slice(0, originalIndex), snapshot, ...sources.slice(originalIndex)];
+      sources = [...sources.slice(0, idx), snapshot, ...sources.slice(idx)];
     }
     console.error('removeSource: failed for source', sourceId, err);
     error = String(err);
@@ -198,27 +225,46 @@ export async function removeSource(sourceId: string): Promise<void> {
 }
 
 /**
- * Undo the most recent soft-delete. Calls `restore_source` IPC and re-inserts
- * the source at its original list position. Clears the stash on success.
+ * Undo the most recent soft-delete (LIFO). Calls `restore_source` IPC, then
+ * reconciles the list via `loadSources` so ordering matches the backend's
+ * canonical newest-first order.
+ *
+ * Identity re-anchor: on successful restore, `loadSources` provides the
+ * canonical list — no stale-index fragility. The optimistic re-insert before
+ * the await is only for perceived responsiveness; the canonical reload
+ * overwrites it.
+ *
  * No-op if there is nothing to undo.
  */
-export async function undoRemove(): Promise<void> {
-  if (trashStash === null) return;
-  const { source, index, timeoutId } = trashStash;
+export async function undoRemove(notebookId?: string): Promise<void> {
+  if (trashQueue.length === 0) return;
 
-  // Clear the timeout so the stash doesn't auto-expire mid-flight.
-  clearTimeout(timeoutId);
-  trashStash = null;
+  // Pop the most-recent entry (LIFO — tail of the queue).
+  const entry = trashQueue[trashQueue.length - 1];
+  clearTimeout(entry.timeoutId);
+  trashQueue = trashQueue.slice(0, -1);
 
-  // Optimistic re-insert at original index.
-  if (index >= sources.length) {
-    sources = [...sources, source];
+  const { source, prevSiblingId } = entry;
+
+  // Optimistic re-insert using identity anchor:
+  // - If prevSiblingId is null (was at index 0), insert at position 0.
+  // - If prevSiblingId exists in current list, insert immediately after it.
+  // - If prevSiblingId is set but no longer in the list (was also deleted), append.
+  let insertAt: number;
+  if (prevSiblingId === null) {
+    insertAt = 0;
   } else {
-    sources = [...sources.slice(0, index), source, ...sources.slice(index)];
+    const siblingIdx = sources.findIndex((s) => s.id === prevSiblingId);
+    insertAt = siblingIdx >= 0 ? siblingIdx + 1 : sources.length;
   }
+  sources = [...sources.slice(0, insertAt), source, ...sources.slice(insertAt)];
 
   try {
     await restoreSource(source.id);
+    // Reconcile with backend canonical order if the caller provides the notebookId.
+    if (notebookId) {
+      await loadSources(notebookId);
+    }
   } catch (err) {
     // Revert the optimistic re-insert.
     sources = sources.filter((s) => s.id !== source.id);
@@ -236,10 +282,10 @@ export function resetSourcesStore(): void {
   sources = [];
   loading = false;
   error = null;
-  if (trashStash !== null) {
-    clearTimeout(trashStash.timeoutId);
-    trashStash = null;
+  for (const entry of trashQueue) {
+    clearTimeout(entry.timeoutId);
   }
+  trashQueue = [];
 }
 
 // ---------------------------------------------------------------------------

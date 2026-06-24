@@ -84,6 +84,22 @@ pub trait Embedder: Send + Sync {
     /// Every returned vector is length-[`EMBED_DIM`] and L2-normalized.
     fn embed_documents(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, LensError>;
 
+    /// Owned-input variant of [`Embedder::embed_documents`] that avoids the
+    /// borrow path's double copy.
+    ///
+    /// On the ingest hot path each chunk's text is already an owned `String`;
+    /// `embed_documents(&[&str])` then clones every input again to prepend the
+    /// `"search_document: "` prefix. This variant takes ownership of the input
+    /// strings so the prefix can be applied in place (a single allocation per
+    /// input). The default impl just borrows back into [`Embedder::embed_documents`]
+    /// so existing implementations keep working unchanged.
+    ///
+    /// Every returned vector is length-[`EMBED_DIM`] and L2-normalized.
+    fn embed_documents_owned(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, LensError> {
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        self.embed_documents(&refs)
+    }
+
     /// Embeds a single query text.
     ///
     /// Prepends `"search_query: "` to the input before passing it to the
@@ -134,6 +150,22 @@ impl FastembedEmbedder {
         })
     }
 
+    /// Embeds a batch of already-prefixed document strings (the
+    /// `"search_document: "` prefix must already be applied) and validates the
+    /// output. Shared by [`Embedder::embed_documents`] and
+    /// [`Embedder::embed_documents_owned`].
+    fn embed_prefixed_documents(&self, prefixed: Vec<String>) -> Result<Vec<Vec<f32>>, LensError> {
+        let prefixed_refs: Vec<&str> = prefixed.iter().map(String::as_str).collect();
+        let result = self
+            .inner
+            .lock()
+            .map_err(|e| LensError::Model(format!("fastembed mutex poisoned: {e}")))?
+            .embed(prefixed_refs, None)
+            .map_err(|e| LensError::Model(format!("fastembed embed_documents failed: {e}")))?;
+        Self::assert_normalized(&result)?;
+        Ok(result)
+    }
+
     /// Asserts that every vector in `vecs` is L2-normalized (‖v‖ ≈ 1.0 ± 1e-3)
     /// and has the expected dimension.
     ///
@@ -174,15 +206,16 @@ impl Embedder for FastembedEmbedder {
             .iter()
             .map(|t| format!("search_document: {t}"))
             .collect();
-        let prefixed_refs: Vec<&str> = prefixed.iter().map(String::as_str).collect();
-        let result = self
-            .inner
-            .lock()
-            .map_err(|e| LensError::Model(format!("fastembed mutex poisoned: {e}")))?
-            .embed(prefixed_refs, None)
-            .map_err(|e| LensError::Model(format!("fastembed embed_documents failed: {e}")))?;
-        Self::assert_normalized(&result)?;
-        Ok(result)
+        self.embed_prefixed_documents(prefixed)
+    }
+
+    /// Owned-input variant: prefixes each input **in place** (`insert_str`) so the
+    /// ingest hot path copies each chunk's text once instead of twice.
+    fn embed_documents_owned(&self, mut texts: Vec<String>) -> Result<Vec<Vec<f32>>, LensError> {
+        for t in texts.iter_mut() {
+            t.insert_str(0, "search_document: ");
+        }
+        self.embed_prefixed_documents(texts)
     }
 
     /// Prepends `"search_query: "` to the text, embeds it, validates normalization

@@ -561,18 +561,23 @@ impl<'a> NotebookRepo<'a> {
         Ok(())
     }
 
-    /// Permanently deletes a source row by id. Errors if no row matches.
+    /// Permanently deletes a source row by id. Child `chunks` rows cascade via
+    /// `ON DELETE CASCADE`.
     ///
     /// Callers are responsible for removing any associated Lance vectors before
-    /// calling this (Lance before SQLite ordering). Child `chunks` rows cascade
-    /// via `ON DELETE CASCADE`.
+    /// calling this (Lance before SQLite ordering). Only affects trashed sources
+    /// (`trashed_at IS NOT NULL`); purging a live or unknown source affects 0 rows
+    /// and returns a validation error, so a live source can never be hard-deleted
+    /// without first being trashed (mirroring [`purge`](Self::purge)).
     pub async fn purge_source(&self, id: &str) -> Result<(), LensError> {
-        let result = sqlx::query("DELETE FROM sources WHERE id = ?")
+        let result = sqlx::query("DELETE FROM sources WHERE id = ? AND trashed_at IS NOT NULL")
             .bind(id)
             .execute(self.pool)
             .await?;
         if result.rows_affected() == 0 {
-            return Err(LensError::Validation(format!("no source with id {id}")));
+            return Err(LensError::Validation(format!(
+                "no trashed source with id {id}"
+            )));
         }
         Ok(())
     }
@@ -876,6 +881,35 @@ mod tests {
         let trashed = repo.list_trashed_with_counts().await.unwrap();
         assert_eq!(trashed.len(), 1);
         assert!(trashed[0].notebook.trashed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn purge_source_requires_trashed() {
+        let pool = test_pool().await;
+        let repo = NotebookRepo::new(&pool);
+        let nb = repo.create("Notebook", None, None).await.unwrap();
+        let src = repo
+            .add_source(&nb.id, "a.pdf", "/abs/a.pdf")
+            .await
+            .unwrap();
+
+        // A LIVE (non-trashed) source must not be hard-purgeable.
+        assert!(matches!(
+            repo.purge_source(&src.id).await,
+            Err(LensError::Validation(_))
+        ));
+        // The source still exists.
+        assert!(repo.get_source(&src.id).await.unwrap().is_some());
+
+        // After trashing, purge succeeds.
+        repo.trash_source(&src.id).await.unwrap();
+        repo.purge_source(&src.id).await.unwrap();
+        assert!(repo.get_source(&src.id).await.unwrap().is_none());
+        // Purging again errors (no rows).
+        assert!(matches!(
+            repo.purge_source(&src.id).await,
+            Err(LensError::Validation(_))
+        ));
     }
 
     #[tokio::test]

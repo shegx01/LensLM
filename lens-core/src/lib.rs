@@ -46,6 +46,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use sqlx::SqlitePool;
+use tokenizers::Tokenizer;
 use tokio::sync::{OnceCell, RwLock, RwLockReadGuard, RwLockWriteGuard, Semaphore};
 
 use crate::notebooks::NotebookRepo;
@@ -81,6 +82,24 @@ pub struct LensEngineInner {
 /// Cloning shares the same underlying state (`Arc`). Mutations go through an
 /// async-aware `RwLock` so guards can be safely held across `.await` points —
 /// this is the interior mutability Tauri's immutable `State<T>` requires.
+///
+/// # Concurrency invariants (load-bearing)
+///
+/// * **Single ingest at a time.** Every ingest run holds the single-permit
+///   [`ingest_lock`](Self::ingest_lock) semaphore for its whole duration (the
+///   ONNX session is single-threaded; concurrent `embed()` must not overlap).
+/// * **Destructive deletes take `ingest_lock`.** [`purge_source`](Self::purge_source)
+///   and [`purge_notebook`](Self::purge_notebook) acquire the same permit across
+///   their cross-store (Lance-then-SQLite) deletes, so a destructive wipe can
+///   never interleave a live ingest of the same source/notebook and leave orphan
+///   Lance rows. [`trash_source`](Self::trash_source) /
+///   [`restore_source`](Self::restore_source) are flag-only (no cross-store
+///   mutation) and are intentionally lock-free.
+/// * **One app instance per data dir.** There is NO cross-process lock; correct
+///   operation assumes a single process owns a given `data_dir` at a time.
+/// * **Trashed-source vectors stay in Lance.** Trashing a source leaves its Lance
+///   vectors in place so it can be restored; retrieval MUST therefore exclude
+///   trashed sources at query time (an M5 obligation).
 #[derive(Clone)]
 pub struct LensEngine {
     inner: Arc<RwLock<LensEngineInner>>,
@@ -89,6 +108,15 @@ pub struct LensEngine {
     /// Lives OUTSIDE the `RwLock` so a model load never serializes DB reads.
     /// Built exactly once via [`LensEngine::embedder`]'s `get_or_try_init`.
     embedder: Arc<OnceCell<Arc<dyn Embedder>>>,
+    /// Lazily-resolved, shared nomic tokenizer (parallel to `embedder`).
+    ///
+    /// The nomic `tokenizer.json` is a multi-MB file; resolving it per-ingest
+    /// re-reads and re-parses it from disk every time. Cache it once here —
+    /// built exactly once via [`LensEngine::tokenizer`]'s `get_or_try_init`
+    /// using the shared [`resolve_nomic_tokenizer`] resolver — and reuse the
+    /// `Arc` across ingests. Lives OUTSIDE the `RwLock` for the same reason as
+    /// `embedder`: a resolve/download must never serialize DB reads.
+    tokenizer: Arc<OnceCell<Arc<Tokenizer>>>,
     /// Single-permit gate serializing ingest runs (the ONNX session is
     /// single-threaded; concurrent `embed()` calls must not overlap).
     ingest_lock: Arc<Semaphore>,
@@ -125,6 +153,7 @@ impl LensEngine {
         Ok(Self {
             inner: Arc::new(RwLock::new(LensEngineInner { db, config })),
             embedder: Arc::new(OnceCell::new()),
+            tokenizer: Arc::new(OnceCell::new()),
             ingest_lock: Arc::new(Semaphore::new(1)),
         })
     }
@@ -148,6 +177,7 @@ impl LensEngine {
                 config: AppConfig::default(),
             })),
             embedder: Arc::new(OnceCell::new()),
+            tokenizer: Arc::new(OnceCell::new()),
             ingest_lock: Arc::new(Semaphore::new(1)),
         }
     }
@@ -306,9 +336,19 @@ impl LensEngine {
 
     /// Permanently deletes a source: drops its Lance vectors first (Lance before
     /// SQLite ordering), then removes the `sources` row. Child `chunks` rows
-    /// cascade. Errors if the source does not exist.
+    /// cascade. Errors if the source does not exist or is not trashed.
+    ///
+    /// Holds the `ingest_lock` permit across the whole cross-store delete so a
+    /// destructive wipe cannot interleave a live ingest of the same source (which
+    /// would otherwise re-insert vectors after the drop, leaving orphans). See
+    /// the module-level concurrency invariants on [`LensEngine`].
     #[tracing::instrument(skip(self))]
     pub async fn purge_source(&self, source_id: &str) -> Result<(), LensError> {
+        let _permit = self
+            .ingest_lock()
+            .acquire()
+            .await
+            .map_err(|e| LensError::Internal(format!("ingest semaphore closed: {e}")))?;
         let pool = self.pool().await;
         let data_dir = self.data_dir().await;
         let source = NotebookRepo::new(&pool)
@@ -402,6 +442,24 @@ impl LensEngine {
             .cloned()
     }
 
+    /// Lazily resolves (once) and returns the shared nomic tokenizer.
+    ///
+    /// The first caller resolves the nomic `tokenizer.json` via the shared
+    /// [`resolve_nomic_tokenizer`] resolver (locating a cached copy or
+    /// downloading it once); subsequent callers reuse the cached `Arc`. This
+    /// mirrors [`LensEngine::embedder`] so the multi-MB tokenizer is parsed
+    /// from disk exactly once per engine rather than on every ingest.
+    pub(crate) async fn tokenizer(&self) -> Result<Arc<Tokenizer>, LensError> {
+        self.tokenizer
+            .get_or_try_init(|| async {
+                let data_dir = self.data_dir().await;
+                let tokenizer = resolve_nomic_tokenizer(&data_dir).await?;
+                Ok::<Arc<Tokenizer>, LensError>(Arc::new(tokenizer))
+            })
+            .await
+            .cloned()
+    }
+
     /// Renames a notebook, bumping `updated_at`.
     #[tracing::instrument(skip_all)]
     pub async fn rename_notebook(&self, id: &NotebookId, title: &str) -> Result<(), LensError> {
@@ -435,9 +493,30 @@ impl LensEngine {
 
     /// Permanently deletes a notebook. Child rows cascade via `ON DELETE CASCADE`.
     /// This is the sole hard-delete path (used by "Delete forever").
+    ///
+    /// Drops the notebook's per-notebook Lance tables FIRST (Lance before SQLite,
+    /// mirroring [`purge_source`](Self::purge_source)): the SQLite delete cascades
+    /// the `embedding_index` rows away, so unless the Lance tables are dropped
+    /// beforehand they would be orphaned on disk forever (no registry row left to
+    /// find them by). A crash between the Lance drop and the SQLite commit is
+    /// benign — a re-purge re-drops the (already-gone) tables idempotently.
+    ///
+    /// Holds the `ingest_lock` permit across the whole cross-store delete so a
+    /// destructive wipe cannot interleave a live ingest into the same notebook.
+    /// See the module-level concurrency invariants on [`LensEngine`].
     #[tracing::instrument(skip_all)]
     pub async fn purge_notebook(&self, id: &NotebookId) -> Result<(), LensError> {
+        let _permit = self
+            .ingest_lock()
+            .acquire()
+            .await
+            .map_err(|e| LensError::Internal(format!("ingest semaphore closed: {e}")))?;
         let pool = self.pool().await;
+        let data_dir = self.data_dir().await;
+        // Lance-first: drop the per-notebook tables BEFORE the SQLite delete
+        // cascades the `embedding_index` rows that name them.
+        let store = crate::vector_store::LanceVectorStore::new(&data_dir, pool.clone());
+        store.drop_notebook_tables(id.as_str()).await?;
         NotebookRepo::new(&pool).purge(id).await
     }
 }

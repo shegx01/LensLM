@@ -1011,7 +1011,11 @@ async fn purge_source_removes_rows_and_vectors() {
     let vecs_before = vector_row_count(&data_dir, &nb.id.to_string(), &src.id).await;
     assert!(vecs_before > 0, "vectors must exist before purge");
 
-    // 4. Purge the source — must succeed.
+    // 4. Trash then purge the source — purge requires a trashed source.
+    engine
+        .trash_source(&src.id)
+        .await
+        .expect("trash_source should succeed");
     engine
         .purge_source(&src.id)
         .await
@@ -1199,7 +1203,11 @@ async fn purge_source_without_vectors_is_clean() {
         .unwrap();
 
     // Purge without any prior ingest — must succeed (vector store handles missing
-    // table gracefully).
+    // table gracefully). Purge requires a trashed source, so trash it first.
+    engine
+        .trash_source(&src.id)
+        .await
+        .expect("trash_source should succeed");
     engine
         .purge_source(&src.id)
         .await

@@ -14,7 +14,7 @@
   import { cn } from '$lib/utils.js';
   import { Button } from '$lib/components/ui/button/index.js';
   import { addFileSource, addTextSource } from '$lib/sources/ipc.js';
-  import { loadSources, ingest } from '$lib/sources/sources-state.svelte.js';
+  import { addSourceLocal, loadSources, ingest } from '$lib/sources/sources-state.svelte.js';
   import { notebookStore } from '$lib/notebooks/index.js';
 
   // ---------------------------------------------------------------------------
@@ -111,9 +111,13 @@
       // Use both / and \ to extract the filename (Tauri returns OS-native paths).
       const name = path.split(/[\\/]/).pop() ?? path;
       const source = await addFileSource(activeNotebookId, name, path);
-      await loadSources(activeNotebookId);
+      // Optimistically insert the row BEFORE starting ingest so progress events
+      // find the entry in the store immediately (avoids silent drops).
+      addSourceLocal(source);
       void ingest(source.id);
       onclose?.();
+      // Reconcile with backend ordering after the modal closes.
+      void loadSources(activeNotebookId);
     } catch (err) {
       uploadError = 'Could not add file. Please try again.';
       console.error('AddSourcesModal: handleBrowse failed', err);
@@ -150,9 +154,13 @@
     try {
       const title = pasteTitle.trim() || 'Untitled text';
       const source = await addTextSource(activeNotebookId, title, pasteContent.trim(), 'text');
-      await loadSources(activeNotebookId);
+      // Optimistically insert the row BEFORE starting ingest so progress events
+      // find the entry in the store immediately (avoids silent drops).
+      addSourceLocal(source);
       void ingest(source.id);
       onclose?.();
+      // Reconcile with backend ordering after the modal closes.
+      void loadSources(activeNotebookId);
     } catch (err) {
       pasteError = 'Could not add source. Please try again.';
       console.error('AddSourcesModal: handlePasteSubmit failed', err);

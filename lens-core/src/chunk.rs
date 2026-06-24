@@ -7,7 +7,8 @@
 //! * **Parents** (`level = 0`, `kind = "parent"`, `parent_id = None`): pack
 //!   adjacent blocks into windows of approximately **512 tokens** each.
 //! * **Children** (`level = 1`, `kind = "child"`, `parent_id = Some(parent_id)`):
-//!   split each parent text into windows of approximately **128 tokens** each.
+//!   split each parent text into windows of approximately **128 tokens** each,
+//!   with a small overlap between adjacent children (see [`CHILD_OVERLAP_TOKENS`]).
 //!
 //! Both parents and children are returned in one `Vec<Chunk>` (interleaved:
 //! each parent followed immediately by its children).  They all become rows in
@@ -22,7 +23,9 @@
 //! ```
 //! The public functions take `src: &str` so they can slice the original bytes
 //! directly; blocks are joined by preserving the source bytes between them rather
-//! than inserting synthetic `\n` separators.
+//! than inserting synthetic `\n` separators.  This holds even with child overlap:
+//! overlapping children share source bytes, but each child's `text` is still a
+//! single verbatim contiguous source span.
 //!
 //! ## Token counting
 //!
@@ -30,6 +33,16 @@
 //! `tokenizers::Tokenizer`.  This is the **same tokenizer** that
 //! `fastembed`/`nomic-embed-text-v1.5` uses internally, so the 512/128 windows
 //! are measured with the same vocabulary as the eventual embedding step.
+//!
+//! Window *packing* uses an **incremental** count: each block is tokenized once
+//! and a running per-block sum drives the "would this overflow?" decision.  The
+//! per-block sum is a conservative over-estimate of the merged-span count
+//! (`encode(.., true)` adds CLS/SEP special tokens per call, and cross-block
+//! subword merges only ever *reduce* the count), so packing never *under*-counts
+//! and never exceeds the bound.  At each flush boundary the exact merged span is
+//! re-encoded once to record the precise `token_start`/`token_end`.  This avoids
+//! the previous O(n²) behaviour of re-tokenizing the whole growing window on
+//! every block.
 //!
 //! ## Tolerance
 //!
@@ -85,6 +98,26 @@ pub const CHILD_TOKEN_TOLERANCE: usize = 1;
 /// Allowed overshoot above the parent target due to boundary tokenization.
 pub const PARENT_TOKEN_TOLERANCE: usize = 1;
 
+/// Number of tokens each child re-shares with the tail of the previous child.
+///
+/// Children are otherwise non-overlapping windows.  A concept whose phrasing
+/// straddles a child boundary would, without overlap, be split across two
+/// children such that *neither* embeds the whole concept — hurting recall.  By
+/// having each child (after the first within a parent) start ~`CHILD_OVERLAP_TOKENS`
+/// tokens back into the previous child's tail, the boundary concept appears
+/// intact in at least one child.
+///
+/// `16` is ≈12% of the 128-token child target — large enough to capture a short
+/// phrase spanning the seam, small enough to keep redundancy (and embedding
+/// cost) low.  Parents stay **non-overlapping**: overlap is a child-level
+/// retrieval aid, and overlapping parents would inflate the context the LLM
+/// re-reads after a child hit.
+///
+/// Byte-identity is preserved: the overlap means adjacent child spans *share*
+/// source bytes, but each child's `text` is still one verbatim contiguous slice
+/// of `src`.
+pub const CHILD_OVERLAP_TOKENS: usize = 16;
+
 /// A chunk row ready for insertion into the `chunks` SQLite table.
 ///
 /// Fields map 1-to-1 to the table columns defined in
@@ -118,9 +151,14 @@ pub struct Chunk {
     /// Byte offset one-past the last byte of this chunk in the source string.
     pub char_end: i64,
     /// Block type of the first (or dominant) block composing this chunk.
-    /// Maps to the `chunks.block_type` column.  Parent chunks carry the block
-    /// type of their first constituent block; child chunks inherit from the
-    /// parent block.  `None` is valid (the column is nullable in SQLite).
+    ///
+    /// **Lossy for multi-block parents.**  A parent packed from several blocks
+    /// carries only the **first** (dominant) block's `block_type` — there is no
+    /// single value that describes a mixed window, so downstream consumers must
+    /// treat a parent's `block_type` as the leading block's type, not an
+    /// invariant over every byte in the parent.  Child chunks inherit the type
+    /// of the block they were split from.  `None` is valid (the column is
+    /// nullable in SQLite).
     pub block_type: Option<String>,
 }
 
@@ -271,6 +309,58 @@ fn chunk_blocks_inner(
 }
 
 // ---------------------------------------------------------------------------
+// Oversized-block splitting (shared by parent and child levels)
+// ---------------------------------------------------------------------------
+
+/// Splits a single oversized `block` whose text exceeds `limit` tokens into
+/// bounded contiguous sub-spans, invoking `emit` once per sub-span.
+///
+/// This is the single source of truth for "find split point → slice → emit"
+/// at both the parent and child levels; the two callers differ only in `limit`
+/// and what they build from each `(seg_text, abs_start, abs_end)` triple
+/// (a [`ParentWindow`] vs a child [`Chunk`]).  `block.text` is a verbatim slice
+/// of `src` anchored at `block.char_start`, so slicing `src[abs_start..abs_end]`
+/// yields byte-identical sub-span text.
+///
+/// `emit` receives `(seg_text, abs_start, abs_end)` where `abs_*` are absolute
+/// byte offsets in `src` and `src[abs_start..abs_end] == seg_text`.
+fn split_oversized<F>(
+    src: &str,
+    block: &Block,
+    limit: usize,
+    tokenizer: &Tokenizer,
+    mut emit: F,
+) -> Result<(), LensError>
+where
+    F: FnMut(&str, usize, usize) -> Result<(), LensError>,
+{
+    let limit = limit.max(1);
+    let text = &block.text;
+    let mut seg_start_byte: usize = 0; // byte offset within `block.text`
+
+    while seg_start_byte < text.len() {
+        let remaining = &text[seg_start_byte..];
+        let seg_len = find_split(remaining, tokenizer, limit)?;
+        let mut seg_end_byte = (seg_start_byte + seg_len).min(text.len());
+        // Ensure progress — never produce a zero-length segment.
+        if seg_end_byte <= seg_start_byte {
+            seg_end_byte = (seg_start_byte + 1).min(text.len());
+        }
+
+        // Absolute byte offsets in the source string.
+        let abs_start = block.char_start + seg_start_byte;
+        let abs_end = (block.char_start + seg_end_byte).min(src.len());
+        let seg_text = &src[abs_start..abs_end];
+
+        emit(seg_text, abs_start, abs_end)?;
+
+        seg_start_byte = seg_end_byte;
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Parent window building
 // ---------------------------------------------------------------------------
 
@@ -280,7 +370,7 @@ struct ParentWindow {
     text: String,
     /// Heading trail from the first block in this window.
     section_path: String,
-    /// Block type of the first block in this window.
+    /// Block type of the first block in this window (see [`Chunk::block_type`]).
     block_type: Option<String>,
     /// Byte offset of the first byte of the first block.
     char_start: usize,
@@ -296,6 +386,11 @@ struct ParentWindow {
 /// The window text is `src[first.char_start..last.char_end]` — verbatim source
 /// bytes including any whitespace between blocks — so
 /// `src[window.char_start..window.char_end] == window.text` always holds.
+///
+/// Token counting is **incremental**: each block is tokenized once and a running
+/// per-block sum drives the overflow decision (see the module-level "Token
+/// counting" note).  The exact merged-span count is recorded later, in
+/// `chunk_blocks_inner`, when each window's parent chunk is emitted.
 fn build_parent_windows(
     src: &str,
     blocks: &[Block],
@@ -307,30 +402,37 @@ fn build_parent_windows(
     let mut current_blocks: Vec<Block> = Vec::new();
     let mut current_char_start: usize = 0;
     let mut current_char_end: usize = 0;
+    let mut current_tokens: usize = 0; // running per-block sum for the open window
 
     for block in blocks {
-        // Compute tentative text if we add this block to the current window.
-        let tentative_start = if current_blocks.is_empty() {
-            block.char_start
-        } else {
-            current_char_start
-        };
-        let tentative_end = block.char_end;
-        let tentative_text = &src[tentative_start..tentative_end.min(src.len())];
-        let tentative_tokens = token_count(tokenizer, tentative_text)?;
+        // Tokenize this block exactly once.
+        let block_tokens = token_count(tokenizer, &block.text)?;
 
         // If this single block already exceeds the limit on its own, split it
         // (after flushing any in-progress window) into multiple BOUNDED parent
         // windows so no parent ever exceeds PARENT_TOKEN_TARGET + tolerance. A
         // single oversized block previously became one unbounded parent, which
         // violated the AC "parent ≤ 512 + tolerance".
-        if current_blocks.is_empty() && token_count(tokenizer, &block.text)? > limit {
+        if block_tokens > limit {
+            if !current_blocks.is_empty() {
+                flush_parent_window(
+                    src,
+                    &current_blocks,
+                    current_char_start,
+                    current_char_end,
+                    &mut windows,
+                );
+                current_blocks.clear();
+                current_tokens = 0;
+            }
             split_oversized_parent_block(src, block, tokenizer, limit, &mut windows)?;
             continue;
         }
 
         // If adding this block would overflow the current window, flush it.
-        if !current_blocks.is_empty() && tentative_tokens > limit {
+        // The running sum is a conservative over-estimate of the exact merged
+        // count, so this never under-counts.
+        if !current_blocks.is_empty() && current_tokens + block_tokens > limit {
             flush_parent_window(
                 src,
                 &current_blocks,
@@ -339,12 +441,14 @@ fn build_parent_windows(
                 &mut windows,
             );
             current_blocks.clear();
+            current_tokens = 0;
         }
 
         if current_blocks.is_empty() {
             current_char_start = block.char_start;
         }
         current_char_end = block.char_end;
+        current_tokens += block_tokens;
         current_blocks.push(block.clone());
     }
 
@@ -363,9 +467,8 @@ fn build_parent_windows(
 }
 
 /// Splits a single block whose text exceeds the PARENT token limit into multiple
-/// bounded [`ParentWindow`]s, mirroring the child-level
-/// [`split_oversized_block`] logic (whitespace-boundary scan via
-/// [`find_child_split`]) but at the parent limit.
+/// bounded [`ParentWindow`]s via the shared [`split_oversized`] helper at the
+/// parent limit.
 ///
 /// Each emitted window carries a synthetic single-block `blocks` vector that is a
 /// verbatim sub-slice of the original block, so the downstream child splitter
@@ -379,46 +482,30 @@ fn split_oversized_parent_block(
     limit: usize,
     windows: &mut Vec<ParentWindow>,
 ) -> Result<(), LensError> {
-    let limit = limit.max(1);
-    let text = &block.text;
-    let mut seg_start_byte: usize = 0; // byte offset within `block.text`
-
-    while seg_start_byte < text.len() {
-        let remaining = &text[seg_start_byte..];
-        let seg_len = find_child_split(remaining, tokenizer, limit)?;
-        let mut seg_end_byte = (seg_start_byte + seg_len).min(text.len());
-        // Ensure progress — never produce a zero-length segment.
-        if seg_end_byte <= seg_start_byte {
-            seg_end_byte = (seg_start_byte + 1).min(text.len());
-        }
-
-        // Absolute byte offsets in the source string (block.text is a verbatim
-        // slice of src anchored at block.char_start). Slice `src` directly so the
-        // window text is byte-identical to the source span.
-        let abs_start = block.char_start + seg_start_byte;
-        let abs_end = (block.char_start + seg_end_byte).min(src.len());
-        let seg_text = src[abs_start..abs_end].to_string();
-
-        let sub_block = Block {
-            block_type: block.block_type.clone(),
-            section_path: block.section_path.clone(),
-            text: seg_text.clone(),
-            char_start: abs_start,
-            char_end: abs_end,
-        };
-        windows.push(ParentWindow {
-            text: seg_text,
-            section_path: block.section_path.clone(),
-            block_type: Some(block.block_type.clone()),
-            char_start: abs_start,
-            char_end: abs_end,
-            blocks: vec![sub_block],
-        });
-
-        seg_start_byte = seg_end_byte;
-    }
-
-    Ok(())
+    split_oversized(
+        src,
+        block,
+        limit,
+        tokenizer,
+        |seg_text, abs_start, abs_end| {
+            let sub_block = Block {
+                block_type: block.block_type.clone(),
+                section_path: block.section_path.clone(),
+                text: seg_text.to_string(),
+                char_start: abs_start,
+                char_end: abs_end,
+            };
+            windows.push(ParentWindow {
+                text: seg_text.to_string(),
+                section_path: block.section_path.clone(),
+                block_type: Some(block.block_type.clone()),
+                char_start: abs_start,
+                char_end: abs_end,
+                blocks: vec![sub_block],
+            });
+            Ok(())
+        },
+    )
 }
 
 /// Finalises a parent window and appends it to `windows`.
@@ -451,16 +538,54 @@ fn flush_parent_window(
 // Child chunk building
 // ---------------------------------------------------------------------------
 
+/// Mutable state threaded through child packing, mirroring the locals that
+/// [`flush_parent_window`] takes by argument.  Holds the open child window's
+/// blocks, its byte span, and the running per-block token sum (incremental
+/// count — see the module "Token counting" note).
+struct ChildAccumulator<'a> {
+    blocks: Vec<&'a Block>,
+    char_start: usize,
+    char_end: usize,
+    /// Running per-block token sum for the open window (conservative).
+    tokens: usize,
+}
+
+impl<'a> ChildAccumulator<'a> {
+    fn new() -> Self {
+        Self {
+            blocks: Vec::new(),
+            char_start: 0,
+            char_end: 0,
+            tokens: 0,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.blocks.is_empty()
+    }
+}
+
+/// Read-only context for the child splitter, grouping the parameters that do
+/// not change across a single parent's children.
+struct ChildCtx<'a> {
+    src: &'a str,
+    tokenizer: &'a Tokenizer,
+    parent_id: &'a str,
+    strategy: &'a IdStrategy,
+}
+
 /// Splits a parent window into child chunks of ≤ `CHILD_TOKEN_TARGET +
-/// CHILD_TOKEN_TOLERANCE` tokens.
+/// CHILD_TOKEN_TOLERANCE` tokens, with a [`CHILD_OVERLAP_TOKENS`]-token overlap
+/// between adjacent children.
 ///
 /// Splitting follows block boundaries first: blocks are packed into child
-/// windows exactly as parent windows are packed from blocks.  If a single
-/// block exceeds the child limit it is split at whitespace boundaries (best
-/// effort — guaranteed to terminate).
+/// windows exactly as parent windows are packed from blocks (incremental token
+/// count).  If a single block exceeds the child limit it is split at whitespace
+/// boundaries (best effort — guaranteed to terminate).
 ///
-/// Each child's text is `src[child.char_start..child.char_end]`, preserving
-/// the byte-identity invariant.
+/// Each child's text is `src[child.char_start..child.char_end]`, preserving the
+/// byte-identity invariant.  Overlapping children share source bytes, but each
+/// child's span is still a single verbatim contiguous slice.
 fn build_child_chunks(
     src: &str,
     win: &ParentWindow,
@@ -471,229 +596,367 @@ fn build_child_chunks(
     child_ordinal: &mut usize,
 ) -> Result<Vec<Chunk>, LensError> {
     let limit = CHILD_TOKEN_TARGET + CHILD_TOKEN_TOLERANCE;
+    let ctx = ChildCtx {
+        src,
+        tokenizer,
+        parent_id,
+        strategy,
+    };
     let mut children: Vec<Chunk> = Vec::new();
     let mut running_token_offset = parent_token_start;
-
-    let mut child_blocks: Vec<&Block> = Vec::new();
-    let mut child_char_start: usize = 0;
-    let mut child_char_end: usize = 0;
-
-    // Helper: emit a child chunk from the current child_blocks accumulation.
-    // Evaluates to the updated token offset (unchanged if nothing was flushed).
-    macro_rules! flush_child {
-        () => {{
-            if !child_blocks.is_empty() {
-                let end = child_char_end.min(src.len());
-                let text = src[child_char_start..end].to_string();
-                let toks = token_count(tokenizer, &text)? as i64;
-                let section_path = child_blocks
-                    .first()
-                    .map(|b| b.section_path.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let block_type_val = child_blocks.first().map(|b| b.block_type.clone());
-                let t_start = running_token_offset;
-                let t_end = t_start + toks;
-                let id = strategy.make_id(1, &section_path, &text, *child_ordinal);
-                *child_ordinal += 1;
-                children.push(Chunk {
-                    id,
-                    parent_id: Some(parent_id.to_string()),
-                    kind: kind::CHILD.to_string(),
-                    level: 1,
-                    section_path,
-                    text,
-                    token_start: t_start,
-                    token_end: t_end,
-                    char_start: child_char_start as i64,
-                    char_end: end as i64,
-                    block_type: block_type_val,
-                });
-                child_blocks.clear();
-                t_end
-            } else {
-                running_token_offset
-            }
-        }};
-    }
+    let mut acc = ChildAccumulator::new();
+    // Byte offset within the parent span at which the *next* child window should
+    // begin so it overlaps the tail of the just-flushed child.  `None` means no
+    // overlap seed is pending (first child, or after an oversized-block split).
+    let mut pending_overlap_start: Option<usize> = None;
 
     for block in &win.blocks {
-        let block_alone_tokens = token_count(tokenizer, &block.text)?;
+        // Tokenize each block exactly once (incremental count — no re-encoding
+        // of the growing window).
+        let block_tokens = token_count(tokenizer, &block.text)?;
 
         // Oversized single block: flush the current child window first, then
-        // split the block at whitespace boundaries.
-        if block_alone_tokens > limit {
-            running_token_offset = flush_child!();
-            let sub = split_oversized_block(
-                SplitCtx {
-                    block,
-                    tokenizer,
-                    parent_id,
-                    strategy,
-                    limit,
-                },
+        // split the block at whitespace boundaries.  Overlap does not span an
+        // oversized hard-split (the split already packs tightly to the limit).
+        if block_tokens > limit {
+            running_token_offset = flush_child_window(
+                &ctx,
+                &mut acc,
+                &mut children,
+                running_token_offset,
+                child_ordinal,
+            )?;
+            pending_overlap_start = None;
+            split_oversized_child_block(
+                &ctx,
+                block,
+                limit,
+                &mut children,
                 &mut running_token_offset,
                 child_ordinal,
             )?;
-            children.extend(sub);
             continue;
         }
 
-        // Compute tentative span if we add this block to the current child window.
-        let tentative_start = if child_blocks.is_empty() {
-            block.char_start
-        } else {
-            child_char_start
-        };
-        let tentative_text = &src[tentative_start..block.char_end.min(src.len())];
-        let tentative_tokens = token_count(tokenizer, tentative_text)?;
-
-        if !child_blocks.is_empty() && tentative_tokens > limit {
-            running_token_offset = flush_child!();
+        // When opening a fresh window, fold any pending overlap seed in. Keep
+        // the seed only if its tail token cost plus this block still fits the
+        // limit; otherwise drop the overlap for this window and start at the
+        // block boundary so the window never exceeds the bound. The seeded
+        // tokens become the window's starting count (conservative incremental
+        // sum: overlap-tail tokens + per-block sums).
+        if acc.is_empty() {
+            let overlap_tokens = match pending_overlap_start {
+                Some(ov) => seed_overlap_tokens(src, ov, block.char_start, tokenizer)?,
+                None => 0,
+            };
+            if overlap_tokens + block_tokens > limit {
+                pending_overlap_start = None;
+                acc.char_start = block.char_start;
+                acc.tokens = 0;
+            } else {
+                acc.char_start = pending_overlap_start.unwrap_or(block.char_start);
+                acc.tokens = overlap_tokens;
+            }
+            acc.char_end = block.char_end;
+            acc.tokens += block_tokens;
+            acc.blocks.push(block);
+            continue;
         }
 
-        if child_blocks.is_empty() {
-            child_char_start = block.char_start;
+        // Incremental overflow check: running sum + this block. The running sum
+        // is a conservative over-estimate of the exact merged-span count, so we
+        // never under-count and never exceed the bound.
+        if acc.tokens + block_tokens > limit {
+            running_token_offset = flush_child_window(
+                &ctx,
+                &mut acc,
+                &mut children,
+                running_token_offset,
+                child_ordinal,
+            )?;
+            pending_overlap_start = overlap_back_off(src, win, children.last(), tokenizer)?;
+
+            // Reopen the window with the (possibly overlap-seeded) block.
+            let overlap_tokens = match pending_overlap_start {
+                Some(ov) => seed_overlap_tokens(src, ov, block.char_start, tokenizer)?,
+                None => 0,
+            };
+            if overlap_tokens + block_tokens > limit {
+                pending_overlap_start = None;
+                acc.char_start = block.char_start;
+                acc.tokens = 0;
+            } else {
+                acc.char_start = pending_overlap_start.unwrap_or(block.char_start);
+                acc.tokens = overlap_tokens;
+            }
+            acc.char_end = block.char_end;
+            acc.tokens += block_tokens;
+            acc.blocks.push(block);
+            continue;
         }
-        child_char_end = block.char_end;
-        child_blocks.push(block);
+
+        // Block fits in the open window.
+        acc.char_end = block.char_end;
+        acc.tokens += block_tokens;
+        acc.blocks.push(block);
     }
 
-    // Update running_token_offset with the final child's token end so the
-    // accumulated offset is consistent; the caller doesn't use this return
-    // value, but the variable must be live here to satisfy `unused_assignments`.
-    let _final_child_token_end = flush_child!();
+    // Flush the final child window.
+    flush_child_window(
+        &ctx,
+        &mut acc,
+        &mut children,
+        running_token_offset,
+        child_ordinal,
+    )?;
 
     Ok(children)
 }
 
-/// Context passed to [`split_oversized_block`], grouping the read-only
-/// parameters to stay within the 7-argument clippy limit.
-struct SplitCtx<'a> {
-    block: &'a Block,
-    tokenizer: &'a Tokenizer,
-    parent_id: &'a str,
-    strategy: &'a IdStrategy,
-    limit: usize,
+/// Finalises the open child window in `acc` (if any), appends the resulting
+/// child [`Chunk`] to `children`, clears `acc`, and returns the updated running
+/// token offset.  Symmetric with [`flush_parent_window`].
+///
+/// The exact token count of the flushed span is computed once here, so the
+/// child's `token_end - token_start` is the true span length (satisfying the
+/// `≤ CHILD_TOKEN_TARGET + tolerance` contract).
+fn flush_child_window(
+    ctx: &ChildCtx<'_>,
+    acc: &mut ChildAccumulator<'_>,
+    children: &mut Vec<Chunk>,
+    running_token_offset: i64,
+    child_ordinal: &mut usize,
+) -> Result<i64, LensError> {
+    if acc.is_empty() {
+        return Ok(running_token_offset);
+    }
+
+    let end = acc.char_end.min(ctx.src.len());
+    let text = ctx.src[acc.char_start..end].to_string();
+    let toks = token_count(ctx.tokenizer, &text)? as i64;
+    let section_path = acc
+        .blocks
+        .first()
+        .map(|b| b.section_path.as_str())
+        .unwrap_or("")
+        .to_string();
+    let block_type_val = acc.blocks.first().map(|b| b.block_type.clone());
+    let t_start = running_token_offset;
+    let t_end = t_start + toks;
+    let id = ctx
+        .strategy
+        .make_id(1, &section_path, &text, *child_ordinal);
+    *child_ordinal += 1;
+
+    children.push(Chunk {
+        id,
+        parent_id: Some(ctx.parent_id.to_string()),
+        kind: kind::CHILD.to_string(),
+        level: 1,
+        section_path,
+        text,
+        token_start: t_start,
+        token_end: t_end,
+        char_start: acc.char_start as i64,
+        char_end: end as i64,
+        block_type: block_type_val,
+    });
+
+    acc.blocks.clear();
+    acc.char_start = 0;
+    acc.char_end = 0;
+    acc.tokens = 0;
+
+    Ok(t_end)
 }
 
-/// Splits a single block whose text exceeds the child token limit into multiple
-/// child chunks by scanning for whitespace boundaries.
+/// Computes the byte offset within the parent span at which the *next* child
+/// should begin so it re-shares ~[`CHILD_OVERLAP_TOKENS`] tokens with the tail
+/// of `last_child`.  Returns `None` if no meaningful overlap is possible (no
+/// previous child, or the previous child is itself ≤ the overlap budget).
+///
+/// The returned offset is clamped to a `char_boundary` of `src` and is `>=`
+/// the previous child's `char_start` (so windows never run backward past the
+/// child they overlap) — preserving byte-identity for the next contiguous span.
+fn overlap_back_off(
+    src: &str,
+    win: &ParentWindow,
+    last_child: Option<&Chunk>,
+    tokenizer: &Tokenizer,
+) -> Result<Option<usize>, LensError> {
+    let Some(prev) = last_child else {
+        return Ok(None);
+    };
+    if CHILD_OVERLAP_TOKENS == 0 {
+        return Ok(None);
+    }
+    let prev_start = prev.char_start as usize;
+    let prev_end = (prev.char_end as usize).min(src.len());
+    if prev_end <= prev_start {
+        return Ok(None);
+    }
+
+    // Find the largest byte offset `b` in (prev_start, prev_end) such that the
+    // tail `src[b..prev_end]` is ~CHILD_OVERLAP_TOKENS tokens.  We want the
+    // overlap span to hold *at most* CHILD_OVERLAP_TOKENS tokens of real
+    // content, so walk whitespace boundaries from the end.
+    let mut candidates: Vec<usize> = Vec::new();
+    for (idx, ch) in src[prev_start..prev_end].char_indices() {
+        if ch.is_whitespace() {
+            let abs = prev_start + idx + ch.len_utf8();
+            if abs > prev_start && abs < prev_end {
+                candidates.push(abs);
+            }
+        }
+    }
+    // Pick the earliest candidate whose tail is ≤ CHILD_OVERLAP_TOKENS so we
+    // capture as much of the boundary concept as the budget allows.
+    let mut chosen: Option<usize> = None;
+    for &b in &candidates {
+        let tail_tokens = token_count(tokenizer, &src[b..prev_end])?;
+        if tail_tokens <= CHILD_OVERLAP_TOKENS {
+            chosen = Some(b);
+            break;
+        }
+    }
+
+    // The next child must extend strictly beyond the previous child, otherwise
+    // the overlap seed alone would reproduce the previous child verbatim and
+    // stall progress.  `win` bounds the parent span; if the overlap start is at
+    // or past the parent end there is nothing left to overlap into.
+    match chosen {
+        Some(b) if b < win.char_end => Ok(Some(b)),
+        _ => Ok(None),
+    }
+}
+
+/// Token cost of the overlap tail `src[overlap_start..block_start]` that a
+/// fresh, overlap-seeded child window would carry before its first block.
+/// Returns `0` when the seed does not actually precede the block.
+fn seed_overlap_tokens(
+    src: &str,
+    overlap_start: usize,
+    block_start: usize,
+    tokenizer: &Tokenizer,
+) -> Result<usize, LensError> {
+    let end = block_start.min(src.len());
+    if overlap_start >= end {
+        return Ok(0);
+    }
+    token_count(tokenizer, &src[overlap_start..end])
+}
+
+/// Splits a single oversized child block into bounded child [`Chunk`]s via the
+/// shared [`split_oversized`] helper at the child limit.
 ///
 /// Byte-identity is preserved: absolute `char_start/char_end` are anchored to
 /// `block.char_start + seg_start_byte` so `src[char_start..char_end] == chunk.text`
-/// holds for every emitted sub-chunk (since `block.text` is a verbatim slice of `src`).
-fn split_oversized_block(
-    ctx: SplitCtx<'_>,
+/// holds for every emitted sub-chunk.  Oversized hard-splits are *not* overlapped
+/// (they already pack tightly to the limit).
+fn split_oversized_child_block(
+    ctx: &ChildCtx<'_>,
+    block: &Block,
+    limit: usize,
+    children: &mut Vec<Chunk>,
     running_token_offset: &mut i64,
     child_ordinal: &mut usize,
-) -> Result<Vec<Chunk>, LensError> {
-    let SplitCtx {
+) -> Result<(), LensError> {
+    split_oversized(
+        ctx.src,
         block,
-        tokenizer,
-        parent_id,
-        strategy,
         limit,
-    } = ctx;
-    let limit = limit.max(1);
-    let text = &block.text;
-    let mut chunks: Vec<Chunk> = Vec::new();
-    let mut seg_start_byte: usize = 0; // byte offset within `text`
-
-    while seg_start_byte < text.len() {
-        let remaining = &text[seg_start_byte..];
-        let seg_len = find_child_split(remaining, tokenizer, limit)?;
-        let seg_end_byte = (seg_start_byte + seg_len).min(text.len());
-        // Ensure progress — never produce a zero-length segment.
-        let seg_end_byte = if seg_end_byte <= seg_start_byte {
-            (seg_start_byte + 1).min(text.len())
-        } else {
-            seg_end_byte
-        };
-
-        let seg_text = &text[seg_start_byte..seg_end_byte];
-        let seg_tokens = token_count(tokenizer, seg_text)? as i64;
-        let t_start = *running_token_offset;
-        let t_end = t_start + seg_tokens;
-
-        // Absolute byte offsets in the source string.
-        let abs_start = block.char_start + seg_start_byte;
-        let abs_end = block.char_start + seg_end_byte;
-
-        let id = strategy.make_id(1, &block.section_path, seg_text, *child_ordinal);
-        *child_ordinal += 1;
-
-        chunks.push(Chunk {
-            id,
-            parent_id: Some(parent_id.to_string()),
-            kind: kind::CHILD.to_string(),
-            level: 1,
-            section_path: block.section_path.clone(),
-            text: seg_text.to_string(),
-            token_start: t_start,
-            token_end: t_end,
-            char_start: abs_start as i64,
-            char_end: abs_end as i64,
-            block_type: Some(block.block_type.clone()),
-        });
-
-        *running_token_offset = t_end;
-        seg_start_byte = seg_end_byte;
-    }
-
-    Ok(chunks)
+        ctx.tokenizer,
+        |seg_text, abs_start, abs_end| {
+            let seg_tokens = token_count(ctx.tokenizer, seg_text)? as i64;
+            let t_start = *running_token_offset;
+            let t_end = t_start + seg_tokens;
+            let id = ctx
+                .strategy
+                .make_id(1, &block.section_path, seg_text, *child_ordinal);
+            *child_ordinal += 1;
+            children.push(Chunk {
+                id,
+                parent_id: Some(ctx.parent_id.to_string()),
+                kind: kind::CHILD.to_string(),
+                level: 1,
+                section_path: block.section_path.clone(),
+                text: seg_text.to_string(),
+                token_start: t_start,
+                token_end: t_end,
+                char_start: abs_start as i64,
+                char_end: abs_end as i64,
+                block_type: Some(block.block_type.clone()),
+            });
+            *running_token_offset = t_end;
+            Ok(())
+        },
+    )
 }
 
 /// Returns the byte offset (within `text`) at which to split to stay under
 /// `limit` tokens.  Tries to split at a whitespace boundary.
 ///
+/// Uses a **binary search** over whitespace-boundary candidates instead of a
+/// linear re-tokenize-every-boundary scan: token count is monotonic in prefix
+/// length, so the longest prefix that fits can be found in `O(log n)` encodes.
+/// Falls back to a per-character binary search when the text has no usable
+/// whitespace boundary.
+///
 /// Guaranteed to return a value in `1..=text.len()` so the caller never loops
 /// infinitely on a non-empty `text`.
-fn find_child_split(text: &str, tokenizer: &Tokenizer, limit: usize) -> Result<usize, LensError> {
+fn find_split(text: &str, tokenizer: &Tokenizer, limit: usize) -> Result<usize, LensError> {
     // Fast path: the whole segment fits.
     if token_count(tokenizer, text)? <= limit {
         return Ok(text.len());
     }
 
-    // Walk forward finding the last whitespace boundary before the limit.
-    let mut last_ws_byte: usize = 0;
-    let mut prev_byte: usize = 0;
+    // Collect whitespace-boundary byte offsets (split *before* the whitespace,
+    // matching the previous behaviour where `&text[..byte_idx]` was the prefix).
+    let ws_boundaries: Vec<usize> = text
+        .char_indices()
+        .filter(|(idx, ch)| *idx > 0 && ch.is_whitespace())
+        .map(|(idx, _)| idx)
+        .collect();
 
-    for (byte_idx, ch) in text.char_indices() {
-        if ch.is_whitespace() {
-            let candidate = &text[..byte_idx];
-            let toks = token_count(tokenizer, candidate)?;
-            if toks <= limit {
-                last_ws_byte = byte_idx;
+    // Binary search for the largest whitespace boundary whose prefix fits.
+    // Monotonicity: token_count(text[..a]) <= token_count(text[..b]) for a <= b.
+    if !ws_boundaries.is_empty() {
+        let mut lo = 0usize;
+        let mut hi = ws_boundaries.len(); // exclusive
+        let mut best: Option<usize> = None;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let cut = ws_boundaries[mid];
+            if token_count(tokenizer, &text[..cut])? <= limit {
+                best = Some(cut);
+                lo = mid + 1;
             } else {
-                // Past the limit — split at last good whitespace boundary.
-                if last_ws_byte == 0 {
-                    // No whitespace found before limit; split here.
-                    last_ws_byte = prev_byte.max(1);
-                }
-                return Ok(last_ws_byte);
+                hi = mid;
             }
         }
-        prev_byte = byte_idx + ch.len_utf8();
-    }
-
-    // Scanned full string without hitting the limit (shouldn't happen after the
-    // fast path, but be safe).
-    if last_ws_byte > 0 {
-        return Ok(text.len());
-    }
-
-    // No whitespace at all — hard split: find the last character boundary that
-    // keeps us under the limit.
-    let mut safe_end: usize = 1;
-    for (byte_idx, _ch) in text.char_indices() {
-        if byte_idx == 0 {
-            continue;
+        if let Some(cut) = best {
+            return Ok(cut);
         }
-        if token_count(tokenizer, &text[..byte_idx])? <= limit {
-            safe_end = byte_idx;
+    }
+
+    // No whitespace boundary fits — hard split at the longest char-boundary
+    // prefix under the limit, found by binary search over char boundaries.
+    let char_boundaries: Vec<usize> = text
+        .char_indices()
+        .map(|(idx, _)| idx)
+        .skip(1) // skip 0 (empty prefix)
+        .collect();
+    let mut lo = 0usize;
+    let mut hi = char_boundaries.len();
+    let mut safe_end = char_boundaries.first().copied().unwrap_or(text.len());
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let cut = char_boundaries[mid];
+        if token_count(tokenizer, &text[..cut])? <= limit {
+            safe_end = cut;
+            lo = mid + 1;
         } else {
-            break;
+            hi = mid;
         }
     }
     Ok(safe_end.max(1))
@@ -811,15 +1074,70 @@ mod tests {
     }
 
     #[test]
+    fn child_overlap_shares_boundary_bytes() {
+        let tok = match load_tokenizer() {
+            Some(t) => t,
+            None => return,
+        };
+
+        // One long paragraph (single block) under the parent limit but well over
+        // the child limit, forcing multiple overlapping children within one
+        // parent. A single block means children are packed by overlap, not by
+        // block boundaries — exactly the seam the overlap is meant to bridge.
+        let mut src = String::from("# Doc\n\n");
+        for i in 0..220 {
+            src.push_str(&format!("token{i} "));
+        }
+
+        let blocks = parse_blocks(&src, SourceKind::Markdown);
+        let chunks = chunk_blocks(&src, &blocks, &tok).unwrap();
+        assert_byte_identity(&src, &chunks);
+
+        let children: Vec<_> = chunks.iter().filter(|c| c.level == 1).collect();
+        assert!(
+            children.len() >= 2,
+            "expected multiple children to exercise overlap (got {})",
+            children.len()
+        );
+
+        // At least one adjacent child pair must share source bytes (overlap):
+        // child[n+1].char_start < child[n].char_end.
+        let overlapped = children.windows(2).any(|w| w[1].char_start < w[0].char_end);
+        assert!(
+            overlapped,
+            "expected at least one overlapping adjacent child pair"
+        );
+
+        // Every child still respects the token bound.
+        for c in &children {
+            let span = (c.token_end - c.token_start) as usize;
+            assert!(
+                span <= CHILD_TOKEN_TARGET + CHILD_TOKEN_TOLERANCE,
+                "child token span {span} exceeds limit"
+            );
+        }
+    }
+
+    #[test]
     fn section_path_inherited() {
         let tok = match load_tokenizer() {
             Some(t) => t,
             None => return,
         };
-        let src = "# Top\n\n## Sub\n\nParagraph under sub.\n";
-        let blocks = parse_blocks(src, SourceKind::Markdown);
-        let chunks = chunk_blocks(src, &blocks, &tok).unwrap();
-        assert_byte_identity(src, &chunks);
+        // Build enough body under `## Sub` that the content there spills into a
+        // child whose first block is the `Top > Sub` paragraph (a tiny doc would
+        // pack every block into one child keyed by the leading `# Top` heading,
+        // and section_path is taken from a chunk's FIRST block — so the trail
+        // would never surface). Several paragraphs guarantee a `Top > Sub` child.
+        let mut src = String::from("# Top\n\n## Sub\n\n");
+        for i in 0..40 {
+            src.push_str(&format!(
+                "Paragraph {i} under sub adds tokens to push the child window past the leading heading block.\n\n"
+            ));
+        }
+        let blocks = parse_blocks(&src, SourceKind::Markdown);
+        let chunks = chunk_blocks(&src, &blocks, &tok).unwrap();
+        assert_byte_identity(&src, &chunks);
         let has_sub = chunks.iter().any(|c| c.section_path.contains("Sub"));
         assert!(
             has_sub,

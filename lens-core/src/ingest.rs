@@ -18,19 +18,31 @@
 //! Re-ingesting an `indexed` source whose `content_hash` is unchanged is a
 //! no-op. A changed hash (or a source left in a non-`indexed` state by a crashed
 //! prior run) re-runs the full wipe + ingest. The wipe drops the Lance vectors
-//! FIRST (`drop_source`), THEN deletes the SQLite `chunks` rows — so a completed
-//! wipe can never leave orphan Lance rows, and a retry converges cleanly.
+//! FIRST (`drop_source`), THEN deletes the SQLite `chunks` rows.
+//!
+//! The exact guarantee this ordering buys (not "orphans are impossible"):
+//! * A *completed* wipe leaves no orphan Lance rows — the Lance drop committed
+//!   before the SQLite delete, so there is never a `chunks` row without its
+//!   vector, nor a vector for a deleted `chunks` row.
+//! * A crash (or a failed SQLite transaction) *after* the Lance drop but before
+//!   the SQLite commit leaves the source transiently empty-of-vectors but with
+//!   its old `chunks` intact. That is reclaimed by the status→`error` flip
+//!   (startup crash-recovery for `parsing`/`embedding`, plus the inline
+//!   error-flip on a failed run) followed by an idempotent re-ingest, which
+//!   re-runs the wipe (a no-op on the already-dropped vectors) and rebuilds.
 //!
 //! # Tokenizer (integration wrinkle)
 //!
 //! `chunk_blocks` needs the nomic `tokenizers::Tokenizer`. `fastembed` downloads
 //! the model into `{data_dir}/models/fastembed/` but does not expose its
-//! tokenizer. We solve this with [`load_nomic_tokenizer`]: first we search the
+//! tokenizer. We solve this with [`resolve_nomic_tokenizer`]: first we search the
 //! fastembed cache subtree for a `tokenizer.json`; if none is found we download
 //! nomic's `tokenizer.json` once (mirroring `tts::download_kokoro_model`) into
 //! `{data_dir}/models/fastembed/tokenizer.json` and load it from there. The
-//! tokenizer is small (a few MB), so loading it per-ingest is acceptable for
-//! Phase 1.
+//! tokenizer is a multi-MB file, so it is parsed from disk once and cached on the
+//! engine ([`LensEngine::tokenizer`]) — reused across ingests rather than
+//! re-loaded per ingest. [`maybe_emit_tokenizer_download`] emits the
+//! `model_download` progress event before a cold-cache fetch.
 //!
 //! # LanceVectorStore construction
 //!
@@ -63,12 +75,48 @@ const TOKENIZER_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// bound peak memory while keeping the ONNX session warm.
 const EMBED_BATCH: usize = 32;
 
+/// Ingest progress phase labels (the [`IngestProgress::phase`] string values).
+///
+/// Single source of truth for the phase literals streamed to the progress sink,
+/// mirroring the `source_status` mod in `notebooks.rs`. The public wire shape is
+/// unchanged — these are the same strings, just no longer scattered as raw
+/// literals. The lifecycle is `parsing → chunking → [model_download] →
+/// embedding → indexing → done`.
+pub(crate) mod ingest_phase {
+    /// Parse phase: source text → blocks.
+    pub const PARSING: &str = "parsing";
+    /// Chunk phase: blocks → parent/child chunks.
+    pub const CHUNKING: &str = "chunking";
+    /// Model-download phase: cold-cache embedder/tokenizer fetch.
+    pub const MODEL_DOWNLOAD: &str = "model_download";
+    /// Embed phase: chunks → vectors.
+    pub const EMBEDDING: &str = "embedding";
+    /// Index phase: vectors → Lance table.
+    pub const INDEXING: &str = "indexing";
+    /// Terminal phase: ingest complete (also the unchanged-content no-op signal).
+    pub const DONE: &str = "done";
+}
+
 /// One ingestion progress event. Serializes as the `T` payload carried by
 /// `StreamEvent<IngestProgress>` over the command channel.
 ///
 /// `phase` is one of `"parsing"`, `"chunking"`, `"model_download"`,
 /// `"embedding"`, `"indexing"`, or `"done"`. `done`/`total` track per-phase
 /// progress (`total` is `None` when the upper bound is unknown).
+///
+/// # Status vs. phase granularity (intentionally NOT 1:1)
+///
+/// The persisted `sources.status` column is **coarse** — it tracks only the
+/// recoverable lifecycle states (`queued → parsing → embedding → indexed`, or
+/// `error`). [`IngestProgress::phase`] is **fine-grained** — it streams the
+/// full UX lifecycle (`parsing → chunking → [model_download] → embedding →
+/// indexing → done`). They deliberately don't map 1:1: the persisted status
+/// folds `chunking` under `parsing` and `model_download`/`indexing` under
+/// `embedding`, so the row status is enough for crash-recovery (it can tell a
+/// transient state apart from a terminal one) but cannot, on its own,
+/// distinguish a crash *during chunking* from a crash *during embedding* — both
+/// land in the same recoverable status. The fine-grained phase exists for the
+/// progress UI, not for persistence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IngestProgress {
     /// The current pipeline phase.
@@ -157,7 +205,7 @@ async fn run_ingest(
             source_id,
             "source already indexed with unchanged content; no-op"
         );
-        on_progress(IngestProgress::new("done", 1, Some(1)));
+        on_progress(IngestProgress::new(ingest_phase::DONE, 1, Some(1)));
         return Ok(());
     }
 
@@ -168,16 +216,26 @@ async fn run_ingest(
     // ── PARSE ─────────────────────────────────────────────────────────────
     {
         let repo = crate::notebooks::NotebookRepo::new(&pool);
+        // INVARIANT (load-bearing): status MUST move to a transient state
+        // (`parsing`) BEFORE the cross-store wipe below, so that if the process
+        // crashes mid-wipe the startup crash-recovery reset (`lib.rs init`, which
+        // flips lingering `parsing`/`embedding` rows → `error`) can reclaim the
+        // half-wiped source on next launch. Wiping while still `indexed` would
+        // leave a row that looks complete but has lost its vectors.
         repo.update_source_status(source_id, crate::notebooks::source_status::PARSING)
             .await?;
     }
-    on_progress(IngestProgress::new("parsing", 0, Some(1)));
+    on_progress(IngestProgress::new(ingest_phase::PARSING, 0, Some(1)));
     let blocks = parse_blocks(&text, kind);
-    on_progress(IngestProgress::new("parsing", 1, Some(1)));
+    on_progress(IngestProgress::new(ingest_phase::PARSING, 1, Some(1)));
 
     // ── CHUNK ─────────────────────────────────────────────────────────────
-    on_progress(IngestProgress::new("chunking", 0, None));
-    let tokenizer = load_nomic_tokenizer(&data_dir, &mut on_progress).await?;
+    on_progress(IngestProgress::new(ingest_phase::CHUNKING, 0, None));
+    // Emit a `model_download` event up front only when the tokenizer is not yet
+    // cached on disk (a cold-cache fetch is about to happen); the engine then
+    // resolves + caches the multi-MB tokenizer once and reuses it across ingests.
+    maybe_emit_tokenizer_download(&data_dir, &mut on_progress);
+    let tokenizer = engine.tokenizer().await?;
     let chunks = chunk_blocks(&text, &blocks, &tokenizer)?;
     let total_tokens: i64 = chunks
         .iter()
@@ -220,27 +278,30 @@ async fn run_ingest(
 
     // Lazily get the cached embedder. Emit a `model_download` phase BEFORE the
     // first construction so a cold-cache download surfaces in the UI.
-    on_progress(IngestProgress::new("model_download", 0, None));
+    on_progress(IngestProgress::new(ingest_phase::MODEL_DOWNLOAD, 0, None));
     let embedder = engine.embedder().await?;
-    on_progress(IngestProgress::new("model_download", 1, Some(1)));
+    on_progress(IngestProgress::new(
+        ingest_phase::MODEL_DOWNLOAD,
+        1,
+        Some(1),
+    ));
 
     // Embed every chunk (parents AND children) in batches under spawn_blocking.
     let total = chunks.len() as u64;
-    on_progress(IngestProgress::new("embedding", 0, Some(total)));
+    on_progress(IngestProgress::new(ingest_phase::EMBEDDING, 0, Some(total)));
 
     let mut rows: Vec<VectorRow> = Vec::with_capacity(chunks.len());
     let mut embedded: u64 = 0;
     for batch in chunks.chunks(EMBED_BATCH) {
+        // One owned copy per chunk text; `embed_documents_owned` then prefixes in
+        // place rather than cloning a second time (micro-opt vs. the borrow path).
         let texts: Vec<String> = batch.iter().map(|c| c.text.clone()).collect();
         let embedder = embedder.clone();
         // MANDATORY: the synchronous fastembed embed() runs under spawn_blocking
         // so it never blocks a tokio worker (Decision M2).
-        let vectors = tokio::task::spawn_blocking(move || {
-            let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
-            embedder.embed_documents(&refs)
-        })
-        .await
-        .map_err(|e| LensError::Model(format!("embed task panicked: {e}")))??;
+        let vectors = tokio::task::spawn_blocking(move || embedder.embed_documents_owned(texts))
+            .await
+            .map_err(|e| LensError::Model(format!("embed task panicked: {e}")))??;
 
         if vectors.len() != batch.len() {
             return Err(LensError::Model(format!(
@@ -260,15 +321,19 @@ async fn run_ingest(
             });
         }
         embedded += batch.len() as u64;
-        on_progress(IngestProgress::new("embedding", embedded, Some(total)));
+        on_progress(IngestProgress::new(
+            ingest_phase::EMBEDDING,
+            embedded,
+            Some(total),
+        ));
     }
 
     // ── INDEX ─────────────────────────────────────────────────────────────
-    on_progress(IngestProgress::new("indexing", 0, Some(1)));
+    on_progress(IngestProgress::new(ingest_phase::INDEXING, 0, Some(1)));
     store
         .add(&notebook, EMBED_MODEL_ID, EMBED_DIM, rows)
         .await?;
-    on_progress(IngestProgress::new("indexing", 1, Some(1)));
+    on_progress(IngestProgress::new(ingest_phase::INDEXING, 1, Some(1)));
 
     // ── Finalize: metadata + indexed status ──────────────────────────────
     {
@@ -278,7 +343,7 @@ async fn run_ingest(
         repo.update_source_status(source_id, crate::notebooks::source_status::INDEXED)
             .await?;
     }
-    on_progress(IngestProgress::new("done", 1, Some(1)));
+    on_progress(IngestProgress::new(ingest_phase::DONE, 1, Some(1)));
     Ok(())
 }
 
@@ -308,76 +373,94 @@ async fn delete_chunks_for_source(
     Ok(())
 }
 
+/// Number of `chunks` rows inserted per multi-row `INSERT` statement.
+///
+/// Each row binds 13 variables (`page` and `enrichment` are literal `NULL`, not
+/// bound), so the per-statement variable count is `60 * 13 = 780`, comfortably
+/// under SQLite's default 999-bound-variable limit (`SQLITE_MAX_VARIABLE_NUMBER`).
+const CHUNK_INSERT_BATCH: usize = 60;
+
 /// Inserts the parent + child chunk rows for `source_id`.
 ///
 /// Parents (`level = 0`, `parent_id IS NULL`) are inserted before children so
-/// the self-referencing `parent_id` FK always resolves at insert time.
+/// the self-referencing `parent_id` FK always resolves at insert time. Within
+/// each level rows are inserted in their original order.
+///
+/// Rows are written in multi-row `INSERT ... VALUES (...),(...),...` batches of
+/// [`CHUNK_INSERT_BATCH`] (one statement instead of one round-trip per chunk),
+/// all inside the caller's transaction. Parents are batched fully before any
+/// child batch so the FK ordering above is preserved across batch boundaries.
 async fn insert_chunks(
     conn: &mut sqlx::SqliteConnection,
     source_id: &str,
     chunks: &[Chunk],
 ) -> Result<(), LensError> {
     let now = chrono::Utc::now().to_rfc3339();
-    // Parents first, then children (FK ordering).
-    for chunk in chunks.iter().filter(|c| c.parent_id.is_none()) {
-        insert_one_chunk(&mut *conn, source_id, chunk, &now).await?;
-    }
-    for chunk in chunks.iter().filter(|c| c.parent_id.is_some()) {
-        insert_one_chunk(&mut *conn, source_id, chunk, &now).await?;
+    // Parents first, then children (FK ordering), each in original order.
+    let parents = chunks.iter().filter(|c| c.parent_id.is_none());
+    let children = chunks.iter().filter(|c| c.parent_id.is_some());
+    let ordered: Vec<&Chunk> = parents.chain(children).collect();
+
+    for batch in ordered.chunks(CHUNK_INSERT_BATCH) {
+        insert_chunk_batch(&mut *conn, source_id, batch, &now).await?;
     }
     Ok(())
 }
 
-/// Inserts a single `chunks` row. `page` and `enrichment` stay NULL in Phase 1.
-async fn insert_one_chunk(
+/// Inserts one batch of `chunks` rows in a single multi-row `INSERT` statement.
+///
+/// `page` and `enrichment` stay NULL in Phase 1 (emitted as SQL literals so they
+/// don't consume bound-variable budget). The remaining 13 columns are bound per
+/// row via [`sqlx::QueryBuilder::push_values`].
+async fn insert_chunk_batch(
     conn: &mut sqlx::SqliteConnection,
     source_id: &str,
-    chunk: &Chunk,
+    chunks: &[&Chunk],
     now: &str,
 ) -> Result<(), LensError> {
-    sqlx::query(
+    if chunks.is_empty() {
+        return Ok(());
+    }
+    let mut qb = sqlx::QueryBuilder::new(
         "INSERT INTO chunks \
              (id, source_id, parent_id, kind, level, section_path, text, \
-              token_start, token_end, page, char_start, char_end, block_type, enrichment, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, NULL, ?)",
-    )
-    .bind(&chunk.id)
-    .bind(source_id)
-    .bind(&chunk.parent_id)
-    .bind(&chunk.kind)
-    .bind(chunk.level)
-    .bind(&chunk.section_path)
-    .bind(&chunk.text)
-    .bind(chunk.token_start)
-    .bind(chunk.token_end)
-    .bind(chunk.char_start)
-    .bind(chunk.char_end)
-    .bind(&chunk.block_type)
-    .bind(now)
-    .execute(&mut *conn)
-    .await?;
+              token_start, token_end, page, char_start, char_end, block_type, enrichment, created_at) ",
+    );
+    qb.push_values(chunks, |mut b, chunk| {
+        b.push_bind(&chunk.id)
+            .push_bind(source_id)
+            .push_bind(&chunk.parent_id)
+            .push_bind(&chunk.kind)
+            .push_bind(chunk.level)
+            .push_bind(&chunk.section_path)
+            .push_bind(&chunk.text)
+            .push_bind(chunk.token_start)
+            .push_bind(chunk.token_end)
+            .push("NULL") // page
+            .push_bind(chunk.char_start)
+            .push_bind(chunk.char_end)
+            .push_bind(&chunk.block_type)
+            .push("NULL") // enrichment
+            .push_bind(now);
+    });
+    qb.build().execute(&mut *conn).await?;
     Ok(())
 }
 
-/// Loads the nomic `tokenizer.json`, downloading it once if necessary, emitting
-/// a `model_download` progress event before a network download so a cold cache
-/// surfaces in the UI.
+/// Emits a `model_download` progress event when a tokenizer network download is
+/// about to happen, so a cold cache surfaces in the UI.
 ///
-/// This is the ingest-pipeline wrapper around [`resolve_nomic_tokenizer`]: it
-/// adds the progress event around the resolution. Both share the single resolver
-/// below (Resolution order + atomic-rename download).
-async fn load_nomic_tokenizer(
-    data_dir: &Path,
-    on_progress: &mut impl FnMut(IngestProgress),
-) -> Result<Tokenizer, LensError> {
+/// The actual resolution + caching is owned by [`LensEngine::tokenizer`] (which
+/// calls the shared [`resolve_nomic_tokenizer`] once and reuses the result
+/// across ingests). This helper only decides whether the upcoming resolve will
+/// hit the network — neither the canonical path nor the cache subtree has a
+/// `tokenizer.json` — and emits the event if so.
+fn maybe_emit_tokenizer_download(data_dir: &Path, on_progress: &mut impl FnMut(IngestProgress)) {
     let fastembed_dir = data_dir.join("models").join("fastembed");
     let canonical = fastembed_dir.join("tokenizer.json");
-    // Only emit a `model_download` event when a network download is actually
-    // about to happen (neither the canonical path nor the cache subtree has one).
     if !canonical.is_file() && find_tokenizer_json(&fastembed_dir).is_none() {
-        on_progress(IngestProgress::new("model_download", 0, None));
+        on_progress(IngestProgress::new(ingest_phase::MODEL_DOWNLOAD, 0, None));
     }
-    resolve_nomic_tokenizer(data_dir).await
 }
 
 /// Resolves the nomic `tokenizer.json`, downloading it once (atomically) if

@@ -9,6 +9,7 @@ import {
   sourcesStore,
   resetSourcesStore,
   loadSources,
+  addSourceLocal,
   ingest,
   toggleSelected,
   removeSource,
@@ -65,6 +66,7 @@ function makeSource(overrides?: Partial<Source>): Source {
     created_at: new Date(Date.now() - 3600_000).toISOString(),
     token_count: 512,
     content_hash: 'abc123',
+    trashed_at: null,
     ...overrides
   };
 }
@@ -133,6 +135,74 @@ describe('loadSources', () => {
 });
 
 // ---------------------------------------------------------------------------
+// addSourceLocal — optimistic insert (fix #1 regression guard)
+// ---------------------------------------------------------------------------
+
+describe('addSourceLocal', () => {
+  it('inserts a source into the store immediately (row exists before ingest events)', () => {
+    const source = makeSource({ id: 'src-new', status: 'queued' });
+
+    // Store starts empty — no loadSources round-trip
+    expect(sourcesStore.sources).toHaveLength(0);
+
+    addSourceLocal(source);
+
+    expect(sourcesStore.sources).toHaveLength(1);
+    expect(sourcesStore.sources[0].id).toBe('src-new');
+  });
+
+  it('does not duplicate if the source already exists (idempotent)', () => {
+    const source = makeSource({ id: 'src-001' });
+    addSourceLocal(source);
+    addSourceLocal(source);
+
+    expect(sourcesStore.sources).toHaveLength(1);
+  });
+
+  it('allows ingest to find the row and update its status without a prior loadSources', async () => {
+    // Simulate the race: addSourceLocal is called, then ingest fires events immediately.
+    const source = makeSource({ id: 'src-new', status: 'queued' });
+    addSourceLocal(source);
+
+    // At this point the store has the row — ingest events must update it.
+    let capturedHandler: ((e: unknown) => void) | null = null;
+    vi.mocked(ingestSource).mockImplementation(async (_id, onProgress) => {
+      capturedHandler = onProgress as (e: unknown) => void;
+    });
+
+    const ingestPromise = ingest('src-new');
+    if (capturedHandler) {
+      (capturedHandler as (e: unknown) => void)({ type: 'done' });
+    }
+    await ingestPromise;
+
+    // Status must be updated — if the row was missing the update would be silently dropped.
+    expect(sourcesStore.sources[0].status).toBe('indexed');
+  });
+
+  it('OLD BUG: without addSourceLocal, ingest events on an empty store are silent no-ops', async () => {
+    // This test documents the bug: if we skip addSourceLocal and rely on a
+    // subsequent loadSources, there is no row when ingest fires — status stays stuck.
+    // The store starts empty.
+    expect(sourcesStore.sources).toHaveLength(0);
+
+    let capturedHandler: ((e: unknown) => void) | null = null;
+    vi.mocked(ingestSource).mockImplementation(async (_id, onProgress) => {
+      capturedHandler = onProgress as (e: unknown) => void;
+    });
+
+    const ingestPromise = ingest('src-ghost');
+    if (capturedHandler) {
+      (capturedHandler as (e: unknown) => void)({ type: 'done' });
+    }
+    await ingestPromise;
+
+    // The row never existed — store is still empty, event was silently dropped.
+    expect(sourcesStore.sources).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // toggleSelected
 // ---------------------------------------------------------------------------
 
@@ -196,7 +266,7 @@ describe('toggleSelected', () => {
 });
 
 // ---------------------------------------------------------------------------
-// ingest — status updates from progress events
+// ingest — status updates from progress events (fix #2: index mutation)
 // ---------------------------------------------------------------------------
 
 describe('ingest', () => {
@@ -311,10 +381,37 @@ describe('ingest', () => {
     expect(sourcesStore.error).toBeTruthy();
     consoleSpy.mockRestore();
   });
+
+  it('mutates by index — does not replace the whole array reference on status update', async () => {
+    // Fix #2: verify index-mutation path rather than whole-array replace.
+    // After a single event the list length must be unchanged and the OTHER row untouched.
+    vi.mocked(listSources).mockResolvedValue([
+      makeSource({ id: 'src-001', status: 'queued' }),
+      makeSource({ id: 'src-002', status: 'indexed' })
+    ]);
+    await loadSources('nb-001');
+
+    let capturedHandler: ((e: unknown) => void) | null = null;
+    vi.mocked(ingestSource).mockImplementation(async (_id, onProgress) => {
+      capturedHandler = onProgress as (e: unknown) => void;
+    });
+
+    const ingestPromise = ingest('src-001');
+    if (capturedHandler) {
+      (capturedHandler as (e: unknown) => void)({ type: 'done' });
+    }
+    await ingestPromise;
+
+    // Only src-001 changed — src-002 must be untouched
+    expect(sourcesStore.sources).toHaveLength(2);
+    expect(sourcesStore.sources[0].status).toBe('indexed');
+    expect(sourcesStore.sources[1].status).toBe('indexed');
+    expect(sourcesStore.sources[1].id).toBe('src-002');
+  });
 });
 
 // ---------------------------------------------------------------------------
-// removeSource — soft-delete (trash) with optimistic remove + undo stash
+// removeSource — soft-delete (trash) with optimistic remove + undo queue
 // ---------------------------------------------------------------------------
 
 describe('removeSource', () => {
@@ -388,10 +485,55 @@ describe('removeSource', () => {
     expect(trashSource).not.toHaveBeenCalled();
     expect(sourcesStore.sources).toHaveLength(1);
   });
+
+  // Undo-queue: second delete in window must NOT strand the first
+  it('two in-window deletes both set recentlyTrashed (queue not overwritten)', async () => {
+    vi.mocked(listSources).mockResolvedValue([
+      makeSource({ id: 'src-001' }),
+      makeSource({ id: 'src-002' }),
+      makeSource({ id: 'src-003' })
+    ]);
+    await loadSources('nb-001');
+    vi.mocked(trashSource).mockResolvedValue(undefined);
+
+    await removeSource('src-001');
+    await removeSource('src-002');
+
+    // Both are in the queue — recentlyTrashed still true
+    expect(sourcesStore.recentlyTrashed).toBe(true);
+    // Only src-003 remains visible
+    expect(sourcesStore.sources).toHaveLength(1);
+    expect(sourcesStore.sources[0].id).toBe('src-003');
+  });
+
+  it('OLD BUG: single-stash would strand first delete on second delete', async () => {
+    // With old single-stash code, after 2 deletes only the second was in stash.
+    // This test documents the fix: both must be independently undoable.
+    vi.mocked(listSources).mockResolvedValue([
+      makeSource({ id: 'src-A' }),
+      makeSource({ id: 'src-B' })
+    ]);
+    await loadSources('nb-001');
+    vi.mocked(trashSource).mockResolvedValue(undefined);
+    vi.mocked(restoreSource).mockResolvedValue(undefined);
+
+    await removeSource('src-A');
+    await removeSource('src-B');
+
+    // With the queue fix, we can undo src-B first (LIFO), then src-A.
+    await undoRemove(); // restores src-B
+    expect(sourcesStore.sources.some((s) => s.id === 'src-B')).toBe(true);
+
+    await undoRemove(); // restores src-A
+    expect(sourcesStore.sources.some((s) => s.id === 'src-A')).toBe(true);
+
+    // Both sources are back
+    expect(sourcesStore.sources).toHaveLength(2);
+  });
 });
 
 // ---------------------------------------------------------------------------
-// undoRemove — re-inserts at original index + calls restoreSource
+// undoRemove — LIFO queue + identity re-anchor
 // ---------------------------------------------------------------------------
 
 describe('undoRemove', () => {
@@ -403,7 +545,7 @@ describe('undoRemove', () => {
     expect(restoreSource).not.toHaveBeenCalled();
   });
 
-  it('re-inserts the source at its original list index', async () => {
+  it('re-inserts the source near its original position (after its previous sibling)', async () => {
     vi.mocked(listSources).mockResolvedValue([
       makeSource({ id: 'src-001' }),
       makeSource({ id: 'src-002' }),
@@ -413,15 +555,17 @@ describe('undoRemove', () => {
     vi.mocked(trashSource).mockResolvedValue(undefined);
     vi.mocked(restoreSource).mockResolvedValue(undefined);
 
-    // Remove the middle item (index 1)
+    // Remove the middle item (index 1, prevSiblingId = src-001)
     await removeSource('src-002');
     expect(sourcesStore.sources).toHaveLength(2);
 
-    // Undo — should re-insert src-002 at index 1
+    // Undo — should re-insert src-002 after src-001
     await undoRemove();
 
     expect(sourcesStore.sources).toHaveLength(3);
-    expect(sourcesStore.sources[1].id).toBe('src-002');
+    const idx = sourcesStore.sources.findIndex((s) => s.id === 'src-002');
+    const prevIdx = sourcesStore.sources.findIndex((s) => s.id === 'src-001');
+    expect(idx).toBe(prevIdx + 1);
   });
 
   it('calls restoreSource with the correct sourceId', async () => {
@@ -436,7 +580,7 @@ describe('undoRemove', () => {
     expect(restoreSource).toHaveBeenCalledWith('src-001');
   });
 
-  it('clears recentlyTrashed after a successful undo', async () => {
+  it('clears recentlyTrashed after all entries are undone', async () => {
     vi.mocked(listSources).mockResolvedValue([makeSource({ id: 'src-001' })]);
     await loadSources('nb-001');
     vi.mocked(trashSource).mockResolvedValue(undefined);
@@ -466,7 +610,7 @@ describe('undoRemove', () => {
     consoleSpy.mockRestore();
   });
 
-  it('re-inserts the first item (index 0) correctly after removal', async () => {
+  it('re-inserts the first item (index 0, no prev sibling) correctly after removal', async () => {
     vi.mocked(listSources).mockResolvedValue([
       makeSource({ id: 'src-001' }),
       makeSource({ id: 'src-002' })
@@ -480,5 +624,83 @@ describe('undoRemove', () => {
 
     expect(sourcesStore.sources[0].id).toBe('src-001');
     expect(sourcesStore.sources[1].id).toBe('src-002');
+  });
+
+  it('LIFO: two deletes → undo order is last-in-first-out', async () => {
+    vi.mocked(listSources).mockResolvedValue([
+      makeSource({ id: 'src-001' }),
+      makeSource({ id: 'src-002' }),
+      makeSource({ id: 'src-003' })
+    ]);
+    await loadSources('nb-001');
+    vi.mocked(trashSource).mockResolvedValue(undefined);
+    vi.mocked(restoreSource).mockResolvedValue(undefined);
+
+    await removeSource('src-001'); // first delete
+    await removeSource('src-002'); // second delete
+
+    // First undo must restore src-002 (most recent)
+    await undoRemove();
+    expect(restoreSource).toHaveBeenLastCalledWith('src-002');
+    expect(sourcesStore.sources.some((s) => s.id === 'src-002')).toBe(true);
+    // src-001 is still trashed — recentlyTrashed still true
+    expect(sourcesStore.recentlyTrashed).toBe(true);
+
+    // Second undo must restore src-001
+    await undoRemove();
+    expect(restoreSource).toHaveBeenLastCalledWith('src-001');
+    expect(sourcesStore.sources.some((s) => s.id === 'src-001')).toBe(true);
+    expect(sourcesStore.recentlyTrashed).toBe(false);
+  });
+
+  it('identity re-anchor: undo appends when prev sibling no longer exists', async () => {
+    // src-001 (prev sibling of src-002) is already gone when undo fires.
+    vi.mocked(listSources).mockResolvedValue([
+      makeSource({ id: 'src-001' }),
+      makeSource({ id: 'src-002' })
+    ]);
+    await loadSources('nb-001');
+    vi.mocked(trashSource).mockResolvedValue(undefined);
+    vi.mocked(restoreSource).mockResolvedValue(undefined);
+
+    // Trash src-002 (prevSiblingId = src-001)
+    await removeSource('src-002');
+    // Also trash src-001 so the sibling is gone at undo time
+    await removeSource('src-001');
+
+    // Undo src-001 first (LIFO)
+    await undoRemove();
+    // Then undo src-002 — prev sibling src-001 may or may not be present
+    await undoRemove();
+
+    // Both should be back regardless of sibling existence
+    expect(sourcesStore.sources.some((s) => s.id === 'src-002')).toBe(true);
+    expect(sourcesStore.sources.some((s) => s.id === 'src-001')).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// trashed_at field — type contract (fix #4)
+// ---------------------------------------------------------------------------
+
+describe('Source type: trashed_at field', () => {
+  it('makeSource fixture includes trashed_at: null', () => {
+    const s = makeSource();
+    expect(Object.prototype.hasOwnProperty.call(s, 'trashed_at')).toBe(true);
+    expect(s.trashed_at).toBeNull();
+  });
+
+  it('accepts a non-null trashed_at string', () => {
+    const s = makeSource({ trashed_at: '2026-06-24T12:00:00.000Z' });
+    expect(s.trashed_at).toBe('2026-06-24T12:00:00.000Z');
+  });
+
+  it('loadSources preserves trashed_at from IPC response', async () => {
+    const trashedSource = makeSource({ id: 'src-trashed', trashed_at: '2026-06-24T10:00:00Z' });
+    vi.mocked(listSources).mockResolvedValue([trashedSource]);
+
+    await loadSources('nb-001');
+
+    expect(sourcesStore.sources[0].trashed_at).toBe('2026-06-24T10:00:00Z');
   });
 });

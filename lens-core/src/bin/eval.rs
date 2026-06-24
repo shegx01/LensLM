@@ -53,9 +53,11 @@ use tokenizers::Tokenizer;
 /// here so the gate is "measured baseline minus margin", not a hand-picked
 /// constant. Each of the 5 canned queries retrieves its gold chunk in the top-5
 /// → 5/5 = 1.00. Last measured 2026-06-24 (`cargo run -p lens-core --bin eval`,
-/// hits 5/5, recall@5 1.0000) — re-confirmed after the M4 robustness fixes; the
-/// deterministic chunk ids in `queries.json` were unchanged (no fixture block
-/// exceeds the parent token bound, so the oversized-parent split never fires).
+/// hits 5/5, recall@5 1.0000) — re-confirmed after the M4 child-overlap chunker
+/// refactor (CHILD_OVERLAP_TOKENS = 16). Child overlap changed the deterministic
+/// second-child id of each fixture, so the `queries.json` gold sets were
+/// re-authored against the new ids (the photosynthesis "Calvin cycle" / "sunlight
+/// into sugar" golds now point at the new section-2 child); recall held at 1.00.
 const BASELINE_RECALL: f32 = 1.00;
 
 /// Margin subtracted from the baseline to set the pass floor. A single query

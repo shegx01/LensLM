@@ -441,16 +441,44 @@ fn locate_in_src(
 /// `"My Heading"`).  This is a best-effort approach that works for the common
 /// ATX-style headings that `pulldown_cmark` emits in offset ranges; setext
 /// headings are handled by the fallback trim.
+///
+/// An ATX *closing* `#` sequence is only valid when preceded by whitespace
+/// (CommonMark §4.2): `## A #` closes to `"A"`, but `# C#` is NOT a closing
+/// marker and must stay `"C#"`. We therefore only strip a trailing `#` run when
+/// it is preceded by whitespace (or is the entire remaining content).
 fn extract_heading_text(raw: &str) -> &str {
     // ATX headings start with one or more '#' characters followed by whitespace.
-    let stripped = raw.trim_start_matches('#').trim_start();
-    // Strip a trailing `#` sequence (optional closing markers in ATX headings).
-    let stripped = stripped.trim_end_matches('#').trim_end();
+    // Trim trailing whitespace first so any ATX closing `#` run sits at the very
+    // end of the slice (the raw range may carry a trailing newline).
+    let stripped = raw.trim_start_matches('#').trim();
+    // Strip an ATX closing `#` run only when it is preceded by whitespace (or is
+    // the whole remainder) — a `#` glued to a word (e.g. `C#`) is part of the
+    // heading text, not a closing marker.
+    let stripped = strip_atx_closing(stripped).trim_end();
     // If nothing was stripped fall back to a plain trim (setext headings).
     if stripped.is_empty() {
         raw.trim()
     } else {
         stripped
+    }
+}
+
+/// Removes a trailing ATX closing `#` run from `s` iff it is a valid closing
+/// marker: the `#` run must be at the end of the string and either preceded by
+/// whitespace or constitute the entire string. A `#` run glued directly to a
+/// non-whitespace character (e.g. `C#`) is left intact.
+fn strip_atx_closing(s: &str) -> &str {
+    let without_hashes = s.trim_end_matches('#');
+    if without_hashes.len() == s.len() {
+        // No trailing `#` at all.
+        return s;
+    }
+    // The closing marker is valid only when the char immediately before the `#`
+    // run is whitespace, or the whole remainder is `#` (e.g. `#` / `###`).
+    match without_hashes.chars().next_back() {
+        None => without_hashes, // entire remainder was `#`s
+        Some(c) if c.is_whitespace() => without_hashes,
+        Some(_) => s, // glued `#` — keep it
     }
 }
 
@@ -573,6 +601,40 @@ mod tests {
             SourceKind::Markdown
         );
         assert!(SourceKind::from_kind_str("pdf").is_err());
+    }
+
+    #[test]
+    fn markdown_heading_hash_not_corrupted() {
+        // `# C#` — the trailing `#` is glued to `C`, so it is NOT an ATX closing
+        // marker and must be preserved as part of the heading text.
+        let src = "# C#\n\nBody.\n";
+        let blocks = parse_blocks(src, SourceKind::Markdown);
+        assert_byte_identity(src, &blocks);
+        let heading = blocks
+            .iter()
+            .find(|b| b.block_type == "heading")
+            .expect("heading should exist");
+        assert_eq!(heading.text, "C#");
+        // The propagated section_path on the body inherits the intact heading.
+        let body = blocks
+            .iter()
+            .find(|b| b.block_type == "paragraph")
+            .expect("paragraph should exist");
+        assert_eq!(body.section_path, "C#");
+    }
+
+    #[test]
+    fn markdown_heading_atx_closing_marker_stripped() {
+        // `## A #` — the trailing `#` is preceded by whitespace, so it IS a valid
+        // ATX closing marker and must be stripped, leaving "A".
+        let src = "## A #\n\nBody.\n";
+        let blocks = parse_blocks(src, SourceKind::Markdown);
+        assert_byte_identity(src, &blocks);
+        let heading = blocks
+            .iter()
+            .find(|b| b.block_type == "heading")
+            .expect("heading should exist");
+        assert_eq!(heading.text, "A");
     }
 
     #[test]

@@ -137,6 +137,7 @@ function makeSource(overrides?: Partial<Source>): Source {
     created_at: new Date().toISOString(),
     token_count: 2048,
     content_hash: 'abc123',
+    trashed_at: null,
     ...overrides
   };
 }
