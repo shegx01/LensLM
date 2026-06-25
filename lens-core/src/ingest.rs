@@ -84,6 +84,18 @@ const TOKENIZER_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// `url_fetch_timeout_fires` integration test).
 pub const URL_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// `User-Agent` sent on the URL-fetch HTTP GET.
+///
+/// A UA-less client is routinely served `403`/`429` by real sites (bot-blocking
+/// CDNs, WAFs), which surfaces here as a silent fetch failure. A named,
+/// honest UA (app name + version + contact URL) avoids those rejections without
+/// impersonating a browser. The version tracks the workspace crate version.
+pub const URL_FETCH_USER_AGENT: &str = concat!(
+    "LensLM/",
+    env!("CARGO_PKG_VERSION"),
+    " (+https://github.com/shegx01/LensLM)"
+);
+
 /// Embed batch size — documents are embedded in batches of this many texts to
 /// bound peak memory while keeping the ONNX session warm.
 const EMBED_BATCH: usize = 32;
@@ -231,14 +243,16 @@ async fn run_ingest(
 ) -> Result<(), LensError> {
     let pool = engine.pool().await;
     let data_dir = engine.data_dir().await;
+    // `NotebookRepo` is a stateless `&pool` wrapper (a shared borrow), so a single
+    // instance is reused for every status/metadata write below — it coexists with
+    // the pool's other shared uses (`pool.clone()`, `pool.begin()`, `&pool`).
+    let repo = crate::notebooks::NotebookRepo::new(&pool);
 
     // ── Load the source row ───────────────────────────────────────────────
-    let source = {
-        let repo = crate::notebooks::NotebookRepo::new(&pool);
-        repo.get_source(source_id)
-            .await?
-            .ok_or_else(|| LensError::Validation(format!("no source with id {source_id}")))?
-    };
+    let source = repo
+        .get_source(source_id)
+        .await?
+        .ok_or_else(|| LensError::Validation(format!("no source with id {source_id}")))?;
 
     let text_like = crate::extract::is_text_like_kind(&source.kind);
 
@@ -346,7 +360,6 @@ async fn run_ingest(
         // chunks + vectors — otherwise stale content stays searchable behind a
         // `needs_ocr` status. Wipe BEFORE the early return.
         wipe_source_content(&pool, &data_dir, &source.notebook_id, source_id).await?;
-        let repo = crate::notebooks::NotebookRepo::new(&pool);
         repo.update_source_status(source_id, crate::notebooks::source_status::NEEDS_OCR)
             .await?;
         // Return Ok so the Err→error flip in ingest_source never fires.
@@ -374,7 +387,6 @@ async fn run_ingest(
             // that flips to a JS shell must drop its stale chunks + vectors so
             // nothing indexed survives behind the `needs_js` status.
             wipe_source_content(&pool, &data_dir, &source.notebook_id, source_id).await?;
-            let repo = crate::notebooks::NotebookRepo::new(&pool);
             repo.update_source_status(source_id, crate::notebooks::source_status::NEEDS_JS)
                 .await?;
             // Return Ok so the Err→error flip in ingest_source never fires.
@@ -437,7 +449,6 @@ async fn run_ingest(
 
     // ── PARSE ─────────────────────────────────────────────────────────────
     {
-        let repo = crate::notebooks::NotebookRepo::new(&pool);
         // INVARIANT (load-bearing): status MUST move to a transient state
         // (`parsing`) BEFORE the cross-store wipe below, so that if the process
         // crashes mid-wipe the startup crash-recovery reset (`lib.rs init`, which
@@ -515,7 +526,6 @@ async fn run_ingest(
     // wipe above already cleared any prior chunks/vectors, so this finalizes the
     // source as an empty-but-indexed row (token_count 0) and emits `done`.
     if chunks.is_empty() {
-        let repo = crate::notebooks::NotebookRepo::new(&pool);
         repo.update_source_metadata(source_id, 0, &content_hash)
             .await?;
         repo.update_source_status(source_id, crate::notebooks::source_status::INDEXED)
@@ -525,11 +535,8 @@ async fn run_ingest(
     }
 
     // ── EMBED ─────────────────────────────────────────────────────────────
-    {
-        let repo = crate::notebooks::NotebookRepo::new(&pool);
-        repo.update_source_status(source_id, crate::notebooks::source_status::EMBEDDING)
-            .await?;
-    }
+    repo.update_source_status(source_id, crate::notebooks::source_status::EMBEDDING)
+        .await?;
 
     // Lazily get the cached embedder. Emit a `model_download` phase BEFORE the
     // first construction so a cold-cache download surfaces in the UI.
@@ -591,13 +598,10 @@ async fn run_ingest(
     on_progress(IngestProgress::new(ingest_phase::INDEXING, 1, Some(1)));
 
     // ── Finalize: metadata + indexed status ──────────────────────────────
-    {
-        let repo = crate::notebooks::NotebookRepo::new(&pool);
-        repo.update_source_metadata(source_id, total_tokens, &content_hash)
-            .await?;
-        repo.update_source_status(source_id, crate::notebooks::source_status::INDEXED)
-            .await?;
-    }
+    repo.update_source_metadata(source_id, total_tokens, &content_hash)
+        .await?;
+    repo.update_source_status(source_id, crate::notebooks::source_status::INDEXED)
+        .await?;
     on_progress(IngestProgress::new(ingest_phase::DONE, 1, Some(1)));
     Ok(())
 }
@@ -869,6 +873,7 @@ async fn fetch_url_guarded_inner(
     } = validate_fetch_url(locator, allow_local)?;
 
     let mut builder = reqwest::Client::builder()
+        .user_agent(URL_FETCH_USER_AGENT)
         .connect_timeout(timeout)
         .timeout(timeout)
         .redirect(reqwest::redirect::Policy::none());
@@ -1002,10 +1007,11 @@ async fn delete_chunks_for_source(
 
 /// Number of `chunks` rows inserted per multi-row `INSERT` statement.
 ///
-/// Each row binds 13 variables (`enrichment` is a literal `NULL`, `page` is
-/// conditionally bound or literal `NULL`, `source_anchor` is bound), so the
-/// per-statement variable count is at most `60 * 14 = 840`, comfortably under
-/// SQLite's default 999-bound-variable limit (`SQLITE_MAX_VARIABLE_NUMBER`).
+/// Each row binds 15 variables (16 columns; `enrichment` is a literal `NULL`,
+/// `page` is always bound — to the PDF page or `NULL` — and `source_anchor` is
+/// bound), so the per-statement variable count is at most `60 * 15 = 900`,
+/// comfortably under SQLite's default 999-bound-variable limit
+/// (`SQLITE_MAX_VARIABLE_NUMBER`).
 const CHUNK_INSERT_BATCH: usize = 60;
 
 /// Inserts the parent + child chunk rows for `source_id`.
@@ -1396,7 +1402,7 @@ mod tests {
 
     // ── Streaming body cap + Content-Type + redirect + timeout (items 2–4) ─
 
-    use wiremock::matchers::{method, path as wm_path};
+    use wiremock::matchers::{header, method, path as wm_path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// Drives the REAL `fetch_url_guarded_inner` against a wiremock server.
@@ -1482,6 +1488,34 @@ mod tests {
         )
         .await
         .expect("text/html must be accepted");
+        assert!(!body.is_empty());
+    }
+
+    /// Item 1: the fetch client sends our named `User-Agent` so bot-blocking
+    /// CDNs/WAFs don't `403`/`429` a UA-less request. The mock ONLY matches when
+    /// the `User-Agent` header equals [`URL_FETCH_USER_AGENT`]; a missing/wrong UA
+    /// would yield no matched mock and a fetch error.
+    #[tokio::test]
+    async fn fetch_sends_user_agent_header() {
+        // Guard against an empty/misconfigured const before relying on it.
+        assert!(!URL_FETCH_USER_AGENT.is_empty());
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/ua"))
+            .and(header("user-agent", URL_FETCH_USER_AGENT))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html; charset=utf-8")
+                    .set_body_string("<html><body>hi</body></html>"),
+            )
+            .mount(&mock)
+            .await;
+        let body = fetch_against_mock(
+            &format!("{}/ua", mock.uri()),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("request carrying the expected User-Agent must be served");
         assert!(!body.is_empty());
     }
 

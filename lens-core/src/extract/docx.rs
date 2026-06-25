@@ -167,6 +167,18 @@ pub struct DocxExtractor;
 
 impl Extractor for DocxExtractor {
     fn extract(&self, raw: &[u8]) -> Result<ExtractOutput, LensError> {
+        // ZIP-BOMB RISK: `read_docx` (docx-rs 0.4.20 → zip 0.6.6) decompresses the
+        // DOCX (a ZIP) with NO intermediate inflation limit, so a small crafted
+        // archive could inflate to large transient memory here. Current mitigation
+        // is bounded and accepted for Phase 2:
+        //   1. Stage-1 raw-bytes cap (MAX_SOURCE_BYTES = 10 MB) rejects the source
+        //      in `run_ingest` BEFORE this call, capping the compressed input.
+        //   2. Stage-2 caps the resulting `extracted_text` length post-extraction.
+        //   3. This whole extraction runs under `spawn_blocking`, so a panic
+        //      (e.g. allocator abort) is isolated to the task, not the runtime.
+        // Stage-1 + Stage-2 bound BOTH the input and the retained output; only the
+        // transient in-`read_docx` inflation is unbounded.
+        // TODO(phase-3): bound intermediate inflation (zip backend swap / size-checked reader).
         let docx = read_docx(raw)
             .map_err(|e| LensError::Parse(format!("docx-rs failed to parse DOCX: {e:?}")))?;
 
@@ -186,6 +198,10 @@ impl Extractor for DocxExtractor {
             match child {
                 DocumentChild::Paragraph(p) => {
                     let node_path = format!("body/p[{para_count}]");
+                    // Increment BEFORE the empty-paragraph skip: node_path is the
+                    // document-child index, which must stay stable regardless of
+                    // which paragraphs are skipped (so anchors round-trip to the
+                    // original DOCX position even past blank paragraphs).
                     para_count += 1;
 
                     let text = para_text(p);

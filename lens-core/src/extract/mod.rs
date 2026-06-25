@@ -44,8 +44,9 @@ pub enum SourceAnchor {
     Pdf { page: u32, bbox: [f32; 4] },
     /// A DOCX block: a path identifying the node (paragraph/table) it came from.
     Docx { node_path: String },
-    /// A URL block: a DOM anchor / selector locating the extracted content.
-    Url { dom_anchor: String },
+    /// A URL block: the decimal BYTE OFFSET (as a string) of the block's first
+    /// character in the canonical extracted-text buffer — NOT a DOM selector.
+    Url { text_offset: String },
     /// No format-native coordinate is meaningful — the whole document IS the
     /// canonical buffer (plain text & Markdown).
     Text,
@@ -377,7 +378,7 @@ mod tests {
                 node_path: "body/p[4]".to_string(),
             },
             SourceAnchor::Url {
-                dom_anchor: "main > article#post".to_string(),
+                text_offset: "42".to_string(),
             },
         ];
         for a in anchors {

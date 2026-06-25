@@ -12,8 +12,8 @@
 //! `rs_trafilatura` returns a flat `content_text` string — it does NOT expose a
 //! structured block tree. We produce one block per non-empty line-group of the
 //! extracted text, with `block_type = "paragraph"` and `section_path = ""`.
-//! Each block's `dom_anchor` is the block's start index as a decimal string
-//! (a stable, round-trippable pointer into the canonical text buffer).
+//! Each block's `text_offset` is the block's start byte index as a decimal
+//! string (a stable, round-trippable pointer into the canonical text buffer).
 //!
 //! # needs_js detection
 //!
@@ -58,7 +58,10 @@ impl Extractor for UrlExtractor {
         let mut blocks = Vec::new();
         let mut anchors = Vec::new();
 
-        // Walk char boundaries, splitting on "\n\n" runs.
+        // Manual byte-offset splitter (not `str::split("\n\n")`): we must track
+        // each block's exact byte `block_start`/`block_end` to set `char_start`/
+        // `char_end` byte-identically into `extracted_text` (the byte-identity
+        // invariant). `str::split` discards offsets, so we walk positions by hand.
         let mut pos = 0usize;
         let bytes = extracted_text.as_bytes();
         let len = bytes.len();
@@ -97,10 +100,10 @@ impl Extractor for UrlExtractor {
                 char_end: block_end,
                 text,
             });
-            // dom_anchor = decimal offset of the block's first character in the
-            // extracted text buffer (a stable, round-trippable pointer).
+            // text_offset = decimal BYTE offset of the block's first character in
+            // the extracted text buffer (a stable, round-trippable pointer).
             anchors.push(SourceAnchor::Url {
-                dom_anchor: block_start.to_string(),
+                text_offset: block_start.to_string(),
             });
 
             // Ensure we make forward progress when the split point lands on
