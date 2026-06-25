@@ -40,19 +40,15 @@ use std::sync::Arc;
 
 use lens_core::ingest::{NEEDS_JS_MIN_CHARS, NEEDS_JS_MIN_TEXT_RATIO, URL_FETCH_TIMEOUT};
 use lens_core::{IngestProgress, LensEngine, Source};
-use tempfile::TempDir;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+mod support;
+use support::{file_engine, inject_fake_embedder, seed_tokenizer_from_env, vector_row_count};
 
 // ===========================================================================
 // Shared helpers
 // ===========================================================================
-
-async fn file_engine() -> (TempDir, LensEngine) {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = LensEngine::init(dir.path()).await.expect("engine init");
-    (dir, engine)
-}
 
 /// Relaxes the URL-fetch SSRF IP guard so the real `ingest_source` pipeline can
 /// fetch from a `wiremock` server bound to `127.0.0.1`.
@@ -74,18 +70,6 @@ fn allow_local_url_fetch_for_test() {
             std::env::set_var("LENS_TEST_ALLOW_LOCAL_URL", "1");
         }
     });
-}
-
-/// Injects a `CountingEmbedder` so the embedder never downloads the model.
-fn inject_fake_embedder(engine: &LensEngine) {
-    use lens_core::embedder::CountingEmbedder;
-    use std::sync::atomic::AtomicUsize;
-    let load_count = Arc::new(AtomicUsize::new(0));
-    let in_flight = Arc::new(AtomicUsize::new(0));
-    let e = Arc::new(CountingEmbedder::new(load_count, in_flight));
-    engine
-        .set_embedder_for_test(e)
-        .expect("embedder not yet initialized");
 }
 
 /// Collects all progress events into a Vec.
@@ -337,17 +321,7 @@ async fn url_indexes_real_article() {
     inject_fake_embedder(&engine);
 
     // Seed the tokenizer so the ingest pipeline doesn't attempt a network download.
-    if let Ok(path_str) = std::env::var("NOMIC_TOKENIZER_PATH") {
-        let data_dir = engine.data_dir_for_test().await;
-        let dest = data_dir
-            .join("models")
-            .join("fastembed")
-            .join("tokenizer.json");
-        if let Some(parent) = dest.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::copy(&path_str, &dest);
-    }
+    seed_tokenizer_from_env(&engine.data_dir_for_test().await);
 
     let nb = engine
         .create_notebook("NB", None, None)
@@ -553,35 +527,6 @@ async fn add_url_source_returns_queued_without_fetch() {
 // Item 5 — URL `.extracted.txt` sibling is removed on purge (no leak)
 // ===========================================================================
 
-/// Counts Lance vector rows for a source by reading the physical table directly.
-async fn vector_row_count(data_dir: &std::path::Path, notebook: &str, source_id: &str) -> usize {
-    use futures_util::TryStreamExt;
-    use lancedb::query::{ExecutableQuery, QueryBase};
-
-    let root = data_dir.join("lancedb");
-    let conn = match lancedb::connect(root.to_string_lossy().as_ref())
-        .execute()
-        .await
-    {
-        Ok(c) => c,
-        Err(_) => return 0,
-    };
-    let table_name = format!("vec__{notebook}__nomic_v15");
-    let names = conn.table_names().execute().await.unwrap_or_default();
-    if !names.iter().any(|n| n == &table_name) {
-        return 0;
-    }
-    let table = conn.open_table(&table_name).execute().await.unwrap();
-    let stream = table
-        .query()
-        .only_if(format!("source_id = '{source_id}'"))
-        .execute()
-        .await
-        .unwrap();
-    let batches: Vec<_> = stream.try_collect().await.unwrap();
-    batches.iter().map(|b| b.num_rows()).sum()
-}
-
 /// Item 5: ingesting a URL writes `{data_dir}/sources/{id}.extracted.txt`; the
 /// sibling MUST be removed on purge (the locator-derived sibling path leaked it
 /// before, because a URL locator is the URL string — not a path under
@@ -734,16 +679,7 @@ async fn reingest_into_needs_js_wipes_stale_chunks_and_vectors() {
     let data_dir = engine.data_dir_for_test().await;
 
     // Seed the tokenizer from NOMIC_TOKENIZER_PATH if present (offline path).
-    if let Ok(path_str) = std::env::var("NOMIC_TOKENIZER_PATH") {
-        let dest = data_dir
-            .join("models")
-            .join("fastembed")
-            .join("tokenizer.json");
-        if let Some(parent) = dest.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::copy(&path_str, &dest);
-    }
+    seed_tokenizer_from_env(&data_dir);
 
     let nb = engine
         .create_notebook("NB", None, None)

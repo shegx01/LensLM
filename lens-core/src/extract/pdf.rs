@@ -33,13 +33,20 @@
 //! [`pdfium`] binds it exactly once, lazily, in this ORDER (the bare two-step bind
 //! fails on a clean checkout with no system pdfium):
 //!   1. `PDFIUM_DYLIB_PATH` env var → `Pdfium::bind_to_library`,
-//!   2. the vendored repo path `src-tauri/frameworks/libpdfium.dylib` (resolved
-//!      relative to `CARGO_MANIFEST_DIR` — tests run from `lens-core/`, so the
-//!      workspace `src-tauri/frameworks/` is `../src-tauri/frameworks/`),
+//!   2. **macOS only** — the vendored repo path
+//!      `src-tauri/frameworks/libpdfium.dylib` (resolved relative to
+//!      `CARGO_MANIFEST_DIR` — tests run from `lens-core/`, so the workspace
+//!      `src-tauri/frameworks/` is `../src-tauri/frameworks/`). The bundled
+//!      pdfium asset is the macOS universal `.dylib`; M4 ships macOS only, so this
+//!      step is `#[cfg(target_os = "macos")]`-gated and does NOT exist on other
+//!      platforms (no silent "look for a `.dylib` that can't exist on Linux").
+//!      Bundling pdfium for other platforms is post-MVP.
 //!   3. `Pdfium::bind_to_system_library()`.
 //!
 //! The result is cached so every `extract` reuses the one binding.
 
+// `PathBuf` is only used by the macOS-only vendored-dylib resolver below.
+#[cfg(target_os = "macos")]
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
@@ -76,6 +83,11 @@ static PDFIUM_EXTRACT_LOCK: Mutex<()> = Mutex::new(());
 ///
 /// `CARGO_MANIFEST_DIR` for this crate is `<workspace>/lens-core`, so the vendored
 /// dylib lives at `<workspace>/src-tauri/frameworks/libpdfium.dylib`.
+///
+/// macOS-only: the bundled asset is the macOS universal `.dylib`. M4 ships macOS;
+/// bundling pdfium for other platforms is post-MVP, so this path does not exist
+/// off macOS (the `pdfium()` bind order below is `#[cfg]`-split to match).
+#[cfg(target_os = "macos")]
 fn vendored_dylib_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -103,27 +115,36 @@ fn pdfium() -> Result<&'static Pdfium, LensError> {
             }
         }
 
-        // 2. Vendored repo path (the dylib fetched by scripts/fetch-pdfium.sh).
-        let vendored = vendored_dylib_path();
-        if vendored.exists() {
-            match Pdfium::bind_to_library(&vendored) {
-                Ok(bindings) => return Ok(Pdfium::new(bindings)),
-                Err(e) => {
-                    return Err(format!(
-                        "vendored libpdfium at {} failed to bind: {e:?}",
-                        vendored.display()
-                    ));
+        // 2. Vendored repo path (macOS ONLY) — the dylib fetched by
+        //    scripts/fetch-pdfium.sh. The bundled asset is the macOS universal
+        //    `.dylib`; M4 ships macOS only and bundling pdfium for other platforms
+        //    is post-MVP, so this step is compiled out entirely off macOS rather
+        //    than probing for a `.dylib` that cannot exist there.
+        #[cfg(target_os = "macos")]
+        {
+            let vendored = vendored_dylib_path();
+            if vendored.exists() {
+                match Pdfium::bind_to_library(&vendored) {
+                    Ok(bindings) => return Ok(Pdfium::new(bindings)),
+                    Err(e) => {
+                        return Err(format!(
+                            "vendored libpdfium at {} failed to bind: {e:?}",
+                            vendored.display()
+                        ));
+                    }
                 }
             }
         }
 
-        // 3. System library fallback.
+        // 3. System library fallback. On non-macOS (where the macOS-only vendored
+        //    `.dylib` step above is compiled out) this is the only path after the
+        //    `PDFIUM_DYLIB_PATH` env override — a system libpdfium must be present.
         match Pdfium::bind_to_system_library() {
             Ok(bindings) => Ok(Pdfium::new(bindings)),
             Err(e) => Err(format!(
-                "could not bind libpdfium: no PDFIUM_DYLIB_PATH, no vendored dylib at {}, \
-                 and bind_to_system_library failed: {e:?}",
-                vendored.display()
+                "could not bind libpdfium: no usable PDFIUM_DYLIB_PATH, \
+                 no bound vendored dylib (macOS-only; bundled-pdfium for other \
+                 platforms is post-MVP), and bind_to_system_library failed: {e:?}"
             )),
         }
     });

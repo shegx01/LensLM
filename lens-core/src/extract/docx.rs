@@ -19,7 +19,7 @@ use docx_rs::{
 };
 
 use crate::LensError;
-use crate::parse::{Block, block_type};
+use crate::parse::{Block, SectionPathStack, block_type};
 
 use super::{ExtractOutput, Extractor, SourceAnchor};
 
@@ -45,41 +45,6 @@ fn heading_level(style_id: &str) -> Option<u8> {
         Some("5") => Some(5),
         Some("6") => Some(6),
         _ => None,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Section-path management (mirrors parse.rs heading stack)
-// ---------------------------------------------------------------------------
-
-/// Maintains a heading-stack identical in spirit to `parse.rs`'s heading-trail
-/// logic.  `push(level, text)` truncates the stack at `level` (so a second H2
-/// clears any H3+ below it) and appends the new heading; `current()` returns the
-/// ` > `-joined trail.
-struct SectionPath {
-    /// Stack entries: (level 1–6, heading text).
-    stack: Vec<(u8, String)>,
-}
-
-impl SectionPath {
-    fn new() -> Self {
-        Self { stack: Vec::new() }
-    }
-
-    /// Updates the section path with a new heading at `level` (1–6).
-    fn push(&mut self, level: u8, text: &str) {
-        // Drop every entry at `level` or deeper (they are now out of scope).
-        self.stack.retain(|(l, _)| *l < level);
-        self.stack.push((level, text.to_string()));
-    }
-
-    /// Returns the current ` > `-joined heading trail (empty at the document top).
-    fn current(&self) -> String {
-        self.stack
-            .iter()
-            .map(|(_, t)| t.as_str())
-            .collect::<Vec<_>>()
-            .join(" > ")
     }
 }
 
@@ -186,7 +151,7 @@ impl Extractor for DocxExtractor {
         let mut blocks: Vec<Block> = Vec::new();
         let mut anchors: Vec<SourceAnchor> = Vec::new();
 
-        let mut section_path = SectionPath::new();
+        let mut section_path = SectionPathStack::new();
 
         // Paragraph counter and table counter — used to build unique node_paths.
         // Each counter increments only for its own element type, so node_paths
@@ -576,7 +541,7 @@ mod tests {
 
     #[test]
     fn section_path_push_and_current() {
-        let mut sp = SectionPath::new();
+        let mut sp = SectionPathStack::new();
         assert_eq!(sp.current(), "");
         sp.push(1, "Chapter 1");
         assert_eq!(sp.current(), "Chapter 1");

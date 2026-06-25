@@ -38,8 +38,12 @@ use lens_core::parse::{Block, SourceKind, parse_blocks};
 use lens_core::vector_store::{LanceVectorStore, VectorRow, VectorStore};
 use lens_core::{EMBED_DIM, EMBED_MODEL_ID, IngestProgress, LensEngine};
 use sqlx::Row;
-use tempfile::TempDir;
-use tokenizers::Tokenizer;
+
+mod support;
+use support::{
+    file_engine, inject_counting_engine, tokenizer_available, tokenizer_for, vector_chunk_ids,
+    vector_row_count,
+};
 
 // ===========================================================================
 // Shared helpers
@@ -71,63 +75,6 @@ fn unit_vector(axis: usize) -> Vec<f32> {
 /// Are the real-model (FastembedEmbedder) tests enabled?
 fn model_tests_enabled() -> bool {
     std::env::var("LENS_RUN_MODEL_TESTS").is_ok()
-}
-
-/// Builds a file-backed engine over a fresh temp dir. Ingest tests need a
-/// file-backed engine (text sources are written under `{data_dir}/sources/`),
-/// not the in-memory `for_test()`.
-async fn file_engine() -> (TempDir, LensEngine) {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = LensEngine::init(dir.path()).await.expect("engine init");
-    (dir, engine)
-}
-
-/// Attempts to load the nomic tokenizer the ingest pipeline would use: from the
-/// `NOMIC_TOKENIZER_PATH` env var (fast offline path) or by performing the
-/// pipeline's own download into `data_dir`. Returns `None` if neither works
-/// (offline + no cached tokenizer) so tokenizer-dependent tests skip cleanly.
-async fn tokenizer_for(data_dir: &std::path::Path) -> Option<Tokenizer> {
-    if let Ok(path) = std::env::var("NOMIC_TOKENIZER_PATH")
-        && let Ok(t) = Tokenizer::from_file(&path)
-    {
-        // Seed the engine's expected location too, so a subsequent ingest in
-        // the same data dir does not re-download.
-        let dest = data_dir
-            .join("models")
-            .join("fastembed")
-            .join("tokenizer.json");
-        if let Some(parent) = dest.parent() {
-            let _ = std::fs::create_dir_all(parent);
-            let _ = std::fs::copy(&path, &dest);
-        }
-        return Some(t);
-    }
-    download_tokenizer_into(data_dir).await
-}
-
-/// Best-effort: download the nomic `tokenizer.json` into the engine's fastembed
-/// cache so the ingest pipeline finds it without a second fetch. Returns the
-/// loaded tokenizer, or `None` on any network failure.
-async fn download_tokenizer_into(data_dir: &std::path::Path) -> Option<Tokenizer> {
-    let url = "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5/resolve/main/tokenizer.json";
-    let dest = data_dir
-        .join("models")
-        .join("fastembed")
-        .join("tokenizer.json");
-    if dest.is_file() {
-        return Tokenizer::from_file(&dest).ok();
-    }
-    std::fs::create_dir_all(dest.parent()?).ok()?;
-    let bytes = reqwest::get(url).await.ok()?.bytes().await.ok()?;
-    std::fs::write(&dest, &bytes).ok()?;
-    Tokenizer::from_file(&dest).ok()
-}
-
-/// True if a tokenizer is reachable (env path or network). Used to skip
-/// tokenizer-dependent tests cleanly when offline with no cached tokenizer.
-async fn tokenizer_available() -> bool {
-    let dir = tempfile::tempdir().expect("tempdir");
-    tokenizer_for(dir.path()).await.is_some()
 }
 
 // ===========================================================================
@@ -766,19 +713,6 @@ fn assert_subsequence(haystack: &[String], needles: &[&str]) {
     }
 }
 
-/// Builds a file-backed engine with an injected CountingEmbedder so ingest tests
-/// avoid the 130 MB model (they still need the tokenizer for chunking).
-async fn inject_counting_engine() -> (TempDir, LensEngine) {
-    let (dir, engine) = file_engine().await;
-    let load_count = Arc::new(AtomicUsize::new(0));
-    let in_flight = Arc::new(AtomicUsize::new(0));
-    let counting: Arc<dyn Embedder> = Arc::new(CountingEmbedder::new(load_count, in_flight));
-    engine
-        .set_embedder_for_test(counting)
-        .expect("inject test embedder");
-    (dir, engine)
-}
-
 // ===========================================================================
 // Re-ingest idempotency + G5 cross-store wipe ordering
 // ===========================================================================
@@ -857,58 +791,6 @@ async fn reingest_idempotency_and_wipe() {
         vec_ids.len(),
         "chunk count and vector count must match after re-index"
     );
-}
-
-/// Counts the Lance vector rows for a given source by querying the store
-/// directly (search-by-source is not a trait method, so we read via a wide
-/// search and filter — sufficient for the small test corpus).
-async fn vector_row_count(data_dir: &std::path::Path, notebook: &str, source_id: &str) -> usize {
-    vector_chunk_ids(data_dir, notebook, source_id).await.len()
-}
-
-/// Returns the set of chunk ids stored in Lance for `source_id`. Reads the
-/// physical table directly via a fresh lancedb connection to avoid coupling to
-/// the (private) store internals.
-async fn vector_chunk_ids(
-    data_dir: &std::path::Path,
-    notebook: &str,
-    source_id: &str,
-) -> std::collections::HashSet<String> {
-    use arrow_array::StringArray;
-    use futures_util::TryStreamExt;
-    use lancedb::query::{ExecutableQuery, QueryBase};
-
-    let root = data_dir.join("lancedb");
-    let conn = lancedb::connect(root.to_string_lossy().as_ref())
-        .execute()
-        .await
-        .expect("connect");
-    let table_name = format!("vec__{notebook}__nomic_v15");
-    let names = conn.table_names().execute().await.unwrap();
-    if !names.iter().any(|n| n == &table_name) {
-        return std::collections::HashSet::new();
-    }
-    let table = conn.open_table(&table_name).execute().await.unwrap();
-    let stream = table
-        .query()
-        .only_if(format!("source_id = '{source_id}'"))
-        .execute()
-        .await
-        .unwrap();
-    let batches: Vec<_> = stream.try_collect().await.unwrap();
-    let mut ids = std::collections::HashSet::new();
-    for batch in &batches {
-        let col = batch
-            .column_by_name("chunk_id")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        for i in 0..batch.num_rows() {
-            ids.insert(col.value(i).to_string());
-        }
-    }
-    ids
 }
 
 async fn live_chunk_ids(engine: &LensEngine, source_id: &str) -> std::collections::HashSet<String> {
