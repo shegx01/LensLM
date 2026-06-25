@@ -111,25 +111,14 @@ impl Extractor for TextExtractor {
     }
 }
 
-/// Classifies a `sources.kind` as *text-like* (`text`/`markdown`) vs *derived*
-/// (`pdf`/`docx`/`url`, and any test-injected binary kind).
-///
-/// This is the single point of truth for the ingest read-path asymmetry
-/// (Decision A1): a text-like kind's ORIGINAL locator content IS the canonical
-/// buffer (no `.extracted.txt` sibling, and the content hash is over that text);
-/// a derived kind's canonical buffer is the persisted `.extracted.txt` sibling
-/// (and the content hash is over the RAW FILE BYTES for re-ingest determinism).
-pub fn is_text_like_kind(kind: &str) -> bool {
-    matches!(kind, "text" | "markdown")
-}
-
 /// Resolves the [`Extractor`] for a `sources.kind` string.
 ///
-/// Maps `"text"`/`"markdown"` to a [`TextExtractor`], `"docx"` to
-/// [`docx::DocxExtractor`], and `"url"` to [`url::UrlExtractor`]. PDF is added
-/// in a later step; until then it returns a [`LensError::Validation`] rather
-/// than fabricating empty output. An unknown kind is also a validation error
-/// (mirroring [`SourceKind::from_kind_str`]).
+/// Parses the boundary `&str` into a [`SourceKind`] and dispatches via an
+/// EXHAUSTIVE match — adding a [`SourceKind`] variant is a compile error here
+/// until an extractor is wired for it. `Text`/`Markdown` map to a
+/// [`TextExtractor`], `Pdf` to [`pdf::PdfExtractor`], `Docx` to
+/// [`docx::DocxExtractor`], and `Url` to [`url::UrlExtractor`]. An unknown kind
+/// string is a [`LensError::Validation`] (from [`SourceKind::from_kind_str`]).
 ///
 /// Under the `test-util` feature a test may register an injected extractor for an
 /// otherwise-unknown kind (see [`set_test_extractor_factory`]); that injection is
@@ -139,21 +128,18 @@ pub fn extractor_for(kind: &str) -> Result<Box<dyn Extractor>, LensError> {
     if let Some(injected) = test_seam::injected_extractor(kind) {
         return Ok(injected);
     }
-    match kind {
-        "text" => Ok(Box::new(TextExtractor::new(SourceKind::Text))),
-        "markdown" => Ok(Box::new(TextExtractor::new(SourceKind::Markdown))),
-        "docx" => Ok(Box::new(docx::DocxExtractor)),
-        // Step 7: URL extractor — rs-trafilatura-based HTML content extraction.
-        // The async reqwest GET lives in run_ingest (ingest.rs); this extractor
-        // receives already-fetched bytes.
-        "url" => Ok(Box::new(url::UrlExtractor)),
-        // Step 5: PDF extractor — pdfium-render text + per-segment bbox extraction.
-        // A no-text-layer (scanned) PDF yields empty output → run_ingest sets
+    match SourceKind::from_kind_str(kind)? {
+        SourceKind::Text => Ok(Box::new(TextExtractor::new(SourceKind::Text))),
+        SourceKind::Markdown => Ok(Box::new(TextExtractor::new(SourceKind::Markdown))),
+        SourceKind::Docx => Ok(Box::new(docx::DocxExtractor)),
+        // URL extractor — rs-trafilatura-based HTML content extraction. The async
+        // reqwest GET lives in run_ingest (ingest.rs); this extractor receives
+        // already-fetched bytes.
+        SourceKind::Url => Ok(Box::new(url::UrlExtractor)),
+        // PDF extractor — pdfium-render text + per-segment bbox extraction. A
+        // no-text-layer (scanned) PDF yields empty output → run_ingest sets
         // needs_ocr (Ok-with-status, never Err).
-        "pdf" => Ok(Box::new(pdf::PdfExtractor)),
-        other => Err(LensError::Validation(format!(
-            "unknown source kind: {other:?}; expected one of \"text\", \"markdown\", \"pdf\", \"docx\", \"url\""
-        ))),
+        SourceKind::Pdf => Ok(Box::new(pdf::PdfExtractor)),
     }
 }
 
@@ -227,7 +213,7 @@ pub mod test_seam {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let text = self.extracted_text.clone();
             let block = super::Block {
-                block_type: "paragraph".to_string(),
+                block_type: crate::parse::BlockType::Paragraph.as_str().to_string(),
                 section_path: String::new(),
                 char_start: 0,
                 char_end: text.len(),
@@ -328,31 +314,31 @@ mod tests {
 
     #[test]
     fn pdf_kind_resolves_to_extractor() {
-        // Proves "pdf" no longer returns an error after Step 5.
+        // pdf is a known kind; extractor_for resolves it to an Extractor.
         let result = extractor_for("pdf");
         assert!(
             result.is_ok(),
-            "extractor_for(\"pdf\") must succeed after Step 5"
+            "extractor_for(\"pdf\") must resolve an extractor"
         );
     }
 
     #[test]
     fn docx_kind_resolves_to_extractor() {
-        // Proves "docx" no longer returns an error after Step 6.
+        // docx is a known kind; extractor_for resolves it to an Extractor.
         let result = extractor_for("docx");
         assert!(
             result.is_ok(),
-            "extractor_for(\"docx\") must succeed after Step 6"
+            "extractor_for(\"docx\") must resolve an extractor"
         );
     }
 
     #[test]
     fn url_kind_resolves_to_extractor() {
-        // Proves "url" no longer returns an error after Step 7.
+        // url is a known kind; extractor_for resolves it to an Extractor.
         let result = extractor_for("url");
         assert!(
             result.is_ok(),
-            "extractor_for(\"url\") must succeed after Step 7"
+            "extractor_for(\"url\") must resolve an extractor"
         );
     }
 

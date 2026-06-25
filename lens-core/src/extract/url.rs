@@ -24,7 +24,7 @@
 //! `extracted_text`).
 
 use crate::LensError;
-use crate::parse::{Block, block_type};
+use crate::parse::{Block, BlockType};
 
 use super::{ExtractOutput, Extractor, SourceAnchor};
 
@@ -94,7 +94,7 @@ impl Extractor for UrlExtractor {
 
             let text = extracted_text[block_start..block_end].to_string();
             blocks.push(Block {
-                block_type: block_type::PARAGRAPH.to_string(),
+                block_type: BlockType::Paragraph.as_str().to_string(),
                 section_path: String::new(),
                 char_start: block_start,
                 char_end: block_end,

@@ -53,7 +53,7 @@ use std::sync::{Mutex, OnceLock};
 use pdfium_render::prelude::{Pdfium, PdfiumError};
 
 use crate::LensError;
-use crate::parse::{Block, block_type};
+use crate::parse::{Block, BlockType};
 
 use super::{ExtractOutput, Extractor, SourceAnchor};
 
@@ -218,9 +218,9 @@ impl Extractor for PdfExtractor {
                     && modal_font > 0.0
                     && seg_font >= modal_font * HEADING_FONT_RATIO;
                 let btype = if is_heading {
-                    block_type::HEADING
+                    BlockType::Heading.as_str()
                 } else {
-                    block_type::PARAGRAPH
+                    BlockType::Paragraph.as_str()
                 };
 
                 let char_start = extracted_text.len();

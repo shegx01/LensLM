@@ -222,7 +222,7 @@ pub async fn ingest_source(
         let pool = engine.pool().await;
         let repo = crate::notebooks::NotebookRepo::new(&pool);
         if let Err(e) = repo
-            .update_source_status(source_id, crate::notebooks::source_status::ERROR)
+            .update_source_status(source_id, crate::notebooks::SourceStatus::Error.as_str())
             .await
         {
             tracing::warn!(
@@ -254,13 +254,33 @@ async fn run_ingest(
         .await?
         .ok_or_else(|| LensError::Validation(format!("no source with id {source_id}")))?;
 
-    let text_like = crate::extract::is_text_like_kind(&source.kind);
+    // Parse the DB-row discriminant strings into their enums ONCE, here at the
+    // boundary. Every dispatch/gate below matches on these enums rather than
+    // re-comparing raw strings.
+    //
+    // `kind` is parsed leniently (`.ok()`): production kinds always parse, but
+    // the `test-util` injection seam (`extractor_for`) can drive an arbitrary
+    // fake binary kind that is NOT a known `SourceKind` — that path must flow
+    // through the DERIVED branch, so an unknown kind is `None` here (neither
+    // text-like, nor `Url`, nor `Pdf`), exactly as the prior string-compares
+    // behaved. `extractor_for` (below) still rejects a truly-unknown kind when
+    // there is no injected factory.
+    //
+    // `status` is parsed STRICTLY (`?`, not `.ok()`) — this asymmetry is
+    // deliberate: an out-of-vocabulary status is a fail-loud invariant breach
+    // (corrupt/forward-incompatible row), whereas an out-of-vocabulary kind is
+    // tolerated to preserve the test seam and the inert `file` kind.
+    let kind = crate::parse::SourceKind::from_kind_str(&source.kind).ok();
+    let status = source.status.parse::<crate::notebooks::SourceStatus>()?;
+    // An unknown (test-injected) kind is treated as DERIVED — `is_text_like` is
+    // the single point of truth, with `None` defaulting to derived.
+    let text_like = kind.is_some_and(|k| k.is_text_like());
 
     // ── Acquire RAW BYTES ─────────────────────────────────────────────────
     // URL sources fetch their bytes over HTTP; all other kinds read a local file.
     // Raw bytes (not `read_to_string`) so binary kinds (pdf/docx) flow through
     // their extractor; text/MD validate UTF-8 inside `TextExtractor`.
-    let raw: Vec<u8> = if source.kind == "url" {
+    let raw: Vec<u8> = if kind == Some(crate::parse::SourceKind::Url) {
         // ── URL: SSRF-guarded, size-bounded, async HTTP GET ───────────────
         // Emit FETCHING progress BEFORE the network round-trip so the UI
         // updates immediately when the task starts.
@@ -299,7 +319,7 @@ async fn run_ingest(
     // non-deterministic) extractor at all (AC4d).
     if !text_like {
         let raw_hash = sha256_hex(&raw);
-        if source.status == crate::notebooks::source_status::INDEXED
+        if status == crate::notebooks::SourceStatus::Indexed
             && source.content_hash.as_deref() == Some(raw_hash.as_str())
         {
             tracing::info!(
@@ -353,7 +373,7 @@ async fn run_ingest(
     // by returning EMPTY output (no Err) — see `extract::pdf`. We set
     // `needs_ocr` via the SAME Ok-with-status mechanism as `needs_js` (NOT Err,
     // which would flip to `error`) and index nothing.
-    if source.kind == "pdf" && out.extracted_text.trim().is_empty() {
+    if kind == Some(crate::parse::SourceKind::Pdf) && out.extracted_text.trim().is_empty() {
         tracing::info!(
             source_id,
             "PDF source produced no text layer — likely scanned/image-only; setting needs_ocr"
@@ -364,14 +384,14 @@ async fn run_ingest(
             &data_dir,
             &source.notebook_id,
             source_id,
-            crate::notebooks::source_status::NEEDS_OCR,
+            crate::notebooks::SourceStatus::NeedsOcr.as_str(),
         )
         .await?;
         // Return Ok so the Err→error flip in ingest_source never fires.
         return Ok(());
     }
 
-    if source.kind == "url" {
+    if kind == Some(crate::parse::SourceKind::Url) {
         let text_len = out.extracted_text.len();
         let raw_len = raw.len();
         let ratio = if raw_len == 0 {
@@ -394,7 +414,7 @@ async fn run_ingest(
                 &data_dir,
                 &source.notebook_id,
                 source_id,
-                crate::notebooks::source_status::NEEDS_JS,
+                crate::notebooks::SourceStatus::NeedsJs.as_str(),
             )
             .await?;
             // Return Ok so the Err→error flip in ingest_source never fires.
@@ -439,7 +459,7 @@ async fn run_ingest(
     // (text/MD extraction is cheap + deterministic, so running it first is fine).
     let content_hash = if text_like {
         let h = sha256_hex(canonical.as_bytes());
-        if source.status == crate::notebooks::source_status::INDEXED
+        if status == crate::notebooks::SourceStatus::Indexed
             && source.content_hash.as_deref() == Some(h.as_str())
         {
             tracing::info!(
@@ -466,7 +486,7 @@ async fn run_ingest(
         // flips lingering `parsing`/`embedding` rows → `error`) can reclaim the
         // half-wiped source on next launch. Wiping while still `indexed` would
         // leave a row that looks complete but has lost its vectors.
-        repo.update_source_status(source_id, crate::notebooks::source_status::PARSING)
+        repo.update_source_status(source_id, crate::notebooks::SourceStatus::Parsing.as_str())
             .await?;
     }
     on_progress(IngestProgress::new(ingest_phase::PARSING, 0, Some(1)));
@@ -539,15 +559,18 @@ async fn run_ingest(
     if chunks.is_empty() {
         repo.update_source_metadata(source_id, 0, &content_hash)
             .await?;
-        repo.update_source_status(source_id, crate::notebooks::source_status::INDEXED)
+        repo.update_source_status(source_id, crate::notebooks::SourceStatus::Indexed.as_str())
             .await?;
         on_progress(IngestProgress::new(ingest_phase::DONE, 1, Some(1)));
         return Ok(());
     }
 
     // ── EMBED ─────────────────────────────────────────────────────────────
-    repo.update_source_status(source_id, crate::notebooks::source_status::EMBEDDING)
-        .await?;
+    repo.update_source_status(
+        source_id,
+        crate::notebooks::SourceStatus::Embedding.as_str(),
+    )
+    .await?;
 
     // Lazily get the cached embedder. Emit a `model_download` phase BEFORE the
     // first construction so a cold-cache download surfaces in the UI.
@@ -611,7 +634,7 @@ async fn run_ingest(
     // ── Finalize: metadata + indexed status ──────────────────────────────
     repo.update_source_metadata(source_id, total_tokens, &content_hash)
         .await?;
-    repo.update_source_status(source_id, crate::notebooks::source_status::INDEXED)
+    repo.update_source_status(source_id, crate::notebooks::SourceStatus::Indexed.as_str())
         .await?;
     on_progress(IngestProgress::new(ingest_phase::DONE, 1, Some(1)));
     Ok(())

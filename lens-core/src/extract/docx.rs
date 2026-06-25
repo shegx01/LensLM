@@ -19,7 +19,7 @@ use docx_rs::{
 };
 
 use crate::LensError;
-use crate::parse::{Block, SectionPathStack, block_type};
+use crate::parse::{Block, BlockType, SectionPathStack};
 
 use super::{ExtractOutput, Extractor, SourceAnchor};
 
@@ -190,9 +190,9 @@ impl Extractor for DocxExtractor {
                     }
 
                     let btype = if level.is_some() {
-                        block_type::HEADING
+                        BlockType::Heading.as_str()
                     } else {
-                        block_type::PARAGRAPH
+                        BlockType::Paragraph.as_str()
                     };
 
                     // The section_path for a heading is the trail INCLUDING itself
@@ -232,7 +232,7 @@ impl Extractor for DocxExtractor {
                     let char_end = extracted_text.len() - 1; // exclude trailing \n
 
                     blocks.push(Block {
-                        block_type: block_type::TABLE.to_string(),
+                        block_type: BlockType::Table.as_str().to_string(),
                         section_path: sp,
                         text,
                         char_start,
@@ -420,7 +420,7 @@ mod tests {
         let heading = out
             .blocks
             .iter()
-            .find(|b| b.block_type == block_type::HEADING)
+            .find(|b| b.block_type == BlockType::Heading.as_str())
             .expect("at least one heading block expected");
         assert_eq!(heading.text, "Test Heading");
         // The heading's section_path includes its own text (mirrors parse.rs).
@@ -437,7 +437,7 @@ mod tests {
         let para = out
             .blocks
             .iter()
-            .find(|b| b.block_type == block_type::PARAGRAPH)
+            .find(|b| b.block_type == BlockType::Paragraph.as_str())
             .expect("at least one paragraph block expected");
         assert_eq!(para.text, "Sentinel body text for extraction.");
         // The paragraph is nested under the H1 heading.
@@ -454,7 +454,7 @@ mod tests {
         let tbl = out
             .blocks
             .iter()
-            .find(|b| b.block_type == block_type::TABLE)
+            .find(|b| b.block_type == BlockType::Table.as_str())
             .expect("at least one table block expected");
         assert!(
             tbl.text.contains("Cell A1"),
@@ -468,9 +468,11 @@ mod tests {
         let out = extract_fixture();
         let types: Vec<&str> = out.blocks.iter().map(|b| b.block_type.as_str()).collect();
         // We expect at minimum: heading, paragraph, table (in that order).
-        let heading_pos = types.iter().position(|&t| t == block_type::HEADING);
-        let para_pos = types.iter().position(|&t| t == block_type::PARAGRAPH);
-        let table_pos = types.iter().position(|&t| t == block_type::TABLE);
+        let heading_pos = types.iter().position(|&t| t == BlockType::Heading.as_str());
+        let para_pos = types
+            .iter()
+            .position(|&t| t == BlockType::Paragraph.as_str());
+        let table_pos = types.iter().position(|&t| t == BlockType::Table.as_str());
         assert!(heading_pos.is_some(), "no heading block");
         assert!(para_pos.is_some(), "no paragraph block");
         assert!(table_pos.is_some(), "no table block");

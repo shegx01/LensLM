@@ -26,7 +26,7 @@ pub use config::AppConfig;
 pub use embedder::{CountingEmbedder, EMBED_DIM, EMBED_MODEL_ID, Embedder, FastembedEmbedder};
 pub use embedding::{InstallProgress, pull_embedding_model};
 pub use error::LensError;
-pub use extract::{ExtractOutput, Extractor, SourceAnchor, extractor_for, is_text_like_kind};
+pub use extract::{ExtractOutput, Extractor, SourceAnchor, extractor_for};
 pub use ingest::{
     IngestProgress, NEEDS_JS_MIN_CHARS, NEEDS_JS_MIN_TEXT_RATIO, URL_FETCH_TIMEOUT, ingest_source,
     resolve_nomic_tokenizer,
@@ -152,12 +152,40 @@ impl LensEngine {
         // reset here. They are deliberately absent from the `IN (?, ?)` clause.
         // Run_ingest sets them directly via `update_source_status` and returns
         // `Ok(())` so they are never surfaced via the Err→error flip path.
-        sqlx::query("UPDATE sources SET status = ? WHERE status IN (?, ?)")
-            .bind(notebooks::source_status::ERROR)
-            .bind(notebooks::source_status::PARSING)
-            .bind(notebooks::source_status::EMBEDDING)
-            .execute(&db)
-            .await?;
+        // The transient set is derived from `SourceStatus::is_transient` (an
+        // exhaustive match), so adding a status variant forces a recovery
+        // decision rather than silently leaving a new transient state stranded.
+        // For the in-progress states this is exactly `(parsing, embedding)`, the
+        // same `IN (?, ?)` clause as before — `needs_ocr`/`needs_js` are NOT
+        // transient and stay excluded.
+        use notebooks::SourceStatus;
+        let transient: Vec<SourceStatus> = [
+            SourceStatus::Pending,
+            SourceStatus::Queued,
+            SourceStatus::Parsing,
+            SourceStatus::Embedding,
+            SourceStatus::Indexed,
+            SourceStatus::Error,
+            SourceStatus::NeedsOcr,
+            SourceStatus::NeedsJs,
+        ]
+        .into_iter()
+        .filter(SourceStatus::is_transient)
+        .collect();
+        debug_assert_eq!(
+            transient,
+            vec![SourceStatus::Parsing, SourceStatus::Embedding],
+            "crash-recovery transient set must stay (parsing, embedding)"
+        );
+        let placeholders = std::iter::repeat_n("?", transient.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("UPDATE sources SET status = ? WHERE status IN ({placeholders})");
+        let mut query = sqlx::query(&sql).bind(SourceStatus::Error.as_str());
+        for s in &transient {
+            query = query.bind(s.as_str());
+        }
+        query.execute(&db).await?;
         let mut config = AppConfig::load(data_dir)?;
         config.paths.data_dir = data_dir.display().to_string();
         tracing::info!("engine initialized");

@@ -400,12 +400,18 @@ async fn crash_recovery_skips_needs_js_and_needs_ocr() {
         .expect("add_url_source for ocr");
 
     // Manually set their statuses to the terminal-pending values.
-    repo.update_source_status(&src_js.id, lens_core::notebooks::source_status::NEEDS_JS)
-        .await
-        .expect("set needs_js");
-    repo.update_source_status(&src_ocr.id, lens_core::notebooks::source_status::NEEDS_OCR)
-        .await
-        .expect("set needs_ocr");
+    repo.update_source_status(
+        &src_js.id,
+        lens_core::notebooks::SourceStatus::NeedsJs.as_str(),
+    )
+    .await
+    .expect("set needs_js");
+    repo.update_source_status(
+        &src_ocr.id,
+        lens_core::notebooks::SourceStatus::NeedsOcr.as_str(),
+    )
+    .await
+    .expect("set needs_ocr");
 
     drop(pool);
     drop(engine);

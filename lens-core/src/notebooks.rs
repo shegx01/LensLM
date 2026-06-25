@@ -9,12 +9,14 @@
 use std::fmt;
 use std::ops::Deref;
 use std::path::Path;
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use crate::LensError;
+use crate::parse::SourceKind;
 
 /// Maximum accepted notebook title length, in characters. Titles longer than
 /// this are rejected with [`LensError::Validation`] rather than silently stored.
@@ -91,25 +93,92 @@ impl fmt::Display for NotebookId {
 /// them to `error`. The crash-recovery reset in [`crate::LensEngine::init`]
 /// (`WHERE status IN (parsing, embedding)`) explicitly excludes both. This
 /// exclusion is locked by the `crash_recovery_skips_needs_js_and_needs_ocr` test.
-pub mod source_status {
+///
+/// Serialized to / parsed from the EXACT legacy `sources.status` strings via
+/// [`as_str`](Self::as_str) and [`FromStr`] — the persisted column values are
+/// unchanged (no DB migration). The [`Source`] FromRow struct keeps `status:
+/// String` at the DB-row / IPC boundary; write sites bind `SourceStatus::X.as_str()`
+/// and gates/transitions match on the parsed enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceStatus {
     /// Inert M1 file record awaiting M4 ingestion.
-    pub const PENDING: &str = "pending";
+    Pending,
     /// Queued for ingestion (the M4 managed-text entry state).
-    pub const QUEUED: &str = "queued";
+    Queued,
     /// Parse phase in progress (transient — reset to `error` on crash recovery).
-    pub const PARSING: &str = "parsing";
+    Parsing,
     /// Embed phase in progress (transient — reset to `error` on crash recovery).
-    pub const EMBEDDING: &str = "embedding";
+    Embedding,
     /// Fully ingested and indexed.
-    pub const INDEXED: &str = "indexed";
+    Indexed,
     /// Ingestion failed (terminal until re-ingest).
-    pub const ERROR: &str = "error";
-    /// Terminal-pending: URL source returned near-empty text — likely a JS-rendered
-    /// SPA. Must NOT be reset to `error` on crash recovery (it is not transient).
-    pub const NEEDS_JS: &str = "needs_js";
+    Error,
     /// Terminal-pending: PDF/image source requires OCR to extract text.
     /// Must NOT be reset to `error` on crash recovery (it is not transient).
-    pub const NEEDS_OCR: &str = "needs_ocr";
+    NeedsOcr,
+    /// Terminal-pending: URL source returned near-empty text — likely a JS-rendered
+    /// SPA. Must NOT be reset to `error` on crash recovery (it is not transient).
+    NeedsJs,
+}
+
+impl SourceStatus {
+    /// The EXACT `sources.status` string stored in SQLite for this variant.
+    /// Inverse of [`FromStr`]. These strings are the persisted wire format and
+    /// MUST NOT change (no DB migration).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Queued => "queued",
+            Self::Parsing => "parsing",
+            Self::Embedding => "embedding",
+            Self::Indexed => "indexed",
+            Self::Error => "error",
+            Self::NeedsOcr => "needs_ocr",
+            Self::NeedsJs => "needs_js",
+        }
+    }
+
+    /// Whether this status is a TRANSIENT in-progress state that the startup
+    /// crash-recovery reset must flip back to [`Error`](Self::Error) (a process
+    /// that died mid-ingest left no task to advance it).
+    ///
+    /// Exhaustive by construction: every status is classified here, so adding a
+    /// variant is a compile error that forces a recovery decision. The
+    /// terminal-pending `NeedsOcr`/`NeedsJs` (and every terminal state) are
+    /// `false` — they must NOT be reset (locked by
+    /// `crash_recovery_skips_needs_js_and_needs_ocr`).
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::Parsing | Self::Embedding => true,
+            Self::Pending
+            | Self::Queued
+            | Self::Indexed
+            | Self::Error
+            | Self::NeedsOcr
+            | Self::NeedsJs => false,
+        }
+    }
+}
+
+impl FromStr for SourceStatus {
+    type Err = LensError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "pending" => Ok(Self::Pending),
+            "queued" => Ok(Self::Queued),
+            "parsing" => Ok(Self::Parsing),
+            "embedding" => Ok(Self::Embedding),
+            "indexed" => Ok(Self::Indexed),
+            "error" => Ok(Self::Error),
+            "needs_ocr" => Ok(Self::NeedsOcr),
+            "needs_js" => Ok(Self::NeedsJs),
+            other => Err(LensError::Validation(format!(
+                "unknown source status: {other:?}; expected one of \"pending\", \"queued\", \
+                 \"parsing\", \"embedding\", \"indexed\", \"error\", \"needs_ocr\", \"needs_js\""
+            ))),
+        }
+    }
 }
 
 /// A source row, returned across the IPC boundary.
@@ -450,7 +519,7 @@ impl<'a> NotebookRepo<'a> {
         .bind(&id)
         .bind(notebook_id)
         .bind(title)
-        .bind(source_status::PENDING)
+        .bind(SourceStatus::Pending.as_str())
         .bind(locator)
         .bind(&now)
         .execute(self.pool)
@@ -460,7 +529,7 @@ impl<'a> NotebookRepo<'a> {
             notebook_id: notebook_id.to_string(),
             kind: "file".to_string(),
             title: title.to_string(),
-            status: source_status::PENDING.to_string(),
+            status: SourceStatus::Pending.as_str().to_string(),
             locator: locator.to_string(),
             selected: 1,
             token_count: None,
@@ -496,12 +565,16 @@ impl<'a> NotebookRepo<'a> {
                 crate::ingest::MAX_SOURCE_BYTES
             )));
         }
-        let ext = match kind {
-            "text" => "txt",
-            "markdown" => "md",
+        // Parse the boundary string into the enum and dispatch the managed
+        // extension via an exhaustive match. Only the text-like kinds are valid
+        // for a pasted-text source; the derived kinds are rejected here.
+        let ext = match SourceKind::from_kind_str(kind)? {
+            SourceKind::Text => "txt",
+            SourceKind::Markdown => "md",
             other => {
                 return Err(LensError::Validation(format!(
-                    "unknown text source kind: {other:?}; expected \"text\" or \"markdown\""
+                    "unknown text source kind: {:?}; expected \"text\" or \"markdown\"",
+                    other.as_str()
                 )));
             }
         };
@@ -526,7 +599,7 @@ impl<'a> NotebookRepo<'a> {
         .bind(notebook_id)
         .bind(kind)
         .bind(title)
-        .bind(source_status::QUEUED)
+        .bind(SourceStatus::Queued.as_str())
         .bind(&locator)
         .bind(&now)
         .execute(self.pool)
@@ -537,7 +610,7 @@ impl<'a> NotebookRepo<'a> {
             notebook_id: notebook_id.to_string(),
             kind: kind.to_string(),
             title: title.to_string(),
-            status: source_status::QUEUED.to_string(),
+            status: SourceStatus::Queued.as_str().to_string(),
             locator,
             selected: 1,
             token_count: None,
@@ -577,10 +650,10 @@ impl<'a> NotebookRepo<'a> {
             .and_then(|e| e.to_str())
             .map(str::to_ascii_lowercase);
         let (kind, ext) = match ext_lower.as_deref() {
-            Some("pdf") => ("pdf", "pdf"),
-            Some("docx") => ("docx", "docx"),
-            Some("txt") => ("text", "txt"),
-            Some("md") | Some("markdown") => ("markdown", "md"),
+            Some("pdf") => (SourceKind::Pdf.as_str(), "pdf"),
+            Some("docx") => (SourceKind::Docx.as_str(), "docx"),
+            Some("txt") => (SourceKind::Text.as_str(), "txt"),
+            Some("md") | Some("markdown") => (SourceKind::Markdown.as_str(), "md"),
             other => {
                 return Err(LensError::Validation(format!(
                     "unsupported file extension {other:?} for {}; expected one of \
@@ -627,7 +700,7 @@ impl<'a> NotebookRepo<'a> {
         .bind(notebook_id)
         .bind(kind)
         .bind(&title)
-        .bind(source_status::QUEUED)
+        .bind(SourceStatus::Queued.as_str())
         .bind(&locator)
         .bind(&now)
         .execute(self.pool)
@@ -638,7 +711,7 @@ impl<'a> NotebookRepo<'a> {
             notebook_id: notebook_id.to_string(),
             kind: kind.to_string(),
             title,
-            status: source_status::QUEUED.to_string(),
+            status: SourceStatus::Queued.as_str().to_string(),
             locator,
             selected: 1,
             token_count: None,
@@ -670,7 +743,7 @@ impl<'a> NotebookRepo<'a> {
         .bind(&id)
         .bind(notebook_id)
         .bind(title)
-        .bind(source_status::QUEUED)
+        .bind(SourceStatus::Queued.as_str())
         .bind(url)
         .bind(&now)
         .execute(self.pool)
@@ -678,9 +751,9 @@ impl<'a> NotebookRepo<'a> {
         Ok(Source {
             id,
             notebook_id: notebook_id.to_string(),
-            kind: "url".to_string(),
+            kind: SourceKind::Url.as_str().to_string(),
             title: title.to_string(),
-            status: source_status::QUEUED.to_string(),
+            status: SourceStatus::Queued.as_str().to_string(),
             locator: url.to_string(),
             selected: 1,
             token_count: None,
@@ -861,6 +934,54 @@ mod tests {
         assert_eq!(&*id, "abc");
         assert_eq!(id.to_string(), "abc");
         assert_eq!(id.as_str(), "abc");
+    }
+
+    #[test]
+    fn source_status_roundtrip_and_wire_strings() {
+        // Lock the EXACT persisted `sources.status` strings (no DB migration) —
+        // this is the highest-stakes enum: its wire values gate crash-recovery.
+        let cases = [
+            (SourceStatus::Pending, "pending"),
+            (SourceStatus::Queued, "queued"),
+            (SourceStatus::Parsing, "parsing"),
+            (SourceStatus::Embedding, "embedding"),
+            (SourceStatus::Indexed, "indexed"),
+            (SourceStatus::Error, "error"),
+            (SourceStatus::NeedsOcr, "needs_ocr"),
+            (SourceStatus::NeedsJs, "needs_js"),
+        ];
+        for (status, s) in cases {
+            assert_eq!(status.as_str(), s, "as_str must equal legacy wire string");
+            assert_eq!(
+                SourceStatus::from_str(s).unwrap(),
+                status,
+                "FromStr round-trips as_str"
+            );
+        }
+    }
+
+    #[test]
+    fn source_status_is_transient_table() {
+        // Exactly {Parsing, Embedding} are transient — locked in release (not
+        // only via the exhaustive-match debug guarantee). Crash-recovery resets
+        // these back to Error and MUST skip every other status.
+        let cases = [
+            (SourceStatus::Pending, false),
+            (SourceStatus::Queued, false),
+            (SourceStatus::Parsing, true),
+            (SourceStatus::Embedding, true),
+            (SourceStatus::Indexed, false),
+            (SourceStatus::Error, false),
+            (SourceStatus::NeedsOcr, false),
+            (SourceStatus::NeedsJs, false),
+        ];
+        for (status, transient) in cases {
+            assert_eq!(
+                status.is_transient(),
+                transient,
+                "{status:?} transient classification must be locked"
+            );
+        }
     }
 
     /// Spins up a fully-migrated in-memory pool for repo tests.

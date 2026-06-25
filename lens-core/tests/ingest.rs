@@ -1449,7 +1449,7 @@ use lens_core::extract::test_seam::{
 
 /// A test-only DERIVED kind whose `Extractor` is injected via the `test-util`
 /// seam. The ingest pipeline treats it as binary (raw-bytes hash, `.extracted.txt`
-/// sibling, Stage-1 guard) because it is NOT in `is_text_like_kind`.
+/// sibling, Stage-1 guard) because it is NOT `SourceKind::is_text_like`.
 const FAKE_KIND: &str = "faketest";
 
 /// Writes a raw binary file under `{data_dir}/sources/{id}.bin` and returns its

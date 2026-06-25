@@ -3,15 +3,35 @@
 // TypeScript mirrors of the Rust source structs. serde on the Rust side uses
 // verbatim snake_case field names, so this shape must match exactly.
 
-/** Constrained set of source ingestion states — mirrors the Rust status values.
- * 'pending' is used by the add_source (file) path before ingest begins. */
-export type SourceStatus = 'pending' | 'queued' | 'parsing' | 'embedding' | 'indexed' | 'error';
+/** Constrained set of source ingestion states — mirrors the Rust
+ * `SourceStatus` enum (lens-core/src/notebooks.rs). 'pending' is used by the
+ * add_source (file) path before ingest begins; 'needs_ocr'/'needs_js' are the
+ * terminal-pending states from the PDF/URL ingest gates. */
+export type SourceStatus =
+  | 'pending'
+  | 'queued'
+  | 'parsing'
+  | 'embedding'
+  | 'indexed'
+  | 'error'
+  | 'needs_ocr'
+  | 'needs_js';
+
+/** Constrained set of source kinds — the exact `sources.kind` column values
+ * returned across IPC. 'text'|'markdown'|'pdf'|'docx'|'url' mirror the Rust
+ * `SourceKind` enum (lens-core/src/parse.rs) — the ingestable kinds. 'file' is
+ * the legacy inert M1 placeholder written by the `add_source` path (kind =
+ * "file", status = "pending") before M4 ingestion; it is NOT a `SourceKind`
+ * variant on the Rust side but is a real persisted value, so it is included
+ * here for the rows the backend can return. */
+// SYNC-CHECK: must match lens-core/src/parse.rs SourceKind enum
+export type SourceKind = 'text' | 'markdown' | 'pdf' | 'docx' | 'url' | 'file';
 
 // SYNC-CHECK: must match lens-core/src/notebooks.rs Source struct (around line 82)
 export interface Source {
   id: string;
   notebook_id: string;
-  kind: string;
+  kind: SourceKind;
   title: string;
   status: SourceStatus;
   locator: string;
