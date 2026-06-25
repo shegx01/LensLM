@@ -2129,3 +2129,254 @@ async fn pdf_text_layer_source_indexed_with_anchors_end_to_end() {
         );
     }
 }
+
+// ===========================================================================
+// add_file_source — real-binary DOCX/PDF end-to-end (REAL extractor, NOT the
+// FakeBinaryExtractor seam): extension→kind detection, managed copy, real
+// ingest, sibling + anchor + byte-identity + purge lifecycle.
+// ===========================================================================
+
+/// Builds a real `.docx` in memory: a Heading1, a body paragraph carrying a
+/// known sentinel, and a 2×2 table. Mirrors the in-crate `build_fixture_docx`
+/// helper but lives here so the integration test owns its own fixture.
+fn build_e2e_docx_bytes(sentinel: &str) -> Vec<u8> {
+    use docx_rs::{Docx, Paragraph, Run, Table, TableCell, TableRow};
+    use std::io::Cursor;
+    let docx = Docx::new()
+        .add_paragraph(
+            Paragraph::new()
+                .add_run(Run::new().add_text("E2E Heading"))
+                .style("Heading1"),
+        )
+        .add_paragraph(Paragraph::new().add_run(Run::new().add_text(sentinel)))
+        .add_table(Table::new(vec![
+            TableRow::new(vec![
+                TableCell::new()
+                    .add_paragraph(Paragraph::new().add_run(Run::new().add_text("Cell A1"))),
+                TableCell::new()
+                    .add_paragraph(Paragraph::new().add_run(Run::new().add_text("Cell A2"))),
+            ]),
+            TableRow::new(vec![
+                TableCell::new()
+                    .add_paragraph(Paragraph::new().add_run(Run::new().add_text("Cell B1"))),
+                TableCell::new()
+                    .add_paragraph(Paragraph::new().add_run(Run::new().add_text("Cell B2"))),
+            ]),
+        ]));
+    let mut buf = Vec::new();
+    docx.build()
+        .pack(Cursor::new(&mut buf))
+        .expect("fixture DOCX build failed");
+    buf
+}
+
+/// AC (DOCX end-to-end, REAL extractor) — a real `.docx` added via
+/// `add_file_source` (extension→kind = "docx", copied into managed storage) and
+/// ingested through the REAL `DocxExtractor` reaches `indexed`; the
+/// `{data_dir}/sources/{id}.extracted.txt` sibling exists with the sentinel;
+/// every chunk carries a `SourceAnchor::Docx`; chunks slice the canonical sibling
+/// byte-identically; and purge removes BOTH the managed original AND the sibling.
+///
+/// Runs everywhere (docx-rs is pure Rust — no platform-gated native dependency).
+#[tokio::test]
+async fn docx_file_source_indexed_with_anchors_end_to_end() {
+    const SENTINEL: &str = "Sentinel body text for docx end-to-end extraction.";
+
+    if !tokenizer_available().await {
+        eprintln!(
+            "skipping docx_file_source_indexed_with_anchors_end_to_end: no tokenizer (offline)"
+        );
+        return;
+    }
+
+    let (_dir, engine) = inject_counting_engine().await;
+    let data_dir = engine.data_dir_for_test().await;
+    let nb = engine
+        .create_notebook("docx-e2e-nb", None, None)
+        .await
+        .unwrap();
+
+    // Write the `.docx` to a temp path OUTSIDE managed storage; `add_file_source`
+    // copies it into `{data_dir}/sources/{id}.docx`.
+    let src_dir = tempfile::tempdir().unwrap();
+    let src_path = src_dir.path().join("report.docx");
+    std::fs::write(&src_path, build_e2e_docx_bytes(SENTINEL)).unwrap();
+
+    let source = engine
+        .add_file_source(&nb.id, &src_path, None)
+        .await
+        .expect("add_file_source for a .docx must succeed");
+    assert_eq!(source.kind, "docx", "extension .docx → kind docx");
+    assert_eq!(source.status, "queued", "new file source is queued");
+    assert_eq!(
+        source.title, "report.docx",
+        "title defaults to the file name"
+    );
+    // The managed copy lives under {data_dir}/sources and is what the ingest reads.
+    assert!(
+        std::path::Path::new(&source.locator).exists(),
+        "managed copy must exist after add_file_source: {}",
+        source.locator
+    );
+
+    engine.ingest_source(&source.id, |_p| {}).await.unwrap();
+    assert_eq!(engine_source_status(&engine, &source.id).await, "indexed");
+
+    // The canonical buffer is the persisted `.extracted.txt` sibling.
+    let sibling = data_dir
+        .join("sources")
+        .join(format!("{}.extracted.txt", source.id));
+    let canonical = std::fs::read_to_string(&sibling)
+        .expect("a derived DOCX source must persist its .extracted.txt sibling");
+    assert!(
+        canonical.contains(SENTINEL),
+        "sentinel missing from the persisted canonical buffer; got {canonical:?}"
+    );
+
+    // Chunks slice the canonical buffer byte-identically.
+    assert_chunk_byte_identity(&engine, &source.id, &canonical).await;
+
+    // Every chunk anchor is a SourceAnchor::Docx.
+    let pool = engine.pool().await;
+    let rows = sqlx::query("SELECT source_anchor FROM chunks WHERE source_id = ?")
+        .bind(&source.id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert!(!rows.is_empty(), "expected chunks for the DOCX source");
+    for (i, row) in rows.iter().enumerate() {
+        let anchor_json = row
+            .get::<Option<String>, _>("source_anchor")
+            .unwrap_or_else(|| panic!("chunk[{i}] source_anchor must be non-NULL for DOCX"));
+        let anchor: SourceAnchor = serde_json::from_str(&anchor_json).unwrap();
+        assert!(
+            matches!(anchor, SourceAnchor::Docx { .. }),
+            "chunk[{i}] anchor must be SourceAnchor::Docx, got {anchor:?}"
+        );
+    }
+
+    // Purge removes BOTH the managed original AND the `.extracted.txt` sibling.
+    let managed = std::path::PathBuf::from(&source.locator);
+    engine.trash_source(&source.id).await.unwrap();
+    engine.purge_source(&source.id).await.unwrap();
+    assert!(
+        !managed.exists(),
+        "purge must remove the managed DOCX original"
+    );
+    assert!(
+        !sibling.exists(),
+        "purge must remove the .extracted.txt sibling"
+    );
+}
+
+/// AC (PDF end-to-end, REAL extractor) — a real text-layer PDF added via
+/// `add_file_source` (extension→kind = "pdf", copied into managed storage) and
+/// ingested through the REAL `PdfExtractor` reaches `indexed`; the
+/// `.extracted.txt` sibling is written with the sentinel; chunks slice the
+/// canonical sibling byte-identically; and every chunk carries a
+/// `SourceAnchor::Pdf` with a non-NULL `chunks.page`.
+///
+/// `#[cfg(target_os = "macos")]`-gated, mirroring the `pdf.rs` extractor build
+/// gating (the vendored libpdfium asset is the macOS universal dylib).
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn pdf_file_source_indexed_with_anchors_end_to_end() {
+    use lens_core::extract::extractor_for;
+
+    const SENTINEL: &str = "The quick brown fox jumps over the lazy dog.";
+
+    if !tokenizer_available().await {
+        eprintln!(
+            "skipping pdf_file_source_indexed_with_anchors_end_to_end: no tokenizer (offline)"
+        );
+        return;
+    }
+
+    // Build a text-layer PDF with a known sentinel.
+    let raw = {
+        use printpdf::{BuiltinFont, Mm, PdfDocument};
+        use std::io::BufWriter;
+        let (doc, page1, layer1) =
+            PdfDocument::new("pdf-file-source-fixture", Mm(210.0), Mm(297.0), "Layer 1");
+        let layer = doc.get_page(page1).get_layer(layer1);
+        let font = doc.add_builtin_font(BuiltinFont::Helvetica).unwrap();
+        layer.use_text(SENTINEL, 14.0, Mm(20.0), Mm(270.0), &font);
+        let mut buf = Vec::new();
+        doc.save(&mut BufWriter::new(&mut buf)).unwrap();
+        buf
+    };
+
+    // Probe binding: skip (not fail) where the universal dylib can't load.
+    let extractor = extractor_for("pdf").expect("pdf extractor resolves");
+    if extractor.extract(&raw).is_err() {
+        eprintln!(
+            "skipping pdf_file_source_indexed_with_anchors_end_to_end: libpdfium not bindable here"
+        );
+        return;
+    }
+
+    let (_dir, engine) = inject_counting_engine().await;
+    let data_dir = engine.data_dir_for_test().await;
+    let nb = engine
+        .create_notebook("pdf-file-nb", None, None)
+        .await
+        .unwrap();
+
+    // Write the PDF to a temp path OUTSIDE managed storage; add_file_source copies.
+    let src_dir = tempfile::tempdir().unwrap();
+    let src_path = src_dir.path().join("paper.pdf");
+    std::fs::write(&src_path, &raw).unwrap();
+
+    let source = engine
+        .add_file_source(&nb.id, &src_path, Some("Custom Title"))
+        .await
+        .expect("add_file_source for a .pdf must succeed");
+    assert_eq!(source.kind, "pdf", "extension .pdf → kind pdf");
+    assert_eq!(source.status, "queued");
+    assert_eq!(source.title, "Custom Title", "supplied title is honored");
+
+    engine.ingest_source(&source.id, |_p| {}).await.unwrap();
+    assert_eq!(engine_source_status(&engine, &source.id).await, "indexed");
+
+    // The canonical buffer is the persisted `.extracted.txt` sibling.
+    let sibling = data_dir
+        .join("sources")
+        .join(format!("{}.extracted.txt", source.id));
+    let canonical = std::fs::read_to_string(&sibling)
+        .expect("a derived PDF source must persist its .extracted.txt sibling");
+
+    // Sentinel present (whitespace-normalized — pdfium may resegment).
+    let got: String = canonical.split_whitespace().collect::<Vec<_>>().join(" ");
+    let want: String = SENTINEL.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        got.contains(&want),
+        "sentinel missing from persisted canonical buffer; got {got:?}"
+    );
+
+    // Chunks slice the canonical buffer byte-identically.
+    assert_chunk_byte_identity(&engine, &source.id, &canonical).await;
+
+    // Every chunk anchor is Pdf with a non-NULL, 1-based page.
+    let pool = engine.pool().await;
+    let rows = sqlx::query("SELECT source_anchor, page FROM chunks WHERE source_id = ?")
+        .bind(&source.id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert!(!rows.is_empty(), "expected chunks for the text-layer PDF");
+    for (i, row) in rows.iter().enumerate() {
+        let anchor_json = row
+            .get::<Option<String>, _>("source_anchor")
+            .unwrap_or_else(|| panic!("chunk[{i}] source_anchor must be non-NULL for PDF"));
+        let anchor: SourceAnchor = serde_json::from_str(&anchor_json).unwrap();
+        assert!(
+            matches!(anchor, SourceAnchor::Pdf { .. }),
+            "chunk[{i}] anchor must be SourceAnchor::Pdf, got {anchor:?}"
+        );
+        let page = row.get::<Option<i64>, _>("page");
+        assert!(
+            matches!(page, Some(p) if p >= 1),
+            "chunk[{i}] chunks.page must be a populated 1-based page, got {page:?}"
+        );
+    }
+}

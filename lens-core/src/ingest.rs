@@ -273,7 +273,10 @@ async fn run_ingest(
         bytes
     } else {
         // ── File-backed: read raw bytes from the locator path ─────────────
-        std::fs::read(&source.locator)
+        // Async read so a large local file never blocks the tokio worker for the
+        // duration of the disk read (the pipeline holds the single ingest permit).
+        tokio::fs::read(&source.locator)
+            .await
             .map_err(|e| LensError::Io(format!("read source {}: {e}", source.locator)))?
     };
 
@@ -355,13 +358,15 @@ async fn run_ingest(
             source_id,
             "PDF source produced no text layer — likely scanned/image-only; setting needs_ocr"
         );
-        // A source transitioning INTO needs_ocr (e.g. a previously-INDEXED PDF
-        // whose new content is scanned/image-only) must drop its prior indexed
-        // chunks + vectors — otherwise stale content stays searchable behind a
-        // `needs_ocr` status. Wipe BEFORE the early return.
-        wipe_source_content(&pool, &data_dir, &source.notebook_id, source_id).await?;
-        repo.update_source_status(source_id, crate::notebooks::source_status::NEEDS_OCR)
-            .await?;
+        set_terminal_pending(
+            &repo,
+            &pool,
+            &data_dir,
+            &source.notebook_id,
+            source_id,
+            crate::notebooks::source_status::NEEDS_OCR,
+        )
+        .await?;
         // Return Ok so the Err→error flip in ingest_source never fires.
         return Ok(());
     }
@@ -383,12 +388,15 @@ async fn run_ingest(
                 ratio,
                 "URL source has near-empty extraction — likely JS-rendered; setting needs_js"
             );
-            // Same rationale as needs_ocr above: a previously-INDEXED URL source
-            // that flips to a JS shell must drop its stale chunks + vectors so
-            // nothing indexed survives behind the `needs_js` status.
-            wipe_source_content(&pool, &data_dir, &source.notebook_id, source_id).await?;
-            repo.update_source_status(source_id, crate::notebooks::source_status::NEEDS_JS)
-                .await?;
+            set_terminal_pending(
+                &repo,
+                &pool,
+                &data_dir,
+                &source.notebook_id,
+                source_id,
+                crate::notebooks::source_status::NEEDS_JS,
+            )
+            .await?;
             // Return Ok so the Err→error flip in ingest_source never fires.
             return Ok(());
         }
@@ -412,12 +420,15 @@ async fn run_ingest(
     // content hash, with no second disk read between them.
     if !text_like {
         let sources_dir = data_dir.join("sources");
-        std::fs::create_dir_all(&sources_dir)
+        tokio::fs::create_dir_all(&sources_dir)
+            .await
             .map_err(|e| LensError::Io(format!("{}: {e}", sources_dir.display())))?;
         // SAME path builder the purge path uses (`extracted_sibling_path`), so
-        // the write site and the cleanup site can never diverge.
+        // the write site and the cleanup site can never diverge. Async write so
+        // persisting a large extracted buffer never blocks the tokio worker.
         let sibling = extracted_sibling_path(&data_dir, source_id);
-        std::fs::write(&sibling, &out.extracted_text)
+        tokio::fs::write(&sibling, &out.extracted_text)
+            .await
             .map_err(|e| LensError::Io(format!("{}: {e}", sibling.display())))?;
     }
     let canonical: &str = &out.extracted_text;
@@ -968,6 +979,29 @@ async fn fetch_url_guarded_inner(
 /// terminal-pending status (e.g. a previously-INDEXED source whose content
 /// changes to scanned/SPA) drops its prior indexed chunks + vectors rather than
 /// leaving stale content searchable behind the pending status.
+/// Drives a source into a TERMINAL-PENDING status (`needs_ocr` / `needs_js`):
+/// wipes any prior indexed content from BOTH stores, then sets the status.
+///
+/// Single source of truth for the wipe-then-set-status pattern shared by the
+/// `needs_ocr` (image-only PDF) and `needs_js` (JS-rendered URL) gates in
+/// [`run_ingest`]. The wipe is load-bearing: a source transitioning INTO a
+/// pending status (e.g. a previously-INDEXED source whose new content is
+/// scanned/SPA) must drop its stale chunks + vectors so nothing indexed survives
+/// searchable behind the pending status. The caller returns `Ok(())` after this
+/// so the `Err→error` flip in [`ingest_source`] never fires.
+async fn set_terminal_pending(
+    repo: &crate::notebooks::NotebookRepo<'_>,
+    pool: &sqlx::SqlitePool,
+    data_dir: &Path,
+    notebook_id: &str,
+    source_id: &str,
+    status: &str,
+) -> Result<(), LensError> {
+    wipe_source_content(pool, data_dir, notebook_id, source_id).await?;
+    repo.update_source_status(source_id, status).await?;
+    Ok(())
+}
+
 async fn wipe_source_content(
     pool: &sqlx::SqlitePool,
     data_dir: &Path,

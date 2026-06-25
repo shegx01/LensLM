@@ -547,6 +547,107 @@ impl<'a> NotebookRepo<'a> {
         })
     }
 
+    /// Inserts a managed local-file source (PDF/DOCX/text/markdown) for M4
+    /// ingestion.
+    ///
+    /// The product entry point for ingesting a local file (the M1
+    /// [`add_source`](Self::add_source) path stays inert; this one queues for
+    /// ingest). Detects `kind` from the file EXTENSION — `.pdf` → `"pdf"`,
+    /// `.docx` → `"docx"`, `.txt` → `"text"`, `.md`/`.markdown` → `"markdown"`;
+    /// any other (or missing) extension is rejected with [`LensError::Validation`].
+    /// COPIES the file into managed storage `{data_dir}/sources/{id}.{ext}` (so
+    /// the `locator` is a managed path — consistent with
+    /// [`add_text_source`](Self::add_text_source) — and a purge of the source
+    /// reclaims the copy via `remove_managed_source_file`). Inserts a `sources`
+    /// row with `status = "queued"`, `selected = 1`. `title` defaults to the
+    /// source file's name when not supplied. Returns the inserted [`Source`]
+    /// (`token_count`/`content_hash` are `NULL` until ingestion populates them).
+    pub async fn add_file_source(
+        &self,
+        data_dir: &Path,
+        notebook_id: &NotebookId,
+        src_path: &Path,
+        title: Option<&str>,
+    ) -> Result<Source, LensError> {
+        // Detect kind + canonical extension from the source file extension
+        // (case-insensitive). An unknown / missing extension is a clear
+        // validation error rather than a silently-mis-ingested source.
+        let ext_lower = src_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase);
+        let (kind, ext) = match ext_lower.as_deref() {
+            Some("pdf") => ("pdf", "pdf"),
+            Some("docx") => ("docx", "docx"),
+            Some("txt") => ("text", "txt"),
+            Some("md") | Some("markdown") => ("markdown", "md"),
+            other => {
+                return Err(LensError::Validation(format!(
+                    "unsupported file extension {other:?} for {}; expected one of \
+                     \".pdf\", \".docx\", \".txt\", \".md\", \".markdown\"",
+                    src_path.display()
+                )));
+            }
+        };
+
+        // Derive a default title from the file name when none is supplied.
+        let title = match title {
+            Some(t) => t.to_string(),
+            None => src_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("Untitled")
+                .to_string(),
+        };
+
+        let id = Uuid::now_v7().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // Copy the original file into the managed sources dir so `locator` is a
+        // managed path (so purge reclaims it and the ingest read path is the
+        // same as the paste/text path).
+        let sources_dir = data_dir.join("sources");
+        std::fs::create_dir_all(&sources_dir)
+            .map_err(|e| LensError::Io(format!("{}: {e}", sources_dir.display())))?;
+        let dest = sources_dir.join(format!("{id}.{ext}"));
+        std::fs::copy(src_path, &dest).map_err(|e| {
+            LensError::Io(format!(
+                "copy {} -> {}: {e}",
+                src_path.display(),
+                dest.display()
+            ))
+        })?;
+        let locator = dest.display().to_string();
+
+        sqlx::query(
+            "INSERT INTO sources (id, notebook_id, kind, title, status, locator, selected, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
+        )
+        .bind(&id)
+        .bind(notebook_id)
+        .bind(kind)
+        .bind(&title)
+        .bind(source_status::QUEUED)
+        .bind(&locator)
+        .bind(&now)
+        .execute(self.pool)
+        .await?;
+
+        Ok(Source {
+            id,
+            notebook_id: notebook_id.to_string(),
+            kind: kind.to_string(),
+            title,
+            status: source_status::QUEUED.to_string(),
+            locator,
+            selected: 1,
+            token_count: None,
+            content_hash: None,
+            created_at: now,
+            trashed_at: None,
+        })
+    }
+
     /// Inserts a URL source for M4 ingestion.
     ///
     /// Inserts a `sources` row with `kind = "url"`, `status = "queued"`,

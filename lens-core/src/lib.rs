@@ -345,6 +345,25 @@ impl LensEngine {
             .await
     }
 
+    /// Inserts a managed local-file source (PDF/DOCX/text/markdown): copies the
+    /// file into managed storage under `{data_dir}/sources/` and inserts a
+    /// `queued` `sources` row. `kind` is detected from the file EXTENSION. `title`
+    /// defaults to the file name when not supplied. Returns the inserted source.
+    /// Call [`ingest_source`](Self::ingest_source) separately to extract + index it.
+    #[tracing::instrument(skip(self))]
+    pub async fn add_file_source(
+        &self,
+        notebook_id: &NotebookId,
+        src_path: &Path,
+        title: Option<&str>,
+    ) -> Result<Source, LensError> {
+        let data_dir = self.data_dir().await;
+        let pool = self.pool().await;
+        NotebookRepo::new(&pool)
+            .add_file_source(&data_dir, notebook_id, src_path, title)
+            .await
+    }
+
     /// Soft-deletes a source: sets `trashed_at` to now. Keeps all chunks and
     /// Lance vectors so the source can be restored. Errors if the source is
     /// missing or already trashed.
