@@ -111,8 +111,14 @@ impl Extractor for TextExtractor {
     }
 }
 
-/// Classifies a `sources.kind` as *text-like* (`text`/`markdown`) vs *derived*
-/// (`pdf`/`docx`/`url`, and any test-injected binary kind).
+/// Classifies a `sources.kind` string as *text-like* (`text`/`markdown`) vs
+/// *derived* (`pdf`/`docx`/`url`).
+///
+/// Thin `&str` boundary shim over [`SourceKind::is_text_like`]: parses the
+/// DB-row string into the [`SourceKind`] enum, then dispatches the
+/// classification via the enum's exhaustive match. An unknown kind is reported
+/// as not-text-like (so a test-injected binary kind flows through the derived
+/// path); production kinds always parse cleanly.
 ///
 /// This is the single point of truth for the ingest read-path asymmetry
 /// (Decision A1): a text-like kind's ORIGINAL locator content IS the canonical
@@ -120,16 +126,17 @@ impl Extractor for TextExtractor {
 /// a derived kind's canonical buffer is the persisted `.extracted.txt` sibling
 /// (and the content hash is over the RAW FILE BYTES for re-ingest determinism).
 pub fn is_text_like_kind(kind: &str) -> bool {
-    matches!(kind, "text" | "markdown")
+    SourceKind::from_kind_str(kind).is_ok_and(|k| k.is_text_like())
 }
 
 /// Resolves the [`Extractor`] for a `sources.kind` string.
 ///
-/// Maps `"text"`/`"markdown"` to a [`TextExtractor`], `"docx"` to
-/// [`docx::DocxExtractor`], and `"url"` to [`url::UrlExtractor`]. PDF is added
-/// in a later step; until then it returns a [`LensError::Validation`] rather
-/// than fabricating empty output. An unknown kind is also a validation error
-/// (mirroring [`SourceKind::from_kind_str`]).
+/// Parses the boundary `&str` into a [`SourceKind`] and dispatches via an
+/// EXHAUSTIVE match — adding a [`SourceKind`] variant is a compile error here
+/// until an extractor is wired for it. `Text`/`Markdown` map to a
+/// [`TextExtractor`], `Pdf` to [`pdf::PdfExtractor`], `Docx` to
+/// [`docx::DocxExtractor`], and `Url` to [`url::UrlExtractor`]. An unknown kind
+/// string is a [`LensError::Validation`] (from [`SourceKind::from_kind_str`]).
 ///
 /// Under the `test-util` feature a test may register an injected extractor for an
 /// otherwise-unknown kind (see [`set_test_extractor_factory`]); that injection is
@@ -139,21 +146,18 @@ pub fn extractor_for(kind: &str) -> Result<Box<dyn Extractor>, LensError> {
     if let Some(injected) = test_seam::injected_extractor(kind) {
         return Ok(injected);
     }
-    match kind {
-        "text" => Ok(Box::new(TextExtractor::new(SourceKind::Text))),
-        "markdown" => Ok(Box::new(TextExtractor::new(SourceKind::Markdown))),
-        "docx" => Ok(Box::new(docx::DocxExtractor)),
-        // Step 7: URL extractor — rs-trafilatura-based HTML content extraction.
-        // The async reqwest GET lives in run_ingest (ingest.rs); this extractor
-        // receives already-fetched bytes.
-        "url" => Ok(Box::new(url::UrlExtractor)),
-        // Step 5: PDF extractor — pdfium-render text + per-segment bbox extraction.
-        // A no-text-layer (scanned) PDF yields empty output → run_ingest sets
+    match SourceKind::from_kind_str(kind)? {
+        SourceKind::Text => Ok(Box::new(TextExtractor::new(SourceKind::Text))),
+        SourceKind::Markdown => Ok(Box::new(TextExtractor::new(SourceKind::Markdown))),
+        SourceKind::Docx => Ok(Box::new(docx::DocxExtractor)),
+        // URL extractor — rs-trafilatura-based HTML content extraction. The async
+        // reqwest GET lives in run_ingest (ingest.rs); this extractor receives
+        // already-fetched bytes.
+        SourceKind::Url => Ok(Box::new(url::UrlExtractor)),
+        // PDF extractor — pdfium-render text + per-segment bbox extraction. A
+        // no-text-layer (scanned) PDF yields empty output → run_ingest sets
         // needs_ocr (Ok-with-status, never Err).
-        "pdf" => Ok(Box::new(pdf::PdfExtractor)),
-        other => Err(LensError::Validation(format!(
-            "unknown source kind: {other:?}; expected one of \"text\", \"markdown\", \"pdf\", \"docx\", \"url\""
-        ))),
+        SourceKind::Pdf => Ok(Box::new(pdf::PdfExtractor)),
     }
 }
 

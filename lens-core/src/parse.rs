@@ -12,50 +12,140 @@
 //! it never reconstructs text from event data, which would break multi-byte
 //! characters and normalisation differences.
 
+use std::str::FromStr;
+
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 use crate::LensError;
 
-/// Selects the document format for [`parse_blocks`].
+/// The `sources.kind` discriminant: the source's document format.
+///
+/// Serialized to / parsed from the EXACT legacy `sources.kind` strings stored in
+/// SQLite (`"text"`/`"markdown"`/`"pdf"`/`"docx"`/`"url"`) via [`as_str`](Self::as_str)
+/// and [`from_kind_str`](Self::from_kind_str) — the wire/DB format is unchanged.
+/// The DB-row / IPC boundary keeps a raw `String`; logic converts to this enum
+/// immediately and dispatches via exhaustive `match` so adding a variant is a
+/// compile error everywhere it matters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceKind {
     /// Plain text (no markup). Blocks are paragraphs split on blank lines.
     Text,
     /// CommonMark / GitHub-flavoured Markdown.
     Markdown,
+    /// A PDF document (pdfium text + per-segment bbox extraction).
+    Pdf,
+    /// A DOCX document (docx-rs XML walk).
+    Docx,
+    /// A remote URL (HTML fetched then content-extracted).
+    Url,
 }
 
 impl SourceKind {
-    /// Maps the `sources.kind` string stored in SQLite (`"text"` | `"markdown"`)
-    /// to the enum variant.  Unknown values are an input-validation error.
+    /// The EXACT `sources.kind` string stored in SQLite for this variant.
+    ///
+    /// Inverse of [`from_kind_str`](Self::from_kind_str). These strings are the
+    /// persisted wire format and MUST NOT change (no DB migration).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Markdown => "markdown",
+            Self::Pdf => "pdf",
+            Self::Docx => "docx",
+            Self::Url => "url",
+        }
+    }
+
+    /// Maps the `sources.kind` string stored in SQLite to the enum variant.
+    /// Unknown values are an input-validation error.
     pub fn from_kind_str(s: &str) -> Result<Self, LensError> {
         match s {
             "text" => Ok(Self::Text),
             "markdown" => Ok(Self::Markdown),
+            "pdf" => Ok(Self::Pdf),
+            "docx" => Ok(Self::Docx),
+            "url" => Ok(Self::Url),
             other => Err(LensError::Validation(format!(
-                "unknown source kind: {other:?}; expected \"text\" or \"markdown\""
+                "unknown source kind: {other:?}; expected one of \"text\", \"markdown\", \"pdf\", \"docx\", \"url\""
             ))),
+        }
+    }
+
+    /// Whether this kind is *text-like* (`Text`/`Markdown`) — the original
+    /// locator content IS the canonical buffer — vs. *derived* (`Pdf`/`Docx`/`Url`),
+    /// whose canonical buffer is the persisted `.extracted.txt` sibling. Single
+    /// point of truth for the ingest read-path asymmetry (Decision A1).
+    pub fn is_text_like(&self) -> bool {
+        match self {
+            Self::Text | Self::Markdown => true,
+            Self::Pdf | Self::Docx | Self::Url => false,
         }
     }
 }
 
-/// Semantic block-type labels (the `Block::block_type` / `chunks.block_type`
-/// column values).
+impl FromStr for SourceKind {
+    type Err = LensError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::from_kind_str(s)
+    }
+}
+
+/// The `Block::block_type` / `chunks.block_type` discriminant: a block's semantic
+/// label.
 ///
-/// Single source of truth for the block-type string literals the parser emits.
-pub(crate) mod block_type {
+/// Single source of truth for the block-type string vocabulary the parser and
+/// every extractor emit. Serialized to / parsed from the EXACT legacy strings via
+/// [`as_str`](Self::as_str) and [`FromStr`] — the persisted `chunks.block_type`
+/// values are unchanged. `Block::block_type` stays a `String` at the struct
+/// boundary; construction sites use `BlockType::X.as_str()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockType {
     /// A markdown/plain heading.
-    pub const HEADING: &str = "heading";
+    Heading,
     /// A paragraph of prose.
-    pub const PARAGRAPH: &str = "paragraph";
+    Paragraph,
     /// A fenced or indented code block.
-    pub const CODE: &str = "code";
+    Code,
     /// A single list item.
-    pub const LIST_ITEM: &str = "list_item";
+    ListItem,
     /// A GFM table, emitted as one block carrying the raw table markdown.
-    pub const TABLE: &str = "table";
+    Table,
     /// A raw HTML block, emitted verbatim.
-    pub const HTML: &str = "html";
+    Html,
+}
+
+impl BlockType {
+    /// The EXACT `block_type` string emitted for this variant (the persisted
+    /// `chunks.block_type` value). Inverse of [`FromStr`].
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Heading => "heading",
+            Self::Paragraph => "paragraph",
+            Self::Code => "code",
+            Self::ListItem => "list_item",
+            Self::Table => "table",
+            Self::Html => "html",
+        }
+    }
+}
+
+impl FromStr for BlockType {
+    type Err = LensError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "heading" => Ok(Self::Heading),
+            "paragraph" => Ok(Self::Paragraph),
+            "code" => Ok(Self::Code),
+            "list_item" => Ok(Self::ListItem),
+            "table" => Ok(Self::Table),
+            "html" => Ok(Self::Html),
+            other => Err(LensError::Validation(format!(
+                "unknown block type: {other:?}; expected one of \"heading\", \"paragraph\", \
+                 \"code\", \"list_item\", \"table\", \"html\""
+            ))),
+        }
+    }
 }
 
 /// Shared heading-trail stack used by every extractor that tracks `section_path`
@@ -154,8 +244,12 @@ pub struct Block {
 /// `section_path = ""`.
 pub fn parse_blocks(src: &str, kind: SourceKind) -> Vec<Block> {
     match kind {
-        SourceKind::Text => parse_text(src),
         SourceKind::Markdown => parse_markdown(src),
+        // Plain-text path. The derived kinds (`Pdf`/`Docx`/`Url`) never reach
+        // here — they each have a dedicated `Extractor` and only `Text`/`Markdown`
+        // build a `TextExtractor` (see `extract::extractor_for`). Treating them as
+        // plain text is a safe, non-panicking default for this unreachable path.
+        SourceKind::Text | SourceKind::Pdf | SourceKind::Docx | SourceKind::Url => parse_text(src),
     }
 }
 
@@ -202,7 +296,7 @@ fn parse_text(src: &str) -> Vec<Block> {
         let trim_end = trim_offset + trimmed.len();
 
         blocks.push(Block {
-            block_type: block_type::PARAGRAPH.to_string(),
+            block_type: BlockType::Paragraph.as_str().to_string(),
             section_path: String::new(),
             text: trimmed.to_string(),
             char_start: trim_offset,
@@ -388,7 +482,7 @@ fn parse_markdown(src: &str) -> Vec<Block> {
                 let path = heading_stack.current();
                 emit_block(
                     src,
-                    block_type::TABLE,
+                    BlockType::Table.as_str(),
                     &path,
                     range.start,
                     range.end,
@@ -404,7 +498,7 @@ fn parse_markdown(src: &str) -> Vec<Block> {
                 let path = heading_stack.current();
                 emit_block(
                     src,
-                    block_type::HTML,
+                    BlockType::Html.as_str(),
                     &path,
                     range.start,
                     range.end,
@@ -422,7 +516,7 @@ fn parse_markdown(src: &str) -> Vec<Block> {
                     let byte_end = range.end;
                     emit_block(
                         src,
-                        block_type::PARAGRAPH,
+                        BlockType::Paragraph.as_str(),
                         &path,
                         byte_start,
                         byte_end,
@@ -435,7 +529,7 @@ fn parse_markdown(src: &str) -> Vec<Block> {
                     let byte_end = range.end;
                     emit_block(
                         src,
-                        block_type::CODE,
+                        BlockType::Code.as_str(),
                         &path,
                         byte_start,
                         byte_end,
@@ -456,7 +550,7 @@ fn parse_markdown(src: &str) -> Vec<Block> {
                         if !is_blank_or_marker(raw.trim()) {
                             emit_block(
                                 src,
-                                block_type::LIST_ITEM,
+                                BlockType::ListItem.as_str(),
                                 &path,
                                 byte_start,
                                 range.end,
@@ -486,7 +580,7 @@ fn parse_markdown(src: &str) -> Vec<Block> {
                     let (start, end) = locate_in_src(src, heading_text, byte_start, byte_end);
                     if end > start {
                         blocks.push(Block {
-                            block_type: block_type::HEADING.to_string(),
+                            block_type: BlockType::Heading.as_str().to_string(),
                             section_path: path,
                             text: heading_text.to_string(),
                             char_start: start,
@@ -534,7 +628,7 @@ fn emit_item_own_text_before_child(
             if !is_blank_or_marker(raw.trim()) {
                 emit_block(
                     src,
-                    block_type::LIST_ITEM,
+                    BlockType::ListItem.as_str(),
                     &path,
                     byte_start,
                     child_start,
@@ -846,7 +940,75 @@ mod tests {
             SourceKind::from_kind_str("markdown").unwrap(),
             SourceKind::Markdown
         );
-        assert!(SourceKind::from_kind_str("pdf").is_err());
+        assert_eq!(SourceKind::from_kind_str("pdf").unwrap(), SourceKind::Pdf);
+        assert_eq!(SourceKind::from_kind_str("docx").unwrap(), SourceKind::Docx);
+        assert_eq!(SourceKind::from_kind_str("url").unwrap(), SourceKind::Url);
+        assert!(SourceKind::from_kind_str("nonsense").is_err());
+    }
+
+    #[test]
+    fn source_kind_roundtrip_and_wire_strings() {
+        use std::str::FromStr;
+        // Lock the EXACT persisted wire strings (no DB migration).
+        let cases = [
+            (SourceKind::Text, "text"),
+            (SourceKind::Markdown, "markdown"),
+            (SourceKind::Pdf, "pdf"),
+            (SourceKind::Docx, "docx"),
+            (SourceKind::Url, "url"),
+        ];
+        for (kind, s) in cases {
+            assert_eq!(kind.as_str(), s, "as_str must equal legacy wire string");
+            assert_eq!(
+                SourceKind::from_str(s).unwrap(),
+                kind,
+                "FromStr round-trips as_str"
+            );
+        }
+    }
+
+    #[test]
+    fn source_kind_from_str_rejects_unknown() {
+        let err = SourceKind::from_str("nope").expect_err("unknown kind must error");
+        assert!(matches!(err, LensError::Validation(_)));
+    }
+
+    #[test]
+    fn source_kind_is_text_like() {
+        assert!(SourceKind::Text.is_text_like());
+        assert!(SourceKind::Markdown.is_text_like());
+        assert!(!SourceKind::Pdf.is_text_like());
+        assert!(!SourceKind::Docx.is_text_like());
+        assert!(!SourceKind::Url.is_text_like());
+    }
+
+    #[test]
+    fn block_type_roundtrip_and_wire_strings() {
+        use std::str::FromStr;
+        // Lock the EXACT persisted `chunks.block_type` strings.
+        let cases = [
+            (BlockType::Heading, "heading"),
+            (BlockType::Paragraph, "paragraph"),
+            (BlockType::Code, "code"),
+            (BlockType::ListItem, "list_item"),
+            (BlockType::Table, "table"),
+            (BlockType::Html, "html"),
+        ];
+        for (bt, s) in cases {
+            assert_eq!(bt.as_str(), s, "as_str must equal legacy block-type string");
+            assert_eq!(
+                BlockType::from_str(s).unwrap(),
+                bt,
+                "FromStr round-trips as_str"
+            );
+        }
+    }
+
+    #[test]
+    fn block_type_from_str_rejects_unknown() {
+        use std::str::FromStr;
+        let err = BlockType::from_str("bogus").expect_err("unknown block type must error");
+        assert!(matches!(err, LensError::Validation(_)));
     }
 
     #[test]
