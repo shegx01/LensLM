@@ -1,0 +1,21 @@
+---
+source: lens-core/src/extract/docx.rs
+expression: snaps
+---
+[
+  {
+    "block_type": "heading",
+    "section_path": "Test Heading",
+    "text": "Test Heading"
+  },
+  {
+    "block_type": "paragraph",
+    "section_path": "Test Heading",
+    "text": "Sentinel body text for extraction."
+  },
+  {
+    "block_type": "table",
+    "section_path": "Test Heading",
+    "text": "Cell A1  Cell A2\nCell B1  Cell B2"
+  }
+]

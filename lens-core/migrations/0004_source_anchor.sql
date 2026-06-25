@@ -1,0 +1,18 @@
+-- M4 Phase 2: dedicated SourceAnchor column (Decision B2).
+-- Adds a nullable TEXT column to `chunks` that persists the per-block
+-- SourceAnchor as JSON (tagged enum: Pdf/Docx/Url/Text).
+--
+-- Decision B2 rationale: `chunks.enrichment` is contractually reserved for
+-- the M4 Phase-3 enrichment pass (`0001_init.sql:37-38`); reusing it for
+-- SourceAnchor creates a cross-phase write-ordering hazard with no upside
+-- once an additive migration is this cheap.
+--
+-- NULL = no anchor persisted (pre-migration rows, or formats not yet wired).
+-- Non-NULL = JSON-serialized SourceAnchor (e.g. `{"kind":"Text"}` for text/MD).
+-- SQLite `ADD COLUMN` of a nullable column with no DEFAULT is a safe, O(1)
+-- metadata-only operation (no table rewrite). Existing rows read NULL.
+--
+-- NOTE: SQLite has no `ADD COLUMN IF NOT EXISTS`; idempotency rests on
+-- sqlx's migration ledger (`_sqlx_migrations`) never re-running an applied
+-- file, consistent with the one-file-one-atomic-unit convention in 0001_init.sql.
+ALTER TABLE chunks ADD COLUMN source_anchor TEXT;

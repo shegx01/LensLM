@@ -73,6 +73,44 @@ pub async fn add_text_source(
         .await
 }
 
+/// Inserts a URL source: inserts a `queued` row whose `locator` is the URL.
+/// Returns immediately — no HTTP fetch happens here.
+/// Call `ingest_source` separately to fetch + extract the page in the background.
+#[tracing::instrument(skip(engine))]
+#[tauri::command]
+pub async fn add_url_source(
+    notebook_id: String,
+    title: String,
+    url: String,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<Source, LensError> {
+    engine
+        .add_url_source(&NotebookId::from(notebook_id), &title, &url)
+        .await
+}
+
+/// Inserts a managed local-file source (PDF/DOCX/text/markdown): copies the file
+/// into managed storage and inserts a `queued` row. `kind` is detected from the
+/// file extension; an unsupported extension is rejected. `title` defaults to the
+/// file name when omitted. Returns the inserted source — no ingestion happens
+/// here; call `ingest_source` separately to extract + index it.
+#[tracing::instrument(skip(engine))]
+#[tauri::command]
+pub async fn add_file_source(
+    notebook_id: String,
+    path: String,
+    title: Option<String>,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<Source, LensError> {
+    engine
+        .add_file_source(
+            &NotebookId::from(notebook_id),
+            std::path::Path::new(&path),
+            title.as_deref(),
+        )
+        .await
+}
+
 /// Soft-deletes a source: sets `trashed_at` to now. Keeps chunks + Lance
 /// vectors so the source can be restored. Errors if missing or already trashed.
 #[tracing::instrument(skip(engine))]

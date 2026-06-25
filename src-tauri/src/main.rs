@@ -45,6 +45,8 @@ fn main() {
             commands::notebooks::add_source,
             commands::notebooks::list_sources,
             commands::notebooks::add_text_source,
+            commands::notebooks::add_url_source,
+            commands::notebooks::add_file_source,
             commands::notebooks::set_source_selected,
             commands::notebooks::trash_source,
             commands::notebooks::restore_source,

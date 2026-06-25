@@ -58,6 +58,51 @@ pub(crate) mod block_type {
     pub const HTML: &str = "html";
 }
 
+/// Shared heading-trail stack used by every extractor that tracks `section_path`
+/// (the Markdown path in this module and the DOCX extractor in
+/// [`crate::extract::docx`]).
+///
+/// Headings are 1–6 (H1…H6). [`push`](Self::push) records a heading at a level,
+/// clearing every deeper level so a new H2 drops any H3+ beneath it;
+/// [`current`](Self::current) returns the ` > `-joined trail of every level still
+/// in force (e.g. `"A > B > C"`). The trail is empty at the document top.
+///
+/// A fixed `[Option<String>; 6]` (rather than a growable stack) keeps the level →
+/// slot mapping direct and matches the shape the Markdown path already used.
+#[derive(Debug, Default)]
+pub(crate) struct SectionPathStack {
+    /// `levels[0]` = current H1 text, `[1]` = H2, … `[5]` = H6. `None` when that
+    /// level is not currently in force.
+    levels: [Option<String>; 6],
+}
+
+impl SectionPathStack {
+    /// Creates an empty stack (no headings in force).
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records `text` as the heading at `level` (1–6, clamped) and clears every
+    /// deeper level (a new heading at `level` invalidates any sub-heading below
+    /// it). Levels outside 1–6 are clamped into range so callers cannot panic.
+    pub(crate) fn push(&mut self, level: u8, text: &str) {
+        let idx = (level.clamp(1, 6) - 1) as usize;
+        self.levels[idx] = Some(text.to_string());
+        for deeper in self.levels.iter_mut().skip(idx + 1) {
+            *deeper = None;
+        }
+    }
+
+    /// Returns the current ` > `-joined heading trail (empty at the document top).
+    pub(crate) fn current(&self) -> String {
+        self.levels
+            .iter()
+            .filter_map(|opt| opt.as_deref())
+            .collect::<Vec<_>>()
+            .join(" > ")
+    }
+}
+
 /// A bounded, semantically-labelled span within a source document.
 ///
 /// Every field is derived from the source text so that callers can reconstruct
@@ -214,25 +259,16 @@ fn find_paragraph_end(src: &str, start: usize) -> usize {
 // Markdown path
 // ---------------------------------------------------------------------------
 
-/// Heading-level index (H1=0 … H6=5) used for the stack.
-fn heading_index(level: HeadingLevel) -> usize {
+/// Heading level (H1=1 … H6=6) for [`SectionPathStack::push`].
+fn heading_level_u8(level: HeadingLevel) -> u8 {
     match level {
-        HeadingLevel::H1 => 0,
-        HeadingLevel::H2 => 1,
-        HeadingLevel::H3 => 2,
-        HeadingLevel::H4 => 3,
-        HeadingLevel::H5 => 4,
-        HeadingLevel::H6 => 5,
+        HeadingLevel::H1 => 1,
+        HeadingLevel::H2 => 2,
+        HeadingLevel::H3 => 3,
+        HeadingLevel::H4 => 4,
+        HeadingLevel::H5 => 5,
+        HeadingLevel::H6 => 6,
     }
-}
-
-/// Builds the `" > "`-joined heading trail from the stack.
-fn build_section_path(stack: &[Option<String>; 6]) -> String {
-    stack
-        .iter()
-        .filter_map(|opt| opt.as_deref())
-        .collect::<Vec<_>>()
-        .join(" > ")
 }
 
 /// State machine context for block accumulation inside a Markdown container tag.
@@ -289,8 +325,8 @@ fn parse_markdown(src: &str) -> Vec<Block> {
     let parser = Parser::new_ext(src, Options::all()).into_offset_iter();
 
     let mut blocks: Vec<Block> = Vec::new();
-    // heading_stack[0] = current H1 text, [1] = H2, … [5] = H6.
-    let mut heading_stack: [Option<String>; 6] = Default::default();
+    // Shared heading-trail stack (H1…H6); see [`SectionPathStack`].
+    let mut heading_stack = SectionPathStack::new();
     // Stack of (context, byte_start, section_path at open time).
     let mut ctx_stack: Vec<(BlockContext, usize, String)> = Vec::new();
     // Depth of open `Tag::Table`s. While > 0 we swallow every event (the whole
@@ -329,15 +365,15 @@ fn parse_markdown(src: &str) -> Vec<Block> {
         match event {
             // ── Opening tags ──────────────────────────────────────────────
             Event::Start(Tag::Paragraph) => {
-                let path = build_section_path(&heading_stack);
+                let path = heading_stack.current();
                 ctx_stack.push((BlockContext::Paragraph, range.start, path));
             }
             Event::Start(Tag::CodeBlock(_)) => {
-                let path = build_section_path(&heading_stack);
+                let path = heading_stack.current();
                 ctx_stack.push((BlockContext::CodeBlock, range.start, path));
             }
             Event::Start(Tag::Item) => {
-                let path = build_section_path(&heading_stack);
+                let path = heading_stack.current();
                 ctx_stack.push((BlockContext::ListItem { emitted: false }, range.start, path));
             }
             Event::Start(Tag::List(_)) => {
@@ -349,7 +385,7 @@ fn parse_markdown(src: &str) -> Vec<Block> {
             Event::Start(Tag::Table(_)) => {
                 // Emit the WHOLE table as one block (raw markdown, byte-identical)
                 // then swallow all inner events until `End(Table)` (B1).
-                let path = build_section_path(&heading_stack);
+                let path = heading_stack.current();
                 emit_block(
                     src,
                     block_type::TABLE,
@@ -365,7 +401,7 @@ fn parse_markdown(src: &str) -> Vec<Block> {
                 // `Start..End` range covers the whole block, so a single slice is
                 // byte-identical; the inner `Event::Html` text events that follow
                 // fall through the `_ => {}` arm and are not re-emitted.
-                let path = build_section_path(&heading_stack);
+                let path = heading_stack.current();
                 emit_block(
                     src,
                     block_type::HTML,
@@ -376,7 +412,7 @@ fn parse_markdown(src: &str) -> Vec<Block> {
                 );
             }
             Event::Start(Tag::Heading { .. }) => {
-                let path = build_section_path(&heading_stack);
+                let path = heading_stack.current();
                 ctx_stack.push((BlockContext::Heading, range.start, path));
             }
 
@@ -441,12 +477,9 @@ fn parse_markdown(src: &str) -> Vec<Block> {
                     // whitespace from the raw slice.
                     let heading_text = extract_heading_text(raw);
 
-                    // Update the heading stack: clear all deeper levels.
-                    let idx = heading_index(level);
-                    heading_stack[idx] = Some(heading_text.to_string());
-                    for deeper in heading_stack.iter_mut().skip(idx + 1) {
-                        *deeper = None;
-                    }
+                    // Update the heading stack: record this heading at its level
+                    // and clear all deeper levels (handled by `push`).
+                    heading_stack.push(heading_level_u8(level), heading_text);
 
                     // Emit a "heading" block. `text` is the trimmed heading
                     // text; `char_start/char_end` anchor to that text inside src.

@@ -27,3 +27,7 @@ src-tauri/gen/schemas
 
 # Git worktrees (feature work is isolated in worktrees; never tracked)
 worktrees/
+
+# Vendored pdfium dylib (M4 Phase 2 PDF extractor). Fetched + checksum-verified
+# via scripts/fetch-pdfium.sh; NEVER committed (the script + CHECKSUMS are).
+src-tauri/frameworks/libpdfium.dylib

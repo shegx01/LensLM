@@ -82,7 +82,16 @@ impl fmt::Display for NotebookId {
 /// `queued → parsing → embedding → indexed` (or `error` on failure). `pending`
 /// is the legacy status [`NotebookRepo::add_source`] writes for inert M1 file
 /// records (awaiting M4 ingestion).
-pub(crate) mod source_status {
+///
+/// # Terminal-pending statuses
+///
+/// `needs_ocr` and `needs_js` are TERMINAL-PENDING: the source has been
+/// processed but could not be fully indexed without additional capability (OCR
+/// or a JS-rendering browser). They are NOT transient — a restart must NOT reset
+/// them to `error`. The crash-recovery reset in [`crate::LensEngine::init`]
+/// (`WHERE status IN (parsing, embedding)`) explicitly excludes both. This
+/// exclusion is locked by the `crash_recovery_skips_needs_js_and_needs_ocr` test.
+pub mod source_status {
     /// Inert M1 file record awaiting M4 ingestion.
     pub const PENDING: &str = "pending";
     /// Queued for ingestion (the M4 managed-text entry state).
@@ -95,6 +104,12 @@ pub(crate) mod source_status {
     pub const INDEXED: &str = "indexed";
     /// Ingestion failed (terminal until re-ingest).
     pub const ERROR: &str = "error";
+    /// Terminal-pending: URL source returned near-empty text — likely a JS-rendered
+    /// SPA. Must NOT be reset to `error` on crash recovery (it is not transient).
+    pub const NEEDS_JS: &str = "needs_js";
+    /// Terminal-pending: PDF/image source requires OCR to extract text.
+    /// Must NOT be reset to `error` on crash recovery (it is not transient).
+    pub const NEEDS_OCR: &str = "needs_ocr";
 }
 
 /// A source row, returned across the IPC boundary.
@@ -524,6 +539,149 @@ impl<'a> NotebookRepo<'a> {
             title: title.to_string(),
             status: source_status::QUEUED.to_string(),
             locator,
+            selected: 1,
+            token_count: None,
+            content_hash: None,
+            created_at: now,
+            trashed_at: None,
+        })
+    }
+
+    /// Inserts a managed local-file source (PDF/DOCX/text/markdown) for M4
+    /// ingestion.
+    ///
+    /// The product entry point for ingesting a local file (the M1
+    /// [`add_source`](Self::add_source) path stays inert; this one queues for
+    /// ingest). Detects `kind` from the file EXTENSION — `.pdf` → `"pdf"`,
+    /// `.docx` → `"docx"`, `.txt` → `"text"`, `.md`/`.markdown` → `"markdown"`;
+    /// any other (or missing) extension is rejected with [`LensError::Validation`].
+    /// COPIES the file into managed storage `{data_dir}/sources/{id}.{ext}` (so
+    /// the `locator` is a managed path — consistent with
+    /// [`add_text_source`](Self::add_text_source) — and a purge of the source
+    /// reclaims the copy via `remove_managed_source_file`). Inserts a `sources`
+    /// row with `status = "queued"`, `selected = 1`. `title` defaults to the
+    /// source file's name when not supplied. Returns the inserted [`Source`]
+    /// (`token_count`/`content_hash` are `NULL` until ingestion populates them).
+    pub async fn add_file_source(
+        &self,
+        data_dir: &Path,
+        notebook_id: &NotebookId,
+        src_path: &Path,
+        title: Option<&str>,
+    ) -> Result<Source, LensError> {
+        // Detect kind + canonical extension from the source file extension
+        // (case-insensitive). An unknown / missing extension is a clear
+        // validation error rather than a silently-mis-ingested source.
+        let ext_lower = src_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase);
+        let (kind, ext) = match ext_lower.as_deref() {
+            Some("pdf") => ("pdf", "pdf"),
+            Some("docx") => ("docx", "docx"),
+            Some("txt") => ("text", "txt"),
+            Some("md") | Some("markdown") => ("markdown", "md"),
+            other => {
+                return Err(LensError::Validation(format!(
+                    "unsupported file extension {other:?} for {}; expected one of \
+                     \".pdf\", \".docx\", \".txt\", \".md\", \".markdown\"",
+                    src_path.display()
+                )));
+            }
+        };
+
+        // Derive a default title from the file name when none is supplied.
+        let title = match title {
+            Some(t) => t.to_string(),
+            None => src_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("Untitled")
+                .to_string(),
+        };
+
+        let id = Uuid::now_v7().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // Copy the original file into the managed sources dir so `locator` is a
+        // managed path (so purge reclaims it and the ingest read path is the
+        // same as the paste/text path).
+        let sources_dir = data_dir.join("sources");
+        std::fs::create_dir_all(&sources_dir)
+            .map_err(|e| LensError::Io(format!("{}: {e}", sources_dir.display())))?;
+        let dest = sources_dir.join(format!("{id}.{ext}"));
+        std::fs::copy(src_path, &dest).map_err(|e| {
+            LensError::Io(format!(
+                "copy {} -> {}: {e}",
+                src_path.display(),
+                dest.display()
+            ))
+        })?;
+        let locator = dest.display().to_string();
+
+        sqlx::query(
+            "INSERT INTO sources (id, notebook_id, kind, title, status, locator, selected, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
+        )
+        .bind(&id)
+        .bind(notebook_id)
+        .bind(kind)
+        .bind(&title)
+        .bind(source_status::QUEUED)
+        .bind(&locator)
+        .bind(&now)
+        .execute(self.pool)
+        .await?;
+
+        Ok(Source {
+            id,
+            notebook_id: notebook_id.to_string(),
+            kind: kind.to_string(),
+            title,
+            status: source_status::QUEUED.to_string(),
+            locator,
+            selected: 1,
+            token_count: None,
+            content_hash: None,
+            created_at: now,
+            trashed_at: None,
+        })
+    }
+
+    /// Inserts a URL source for M4 ingestion.
+    ///
+    /// Inserts a `sources` row with `kind = "url"`, `status = "queued"`,
+    /// `selected = 1`, and `locator` = the verbatim URL string. No file is written
+    /// to disk — the locator IS the URL, and the ingest pipeline fetches the HTML
+    /// at ingest time. Returns the inserted [`Source`] (`token_count` and
+    /// `content_hash` are `NULL` until ingestion populates them).
+    pub async fn add_url_source(
+        &self,
+        notebook_id: &NotebookId,
+        title: &str,
+        url: &str,
+    ) -> Result<Source, LensError> {
+        let id = Uuid::now_v7().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO sources (id, notebook_id, kind, title, status, locator, selected, created_at) \
+             VALUES (?, ?, 'url', ?, ?, ?, 1, ?)",
+        )
+        .bind(&id)
+        .bind(notebook_id)
+        .bind(title)
+        .bind(source_status::QUEUED)
+        .bind(url)
+        .bind(&now)
+        .execute(self.pool)
+        .await?;
+        Ok(Source {
+            id,
+            notebook_id: notebook_id.to_string(),
+            kind: "url".to_string(),
+            title: title.to_string(),
+            status: source_status::QUEUED.to_string(),
+            locator: url.to_string(),
             selected: 1,
             token_count: None,
             content_hash: None,

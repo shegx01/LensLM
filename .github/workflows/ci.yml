@@ -56,6 +56,18 @@ jobs:
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
 
+      # Vendor + verify the pinned libpdfium dylib (M4 Phase 2 PDF extractor).
+      # The dylib is gitignored and fetched here; scripts/fetch-pdfium.sh re-runs
+      # in --verify mode so the downloaded binary's SHA-256 is checked against the
+      # committed src-tauri/frameworks/CHECKSUMS (supply-chain integrity) BEFORE
+      # the build/test steps. NOTE: the pinned asset is the macOS universal dylib;
+      # on this Linux runner it is fetched + checksum-verified but cannot be loaded
+      # at runtime, so the PDF *binding* tests are #[cfg(target_os = "macos")]-gated
+      # (verified on macOS dev / release). This step still guards the checksum so a
+      # tampered/unpinned binary fails CI regardless of platform.
+      - name: Fetch + verify pinned libpdfium dylib
+        run: scripts/fetch-pdfium.sh --verify
+
       - name: Format check
         run: cargo fmt --all -- --check
 

@@ -38,8 +38,12 @@ use lens_core::parse::{Block, SourceKind, parse_blocks};
 use lens_core::vector_store::{LanceVectorStore, VectorRow, VectorStore};
 use lens_core::{EMBED_DIM, EMBED_MODEL_ID, IngestProgress, LensEngine};
 use sqlx::Row;
-use tempfile::TempDir;
-use tokenizers::Tokenizer;
+
+mod support;
+use support::{
+    file_engine, inject_counting_engine, tokenizer_available, tokenizer_for, vector_chunk_ids,
+    vector_row_count,
+};
 
 // ===========================================================================
 // Shared helpers
@@ -71,63 +75,6 @@ fn unit_vector(axis: usize) -> Vec<f32> {
 /// Are the real-model (FastembedEmbedder) tests enabled?
 fn model_tests_enabled() -> bool {
     std::env::var("LENS_RUN_MODEL_TESTS").is_ok()
-}
-
-/// Builds a file-backed engine over a fresh temp dir. Ingest tests need a
-/// file-backed engine (text sources are written under `{data_dir}/sources/`),
-/// not the in-memory `for_test()`.
-async fn file_engine() -> (TempDir, LensEngine) {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = LensEngine::init(dir.path()).await.expect("engine init");
-    (dir, engine)
-}
-
-/// Attempts to load the nomic tokenizer the ingest pipeline would use: from the
-/// `NOMIC_TOKENIZER_PATH` env var (fast offline path) or by performing the
-/// pipeline's own download into `data_dir`. Returns `None` if neither works
-/// (offline + no cached tokenizer) so tokenizer-dependent tests skip cleanly.
-async fn tokenizer_for(data_dir: &std::path::Path) -> Option<Tokenizer> {
-    if let Ok(path) = std::env::var("NOMIC_TOKENIZER_PATH")
-        && let Ok(t) = Tokenizer::from_file(&path)
-    {
-        // Seed the engine's expected location too, so a subsequent ingest in
-        // the same data dir does not re-download.
-        let dest = data_dir
-            .join("models")
-            .join("fastembed")
-            .join("tokenizer.json");
-        if let Some(parent) = dest.parent() {
-            let _ = std::fs::create_dir_all(parent);
-            let _ = std::fs::copy(&path, &dest);
-        }
-        return Some(t);
-    }
-    download_tokenizer_into(data_dir).await
-}
-
-/// Best-effort: download the nomic `tokenizer.json` into the engine's fastembed
-/// cache so the ingest pipeline finds it without a second fetch. Returns the
-/// loaded tokenizer, or `None` on any network failure.
-async fn download_tokenizer_into(data_dir: &std::path::Path) -> Option<Tokenizer> {
-    let url = "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5/resolve/main/tokenizer.json";
-    let dest = data_dir
-        .join("models")
-        .join("fastembed")
-        .join("tokenizer.json");
-    if dest.is_file() {
-        return Tokenizer::from_file(&dest).ok();
-    }
-    std::fs::create_dir_all(dest.parent()?).ok()?;
-    let bytes = reqwest::get(url).await.ok()?.bytes().await.ok()?;
-    std::fs::write(&dest, &bytes).ok()?;
-    Tokenizer::from_file(&dest).ok()
-}
-
-/// True if a tokenizer is reachable (env path or network). Used to skip
-/// tokenizer-dependent tests cleanly when offline with no cached tokenizer.
-async fn tokenizer_available() -> bool {
-    let dir = tempfile::tempdir().expect("tempdir");
-    tokenizer_for(dir.path()).await.is_some()
 }
 
 // ===========================================================================
@@ -766,19 +713,6 @@ fn assert_subsequence(haystack: &[String], needles: &[&str]) {
     }
 }
 
-/// Builds a file-backed engine with an injected CountingEmbedder so ingest tests
-/// avoid the 130 MB model (they still need the tokenizer for chunking).
-async fn inject_counting_engine() -> (TempDir, LensEngine) {
-    let (dir, engine) = file_engine().await;
-    let load_count = Arc::new(AtomicUsize::new(0));
-    let in_flight = Arc::new(AtomicUsize::new(0));
-    let counting: Arc<dyn Embedder> = Arc::new(CountingEmbedder::new(load_count, in_flight));
-    engine
-        .set_embedder_for_test(counting)
-        .expect("inject test embedder");
-    (dir, engine)
-}
-
 // ===========================================================================
 // Re-ingest idempotency + G5 cross-store wipe ordering
 // ===========================================================================
@@ -857,58 +791,6 @@ async fn reingest_idempotency_and_wipe() {
         vec_ids.len(),
         "chunk count and vector count must match after re-index"
     );
-}
-
-/// Counts the Lance vector rows for a given source by querying the store
-/// directly (search-by-source is not a trait method, so we read via a wide
-/// search and filter — sufficient for the small test corpus).
-async fn vector_row_count(data_dir: &std::path::Path, notebook: &str, source_id: &str) -> usize {
-    vector_chunk_ids(data_dir, notebook, source_id).await.len()
-}
-
-/// Returns the set of chunk ids stored in Lance for `source_id`. Reads the
-/// physical table directly via a fresh lancedb connection to avoid coupling to
-/// the (private) store internals.
-async fn vector_chunk_ids(
-    data_dir: &std::path::Path,
-    notebook: &str,
-    source_id: &str,
-) -> std::collections::HashSet<String> {
-    use arrow_array::StringArray;
-    use futures_util::TryStreamExt;
-    use lancedb::query::{ExecutableQuery, QueryBase};
-
-    let root = data_dir.join("lancedb");
-    let conn = lancedb::connect(root.to_string_lossy().as_ref())
-        .execute()
-        .await
-        .expect("connect");
-    let table_name = format!("vec__{notebook}__nomic_v15");
-    let names = conn.table_names().execute().await.unwrap();
-    if !names.iter().any(|n| n == &table_name) {
-        return std::collections::HashSet::new();
-    }
-    let table = conn.open_table(&table_name).execute().await.unwrap();
-    let stream = table
-        .query()
-        .only_if(format!("source_id = '{source_id}'"))
-        .execute()
-        .await
-        .unwrap();
-    let batches: Vec<_> = stream.try_collect().await.unwrap();
-    let mut ids = std::collections::HashSet::new();
-    for batch in &batches {
-        let col = batch
-            .column_by_name("chunk_id")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        for i in 0..batch.num_rows() {
-            ids.insert(col.value(i).to_string());
-        }
-    }
-    ids
 }
 
 async fn live_chunk_ids(engine: &LensEngine, source_id: &str) -> std::collections::HashSet<String> {
@@ -1554,4 +1436,947 @@ async fn ingest_preserves_gfm_table_block() {
             .any(|t| t.contains('x') && t.contains('y')),
         "table chunk text must carry the cell values, got {table_texts:?}"
     );
+}
+
+// ===========================================================================
+// Step 3 — Extractor-seam rewire: canonical buffer, hash split, two-stage
+// guard, sibling persist + purge (AC3, AC4a, AC4b, AC4d)
+// ===========================================================================
+
+use lens_core::extract::test_seam::{
+    FakeBinaryExtractor, clear_test_extractor_factory, set_test_extractor_factory,
+};
+
+/// A test-only DERIVED kind whose `Extractor` is injected via the `test-util`
+/// seam. The ingest pipeline treats it as binary (raw-bytes hash, `.extracted.txt`
+/// sibling, Stage-1 guard) because it is NOT in `is_text_like_kind`.
+const FAKE_KIND: &str = "faketest";
+
+/// Writes a raw binary file under `{data_dir}/sources/{id}.bin` and returns its
+/// path string (the source locator for a fake-binary source).
+fn write_raw_source_file(data_dir: &std::path::Path, id: &str, bytes: &[u8]) -> String {
+    let sources_dir = data_dir.join("sources");
+    std::fs::create_dir_all(&sources_dir).unwrap();
+    let path = sources_dir.join(format!("{id}.bin"));
+    std::fs::write(&path, bytes).unwrap();
+    path.display().to_string()
+}
+
+/// Reads back the `(canonical_buffer, content_hash)` chunk-slice invariant and
+/// asserts byte-identity: `canonical[char_start..char_end] == text` for every
+/// chunk. `canonical` is the EXACT buffer the chunker was fed.
+async fn assert_chunk_byte_identity(engine: &LensEngine, source_id: &str, canonical: &str) {
+    let pool = engine.pool().await;
+    let rows = sqlx::query(
+        "SELECT text, char_start, char_end FROM chunks WHERE source_id = ? ORDER BY rowid",
+    )
+    .bind(source_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(!rows.is_empty(), "expected chunks for {source_id}");
+    for (i, r) in rows.iter().enumerate() {
+        let s = r.get::<i64, _>("char_start") as usize;
+        let e = r.get::<i64, _>("char_end") as usize;
+        let text = r.get::<String, _>("text");
+        assert!(e <= canonical.len(), "chunk[{i}] char_end OOB");
+        assert_eq!(
+            &canonical[s..e],
+            text,
+            "byte-identity violated for chunk[{i}] against the canonical buffer"
+        );
+    }
+}
+
+/// AC4a (byte-identity, text/MD end-to-end through the new Extractor seam):
+/// for every chunk, `canonical[char_start..char_end] == chunk.text`, where
+/// `canonical` is the ORIGINAL locator content (text/MD has no sibling).
+#[tokio::test]
+async fn seam_text_md_byte_identity_against_canonical() {
+    if !tokenizer_available().await {
+        eprintln!("skipping seam_text_md_byte_identity_against_canonical: no tokenizer (offline)");
+        return;
+    }
+    let (_dir, engine) = inject_counting_engine().await;
+    let nb = engine.create_notebook("seam-id", None, None).await.unwrap();
+
+    let text_body = "Plain paragraph one with 🦀 emoji.\n\nPlain paragraph two with 日本語 text.\n";
+    let md_body =
+        "# 日本語 Heading\n\nBody under heading with `code` and 🦀.\n\n## Sub\n\nMore body.\n";
+
+    for (title, body, kind) in [
+        ("txt-doc", text_body, "text"),
+        ("md-doc", md_body, "markdown"),
+    ] {
+        let src = engine
+            .add_text_source(&nb.id, title, body, kind)
+            .await
+            .unwrap();
+        engine.ingest_source(&src.id, |_p| {}).await.unwrap();
+        assert_eq!(engine_source_status(&engine, &src.id).await, "indexed");
+        // The canonical buffer for text/MD is the original locator content.
+        let canonical = std::fs::read_to_string(&src.locator).unwrap();
+        assert_chunk_byte_identity(&engine, &src.id, &canonical).await;
+    }
+}
+
+/// AC3 (single buffer): the buffer fed to `chunk_blocks` is the SAME buffer
+/// whose hash is stored as `content_hash`. For text/MD that is the canonical
+/// text, so the stored `content_hash` must equal `sha256(canonical)`. A second
+/// read between chunk + hash would let them diverge — this asserts they don't.
+#[tokio::test]
+async fn seam_single_buffer_drives_chunk_and_hash() {
+    if !tokenizer_available().await {
+        eprintln!("skipping seam_single_buffer_drives_chunk_and_hash: no tokenizer (offline)");
+        return;
+    }
+    let (_dir, engine) = inject_counting_engine().await;
+    let nb = engine
+        .create_notebook("seam-buf", None, None)
+        .await
+        .unwrap();
+    let body = "# Buffer\n\nOne buffer drives both chunking and hashing.\n";
+    let src = engine
+        .add_text_source(&nb.id, "buf", body, "markdown")
+        .await
+        .unwrap();
+    engine.ingest_source(&src.id, |_p| {}).await.unwrap();
+
+    let canonical = std::fs::read_to_string(&src.locator).unwrap();
+    // Byte-identity proves the chunker sliced `canonical`.
+    assert_chunk_byte_identity(&engine, &src.id, &canonical).await;
+
+    // The stored hash is over that SAME canonical buffer.
+    use sha2::{Digest, Sha256};
+    let expected: String = Sha256::digest(canonical.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let pool = engine.pool().await;
+    let stored =
+        sqlx::query_scalar::<_, Option<String>>("SELECT content_hash FROM sources WHERE id = ?")
+            .bind(&src.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        stored.as_deref(),
+        Some(expected.as_str()),
+        "content_hash must be over the same canonical buffer that was chunked"
+    );
+}
+
+/// AC4b Stage 1: a DERIVED-kind raw input OVER `MAX_SOURCE_BYTES` is rejected
+/// BEFORE extraction. The injected extractor is configured to PANIC if called,
+/// so reaching it would fail the test — proving the Stage-1 guard fired first.
+#[tokio::test]
+async fn seam_stage1_guard_rejects_oversized_binary_before_extract() {
+    let (_dir, engine) = file_engine().await;
+    let data_dir = engine.data_dir_for_test().await;
+    let nb = engine.create_notebook("seam-s1", None, None).await.unwrap();
+
+    // Inject a fake extractor that PANICS if `extract` is ever called.
+    set_test_extractor_factory(FAKE_KIND, || {
+        Box::new(FakeBinaryExtractor {
+            calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            extracted_text: String::new(),
+            panic_if_called: true,
+        })
+    });
+
+    // Raw file one byte over the cap.
+    let id = uuid::Uuid::now_v7().to_string();
+    let oversized = vec![0u8; lens_core::ingest::MAX_SOURCE_BYTES + 1];
+    let locator = write_raw_source_file(&data_dir, &id, &oversized);
+    let pool = engine.pool().await;
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO sources (id, notebook_id, kind, title, status, locator, selected, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
+    )
+    .bind(&id)
+    .bind(nb.id.to_string())
+    .bind(FAKE_KIND)
+    .bind("oversize")
+    .bind("queued")
+    .bind(&locator)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let result = engine.ingest_source(&id, |_p| {}).await;
+    clear_test_extractor_factory(FAKE_KIND);
+    assert!(
+        matches!(result, Err(lens_core::LensError::Validation(_))),
+        "oversized binary must be rejected with Validation before extraction, got {result:?}"
+    );
+}
+
+/// AC4b Stage 2: a SMALL DERIVED-kind raw input whose extractor explodes it into
+/// OVER-cap `extracted_text` is rejected AFTER extraction.
+#[tokio::test]
+async fn seam_stage2_guard_rejects_oversized_extracted_text() {
+    let (_dir, engine) = file_engine().await;
+    let data_dir = engine.data_dir_for_test().await;
+    let nb = engine.create_notebook("seam-s2", None, None).await.unwrap();
+
+    // Tiny raw bytes, but the extractor returns over-cap text.
+    let huge_text = "z".repeat(lens_core::ingest::MAX_SOURCE_BYTES + 1);
+    set_test_extractor_factory(FAKE_KIND, {
+        let t = huge_text.clone();
+        move || {
+            Box::new(FakeBinaryExtractor {
+                calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                extracted_text: t.clone(),
+                panic_if_called: false,
+            })
+        }
+    });
+
+    let id = uuid::Uuid::now_v7().to_string();
+    let locator = write_raw_source_file(&data_dir, &id, b"tiny");
+    insert_raw_source_locator(&engine, &nb.id.to_string(), FAKE_KIND, &locator, &id).await;
+
+    let result = engine.ingest_source(&id, |_p| {}).await;
+    clear_test_extractor_factory(FAKE_KIND);
+    assert!(
+        matches!(result, Err(lens_core::LensError::Validation(_))),
+        "over-cap extracted_text must be rejected with Validation, got {result:?}"
+    );
+}
+
+/// Inserts a raw source with a known id + locator (helper for the Stage-2 /
+/// no-op tests where the id is needed to predict the `.extracted.txt` sibling).
+async fn insert_raw_source_locator(
+    engine: &LensEngine,
+    notebook_id: &str,
+    kind: &str,
+    locator: &str,
+    id: &str,
+) {
+    let pool = engine.pool().await;
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO sources (id, notebook_id, kind, title, status, locator, selected, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
+    )
+    .bind(id)
+    .bind(notebook_id)
+    .bind(kind)
+    .bind("fake")
+    .bind("queued")
+    .bind(locator)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .unwrap();
+}
+
+/// AC4d (re-ingest no-op WITHOUT re-extraction, DERIVED kind): ingest a fake
+/// binary source twice with unchanged raw bytes. The second ingest must be a
+/// no-op (status stays `indexed`) AND must NOT call the extractor (raw-bytes
+/// hash matched). Also asserts the `.extracted.txt` sibling was written for the
+/// derived kind and is removed on purge.
+#[tokio::test]
+async fn seam_derived_reingest_noop_without_reextract_and_sibling_lifecycle() {
+    if !tokenizer_available().await {
+        eprintln!(
+            "skipping seam_derived_reingest_noop_without_reextract_and_sibling_lifecycle: no tokenizer (offline)"
+        );
+        return;
+    }
+    let (_dir, engine) = inject_counting_engine().await;
+    let data_dir = engine.data_dir_for_test().await;
+    let nb = engine
+        .create_notebook("seam-noop", None, None)
+        .await
+        .unwrap();
+
+    // Shared call counter across every box the factory builds.
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fake_text =
+        "# Fake Binary\n\nDecoded canonical text for the fake binary source.\n".to_string();
+    set_test_extractor_factory(FAKE_KIND, {
+        let calls = std::sync::Arc::clone(&calls);
+        let t = fake_text.clone();
+        move || {
+            Box::new(FakeBinaryExtractor {
+                calls: std::sync::Arc::clone(&calls),
+                extracted_text: t.clone(),
+                panic_if_called: false,
+            })
+        }
+    });
+
+    let id = uuid::Uuid::now_v7().to_string();
+    let locator = write_raw_source_file(&data_dir, &id, b"\x00\x01\x02 fake binary bytes \xff");
+    insert_raw_source_locator(&engine, &nb.id.to_string(), FAKE_KIND, &locator, &id).await;
+
+    // First ingest → indexed, extractor called once, sibling written.
+    engine.ingest_source(&id, |_p| {}).await.unwrap();
+    assert_eq!(engine_source_status(&engine, &id).await, "indexed");
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "extractor must run exactly once on the first ingest"
+    );
+    // The canonical buffer for a DERIVED kind is the `.extracted.txt` sibling.
+    let sibling = data_dir.join("sources").join(format!("{id}.extracted.txt"));
+    assert!(
+        sibling.exists(),
+        "derived kind must persist the .extracted.txt sibling"
+    );
+    let canonical = std::fs::read_to_string(&sibling).unwrap();
+    assert_eq!(canonical, fake_text, "sibling holds the extracted_text");
+    assert_chunk_byte_identity(&engine, &id, &canonical).await;
+
+    // Second ingest, UNCHANGED raw bytes → no-op, extractor NOT called again.
+    engine.ingest_source(&id, |_p| {}).await.unwrap();
+    assert_eq!(engine_source_status(&engine, &id).await, "indexed");
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "unchanged-binary re-ingest must NOT re-run the extractor (raw-bytes hash matched)"
+    );
+
+    // Purge removes BOTH the locator AND the `.extracted.txt` sibling.
+    engine.trash_source(&id).await.unwrap();
+    engine.purge_source(&id).await.unwrap();
+    clear_test_extractor_factory(FAKE_KIND);
+    assert!(
+        !std::path::Path::new(&locator).exists(),
+        "purge must remove the original locator file"
+    );
+    assert!(
+        !sibling.exists(),
+        "purge must remove the .extracted.txt sibling"
+    );
+}
+
+// ===========================================================================
+// Step 4 — SourceAnchor persisted in a dedicated column (AC5)
+// ===========================================================================
+
+use lens_core::extract::SourceAnchor;
+
+/// AC5 — migration 0004: the `chunks.source_anchor` column exists after
+/// migrations are applied on a fresh DB (the migrator picks up `0004`).
+#[tokio::test]
+async fn migration_0004_adds_source_anchor_column() {
+    let engine = LensEngine::for_test().await;
+    let pool = engine.pool().await;
+    let rows = sqlx::query("PRAGMA table_info(chunks)")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    let cols: std::collections::HashSet<String> = rows
+        .into_iter()
+        .map(|r| r.get::<String, _>("name"))
+        .collect();
+    assert!(
+        cols.contains("source_anchor"),
+        "migration 0004 must add chunks.source_anchor column; found: {cols:?}"
+    );
+    // enrichment is still there (not reused / removed).
+    assert!(
+        cols.contains("enrichment"),
+        "chunks.enrichment must still exist after 0004"
+    );
+}
+
+/// AC5 — anchor round-trip + enrichment stays NULL: ingest a text/MD source and
+/// read back `source_anchor` (deserializable as `SourceAnchor`) and assert
+/// `enrichment` is still NULL on those rows.
+#[tokio::test]
+async fn source_anchor_roundtrip_and_enrichment_null_for_text_source() {
+    if !tokenizer_available().await {
+        eprintln!(
+            "skipping source_anchor_roundtrip_and_enrichment_null_for_text_source: no tokenizer (offline)"
+        );
+        return;
+    }
+    let (_dir, engine) = inject_counting_engine().await;
+    let nb = engine
+        .create_notebook("anchor-rt-nb", None, None)
+        .await
+        .unwrap();
+    let body = "# Anchor Test\n\nParagraph one.\n\nParagraph two.\n";
+    let src = engine
+        .add_text_source(&nb.id, "doc", body, "markdown")
+        .await
+        .unwrap();
+    engine.ingest_source(&src.id, |_p| {}).await.unwrap();
+    assert_eq!(engine_source_status(&engine, &src.id).await, "indexed");
+
+    let pool = engine.pool().await;
+    let rows = sqlx::query(
+        "SELECT source_anchor, enrichment FROM chunks WHERE source_id = ? ORDER BY rowid",
+    )
+    .bind(&src.id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
+    assert!(!rows.is_empty(), "expected chunks for the ingested source");
+
+    for (i, row) in rows.iter().enumerate() {
+        // enrichment must remain NULL (reserved for Phase-3 pass).
+        let enrichment = row.get::<Option<String>, _>("enrichment");
+        assert!(
+            enrichment.is_none(),
+            "chunk[{i}] enrichment must be NULL (reserved for Phase-3); got {enrichment:?}"
+        );
+
+        // source_anchor is set (text/MD yields SourceAnchor::Text for every block).
+        let anchor_json = row.get::<Option<String>, _>("source_anchor");
+        assert!(
+            anchor_json.is_some(),
+            "chunk[{i}] source_anchor must be non-NULL for a text/MD source"
+        );
+        let json = anchor_json.unwrap();
+        let anchor: SourceAnchor = serde_json::from_str(&json).unwrap_or_else(|e| {
+            panic!("chunk[{i}] source_anchor is not a valid SourceAnchor JSON: {e}\njson={json}")
+        });
+        // Text/MD blocks always carry SourceAnchor::Text.
+        assert_eq!(
+            anchor,
+            SourceAnchor::Text,
+            "chunk[{i}] source_anchor must be SourceAnchor::Text for a markdown source"
+        );
+    }
+}
+
+/// AC5 (forward-check) — PDF anchor maps to `chunks.page`: a `SourceAnchor::Pdf`
+/// with `page: 3` (injected via the fake-binary extractor) is serialized and
+/// stored, and the `chunks.page` column is populated with `3`.
+///
+/// This test exercises the anchor-to-page mapping unit-path even before the real
+/// PDF extractor is wired up (Step 5), keeping the contract clear.
+#[tokio::test]
+async fn source_anchor_pdf_maps_page_to_chunk_page_column() {
+    use lens_core::parse::Block;
+
+    if !tokenizer_available().await {
+        eprintln!(
+            "skipping source_anchor_pdf_maps_page_to_chunk_page_column: no tokenizer (offline)"
+        );
+        return;
+    }
+
+    // Build a fake PDF extractor that returns a single block with a
+    // SourceAnchor::Pdf { page: 3 }.
+    struct FakePdfExtractor;
+    impl lens_core::extract::Extractor for FakePdfExtractor {
+        fn extract(
+            &self,
+            _raw: &[u8],
+        ) -> Result<lens_core::extract::ExtractOutput, lens_core::LensError> {
+            let text = "PDF page three paragraph content.\n".to_string();
+            let block = Block {
+                block_type: "paragraph".to_string(),
+                section_path: String::new(),
+                char_start: 0,
+                char_end: text.len(),
+                text: text.clone(),
+            };
+            Ok(lens_core::extract::ExtractOutput {
+                extracted_text: text,
+                blocks: vec![block],
+                anchors: vec![SourceAnchor::Pdf {
+                    page: 3,
+                    bbox: [10.0, 20.0, 500.0, 700.0],
+                }],
+            })
+        }
+    }
+
+    const PDF_KIND: &str = "fakepdf";
+    set_test_extractor_factory(PDF_KIND, || Box::new(FakePdfExtractor));
+
+    let (_dir, engine) = inject_counting_engine().await;
+    let data_dir = engine.data_dir_for_test().await;
+    let nb = engine
+        .create_notebook("pdf-page-nb", None, None)
+        .await
+        .unwrap();
+
+    let id = uuid::Uuid::now_v7().to_string();
+    let locator = write_raw_source_file(&data_dir, &id, b"fake pdf bytes");
+    insert_raw_source_locator(&engine, &nb.id.to_string(), PDF_KIND, &locator, &id).await;
+
+    engine.ingest_source(&id, |_p| {}).await.unwrap();
+    clear_test_extractor_factory(PDF_KIND);
+    assert_eq!(engine_source_status(&engine, &id).await, "indexed");
+
+    let pool = engine.pool().await;
+    let rows = sqlx::query(
+        "SELECT source_anchor, page, enrichment FROM chunks WHERE source_id = ? ORDER BY rowid",
+    )
+    .bind(&id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
+    assert!(!rows.is_empty(), "expected chunks for the fake PDF source");
+
+    for (i, row) in rows.iter().enumerate() {
+        // enrichment still NULL.
+        let enrichment = row.get::<Option<String>, _>("enrichment");
+        assert!(
+            enrichment.is_none(),
+            "chunk[{i}] enrichment must be NULL; got {enrichment:?}"
+        );
+
+        // source_anchor round-trips as SourceAnchor::Pdf.
+        let anchor_json = row
+            .get::<Option<String>, _>("source_anchor")
+            .unwrap_or_else(|| panic!("chunk[{i}] source_anchor must be non-NULL for PDF"));
+        let anchor: SourceAnchor = serde_json::from_str(&anchor_json)
+            .unwrap_or_else(|e| panic!("chunk[{i}] invalid anchor JSON: {e}\njson={anchor_json}"));
+        assert!(
+            matches!(anchor, SourceAnchor::Pdf { page: 3, .. }),
+            "chunk[{i}] source_anchor must be SourceAnchor::Pdf {{ page: 3, .. }}, got {anchor:?}"
+        );
+
+        // chunks.page must be populated with 3 for PDF anchors.
+        let page = row.get::<Option<i64>, _>("page");
+        assert_eq!(
+            page,
+            Some(3),
+            "chunk[{i}] chunks.page must be 3 for a SourceAnchor::Pdf {{ page: 3 }}"
+        );
+    }
+}
+
+/// Builds a tiny single-page PDF with NO text layer (image-only / scanned PDF
+/// surrogate) as in-memory bytes, using `printpdf`. The REAL `PdfExtractor` will
+/// extract empty text from it, exercising the end-to-end `needs_ocr` path.
+fn build_no_text_layer_pdf_bytes() -> Vec<u8> {
+    use printpdf::{Mm, PdfDocument};
+    use std::io::BufWriter;
+    let (doc, _page1, _layer1) =
+        PdfDocument::new("no-text-fixture", Mm(210.0), Mm(297.0), "Layer 1");
+    let mut buf = Vec::new();
+    doc.save(&mut BufWriter::new(&mut buf))
+        .expect("serialize no-text PDF fixture");
+    buf
+}
+
+/// AC7 (end-to-end) — a real image-only / no-text-layer PDF ingested via the
+/// `"pdf"` kind drives `run_ingest` through the REAL `PdfExtractor`, which yields
+/// empty text, so the source ends at `status = needs_ocr` (Ok-with-status, NOT
+/// Err, NOT indexed, zero chunks).
+///
+/// Skipped when libpdfium cannot bind on this platform (the vendored asset is the
+/// macOS universal dylib; AC7 is gated on macOS dev / release).
+#[tokio::test]
+async fn pdf_image_only_source_sets_needs_ocr_end_to_end() {
+    use lens_core::extract::extractor_for;
+
+    if !tokenizer_available().await {
+        eprintln!(
+            "skipping pdf_image_only_source_sets_needs_ocr_end_to_end: no tokenizer (offline)"
+        );
+        return;
+    }
+    // Probe binding: skip (not fail) where the universal dylib can't load.
+    let raw = build_no_text_layer_pdf_bytes();
+    let extractor = extractor_for("pdf").expect("pdf extractor resolves");
+    if extractor.extract(&raw).is_err() {
+        eprintln!(
+            "skipping pdf_image_only_source_sets_needs_ocr_end_to_end: libpdfium not bindable here"
+        );
+        return;
+    }
+
+    let (_dir, engine) = inject_counting_engine().await;
+    let data_dir = engine.data_dir_for_test().await;
+    let nb = engine
+        .create_notebook("pdf-ocr-nb", None, None)
+        .await
+        .unwrap();
+
+    let id = uuid::Uuid::now_v7().to_string();
+    // Write the PDF bytes to a real on-disk file the locator points at.
+    let sources_dir = data_dir.join("sources");
+    std::fs::create_dir_all(&sources_dir).unwrap();
+    let path = sources_dir.join(format!("{id}.pdf"));
+    std::fs::write(&path, &raw).unwrap();
+    let locator = path.display().to_string();
+    insert_raw_source_locator(&engine, &nb.id.to_string(), "pdf", &locator, &id).await;
+
+    // The ingest must return Ok (NOT Err — an Err would flip status to `error`).
+    let result = engine.ingest_source(&id, |_p| {}).await;
+    assert!(
+        result.is_ok(),
+        "image-only PDF must return Ok-with-status, not Err: {result:?}"
+    );
+
+    // Status is needs_ocr (terminal-pending), not indexed and not error.
+    assert_eq!(
+        engine_source_status(&engine, &id).await,
+        "needs_ocr",
+        "image-only PDF must set status = needs_ocr"
+    );
+
+    // Nothing was indexed.
+    let pool = engine.pool().await;
+    let chunk_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE source_id = ?")
+        .bind(&id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(chunk_count, 0, "needs_ocr source must index zero chunks");
+}
+
+/// AC4a + AC4c + AC5 (end-to-end) — a real text-layer PDF ingested via the `"pdf"`
+/// kind reaches `indexed`, every chunk slices the canonical `.extracted.txt`
+/// sibling byte-identically, the sentinel text is present, and every chunk's
+/// `source_anchor` is a `SourceAnchor::Pdf` with a non-NULL `chunks.page`.
+///
+/// Skipped when libpdfium cannot bind on this platform.
+#[tokio::test]
+async fn pdf_text_layer_source_indexed_with_anchors_end_to_end() {
+    use lens_core::extract::extractor_for;
+
+    const SENTINEL: &str = "The quick brown fox jumps over the lazy dog.";
+
+    if !tokenizer_available().await {
+        eprintln!(
+            "skipping pdf_text_layer_source_indexed_with_anchors_end_to_end: no tokenizer (offline)"
+        );
+        return;
+    }
+
+    // Build a text-layer PDF with a known sentinel.
+    let raw = {
+        use printpdf::{BuiltinFont, Mm, PdfDocument};
+        use std::io::BufWriter;
+        let (doc, page1, layer1) =
+            PdfDocument::new("sentinel-fixture", Mm(210.0), Mm(297.0), "Layer 1");
+        let layer = doc.get_page(page1).get_layer(layer1);
+        let font = doc.add_builtin_font(BuiltinFont::Helvetica).unwrap();
+        layer.use_text(SENTINEL, 14.0, Mm(20.0), Mm(270.0), &font);
+        let mut buf = Vec::new();
+        doc.save(&mut BufWriter::new(&mut buf)).unwrap();
+        buf
+    };
+
+    let extractor = extractor_for("pdf").expect("pdf extractor resolves");
+    if extractor.extract(&raw).is_err() {
+        eprintln!(
+            "skipping pdf_text_layer_source_indexed_with_anchors_end_to_end: libpdfium not bindable here"
+        );
+        return;
+    }
+
+    let (_dir, engine) = inject_counting_engine().await;
+    let data_dir = engine.data_dir_for_test().await;
+    let nb = engine
+        .create_notebook("pdf-text-nb", None, None)
+        .await
+        .unwrap();
+
+    let id = uuid::Uuid::now_v7().to_string();
+    let sources_dir = data_dir.join("sources");
+    std::fs::create_dir_all(&sources_dir).unwrap();
+    let path = sources_dir.join(format!("{id}.pdf"));
+    std::fs::write(&path, &raw).unwrap();
+    let locator = path.display().to_string();
+    insert_raw_source_locator(&engine, &nb.id.to_string(), "pdf", &locator, &id).await;
+
+    engine.ingest_source(&id, |_p| {}).await.unwrap();
+    assert_eq!(engine_source_status(&engine, &id).await, "indexed");
+
+    // The canonical buffer is the persisted `.extracted.txt` sibling.
+    let sibling = sources_dir.join(format!("{id}.extracted.txt"));
+    let canonical = std::fs::read_to_string(&sibling)
+        .expect("a derived PDF source must persist its .extracted.txt sibling");
+
+    // AC4c: sentinel present (whitespace-normalized — pdfium may resegment).
+    let got: String = canonical.split_whitespace().collect::<Vec<_>>().join(" ");
+    let want: String = SENTINEL.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        got.contains(&want),
+        "sentinel missing from persisted canonical buffer; got {got:?}"
+    );
+
+    // AC4a: chunks slice the canonical buffer byte-identically.
+    assert_chunk_byte_identity(&engine, &id, &canonical).await;
+
+    // AC5: every chunk anchor is Pdf with a non-NULL page.
+    let pool = engine.pool().await;
+    let rows = sqlx::query("SELECT source_anchor, page FROM chunks WHERE source_id = ?")
+        .bind(&id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert!(!rows.is_empty(), "expected chunks for the text-layer PDF");
+    for (i, row) in rows.iter().enumerate() {
+        let anchor_json = row
+            .get::<Option<String>, _>("source_anchor")
+            .unwrap_or_else(|| panic!("chunk[{i}] source_anchor must be non-NULL for PDF"));
+        let anchor: SourceAnchor = serde_json::from_str(&anchor_json).unwrap();
+        assert!(
+            matches!(anchor, SourceAnchor::Pdf { .. }),
+            "chunk[{i}] anchor must be SourceAnchor::Pdf, got {anchor:?}"
+        );
+        let page = row.get::<Option<i64>, _>("page");
+        assert!(
+            matches!(page, Some(p) if p >= 1),
+            "chunk[{i}] chunks.page must be a populated 1-based page, got {page:?}"
+        );
+    }
+}
+
+// ===========================================================================
+// add_file_source — real-binary DOCX/PDF end-to-end (REAL extractor, NOT the
+// FakeBinaryExtractor seam): extension→kind detection, managed copy, real
+// ingest, sibling + anchor + byte-identity + purge lifecycle.
+// ===========================================================================
+
+/// Builds a real `.docx` in memory: a Heading1, a body paragraph carrying a
+/// known sentinel, and a 2×2 table. Mirrors the in-crate `build_fixture_docx`
+/// helper but lives here so the integration test owns its own fixture.
+fn build_e2e_docx_bytes(sentinel: &str) -> Vec<u8> {
+    use docx_rs::{Docx, Paragraph, Run, Table, TableCell, TableRow};
+    use std::io::Cursor;
+    let docx = Docx::new()
+        .add_paragraph(
+            Paragraph::new()
+                .add_run(Run::new().add_text("E2E Heading"))
+                .style("Heading1"),
+        )
+        .add_paragraph(Paragraph::new().add_run(Run::new().add_text(sentinel)))
+        .add_table(Table::new(vec![
+            TableRow::new(vec![
+                TableCell::new()
+                    .add_paragraph(Paragraph::new().add_run(Run::new().add_text("Cell A1"))),
+                TableCell::new()
+                    .add_paragraph(Paragraph::new().add_run(Run::new().add_text("Cell A2"))),
+            ]),
+            TableRow::new(vec![
+                TableCell::new()
+                    .add_paragraph(Paragraph::new().add_run(Run::new().add_text("Cell B1"))),
+                TableCell::new()
+                    .add_paragraph(Paragraph::new().add_run(Run::new().add_text("Cell B2"))),
+            ]),
+        ]));
+    let mut buf = Vec::new();
+    docx.build()
+        .pack(Cursor::new(&mut buf))
+        .expect("fixture DOCX build failed");
+    buf
+}
+
+/// AC (DOCX end-to-end, REAL extractor) — a real `.docx` added via
+/// `add_file_source` (extension→kind = "docx", copied into managed storage) and
+/// ingested through the REAL `DocxExtractor` reaches `indexed`; the
+/// `{data_dir}/sources/{id}.extracted.txt` sibling exists with the sentinel;
+/// every chunk carries a `SourceAnchor::Docx`; chunks slice the canonical sibling
+/// byte-identically; and purge removes BOTH the managed original AND the sibling.
+///
+/// Runs everywhere (docx-rs is pure Rust — no platform-gated native dependency).
+#[tokio::test]
+async fn docx_file_source_indexed_with_anchors_end_to_end() {
+    const SENTINEL: &str = "Sentinel body text for docx end-to-end extraction.";
+
+    if !tokenizer_available().await {
+        eprintln!(
+            "skipping docx_file_source_indexed_with_anchors_end_to_end: no tokenizer (offline)"
+        );
+        return;
+    }
+
+    let (_dir, engine) = inject_counting_engine().await;
+    let data_dir = engine.data_dir_for_test().await;
+    let nb = engine
+        .create_notebook("docx-e2e-nb", None, None)
+        .await
+        .unwrap();
+
+    // Write the `.docx` to a temp path OUTSIDE managed storage; `add_file_source`
+    // copies it into `{data_dir}/sources/{id}.docx`.
+    let src_dir = tempfile::tempdir().unwrap();
+    let src_path = src_dir.path().join("report.docx");
+    std::fs::write(&src_path, build_e2e_docx_bytes(SENTINEL)).unwrap();
+
+    let source = engine
+        .add_file_source(&nb.id, &src_path, None)
+        .await
+        .expect("add_file_source for a .docx must succeed");
+    assert_eq!(source.kind, "docx", "extension .docx → kind docx");
+    assert_eq!(source.status, "queued", "new file source is queued");
+    assert_eq!(
+        source.title, "report.docx",
+        "title defaults to the file name"
+    );
+    // The managed copy lives under {data_dir}/sources and is what the ingest reads.
+    assert!(
+        std::path::Path::new(&source.locator).exists(),
+        "managed copy must exist after add_file_source: {}",
+        source.locator
+    );
+
+    engine.ingest_source(&source.id, |_p| {}).await.unwrap();
+    assert_eq!(engine_source_status(&engine, &source.id).await, "indexed");
+
+    // The canonical buffer is the persisted `.extracted.txt` sibling.
+    let sibling = data_dir
+        .join("sources")
+        .join(format!("{}.extracted.txt", source.id));
+    let canonical = std::fs::read_to_string(&sibling)
+        .expect("a derived DOCX source must persist its .extracted.txt sibling");
+    assert!(
+        canonical.contains(SENTINEL),
+        "sentinel missing from the persisted canonical buffer; got {canonical:?}"
+    );
+
+    // Chunks slice the canonical buffer byte-identically.
+    assert_chunk_byte_identity(&engine, &source.id, &canonical).await;
+
+    // Every chunk anchor is a SourceAnchor::Docx.
+    let pool = engine.pool().await;
+    let rows = sqlx::query("SELECT source_anchor FROM chunks WHERE source_id = ?")
+        .bind(&source.id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert!(!rows.is_empty(), "expected chunks for the DOCX source");
+    for (i, row) in rows.iter().enumerate() {
+        let anchor_json = row
+            .get::<Option<String>, _>("source_anchor")
+            .unwrap_or_else(|| panic!("chunk[{i}] source_anchor must be non-NULL for DOCX"));
+        let anchor: SourceAnchor = serde_json::from_str(&anchor_json).unwrap();
+        assert!(
+            matches!(anchor, SourceAnchor::Docx { .. }),
+            "chunk[{i}] anchor must be SourceAnchor::Docx, got {anchor:?}"
+        );
+    }
+
+    // Purge removes BOTH the managed original AND the `.extracted.txt` sibling.
+    let managed = std::path::PathBuf::from(&source.locator);
+    engine.trash_source(&source.id).await.unwrap();
+    engine.purge_source(&source.id).await.unwrap();
+    assert!(
+        !managed.exists(),
+        "purge must remove the managed DOCX original"
+    );
+    assert!(
+        !sibling.exists(),
+        "purge must remove the .extracted.txt sibling"
+    );
+}
+
+/// AC (PDF end-to-end, REAL extractor) — a real text-layer PDF added via
+/// `add_file_source` (extension→kind = "pdf", copied into managed storage) and
+/// ingested through the REAL `PdfExtractor` reaches `indexed`; the
+/// `.extracted.txt` sibling is written with the sentinel; chunks slice the
+/// canonical sibling byte-identically; and every chunk carries a
+/// `SourceAnchor::Pdf` with a non-NULL `chunks.page`.
+///
+/// `#[cfg(target_os = "macos")]`-gated, mirroring the `pdf.rs` extractor build
+/// gating (the vendored libpdfium asset is the macOS universal dylib).
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn pdf_file_source_indexed_with_anchors_end_to_end() {
+    use lens_core::extract::extractor_for;
+
+    const SENTINEL: &str = "The quick brown fox jumps over the lazy dog.";
+
+    if !tokenizer_available().await {
+        eprintln!(
+            "skipping pdf_file_source_indexed_with_anchors_end_to_end: no tokenizer (offline)"
+        );
+        return;
+    }
+
+    // Build a text-layer PDF with a known sentinel.
+    let raw = {
+        use printpdf::{BuiltinFont, Mm, PdfDocument};
+        use std::io::BufWriter;
+        let (doc, page1, layer1) =
+            PdfDocument::new("pdf-file-source-fixture", Mm(210.0), Mm(297.0), "Layer 1");
+        let layer = doc.get_page(page1).get_layer(layer1);
+        let font = doc.add_builtin_font(BuiltinFont::Helvetica).unwrap();
+        layer.use_text(SENTINEL, 14.0, Mm(20.0), Mm(270.0), &font);
+        let mut buf = Vec::new();
+        doc.save(&mut BufWriter::new(&mut buf)).unwrap();
+        buf
+    };
+
+    // Probe binding: skip (not fail) where the universal dylib can't load.
+    let extractor = extractor_for("pdf").expect("pdf extractor resolves");
+    if extractor.extract(&raw).is_err() {
+        eprintln!(
+            "skipping pdf_file_source_indexed_with_anchors_end_to_end: libpdfium not bindable here"
+        );
+        return;
+    }
+
+    let (_dir, engine) = inject_counting_engine().await;
+    let data_dir = engine.data_dir_for_test().await;
+    let nb = engine
+        .create_notebook("pdf-file-nb", None, None)
+        .await
+        .unwrap();
+
+    // Write the PDF to a temp path OUTSIDE managed storage; add_file_source copies.
+    let src_dir = tempfile::tempdir().unwrap();
+    let src_path = src_dir.path().join("paper.pdf");
+    std::fs::write(&src_path, &raw).unwrap();
+
+    let source = engine
+        .add_file_source(&nb.id, &src_path, Some("Custom Title"))
+        .await
+        .expect("add_file_source for a .pdf must succeed");
+    assert_eq!(source.kind, "pdf", "extension .pdf → kind pdf");
+    assert_eq!(source.status, "queued");
+    assert_eq!(source.title, "Custom Title", "supplied title is honored");
+
+    engine.ingest_source(&source.id, |_p| {}).await.unwrap();
+    assert_eq!(engine_source_status(&engine, &source.id).await, "indexed");
+
+    // The canonical buffer is the persisted `.extracted.txt` sibling.
+    let sibling = data_dir
+        .join("sources")
+        .join(format!("{}.extracted.txt", source.id));
+    let canonical = std::fs::read_to_string(&sibling)
+        .expect("a derived PDF source must persist its .extracted.txt sibling");
+
+    // Sentinel present (whitespace-normalized — pdfium may resegment).
+    let got: String = canonical.split_whitespace().collect::<Vec<_>>().join(" ");
+    let want: String = SENTINEL.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        got.contains(&want),
+        "sentinel missing from persisted canonical buffer; got {got:?}"
+    );
+
+    // Chunks slice the canonical buffer byte-identically.
+    assert_chunk_byte_identity(&engine, &source.id, &canonical).await;
+
+    // Every chunk anchor is Pdf with a non-NULL, 1-based page.
+    let pool = engine.pool().await;
+    let rows = sqlx::query("SELECT source_anchor, page FROM chunks WHERE source_id = ?")
+        .bind(&source.id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert!(!rows.is_empty(), "expected chunks for the text-layer PDF");
+    for (i, row) in rows.iter().enumerate() {
+        let anchor_json = row
+            .get::<Option<String>, _>("source_anchor")
+            .unwrap_or_else(|| panic!("chunk[{i}] source_anchor must be non-NULL for PDF"));
+        let anchor: SourceAnchor = serde_json::from_str(&anchor_json).unwrap();
+        assert!(
+            matches!(anchor, SourceAnchor::Pdf { .. }),
+            "chunk[{i}] anchor must be SourceAnchor::Pdf, got {anchor:?}"
+        );
+        let page = row.get::<Option<i64>, _>("page");
+        assert!(
+            matches!(page, Some(p) if p >= 1),
+            "chunk[{i}] chunks.page must be a populated 1-based page, got {page:?}"
+        );
+    }
 }
