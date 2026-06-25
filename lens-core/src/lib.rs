@@ -14,6 +14,7 @@ pub(crate) mod db;
 pub mod embedder;
 pub mod embedding;
 pub mod error;
+pub mod extract;
 pub mod ingest;
 pub mod notebooks;
 pub mod parse;
@@ -25,7 +26,11 @@ pub use config::AppConfig;
 pub use embedder::{CountingEmbedder, EMBED_DIM, EMBED_MODEL_ID, Embedder, FastembedEmbedder};
 pub use embedding::{InstallProgress, pull_embedding_model};
 pub use error::LensError;
-pub use ingest::{IngestProgress, ingest_source, resolve_nomic_tokenizer};
+pub use extract::{ExtractOutput, Extractor, SourceAnchor, extractor_for, is_text_like_kind};
+pub use ingest::{
+    IngestProgress, NEEDS_JS_MIN_CHARS, NEEDS_JS_MIN_TEXT_RATIO, URL_FETCH_TIMEOUT, ingest_source,
+    resolve_nomic_tokenizer,
+};
 pub use notebooks::{Notebook, NotebookId, NotebookSummary, Source};
 pub use system_check::{
     ALLOWED_EMBEDDING_MODELS, CheckAction, CheckId, CheckResult, CheckStatus, LlmDetection,
@@ -141,6 +146,12 @@ impl LensEngine {
         // to advance it. Reset those to `error` once at startup so the UI can
         // surface them as re-ingestable rather than spinning forever. Terminal
         // states (`queued`/`indexed`/`error`/`pending`) are untouched.
+        //
+        // INVARIANT (locked by test `crash_recovery_skips_needs_js_and_needs_ocr`):
+        // `needs_js` and `needs_ocr` are TERMINAL-PENDING — they must NOT be
+        // reset here. They are deliberately absent from the `IN (?, ?)` clause.
+        // Run_ingest sets them directly via `update_source_status` and returns
+        // `Ok(())` so they are never surfaced via the Err→error flip path.
         sqlx::query("UPDATE sources SET status = ? WHERE status IN (?, ?)")
             .bind(notebooks::source_status::ERROR)
             .bind(notebooks::source_status::PARSING)
@@ -299,6 +310,23 @@ impl LensEngine {
         NotebookRepo::new(&pool).list_sources(notebook_id).await
     }
 
+    /// Inserts a URL source: inserts a `queued` `sources` row whose `locator` is
+    /// the verbatim URL string. Returns immediately — no fetch happens here.
+    /// The caller should invoke [`ingest_source`](Self::ingest_source) separately
+    /// to fetch and extract the page in the background.
+    #[tracing::instrument(skip(self))]
+    pub async fn add_url_source(
+        &self,
+        notebook_id: &NotebookId,
+        title: &str,
+        url: &str,
+    ) -> Result<Source, LensError> {
+        let pool = self.pool().await;
+        NotebookRepo::new(&pool)
+            .add_url_source(notebook_id, title, url)
+            .await
+    }
+
     /// Inserts a managed text/markdown source: writes `text` to a managed file
     /// under `{data_dir}/sources/` and inserts a `queued` `sources` row.
     /// `kind` must be `"text"` or `"markdown"`. Returns the inserted source.
@@ -360,9 +388,10 @@ impl LensEngine {
             .drop_source(&source.notebook_id, EMBED_MODEL_ID, EMBED_DIM, source_id)
             .await?;
         NotebookRepo::new(&pool).purge_source(source_id).await?;
-        // Best-effort: remove the managed source file so "Delete forever" does
-        // not leak it on disk. A missing file (already gone) is not an error.
-        remove_managed_source_file(&source.locator);
+        // Best-effort: remove the managed source file AND its `.extracted.txt`
+        // sibling so "Delete forever" does not leak either on disk. A missing
+        // file (already gone) is not an error.
+        remove_managed_source_file(&data_dir, source_id, &source.locator);
         Ok(())
     }
 
@@ -517,11 +546,12 @@ impl LensEngine {
             .map_err(|e| LensError::Internal(format!("ingest semaphore closed: {e}")))?;
         let pool = self.pool().await;
         let data_dir = self.data_dir().await;
-        // Capture every source locator (live AND trashed) BEFORE the cascade
-        // deletes the `sources` rows, so the managed source files can be removed
-        // afterwards rather than leaked on disk forever.
-        let locators: Vec<String> =
-            sqlx::query_scalar("SELECT locator FROM sources WHERE notebook_id = ?")
+        // Capture every source (id, locator) pair (live AND trashed) BEFORE the
+        // cascade deletes the `sources` rows, so the managed source files AND
+        // their `.extracted.txt` siblings can be removed afterwards rather than
+        // leaked on disk forever. The id is needed to derive the sibling path.
+        let sources: Vec<(String, String)> =
+            sqlx::query_as("SELECT id, locator FROM sources WHERE notebook_id = ?")
                 .bind(id.as_str())
                 .fetch_all(&pool)
                 .await?;
@@ -533,23 +563,45 @@ impl LensEngine {
         // Best-effort: remove the managed source files. A missing file (e.g. an
         // M1 `file` record whose locator points outside the managed dir, or an
         // already-deleted file) is ignored — purge must not fail on it.
-        for locator in &locators {
-            remove_managed_source_file(locator);
+        for (source_id, locator) in &sources {
+            remove_managed_source_file(&data_dir, source_id, locator);
         }
         Ok(())
     }
 }
 
-/// Best-effort removal of a managed source file, ignoring a missing file.
+/// Best-effort removal of a managed source file AND its canonical
+/// `.extracted.txt` sibling, ignoring a missing file.
 ///
 /// Used by the purge paths to reclaim `{data_dir}/sources/{id}.{ext}` files
-/// written by `add_text_source`. A `NotFound` is silently ignored (the file may
-/// already be gone, or the locator may point at an external file an M1 `file`
-/// record references); any other error is logged but never fails the purge.
-fn remove_managed_source_file(locator: &str) {
-    match std::fs::remove_file(locator) {
+/// written by `add_text_source`, PLUS the canonical
+/// `{data_dir}/sources/{id}.extracted.txt` sibling that Phase 2 persists for
+/// DERIVED (pdf/docx/url) kinds (see [`ingest`]). The sibling is derived from
+/// `(data_dir, source_id)` via the SHARED [`ingest::extracted_sibling_path`] —
+/// the SAME builder the ingest write site uses — so the write and purge paths
+/// can never diverge. Deriving it from `(data_dir, source_id)` (NOT the
+/// locator's parent+stem) is REQUIRED because a URL source's locator is the URL
+/// string, whose parent/stem do not point at `{data_dir}/sources/{id}`.
+///
+/// A `NotFound` is silently ignored (the file may already be gone, or the
+/// locator may point at an external file an M1 `file` record references); any
+/// other error is logged but never fails the purge.
+fn remove_managed_source_file(data_dir: &Path, source_id: &str, locator: &str) {
+    remove_file_best_effort(Path::new(locator));
+    // The `.extracted.txt` sibling lives at {data_dir}/sources/{id}.extracted.txt
+    // regardless of the locator (a URL locator is not a filesystem path).
+    let sibling = crate::ingest::extracted_sibling_path(data_dir, source_id);
+    remove_file_best_effort(&sibling);
+}
+
+/// Removes a single file, ignoring `NotFound` and logging any other error.
+fn remove_file_best_effort(path: &Path) {
+    match std::fs::remove_file(path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => tracing::warn!(locator, "failed to remove managed source file: {e}"),
+        Err(e) => tracing::warn!(
+            path = %path.display(),
+            "failed to remove managed source file: {e}"
+        ),
     }
 }

@@ -58,6 +58,43 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # version already resolved in the lock tree (transitive) so no new copy is added.
 sha2 = "=0.10.9"
 
+# --- M4 Source Grounding (Phase 2, Step 7) ---
+# Rust port of trafilatura for HTML content extraction (URL sources).
+# MIT OR Apache-2.0 — both in deny.toml allowlist. Default features only
+# (no spider/headless-browser dependency).
+rs-trafilatura = { version = "=0.2.2", default-features = false }
+
+# URL parsing for the SSRF guard on URL-source fetches (scheme allowlist + host
+# inspection before the network round-trip). Already resolved transitively via
+# reqwest; pinned to that version so no second copy is added. MIT OR Apache-2.0
+# — both in deny.toml allowlist.
+url = "=2.5.8"
+
+# --- M4 Source Grounding (Phase 2, Step 6) ---
+# DOCX paragraph/heading/table extraction. MIT licence — in deny.toml allowlist.
+# Pinned exactly to avoid future breaking changes in a crate still at 0.x.
+# `default-features = false` drops the optional `image` dep (not needed for extraction).
+docx-rs = { version = "=0.4.20", default-features = false }
+
+# --- M4 Source Grounding (Phase 2, Step 5) ---
+# PDF text + per-segment bounding-box extraction. `pdfium-render` is a pure-Rust
+# binding that DYNAMICALLY LOADS the prebuilt libpdfium dylib at runtime
+# (Pdfium::bind_to_library / bind_to_system_library) — it does NOT build or pull
+# the GPL `pdfium` C++ sources, and links no `pdfium` crate. MIT OR Apache-2.0,
+# both in deny.toml allowlist. `default-features = false` drops `image_latest`
+# (the heavy `image` crate, only needed for page rasterization — we extract text
+# only). `thread_safe` adds NO new deps (feature = []) but is REQUIRED: it makes
+# `Pdfium` `Send + Sync` (so it can live behind the process-global `OnceLock`
+# binding) and serializes all FFI calls behind pdfium-render's internal lock, so
+# parallel `cargo test` threads sharing the one global binding are safe.
+# `pdfium_latest` selects the newest API-version surface the binding exposes;
+# our vendored binary is bblanchon chromium/7906 (>= the binding's pinned 7763),
+# which is API-compatible for the text/page/object calls we use.
+pdfium-render = { version = "=0.9.2", default-features = false, features = [
+    "pdfium_latest",
+    "thread_safe",
+] }
+
 # --- M4 Source Grounding (Phase 1) ---
 # Local embeddings: nomic-embed-text-v1.5 (768d) via ONNX. fastembed transitively
 # pins `ort = =2.0.0-rc.12` (download-binaries default → onnxruntime bundled, no
@@ -94,6 +131,10 @@ wiremock = "0.6"
 # in the re-ingest/wipe test). Pinned to the same versions the lib already
 # resolves so no second copy is pulled into the lock tree.
 lancedb = "0.30.0"
+# Pure-Rust PDF writer — generates the tiny text-layer PDF fixture IN-TEST (Step 5
+# TDD) so no binary fixture is committed. Dev-only; never in production builds.
+# MIT-licensed (deny.toml allowlist).
+printpdf = "=0.7.0"
 arrow-array = "58"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # Tokenizer download fallback for tokenizer-dependent tests when offline cache

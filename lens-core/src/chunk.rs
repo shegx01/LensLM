@@ -168,6 +168,18 @@ pub struct Chunk {
     /// of the block they were split from.  `None` is valid (the column is
     /// nullable in SQLite).
     pub block_type: Option<String>,
+    /// JSON-serialized [`SourceAnchor`](crate::extract::SourceAnchor) for this
+    /// chunk — the format-native coordinates of the first (or dominant) block
+    /// that composed this chunk (consistent with how `block_type` / `section_path`
+    /// inherit from the first block).
+    ///
+    /// Stored as a pre-serialized JSON `String` rather than the enum itself so
+    /// `Chunk` stays format-agnostic and keeps its `Eq` derivation (not all
+    /// anchor variants are total-order comparable). `None` means no anchor was
+    /// supplied (possible for chunks produced before Step 4, or via
+    /// `chunk_blocks` called directly without an anchor map). The string is
+    /// persisted verbatim into the `chunks.source_anchor` TEXT column.
+    pub source_anchor: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -320,6 +332,10 @@ fn chunk_blocks_inner(
             char_start: win.char_start as i64,
             char_end: win.char_end as i64,
             block_type: win.block_type.clone(),
+            // Anchor is attached post-chunking by the ingest pipeline (it aligns
+            // chunks to source blocks by char offset). `chunk_blocks` itself stays
+            // format-agnostic and leaves this field as None.
+            source_anchor: None,
         });
 
         // Emit the children immediately after their parent.
@@ -849,6 +865,7 @@ fn flush_child_window(
         char_start: acc.char_start as i64,
         char_end: end as i64,
         block_type: block_type_val,
+        source_anchor: None,
     });
 
     acc.blocks.clear();
@@ -1027,6 +1044,7 @@ fn split_oversized_child_block(
             char_start: win_start as i64,
             char_end: abs_end as i64,
             block_type: Some(block.block_type.clone()),
+            source_anchor: None,
         });
         *running_token_offset = t_end;
 

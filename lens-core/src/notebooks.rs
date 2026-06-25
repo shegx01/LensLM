@@ -82,7 +82,16 @@ impl fmt::Display for NotebookId {
 /// `queued → parsing → embedding → indexed` (or `error` on failure). `pending`
 /// is the legacy status [`NotebookRepo::add_source`] writes for inert M1 file
 /// records (awaiting M4 ingestion).
-pub(crate) mod source_status {
+///
+/// # Terminal-pending statuses
+///
+/// `needs_ocr` and `needs_js` are TERMINAL-PENDING: the source has been
+/// processed but could not be fully indexed without additional capability (OCR
+/// or a JS-rendering browser). They are NOT transient — a restart must NOT reset
+/// them to `error`. The crash-recovery reset in [`crate::LensEngine::init`]
+/// (`WHERE status IN (parsing, embedding)`) explicitly excludes both. This
+/// exclusion is locked by the `crash_recovery_skips_needs_js_and_needs_ocr` test.
+pub mod source_status {
     /// Inert M1 file record awaiting M4 ingestion.
     pub const PENDING: &str = "pending";
     /// Queued for ingestion (the M4 managed-text entry state).
@@ -95,6 +104,12 @@ pub(crate) mod source_status {
     pub const INDEXED: &str = "indexed";
     /// Ingestion failed (terminal until re-ingest).
     pub const ERROR: &str = "error";
+    /// Terminal-pending: URL source returned near-empty text — likely a JS-rendered
+    /// SPA. Must NOT be reset to `error` on crash recovery (it is not transient).
+    pub const NEEDS_JS: &str = "needs_js";
+    /// Terminal-pending: PDF/image source requires OCR to extract text.
+    /// Must NOT be reset to `error` on crash recovery (it is not transient).
+    pub const NEEDS_OCR: &str = "needs_ocr";
 }
 
 /// A source row, returned across the IPC boundary.
@@ -524,6 +539,48 @@ impl<'a> NotebookRepo<'a> {
             title: title.to_string(),
             status: source_status::QUEUED.to_string(),
             locator,
+            selected: 1,
+            token_count: None,
+            content_hash: None,
+            created_at: now,
+            trashed_at: None,
+        })
+    }
+
+    /// Inserts a URL source for M4 ingestion.
+    ///
+    /// Inserts a `sources` row with `kind = "url"`, `status = "queued"`,
+    /// `selected = 1`, and `locator` = the verbatim URL string. No file is written
+    /// to disk — the locator IS the URL, and the ingest pipeline fetches the HTML
+    /// at ingest time. Returns the inserted [`Source`] (`token_count` and
+    /// `content_hash` are `NULL` until ingestion populates them).
+    pub async fn add_url_source(
+        &self,
+        notebook_id: &NotebookId,
+        title: &str,
+        url: &str,
+    ) -> Result<Source, LensError> {
+        let id = Uuid::now_v7().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO sources (id, notebook_id, kind, title, status, locator, selected, created_at) \
+             VALUES (?, ?, 'url', ?, ?, ?, 1, ?)",
+        )
+        .bind(&id)
+        .bind(notebook_id)
+        .bind(title)
+        .bind(source_status::QUEUED)
+        .bind(url)
+        .bind(&now)
+        .execute(self.pool)
+        .await?;
+        Ok(Source {
+            id,
+            notebook_id: notebook_id.to_string(),
+            kind: "url".to_string(),
+            title: title.to_string(),
+            status: source_status::QUEUED.to_string(),
+            locator: url.to_string(),
             selected: 1,
             token_count: None,
             content_hash: None,

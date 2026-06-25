@@ -36,6 +36,9 @@
       "icons/[email protected]",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "macOS": {
+      "frameworks": ["frameworks/libpdfium.dylib"]
+    }
   }
 }
