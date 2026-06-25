@@ -265,6 +265,11 @@ async fn run_ingest(
     // text-like, nor `Url`, nor `Pdf`), exactly as the prior string-compares
     // behaved. `extractor_for` (below) still rejects a truly-unknown kind when
     // there is no injected factory.
+    //
+    // `status` is parsed STRICTLY (`?`, not `.ok()`) — this asymmetry is
+    // deliberate: an out-of-vocabulary status is a fail-loud invariant breach
+    // (corrupt/forward-incompatible row), whereas an out-of-vocabulary kind is
+    // tolerated to preserve the test seam and the inert `file` kind.
     let kind = crate::parse::SourceKind::from_kind_str(&source.kind).ok();
     let status = source.status.parse::<crate::notebooks::SourceStatus>()?;
     // An unknown (test-injected) kind is treated as DERIVED — `is_text_like` is

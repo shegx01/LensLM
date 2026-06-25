@@ -9,6 +9,7 @@
 use std::fmt;
 use std::ops::Deref;
 use std::path::Path;
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -159,7 +160,7 @@ impl SourceStatus {
     }
 }
 
-impl std::str::FromStr for SourceStatus {
+impl FromStr for SourceStatus {
     type Err = LensError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -933,6 +934,54 @@ mod tests {
         assert_eq!(&*id, "abc");
         assert_eq!(id.to_string(), "abc");
         assert_eq!(id.as_str(), "abc");
+    }
+
+    #[test]
+    fn source_status_roundtrip_and_wire_strings() {
+        // Lock the EXACT persisted `sources.status` strings (no DB migration) —
+        // this is the highest-stakes enum: its wire values gate crash-recovery.
+        let cases = [
+            (SourceStatus::Pending, "pending"),
+            (SourceStatus::Queued, "queued"),
+            (SourceStatus::Parsing, "parsing"),
+            (SourceStatus::Embedding, "embedding"),
+            (SourceStatus::Indexed, "indexed"),
+            (SourceStatus::Error, "error"),
+            (SourceStatus::NeedsOcr, "needs_ocr"),
+            (SourceStatus::NeedsJs, "needs_js"),
+        ];
+        for (status, s) in cases {
+            assert_eq!(status.as_str(), s, "as_str must equal legacy wire string");
+            assert_eq!(
+                SourceStatus::from_str(s).unwrap(),
+                status,
+                "FromStr round-trips as_str"
+            );
+        }
+    }
+
+    #[test]
+    fn source_status_is_transient_table() {
+        // Exactly {Parsing, Embedding} are transient — locked in release (not
+        // only via the exhaustive-match debug guarantee). Crash-recovery resets
+        // these back to Error and MUST skip every other status.
+        let cases = [
+            (SourceStatus::Pending, false),
+            (SourceStatus::Queued, false),
+            (SourceStatus::Parsing, true),
+            (SourceStatus::Embedding, true),
+            (SourceStatus::Indexed, false),
+            (SourceStatus::Error, false),
+            (SourceStatus::NeedsOcr, false),
+            (SourceStatus::NeedsJs, false),
+        ];
+        for (status, transient) in cases {
+            assert_eq!(
+                status.is_transient(),
+                transient,
+                "{status:?} transient classification must be locked"
+            );
+        }
     }
 
     /// Spins up a fully-migrated in-memory pool for repo tests.

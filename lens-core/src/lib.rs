@@ -26,7 +26,7 @@ pub use config::AppConfig;
 pub use embedder::{CountingEmbedder, EMBED_DIM, EMBED_MODEL_ID, Embedder, FastembedEmbedder};
 pub use embedding::{InstallProgress, pull_embedding_model};
 pub use error::LensError;
-pub use extract::{ExtractOutput, Extractor, SourceAnchor, extractor_for, is_text_like_kind};
+pub use extract::{ExtractOutput, Extractor, SourceAnchor, extractor_for};
 pub use ingest::{
     IngestProgress, NEEDS_JS_MIN_CHARS, NEEDS_JS_MIN_TEXT_RATIO, URL_FETCH_TIMEOUT, ingest_source,
     resolve_nomic_tokenizer,

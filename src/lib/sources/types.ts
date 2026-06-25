@@ -24,6 +24,7 @@ export type SourceStatus =
  * "file", status = "pending") before M4 ingestion; it is NOT a `SourceKind`
  * variant on the Rust side but is a real persisted value, so it is included
  * here for the rows the backend can return. */
+// SYNC-CHECK: must match lens-core/src/parse.rs SourceKind enum
 export type SourceKind = 'text' | 'markdown' | 'pdf' | 'docx' | 'url' | 'file';
 
 // SYNC-CHECK: must match lens-core/src/notebooks.rs Source struct (around line 82)

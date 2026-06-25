@@ -111,24 +111,6 @@ impl Extractor for TextExtractor {
     }
 }
 
-/// Classifies a `sources.kind` string as *text-like* (`text`/`markdown`) vs
-/// *derived* (`pdf`/`docx`/`url`).
-///
-/// Thin `&str` boundary shim over [`SourceKind::is_text_like`]: parses the
-/// DB-row string into the [`SourceKind`] enum, then dispatches the
-/// classification via the enum's exhaustive match. An unknown kind is reported
-/// as not-text-like (so a test-injected binary kind flows through the derived
-/// path); production kinds always parse cleanly.
-///
-/// This is the single point of truth for the ingest read-path asymmetry
-/// (Decision A1): a text-like kind's ORIGINAL locator content IS the canonical
-/// buffer (no `.extracted.txt` sibling, and the content hash is over that text);
-/// a derived kind's canonical buffer is the persisted `.extracted.txt` sibling
-/// (and the content hash is over the RAW FILE BYTES for re-ingest determinism).
-pub fn is_text_like_kind(kind: &str) -> bool {
-    SourceKind::from_kind_str(kind).is_ok_and(|k| k.is_text_like())
-}
-
 /// Resolves the [`Extractor`] for a `sources.kind` string.
 ///
 /// Parses the boundary `&str` into a [`SourceKind`] and dispatches via an
@@ -231,7 +213,7 @@ pub mod test_seam {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let text = self.extracted_text.clone();
             let block = super::Block {
-                block_type: "paragraph".to_string(),
+                block_type: crate::parse::BlockType::Paragraph.as_str().to_string(),
                 section_path: String::new(),
                 char_start: 0,
                 char_end: text.len(),
@@ -332,31 +314,31 @@ mod tests {
 
     #[test]
     fn pdf_kind_resolves_to_extractor() {
-        // Proves "pdf" no longer returns an error after Step 5.
+        // pdf is a known kind; extractor_for resolves it to an Extractor.
         let result = extractor_for("pdf");
         assert!(
             result.is_ok(),
-            "extractor_for(\"pdf\") must succeed after Step 5"
+            "extractor_for(\"pdf\") must resolve an extractor"
         );
     }
 
     #[test]
     fn docx_kind_resolves_to_extractor() {
-        // Proves "docx" no longer returns an error after Step 6.
+        // docx is a known kind; extractor_for resolves it to an Extractor.
         let result = extractor_for("docx");
         assert!(
             result.is_ok(),
-            "extractor_for(\"docx\") must succeed after Step 6"
+            "extractor_for(\"docx\") must resolve an extractor"
         );
     }
 
     #[test]
     fn url_kind_resolves_to_extractor() {
-        // Proves "url" no longer returns an error after Step 7.
+        // url is a known kind; extractor_for resolves it to an Extractor.
         let result = extractor_for("url");
         assert!(
             result.is_ok(),
-            "extractor_for(\"url\") must succeed after Step 7"
+            "extractor_for(\"url\") must resolve an extractor"
         );
     }
 

@@ -245,11 +245,19 @@ pub struct Block {
 pub fn parse_blocks(src: &str, kind: SourceKind) -> Vec<Block> {
     match kind {
         SourceKind::Markdown => parse_markdown(src),
-        // Plain-text path. The derived kinds (`Pdf`/`Docx`/`Url`) never reach
-        // here — they each have a dedicated `Extractor` and only `Text`/`Markdown`
-        // build a `TextExtractor` (see `extract::extractor_for`). Treating them as
-        // plain text is a safe, non-panicking default for this unreachable path.
-        SourceKind::Text | SourceKind::Pdf | SourceKind::Docx | SourceKind::Url => parse_text(src),
+        SourceKind::Text => parse_text(src),
+        // The derived kinds (`Pdf`/`Docx`/`Url`) must never reach here — each has
+        // a dedicated `Extractor` and only `Text`/`Markdown` build a
+        // `TextExtractor` (see `extract::extractor_for`). A `debug_assert!`
+        // catches a mis-call in debug/test builds; release falls through to
+        // `parse_text` as a safe, non-panicking default rather than crashing.
+        SourceKind::Pdf | SourceKind::Docx | SourceKind::Url => {
+            debug_assert!(
+                false,
+                "parse_blocks called with derived kind {kind:?} — use an Extractor"
+            );
+            parse_text(src)
+        }
     }
 }
 
