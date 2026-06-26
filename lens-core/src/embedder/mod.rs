@@ -40,7 +40,9 @@ use crate::LensError;
 
 pub mod registry;
 
-pub use registry::{DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, EmbeddingModelSpec, resolve};
+pub use registry::{
+    DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, EmbeddingModelSpec, resolve, resolve_opt,
+};
 
 // ---------------------------------------------------------------------------
 // Public constants
@@ -69,20 +71,22 @@ pub const PREFIX_CONVENTION: &str = "search_document/search_query";
 /// ## Object safety
 ///
 /// The trait is `Send + Sync` so it can be held behind an `Arc<dyn Embedder>`
-/// that is shared across threads and stored in the engine's `OnceCell`.
+/// that is shared across threads and stored in the engine's keyed embedder cache
+/// (one entry per `model_id`).
 pub trait Embedder: Send + Sync {
     /// Returns the canonical model identifier, e.g. `"nomic-embed-text-v1.5"`.
     fn model_id(&self) -> &str;
 
-    /// Returns the output vector dimension (e.g. `768`).
+    /// Returns the output vector dimension (model-dependent: 384, 768, or 1024).
     fn dim(&self) -> usize;
 
     /// Embeds a batch of document texts.
     ///
-    /// Prepends `"search_document: "` to each input before passing it to the
-    /// underlying model.  Returns one `Vec<f32>` per input, in order.
+    /// Prepends the model's document prefix (from its registry spec; empty = no
+    /// prefix) to each input before passing it to the underlying model. Returns
+    /// one `Vec<f32>` per input, in order.
     ///
-    /// Every returned vector is length-[`DEFAULT_EMBED_DIM`] and L2-normalized.
+    /// Every returned vector has length [`Embedder::dim`] and is L2-normalized.
     fn embed_documents(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, LensError>;
 
     /// Owned-input variant of [`Embedder::embed_documents`] that avoids the
@@ -90,10 +94,10 @@ pub trait Embedder: Send + Sync {
     ///
     /// On the ingest hot path each chunk's text is already an owned `String`;
     /// `embed_documents(&[&str])` then clones every input again to prepend the
-    /// `"search_document: "` prefix. This variant takes ownership of the input
-    /// strings so the prefix can be applied in place (a single allocation per
-    /// input). The default impl just borrows back into [`Embedder::embed_documents`]
-    /// so existing implementations keep working unchanged.
+    /// model's document prefix. This variant takes ownership of the input strings
+    /// so the prefix can be applied in place (a single allocation per input). The
+    /// default impl just borrows back into [`Embedder::embed_documents`] so
+    /// existing implementations keep working unchanged.
     ///
     /// Every returned vector has length [`Embedder::dim`] and is L2-normalized.
     fn embed_documents_owned(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, LensError> {
@@ -103,9 +107,9 @@ pub trait Embedder: Send + Sync {
 
     /// Embeds a single query text.
     ///
-    /// Prepends `"search_query: "` to the input before passing it to the
-    /// underlying model.  Returns one L2-normalized `Vec<f32>` of length
-    /// [`DEFAULT_EMBED_DIM`].
+    /// Prepends the model's query prefix (from its registry spec; empty = no
+    /// prefix) to the input before passing it to the underlying model. Returns one
+    /// L2-normalized `Vec<f32>` of length [`Embedder::dim`].
     fn embed_query(&self, text: &str) -> Result<Vec<f32>, LensError>;
 }
 
@@ -115,8 +119,9 @@ pub trait Embedder: Send + Sync {
 
 /// Production embedder backed by `fastembed` + bundled onnxruntime.
 ///
-/// Wraps [`fastembed::TextEmbedding`] for `nomic-embed-text-v1.5` (768d) and
-/// applies the required `search_document:` / `search_query:` prefixes.
+/// Wraps [`fastembed::TextEmbedding`] for any model described by an
+/// [`EmbeddingModelSpec`] and applies that spec's document / query prefixes
+/// (empty = none).
 ///
 /// **Construction is expensive** (~130 MB ONNX session init, plus a one-time
 /// model download from HuggingFace on first use).  Construct once and cache

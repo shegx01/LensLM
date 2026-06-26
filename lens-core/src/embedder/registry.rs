@@ -104,13 +104,21 @@ pub static REGISTRY: &[EmbeddingModelSpec] = &[
 /// id falls back to the default ([`DEFAULT_EMBED_MODEL_ID`], the first registry
 /// entry) so callers always get a usable spec.
 pub fn resolve(id: &str) -> &'static EmbeddingModelSpec {
+    resolve_opt(id).unwrap_or_else(default_spec)
+}
+
+/// Resolves a model id to its [`EmbeddingModelSpec`], returning `None` for a
+/// genuinely-unknown id (rather than falling back to the default).
+///
+/// The legacy alias `"nomic-embed-text"` resolves to the nomic entry (so callers
+/// can accept the frontend's Ollama-facing id and persist the canonical
+/// `spec.id`). Use this — not [`resolve`] — when an unknown id must be REJECTED
+/// (e.g. the `set_notebook_embedding_model` command, the `eval --model` flag).
+pub fn resolve_opt(id: &str) -> Option<&'static EmbeddingModelSpec> {
     if id == LEGACY_DEFAULT_ALIAS {
-        return default_spec();
+        return Some(default_spec());
     }
-    REGISTRY
-        .iter()
-        .find(|spec| spec.id == id)
-        .unwrap_or_else(default_spec)
+    REGISTRY.iter().find(|spec| spec.id == id)
 }
 
 /// Returns the default spec (the first registry entry, the nomic model).

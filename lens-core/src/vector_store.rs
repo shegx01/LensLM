@@ -26,7 +26,8 @@
 //!
 //! One LanceDB table per `(notebook, model, dim)`. Each row is
 //! `{chunk_id: Utf8, source_id: Utf8, notebook_id: Utf8, level: Int32,
-//! vector: FixedSizeList<Float32, 768>}`. Searches pin the distance metric to
+//! vector: FixedSizeList<Float32, dim>}` where `dim` is the coordinate's
+//! embedding dimension (384/768/1024 per model). Searches pin the distance metric to
 //! cosine **explicitly** and additionally run `.only_if("notebook_id = '…'")`
 //! as cheap defense-in-depth (the AC asserts notebook isolation directly).
 //! Brute-force kNN below [`ANN_INDEX_MIN_ROWS`]; above it an IVF_PQ cosine index is
@@ -51,7 +52,10 @@ use uuid::Uuid;
 
 use crate::LensError;
 
-/// Embedding dimension for nomic-embed-text-v1.5. Phase 1 is fixed at 768.
+/// The default embedding dimension (nomic-embed-text-v1.5 = 768). NOT a global
+/// constraint since M4 Phase 4b: each coordinate carries its own `dim` (384/768/
+/// 1024), threaded through the write/read paths. Retained for the default-model
+/// schema in unit tests; prefer [`crate::DEFAULT_EMBED_DIM`] in new code.
 pub const VECTOR_DIM: usize = 768;
 
 /// Row count at/above which an active (or building) table gets an IVF_PQ ANN
@@ -987,7 +991,7 @@ impl LanceVectorStore {
     /// logged and swallowed — search degrades to exact brute-force kNN (correct,
     /// only slower), so a transient index error never fails an ingest or re-embed.
     /// `dim` selects the PQ sub-vector count; it MUST match the table's vector
-    /// width (callers pass the coordinate dim — [`VECTOR_DIM`] in Phase 1).
+    /// width (callers pass the coordinate's `dim`, resolved per notebook model).
     ///
     /// Takes the JUST-WRITTEN handle so the threshold gate (`count_rows`, which DOES
     /// reflect the rows this call appended) costs nothing extra in the common case —

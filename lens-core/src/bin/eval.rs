@@ -190,9 +190,19 @@ async fn run() -> Result<ExitCode, LensError> {
             .map(|w| w[1].clone())
             .unwrap_or_else(|| DEFAULT_EMBED_MODEL_ID.to_string())
     };
-    // Resolve the spec (unknown id falls back to nomic — same behaviour as the
-    // engine; the eval header will print the actual model used).
-    let spec: &'static EmbeddingModelSpec = lens_core::resolve(&model_id);
+    // Resolve the spec, REJECTING an unknown id (mirrors the
+    // `set_notebook_embedding_model` command) so a typo'd `--model` fails loudly
+    // instead of silently measuring nomic. The legacy alias is accepted.
+    let spec: &'static EmbeddingModelSpec = match lens_core::resolve_opt(&model_id) {
+        Some(spec) => spec,
+        None => {
+            eprintln!(
+                "error: unknown --model {model_id:?}; known ids: nomic-embed-text-v1.5 \
+                 (alias nomic-embed-text), mxbai-embed-large, all-minilm, bge-m3"
+            );
+            std::process::exit(2);
+        }
+    };
 
     // Authoring aid: dump deterministic ids and exit (no embedding/search).
     if std::env::args().any(|a| a == "--print-ids") {

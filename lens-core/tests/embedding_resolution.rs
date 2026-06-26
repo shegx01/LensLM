@@ -8,8 +8,8 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-use lens_core::LensEngine;
 use lens_core::embedder::{CountingEmbedder, Embedder, resolve};
+use lens_core::{LensEngine, NotebookId};
 
 // ---------------------------------------------------------------------------
 // Step 5 — keyed embedder cache (R8)
@@ -162,4 +162,60 @@ async fn resolve_notebook_embedding_unknown_is_default() {
         .expect("resolve");
     assert_eq!(model, "nomic-embed-text-v1.5");
     assert_eq!(dim, 768);
+}
+
+/// `set_notebook_embedding_model` accepts the frontend's legacy alias
+/// `"nomic-embed-text"` and persists the CANONICAL id `"nomic-embed-text-v1.5"`
+/// (the TS `EMBEDDING_MODELS` uses the Ollama-facing alias). Guards the API
+/// contract for the 4b-B selector UI.
+#[tokio::test]
+async fn set_embedding_model_accepts_legacy_alias_and_persists_canonical() {
+    let engine = LensEngine::for_test().await;
+    let nb = engine
+        .create_notebook("Alias NB", None, None)
+        .await
+        .expect("create notebook");
+
+    engine
+        .set_notebook_embedding_model(&nb.id, "nomic-embed-text")
+        .await
+        .expect("legacy alias accepted");
+
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT embedding_model FROM notebooks WHERE id = ?")
+            .bind(nb.id.as_str())
+            .fetch_one(&engine.pool().await)
+            .await
+            .unwrap();
+    assert_eq!(stored.as_deref(), Some("nomic-embed-text-v1.5"));
+}
+
+/// `set_notebook_embedding_model` rejects a genuinely-unknown id (no silent
+/// fallback to nomic).
+#[tokio::test]
+async fn set_embedding_model_rejects_unknown_id() {
+    let engine = LensEngine::for_test().await;
+    let nb = engine
+        .create_notebook("Reject NB", None, None)
+        .await
+        .expect("create notebook");
+
+    let err = engine
+        .set_notebook_embedding_model(&nb.id, "totally-made-up-model")
+        .await
+        .expect_err("unknown id rejected");
+    assert!(format!("{err}").contains("unknown embedding model id"));
+}
+
+/// `resolve_notebook_embedding` fails fast for a non-existent notebook (rather
+/// than silently returning the default), so callers get a clear error.
+#[tokio::test]
+async fn resolve_notebook_embedding_errors_for_missing_notebook() {
+    let engine = LensEngine::for_test().await;
+    let missing = NotebookId::from("no-such-notebook".to_string());
+    let err = engine
+        .resolve_notebook_embedding(&missing)
+        .await
+        .expect_err("missing notebook errors");
+    assert!(format!("{err}").contains("no notebook with id"));
 }

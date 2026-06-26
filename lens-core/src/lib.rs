@@ -29,7 +29,7 @@ pub mod vector_store;
 pub use config::{AppConfig, EnrichmentConfig, TaskModel};
 pub use embedder::{
     CountingEmbedder, DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, Embedder, EmbeddingModelSpec,
-    FastembedEmbedder, resolve,
+    FastembedEmbedder, resolve, resolve_opt,
 };
 pub use embedding::{InstallProgress, pull_embedding_model};
 pub use enrichment::{ENRICHMENT_QUEUE_CAPACITY, EnrichmentJob};
@@ -144,10 +144,15 @@ pub struct LensEngine {
     /// deferred to M9. In practice the working set is the handful of models the
     /// open notebooks use.
     ///
-    /// Concurrent `embedder_for` calls for the SAME key serialize on the
-    /// `Mutex` so a model is constructed exactly once even under a race — the
-    /// second caller waits, then finds the cached entry. This is intended: the
-    /// expensive ONNX init must not run twice for one key.
+    /// Concurrency: this is a single `Mutex` guarding the whole map, held across
+    /// the `spawn_blocking` ONNX init in [`LensEngine::embedder_for`], so ALL
+    /// concurrent `embedder_for` calls serialize on it — including ones for a
+    /// DIFFERENT, already-cached key. This guarantees an expensive ONNX init runs
+    /// exactly once per key (no duplicate construction under a race), at the cost
+    /// of serializing cold-start inits across models. In practice the single-permit
+    /// `ingest_lock` already serializes the embed paths, so this rarely bites; a
+    /// per-key `OnceCell` (init outside the map lock) is the M9 follow-up if cold
+    /// multi-model startup latency becomes a concern.
     embedders: Arc<Mutex<HashMap<String, Arc<dyn Embedder>>>>,
     /// Lazily-resolved, shared nomic tokenizer (parallel to `embedder`).
     ///
@@ -1101,12 +1106,16 @@ impl LensEngine {
         notebook_id: &NotebookId,
     ) -> Result<(String, usize), LensError> {
         let pool = self.pool().await;
+        // `fetch_optional` → None means NO such notebook row (fail fast); `Some(None)`
+        // means the row exists with a NULL `embedding_model` (resolve to the default).
         let stored: Option<String> =
             sqlx::query_scalar("SELECT embedding_model FROM notebooks WHERE id = ?")
                 .bind(notebook_id.as_str())
                 .fetch_optional(&pool)
                 .await?
-                .flatten();
+                .ok_or_else(|| {
+                    LensError::Validation(format!("no notebook with id {notebook_id}"))
+                })?;
         let spec = crate::embedder::resolve(stored.as_deref().unwrap_or(""));
         Ok((spec.id.to_string(), spec.dim))
     }
@@ -1126,21 +1135,22 @@ impl LensEngine {
         notebook_id: &NotebookId,
         model_id: &str,
     ) -> Result<(), LensError> {
-        // Reject unknown ids (resolve() falls back to nomic for anything unknown;
-        // we compare the resolved id against the input to detect the silent fallback).
-        let spec = crate::embedder::resolve(model_id);
-        if spec.id != model_id {
-            return Err(LensError::Validation(format!(
-                "unknown embedding model id: {model_id:?}; known ids: nomic-embed-text-v1.5, \
-                 mxbai-embed-large, all-minilm, bge-m3"
-            )));
-        }
+        // Reject genuinely-unknown ids via the registry's strict lookup (which
+        // accepts the legacy alias `nomic-embed-text` → nomic). Persist the
+        // CANONICAL `spec.id` (e.g. the frontend's Ollama-facing `nomic-embed-text`
+        // is stored as `nomic-embed-text-v1.5`) so resolution downstream is exact.
+        let spec = crate::embedder::resolve_opt(model_id).ok_or_else(|| {
+            LensError::Validation(format!(
+                "unknown embedding model id: {model_id:?}; known ids: nomic-embed-text-v1.5 \
+                 (alias nomic-embed-text), mxbai-embed-large, all-minilm, bge-m3"
+            ))
+        })?;
         let pool = self.pool().await;
         let result = sqlx::query(
             "UPDATE notebooks SET embedding_model = ?, updated_at = ? \
              WHERE id = ? AND trashed_at IS NULL",
         )
-        .bind(model_id)
+        .bind(spec.id)
         .bind(chrono::Utc::now().to_rfc3339())
         .bind(notebook_id.as_str())
         .execute(&pool)
