@@ -128,7 +128,7 @@ describe('saveEnrichmentPrefs (RMW into enrichment)', () => {
     expect(w.onboarding_complete).toBe(stored.onboarding_complete);
   });
 
-  it('persists cloud_consent and the dedicated_model coref value', async () => {
+  it('persists cloud_consent and the llm_inline coref value', async () => {
     const stored = baseAppConfig();
     let written: AppConfig | null = null;
     mockIPC((cmd, args) => {
@@ -141,12 +141,12 @@ describe('saveEnrichmentPrefs (RMW into enrichment)', () => {
 
     await saveEnrichmentPrefs({
       enabled: true,
-      coref_strategy: 'dedicated_model',
+      coref_strategy: 'llm_inline',
       cloud_consent: true
     });
 
     const w = written as unknown as AppConfig;
     expect(w.enrichment.cloud_consent).toBe(true);
-    expect(w.enrichment.coref_strategy).toBe('dedicated_model');
+    expect(w.enrichment.coref_strategy).toBe('llm_inline');
   });
 });

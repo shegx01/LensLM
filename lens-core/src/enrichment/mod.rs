@@ -18,12 +18,14 @@
 //! against the held permit (a dropped job is recovered by the startup/rescan
 //! queue-rebuild). See [`crate::LensEngine::enqueue_enrichment`].
 
+pub mod coref;
 pub mod embedding_text;
 pub mod map;
 pub mod meta;
 pub mod reembed;
 pub mod worker;
 
+pub use coref::{ChunkCoref, CorefResponse, CorefSub, apply_substitutions, resolve_coref_batch};
 pub use embedding_text::{CorefStrategy, compose_embedding_text, compose_prefix};
 pub use map::{MapError, MapOutcome, build_structural_map};
 pub use meta::{

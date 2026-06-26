@@ -84,6 +84,14 @@ fn valid_map() -> &'static str {
     r#"{"entities":["Ada Lovelace"],"definitions":[{"term":"engine","definition":"a machine"}],"dates":["1843"],"summary":"A note about Ada Lovelace and the analytical engine."}"#
 }
 
+/// A valid coref response with NO substitutions (the body stays raw, byte-identity
+/// preserved). Under the default `LlmInline` strategy a successful `ok` map now
+/// triggers ONE coref call per batch; an empty-subs reply parses cleanly so the
+/// pass adds exactly one dispatch without altering any body.
+fn empty_coref() -> &'static str {
+    r#"{"results":[]}"#
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -264,7 +272,11 @@ async fn ac4_valid_map_is_stored_on_parent_and_text_byte_identical() {
     )
     .await;
 
-    let (provider, calls) = MockProvider::new("mock-1", vec![valid_map()]);
+    // map call (valid) then coref calls (empty subs cycle) under the default
+    // LlmInline. The exact coref-call count depends on how the bodies batch under
+    // the char budget (a detail), so we assert the map fired + at least one coref
+    // call, not a brittle exact total.
+    let (provider, calls) = MockProvider::new("mock-1", vec![valid_map(), empty_coref()]);
     engine.set_llm_provider(Some(provider)).await;
     engine.enqueue_enrichment_for_test(&source_id);
 
@@ -277,7 +289,11 @@ async fn ac4_valid_map_is_stored_on_parent_and_text_byte_identical() {
         enrichment_status(&engine, &source_id).await
     );
 
-    assert_eq!(calls.load(Ordering::SeqCst), 1, "exactly one map LLM call");
+    assert!(
+        calls.load(Ordering::SeqCst) >= 2,
+        "one map LLM call + at least one coref LLM call (LlmInline default); got {}",
+        calls.load(Ordering::SeqCst)
+    );
 
     // The map JSON is on the PARENT row; it parses as a StructuralMap.
     let (parent_text, parent_et, parent_enrichment) = chunk_columns(&engine, &ids[0]).await;
@@ -365,13 +381,13 @@ async fn ac9_matching_cache_key_skips_llm_entirely() {
     )
     .await;
 
-    let (provider, calls) = MockProvider::new("mock-1", vec![valid_map()]);
+    let (provider, calls) = MockProvider::new("mock-1", vec![valid_map(), empty_coref()]);
     engine.set_llm_provider(Some(provider)).await;
 
-    // First run: one LLM call; the fused worker completes to `enriched`.
+    // First run: one map + one coref call; the fused worker completes to `enriched`.
     engine.enqueue_enrichment_for_test(&source_id);
     assert!(wait_for_status(&engine, &source_id, "enriched").await);
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
 
     // Re-enqueue with the SAME config → the persisted cache key matches → ZERO
     // additional LLM calls; status stays `enriched`.
@@ -379,7 +395,7 @@ async fn ac9_matching_cache_key_skips_llm_entirely() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(
         calls.load(Ordering::SeqCst),
-        1,
+        2,
         "a matching cache key must dispatch ZERO additional LLM calls"
     );
     assert_eq!(
@@ -400,22 +416,25 @@ async fn ac9_model_change_invalidates_cache_key_and_reruns() {
     )
     .await;
 
-    // First provider (model "mock-A") enriches once.
-    let (provider_a, calls_a) = MockProvider::new("mock-A", vec![valid_map()]);
+    // First provider (model "mock-A") enriches once (map + coref).
+    let (provider_a, calls_a) = MockProvider::new("mock-A", vec![valid_map(), empty_coref()]);
     engine.set_llm_provider(Some(provider_a)).await;
     engine.enqueue_enrichment_for_test(&source_id);
     assert!(wait_for_status(&engine, &source_id, "enriched").await);
-    assert_eq!(calls_a.load(Ordering::SeqCst), 1);
+    assert!(
+        calls_a.load(Ordering::SeqCst) >= 2,
+        "model-A run fired a map + at least one coref call"
+    );
 
     // Swap to a DIFFERENT model id → the composite cache key changes (model_id is
     // a key component, exactly like a prompt_version bump) → it MUST re-run. The
-    // re-run re-enriches and completes back to `enriched` with a fresh LLM call.
-    let (provider_b, calls_b) = MockProvider::new("mock-B", vec![valid_map()]);
+    // re-run re-enriches and completes back to `enriched` with fresh LLM calls.
+    let (provider_b, calls_b) = MockProvider::new("mock-B", vec![valid_map(), empty_coref()]);
     engine.set_llm_provider(Some(provider_b)).await;
     // Move OFF `enriched` first so the re-run's completion back to `enriched` is
     // observable as a transition (the cache-key mismatch forces the LLM call).
     engine.enqueue_enrichment_for_test(&source_id);
-    // The model-id change invalidates the cache key → a second LLM call fires.
+    // The model-id change invalidates the cache key → fresh LLM calls fire.
     for _ in 0..300 {
         if calls_b.load(Ordering::SeqCst) >= 1 {
             break;
@@ -426,10 +445,10 @@ async fn ac9_model_change_invalidates_cache_key_and_reruns() {
         wait_for_status(&engine, &source_id, "enriched").await,
         "a changed model id must invalidate the cache key and re-run"
     );
-    assert_eq!(
-        calls_b.load(Ordering::SeqCst),
-        1,
-        "the new-model run dispatched a fresh LLM call"
+    assert!(
+        calls_b.load(Ordering::SeqCst) >= 2,
+        "the new-model run dispatched a fresh map + coref LLM call; got {}",
+        calls_b.load(Ordering::SeqCst)
     );
 }
 
@@ -576,5 +595,58 @@ async fn tiny_prose_source_is_skipped_by_size_gate() {
     assert!(
         et.is_some(),
         "size-gated source still gets a prefix-only embedding_text"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// coref (LlmInline) — real substitution applied to embedding_text; canonical
+// text byte-identical (AC5 / Step-4 coref)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn coref_substitution_resolves_embedding_text_body_canonical_text_untouched() {
+    let (_dir, engine) = file_engine().await;
+    // A prose body that clears the size gate. The first token is the pronoun "It"
+    // at char offsets [0,2); the coref mock substitutes it with the named entity
+    // "Ada Lovelace" (present in the map entities → passes the allow-list guard).
+    let body = format!("It {}", "Ada ".repeat(2100).trim_end());
+    let (_nb, source_id, ids) = seed_source_with_chunks(
+        &engine,
+        "hash-coref",
+        &[(None, "parent", 0, "Intro", &body, Some("paragraph"))],
+    )
+    .await;
+
+    // map (valid; entities=["Ada Lovelace"]) then a coref reply substituting the
+    // leading "It" (id=0, [0,2)) → "Ada Lovelace".
+    let coref = r#"{"results":[{"id":0,"subs":[{"mention":"It","char_start":0,"char_end":2,"antecedent":"Ada Lovelace"}]}]}"#;
+    let (provider, calls) = MockProvider::new("mock-1", vec![valid_map(), coref]);
+    engine.set_llm_provider(Some(provider)).await;
+    engine.enqueue_enrichment_for_test(&source_id);
+
+    assert!(
+        wait_for_status(&engine, &source_id, "enriched").await,
+        "coref run must complete to `enriched`; got {:?}",
+        enrichment_status(&engine, &source_id).await
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "one map + one coref LLM call"
+    );
+
+    let (text, et, _enr) = chunk_columns(&engine, &ids[0]).await;
+    // Canonical text is BYTE-IDENTICAL — coref never mutates `chunks.text`.
+    assert_eq!(text, body, "canonical text must be byte-identical");
+    // embedding_text carries the RESOLVED body: the leading pronoun is replaced.
+    let et = et.expect("embedding_text written");
+    assert!(
+        et.contains("Ada Lovelace Ada"),
+        "embedding_text body must have the coref substitution applied; got: {}",
+        &et[..et.len().min(120)]
+    );
+    assert!(
+        !et.starts_with("[Document:") || !et.contains("] It "),
+        "the resolved body must not retain the unresolved leading pronoun"
     );
 }

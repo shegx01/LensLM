@@ -46,8 +46,14 @@ const PROVIDER_ANTHROPIC: &str = "anthropic";
 /// A single completion request to an [`LlmProvider`].
 ///
 /// `system` is an optional system/instruction prompt; `prompt` is the user
-/// turn; `max_tokens` caps the generated output.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// turn; `max_tokens` caps the generated output. `temperature` and `json` are
+/// the determinism knobs threaded into every backend so enrichment can pin
+/// reproducible, machine-parseable output (the enrichment callers pass
+/// `temperature: 0.0, json: true`).
+///
+/// `temperature` is `f32`, so the struct uses `PartialEq` only (no `Eq`/`Hash`):
+/// `LlmRequest` is a transient request value, never a map key.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LlmRequest {
     /// Optional system/instruction prompt.
     pub system: Option<String>,
@@ -55,6 +61,14 @@ pub struct LlmRequest {
     pub prompt: String,
     /// Maximum output tokens to generate.
     pub max_tokens: u32,
+    /// Sampling temperature. `0.0` requests greedy/deterministic decoding;
+    /// enrichment callers pin this to `0.0`. Sent on every backend.
+    pub temperature: f32,
+    /// Request strict JSON output. When `true`, each backend asks for JSON mode
+    /// where supported (Ollama `format:"json"`, OpenAI `response_format`); the
+    /// Anthropic API has NO such param, so JSON is enforced only via the prompt
+    /// there (the strict serde parse + retries remain the real guard).
+    pub json: bool,
 }
 
 /// A completion response from an [`LlmProvider`].
@@ -220,15 +234,24 @@ impl LlmProvider for OllamaProvider {
         }
         messages.push(serde_json::json!({ "role": "user", "content": req.prompt }));
 
+        let mut body = serde_json::json!({
+            "model": self.model,
+            "messages": messages,
+            "stream": false,
+            "options": {
+                "num_predict": req.max_tokens,
+                "temperature": req.temperature,
+            },
+        });
+        // Ollama JSON mode is a top-level `format:"json"` constraint.
+        if req.json {
+            body["format"] = serde_json::Value::String("json".to_string());
+        }
+
         let resp = self
             .client
             .post(&url)
-            .json(&serde_json::json!({
-                "model": self.model,
-                "messages": messages,
-                "stream": false,
-                "options": { "num_predict": req.max_tokens },
-            }))
+            .json(&body)
             .send()
             .await
             .map_err(network_err)?;
@@ -325,13 +348,20 @@ impl LlmProvider for OpenAiCompatProvider {
         }
         messages.push(serde_json::json!({ "role": "user", "content": req.prompt }));
 
+        let mut body = serde_json::json!({
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": req.max_tokens,
+            "temperature": req.temperature,
+        });
+        // OpenAI-compatible JSON mode.
+        if req.json {
+            body["response_format"] = serde_json::json!({ "type": "json_object" });
+        }
+
         let resp = self
             .auth(self.client.post(&url))
-            .json(&serde_json::json!({
-                "model": self.model,
-                "messages": messages,
-                "max_tokens": req.max_tokens,
-            }))
+            .json(&body)
             .send()
             .await
             .map_err(network_err)?;
@@ -415,9 +445,12 @@ impl LlmProvider for AnthropicProvider {
     async fn reachable(&self) -> bool {
         // No GET /v1/models on Anthropic — ping with a max_tokens=1 message.
         let url = format!("{}/v1/messages", self.base_url);
+        // A minimal valid request: max_tokens=1, temperature 0.0, no JSON mode
+        // (Anthropic has no json param anyway — see `generate`).
         let body = serde_json::json!({
             "model": self.model,
             "max_tokens": 1,
+            "temperature": 0.0,
             "messages": [{ "role": "user", "content": "ping" }],
         });
         match self
@@ -433,9 +466,14 @@ impl LlmProvider for AnthropicProvider {
 
     async fn generate(&self, req: &LlmRequest) -> Result<LlmResponse, LensError> {
         let url = format!("{}/v1/messages", self.base_url);
+        // Anthropic exposes a top-level `temperature` but has NO JSON-mode /
+        // `response_format` param — `req.json` is honored only via the prompt
+        // here (the strict serde parse + reprompts in `enrichment::map` are the
+        // real guard), so we never send an unsupported field.
         let mut body = serde_json::json!({
             "model": self.model,
             "max_tokens": req.max_tokens,
+            "temperature": req.temperature,
             "messages": [{ "role": "user", "content": req.prompt }],
         });
         if let Some(system) = &req.system {
@@ -523,7 +561,7 @@ mod tests {
     use super::*;
 
     use crate::config::ModelConfig;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// A fixed always-refused localhost port. Nothing binds `127.0.0.1:1`, so the
@@ -536,6 +574,9 @@ mod tests {
             system: Some("be terse".to_string()),
             prompt: "hello".to_string(),
             max_tokens: 64,
+            // The enrichment determinism defaults: greedy decode + JSON mode.
+            temperature: 0.0,
+            json: true,
         }
     }
 
@@ -567,6 +608,12 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/chat"))
+            // The determinism knobs must be on the wire: temperature in
+            // `options` and the top-level `format:"json"` when json-mode is set.
+            .and(body_partial_json(serde_json::json!({
+                "options": { "temperature": 0.0 },
+                "format": "json"
+            })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "message": { "role": "assistant", "content": "hi there" },
                 "prompt_eval_count": 10,
@@ -631,6 +678,11 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
+            // temperature + `response_format: json_object` must be on the wire.
+            .and(body_partial_json(serde_json::json!({
+                "temperature": 0.0,
+                "response_format": { "type": "json_object" }
+            })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "choices": [{ "message": { "role": "assistant", "content": "the answer" } }],
                 "usage": { "total_tokens": 42 }
@@ -709,6 +761,8 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
             .and(header("x-api-key", "sk-ant"))
+            // Anthropic gets a top-level temperature.
+            .and(body_partial_json(serde_json::json!({ "temperature": 0.0 })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "content": [
                     { "type": "text", "text": "structured " },
@@ -727,6 +781,14 @@ mod tests {
         let resp = provider.generate(&req()).await.unwrap();
         assert_eq!(resp.text, "structured map");
         assert_eq!(resp.tokens_used, 42);
+
+        // Anthropic has NO json-mode param even when `req.json` is true — assert
+        // the body never carries `response_format`/`format` (relies on the prompt).
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert!(body.get("response_format").is_none());
+        assert!(body.get("format").is_none());
+        assert_eq!(body["temperature"], serde_json::json!(0.0));
     }
 
     #[tokio::test]

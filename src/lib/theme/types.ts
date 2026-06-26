@@ -29,9 +29,10 @@ export interface TtsConfig {
 // the snake_case serde strings are the on-disk JSON + cache-key contract; update both.
 //
 // The coreference-resolution strategy applied while composing `embedding_text`.
-// `dedicated_model` is a config-level stub in Phase 3 (falls back to `llm_inline`
-// at runtime — Decision I), but the value is still persisted/round-tripped.
-export type CorefStrategy = 'none' | 'llm_inline' | 'dedicated_model';
+// Only the two strategies that ship: `none` or `llm_inline`. (A `dedicated_model`
+// stub was removed — it only fell back to `llm_inline`; the Rust side still reads
+// a legacy `"dedicated_model"` string back as `llm_inline` for config round-trip.)
+export type CorefStrategy = 'none' | 'llm_inline';
 
 // SYNC-CHECK: must match lens-core/src/config.rs EnrichmentConfig — update both together.
 //

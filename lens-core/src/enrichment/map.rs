@@ -82,26 +82,31 @@ fn batch_parents(parent_texts: &[String]) -> Vec<String> {
     batches
 }
 
-/// Calls the LLM for one batch's map, validating the response with up to
-/// [`ENRICHMENT_MAX_RETRIES`] reprompts. Returns:
-/// * `Ok(Some(map))` — validated;
+/// Shared LLM retry/budget/parse loop for the enrichment passes (DRY across the
+/// structural map and coref). Calls `provider.generate` with up to
+/// [`ENRICHMENT_MAX_RETRIES`] reprompts, parsing each reply with `parse`. Returns:
+/// * `Ok(Some(value))` — `parse` succeeded;
 /// * `Ok(None)` — exhausted retries with malformed output (caller degrades);
 /// * `Err(BudgetExceeded)` — a pre-dispatch budget breach (caller fails);
 /// * `Err(Llm(_))` — a transport/provider error (caller fails).
 ///
-/// Budget is checked BEFORE every `generate()` (AC11): on a breach the call is
-/// NEVER dispatched.
-async fn map_one_batch(
+/// Budget is checked BEFORE every `generate()` (AC11) using `max_tokens` as the
+/// projected per-call cost: on a breach the call is NEVER dispatched. Every call
+/// pins `temperature: 0.0, json: true` for deterministic, machine-parseable output.
+pub(super) async fn run_llm_with_retries<T>(
     provider: &dyn LlmProvider,
     budget: &mut Budget,
+    system_prompt: &str,
     user_prompt: &str,
-) -> Result<Option<StructuralMap>, MapError> {
+    max_tokens: u32,
+    parse: impl Fn(&str) -> Result<T, LensError>,
+) -> Result<Option<T>, MapError> {
     // 1 initial attempt + ENRICHMENT_MAX_RETRIES reprompts.
     let total_attempts = ENRICHMENT_MAX_RETRIES + 1;
     let mut last_body = String::new();
     for attempt in 0..total_attempts {
         // AC11: check the budget BEFORE dispatching. A breach short-circuits.
-        if budget.check_before_dispatch(ENRICHMENT_MAP_MAX_TOKENS) == BudgetCheck::Exceeded {
+        if budget.check_before_dispatch(max_tokens) == BudgetCheck::Exceeded {
             return Err(MapError::BudgetExceeded);
         }
 
@@ -116,15 +121,20 @@ async fn map_one_batch(
         };
 
         let req = LlmRequest {
-            system: Some(MAP_SYSTEM_PROMPT.to_string()),
+            system: Some(system_prompt.to_string()),
             prompt,
-            max_tokens: ENRICHMENT_MAP_MAX_TOKENS,
+            max_tokens,
+            // Determinism: greedy decode + JSON mode. The system prompt already
+            // demands strict JSON; pinning temperature 0.0 + json maximizes
+            // reproducible, machine-parseable output.
+            temperature: 0.0,
+            json: true,
         };
         let resp = provider.generate(&req).await?;
         budget.record(resp.tokens_used);
 
-        match StructuralMap::parse_strict(&resp.text) {
-            Ok(map) => return Ok(Some(map)),
+        match parse(&resp.text) {
+            Ok(value) => return Ok(Some(value)),
             Err(_) => {
                 last_body = resp.text;
                 // loop to reprompt (if any attempts remain)
@@ -132,6 +142,24 @@ async fn map_one_batch(
         }
     }
     Ok(None)
+}
+
+/// Calls the LLM for one batch's map (thin wrapper over [`run_llm_with_retries`]
+/// pinned to the [`StructuralMap`] schema + the map system prompt + token budget).
+async fn map_one_batch(
+    provider: &dyn LlmProvider,
+    budget: &mut Budget,
+    user_prompt: &str,
+) -> Result<Option<StructuralMap>, MapError> {
+    run_llm_with_retries(
+        provider,
+        budget,
+        MAP_SYSTEM_PROMPT,
+        user_prompt,
+        ENRICHMENT_MAP_MAX_TOKENS,
+        StructuralMap::parse_strict,
+    )
+    .await
 }
 
 /// Runs the full structural-map pass over `parent_texts` (the source's level-0

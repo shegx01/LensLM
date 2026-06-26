@@ -27,6 +27,7 @@ use tokio::sync::mpsc;
 use crate::LensEngine;
 use crate::notebooks::{ChunkEnrichmentUpdate, EnrichmentChunk, EnrichmentStatus, NotebookRepo};
 
+use super::coref::{CorefSub, apply_substitutions, resolve_coref_batch};
 use super::embedding_text::{CorefStrategy, compose_embedding_text, compose_prefix, count_tokens};
 use super::map::{MapError, MapOutcome, build_structural_map};
 use super::meta::{
@@ -261,16 +262,17 @@ async fn process_job(
         .map(|c| c.text.clone())
         .collect();
 
-    let (map_json, doc_summary, map_quality) =
+    let (map_json, doc_summary, map_entities, map_quality) =
         match build_structural_map(provider.as_ref(), &mut budget, &parent_texts).await {
             Ok(MapOutcome::Ok(map)) => {
                 let summary = map.summary.clone();
+                let entities = map.entities.clone();
                 let json = serde_json::to_string(&map)?;
-                (Some(json), summary, MAP_QUALITY_OK)
+                (Some(json), summary, entities, MAP_QUALITY_OK)
             }
             // AC4: persistent malformed output ⇒ degrade to context-prefix-only,
             // source NOT failed.
-            Ok(MapOutcome::Fallback) => (None, String::new(), MAP_QUALITY_FALLBACK),
+            Ok(MapOutcome::Fallback) => (None, String::new(), Vec::new(), MAP_QUALITY_FALLBACK),
             // AC11: a budget circuit-break ⇒ `failed` + `budget_exceeded`, never
             // silent. Raw vectors are untouched (no text columns written).
             Err(MapError::BudgetExceeded) => {
@@ -315,13 +317,82 @@ async fn process_job(
             }
         };
 
+    // ── Coref resolution (AC5, `LlmInline`). When the map is `ok` (entities are
+    // available) and the strategy is `LlmInline`, run real LLM-driven coref over
+    // the chunks being enriched, sharing the SAME `Budget` instance as the map so
+    // the per-job circuit-break (AC11) covers BOTH passes. The LLM only IDENTIFIES
+    // substitutions; `apply_substitutions` applies them deterministically to each
+    // chunk's BODY (the canonical `chunks.text` is never touched). A coref budget
+    // breach fails the source exactly like the map; any other coref miss
+    // (malformed/transport) DEGRADES to empty subs so the body falls back to raw —
+    // coref is strictly additive and never fails the source on its own.
+    let coref_subs: std::collections::HashMap<usize, Vec<CorefSub>> = if coref
+        == CorefStrategy::LlmInline
+        && map_quality == MAP_QUALITY_OK
+        && !map_entities.is_empty()
+    {
+        let coref_chunks: Vec<(usize, &str)> = chunks
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (i, c.text.as_str()))
+            .collect();
+        match resolve_coref_batch(provider.as_ref(), &mut budget, &coref_chunks, &map_entities)
+            .await
+        {
+            Ok(subs) => subs,
+            // AC11: a budget circuit-break during coref ⇒ `failed` + `budget_exceeded`
+            // (the shared budget makes this identical to a map breach).
+            Err(MapError::BudgetExceeded) => {
+                let meta = EnrichmentMeta {
+                    cache_key,
+                    map_quality: String::new(),
+                    budget_exceeded: true,
+                    tokens_spent: budget.job_tokens(),
+                    calls_made: budget.job_calls(),
+                };
+                repo.update_enrichment_status_and_meta(
+                    &job.source_id,
+                    EnrichmentStatus::Failed,
+                    &serde_json::to_string(&meta)?,
+                )
+                .await?;
+                tracing::warn!(
+                    source_id = %job.source_id,
+                    calls = budget.job_calls(),
+                    "enrichment: coref budget exceeded, circuit-broke to failed"
+                );
+                return Ok(());
+            }
+            // A coref transport error is NOT a source failure — coref is additive.
+            // Degrade to empty subs (every body falls back to raw).
+            Err(MapError::Llm(e)) => {
+                tracing::debug!(
+                    source_id = %job.source_id,
+                    "enrichment: coref LLM error, degrading to raw bodies: {e}"
+                );
+                std::collections::HashMap::new()
+            }
+        }
+    } else {
+        std::collections::HashMap::new()
+    };
+
     // ── Compose `embedding_text` for every chunk (AC5) + attach the map JSON to
     // the FIRST level-0 parent row, then write the TEXT columns in one txn.
     let mut updates: Vec<ChunkEnrichmentUpdate> = Vec::with_capacity(chunks.len());
     let mut map_attached = map_json.is_none();
-    for chunk in &chunks {
+    for (i, chunk) in chunks.iter().enumerate() {
         let prefix = compose_prefix(&doc_summary, &chunk.section_path, coref);
-        let embedding_text = compose_embedding_text(&prefix, &chunk.text, tokenizer.as_deref());
+        // The body sourced into `embedding_text` is the canonical text with this
+        // chunk's surviving coref substitutions applied (RIGHT-TO-LEFT, validated).
+        // `chunks.text` itself stays byte-identical — only `embedding_text` carries
+        // the resolved body. On no subs (None strategy / degrade) this is the raw
+        // body unchanged.
+        let resolved_body = match coref_subs.get(&i) {
+            Some(subs) if !subs.is_empty() => apply_substitutions(&chunk.text, subs, &map_entities),
+            _ => chunk.text.clone(),
+        };
+        let embedding_text = compose_embedding_text(&prefix, &resolved_body, tokenizer.as_deref());
         // Attach the per-doc map to the first parent row only (AC4).
         let enrichment_json = if !map_attached && chunk.parent_id.is_none() {
             map_attached = true;

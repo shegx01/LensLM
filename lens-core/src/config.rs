@@ -110,8 +110,8 @@ impl std::fmt::Debug for TtsConfig {
 ///
 /// `coref_strategy` is the typed [`CorefStrategy`] (single source of truth shared
 /// with the enrichment worker — no stringly-typed config); it serializes to the
-/// stable snake_case strings (`none`/`llm_inline`/`dedicated_model`) so the
-/// on-disk JSON and the TS mirror stay byte-compatible.
+/// stable snake_case strings (`none`/`llm_inline`) so the on-disk JSON and the
+/// TS mirror stay byte-compatible.
 ///
 /// ## Provider-driven defaults
 /// The onboarding LLM step picks defaults from the configured provider (see
@@ -125,7 +125,11 @@ pub struct EnrichmentConfig {
     /// vectors — `none`/`pending`, the same graceful path as no provider).
     pub enabled: bool,
     /// Coreference-resolution strategy applied while composing `embedding_text`.
-    /// Typed (the canonical [`CorefStrategy`]); defaults to `LlmInline`.
+    /// Typed (the canonical [`CorefStrategy`]); defaults to `LlmInline`. Read
+    /// through [`deserialize_coref_strategy`] so a legacy `"dedicated_model"`
+    /// string (the now-removed stub) round-trips to `LlmInline` instead of
+    /// failing to deserialize.
+    #[serde(deserialize_with = "deserialize_coref_strategy")]
     pub coref_strategy: CorefStrategy,
     /// Explicit consent to send document text to a CLOUD LLM. Defaults to `false`
     /// (local-first): cloud enrichment is gated on this and never dispatches
@@ -138,6 +142,19 @@ pub struct EnrichmentConfig {
 /// there is exactly ONE definition (de-duplicated — the enum lives in
 /// [`crate::enrichment::embedding_text`] and is the worker's runtime strategy).
 pub use crate::enrichment::CorefStrategy;
+
+/// Tolerant deserializer for [`EnrichmentConfig::coref_strategy`]: parses the
+/// snake_case string via [`CorefStrategy::from_config`], so the canonical
+/// `"none"`/`"llm_inline"` values AND a legacy `"dedicated_model"` string (the
+/// removed Phase-3 stub) all deserialize without error — the latter mapping to
+/// `LlmInline`. Keeps an old `config.json` round-tripping instead of panicking.
+fn deserialize_coref_strategy<'de, D>(deserializer: D) -> Result<CorefStrategy, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    Ok(CorefStrategy::from_config(&raw))
+}
 
 impl Default for EnrichmentConfig {
     /// The conservative default: enrichment OFF, `LlmInline` coref, cloud consent
@@ -598,13 +615,25 @@ mod tests {
             serde_json::to_string(&CorefStrategy::LlmInline).unwrap(),
             "\"llm_inline\""
         );
-        assert_eq!(
-            serde_json::to_string(&CorefStrategy::DedicatedModel).unwrap(),
-            "\"dedicated_model\""
-        );
-        // …and deserialize back.
-        let s: CorefStrategy = serde_json::from_str("\"dedicated_model\"").unwrap();
-        assert_eq!(s, CorefStrategy::DedicatedModel);
+        // …and deserialize back (only `none`/`llm_inline` are emitted now).
+        let s: CorefStrategy = serde_json::from_str("\"llm_inline\"").unwrap();
+        assert_eq!(s, CorefStrategy::LlmInline);
+    }
+
+    #[test]
+    fn legacy_dedicated_model_coref_deserializes_to_llm_inline() {
+        // An older build shipped a `dedicated_model` coref stub that has since been
+        // removed (no stub ships). A `config.json` written by that build must still
+        // load: the legacy string round-trips to `LlmInline` rather than failing to
+        // deserialize the enrichment section.
+        let json = r#"{
+            "enabled": true,
+            "coref_strategy": "dedicated_model",
+            "cloud_consent": false
+        }"#;
+        let e: EnrichmentConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(e.coref_strategy, CorefStrategy::LlmInline);
+        assert!(e.enabled);
     }
 
     #[test]

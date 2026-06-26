@@ -78,13 +78,12 @@
   // only on the Cloud API tab; forced false on the local save path.
   let cloudConsent = $state(false);
 
-  // Coref strategy options. `dedicated_model` is a Phase-3 stub that behaves like
-  // `llm_inline` at runtime (Decision I) — surfaced so the choice round-trips, but
-  // labeled honestly as falling back today.
+  // Coref strategy options. Only the two strategies that actually ship: inline
+  // coref in the enrichment LLM pass, or off. (A `dedicated_model` stub was
+  // removed — it only ever fell back to inline, so surfacing it was a UX lie.)
   const COREF_OPTIONS = [
     { value: 'llm_inline' as const, label: 'Inline (recommended)' },
-    { value: 'none' as const, label: 'Off' },
-    { value: 'dedicated_model' as const, label: 'Dedicated model (falls back to inline)' }
+    { value: 'none' as const, label: 'Off' }
   ] as const;
 
   const CONTEXT_OPTIONS = [

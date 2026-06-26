@@ -20,7 +20,12 @@ use sha2::{Digest, Sha256};
 /// Structural-map / coref prompt version. A component of the composite cache key
 /// (AC9, lock #5): bumping it changes the key so an already-enriched source
 /// re-runs the LLM pass. Bump on ANY prompt change.
-pub const ENRICHMENT_PROMPT_VERSION: u32 = 1;
+///
+/// `2`: real LLM-driven coref-substitution resolution replaced the static prefix
+/// "[Resolve pronouns…]" hint clause — the coref prompt + schema (and thus the
+/// composed `embedding_text` body) changed, so the composite key MUST invalidate
+/// every prior enrichment.
+pub const ENRICHMENT_PROMPT_VERSION: u32 = 2;
 
 /// Skip enrichment for docs whose total token count is below this gate (Decision
 /// C): small docs don't benefit from a structural map and aren't worth an LLM
@@ -44,6 +49,11 @@ pub const ENRICHMENT_MAX_RETRIES: u32 = 2;
 
 /// Max output tokens requested for a single structural-map LLM call.
 pub const ENRICHMENT_MAP_MAX_TOKENS: u32 = 1_024;
+
+/// Max output tokens requested for a single coref-resolution LLM call (also the
+/// projected pre-dispatch budget cost for a coref batch, AC11). Coref output is a
+/// compact substitution list, so it is modest.
+pub const ENRICHMENT_COREF_MAX_TOKENS: u32 = 1_024;
 
 /// The embedder's input token window (nomic-embed-text-v1.5 = 2048). The composed
 /// `embedding_text` must fit within this window AFTER the hard-applied
@@ -154,7 +164,10 @@ fn truncate_chars(s: &mut String, max_chars: usize) {
 /// Extracts the first balanced top-level `{...}` JSON object from `text`, so a
 /// response wrapped in ```json fences or chat preamble still validates. Returns
 /// `None` when no balanced object is found (caller falls back to the raw body).
-fn extract_json_object(text: &str) -> Option<&str> {
+///
+/// Shared by [`StructuralMap::parse_strict`] and the coref parser
+/// ([`super::coref::CorefResponse::parse_strict`]).
+pub(super) fn extract_json_object(text: &str) -> Option<&str> {
     let start = text.find('{')?;
     let bytes = text.as_bytes();
     let mut depth = 0usize;
@@ -204,7 +217,7 @@ pub struct CacheKeyParts {
     pub llm_model_id: String,
     /// [`ENRICHMENT_PROMPT_VERSION`] at enrichment time.
     pub prompt_version: u32,
-    /// The coref strategy used (`"llm_inline"` / `"none"` / `"dedicated_model"`).
+    /// The coref strategy used (`"llm_inline"` / `"none"`).
     pub coref_strategy: String,
 }
 
