@@ -1,0 +1,21 @@
+---
+source: lens-core/src/extract/jsonl.rs
+expression: snaps
+---
+[
+  {
+    "block_type": "paragraph",
+    "section_path": "[0] > age",
+    "text": "/0/age: 30"
+  },
+  {
+    "block_type": "paragraph",
+    "section_path": "[0] > name",
+    "text": "/0/name: Alice"
+  },
+  {
+    "block_type": "paragraph",
+    "section_path": "[1] > name",
+    "text": "/1/name: Bob"
+  }
+]

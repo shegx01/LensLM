@@ -1,0 +1,31 @@
+---
+source: lens-core/src/extract/json.rs
+expression: snaps
+---
+[
+  {
+    "block_type": "paragraph",
+    "section_path": "meta > author",
+    "text": "/meta/author: Alice"
+  },
+  {
+    "block_type": "paragraph",
+    "section_path": "meta > year",
+    "text": "/meta/year: 2024"
+  },
+  {
+    "block_type": "paragraph",
+    "section_path": "tags > 0",
+    "text": "/tags/0: a"
+  },
+  {
+    "block_type": "paragraph",
+    "section_path": "tags > 1",
+    "text": "/tags/1: b"
+  },
+  {
+    "block_type": "paragraph",
+    "section_path": "title",
+    "text": "/title: Doc"
+  }
+]

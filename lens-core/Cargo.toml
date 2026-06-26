@@ -89,6 +89,14 @@ rs-trafilatura = { version = "=0.2.2", default-features = false }
 # — both in deny.toml allowlist.
 url = "=2.5.8"
 
+# --- M4 Phase 2.5c: structured-format extractors (JSON/JSONL/YAML/XML) ---
+# YAML → serde_json::Value deserialization for the YAML extractor. Pinned
+# exactly per repo convention. MIT OR Apache-2.0 — both in deny.toml allowlist.
+serde-saphyr = "=0.0.28"
+# Zero-copy XML DOM parser for the XML extractor. MIT OR Apache-2.0 — both in
+# deny.toml allowlist. Pinned exactly per repo convention.
+roxmltree = "=0.21.1"
+
 # --- M4 Source Grounding (Phase 2, Step 6) ---
 # DOCX paragraph/heading/table extraction. MIT licence — in deny.toml allowlist.
 # Pinned exactly to avoid future breaking changes in a crate still at 0.x.
