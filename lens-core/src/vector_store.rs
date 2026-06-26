@@ -723,30 +723,64 @@ impl LanceVectorStore {
         );
 
         let conn = self.connect().await?;
-        let name = table_name(notebook, model);
 
+        // REGISTRY-DRIVEN resolution (mirror of `open_active_table`): if a
+        // `status='active'` row already exists for this coordinate, append to THAT
+        // physical table. After a re-embed flip the active table is gen-suffixed and
+        // the bare `table_name()` formula points at a DROPPED stale table; resolving
+        // via the formula here would create a fresh gen-0 orphan and silently lose
+        // the appended vectors (search reads only the registered active table). This
+        // is the write-path twin of the read-path AC8 resolution.
+        if let Some(active_name) = self
+            .registry
+            .active_lance_table_name(notebook, model, dim)
+            .await?
+        {
+            if let Some(table) = self.open_table_by_name(&active_name).await? {
+                return Ok(table);
+            }
+            // Registered active row but the physical table is momentarily absent.
+            // `add` and `flip_active` are both serialized under `ingest_lock`, so
+            // this should not occur in practice; recreate the REGISTERED-named table
+            // (not a gen-0 formula table) so the append lands where search reads.
+            // Warn so an operator notices if this defensive path ever fires — it
+            // signals an unexpected registry/Lance divergence.
+            tracing::warn!(
+                notebook,
+                model,
+                active_table = active_name,
+                "ensure_table: active registry row present but its Lance table was \
+                 absent; recreating it (unexpected — investigate registry/Lance drift)"
+            );
+            return conn
+                .create_empty_table(active_name.as_str(), vector_schema(dim))
+                .execute()
+                .await
+                .map_err(|e| LensError::Vector(format!("lancedb create_empty_table failed: {e}")));
+        }
+
+        // No active row ⇒ first CREATE for this coordinate. gen-0 == the formula
+        // name. Open a pre-existing (unregistered, e.g. crash-orphaned) table or
+        // create a fresh one, then register the mapping `active` (the register is a
+        // no-op on conflict, so a concurrent create is self-healing).
+        let name = table_name(notebook, model);
         let existing = conn
             .table_names()
             .execute()
             .await
             .map_err(|e| LensError::Vector(format!("lancedb table_names failed: {e}")))?;
 
-        if existing.iter().any(|t| t == &name) {
-            return conn
-                .open_table(name.as_str())
+        let table = if existing.iter().any(|t| t == &name) {
+            conn.open_table(name.as_str())
                 .execute()
                 .await
-                .map_err(|e| LensError::Vector(format!("lancedb open_table failed: {e}")));
-        }
-
-        // First CREATE for this logical coordinate: create an empty table with
-        // our schema, then register the mapping (registry insert is a no-op on
-        // conflict, so a concurrent create is self-healing).
-        let table = conn
-            .create_empty_table(name.as_str(), vector_schema(dim))
-            .execute()
-            .await
-            .map_err(|e| LensError::Vector(format!("lancedb create_empty_table failed: {e}")))?;
+                .map_err(|e| LensError::Vector(format!("lancedb open_table failed: {e}")))?
+        } else {
+            conn.create_empty_table(name.as_str(), vector_schema(dim))
+                .execute()
+                .await
+                .map_err(|e| LensError::Vector(format!("lancedb create_empty_table failed: {e}")))?
+        };
 
         self.registry
             .register(
@@ -760,6 +794,76 @@ impl LanceVectorStore {
             .await?;
 
         Ok(table)
+    }
+
+    /// Copies every row of the current active table whose `source_id` differs from
+    /// `exclude_source_id` into the named building table.
+    ///
+    /// Used by the per-source re-embed flip so the rebuilt table PRESERVES the
+    /// notebook's other sources instead of replacing the whole table with just the
+    /// re-embedded source. The caller then appends `exclude_source_id`'s freshly
+    /// re-embedded vectors, and the flip promotes a table holding every source.
+    ///
+    /// A no-op when the coordinate has no active table yet (the notebook's first
+    /// source) — the caller then populates the building table with that source
+    /// alone. Vectors are copied as Arrow batches directly (both tables share
+    /// [`vector_schema`]), so no float round-trip or re-embed of unchanged sources.
+    pub(crate) async fn seed_building_from_active(
+        &self,
+        notebook: &str,
+        model: &str,
+        dim: usize,
+        building_name: &str,
+        exclude_source_id: &str,
+    ) -> Result<(), LensError> {
+        let active = match self.open_active_table(notebook, model, dim).await? {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+        let building = self
+            .open_table_by_name(building_name)
+            .await?
+            .ok_or_else(|| {
+                LensError::Vector(format!("no building table {building_name} to seed"))
+            })?;
+
+        // Stream the scan one batch at a time (read → write → drop), capping memory
+        // at a single batch rather than materializing the whole active-minus-source
+        // table in RAM (the notebook can hold many sources' vectors).
+        let stream = active
+            .query()
+            .only_if(format!(
+                "source_id != '{}'",
+                escape_lance_literal(exclude_source_id)
+            ))
+            .execute()
+            .await
+            .map_err(|e| LensError::Vector(format!("lancedb seed scan failed: {e}")))?;
+        let mut stream = std::pin::pin!(stream);
+        let mut seeded_rows = 0usize;
+        while let Some(batch) = stream
+            .try_next()
+            .await
+            .map_err(|e| LensError::Vector(format!("lancedb seed scan failed: {e}")))?
+        {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            seeded_rows += batch.num_rows();
+            building
+                .add(batch)
+                .execute()
+                .await
+                .map_err(|e| LensError::Vector(format!("lancedb seed add failed: {e}")))?;
+        }
+        tracing::debug!(
+            notebook,
+            building = building_name,
+            exclude_source_id,
+            seeded_rows,
+            "seed_building_from_active: copied other sources into building table"
+        );
+        Ok(())
     }
 }
 
