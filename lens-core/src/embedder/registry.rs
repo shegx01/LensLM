@@ -60,12 +60,27 @@ pub struct EmbeddingModelSpec {
     pub prefix_query: &'static str,
 }
 
+impl EmbeddingModelSpec {
+    /// A descriptive `doc/query` record of this model's prefix convention for the
+    /// `embedding_index.prefix_convention` metadata column (`"none"` for an empty
+    /// prefix). Metadata only — the prefixes actually APPLIED at embed time come
+    /// from [`prefix_doc`](Self::prefix_doc)/[`prefix_query`](Self::prefix_query)
+    /// directly, so this string is descriptive, not load-bearing.
+    pub fn prefix_convention(&self) -> String {
+        let label = |p: &str| if p.is_empty() { "none" } else { p.trim() }.to_string();
+        format!("{}/{}", label(self.prefix_doc), label(self.prefix_query))
+    }
+}
+
 /// The complete set of supported embedding models. The first entry is the
 /// default and is what unknown / empty ids resolve to.
 ///
 /// SYNC-CHECK: keep in sync with `src/lib/onboarding/system-check.ts`
-/// `EMBEDDING_MODELS`. The ids and dims here must match the TS `EmbeddingModelSpec`
-/// array; also keep `ALLOWED_EMBEDDING_MODELS` in `system_check.rs` in sync.
+/// `EMBEDDING_MODELS`. The **dims** must match the TS `EmbeddingModelSpec` array.
+/// The **ids** intentionally differ for nomic: the TS/Ollama-facing id is the
+/// alias `"nomic-embed-text"`, which [`LEGACY_DEFAULT_ALIAS`] bridges to the
+/// canonical `"nomic-embed-text-v1.5"` here (the value persisted on a notebook).
+/// Also keep `ALLOWED_EMBEDDING_MODELS` in `system_check.rs` in sync.
 pub static REGISTRY: &[EmbeddingModelSpec] = &[
     EmbeddingModelSpec {
         id: "nomic-embed-text-v1.5",

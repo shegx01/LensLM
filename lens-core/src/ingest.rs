@@ -1137,17 +1137,21 @@ async fn wipe_source_content(
 /// pool (the pool-only twin of [`crate::LensEngine::resolve_notebook_embedding`]).
 ///
 /// Used by the ingest helpers that hold a `&SqlitePool` but no engine handle. A
-/// NULL/absent/unknown `embedding_model` falls back to the registry default.
+/// NULL `embedding_model` (the column exists but is unset) or an unknown value
+/// falls back to the registry default; a MISSING notebook row fails fast, matching
+/// [`crate::LensEngine::resolve_notebook_embedding`].
 async fn resolve_notebook_embedding_from_pool(
     pool: &sqlx::SqlitePool,
     notebook_id: &str,
 ) -> Result<(String, usize), LensError> {
+    // `fetch_optional` → None means NO such notebook (fail fast); `Some(None)` means
+    // the row exists with a NULL `embedding_model` (resolve to the default).
     let stored: Option<String> =
         sqlx::query_scalar("SELECT embedding_model FROM notebooks WHERE id = ?")
             .bind(notebook_id)
             .fetch_optional(pool)
             .await?
-            .flatten();
+            .ok_or_else(|| LensError::Validation(format!("no notebook with id {notebook_id}")))?;
     let spec = crate::embedder::resolve(stored.as_deref().unwrap_or(""));
     Ok((spec.id.to_string(), spec.dim))
 }

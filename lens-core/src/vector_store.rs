@@ -428,8 +428,11 @@ impl EmbeddingIndexRepo {
 
     /// Fetches the registry row for a logical coordinate, if registered.
     ///
-    /// Part of the registry surface mandated by the plan (Step c.3); consumed by
-    /// the Phase-4 model-switch flow, hence `allow(dead_code)` in Phase 1.
+    /// Speculative registry surface from the Phase-1 plan (Step c.3). The Phase-4b
+    /// model-switch flow ended up resolving coordinates via the purpose-built
+    /// [`active_lance_table_name`](Self::active_lance_table_name) instead, so this
+    /// remains unused — kept (`allow(dead_code)`) as a complete registry API; may
+    /// be removed if no consumer emerges.
     #[allow(dead_code)]
     async fn get(
         &self,
@@ -466,11 +469,13 @@ impl EmbeddingIndexRepo {
         Ok(names)
     }
 
-    /// Updates the `status` of an existing registry row (Phase-4 model-switch
-    /// lifecycle: `active`/`building`/`stale`). Errors if no row matches.
+    /// Updates the `status` of EVERY row for a coordinate (not status-scoped).
+    /// Errors if no row matches.
     ///
-    /// Reserved for the Phase-4 model-switch flow; hence `allow(dead_code)` in
-    /// Phase 1, where status is always `active`.
+    /// Superseded by the purpose-built [`demote_active_to_stale`](Self::demote_active_to_stale)
+    /// for the Phase-4b retire path (R3 deliberately left this generic helper
+    /// untouched rather than narrowing it), so it is currently unused — kept
+    /// (`allow(dead_code)`) as a complete registry API.
     #[allow(dead_code)]
     async fn set_status(
         &self,
@@ -896,7 +901,7 @@ impl LanceVectorStore {
                 notebook,
                 model,
                 dim,
-                crate::embedder::PREFIX_CONVENTION,
+                &crate::embedder::resolve(model).prefix_convention(),
                 &name,
                 REGISTRY_STATUS_ACTIVE,
             )
@@ -1314,7 +1319,7 @@ impl VectorStore for LanceVectorStore {
                 notebook,
                 model,
                 dim,
-                crate::embedder::PREFIX_CONVENTION,
+                &crate::embedder::resolve(model).prefix_convention(),
                 &building_name,
                 "building",
             )

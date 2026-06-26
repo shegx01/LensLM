@@ -471,9 +471,11 @@ async fn embedding_index_registers_once_per_notebook() {
     let r = &rows[0];
     assert_eq!(r.get::<String, _>("model"), DEFAULT_EMBED_MODEL_ID);
     assert_eq!(r.get::<i64, _>("dim"), DEFAULT_EMBED_DIM as i64);
+    // Per-spec convention string (M4 Phase 4b): the actual prefix tokens, joined
+    // doc/query ("none" when a model has no prefix). Nomic = the search_* prefixes.
     assert_eq!(
         r.get::<String, _>("prefix_convention"),
-        "search_document/search_query"
+        "search_document:/search_query:"
     );
     assert_eq!(
         r.get::<String, _>("lance_table_name"),

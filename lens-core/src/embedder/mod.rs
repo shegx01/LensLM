@@ -5,13 +5,13 @@
 //!
 //! ## Prefix convention
 //!
-//! `nomic-embed-text-v1.5` requires caller-applied prefixes:
-//! - `"search_document: "` for corpus text at ingest time.
-//! - `"search_query: "` for query strings at retrieval time.
-//!
-//! `fastembed` 5.17.2 does **not** apply these automatically; [`FastembedEmbedder`]
-//! applies them unconditionally.  See [`PREFIX_CONVENTION`] for the canonical
-//! record.
+//! Prefixes are PER-MODEL and live in the registry's [`EmbeddingModelSpec`]
+//! (`prefix_doc`/`prefix_query`; empty = none). For example
+//! `nomic-embed-text-v1.5` uses `"search_document: "` / `"search_query: "`, while
+//! `all-minilm`/`bge-m3` use no prefix and `mxbai-embed-large` prefixes only the
+//! query. `fastembed` 5.17.2 does **not** apply any of these automatically;
+//! [`FastembedEmbedder`] applies its spec's prefixes (skipping empty ones).
+//! [`PREFIX_CONVENTION`] records the nomic default specifically.
 //!
 //! ## Normalization
 //!
@@ -187,10 +187,9 @@ impl FastembedEmbedder {
         })
     }
 
-    /// Embeds a batch of already-prefixed document strings (the
-    /// `"search_document: "` prefix must already be applied) and validates the
-    /// output. Shared by [`Embedder::embed_documents`] and
-    /// [`Embedder::embed_documents_owned`].
+    /// Embeds a batch of already-prefixed document strings (the model's document
+    /// prefix must already be applied) and validates the output. Shared by
+    /// [`Embedder::embed_documents`] and [`Embedder::embed_documents_owned`].
     fn embed_prefixed_documents(&self, prefixed: Vec<String>) -> Result<Vec<Vec<f32>>, LensError> {
         let prefixed_refs: Vec<&str> = prefixed.iter().map(String::as_str).collect();
         let result = self
