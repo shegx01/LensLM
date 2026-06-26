@@ -60,6 +60,10 @@ fn main() {
             commands::system::install_embedding_model,
             commands::system::download_tts_engine,
             commands::system::kokoro_downloaded,
+            commands::models::list_models,
+            commands::models::list_provider_models,
+            commands::models::list_ollama_models,
+            commands::models::refresh_models,
             // Dev-only streaming demonstrator; absent from the release surface.
             #[cfg(debug_assertions)]
             commands::system::stream_demo,

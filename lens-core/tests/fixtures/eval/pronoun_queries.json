@@ -1,0 +1,17 @@
+[
+  {
+    "query": "Why does the Antikythera mechanism's prediction accelerate and decelerate over the lunar month?",
+    "gold_chunk_ids": ["4c41e2e0032a0a69bd718297fc51ccd361a9f9a5160c99911b13e712da526c28"]
+  },
+  {
+    "query": "Why is the Antikythera mechanism called the first analog computer?",
+    "gold_chunk_ids": ["c7090985a5dda5716280a11fbd025d10ccb7e1b888b61eabf24f3133810dd031"]
+  },
+  {
+    "query": "Where was the Antikythera mechanism discovered?",
+    "gold_chunk_ids": [
+      "74694b888d28fabdc5acf4ee56aa0c1d56d69158f3ccda345090102d829985e1",
+      "5f29a8a213986744dad7c23f2ad61b32fba930eae6c180b8ab2e85c9dc6e6380"
+    ]
+  }
+]

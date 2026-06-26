@@ -87,6 +87,10 @@ pub(crate) mod kind {
     pub const PARENT: &str = "parent";
     /// A level-1 child chunk.
     pub const CHILD: &str = "child";
+    /// A level-2 doc-summary RAPTOR node (`parent_id = NULL`, `source_id` set),
+    /// emitted by the M4 Phase-3 enrichment pass. Consumed by the enrichment
+    /// worker (Step 4/5); declared here as the schema-level kind constant.
+    pub const SUMMARY: &str = "summary";
 }
 
 /// Soft upper bound for child-chunk token span (target = 128, tolerance = 1).

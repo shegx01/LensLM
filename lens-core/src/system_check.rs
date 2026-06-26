@@ -173,6 +173,34 @@ pub async fn detect_llm(base_url: &str) -> LlmDetection {
     }
 }
 
+/// Lists the LOCALLY-available Ollama models at `base_url` via `GET /api/tags`
+/// (M4 Phase 3, Stage 3 — the per-provider picker for local models).
+///
+/// models.dev only catalogs CLOUD providers; the user's pulled local models are
+/// known only to their running Ollama. This reuses the SAME hardened probe
+/// (`probe_ollama_endpoint`) the system-check + `detect_llm` use, so the picker and
+/// the readiness gate can never drift on how they speak Ollama.
+///
+/// **Graceful by contract:** when Ollama is unreachable (not running, wrong URL,
+/// non-Ollama endpoint) this returns an EMPTY `Vec` — never an `Err`. The picker
+/// surfaces that as a "no local models / Ollama not reachable" state rather than an
+/// error toast (the plan's never-error-toast requirement).
+pub async fn list_ollama_models(base_url: &str) -> Vec<String> {
+    let base_url = base_url.trim_end_matches('/');
+
+    // Scheme allowlist (self-SSRF defense-in-depth), mirroring `detect_llm`.
+    let scheme_ok = base_url.split_once("://").is_some_and(|(scheme, _)| {
+        scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+    });
+    if !scheme_ok {
+        return Vec::new();
+    }
+
+    let client = probe_client();
+    let (_version, models) = probe_ollama_endpoint(&client, base_url).await;
+    models
+}
+
 /// GETs `url` and deserializes a successful (2xx) response as `T`, capping the
 /// buffered body at [`MAX_PROBE_BODY_BYTES`] before parsing. Returns `None` on a
 /// connect/timeout error, a non-2xx status, an over-cap body, or a parse miss.
@@ -273,31 +301,15 @@ struct LlmRuntimeProbe {
     ollama_base_url: String,
 }
 
-/// Builds a short-timeout HTTP client for runtime detection.
-///
-/// Both connect and read timeouts are bounded so a closed port or a black-hole
-/// host fails fast rather than hanging the onboarding screen.
-/// The shared probe-client builder: bounded connect/read timeouts plus SSRF
-/// hardening (never follow a redirect — a malicious / misconfigured endpoint
+/// Builds a short-timeout HTTP client for runtime detection via the one hardened
+/// builder ([`crate::http::hardened_client`]): bounded connect/read timeouts plus
+/// SSRF hardening (never follow a redirect — a malicious / misconfigured endpoint
 /// could 30x a probe toward an internal host; a probe only ever inspects the
-/// directly-addressed service). Centralized so the primary build and its
-/// fallback can never drift apart.
-fn probe_builder() -> reqwest::ClientBuilder {
-    reqwest::Client::builder()
-        .connect_timeout(PROBE_CONNECT_TIMEOUT)
-        .timeout(PROBE_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::none())
-}
-
+/// directly-addressed service). Centralized so the primary build and its fallback
+/// can never drift apart, and so the fallback never degrades to a
+/// redirect-following default.
 fn probe_client() -> reqwest::Client {
-    // The builder only fails if the TLS backend can't initialize. Retry the
-    // identical (timeout + no-redirect) builder once; the final
-    // `unwrap_or_default` is a last-resort guard that can realistically never
-    // run (rustls is pure Rust with no system deps) so a probe degrades to a
-    // clean Fail, never a panic.
-    probe_builder()
-        .build()
-        .unwrap_or_else(|_| probe_builder().build().unwrap_or_default())
+    crate::http::hardened_client(PROBE_CONNECT_TIMEOUT, PROBE_TIMEOUT)
 }
 
 /// Resolves the configured Ollama base URL, defaulting to localhost.
@@ -330,12 +342,33 @@ fn provider_base_url(config: &AppConfig, provider: &str) -> Option<String> {
         .map(|m| m.base_url.trim_end_matches('/').to_string())
 }
 
-/// Returns `true` when `config.models` carries a usable cloud LLM entry: an
-/// `openai-compatible` provider with a non-empty `api_key` AND `model`. This is
-/// the cloud arm of the LLM-runtime gate (the local arm is runtime detection).
+/// Canonical cloud LLM provider ids (real models.dev keys) plus the legacy/custom
+/// `openai-compatible` endpoint id. Used by [`has_cloud_llm`] to recognize a
+/// configured cloud provider regardless of which first-class card the user picked.
+const CLOUD_LLM_PROVIDERS: &[&str] = &[
+    "openai",
+    "anthropic",
+    "google",
+    "zai",
+    "glm",
+    "groq",
+    "deepseek",
+    "xai",
+    "cohere",
+    "ollama-cloud",
+    "openai-compatible",
+];
+
+/// Returns `true` when `config.models` carries a usable cloud LLM entry: a
+/// recognized cloud provider (a real models.dev id `openai`/`anthropic`/`google`/
+/// `zai`, or a custom `openai-compatible` endpoint) with a non-empty `api_key` AND
+/// `model`. This is the cloud arm of the LLM-runtime gate (the local arm is
+/// runtime detection).
 fn has_cloud_llm(config: &AppConfig) -> bool {
     config.models.iter().any(|m| {
-        m.provider.eq_ignore_ascii_case("openai-compatible")
+        CLOUD_LLM_PROVIDERS
+            .iter()
+            .any(|p| m.provider.eq_ignore_ascii_case(p))
             && !m.api_key.is_empty()
             && !m.model.is_empty()
     })
@@ -385,29 +418,22 @@ async fn probe_llm_runtime(config: &AppConfig) -> LlmRuntimeProbe {
     let ollama_up = ollama_version.is_some();
     let cloud_ok = has_cloud_llm(config);
 
-    let result = match (ollama_version, lmstudio_up, cloud_ok) {
-        (Some(version), _, _) => CheckResult {
+    let result = match (ollama_up, lmstudio_up, cloud_ok) {
+        (true, _, _) | (_, true, _) => CheckResult {
             id: CheckId::LlmRuntime,
             label: "LLM runtime".to_string(),
             status: CheckStatus::Pass,
-            detail: format!("Ollama {version} detected"),
+            detail: "Configure your preferred LLM".to_string(),
             action: Some(CheckAction::Configure),
         },
-        (None, true, _) => CheckResult {
-            id: CheckId::LlmRuntime,
-            label: "LLM runtime".to_string(),
-            status: CheckStatus::Pass,
-            detail: "LM Studio detected".to_string(),
-            action: Some(CheckAction::Configure),
-        },
-        (None, false, true) => CheckResult {
+        (false, false, true) => CheckResult {
             id: CheckId::LlmRuntime,
             label: "LLM runtime".to_string(),
             status: CheckStatus::Pass,
             detail: "Cloud provider configured".to_string(),
             action: Some(CheckAction::Configure),
         },
-        (None, false, false) => CheckResult {
+        (false, false, false) => CheckResult {
             id: CheckId::LlmRuntime,
             label: "LLM runtime".to_string(),
             status: CheckStatus::Fail,
@@ -634,7 +660,7 @@ mod tests {
 
         assert_eq!(probe.result.status, CheckStatus::Pass);
         assert!(!probe.ollama_up);
-        assert_eq!(probe.result.detail, "LM Studio detected");
+        assert_eq!(probe.result.detail, "Configure your preferred LLM");
         assert_eq!(probe.result.action, Some(CheckAction::Configure));
     }
 
@@ -654,7 +680,7 @@ mod tests {
 
         assert_eq!(probe.result.status, CheckStatus::Pass);
         assert!(probe.ollama_up);
-        assert_eq!(probe.result.detail, "Ollama 0.3.2 detected");
+        assert_eq!(probe.result.detail, "Configure your preferred LLM");
     }
 
     #[tokio::test]
@@ -713,6 +739,27 @@ mod tests {
         // Both present ⇒ usable.
         config.models[0].model = "gpt-4o".to_string();
         assert!(has_cloud_llm(&config));
+    }
+
+    #[test]
+    fn has_cloud_llm_recognizes_first_class_cloud_providers() {
+        // Fix #1: a first-class cloud entry now carries its REAL provider id, not a
+        // blanket 'openai-compatible'. The LLM-runtime cloud arm must still
+        // recognize it (else a configured Anthropic/Google cloud provider would
+        // fail the readiness gate).
+        for provider in ["anthropic", "google", "openai", "zai"] {
+            let mut config = AppConfig::default();
+            config.models.push(ModelConfig {
+                provider: provider.to_string(),
+                model: "some-model".to_string(),
+                api_key: "k".to_string(),
+                ..ModelConfig::default()
+            });
+            assert!(
+                has_cloud_llm(&config),
+                "{provider} cloud entry must be recognized"
+            );
+        }
     }
 
     #[test]
@@ -1189,6 +1236,62 @@ mod tests {
         assert!(!result.reachable);
         assert_eq!(result.version, None);
         assert!(result.models.is_empty());
+    }
+
+    // --- list_ollama_models tests (Stage 3 — live local picker) ------------
+
+    #[tokio::test]
+    async fn list_ollama_models_returns_pulled_models() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/version"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "version": "0.4.1"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [
+                    { "name": "qwen2.5-coder:latest" },
+                    { "name": "qwen2.5:7b" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let models = list_ollama_models(&server.uri()).await;
+        assert_eq!(models, vec!["qwen2.5-coder:latest", "qwen2.5:7b"]);
+    }
+
+    #[tokio::test]
+    async fn list_ollama_models_empty_when_unreachable() {
+        // Ollama not running (always-refused port) ⇒ empty list, NEVER an error.
+        let models = list_ollama_models("http://127.0.0.1:1").await;
+        assert!(models.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_ollama_models_empty_for_non_http_scheme() {
+        // A non-http(s) scheme short-circuits to empty (no probe), no panic/error.
+        let models = list_ollama_models("file:///etc/passwd").await;
+        assert!(models.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_ollama_models_empty_when_not_ollama_endpoint() {
+        // An endpoint with no /api/version (not Ollama) ⇒ empty list, never errors.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{ "id": "gpt-4o" }]
+            })))
+            .mount(&server)
+            .await;
+        let models = list_ollama_models(&server.uri()).await;
+        assert!(models.is_empty(), "no /api/version ⇒ Ollama absent ⇒ empty");
     }
 
     /// Snapshot the exact serde wire-format of `LlmDetection`. Locks the FROZEN

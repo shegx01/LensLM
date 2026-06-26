@@ -68,6 +68,8 @@ function makeSource(overrides?: Partial<Source>): Source {
     token_count: 512,
     content_hash: 'abc123',
     trashed_at: null,
+    enrichment_status: null,
+    enrichment_meta: null,
     ...overrides
   };
 }

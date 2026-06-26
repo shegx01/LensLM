@@ -1,8 +1,8 @@
 import { mockIPC, clearMocks } from '@tauri-apps/api/mocks';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { saveLlmProvider } from './llm-config.js';
+import { saveLlmProvider, saveEnrichmentPrefs } from './llm-config.js';
 import type { AppConfig } from '$lib/theme/types.js';
-import { baseAppConfig } from '$lib/test-fixtures.js';
+import { baseAppConfig, fullAppConfig } from '$lib/test-fixtures.js';
 
 // A base AppConfig carrying an EXISTING ollama model entry so we can assert the
 // upsert REPLACES it (rather than appending a duplicate).
@@ -87,5 +87,66 @@ describe('saveLlmProvider (upsert into models[])', () => {
 
     const w = written as unknown as AppConfig;
     expect(w.models[0].context).toBe(32768);
+  });
+});
+
+describe('saveEnrichmentPrefs (RMW into enrichment)', () => {
+  it('writes the enrichment section while PRESERVING every other field', async () => {
+    // Start from a fully-populated config so we can assert nothing else is lost.
+    const stored = fullAppConfig();
+    let written: AppConfig | null = null;
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return stored;
+      if (cmd === 'set_config') {
+        written = (args as { config: AppConfig }).config;
+        return undefined;
+      }
+    });
+
+    await saveEnrichmentPrefs({
+      enabled: true,
+      coref_strategy: 'llm_inline',
+      cloud_consent: false
+    });
+
+    expect(written).not.toBeNull();
+    const w = written as unknown as AppConfig;
+    // The enrichment section was written.
+    expect(w.enrichment).toEqual({
+      enabled: true,
+      coref_strategy: 'llm_inline',
+      cloud_consent: false
+    });
+    // Every other field round-tripped verbatim.
+    expect(w.models).toEqual(stored.models);
+    expect(w.endpoints).toEqual(stored.endpoints);
+    expect(w.voices).toEqual(stored.voices);
+    expect(w.tts).toEqual(stored.tts);
+    expect(w.paths).toEqual(stored.paths);
+    expect(w.theme).toBe(stored.theme);
+    expect(w.accent).toBe(stored.accent);
+    expect(w.onboarding_complete).toBe(stored.onboarding_complete);
+  });
+
+  it('persists cloud_consent and the llm_inline coref value', async () => {
+    const stored = baseAppConfig();
+    let written: AppConfig | null = null;
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return stored;
+      if (cmd === 'set_config') {
+        written = (args as { config: AppConfig }).config;
+        return undefined;
+      }
+    });
+
+    await saveEnrichmentPrefs({
+      enabled: true,
+      coref_strategy: 'llm_inline',
+      cloud_consent: true
+    });
+
+    const w = written as unknown as AppConfig;
+    expect(w.enrichment.cloud_consent).toBe(true);
+    expect(w.enrichment.coref_strategy).toBe('llm_inline');
   });
 });

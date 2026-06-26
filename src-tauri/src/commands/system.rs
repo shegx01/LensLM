@@ -356,8 +356,8 @@ mod tests {
         let status = health_check(engine).await.unwrap();
         assert!(status.db_ok);
         // All migrations are recorded: 0001_init, 0002_notebook_personalize,
-        // 0003_source_soft_delete, 0004_source_anchor.
-        assert_eq!(status.migration_count, 4);
+        // 0003_source_soft_delete, 0004_source_anchor, 0005_enrichment.
+        assert_eq!(status.migration_count, 5);
     }
 
     #[tokio::test]

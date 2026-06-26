@@ -54,6 +54,25 @@ reqwest = { version = "=0.13.4", default-features = false, features = [
 ] }
 # Stream combinators (`StreamExt::next`) for consuming `reqwest`'s byte stream.
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+# Gunzip the committed `bundled-catalog.json.gz` offline-floor catalog in
+# `model_catalog::ModelCatalog::bundled()`. flate2 is ALREADY in the lock tree
+# (transitive via fastembed/lancedb), so this pulls NO new external crate — it
+# just makes the already-compiled crate a direct dependency. Pinned to that
+# resolved version so no second copy is added. MIT OR Apache-2.0 (deny.toml).
+flate2 = "=1.1.9"
+
+# --- M4 Phase 3 (Stage 2): unified LLM client behind the `LlmProvider` trait ---
+# `genai` is the multi-provider LLM client (Anthropic/OpenAI/Gemini/Ollama/GLM/
+# Ollama-Cloud/LM Studio) that replaces the three hand-rolled HTTP backends.
+# Pinned to the stable 0.6.x line; 0.6.5 depends on `reqwest ^0.13` — the SAME
+# major lens-core already pins (=0.13.4), so it DEDUPES (verify: `cargo tree -d
+# -p reqwest`). `default-features = false` + `rustls-tls` keeps us on the
+# pure-Rust rustls stack (no OpenSSL/native-tls), matching the system-check probe
+# client. We inject our hardened reqwest client via `Client::builder().with_reqwest`
+# (SSRF no-redirect + bounded timeouts). MIT OR Apache-2.0 — both in deny.toml.
+genai = { version = "=0.6.5", default-features = false, features = ["rustls-tls"] }
+
 # SHA256 integrity verification of the downloaded Kokoro model. Pinned to the
 # version already resolved in the lock tree (transitive) so no new copy is added.
 sha2 = "=0.10.9"

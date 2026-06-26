@@ -181,6 +181,71 @@ impl FromStr for SourceStatus {
     }
 }
 
+/// The per-source enrichment lifecycle, persisted in `sources.enrichment_status`
+/// as one of the literal strings below. SEPARATE from [`SourceStatus`] (lock #2
+/// of the M4 Phase-3 plan): "searchable" (the `SourceStatus`) stays orthogonal to
+/// "enriched", so adding enrichment never touches the compile-locked SourceStatus
+/// crash-recovery invariant.
+///
+/// `NULL` in the column (pre-Phase-3 rows, or a freshly-ingested source before the
+/// worker touches it) is read as [`None`](EnrichmentStatus::None) by convention.
+/// The string literals are the persisted wire format and MUST NOT change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnrichmentStatus {
+    /// Not enriched (and not queued). Equivalent to a NULL column value.
+    None,
+    /// Queued for the background enrichment worker (or awaiting a reachable
+    /// provider). Eligible for the startup/rescan queue-rebuild.
+    Pending,
+    /// The worker is actively enriching this source. TRANSIENT — reset to
+    /// [`Pending`](EnrichmentStatus::Pending) on crash recovery (a process that
+    /// died mid-enrichment left no task to advance it). Distinct from the
+    /// `SourceStatus` transient reset, which it never collides with.
+    Enriching,
+    /// Enrichment completed (structural map + contextual `embedding_text` +
+    /// summary node + re-embed flip all applied).
+    Enriched,
+    /// Enrichment failed (LLM unreachable mid-run, budget overspend, malformed
+    /// output). Raw vectors are untouched; eligible for re-enqueue.
+    Failed,
+    /// The structural-map pass was deliberately skipped (non-prose kind); a
+    /// lightweight context-prefix `embedding_text` may still be applied.
+    Skipped,
+}
+
+impl EnrichmentStatus {
+    /// The EXACT `sources.enrichment_status` string stored in SQLite. Inverse of
+    /// [`from_db`](Self::from_db). These strings are the persisted wire format.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Pending => "pending",
+            Self::Enriching => "enriching",
+            Self::Enriched => "enriched",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+        }
+    }
+
+    /// Parses a stored column value into the enum. A NULL column (`None`) or the
+    /// literal `"none"` both map to [`None`](EnrichmentStatus::None); an
+    /// out-of-vocabulary value is a fail-loud invariant breach.
+    pub fn from_db(value: Option<&str>) -> Result<Self, LensError> {
+        match value {
+            None | Some("none") => Ok(Self::None),
+            Some("pending") => Ok(Self::Pending),
+            Some("enriching") => Ok(Self::Enriching),
+            Some("enriched") => Ok(Self::Enriched),
+            Some("failed") => Ok(Self::Failed),
+            Some("skipped") => Ok(Self::Skipped),
+            Some(other) => Err(LensError::Validation(format!(
+                "unknown enrichment status: {other:?}; expected one of \"none\", \"pending\", \
+                 \"enriching\", \"enriched\", \"failed\", \"skipped\""
+            ))),
+        }
+    }
+}
+
 /// A source row, returned across the IPC boundary.
 ///
 /// In M1 sources are inert *records* only: the onboarding "Add sources" step
@@ -213,6 +278,65 @@ pub struct Source {
     pub created_at: String,
     /// RFC3339 soft-delete timestamp, or `None` if live.
     pub trashed_at: Option<String>,
+    /// Enrichment lifecycle, SEPARATE from `status` (SourceStatus):
+    /// `none|pending|enriching|enriched|failed|skipped`. `None` (NULL) ≡ `none`
+    /// for pre-Phase-3 rows; populated by the M4 Phase-3 enrichment worker.
+    pub enrichment_status: Option<String>,
+    /// JSON enrichment metadata (composite cache key + budget/skip reason),
+    /// written by the enrichment worker. `None` until the source is enriched.
+    pub enrichment_meta: Option<String>,
+}
+
+/// A chunk row projected for the enrichment pass (M4 Phase-3 Step 4).
+///
+/// A read-only view of the columns the structural-map + `embedding_text`
+/// composition need; the canonical `text` here is the IMMUTABLE citation text
+/// (enrichment writes only `embedding_text` / `enrichment`, never `text`).
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct EnrichmentChunk {
+    /// Chunk primary key.
+    pub id: String,
+    /// `None` for level-0 parents; `Some(parent.id)` for children.
+    pub parent_id: Option<String>,
+    /// `"parent"` (level 0) / `"child"` (level 1).
+    pub kind: String,
+    /// `0` parent, `1` child.
+    pub level: i32,
+    /// Heading-trail context for the prefix.
+    pub section_path: String,
+    /// Canonical, immutable citation text (the body of `embedding_text`).
+    pub text: String,
+    /// Leading block type (`paragraph`/`heading`/`code`/`table`/…) for the
+    /// kind-awareness gate (sub-decision b). `None` when unknown.
+    pub block_type: Option<String>,
+}
+
+/// A single chunk's enrichment write (M4 Phase-3 Step 4): the composed
+/// `embedding_text` and, for a representative parent row, the structural-map
+/// `enrichment` JSON. Applied via [`NotebookRepo::write_chunk_enrichment`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkEnrichmentUpdate {
+    /// The chunk to update.
+    pub chunk_id: String,
+    /// The composed contextual `embedding_text` (prefix + canonical body).
+    pub embedding_text: String,
+    /// `Some(map_json)` to also write the per-doc structural map onto this row
+    /// (parent rows only); `None` leaves `chunks.enrichment` unchanged.
+    pub enrichment_json: Option<String>,
+}
+
+/// A chunk row projected for the Step-5 re-embed flip: the id, level, and the
+/// text the re-embed embeds — `COALESCE(embedding_text, text)` so enriched chunks
+/// embed their contextual text and any chunk the worker did not touch (NULL
+/// `embedding_text`) falls back to the canonical body.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct ReembedChunk {
+    /// Chunk primary key (becomes the Lance `chunk_id`).
+    pub id: String,
+    /// Chunk level (`0` parent, `1` child, `2` summary).
+    pub level: i32,
+    /// `COALESCE(embedding_text, text)` — the text to embed.
+    pub embed_text: String,
 }
 
 /// A notebook row, returned across the IPC boundary.
@@ -536,6 +660,8 @@ impl<'a> NotebookRepo<'a> {
             content_hash: None,
             created_at: now,
             trashed_at: None,
+            enrichment_status: None,
+            enrichment_meta: None,
         })
     }
 
@@ -617,6 +743,8 @@ impl<'a> NotebookRepo<'a> {
             content_hash: None,
             created_at: now,
             trashed_at: None,
+            enrichment_status: None,
+            enrichment_meta: None,
         })
     }
 
@@ -718,6 +846,8 @@ impl<'a> NotebookRepo<'a> {
             content_hash: None,
             created_at: now,
             trashed_at: None,
+            enrichment_status: None,
+            enrichment_meta: None,
         })
     }
 
@@ -760,6 +890,8 @@ impl<'a> NotebookRepo<'a> {
             content_hash: None,
             created_at: now,
             trashed_at: None,
+            enrichment_status: None,
+            enrichment_meta: None,
         })
     }
 
@@ -850,6 +982,169 @@ impl<'a> NotebookRepo<'a> {
         Ok(())
     }
 
+    /// Sets a source's enrichment lifecycle status (`sources.enrichment_status`),
+    /// SEPARATE from [`update_source_status`](Self::update_source_status) which
+    /// writes the orthogonal `sources.status` (`SourceStatus`). Bind via
+    /// [`EnrichmentStatus::as_str`].
+    ///
+    /// A missing row is a benign no-op (`Ok(())`), NOT an error: the enrichment
+    /// worker updates status at points where a concurrent `purge_source` may have
+    /// already deleted the row, so the source being gone is the correct outcome.
+    pub async fn update_enrichment_status(
+        &self,
+        id: &str,
+        status: EnrichmentStatus,
+    ) -> Result<(), LensError> {
+        // rows_affected() == 0 ⇒ the source was purged mid-enrichment; treat as a
+        // successful no-op rather than a misleading validation error.
+        sqlx::query("UPDATE sources SET enrichment_status = ? WHERE id = ?")
+            .bind(status.as_str())
+            .bind(id)
+            .execute(self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Sets a source's `enrichment_status` AND `enrichment_meta` JSON in one
+    /// statement (M4 Phase-3 Step 4). The meta JSON carries the composite cache
+    /// key + budget/skip reason (AC9/AC11).
+    ///
+    /// A missing row is a benign no-op (`Ok(())`), NOT an error: the enrichment
+    /// worker updates meta at points where a concurrent `purge_source` may have
+    /// already deleted the row, so the source being gone is the correct outcome.
+    pub async fn update_enrichment_status_and_meta(
+        &self,
+        id: &str,
+        status: EnrichmentStatus,
+        meta_json: &str,
+    ) -> Result<(), LensError> {
+        // rows_affected() == 0 ⇒ the source was purged mid-enrichment; treat as a
+        // successful no-op rather than a misleading validation error.
+        sqlx::query("UPDATE sources SET enrichment_status = ?, enrichment_meta = ? WHERE id = ?")
+            .bind(status.as_str())
+            .bind(meta_json)
+            .bind(id)
+            .execute(self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Reads the chunks of a source needed for the enrichment pass (M4 Phase-3
+    /// Step 4): id, parent_id, kind, level, section_path, the canonical text, and
+    /// block_type. Ordered parents-first then by `token_start` so the worker maps
+    /// over level-0 parents in document order. The canonical `text` is read but
+    /// NEVER mutated by enrichment (only `enrichment`/`embedding_text` are written).
+    pub async fn list_chunks_for_enrichment(
+        &self,
+        source_id: &str,
+    ) -> Result<Vec<EnrichmentChunk>, LensError> {
+        let rows = sqlx::query_as::<_, EnrichmentChunk>(
+            "SELECT id, parent_id, kind, level, section_path, text, block_type \
+             FROM chunks WHERE source_id = ? ORDER BY level ASC, token_start ASC",
+        )
+        .bind(source_id)
+        .fetch_all(self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Writes the per-chunk `embedding_text` (and, for the representative parent
+    /// row, the structural-map `enrichment` JSON) for a source (M4 Phase-3 Step 4).
+    ///
+    /// Each `(chunk_id, embedding_text, enrichment_json)` is applied as a single
+    /// `UPDATE … WHERE id = ?` inside ONE transaction (Decision D); the canonical
+    /// `chunks.text` column is untouched. `enrichment_json = None` leaves that
+    /// column as-is for child rows (the map attaches to parent rows only, AC4).
+    pub async fn write_chunk_enrichment(
+        &self,
+        updates: &[ChunkEnrichmentUpdate],
+    ) -> Result<(), LensError> {
+        let mut tx = self.pool.begin().await?;
+        for u in updates {
+            match &u.enrichment_json {
+                Some(json) => {
+                    sqlx::query(
+                        "UPDATE chunks SET embedding_text = ?, enrichment = ? WHERE id = ?",
+                    )
+                    .bind(&u.embedding_text)
+                    .bind(json)
+                    .bind(&u.chunk_id)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                None => {
+                    sqlx::query("UPDATE chunks SET embedding_text = ? WHERE id = ?")
+                        .bind(&u.embedding_text)
+                        .bind(&u.chunk_id)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Reads every chunk of a source projected for the Step-5 re-embed flip:
+    /// `(id, level, COALESCE(embedding_text, text))`. Includes the level-2 summary
+    /// RAPTOR node if one was inserted. Ordered by level then `token_start` so the
+    /// re-embed walks a stable order (summary nodes — `token_start IS NULL` — sort
+    /// last within their level, which is harmless).
+    pub async fn list_chunks_for_reembed(
+        &self,
+        source_id: &str,
+    ) -> Result<Vec<ReembedChunk>, LensError> {
+        let rows = sqlx::query_as::<_, ReembedChunk>(
+            "SELECT id, level, COALESCE(embedding_text, text) AS embed_text \
+             FROM chunks WHERE source_id = ? ORDER BY level ASC, token_start ASC",
+        )
+        .bind(source_id)
+        .fetch_all(self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Inserts the doc-summary RAPTOR node (AC6): a `chunks` row with
+    /// `kind="summary"`, `level=2`, `parent_id=NULL`, `source_id` SET (so
+    /// `drop_source`/purge reclaims its vector), `section_path=""`,
+    /// `char_start=char_end=0`, `block_type=NULL`, `enrichment=NULL`,
+    /// `embedding_text=NULL` (the summary embeds its `text` directly). A SINGLE
+    /// INSERT — NOT the parent-first `insert_chunk_batch` path. Returns the new
+    /// chunk id. If a summary node already exists for the source it is deleted
+    /// first so a re-run does not accumulate duplicates.
+    pub async fn insert_summary_chunk(
+        &self,
+        source_id: &str,
+        text: &str,
+    ) -> Result<String, LensError> {
+        let mut tx = self.pool.begin().await?;
+        // Idempotency: a re-run (e.g. after an `enriching→pending` reset) must not
+        // stack a second summary row. Drop any prior summary node for the source.
+        sqlx::query("DELETE FROM chunks WHERE source_id = ? AND kind = ?")
+            .bind(source_id)
+            .bind(crate::chunk::kind::SUMMARY)
+            .execute(&mut *tx)
+            .await?;
+        let id = Uuid::now_v7().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO chunks \
+                 (id, source_id, parent_id, kind, level, section_path, text, \
+                  token_start, token_end, page, char_start, char_end, block_type, \
+                  enrichment, embedding_text, source_anchor, created_at) \
+             VALUES (?, ?, NULL, ?, 2, '', ?, NULL, NULL, NULL, 0, 0, NULL, NULL, NULL, NULL, ?)",
+        )
+        .bind(&id)
+        .bind(source_id)
+        .bind(crate::chunk::kind::SUMMARY)
+        .bind(text)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(id)
+    }
+
     /// Populates a source's post-ingest metadata (`token_count`,
     /// `content_hash`). Errors if no row matches.
     pub async fn update_source_metadata(
@@ -875,7 +1170,7 @@ impl<'a> NotebookRepo<'a> {
     pub async fn get_source(&self, id: &str) -> Result<Option<Source>, LensError> {
         let row = sqlx::query_as::<_, Source>(
             "SELECT id, notebook_id, kind, title, status, locator, selected, token_count, \
-             content_hash, created_at, trashed_at \
+             content_hash, created_at, trashed_at, enrichment_status, enrichment_meta \
              FROM sources WHERE id = ?",
         )
         .bind(id)
@@ -888,7 +1183,7 @@ impl<'a> NotebookRepo<'a> {
     pub async fn list_sources(&self, notebook_id: &NotebookId) -> Result<Vec<Source>, LensError> {
         let rows = sqlx::query_as::<_, Source>(
             "SELECT id, notebook_id, kind, title, status, locator, selected, token_count, \
-             content_hash, created_at, trashed_at \
+             content_hash, created_at, trashed_at, enrichment_status, enrichment_meta \
              FROM sources WHERE notebook_id = ? AND trashed_at IS NULL ORDER BY created_at DESC",
         )
         .bind(notebook_id)
@@ -1027,6 +1322,51 @@ mod tests {
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].source_count, 3);
         assert_eq!(summaries[0].notebook.id, nb.id);
+    }
+
+    #[tokio::test]
+    async fn update_enrichment_status_missing_source_is_noop() {
+        // A concurrent purge_source can delete the row between the worker's
+        // enrichment steps; updating a gone source must be a benign Ok no-op, NOT
+        // a misleading validation error.
+        let pool = test_pool().await;
+        let repo = NotebookRepo::new(&pool);
+
+        repo.update_enrichment_status("does-not-exist", EnrichmentStatus::Enriching)
+            .await
+            .expect("status update on a missing source is a no-op");
+        repo.update_enrichment_status_and_meta("does-not-exist", EnrichmentStatus::Enriched, "{}")
+            .await
+            .expect("status+meta update on a missing source is a no-op");
+
+        // No row was created by the no-op updates.
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sources")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "no-op update must not insert a row");
+    }
+
+    #[tokio::test]
+    async fn update_enrichment_status_persists_for_real_source() {
+        let pool = test_pool().await;
+        let repo = NotebookRepo::new(&pool);
+        let nb = repo.create("Notebook", None, None).await.unwrap();
+        let src = repo
+            .add_source(&nb.id, "file.pdf", "/abs/file.pdf")
+            .await
+            .unwrap();
+
+        repo.update_enrichment_status(&src.id, EnrichmentStatus::Skipped)
+            .await
+            .unwrap();
+        let status: Option<String> =
+            sqlx::query_scalar("SELECT enrichment_status FROM sources WHERE id = ?")
+                .bind(&src.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status.as_deref(), Some("skipped"));
     }
 
     #[tokio::test]

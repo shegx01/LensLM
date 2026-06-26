@@ -1,13 +1,35 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { invoke, isTauri } from '@tauri-apps/api/core';
+  import { Combobox } from 'bits-ui';
   import { Input } from '$lib/components/ui/input/index.js';
   import { Button } from '$lib/components/ui/button/index.js';
   import LoaderCircle from '@lucide/svelte/icons/loader-circle';
+  import ChevronsUpDown from '@lucide/svelte/icons/chevrons-up-down';
+  import Check from '@lucide/svelte/icons/check';
   import { cn } from '$lib/utils.js';
   import { detectLlm } from '$lib/onboarding/system-check.js';
-  import { saveLlmProvider, type LlmProviderTab } from '$lib/onboarding/llm-config.js';
-  import type { AppConfig } from '$lib/theme/types.js';
+  import {
+    saveLlmProvider,
+    saveEnrichmentPrefs,
+    type LlmProviderTab
+  } from '$lib/onboarding/llm-config.js';
+  import {
+    CLOUD_PROVIDERS,
+    CLOUD_PROVIDER_IDS,
+    findCloudProvider,
+    defaultModelFor,
+    type CloudProvider
+  } from '$lib/onboarding/cloud-providers.js';
+  import type { AppConfig, CorefStrategy, LlmRouting, TaskModel } from '$lib/theme/types.js';
+  import {
+    listCloudModelOptions,
+    listOllamaModelOptions,
+    refreshCatalog,
+    formatCompact,
+    formatUsd,
+    type ModelOption
+  } from '$lib/models/catalog.js';
   import { SELECT_CLASS } from './styles.js';
 
   // Cloud config has no Context Window picker (it's Local-only), so cloud saves
@@ -32,18 +54,45 @@
   // Detected models list (populated by Auto-detect)
   let detectedModels = $state<string[]>([]);
   let detectStatus = $state<'idle' | 'detecting' | 'found' | 'not-found'>('idle');
-  let detectVersion = $state<string | null>(null);
   let detectError = $state<string | null>(null);
   let testStatus = $state<'idle' | 'testing' | 'success' | 'fail'>('idle');
   let testMessage = $state<string | null>(null);
 
   // --- Cloud API tab fields ---
-  let cloudProvider = $state<'openai' | 'anthropic' | 'google'>('openai');
-  let cloudBaseUrl = $state('https://api.openai.com/v1');
+  // The canonical provider id (= models.dev catalog key for first-class providers).
+  // Drives the searchable combobox; defaults to the first surfaced provider.
+  let cloudProvider = $state<string>(CLOUD_PROVIDERS[0].id);
+  // Type-to-filter query for the provider combobox (Combobox.Input value).
+  let providerQuery = $state('');
+  // Custom OpenAI-compatible endpoints take a user base_url; native providers
+  // leave this empty (the backend resolves genai's canonical endpoint).
+  let cloudBaseUrl = $state('');
   let cloudApiKey = $state('');
-  // User-editable model id (seeded from the provider default, like the Local
-  // tab's model field). 'gpt-4o' matches the initial 'openai' provider.
+  // User-editable model id. Seeded from the provider default as an offline floor,
+  // but the SMART DEFAULT (loadCloudModels) overrides it with the newest
+  // text-capable catalog model when the user hasn't explicitly picked one.
+  // 'gpt-4o' matches the initial 'openai' provider.
   let cloudModel = $state('gpt-4o');
+  // Whether the user has EXPLICITLY chosen a cloud model (via the picker) or
+  // restored a saved one. While false, the smart default re-resolves to the
+  // newest text-capable model on every (re)load — so a background catalog
+  // refresh converges the default to the live newest model. Once the user picks
+  // (or a saved model is restored), their choice is preserved across reloads.
+  let cloudModelPicked = $state(false);
+
+  // --- Capability-aware model pickers (M4 Phase 3, Stage 3) ---
+  // The CLOUD catalog options for the selected provider (models.dev). Loaded on
+  // expand and whenever the provider card changes. Resilient by contract: any
+  // throw / non-Tauri / empty map leaves this `[]`, and we fall back to a single
+  // default-model option so the picker still works offline (and legacy tests pass).
+  let cloudModelOptions = $state<ModelOption[]>([]);
+  // The locally-pulled Ollama models at the current endpoint (info: null). Loaded
+  // on expand; surfaces pulled models in the model picker without Auto-detect.
+  let ollamaModelOptions = $state<ModelOption[]>([]);
+  // Whether a live catalog refresh (models.dev) is in flight. Drives the subtle
+  // "updating…" affordance under the cloud picker. NEVER blocks selection: the
+  // already-loaded options stay rendered + selectable while this is true.
+  let catalogUpdating = $state(false);
 
   // --- Save state (cloud) ---
   let saving = $state(false);
@@ -62,6 +111,40 @@
   let editingKey = $state(false);
   const hasSavedKey = $derived(cloudProvider === savedProviderId);
 
+  // --- Enrichment preferences (M4 Phase 3) ---
+  // Non-blocking: the toggle defaults to ON for the local tab (provider-driven
+  // default — local Ollama → enrichment on + LlmInline) and OFF for the cloud tab
+  // (cloud is explicit-enable + requires consent). Saving the provider above also
+  // persists these prefs via `saveEnrichmentPrefs` (RMW), so a user who completes
+  // (or skips) the step lands on the conservative Rust-side defaults regardless.
+  let enrichmentEnabled = $state(true);
+  let corefStrategy = $state<CorefStrategy>('llm_inline');
+  // Explicit, separate consent for sending document text to a CLOUD LLM. Shown
+  // only on the Cloud API tab; forced false on the local save path.
+  let cloudConsent = $state(false);
+
+  // --- Routing + per-task overrides (M4 Phase 3, Stage 3) ---
+  // Typed routing policy. 'explicit' pins to the currently-selected provider+model.
+  let routingKind = $state<'cloud_first' | 'local_first' | 'explicit'>('cloud_first');
+  // Coreference-model override (a per-task TaskModel pin). '' = use the configured
+  // model (no override → coref_model: null); a model id sets the pin for the active
+  // tab's provider. (map_model override is out of scope — left undefined on save.)
+  let corefModelId = $state('');
+
+  const ROUTING_OPTIONS = [
+    { value: 'cloud_first' as const, label: 'Cloud-first' },
+    { value: 'local_first' as const, label: 'Local-first' },
+    { value: 'explicit' as const, label: 'Explicit' }
+  ] as const;
+
+  // Coref strategy options. Only the two strategies that actually ship: inline
+  // coref in the enrichment LLM pass, or off. (A `dedicated_model` stub was
+  // removed — it only ever fell back to inline, so surfacing it was a UX lie.)
+  const COREF_OPTIONS = [
+    { value: 'llm_inline' as const, label: 'Inline (recommended)' },
+    { value: 'none' as const, label: 'Off' }
+  ] as const;
+
   const CONTEXT_OPTIONS = [
     { label: '4K', value: 4096, helper: '~3,000 words. For very small models only.' },
     {
@@ -78,50 +161,213 @@
     }
   ] as const;
 
-  // `models` is the card subtitle only — keep it a generic family name (not
-  // specific versions like "GPT-4o") so we don't have to ship a UI update every
-  // time a provider releases a new model. `defaultModel` is the actual id sent
-  // to the API and can be refined independently.
-  const CLOUD_PROVIDERS = [
-    {
-      id: 'openai' as const,
-      name: 'OpenAI',
-      models: 'GPT Models',
-      defaultModel: 'gpt-4o',
-      baseUrl: 'https://api.openai.com/v1'
-    },
-    {
-      id: 'anthropic' as const,
-      name: 'Anthropic',
-      models: 'Claude Models',
-      defaultModel: 'claude-3-5-sonnet-latest',
-      baseUrl: 'https://api.anthropic.com/v1'
-    },
-    {
-      id: 'google' as const,
-      name: 'Google',
-      models: 'Gemini Models',
-      defaultModel: 'gemini-1.5-pro',
-      baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai'
-    }
+  // The provider list is sourced from the single shared CLOUD_PROVIDERS table
+  // (mirrors the backend `adapter_for`/`catalog_key_for` set). The model picker
+  // is catalog-driven, so each entry needs no hand-maintained default-model id;
+  // a per-provider offline floor is derived below.
+  const PROVIDER_GROUPS = [
+    { key: 'popular' as const, label: 'Popular' },
+    { key: 'all' as const, label: 'All' }
   ] as const;
+
+  // Providers filtered by the combobox query (case-insensitive substring on the
+  // display name or id), grouped for the listbox — type-to-filter. The query
+  // mirrors the input text; once a provider is selected the input shows its name,
+  // so a query that exactly equals the current selection's name is treated as "no
+  // filter" (show the full grouped list) rather than narrowing to one row.
+  const filteredProviders = $derived.by(() => {
+    const raw = providerQuery.trim();
+    const q = raw.toLowerCase();
+    const isSelectionEcho = raw !== '' && raw === selectedProvider.name;
+    const matches = (p: CloudProvider) =>
+      q === '' ||
+      isSelectionEcho ||
+      p.name.toLowerCase().includes(q) ||
+      p.id.toLowerCase().includes(q);
+    return PROVIDER_GROUPS.map((g) => ({
+      ...g,
+      items: CLOUD_PROVIDERS.filter((p) => p.group === g.key && matches(p))
+    })).filter((g) => g.items.length > 0);
+  });
 
   const contextHelper = $derived(
     CONTEXT_OPTIONS.find((o) => o.value === contextWindow)?.helper ?? ''
   );
 
-  const selectedProvider = $derived(CLOUD_PROVIDERS.find((p) => p.id === cloudProvider)!);
+  const selectedProvider = $derived(findCloudProvider(cloudProvider) ?? CLOUD_PROVIDERS[0]);
+
+  // Whether the selected provider is the custom OpenAI-compatible escape hatch
+  // (reveals the base-URL field; the model is free-text, no catalog).
+  const isCustomProvider = $derived(selectedProvider.custom === true);
+
+  // The per-provider offline floor for the model id (when the catalog is empty:
+  // offline / non-Tauri / no-catalog provider) is `defaultModelFor` from the shared
+  // cloud-providers table — a catalog-valid recent model per provider so an offline
+  // save passes the backend `validate(provider, model)` gate (fix #3). The SMART
+  // default (loadCloudModels) still overrides it with the newest catalog model.
+
+  // The cloud catalog key for the selected provider. `null` for providers with no
+  // models.dev namespace (Ollama Cloud — user-pulled; the custom endpoint —
+  // arbitrary), which switch the picker to a free-text model input.
+  const cloudCatalogKey = $derived(selectedProvider.catalogKey);
+
+  // The canonical backend provider id for the ACTIVE tab — used for routing pins
+  // and per-task TaskModel overrides. Local → 'ollama'; cloud → the REAL provider
+  // id (= models.dev catalog key) so the Rust factory validates against the right
+  // namespace (NOT a blanket 'openai-compatible', which broke claude-*/gemini-*).
+  const canonicalProviderId = $derived(activeTab === 'local' ? 'ollama' : cloudProvider);
+
+  // The options actually rendered in the cloud model <select>. When the catalog
+  // is empty (offline / non-Tauri / mock returns nothing), fall back to a single
+  // option for the provider default so the picker stays usable and the legacy
+  // cloud Save tests (which expect 'gpt-4o') still pass.
+  const cloudSelectOptions = $derived<ModelOption[]>(
+    cloudModelOptions.length > 0
+      ? cloudModelOptions
+      : [
+          {
+            id: defaultModelFor(cloudProvider),
+            label: defaultModelFor(cloudProvider),
+            info: null
+          }
+        ]
+  );
+
+  // The capability info for the currently-selected cloud model (drives the
+  // thinking toggle + context/cost helper). `null` when the catalog is empty
+  // (offline fallback) or the id isn't in the catalog.
+  const selectedCloudModel = $derived(cloudModelOptions.find((o) => o.id === cloudModel) ?? null);
+
+  // Compact capability/cost helper for the selected cloud model, e.g.
+  // "1.05M Context · ~$5/1M input · ~$25/1M output". Each clause is included only
+  // when its datum is present (no context_limit → no Context clause; no input/
+  // output cost → that cost clause is omitted), and the present clauses are
+  // joined with " · ". Empty string when the model exposes neither.
+  const modelHint = $derived.by(() => {
+    const info = selectedCloudModel?.info;
+    if (!info) return '';
+    const clauses: string[] = [];
+    if (info.context_limit != null) {
+      clauses.push(`${formatCompact(info.context_limit)} Context`);
+    }
+    if (info.cost?.input != null) {
+      clauses.push(`~$${formatUsd(info.cost.input)}/1M input`);
+    }
+    if (info.cost?.output != null) {
+      clauses.push(`~$${formatUsd(info.cost.output)}/1M output`);
+    }
+    return clauses.join(' · ');
+  });
+
+  // The model options offered for the coref-override picker on the active tab.
+  const corefModelOptions = $derived(
+    activeTab === 'local' ? ollamaModelOptions : cloudModelOptions
+  );
+
+  // Loads the cloud catalog (text-capable models only, newest first) for the
+  // selected provider and resolves the selected model. Resilient: any throw /
+  // empty map leaves the options empty so the picker falls back to the seeded
+  // default option offline (and the legacy "gpt-4o" save tests stay green).
+  //
+  // Smart default: when the user hasn't explicitly picked (or restored) a model,
+  // select the FIRST option — the newest text-capable model for the provider —
+  // so the default reflects the live catalog and re-resolves after a background
+  // refresh. When the user HAS picked one, preserve it (keep it if still valid;
+  // only fall back to the seed if it vanished from the catalog). When the
+  // filtered list is empty (offline), keep the seeded default so the field is
+  // never blank.
+  async function loadCloudModels(): Promise<void> {
+    // No catalog namespace (Ollama Cloud / custom endpoint): the model is
+    // free-text — leave options empty and don't clobber a user-entered id.
+    if (cloudCatalogKey === null) {
+      cloudModelOptions = [];
+      if (!cloudModelPicked && !cloudModel.trim()) {
+        cloudModel = defaultModelFor(cloudProvider);
+      }
+      return;
+    }
+    try {
+      const opts = await listCloudModelOptions(cloudCatalogKey);
+      cloudModelOptions = opts.length > 0 ? opts : [];
+    } catch {
+      cloudModelOptions = [];
+    }
+    if (cloudModelOptions.length === 0) {
+      // Offline / empty catalog: fall back to the per-provider seed so the field
+      // is never blank (the picker renders the single seeded fallback option).
+      cloudModel = defaultModelFor(cloudProvider);
+      return;
+    }
+    if (!cloudModelPicked) {
+      // Smart default: newest text-capable model (the list is sorted desc).
+      cloudModel = cloudModelOptions[0].id;
+      return;
+    }
+    // User/saved choice: keep it if still in the catalog, else fall back to seed.
+    if (!cloudModelOptions.some((o) => o.id === cloudModel)) {
+      cloudModel = defaultModelFor(cloudProvider);
+    }
+  }
+
+  // Triggers a LIVE catalog refresh from models.dev, then RE-READS the loaded
+  // catalog so the cloud picker converges to the CURRENT full list (new models
+  // appear, removed ones disappear) — the data-driven contract. Fire-and-forget
+  // from the caller's view: the loaded list is already rendered (loadCloudModels
+  // ran first), so this only ever ADDS freshness, never blocks selection.
+  //
+  // Graceful: refreshCatalog() swallows offline/HTTP errors (resolves false), so
+  // we always re-read whatever the backend now serves — the existing list when
+  // offline, the freshly-fetched one when online. The backend gates the fetch on
+  // staleness, so repeated opens don't trigger a refetch storm. Never throws.
+  async function refreshAndReloadCloud(): Promise<void> {
+    catalogUpdating = true;
+    try {
+      await refreshCatalog();
+      // Re-read regardless of the refresh result: on success the cache now holds
+      // the fresh catalog; on failure we harmlessly re-read the unchanged one.
+      await loadCloudModels();
+    } finally {
+      catalogUpdating = false;
+    }
+  }
+
+  // Loads the live Ollama model list for the current endpoint. Resilient: any
+  // throw leaves the list empty (the free-text fallback then renders).
+  async function loadOllamaModels(): Promise<void> {
+    try {
+      ollamaModelOptions = await listOllamaModelOptions(localEndpoint);
+    } catch {
+      ollamaModelOptions = [];
+    }
+  }
+
+  // The routing payload sent to `saveEnrichmentPrefs`. 'explicit' pins the
+  // currently-selected provider+model for the active tab.
+  function buildRouting(): LlmRouting {
+    if (routingKind === 'explicit') {
+      return {
+        kind: 'explicit',
+        provider: canonicalProviderId,
+        model: activeTab === 'local' ? localModel : cloudModel
+      };
+    }
+    return { kind: routingKind };
+  }
+
+  // The coref override payload. '' clears the override (null); a chosen id pins
+  // it to the active tab's canonical provider.
+  function buildCorefModel(): TaskModel | null {
+    return corefModelId ? { provider: canonicalProviderId, model: corefModelId } : null;
+  }
 
   // Auto-detect: probe the current endpoint and populate the model list.
   async function handleAutoDetect(): Promise<void> {
     detectStatus = 'detecting';
     detectError = null;
-    detectVersion = null;
     try {
       const result = await detectLlm(localEndpoint);
       if (result.reachable) {
         detectStatus = 'found';
-        detectVersion = result.version;
         detectedModels = result.models;
         if (result.models.length > 0 && !result.models.includes(localModel)) {
           localModel = result.models[0];
@@ -148,6 +394,14 @@
         api_key: '',
         context: contextWindow
       });
+      // Local provider never sends text off-machine → consent is irrelevant (false).
+      await saveEnrichmentPrefs({
+        enabled: enrichmentEnabled,
+        coref_strategy: corefStrategy,
+        cloud_consent: false,
+        routing: buildRouting(),
+        coref_model: buildCorefModel()
+      });
       const result = await detectLlm(localEndpoint);
       if (result.reachable) {
         testStatus = 'success';
@@ -168,14 +422,30 @@
     saving = true;
     saveError = null;
     try {
-      const provider = CLOUD_PROVIDERS.find((p) => p.id === cloudProvider)!;
       await saveLlmProvider({
-        provider: 'openai-compatible',
-        base_url: cloudBaseUrl || provider.baseUrl,
-        // User's chosen model id; fall back to the provider default if cleared.
-        model: cloudModel.trim() || provider.defaultModel,
+        // Persist the REAL provider id (= models.dev catalog key) so the Rust
+        // factory validates the model against its OWN catalog namespace — a
+        // blanket 'openai-compatible' validated claude-*/gemini-* against the
+        // OpenAI namespace and silently broke routing (fix #1).
+        provider: cloudProvider,
+        // Native providers persist an EMPTY base_url so the backend uses genai's
+        // canonical endpoint; the custom OpenAI-compatible entry persists the
+        // user-supplied (or seeded) URL.
+        base_url: isCustomProvider ? cloudBaseUrl || selectedProvider.baseUrl : '',
+        // User's chosen model id; fall back to the provider floor if cleared.
+        model: cloudModel.trim() || defaultModelFor(cloudProvider),
         api_key: cloudApiKey,
         context: CLOUD_DEFAULT_CONTEXT
+      });
+      // Cloud enrichment is gated on explicit consent: without it, enrichment
+      // stays OFF so document text is never sent to a cloud LLM (and the Rust
+      // factory rejects a cloud provider without consent regardless).
+      await saveEnrichmentPrefs({
+        enabled: enrichmentEnabled && cloudConsent,
+        coref_strategy: corefStrategy,
+        cloud_consent: cloudConsent,
+        routing: buildRouting(),
+        coref_model: buildCorefModel()
       });
       await oncheck();
       oncollapse();
@@ -186,20 +456,40 @@
     }
   }
 
-  function selectProvider(id: typeof cloudProvider): void {
+  async function selectProvider(id: string): Promise<void> {
     cloudProvider = id;
-    const p = CLOUD_PROVIDERS.find((p) => p.id === id)!;
+    const p = findCloudProvider(id) ?? CLOUD_PROVIDERS[0];
+    // Native providers carry an empty baseUrl (genai resolves the canonical
+    // endpoint); only the custom OpenAI-compatible entry seeds a base URL.
     cloudBaseUrl = p.baseUrl;
-    cloudModel = p.defaultModel;
-    // Switching cards starts clean: clear any typed/edited key. `hasSavedKey`
+    cloudModel = defaultModelFor(id);
+    // Switching providers starts the model selection clean: drop any prior
+    // explicit pick so loadCloudModels re-applies the smart default (newest text
+    // model) for the new provider.
+    cloudModelPicked = false;
+    // Switching providers starts clean: clear any typed/edited key. `hasSavedKey`
     // recomputes from the derived (true only when `id` is the saved provider).
     editingKey = false;
     cloudApiKey = '';
+    // The catalog (and thus the coref-override list) is provider-specific, so a
+    // stale override id may no longer exist — clear it and reload the catalog.
+    corefModelId = '';
+    // Render the loaded list for the new provider immediately, then refresh live
+    // in the background so the switched-to provider also converges to the current
+    // models.dev list. Graceful when offline.
+    await loadCloudModels();
+    void refreshAndReloadCloud();
   }
 
-  const modelOptions = $derived(
-    detectedModels.length > 0 ? detectedModels : localModel ? [localModel] : []
-  );
+  // The local model picker draws from Auto-detect results first, then the live
+  // Ollama list (so pulled models surface without Auto-detect), de-duplicated.
+  // When neither yields anything, fall back to the current single id (free-text
+  // Input renders below for the single-or-empty case).
+  const modelOptions = $derived.by(() => {
+    const listed = ollamaModelOptions.map((o) => o.id);
+    const merged = Array.from(new Set([...detectedModels, ...listed]));
+    return merged.length > 0 ? merged : localModel ? [localModel] : [];
+  });
 
   // Behaviorally identical to TtsConfigPanel's gate. For the SAVED provider we
   // require re-entry (a fresh non-empty key) since we never load the real key
@@ -209,31 +499,62 @@
     saving || (hasSavedKey ? !editingKey || !cloudApiKey.trim() : !cloudApiKey.trim())
   );
 
-  // On mount, pre-fill the Cloud tab from a previously-saved openai-compatible
-  // config (provider/model) but keep the real api_key OUT of the DOM — we only
-  // record that a key exists so the field renders masked and Save stays disabled
-  // until the user re-enters one.
-  onMount(async () => {
-    if (!isTauri()) return;
+  // Pre-fills the Cloud tab from a previously-saved openai-compatible config
+  // (provider/model) but keeps the real api_key OUT of the DOM — we only record
+  // that a key exists so the field renders masked and Save stays disabled until
+  // the user re-enters one. Its early `return`s are SELF-CONTAINED (this is a
+  // dedicated function, not inline in onMount) so they never short-circuit the
+  // background catalog refresh that runs after it.
+  async function restoreSavedCloud(): Promise<void> {
     try {
       const cfg = await invoke<AppConfig>('get_config');
+      // A saved cloud entry carries the REAL provider id (= a CLOUD_PROVIDERS id,
+      // including the legacy 'openai-compatible'). Match it to a combobox entry by
+      // id; only the matched provider gets the per-provider saved/masked treatment.
       const saved = cfg.models?.find(
-        (m) => m.provider === 'openai-compatible' && m.api_key.trim() !== ''
+        (m) => CLOUD_PROVIDER_IDS.includes(m.provider) && m.api_key.trim() !== ''
       );
       if (!saved) return;
-      // Map the saved entry to a provider card by base_url. Only a recognized
-      // provider gets the per-provider saved/masked treatment; an unmatched
-      // base_url leaves every card in the normal (unsaved) entry state.
-      const match = CLOUD_PROVIDERS.find((p) => p.baseUrl === saved.base_url);
+      const match = findCloudProvider(saved.provider);
       if (!match) return;
       savedProviderId = match.id;
       cloudProvider = match.id;
-      cloudBaseUrl = saved.base_url || match.baseUrl;
-      cloudModel = saved.model || match.defaultModel;
+      // The custom endpoint restores its saved base URL; native providers keep an
+      // empty base_url (genai resolves the canonical endpoint).
+      cloudBaseUrl = match.custom ? saved.base_url || match.baseUrl : '';
+      // Preserve the user's prior model choice (don't override with the smart
+      // default). A truthy saved model counts as an explicit pick.
+      if (saved.model) {
+        cloudModel = saved.model;
+        cloudModelPicked = true;
+      } else {
+        cloudModel = defaultModelFor(match.id);
+      }
       cloudApiKey = '';
+      // Reload the catalog for the saved provider so the picker + capability
+      // controls reflect the restored selection.
+      await loadCloudModels();
     } catch {
       // Non-fatal: fall back to the default empty Cloud form.
     }
+  }
+
+  // On mount, populate the pickers from the loaded catalog, restore any saved
+  // cloud config, then refresh the catalog live in the background.
+  onMount(async () => {
+    if (!isTauri()) return;
+    // Populate the capability-aware pickers on expand from the ALREADY-LOADED
+    // catalog (cache-or-bundled-floor), so the picker is never empty. Both are
+    // resilient (any throw ⇒ empty options + fallback), so onboarding stays
+    // non-blocking.
+    await Promise.all([loadCloudModels(), loadOllamaModels()]);
+    await restoreSavedCloud();
+    // After the immediate (loaded) options are on screen and any saved provider
+    // is restored, trigger a LIVE refresh + re-read in the background so an online
+    // user converges to the CURRENT full models.dev list. Fire-and-forget: NOT
+    // awaited so the loaded options render instantly; the picker updates in place
+    // when the fetch completes. Graceful when offline (keeps the loaded list).
+    void refreshAndReloadCloud();
   });
 
   // Entering "editing" mode clears the masked field so the user types a fresh key.
@@ -327,8 +648,8 @@
         </Button>
       </div>
 
-      {#if detectStatus === 'found' && detectVersion}
-        <p class="text-primary text-[0.75rem]">{detectVersion} detected</p>
+      {#if detectStatus === 'found'}
+        <p class="text-primary text-[0.75rem]">Configure your preferred LLM</p>
       {:else if detectStatus === 'not-found'}
         <p class="text-muted-foreground text-[0.75rem]">
           {detectError ?? 'Not detected — check that your local server is running.'}
@@ -439,47 +760,127 @@
     tabindex={activeTab === 'cloud' ? 0 : -1}
     class={cn('mt-3 flex flex-col gap-3', activeTab !== 'cloud' && 'hidden')}
   >
-    <!-- Provider cards -->
-    <div class="grid grid-cols-3 gap-2" role="radiogroup" aria-label="Cloud LLM provider">
-      {#each CLOUD_PROVIDERS as provider (provider.id)}
-        {@const isSelected = cloudProvider === provider.id}
-        <button
-          role="radio"
-          aria-checked={isSelected}
-          onclick={() => selectProvider(provider.id)}
-          class={cn(
-            'rounded-lg border px-2.5 py-2 text-left transition-colors',
-            isSelected
-              ? 'border-primary bg-primary/10 ring-1 ring-primary'
-              : 'border-border bg-card hover:bg-muted/50'
-          )}
-        >
-          <p class="text-[0.8rem] font-semibold text-foreground">{provider.name}</p>
-          <p class="text-[0.7rem] text-muted-foreground mt-0.5">{provider.models}</p>
-        </button>
-      {/each}
+    <!-- Cloud provider — searchable combobox (type-to-filter, grouped). -->
+    <div class="flex flex-col gap-1.5">
+      <label
+        for="llm-cloud-provider"
+        class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase"
+      >
+        Cloud provider
+      </label>
+      <Combobox.Root
+        type="single"
+        value={cloudProvider}
+        onValueChange={(v) => {
+          if (v) void selectProvider(v);
+        }}
+        onOpenChange={(open) => {
+          // Reset the type-to-filter query when the menu closes so the next open
+          // shows the full grouped list (the input text reflects the selection).
+          if (!open) providerQuery = '';
+        }}
+      >
+        <div class="relative">
+          <Combobox.Input
+            id="llm-cloud-provider"
+            aria-label="Cloud provider"
+            defaultValue={selectedProvider.name}
+            oninput={(e) => (providerQuery = e.currentTarget.value)}
+            placeholder="Search providers…"
+            class="border-input bg-transparent dark:bg-input/30 focus-visible:border-ring focus-visible:ring-ring/50 text-foreground placeholder:text-muted-foreground h-9 w-full min-w-0 rounded-lg border px-2.5 py-1 pr-8 text-sm outline-none transition-colors focus-visible:ring-3"
+          />
+          <Combobox.Trigger
+            aria-label="Show providers"
+            class="text-muted-foreground absolute inset-y-0 right-0 flex items-center pr-2.5 outline-none"
+          >
+            <ChevronsUpDown class="size-4" aria-hidden="true" />
+          </Combobox.Trigger>
+        </div>
+        <Combobox.Portal>
+          <Combobox.Content
+            class="border-border bg-popover text-popover-foreground z-[70] max-h-64 w-[var(--bits-combobox-anchor-width)] overflow-y-auto rounded-lg border p-1 shadow-lg"
+            sideOffset={4}
+          >
+            {#each filteredProviders as group (group.key)}
+              <Combobox.Group>
+                <Combobox.GroupHeading
+                  class="text-muted-foreground px-2 pt-1.5 pb-1 text-[0.62rem] font-semibold tracking-widest uppercase"
+                >
+                  {group.label}
+                </Combobox.GroupHeading>
+                {#each group.items as provider (provider.id)}
+                  <Combobox.Item
+                    value={provider.id}
+                    label={provider.name}
+                    class="data-highlighted:bg-primary/10 data-highlighted:text-foreground text-foreground flex cursor-pointer items-center justify-between rounded-md px-2 py-1.5 text-sm outline-none"
+                  >
+                    {#snippet children({ selected })}
+                      <span>{provider.name}</span>
+                      {#if selected}
+                        <Check class="text-primary size-4" aria-hidden="true" />
+                      {/if}
+                    {/snippet}
+                  </Combobox.Item>
+                {/each}
+              </Combobox.Group>
+            {/each}
+            {#if filteredProviders.length === 0}
+              <div class="text-muted-foreground px-2 py-3 text-center text-[0.78rem]">
+                No providers found
+              </div>
+            {/if}
+          </Combobox.Content>
+        </Combobox.Portal>
+      </Combobox.Root>
     </div>
 
     <!-- MODEL -->
     <div class="flex flex-col gap-1.5">
-      <label
-        for="llm-cloud-model"
-        class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase"
-      >
-        Model
-      </label>
-      <Input
-        id="llm-cloud-model"
-        type="text"
-        bind:value={cloudModel}
-        placeholder={selectedProvider.defaultModel}
-        autocomplete="off"
-        spellcheck={false}
-      />
-      <p class="text-muted-foreground text-[0.72rem] leading-relaxed">
-        The exact model id to use (e.g. {selectedProvider.defaultModel}). Enter any model your
-        provider supports — no need to wait for an app update when a new one ships.
-      </p>
+      <div class="flex items-baseline gap-1.5">
+        <label
+          for="llm-cloud-model"
+          class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase"
+        >
+          Model
+        </label>
+        {#if catalogUpdating}
+          <span class="text-muted-foreground text-[0.68rem]" aria-live="polite">updating…</span>
+        {/if}
+      </div>
+      {#if cloudCatalogKey === null}
+        <!-- No models.dev namespace (Ollama Cloud / custom endpoint): the model
+             is a free-text id the user supplies (their pulled / hosted model). -->
+        <Input
+          id="llm-cloud-model"
+          type="text"
+          value={cloudModel}
+          oninput={(e) => {
+            cloudModel = e.currentTarget.value;
+            cloudModelPicked = true;
+          }}
+          placeholder="model id (e.g. gpt-oss:20b)"
+          autocomplete="off"
+          spellcheck={false}
+        />
+      {:else}
+        <select
+          id="llm-cloud-model"
+          value={cloudModel}
+          onchange={(e) => {
+            cloudModel = e.currentTarget.value;
+            // An explicit pick: pin it so a background refresh won't re-default it.
+            cloudModelPicked = true;
+          }}
+          class={SELECT_CLASS}
+        >
+          {#each cloudSelectOptions as opt (opt.id)}
+            <option value={opt.id}>{opt.label}</option>
+          {/each}
+        </select>
+      {/if}
+      {#if modelHint}
+        <p class="text-muted-foreground text-[0.72rem] leading-relaxed">{modelHint}</p>
+      {/if}
     </div>
 
     <!-- API KEY -->
@@ -508,30 +909,30 @@
       {/if}
     </div>
 
-    <!-- BASE URL -->
-    <div class="flex flex-col gap-1.5">
-      <div class="flex items-baseline gap-1">
+    <!-- BASE URL — only for the custom OpenAI-compatible endpoint. Native cloud
+         providers use genai's built-in endpoint (no URL to configure). -->
+    {#if isCustomProvider}
+      <div class="flex flex-col gap-1.5">
         <label
           for="llm-cloud-url"
           class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase"
         >
           Base URL
         </label>
-        <span class="text-muted-foreground text-[0.68rem]">— optional override</span>
+        <Input
+          id="llm-cloud-url"
+          type="url"
+          bind:value={cloudBaseUrl}
+          placeholder="https://api.openai.com/v1"
+          autocomplete="off"
+          spellcheck={false}
+        />
+        <p class="text-muted-foreground text-[0.72rem] leading-relaxed">
+          The OpenAI-compatible endpoint to call — for LM Studio, vLLM, a proxy, or any other
+          self-hosted/compatible server.
+        </p>
       </div>
-      <Input
-        id="llm-cloud-url"
-        type="url"
-        bind:value={cloudBaseUrl}
-        placeholder="https://api.openai.com/v1"
-        autocomplete="off"
-        spellcheck={false}
-      />
-      <p class="text-muted-foreground text-[0.72rem] leading-relaxed">
-        Leave empty to use the default. Override for Groq, Together AI, Azure OpenAI, Anyscale and
-        other compatible providers.
-      </p>
-    </div>
+    {/if}
 
     <!-- Save error -->
     {#if saveError}
@@ -542,5 +943,148 @@
     <Button class="h-10 w-full" onclick={handleSave} disabled={cloudSaveDisabled}>
       {saving ? 'Saving…' : 'Save'}
     </Button>
+  </div>
+
+  <!-- ── Enrichment (M4 Phase 3) ──────────────────────────────────────────────
+       Shared across both tabs (the chosen provider runs the optional, additive
+       enrichment pass). Saved alongside the provider above; non-blocking. -->
+  <div class="border-border mt-4 flex flex-col gap-3 border-t pt-4">
+    <!-- ENABLE toggle row -->
+    <div class="flex items-start justify-between gap-3">
+      <div class="flex flex-col gap-0.5">
+        <label for="enrichment-enabled" class="text-foreground text-[0.82rem] font-medium">
+          Improve retrieval with enrichment
+        </label>
+        <p class="text-muted-foreground text-[0.72rem] leading-relaxed">
+          After a source is indexed, your LLM builds context (entities, sections, a summary) in the
+          background to sharpen search. Canonical text is never changed; sources stay usable
+          throughout.
+        </p>
+      </div>
+      <button
+        id="enrichment-enabled"
+        type="button"
+        role="switch"
+        aria-checked={enrichmentEnabled}
+        aria-label="Enable enrichment"
+        onclick={() => (enrichmentEnabled = !enrichmentEnabled)}
+        class={cn(
+          'relative mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors',
+          'focus-visible:ring-ring/50 outline-none focus-visible:ring-3',
+          enrichmentEnabled ? 'bg-primary' : 'bg-muted'
+        )}
+      >
+        <span
+          class={cn(
+            'bg-background inline-block size-4 transform rounded-full shadow-sm transition-transform',
+            enrichmentEnabled ? 'translate-x-4' : 'translate-x-0.5'
+          )}
+        ></span>
+      </button>
+    </div>
+
+    <!-- COREF STRATEGY select -->
+    <div class={cn('flex flex-col gap-1.5', !enrichmentEnabled && 'opacity-50')}>
+      <label
+        for="enrichment-coref"
+        class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase"
+      >
+        Pronoun resolution
+      </label>
+      <select
+        id="enrichment-coref"
+        bind:value={corefStrategy}
+        disabled={!enrichmentEnabled}
+        class={SELECT_CLASS}
+      >
+        {#each COREF_OPTIONS as opt (opt.value)}
+          <option value={opt.value}>{opt.label}</option>
+        {/each}
+      </select>
+      <p class="text-muted-foreground text-[0.72rem] leading-relaxed">
+        Resolves pronouns to their referents while building context, so a query like “what did she
+        invent?” still matches the right passage.
+      </p>
+    </div>
+
+    <!-- ROUTING select — how the enrichment LLM is chosen. Gated on enrichment
+         (grayed + disabled when off), matching the coref controls (fix #4). -->
+    <div class={cn('flex flex-col gap-1.5', !enrichmentEnabled && 'opacity-50')}>
+      <label
+        for="enrichment-routing"
+        class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase"
+      >
+        Routing
+      </label>
+      <select
+        id="enrichment-routing"
+        value={routingKind}
+        onchange={(e) =>
+          (routingKind = e.currentTarget.value as 'cloud_first' | 'local_first' | 'explicit')}
+        disabled={!enrichmentEnabled}
+        class={SELECT_CLASS}
+      >
+        {#each ROUTING_OPTIONS as opt (opt.value)}
+          <option value={opt.value}>{opt.label}</option>
+        {/each}
+      </select>
+      <p class="text-muted-foreground text-[0.72rem] leading-relaxed">
+        How the enrichment model is picked. Cloud-first prefers a consented cloud provider then
+        local; Local-first is the inverse; Explicit pins the provider and model selected above.
+      </p>
+    </div>
+
+    <!-- COREF-MODEL OVERRIDE — optional per-task model pin. Gated on enrichment. -->
+    <div class={cn('flex flex-col gap-1.5', !enrichmentEnabled && 'opacity-50')}>
+      <label
+        for="enrichment-coref-model"
+        class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase"
+      >
+        Coreference model
+      </label>
+      <select
+        id="enrichment-coref-model"
+        value={corefModelId}
+        onchange={(e) => (corefModelId = e.currentTarget.value)}
+        disabled={!enrichmentEnabled}
+        class={SELECT_CLASS}
+      >
+        <option value="">Use the configured model</option>
+        {#each corefModelOptions as opt (opt.id)}
+          <option value={opt.id}>{opt.label}</option>
+        {/each}
+      </select>
+      <p class="text-muted-foreground text-[0.72rem] leading-relaxed">
+        Optionally pin a specific model for pronoun resolution. Leave on the default to reuse the
+        configured enrichment model.
+      </p>
+    </div>
+
+    <!-- CLOUD CONSENT — only when a cloud provider is selected. Honest privacy +
+         cost disclosure (not a dark pattern): defaults OFF, explicit-enable. -->
+    {#if activeTab === 'cloud'}
+      <div class="border-border bg-muted/40 flex flex-col gap-2 rounded-lg border p-3">
+        <label class="flex items-start gap-2.5">
+          <input
+            type="checkbox"
+            bind:checked={cloudConsent}
+            class="border-input text-primary focus-visible:ring-ring/50 mt-0.5 size-4 shrink-0 rounded border outline-none focus-visible:ring-3"
+            aria-describedby="enrichment-cloud-note"
+          />
+          <span class="text-foreground text-[0.8rem] font-medium">
+            Send document text to this cloud provider for enrichment
+          </span>
+        </label>
+        <p
+          id="enrichment-cloud-note"
+          class="text-muted-foreground pl-[1.625rem] text-[0.72rem] leading-relaxed"
+        >
+          Enrichment sends the full text of your sources to {selectedProvider.name} so it can build context.
+          That text leaves your machine and may incur API costs billed by the provider per token. Local-first
+          is the default — leave this off to keep enrichment on-device only (no cloud enrichment runs
+          without your consent).
+        </p>
+      </div>
+    {/if}
   </div>
 </div>

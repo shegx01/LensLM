@@ -66,17 +66,20 @@
   });
 </script>
 
-<div class="absolute top-4 right-4 z-10">
+<!-- macOS drag region (titleBarStyle Overlay): the empty canvas is the window
+     drag handle; every interactive block carries -webkit-app-region: no-drag so
+     clicks/drags-within still work (mirrors SourcesRail.svelte). -->
+<div class="absolute top-4 right-4 z-10" style="-webkit-app-region: no-drag;">
   <ThemeCycleButton class="size-9 rounded-lg" />
 </div>
 
-<main class="flex min-h-svh items-center justify-center p-6">
+<main data-tauri-drag-region class="flex min-h-svh items-center justify-center p-6">
   <!-- Per design: the whole onboarding sits inside ONE outer card (540px,
        14px radius, soft shadow, 36/40/32 padding). The check rows are inner
        surface cards; the footer stays plain (not its own card). -->
   <!-- Width chosen so the rows inside (card width − 2×px-10 padding) land at the
        previous `lg` (512px) and the long descriptions don't truncate. -->
-  <div class="w-full max-w-[592px]">
+  <div class="w-full max-w-[592px]" style="-webkit-app-region: no-drag;">
     <Card class="w-full gap-4 rounded-[14px] px-10 pt-9 pb-8 shadow-2xl ring-0">
       <!-- Header -->
       <div class="flex flex-col items-center text-center gap-3 pb-2">

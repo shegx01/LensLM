@@ -525,4 +525,29 @@ describe('AddSources', () => {
     await waitFor(() => expect(oncomplete).toHaveBeenCalledOnce());
     expect(ipcCalled).toBe(false);
   });
+
+  // ── macOS drag region (mirrors SourcesRail drag assertions) ─────────────────
+
+  it('outer <main> is a data-tauri-drag-region with the Card marked no-drag', () => {
+    mockIPC((cmd) => {
+      if (cmd === 'list_recent_documents') return [];
+    });
+    const { container } = render(AddSources, { props: { oncomplete: vi.fn(), onback: vi.fn() } });
+    const main = container.querySelector('main[data-tauri-drag-region]') as HTMLElement;
+    expect(main).not.toBeNull();
+    const noDrag = main.querySelector('[style*="-webkit-app-region: no-drag"]');
+    expect(noDrag).not.toBeNull();
+  });
+
+  it('the dropzone stays inside a no-drag region so it remains interactive', () => {
+    mockIPC((cmd) => {
+      if (cmd === 'list_recent_documents') return [];
+    });
+    const { container } = render(AddSources, { props: { oncomplete: vi.fn(), onback: vi.fn() } });
+    const dropzone = screen.getByRole('button', { name: /drop files here or click to browse/i });
+    // The dropzone must live within the no-drag content block (not the bare drag region).
+    const noDragAncestor = dropzone.closest('[style*="-webkit-app-region: no-drag"]');
+    expect(noDragAncestor).not.toBeNull();
+    expect(container.querySelector('main[data-tauri-drag-region]')).not.toBeNull();
+  });
 });

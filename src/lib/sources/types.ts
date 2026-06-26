@@ -40,6 +40,12 @@ export interface Source {
   token_count: number | null;
   content_hash: string | null;
   trashed_at: string | null;
+  /** Enrichment lifecycle (none|pending|enriching|enriched|failed|skipped),
+   * SEPARATE from `status`. `null` ≡ `none` for pre-Phase-3 rows. */
+  enrichment_status: string | null;
+  /** JSON enrichment metadata (composite cache key + budget/skip reason);
+   * `null` until the source is enriched. */
+  enrichment_meta: string | null;
 }
 
 // SYNC-CHECK: must match lens-core/src/ingest.rs IngestProgress struct

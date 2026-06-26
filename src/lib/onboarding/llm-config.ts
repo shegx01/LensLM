@@ -7,18 +7,34 @@
 //
 // Provider mapping (per spec):
 //   Local tab  → provider: 'ollama'
-//   Cloud API tab → provider: 'openai-compatible'
+//   Cloud API tab → the REAL provider id matching the models.dev catalog key
+//     ('openai' | 'anthropic' | 'google'), so a claude-*/gemini-* model validates
+//     against its OWN catalog namespace on the Rust side. 'openai-compatible' is
+//     reserved for a genuinely custom/self-hosted endpoint (exempt from catalog
+//     validation) — the cloud cards are all first-class providers.
 //
 // No new Rust command, no main.rs touch.
 
-import type { ModelConfig } from '$lib/theme/types.js';
+import type {
+  ModelConfig,
+  CorefStrategy,
+  EnrichmentConfig,
+  LlmRouting,
+  TaskModel
+} from '$lib/theme/types.js';
 import { updateConfig } from '$lib/config.js';
 
 export type LlmProviderTab = 'local' | 'cloud';
 
 export interface LlmProviderInput {
-  /** 'ollama' for Local tab, 'openai-compatible' for Cloud API tab. */
-  provider: 'ollama' | 'openai-compatible';
+  /** The canonical provider id (= models.dev catalog key for first-class cloud
+   * providers). `'ollama'` for the Local tab; a real cloud provider id
+   * (`'openai' | 'anthropic' | 'google' | 'groq' | 'deepseek' | 'xai' |
+   * 'cohere' | 'zai' | 'ollama-cloud'`) for the Cloud combobox; or
+   * `'openai-compatible'` for a genuinely custom/self-hosted endpoint. Kept as a
+   * plain `string` so the single {@link CLOUD_PROVIDERS} source drives the set
+   * without a divergent union to maintain. */
+  provider: string;
   base_url: string;
   model: string;
   api_key: string;
@@ -51,5 +67,54 @@ export async function saveLlmProvider(input: LlmProviderInput): Promise<void> {
     const models: ModelConfig[] =
       idx >= 0 ? existing.map((m, i) => (i === idx ? entry : m)) : [...existing, entry];
     return { ...cfg, models };
+  });
+}
+
+/** The enrichment preferences captured by the onboarding LLM step. */
+export interface EnrichmentPrefsInput {
+  enabled: boolean;
+  coref_strategy: CorefStrategy;
+  /** Cloud-LLM consent. Ignored (and forced false) for local-only setups. */
+  cloud_consent: boolean;
+  /** Typed routing policy (Stage 2). Optional — omit to leave the existing value
+   * (or the Rust `cloud_first` default) untouched. */
+  routing?: LlmRouting;
+  /** Per-task coref model override (Stage 3). `null` clears it (use the routing
+   * default); `undefined` leaves the existing value untouched. */
+  coref_model?: TaskModel | null;
+  /** Per-task structural-map model override (Stage 3). Same null/undefined
+   * semantics as {@link coref_model}. */
+  map_model?: TaskModel | null;
+}
+
+/**
+ * Read-modify-write `enrichment` while preserving every other AppConfig field
+ * (mirrors {@link saveLlmProvider}). MERGES onto the existing `enrichment` section
+ * rather than replacing it wholesale: the Stage-2 `routing` and Stage-3 per-task
+ * overrides (`coref_model`/`map_model`/`chat_model`) co-exist with the three core
+ * fields, so a partial save must never drop a field the caller didn't set.
+ *
+ * `routing`/`coref_model`/`map_model` are applied ONLY when the caller provides
+ * them (`undefined` ⇒ keep the prior value); passing `null` for a per-task model
+ * explicitly clears the override (back to the routing default). `chat_model` is
+ * never touched here (M5's concern) — it is round-tripped from the prior config.
+ *
+ * A no-op outside Tauri (the `updateConfig` guard), so onboarding stays
+ * non-blocking: a skipped step simply never calls this and the Rust-side
+ * `#[serde(default)]` keeps the conservative defaults.
+ */
+export async function saveEnrichmentPrefs(input: EnrichmentPrefsInput): Promise<void> {
+  await updateConfig((cfg) => {
+    const prior = cfg.enrichment;
+    const enrichment: EnrichmentConfig = {
+      ...prior,
+      enabled: input.enabled,
+      coref_strategy: input.coref_strategy,
+      cloud_consent: input.cloud_consent
+    };
+    if (input.routing !== undefined) enrichment.routing = input.routing;
+    if (input.coref_model !== undefined) enrichment.coref_model = input.coref_model;
+    if (input.map_model !== undefined) enrichment.map_model = input.map_model;
+    return { ...cfg, enrichment };
   });
 }

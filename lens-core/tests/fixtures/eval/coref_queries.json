@@ -1,0 +1,10 @@
+[
+  {
+    "query": "Who chose the recordings and contents of the Voyager Golden Record?",
+    "gold_chunk_ids": ["3a59ae08d3f672daa3f61091a93efa4328e1dec298dfa0eabca513297ec344cf"]
+  },
+  {
+    "query": "What are the size, weight, and material of the Voyager Golden Record disc?",
+    "gold_chunk_ids": ["b2d93123faee661d7d7105d4712ee7c30350f55c3a5751067ef253fad1dfc5c6"]
+  }
+]

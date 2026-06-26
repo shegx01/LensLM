@@ -55,6 +55,18 @@ pub const VECTOR_DIM: usize = 768;
 /// flow). Single source of truth for the registry status literal.
 const REGISTRY_STATUS_ACTIVE: &str = "active";
 
+/// Test-only crash-injection point for the re-embed flip (AC7).
+///
+/// When set to `true`, [`VectorStore::flip_active`] commits the SQLite flip txn
+/// (so the registry shows `active`→`stale`, `building`→`active`) and then returns
+/// EARLY — BEFORE dropping the stale Lance table or deleting its row — simulating
+/// a process crash in exactly the crash window the startup-GC must recover. The
+/// flag is consumed (reset to `false`) on use so a single test can arm it once.
+/// Compiled out of production builds.
+#[cfg(feature = "test-util")]
+pub static CRASH_AFTER_FLIP_TXN_BEFORE_LANCE_DROP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// A single vector row to insert, addressed by its owning logical coordinates.
 ///
 /// `chunk_id` is the SQLite `chunks.id` — the LanceDB→SQLite link is keyed by
@@ -126,6 +138,51 @@ pub trait VectorStore: Send + Sync {
     /// drops each table BEFORE the SQLite delete cascades those registry rows
     /// away, so the per-notebook Lance tables are never orphaned on disk.
     async fn drop_tables(&self, table_names: &[String]) -> Result<(), LensError>;
+
+    /// Creates an empty, gen-suffixed `building` table for the re-embed flip and
+    /// registers a `status='building'` registry row pointing at it (M4 Phase 3,
+    /// Step 5 / AC7).
+    ///
+    /// Picks the next generation above every name already registered for the
+    /// coordinate (gen-0 is the live `active` table), so the new physical table
+    /// co-exists beside the active one. Returns the physical building table name —
+    /// the caller threads it into [`add_to_table`](VectorStore::add_to_table) and
+    /// [`flip_active`](VectorStore::flip_active). The building table is invisible
+    /// to [`search`](VectorStore::search) (which resolves `status='active'` only),
+    /// so populating it needs NO `ingest_lock`.
+    async fn create_building_table(
+        &self,
+        notebook: &str,
+        model: &str,
+        dim: usize,
+    ) -> Result<String, LensError>;
+
+    /// Appends `rows` to the physical table named `table_name` (M4 Phase 3,
+    /// Step 5). Used to populate a `building` table created by
+    /// [`create_building_table`](VectorStore::create_building_table) by its
+    /// EXPLICIT name (the active read path resolves names from the registry, so a
+    /// half-populated building table is unobservable). Errors if the table does
+    /// not exist. An empty `rows` is a no-op.
+    async fn add_to_table(&self, table_name: &str, rows: Vec<VectorRow>) -> Result<(), LensError>;
+
+    /// Atomically flips the `building` table to `active` for a coordinate, then
+    /// drops the now-`stale` Lance table (M4 Phase 3, Step 5 / AC7).
+    ///
+    /// ONE SQLite transaction performs the swap: the current `active` row →
+    /// `stale`, and the `building` row whose `lance_table_name == building_name` →
+    /// `active`. The partial-unique `uq_embidx_active` guarantees at most one
+    /// `active` row per coordinate at every commit boundary, so search never sees
+    /// mixed raw/enriched or an empty index. AFTER the txn commits, the stale
+    /// physical Lance table is dropped and its registry row deleted. A crash
+    /// between the commit and the Lance-drop leaves a `stale` row + orphan table
+    /// that the startup-GC reclaims (idempotently — a missing table is a no-op).
+    async fn flip_active(
+        &self,
+        notebook: &str,
+        model: &str,
+        dim: usize,
+        building_name: &str,
+    ) -> Result<(), LensError>;
 }
 
 /// Slugifies a model id into a filesystem/table-safe token.
@@ -167,6 +224,25 @@ fn model_slug(model: &str) -> String {
 /// be extended to include `dim` (e.g. `vec__{notebook}__{model_slug}__{dim}`).
 fn table_name(notebook: &str, model: &str) -> String {
     format!("vec__{notebook}__{}", model_slug(model))
+}
+
+/// Resolves the gen-suffixed physical table name for a coordinate + generation
+/// (Decision A: the re-embed new-table-flip).
+///
+/// **gen-0 == [`table_name`] (byte-identical).** The Phase-1/2 tables shipped
+/// before the flip existed; they are gen-0 *by convention*, so resolving gen-0
+/// must reproduce the exact formula name or pre-flip search would point at a
+/// table that does not exist. A non-zero generation appends `__{gen}` so a
+/// freshly-built `building` table co-exists beside the live `active` table for
+/// the SAME coordinate (the partial-unique registry from migration `0005` allows
+/// it). Enrichment never changes model/dim, so the `dim`-absent caveat on
+/// [`table_name`] is irrelevant here — only the generation differs.
+fn gen_table_name(notebook: &str, model: &str, generation: u32) -> String {
+    if generation == 0 {
+        table_name(notebook, model)
+    } else {
+        format!("{}__{generation}", table_name(notebook, model))
+    }
 }
 
 /// Escapes a string for safe interpolation into a LanceDB SQL filter literal.
@@ -253,9 +329,20 @@ impl EmbeddingIndexRepo {
 
     /// Registers a `(notebook, model, dim)` mapping if absent.
     ///
-    /// Uses `ON CONFLICT(notebook_id, model, dim) DO NOTHING` so re-registering
-    /// an existing logical coordinate (e.g. on table re-open) keeps the existing
-    /// row untouched and is a no-op.
+    /// Uses `ON CONFLICT(notebook_id, model, dim) WHERE status='active' DO
+    /// NOTHING` so re-registering an existing logical coordinate (e.g. on table
+    /// re-open) keeps the existing row untouched and is a no-op. The conflict
+    /// target carries the `WHERE status='active'` predicate because the registry
+    /// constraint was relaxed in migration `0005` from a table-level
+    /// `UNIQUE(notebook_id, model, dim)` to the PARTIAL unique index
+    /// `uq_embidx_active … WHERE status='active'` (so a transient `building`/
+    /// `stale` row can co-exist with the live `active` row during a re-embed
+    /// flip). SQLite requires the upsert conflict target to match the partial
+    /// index's predicate. `register` inserts a row with the given `status`
+    /// (e.g. `create_building_table` registers a `building` row during a re-embed
+    /// flip); only the partial-unique `uq_embidx_active` constrains uniqueness,
+    /// and it constrains `active` rows ONLY, so transient `building`/`stale` rows
+    /// freely co-exist with the live `active` row for the same coordinate.
     async fn register(
         &self,
         notebook: &str,
@@ -271,7 +358,7 @@ impl EmbeddingIndexRepo {
             "INSERT INTO embedding_index \
                  (id, notebook_id, model, dim, prefix_convention, lance_table_name, status, created_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(notebook_id, model, dim) DO NOTHING",
+             ON CONFLICT(notebook_id, model, dim) WHERE status='active' DO NOTHING",
         )
         .bind(&id)
         .bind(notebook)
@@ -356,6 +443,138 @@ impl EmbeddingIndexRepo {
         }
         Ok(())
     }
+
+    /// Returns every `lance_table_name` registered for a coordinate, regardless of
+    /// status (used to compute the next free generation for a building table).
+    async fn lance_table_names_for_coordinate(
+        &self,
+        notebook: &str,
+        model: &str,
+        dim: usize,
+    ) -> Result<Vec<String>, LensError> {
+        let names = sqlx::query_scalar::<_, String>(
+            "SELECT lance_table_name FROM embedding_index \
+             WHERE notebook_id = ? AND model = ? AND dim = ?",
+        )
+        .bind(notebook)
+        .bind(model)
+        .bind(dim as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(names)
+    }
+
+    /// Resolves the physical `lance_table_name` of the live `status='active'` row
+    /// for a coordinate, or `None` when none is registered (AC8 search read-path).
+    async fn active_lance_table_name(
+        &self,
+        notebook: &str,
+        model: &str,
+        dim: usize,
+    ) -> Result<Option<String>, LensError> {
+        let name = sqlx::query_scalar::<_, String>(
+            "SELECT lance_table_name FROM embedding_index \
+             WHERE notebook_id = ? AND model = ? AND dim = ? AND status = 'active'",
+        )
+        .bind(notebook)
+        .bind(model)
+        .bind(dim as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(name)
+    }
+
+    /// The ONE SQLite transaction of the re-embed flip (AC7): demote the current
+    /// `active` row to `stale` and promote the `building` row named `building_name`
+    /// to `active`, atomically. Returns the `lance_table_name` of the row demoted
+    /// to `stale` (the caller drops that physical table + deletes its row after the
+    /// txn commits).
+    ///
+    /// The partial-unique `uq_embidx_active` (migration `0005`) means at most one
+    /// `active` row per coordinate survives each commit; doing both UPDATEs in one
+    /// txn means a reader between the two statements is impossible (SQLite is
+    /// serialized), so search never observes zero or two active tables.
+    async fn flip_active_txn(
+        &self,
+        notebook: &str,
+        model: &str,
+        dim: usize,
+        building_name: &str,
+    ) -> Result<Option<String>, LensError> {
+        let mut tx = self.pool.begin().await?;
+
+        // Snapshot the current active table name (the one we are about to stale)
+        // inside the txn so it is consistent with the UPDATEs below.
+        let stale_name = sqlx::query_scalar::<_, String>(
+            "SELECT lance_table_name FROM embedding_index \
+             WHERE notebook_id = ? AND model = ? AND dim = ? AND status = 'active'",
+        )
+        .bind(notebook)
+        .bind(model)
+        .bind(dim as i64)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        // Demote the current active row to stale FIRST so the partial-unique index
+        // permits the promote below (at most one `active` per coordinate).
+        sqlx::query(
+            "UPDATE embedding_index SET status = 'stale' \
+             WHERE notebook_id = ? AND model = ? AND dim = ? AND status = 'active'",
+        )
+        .bind(notebook)
+        .bind(model)
+        .bind(dim as i64)
+        .execute(&mut *tx)
+        .await?;
+
+        // Promote the building row (matched by its physical table name) to active.
+        let promoted = sqlx::query(
+            "UPDATE embedding_index SET status = 'active' \
+             WHERE notebook_id = ? AND model = ? AND dim = ? \
+               AND lance_table_name = ? AND status = 'building'",
+        )
+        .bind(notebook)
+        .bind(model)
+        .bind(dim as i64)
+        .bind(building_name)
+        .execute(&mut *tx)
+        .await?;
+        if promoted.rows_affected() == 0 {
+            // No building row to promote — abort so we never leave the coordinate
+            // with zero active rows.
+            tx.rollback().await?;
+            return Err(LensError::Validation(format!(
+                "no building embedding_index row named {building_name} for \
+                 ({notebook}, {model}, {dim}) to promote"
+            )));
+        }
+
+        tx.commit().await?;
+        Ok(stale_name)
+    }
+
+    /// Deletes the registry row naming `table` for a coordinate (the stale row
+    /// removed after its Lance table is dropped post-flip). Idempotent: a missing
+    /// row is not an error (the startup-GC may have already reclaimed it).
+    async fn delete_row_by_table(
+        &self,
+        notebook: &str,
+        model: &str,
+        dim: usize,
+        table: &str,
+    ) -> Result<(), LensError> {
+        sqlx::query(
+            "DELETE FROM embedding_index \
+             WHERE notebook_id = ? AND model = ? AND dim = ? AND lance_table_name = ?",
+        )
+        .bind(notebook)
+        .bind(model)
+        .bind(dim as i64)
+        .bind(table)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 /// A row of the `embedding_index` registry table.
@@ -428,44 +647,60 @@ impl LanceVectorStore {
             .map_err(|e| LensError::Vector(format!("lancedb connect failed: {e}")))
     }
 
-    /// Opens the physical table for `(notebook, model)` IF it already exists,
-    /// returning `None` (without creating or registering anything) when it does
-    /// not.
+    /// Opens a physical table by its EXACT name IF it exists, else `None`.
     ///
-    /// Read/no-op paths ([`search`](VectorStore::search) /
-    /// [`drop_source`](VectorStore::drop_source)) use this so a query against a
-    /// notebook that was never ingested never mutates SQLite or Lance as a side
-    /// effect. Only the write path ([`add`](VectorStore::add)) creates+registers
-    /// via [`ensure_table`](Self::ensure_table).
-    async fn open_table_if_exists(
-        &self,
-        notebook: &str,
-        model: &str,
-    ) -> Result<Option<Table>, LensError> {
+    /// Shared by the registry-driven read path ([`open_active_table`]) and the
+    /// explicit-name write path ([`add_to_table`](VectorStore::add_to_table)). It
+    /// never creates or registers anything.
+    async fn open_table_by_name(&self, name: &str) -> Result<Option<Table>, LensError> {
         let conn = self.connect().await?;
-        let name = table_name(notebook, model);
         let existing = conn
             .table_names()
             .execute()
             .await
             .map_err(|e| LensError::Vector(format!("lancedb table_names failed: {e}")))?;
-        if !existing.iter().any(|t| t == &name) {
+        if !existing.iter().any(|t| t == name) {
             return Ok(None);
         }
         let table = conn
-            .open_table(name.as_str())
+            .open_table(name)
             .execute()
             .await
             .map_err(|e| LensError::Vector(format!("lancedb open_table failed: {e}")))?;
         Ok(Some(table))
     }
 
+    /// Resolves the `status='active'` table from the registry and opens it (AC8).
+    ///
+    /// Returns `None` when there is no `active` registry row (never ingested) OR
+    /// when the named table is momentarily absent (the flip TOCTOU window) — search
+    /// degrades to empty in both cases, never errors. Because gen-0 == the formula
+    /// name, a pre-flip coordinate (whose only registered row was written by
+    /// `ensure_table` as `active`) resolves to the identical physical table the
+    /// old formula-based path opened.
+    async fn open_active_table(
+        &self,
+        notebook: &str,
+        model: &str,
+        dim: usize,
+    ) -> Result<Option<Table>, LensError> {
+        let name = match self
+            .registry
+            .active_lance_table_name(notebook, model, dim)
+            .await?
+        {
+            Some(n) => n,
+            None => return Ok(None),
+        };
+        self.open_table_by_name(&name).await
+    }
+
     /// Resolves `(notebook, model, dim)` to its physical table, creating it on
     /// first use.
     ///
     /// PRIVATE — driven by [`add`](VectorStore::add) only; the read/no-op paths
-    /// use [`open_table_if_exists`](Self::open_table_if_exists) so they never
-    /// create a table as a side effect. Callers never see the physical table
+    /// use [`open_active_table`](Self::open_active_table) (registry-driven) so they
+    /// never create a table as a side effect. Callers never see the physical table
     /// name. Idempotent: opens the table if it already exists, otherwise creates
     /// it (empty, schema-only) and registers the logical coordinate in the owned
     /// `embedding_index` registry.
@@ -566,10 +801,16 @@ impl VectorStore for LanceVectorStore {
                 query.len()
             )));
         }
-        // A search must NEVER create a table as a side effect: if this logical
-        // coordinate was never ingested there is nothing to match, so return an
-        // empty result rather than create_empty_table + register an index row.
-        let table = match self.open_table_if_exists(notebook, model).await? {
+        // AC8 — REGISTRY-DRIVEN resolution: the physical table is the one named by
+        // the `status='active'` registry row, NOT the bare `table_name()` formula.
+        // Because gen-0 == the formula name (Decision A), a notebook that was only
+        // ever ingested pre-flip resolves to the SAME physical table as before, so
+        // existing Phase-1/2 search is byte-identical. After a re-embed flip the
+        // active row names the gen-suffixed enriched table and search follows it.
+        // A search must NEVER create a table as a side effect: a never-ingested
+        // coordinate (no active row) OR a row whose Lance table is momentarily
+        // gone (the flip TOCTOU window) returns an empty result, never an error.
+        let table = match self.open_active_table(notebook, model, dim).await? {
             Some(t) => t,
             None => return Ok(Vec::new()),
         };
@@ -632,17 +873,23 @@ impl VectorStore for LanceVectorStore {
         Ok(hits)
     }
 
+    /// Removes a source's rows from the ACTIVE embedding table. Concurrent
+    /// `building` tables (mid re-embed flip) are safe to ignore: the flip acquires
+    /// `ingest_lock`, serializing it against `purge_source`, so a drop never races
+    /// a half-built table into an inconsistent active set.
     async fn drop_source(
         &self,
         notebook: &str,
         model: &str,
-        _dim: usize,
+        dim: usize,
         source_id: &str,
     ) -> Result<(), LensError> {
-        // A wipe of a never-ingested coordinate is a no-op: opening (let alone
-        // creating + registering) a table just to delete from an empty one would
-        // be a pointless side effect, so short-circuit when it doesn't exist.
-        let table = match self.open_table_if_exists(notebook, model).await? {
+        // Resolve the ACTIVE physical table from the registry (AC8/AC6): after a
+        // re-embed flip the active table is gen-suffixed, and the summary RAPTOR
+        // node (which carries this `source_id`) lives in it — so a drop must target
+        // the active table, not the bare formula name (gen-0), to reclaim it. A
+        // wipe of a never-ingested coordinate (no active row) is a no-op.
+        let table = match self.open_active_table(notebook, model, dim).await? {
             Some(t) => t,
             None => return Ok(()),
         };
@@ -679,6 +926,111 @@ impl VectorStore for LanceVectorStore {
             conn.drop_table(name.as_str(), &[])
                 .await
                 .map_err(|e| LensError::Vector(format!("lancedb drop_table failed: {e}")))?;
+        }
+        Ok(())
+    }
+
+    async fn create_building_table(
+        &self,
+        notebook: &str,
+        model: &str,
+        dim: usize,
+    ) -> Result<String, LensError> {
+        // PHASE-1 INVARIANT (see `table_name`): the physical name omits `dim`. The
+        // re-embed never changes model/dim, so the same guard applies.
+        debug_assert_eq!(
+            dim, VECTOR_DIM,
+            "gen_table_name omits dim and relies on model⇒dim (Phase 1)"
+        );
+
+        // Compute the next free generation above every name registered for the
+        // coordinate (gen-0 is the live active table; prior building/stale rows may
+        // linger until the startup-GC sweeps them).
+        let existing = self
+            .registry
+            .lance_table_names_for_coordinate(notebook, model, dim)
+            .await?;
+        let mut generation = 1u32;
+        loop {
+            let candidate = gen_table_name(notebook, model, generation);
+            if !existing.iter().any(|n| n == &candidate) {
+                break;
+            }
+            generation += 1;
+        }
+        let building_name = gen_table_name(notebook, model, generation);
+
+        // Create the empty physical table, then register the `building` row. The
+        // physical table is created FIRST so a crash before the registry insert
+        // leaves an unregistered orphan table (harmless — invisible to the read
+        // path and reclaimed lazily); a crash after leaves a `building` row the
+        // startup-GC reclaims (idempotent drop of a possibly-missing table).
+        let conn = self.connect().await?;
+        conn.create_empty_table(building_name.as_str(), vector_schema(dim))
+            .execute()
+            .await
+            .map_err(|e| LensError::Vector(format!("lancedb create_empty_table failed: {e}")))?;
+        self.registry
+            .register(
+                notebook,
+                model,
+                dim,
+                crate::embedder::PREFIX_CONVENTION,
+                &building_name,
+                "building",
+            )
+            .await?;
+        Ok(building_name)
+    }
+
+    async fn add_to_table(&self, table_name: &str, rows: Vec<VectorRow>) -> Result<(), LensError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let table = self
+            .open_table_by_name(table_name)
+            .await?
+            .ok_or_else(|| LensError::Vector(format!("no table named {table_name} to add to")))?;
+        let batch = rows_to_batch(&rows, VECTOR_DIM)?;
+        table
+            .add(batch)
+            .execute()
+            .await
+            .map_err(|e| LensError::Vector(format!("lancedb add failed: {e}")))?;
+        Ok(())
+    }
+
+    async fn flip_active(
+        &self,
+        notebook: &str,
+        model: &str,
+        dim: usize,
+        building_name: &str,
+    ) -> Result<(), LensError> {
+        // (1) The ONE atomic SQLite txn: active→stale, building→active. Returns the
+        // physical name of the row demoted to stale (if any) to drop afterwards.
+        let stale_name = self
+            .registry
+            .flip_active_txn(notebook, model, dim, building_name)
+            .await?;
+
+        // ── CRASH WINDOW (AC7): everything below — the stale Lance drop + the
+        // stale registry-row delete — happens AFTER the flip txn has committed. A
+        // crash here leaves a `stale` row + orphan Lance table that the startup-GC
+        // reclaims. The active row already points at the COMPLETE enriched table.
+        #[cfg(feature = "test-util")]
+        if CRASH_AFTER_FLIP_TXN_BEFORE_LANCE_DROP.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        // (2) Drop the stale physical table (idempotent) and delete its registry
+        // row. Order: drop the table FIRST so a crash between the two leaves only a
+        // dangling `stale` row whose (already-gone) table the GC drops as a no-op.
+        if let Some(stale) = stale_name {
+            self.drop_tables(std::slice::from_ref(&stale)).await?;
+            self.registry
+                .delete_row_by_table(notebook, model, dim, &stale)
+                .await?;
         }
         Ok(())
     }

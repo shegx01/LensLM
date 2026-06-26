@@ -5,6 +5,7 @@
 //! envelope. Milestones add files here rather than rewriting a generic handler.
 
 pub mod config;
+pub mod models;
 pub mod notebooks;
 pub mod system;
 

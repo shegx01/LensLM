@@ -17,7 +17,17 @@ yanked = "warn"
 # audit while still flagging anything we pull in ourselves.
 unmaintained = "workspace"
 # Add specific RUSTSEC IDs here to silence a reviewed, accepted advisory.
-ignore = []
+ignore = [
+  # RUSTSEC-2026-0187 — stack overflow in `lopdf` parsing deeply-nested PDF
+  # objects. `lopdf` is a DEV-ONLY transitive dep (via `printpdf`, used solely to
+  # GENERATE sample PDFs in tests); it is not in the shipped binary. Production
+  # PDF *parsing* goes through `pdfium-render`, never `lopdf`, and the test
+  # fixtures we generate are trusted inputs — so the deeply-nested-untrusted-PDF
+  # vector is unreachable. No patched release exists within `printpdf 0.7`'s
+  # range. Tracked: replace `printpdf` test-fixture generation with static
+  # checked-in sample PDFs to drop the dep entirely.
+  "RUSTSEC-2026-0187",
+]
 
 [licenses]
 version = 2
