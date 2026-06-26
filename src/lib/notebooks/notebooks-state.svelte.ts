@@ -34,6 +34,7 @@ let trashedNotebooks = $state<NotebookSummary[]>([]);
 let activeNotebookId = $state<string | null>(null); // session-only
 let activeTab = $state<'chat' | 'notes'>('chat'); // session-only
 let trashOpen = $state(false); // Trash modal visibility (centered dialog)
+let inspectorOpen = $state(false); // dev/QA Embeddings Inspector overlay visibility
 let sidebarCollapsed = $state(false); // session-only; localStorage deferred to follow-up
 let rightRailCollapsed = $state(false); // session-only; persisted same way as sidebarCollapsed
 let paletteOpen = $state(false); // command palette visibility
@@ -108,6 +109,12 @@ export const notebookStore = {
   },
   set trashOpen(v: boolean) {
     trashOpen = v;
+  },
+  get inspectorOpen() {
+    return inspectorOpen;
+  },
+  set inspectorOpen(v: boolean) {
+    inspectorOpen = v;
   },
   get sidebarCollapsed() {
     return sidebarCollapsed;
@@ -328,6 +335,7 @@ export function resetNotebookStore(): void {
   activeNotebookId = null;
   activeTab = 'chat';
   trashOpen = false;
+  inspectorOpen = false;
   sidebarCollapsed = false;
   rightRailCollapsed = false;
   paletteOpen = false;

@@ -25,6 +25,7 @@
   } from '$lib/sources/sources-state.svelte.js';
   import { notebookStore } from '$lib/notebooks/index.js';
   import type { SourceStatus } from '$lib/sources/types.js';
+  import { statusDotClass } from '$lib/sources/status.js';
   import AddSourcesModal from './AddSourcesModal.svelte';
   import StudioPanel from './StudioPanel.svelte';
 
@@ -152,25 +153,7 @@
   // Status dot helpers
   // ---------------------------------------------------------------------------
 
-  /**
-   * Map SourceStatus to a dot color class.
-   * indexed → green, error → destructive/red, queued/pending/parsing/embedding → amber (pulsing)
-   */
-  function statusDotClass(status: SourceStatus): string {
-    switch (status) {
-      case 'indexed':
-        return 'bg-green-primary';
-      case 'error':
-        return 'bg-destructive';
-      case 'parsing':
-      case 'embedding':
-      case 'queued':
-      case 'pending':
-        return 'bg-amber-500 animate-pulse';
-      default:
-        return 'bg-muted-foreground/40';
-    }
-  }
+  // statusDotClass is shared with EmbeddingsInspector — see $lib/sources/status.ts.
 
   function statusDotLabel(status: SourceStatus): string {
     switch (status) {

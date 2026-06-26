@@ -339,6 +339,59 @@ pub struct ReembedChunk {
     pub embed_text: String,
 }
 
+/// A chunk row projected for the dev/QA Embeddings Inspector (M4).
+///
+/// A read-only, IPC-serializable view of a chunk's identity, position in the
+/// parent/child hierarchy, and the metadata the inspector renders: the canonical
+/// citation `text`, the block type, the character span, the `source_anchor` JSON,
+/// and the contextual `embedding_text` (NULL until the enrichment pass runs).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, sqlx::FromRow)]
+pub struct InspectorChunk {
+    /// Chunk primary key.
+    pub id: String,
+    /// `None` for level-0 parents (and the level-2 summary); `Some(parent.id)`
+    /// for child rows.
+    pub parent_id: Option<String>,
+    /// `"parent"` (level 0) / `"child"` (level 1) / `"summary"` (level 2).
+    pub kind: String,
+    /// `0` parent, `1` child, `2` summary.
+    pub level: i32,
+    /// Heading-trail context for the chunk.
+    pub section_path: String,
+    /// Canonical, immutable citation text.
+    pub text: String,
+    /// Leading block type (`paragraph`/`heading`/`code`/`table`/…). `None` when
+    /// unknown.
+    pub block_type: Option<String>,
+    /// Character offset of the chunk's start in the source. `None` when unknown.
+    pub char_start: Option<i64>,
+    /// Character offset of the chunk's end in the source. `None` when unknown.
+    pub char_end: Option<i64>,
+    /// JSON source-anchor payload (page/coords for click-to-open). `None` until
+    /// extraction records one.
+    pub source_anchor: Option<String>,
+    /// The contextual text the embedder embeds (context-prefix + canonical body).
+    /// `None` until the enrichment pass populates it.
+    pub embedding_text: Option<String>,
+}
+
+/// Per-(model, dim) embedding-index stats for a notebook, returned to the dev/QA
+/// Embeddings Inspector header (M4).
+///
+/// One row per ACTIVE `embedding_index` registry entry. A notebook may have
+/// MULTIPLE active rows (the partial-unique `uq_embidx_active` keys on
+/// `(notebook_id, model, dim)`), so the inspector header renders one badge per
+/// row rather than assuming a single active index.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, sqlx::FromRow)]
+pub struct EmbeddingStats {
+    /// The embedding model id (e.g. the nomic model).
+    pub model: String,
+    /// The embedding dimensionality.
+    pub dim: i64,
+    /// The registry status (always `"active"` for inspector rows).
+    pub status: String,
+}
+
 /// A notebook row, returned across the IPC boundary.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Notebook {
@@ -1214,6 +1267,47 @@ impl<'a> NotebookRepo<'a> {
         .await?;
         Ok(rows)
     }
+
+    /// Reads every chunk of a source for the dev/QA Embeddings Inspector (M4):
+    /// the full per-chunk metadata the inspector renders. Ordered `level ASC,
+    /// token_start ASC` (matching `list_chunks_for_enrichment`/`_for_reembed`) so
+    /// parents precede their children in document order; the summary node
+    /// (`token_start IS NULL`) sorts last within its level, which is harmless.
+    /// Read-only (SELECT) — never mutates `chunks`.
+    pub async fn list_source_chunks(
+        &self,
+        source_id: &str,
+    ) -> Result<Vec<InspectorChunk>, LensError> {
+        let rows = sqlx::query_as::<_, InspectorChunk>(
+            "SELECT id, parent_id, kind, level, section_path, text, block_type, \
+             char_start, char_end, source_anchor, embedding_text \
+             FROM chunks WHERE source_id = ? ORDER BY level ASC, token_start ASC",
+        )
+        .bind(source_id)
+        .fetch_all(self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Reads the ACTIVE embedding-index stats for a notebook for the dev/QA
+    /// Embeddings Inspector header (M4): one `(model, dim, status)` row per active
+    /// registry entry, ordered by `model ASC`. Returns a `Vec` (NOT an `Option`):
+    /// the partial-unique `uq_embidx_active(notebook_id, model, dim)` permits
+    /// multiple active rows, so a `LIMIT 1` would be non-deterministic. An empty
+    /// `Vec` means the notebook has not been embedded yet. Read-only (SELECT).
+    pub async fn get_embedding_stats(
+        &self,
+        notebook_id: &str,
+    ) -> Result<Vec<EmbeddingStats>, LensError> {
+        let rows = sqlx::query_as::<_, EmbeddingStats>(
+            "SELECT model, dim, status FROM embedding_index \
+             WHERE notebook_id = ? AND status = 'active' ORDER BY model ASC",
+        )
+        .bind(notebook_id)
+        .fetch_all(self.pool)
+        .await?;
+        Ok(rows)
+    }
 }
 
 #[cfg(test)]
@@ -1759,5 +1853,213 @@ mod tests {
     #[tokio::test]
     async fn add_file_source_xml_extension() {
         assert_eq!(kind_for_extension("xml").await, SourceKind::Xml.as_str());
+    }
+
+    // -----------------------------------------------------------------------
+    // M4 Embeddings Inspector (dev/QA) — list_source_chunks + get_embedding_stats
+    // -----------------------------------------------------------------------
+
+    /// Inserts a `chunks` row directly via raw SQL. Bypasses full ingest (which
+    /// needs the tokenizer, skipped offline) so the inspector reads are tested
+    /// deterministically with no model download. `token_start` drives the
+    /// secondary sort; `None` (a summary node) sorts last within its level.
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_chunk_row(
+        pool: &SqlitePool,
+        source_id: &str,
+        id: &str,
+        parent_id: Option<&str>,
+        kind: &str,
+        level: i32,
+        section_path: &str,
+        text: &str,
+        token_start: Option<i64>,
+        char_start: Option<i64>,
+        char_end: Option<i64>,
+        block_type: Option<&str>,
+        source_anchor: Option<&str>,
+        embedding_text: Option<&str>,
+    ) {
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO chunks \
+                 (id, source_id, parent_id, kind, level, section_path, text, \
+                  token_start, token_end, page, char_start, char_end, block_type, \
+                  source_anchor, embedding_text, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(source_id)
+        .bind(parent_id)
+        .bind(kind)
+        .bind(level)
+        .bind(section_path)
+        .bind(text)
+        .bind(token_start)
+        .bind(char_start)
+        .bind(char_end)
+        .bind(block_type)
+        .bind(source_anchor)
+        .bind(embedding_text)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .expect("insert chunk row");
+    }
+
+    /// Inserts an `embedding_index` registry row directly via raw SQL.
+    /// `for_test()` stubs the embed worker, so ingest yields no registry rows —
+    /// the inspector stats read must be seeded directly.
+    async fn insert_embedding_index_row(
+        pool: &SqlitePool,
+        notebook_id: &str,
+        model: &str,
+        dim: i64,
+        status: &str,
+    ) {
+        let id = Uuid::now_v7().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO embedding_index \
+                 (id, notebook_id, model, dim, prefix_convention, lance_table_name, status, created_at) \
+             VALUES (?, ?, ?, ?, 'nomic', ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(notebook_id)
+        .bind(model)
+        .bind(dim)
+        .bind(format!("lance_{model}_{dim}"))
+        .bind(status)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .expect("insert embedding_index row");
+    }
+
+    #[tokio::test]
+    async fn test_list_source_chunks_returns_ordered_chunks() {
+        let pool = test_pool().await;
+        let repo = NotebookRepo::new(&pool);
+        let nb = repo.create("Notebook", None, None).await.unwrap();
+        let src = repo
+            .add_source(&nb.id, "doc.md", "/abs/doc.md")
+            .await
+            .unwrap();
+
+        // Insert ≥3 chunks across levels with varied token_start, deliberately
+        // out of final order so ORDER BY (level ASC, token_start ASC) is exercised.
+        // The parent is inserted first because the children carry a self-FK to it.
+        // parent 0: level 0, token_start 0
+        insert_chunk_row(
+            &pool,
+            &src.id,
+            "parent-0",
+            None,
+            crate::chunk::kind::PARENT,
+            0,
+            "Intro",
+            "parent text",
+            Some(0),
+            Some(0),
+            Some(40),
+            Some("heading"),
+            Some("{\"page\":1}"),
+            Some("Intro: parent text"),
+        )
+        .await;
+        // child b: level 1, token_start 5 (inserted BEFORE child-a so the
+        // token_start sort, not insertion order, decides the result order)
+        insert_chunk_row(
+            &pool,
+            &src.id,
+            "child-b",
+            Some("parent-0"),
+            crate::chunk::kind::CHILD,
+            1,
+            "Intro > B",
+            "child b text",
+            Some(5),
+            Some(50),
+            Some(60),
+            Some("paragraph"),
+            None,
+            None,
+        )
+        .await;
+        // child a: level 1, token_start 1 (must precede child b at the same level)
+        insert_chunk_row(
+            &pool,
+            &src.id,
+            "child-a",
+            Some("parent-0"),
+            crate::chunk::kind::CHILD,
+            1,
+            "Intro > A",
+            "child a text",
+            Some(1),
+            Some(10),
+            Some(20),
+            None,
+            None,
+            Some("Intro: child a text"),
+        )
+        .await;
+
+        let chunks = repo.list_source_chunks(&src.id).await.unwrap();
+        let ids: Vec<&str> = chunks.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["parent-0", "child-a", "child-b"],
+            "ordered by level ASC then token_start ASC"
+        );
+
+        // Field projection is faithful for the parent row.
+        let parent = &chunks[0];
+        assert_eq!(parent.parent_id, None);
+        assert_eq!(parent.kind, crate::chunk::kind::PARENT);
+        assert_eq!(parent.level, 0);
+        assert_eq!(parent.section_path, "Intro");
+        assert_eq!(parent.text, "parent text");
+        assert_eq!(parent.block_type.as_deref(), Some("heading"));
+        assert_eq!(parent.char_start, Some(0));
+        assert_eq!(parent.char_end, Some(40));
+        assert_eq!(parent.source_anchor.as_deref(), Some("{\"page\":1}"));
+        assert_eq!(parent.embedding_text.as_deref(), Some("Intro: parent text"));
+
+        // Nullable columns surface as None on a child with no anchor.
+        let child_a = &chunks[1];
+        assert_eq!(child_a.parent_id.as_deref(), Some("parent-0"));
+        assert_eq!(child_a.block_type, None);
+        assert_eq!(child_a.source_anchor, None);
+
+        // Unknown source_id → empty vec.
+        let empty = repo.list_source_chunks("no-such-source").await.unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_embedding_stats() {
+        let pool = test_pool().await;
+        let repo = NotebookRepo::new(&pool);
+        let nb = repo.create("Notebook", None, None).await.unwrap();
+
+        // (a) No embedding_index rows → empty Vec.
+        let empty = repo.get_embedding_stats(nb.id.as_str()).await.unwrap();
+        assert!(empty.is_empty(), "no rows → empty Vec");
+
+        // (b) Two ACTIVE rows for the SAME notebook with different (model, dim).
+        // Insert out of model order so ORDER BY model ASC is exercised.
+        insert_embedding_index_row(&pool, nb.id.as_str(), "model-z", 768, "active").await;
+        insert_embedding_index_row(&pool, nb.id.as_str(), "model-a", 384, "active").await;
+        // A non-active row for the same notebook must be EXCLUDED.
+        insert_embedding_index_row(&pool, nb.id.as_str(), "model-m", 512, "building").await;
+
+        let stats = repo.get_embedding_stats(nb.id.as_str()).await.unwrap();
+        assert_eq!(stats.len(), 2, "only the 2 active rows, building excluded");
+        assert_eq!(stats[0].model, "model-a", "ordered by model ASC");
+        assert_eq!(stats[0].dim, 384);
+        assert_eq!(stats[0].status, "active");
+        assert_eq!(stats[1].model, "model-z");
+        assert_eq!(stats[1].dim, 768);
     }
 }

@@ -1,8 +1,9 @@
 <script lang="ts">
   import ChevronUp from '@lucide/svelte/icons/chevron-up';
   import Settings from '@lucide/svelte/icons/settings';
+  import Microscope from '@lucide/svelte/icons/microscope';
   import { cn } from '$lib/utils.js';
-  import { getInitials } from '$lib/notebooks/index.js';
+  import { getInitials, notebookStore } from '$lib/notebooks/index.js';
   import ThemeCycleButton from '$lib/components/ThemeCycleButton.svelte';
   import {
     Tooltip,
@@ -160,6 +161,40 @@
         />
         <span class="text-sm text-sidebar-foreground">Switch theme</span>
       </div>
+
+      <!-- Embeddings Inspector — DEV-only dev/QA tool. Disabled (with a tooltip)
+           when there is no active notebook, since the inspector inspects the
+           active notebook's sources only. -->
+      {#if import.meta.env.DEV}
+        {@const noActive = notebookStore.activeNotebookId === null}
+        <TooltipProvider>
+          <Tooltip>
+            <TooltipTrigger
+              class={cn(
+                'flex w-full items-center gap-2.5 px-3 py-2 text-sm select-none',
+                noActive
+                  ? 'cursor-not-allowed text-sidebar-foreground/40'
+                  : 'cursor-pointer text-sidebar-foreground hover:bg-sidebar-accent/60 transition-colors'
+              )}
+              role="menuitem"
+              data-embeddings-inspector-item
+              disabled={noActive}
+              aria-disabled={noActive}
+              onclick={() => {
+                if (noActive) return;
+                notebookStore.inspectorOpen = true;
+                open = false;
+              }}
+            >
+              <Microscope class="size-4 shrink-0" aria-hidden="true" />
+              <span>Embeddings Inspector</span>
+            </TooltipTrigger>
+            {#if noActive}
+              <TooltipContent side="right">No active notebook</TooltipContent>
+            {/if}
+          </Tooltip>
+        </TooltipProvider>
+      {/if}
     </div>
   {/if}
 </div>

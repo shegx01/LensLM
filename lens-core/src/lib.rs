@@ -48,7 +48,9 @@ pub use model_catalog::{
     ModelCatalog, ModelInfo, ProviderEntry, ReasoningOption, SupportedProvider, catalog_cache_path,
     load_catalog, refresh_if_stale,
 };
-pub use notebooks::{Notebook, NotebookId, NotebookSummary, Source};
+pub use notebooks::{
+    EmbeddingStats, InspectorChunk, Notebook, NotebookId, NotebookSummary, Source,
+};
 pub use system_check::{
     ALLOWED_EMBEDDING_MODELS, CheckAction, CheckId, CheckResult, CheckStatus, LlmDetection,
     detect_llm, list_ollama_models, ollama_base_url,
@@ -540,6 +542,30 @@ impl LensEngine {
     pub async fn list_sources(&self, notebook_id: &NotebookId) -> Result<Vec<Source>, LensError> {
         let pool = self.pool().await;
         NotebookRepo::new(&pool).list_sources(notebook_id).await
+    }
+
+    /// Reads a source's chunks (full per-chunk metadata, ordered `level`,
+    /// `token_start`) for the dev/QA Embeddings Inspector (M4). Read-only.
+    #[tracing::instrument(skip_all)]
+    pub async fn list_source_chunks(
+        &self,
+        source_id: &str,
+    ) -> Result<Vec<InspectorChunk>, LensError> {
+        let pool = self.pool().await;
+        NotebookRepo::new(&pool).list_source_chunks(source_id).await
+    }
+
+    /// Reads a notebook's ACTIVE embedding-index stats (one entry per active
+    /// `(model, dim)`) for the dev/QA Embeddings Inspector header (M4). Read-only.
+    #[tracing::instrument(skip_all)]
+    pub async fn get_embedding_stats(
+        &self,
+        notebook_id: &str,
+    ) -> Result<Vec<EmbeddingStats>, LensError> {
+        let pool = self.pool().await;
+        NotebookRepo::new(&pool)
+            .get_embedding_stats(notebook_id)
+            .await
     }
 
     /// Inserts a URL source: inserts a `queued` `sources` row whose `locator` is

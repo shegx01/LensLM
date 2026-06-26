@@ -69,6 +69,9 @@ fn main() {
             // Dev-only streaming demonstrator; absent from the release surface.
             #[cfg(debug_assertions)]
             commands::system::stream_demo,
+            // Dev/QA Embeddings Inspector; absent from the release surface.
+            #[cfg(debug_assertions)]
+            commands::inspector::list_source_chunks,
         ])
         .run(tauri::generate_context!())
         .expect("Fatal Error: Failed to launch the LensLM application context.");
