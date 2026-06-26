@@ -95,7 +95,7 @@ pub trait Embedder: Send + Sync {
     /// input). The default impl just borrows back into [`Embedder::embed_documents`]
     /// so existing implementations keep working unchanged.
     ///
-    /// Every returned vector is length-[`DEFAULT_EMBED_DIM`] and L2-normalized.
+    /// Every returned vector has length [`Embedder::dim`] and is L2-normalized.
     fn embed_documents_owned(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, LensError> {
         let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
         self.embed_documents(&refs)

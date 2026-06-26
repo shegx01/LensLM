@@ -107,7 +107,7 @@ pub struct VectorRow {
     pub notebook_id: String,
     /// Chunk level: `0` = parent, `1` = child.
     pub level: i32,
-    /// The embedding vector. MUST be length [`VECTOR_DIM`].
+    /// The embedding vector. MUST match the coordinate's dim.
     pub vector: Vec<f32>,
 }
 

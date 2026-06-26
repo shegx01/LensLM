@@ -62,6 +62,10 @@ pub struct EmbeddingModelSpec {
 
 /// The complete set of supported embedding models. The first entry is the
 /// default and is what unknown / empty ids resolve to.
+///
+/// SYNC-CHECK: keep in sync with `src/lib/onboarding/system-check.ts`
+/// `EMBEDDING_MODELS`. The ids and dims here must match the TS `EmbeddingModelSpec`
+/// array; also keep `ALLOWED_EMBEDDING_MODELS` in `system_check.rs` in sync.
 pub static REGISTRY: &[EmbeddingModelSpec] = &[
     EmbeddingModelSpec {
         id: "nomic-embed-text-v1.5",
