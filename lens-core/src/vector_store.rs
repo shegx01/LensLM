@@ -83,6 +83,16 @@ const REGISTRY_STATUS_ACTIVE: &str = "active";
 pub static CRASH_AFTER_FLIP_TXN_BEFORE_LANCE_DROP: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// When set to `true`, [`VectorStore::retire_coordinate`] commits the demotion of
+/// the OLD coordinate's `active` row to `stale` and then returns EARLY — BEFORE
+/// dropping the stale Lance table or deleting its row — simulating a process crash
+/// in exactly the crash window the startup-GC must recover (R3). The flag is
+/// consumed (reset to `false`) on use so a single test can arm it once. Compiled
+/// out of production builds.
+#[cfg(feature = "test-util")]
+pub static CRASH_AFTER_RETIRE_STALE_BEFORE_LANCE_DROP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// A single vector row to insert, addressed by its owning logical coordinates.
 ///
 /// `chunk_id` is the SQLite `chunks.id` — the LanceDB→SQLite link is keyed by
@@ -204,6 +214,24 @@ pub trait VectorStore: Send + Sync {
         model: &str,
         dim: usize,
         building_name: &str,
+    ) -> Result<(), LensError>;
+
+    /// Retires an OLD-model coordinate after a model/dim-change re-embed has
+    /// flipped the NEW coordinate `active` (M4 Phase 4b, Step 9 / R3).
+    ///
+    /// The partial-unique `uq_embidx_active` constrains `active` rows per
+    /// coordinate, and the OLD and NEW coordinates differ in `(model, dim)`, so
+    /// both can be `active` simultaneously during the swap; this call removes the
+    /// OLD one afterwards. Three idempotent steps — demote the OLD `active` row to
+    /// `stale` (committed), drop its physical Lance table, delete its registry row.
+    /// A crash between any two leaves a `stale` row + (possibly already-dropped)
+    /// table that the startup-GC `gc_orphan_embedding_tables` reclaims. A no-op
+    /// when the coordinate has no `active` row (already retired).
+    async fn retire_coordinate(
+        &self,
+        notebook: &str,
+        model: &str,
+        dim: usize,
     ) -> Result<(), LensError>;
 }
 
@@ -572,6 +600,47 @@ impl EmbeddingIndexRepo {
 
         tx.commit().await?;
         Ok(stale_name)
+    }
+
+    /// Demotes ONLY the `status='active'` row of a coordinate to `stale`,
+    /// returning its physical `lance_table_name` (or `None` when the coordinate
+    /// has no active row — an idempotent no-op). The retirement counterpart to the
+    /// flip's in-txn demote.
+    ///
+    /// Deliberately distinct from [`set_status`](Self::set_status): `set_status`
+    /// rewrites EVERY row for a coordinate regardless of status (it is used for
+    /// arbitrary lifecycle transitions), whereas retiring an OLD-model coordinate
+    /// must touch the live `active` row only — never a transient `building`/`stale`
+    /// row that may coexist for the same coordinate during a concurrent flip (R3).
+    async fn demote_active_to_stale(
+        &self,
+        notebook: &str,
+        model: &str,
+        dim: usize,
+    ) -> Result<Option<String>, LensError> {
+        let mut tx = self.pool.begin().await?;
+        let active = sqlx::query_scalar::<_, String>(
+            "SELECT lance_table_name FROM embedding_index \
+             WHERE notebook_id = ? AND model = ? AND dim = ? AND status = 'active'",
+        )
+        .bind(notebook)
+        .bind(model)
+        .bind(dim as i64)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if active.is_some() {
+            sqlx::query(
+                "UPDATE embedding_index SET status = 'stale' \
+                 WHERE notebook_id = ? AND model = ? AND dim = ? AND status = 'active'",
+            )
+            .bind(notebook)
+            .bind(model)
+            .bind(dim as i64)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(active)
     }
 
     /// Deletes the registry row naming `table` for a coordinate (the stale row
@@ -1310,6 +1379,44 @@ impl VectorStore for LanceVectorStore {
                 .delete_row_by_table(notebook, model, dim, &stale)
                 .await?;
         }
+        Ok(())
+    }
+
+    async fn retire_coordinate(
+        &self,
+        notebook: &str,
+        model: &str,
+        dim: usize,
+    ) -> Result<(), LensError> {
+        // (1) Demote ONLY the OLD coordinate's active row to stale (committed).
+        // Returns its physical table name, or None when there is nothing to retire
+        // (idempotent no-op — e.g. a retried retire after the GC already swept it).
+        let Some(stale) = self
+            .registry
+            .demote_active_to_stale(notebook, model, dim)
+            .await?
+        else {
+            return Ok(());
+        };
+
+        // ── CRASH WINDOW (R3): the stale Lance drop + the stale registry-row
+        // delete happen AFTER the demote has committed. A crash here leaves a
+        // `stale` row + orphan Lance table that the startup-GC reclaims; the NEW
+        // coordinate's active row (already flipped) keeps serving search.
+        #[cfg(feature = "test-util")]
+        if CRASH_AFTER_RETIRE_STALE_BEFORE_LANCE_DROP
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(());
+        }
+
+        // (2) Drop the stale physical table FIRST (idempotent), then delete its
+        // registry row — so a crash between the two leaves only a dangling `stale`
+        // row whose (already-gone) table the GC drops as a no-op.
+        self.drop_tables(std::slice::from_ref(&stale)).await?;
+        self.registry
+            .delete_row_by_table(notebook, model, dim, &stale)
+            .await?;
         Ok(())
     }
 }
