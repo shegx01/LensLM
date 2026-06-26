@@ -79,7 +79,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use lens_core::chunk::{Chunk, chunk_blocks_deterministic};
-use lens_core::embedder::{EMBED_DIM, EMBED_MODEL_ID, Embedder, FastembedEmbedder};
+use lens_core::embedder::{DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, Embedder, FastembedEmbedder};
 use lens_core::enrichment::{
     CorefSub, apply_substitutions, compose_embedding_text, compose_prefix,
 };
@@ -202,7 +202,9 @@ async fn run() -> Result<ExitCode, LensError> {
     let data_dir = dir.path();
     let pool = engine.pool().await;
 
-    println!("Building embedder ({EMBED_MODEL_ID}); first run downloads ~130 MB from HuggingFace…");
+    println!(
+        "Building embedder ({DEFAULT_EMBED_MODEL_ID}); first run downloads ~130 MB from HuggingFace…"
+    );
     let embedder = FastembedEmbedder::new(data_dir)?;
     let tokenizer = load_tokenizer(&engine).await?;
 
@@ -593,7 +595,7 @@ async fn measure(
         }
         let n = rows.len();
         store
-            .add(notebook_id, EMBED_MODEL_ID, EMBED_DIM, rows)
+            .add(notebook_id, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM, rows)
             .await?;
         println!("ingested {} ({n} rows)", doc.name);
     }
@@ -603,7 +605,13 @@ async fn measure(
     for q in queries {
         let qvec = embedder.embed_query(&q.query)?;
         let results = store
-            .search(notebook_id, EMBED_MODEL_ID, EMBED_DIM, &qvec, K)
+            .search(
+                notebook_id,
+                DEFAULT_EMBED_MODEL_ID,
+                DEFAULT_EMBED_DIM,
+                &qvec,
+                K,
+            )
             .await?;
         let top_ids: Vec<&str> = results.iter().map(|h| h.chunk_id.as_str()).collect();
         let hit = q

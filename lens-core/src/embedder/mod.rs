@@ -45,18 +45,9 @@ pub use registry::{DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, EmbeddingModelSpec
 // ---------------------------------------------------------------------------
 // Public constants
 // ---------------------------------------------------------------------------
-
-/// Canonical model id for the default embedding model used in Phase 1.
-///
-/// Legacy alias of [`DEFAULT_EMBED_MODEL_ID`]; kept until Step 7 renames the
-/// call sites. New code should reference [`DEFAULT_EMBED_MODEL_ID`].
-pub const EMBED_MODEL_ID: &str = DEFAULT_EMBED_MODEL_ID;
-
-/// Output dimension of [`EMBED_MODEL_ID`].
-///
-/// Legacy alias of [`DEFAULT_EMBED_DIM`]; kept until Step 7 renames the call
-/// sites. New code should reference [`DEFAULT_EMBED_DIM`].
-pub const EMBED_DIM: usize = DEFAULT_EMBED_DIM;
+//
+// `DEFAULT_EMBED_MODEL_ID` / `DEFAULT_EMBED_DIM` are re-exported from
+// `registry` above (the single source of truth for the default coordinate).
 
 /// Human-readable record of the prefix convention baked into [`Embedder`].
 /// `"search_document/search_query"` matches the `embedding_index.prefix_convention`
@@ -91,7 +82,7 @@ pub trait Embedder: Send + Sync {
     /// Prepends `"search_document: "` to each input before passing it to the
     /// underlying model.  Returns one `Vec<f32>` per input, in order.
     ///
-    /// Every returned vector is length-[`EMBED_DIM`] and L2-normalized.
+    /// Every returned vector is length-[`DEFAULT_EMBED_DIM`] and L2-normalized.
     fn embed_documents(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, LensError>;
 
     /// Owned-input variant of [`Embedder::embed_documents`] that avoids the
@@ -104,7 +95,7 @@ pub trait Embedder: Send + Sync {
     /// input). The default impl just borrows back into [`Embedder::embed_documents`]
     /// so existing implementations keep working unchanged.
     ///
-    /// Every returned vector is length-[`EMBED_DIM`] and L2-normalized.
+    /// Every returned vector is length-[`DEFAULT_EMBED_DIM`] and L2-normalized.
     fn embed_documents_owned(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, LensError> {
         let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
         self.embed_documents(&refs)
@@ -114,7 +105,7 @@ pub trait Embedder: Send + Sync {
     ///
     /// Prepends `"search_query: "` to the input before passing it to the
     /// underlying model.  Returns one L2-normalized `Vec<f32>` of length
-    /// [`EMBED_DIM`].
+    /// [`DEFAULT_EMBED_DIM`].
     fn embed_query(&self, text: &str) -> Result<Vec<f32>, LensError>;
 }
 
@@ -476,8 +467,8 @@ mod tests {
 
     #[test]
     fn constants_are_correct() {
-        assert_eq!(EMBED_MODEL_ID, "nomic-embed-text-v1.5");
-        assert_eq!(EMBED_DIM, 768);
+        assert_eq!(DEFAULT_EMBED_MODEL_ID, "nomic-embed-text-v1.5");
+        assert_eq!(DEFAULT_EMBED_DIM, 768);
         assert_eq!(PREFIX_CONVENTION, "search_document/search_query");
     }
 
@@ -486,8 +477,8 @@ mod tests {
     #[test]
     fn counting_embedder_model_id_and_dim() {
         let e = make_embedder();
-        assert_eq!(e.model_id(), EMBED_MODEL_ID);
-        assert_eq!(e.dim(), EMBED_DIM);
+        assert_eq!(e.model_id(), DEFAULT_EMBED_MODEL_ID);
+        assert_eq!(e.dim(), DEFAULT_EMBED_DIM);
     }
 
     #[test]
@@ -523,7 +514,7 @@ mod tests {
         let vecs = e.embed_documents(&texts).unwrap();
         assert_eq!(vecs.len(), 3);
         for v in &vecs {
-            assert_eq!(v.len(), EMBED_DIM);
+            assert_eq!(v.len(), DEFAULT_EMBED_DIM);
         }
     }
 
@@ -544,7 +535,7 @@ mod tests {
     fn embed_query_returns_correct_dim_and_is_normalized() {
         let e = make_embedder();
         let v = e.embed_query("what is the meaning of life?").unwrap();
-        assert_eq!(v.len(), EMBED_DIM);
+        assert_eq!(v.len(), DEFAULT_EMBED_DIM);
         let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!(
             (norm - 1.0).abs() < 1e-3,

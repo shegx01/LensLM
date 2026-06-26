@@ -542,14 +542,14 @@ async fn purge_notebook_drops_lance_table() {
     store
         .add(
             nb.id.as_str(),
-            lens_core::EMBED_MODEL_ID,
-            lens_core::EMBED_DIM,
+            lens_core::DEFAULT_EMBED_MODEL_ID,
+            lens_core::DEFAULT_EMBED_DIM,
             vec![VectorRow {
                 chunk_id: Uuid::now_v7().to_string(),
                 source_id: Uuid::now_v7().to_string(),
                 notebook_id: nb.id.to_string(),
                 level: 0,
-                vector: vec![0.0; lens_core::EMBED_DIM],
+                vector: vec![0.0; lens_core::DEFAULT_EMBED_DIM],
             }],
         )
         .await

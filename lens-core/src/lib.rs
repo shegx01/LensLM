@@ -28,8 +28,8 @@ pub mod vector_store;
 
 pub use config::{AppConfig, EnrichmentConfig, TaskModel};
 pub use embedder::{
-    CountingEmbedder, DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, EMBED_DIM, EMBED_MODEL_ID,
-    Embedder, EmbeddingModelSpec, FastembedEmbedder, resolve,
+    CountingEmbedder, DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, Embedder, EmbeddingModelSpec,
+    FastembedEmbedder, resolve,
 };
 pub use embedding::{InstallProgress, pull_embedding_model};
 pub use enrichment::{ENRICHMENT_QUEUE_CAPACITY, EnrichmentJob};
@@ -64,12 +64,13 @@ pub use vector_store::{LanceVectorStore, VectorStore};
 /// `pub(crate)` `db` module.
 pub use db::run_migrations;
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
 use sqlx::SqlitePool;
 use tokenizers::Tokenizer;
-use tokio::sync::{OnceCell, RwLock, RwLockReadGuard, RwLockWriteGuard, Semaphore, mpsc};
+use tokio::sync::{Mutex, OnceCell, RwLock, RwLockReadGuard, RwLockWriteGuard, Semaphore, mpsc};
 
 use crate::notebooks::{EnrichmentStatus, NotebookRepo};
 
@@ -125,11 +126,29 @@ pub struct LensEngineInner {
 #[derive(Clone)]
 pub struct LensEngine {
     inner: Arc<RwLock<LensEngineInner>>,
-    /// Lazily-constructed, shared embedding model (Decision D1 / M2).
+    /// Lazily-constructed, shared embedding models, keyed by model id
+    /// (Decision D1 / M2, generalized for M4 Phase 4b per-notebook models — R8).
     ///
     /// Lives OUTSIDE the `RwLock` so a model load never serializes DB reads.
-    /// Built exactly once via [`LensEngine::embedder`]'s `get_or_try_init`.
-    embedder: Arc<OnceCell<Arc<dyn Embedder>>>,
+    /// Each entry is built exactly once via [`LensEngine::embedder_for`]; the
+    /// same `Arc<dyn Embedder>` is then shared across every ingest/query that
+    /// resolves to that model id.
+    ///
+    /// ## R8 — RAM cost of holding multiple models
+    ///
+    /// A notebook now carries its own embedding model, so different notebooks
+    /// can resolve to different models in the same session. The cache holds every
+    /// model that has been touched, each a live ONNX session (~130 MB for nomic
+    /// up to ~1.3 GB for the larger models). There is intentionally NO eviction
+    /// cap or LRU here: bounding the cache (and unloading idle sessions) is
+    /// deferred to M9. In practice the working set is the handful of models the
+    /// open notebooks use.
+    ///
+    /// Concurrent `embedder_for` calls for the SAME key serialize on the
+    /// `Mutex` so a model is constructed exactly once even under a race — the
+    /// second caller waits, then finds the cached entry. This is intended: the
+    /// expensive ONNX init must not run twice for one key.
+    embedders: Arc<Mutex<HashMap<String, Arc<dyn Embedder>>>>,
     /// Lazily-resolved, shared nomic tokenizer (parallel to `embedder`).
     ///
     /// The nomic `tokenizer.json` is a multi-MB file; resolving it per-ingest
@@ -292,7 +311,7 @@ impl LensEngine {
 
         let engine = Self {
             inner: Arc::new(RwLock::new(LensEngineInner { db, config })),
-            embedder: Arc::new(OnceCell::new()),
+            embedders: Arc::new(Mutex::new(HashMap::new())),
             tokenizer: Arc::new(OnceCell::new()),
             ingest_lock: Arc::new(Semaphore::new(1)),
             enrichment_tx,
@@ -379,7 +398,7 @@ impl LensEngine {
                 db,
                 config: AppConfig::default(),
             })),
-            embedder: Arc::new(OnceCell::new()),
+            embedders: Arc::new(Mutex::new(HashMap::new())),
             tokenizer: Arc::new(OnceCell::new()),
             ingest_lock: Arc::new(Semaphore::new(1)),
             enrichment_tx,
@@ -609,9 +628,13 @@ impl LensEngine {
             .get_source(source_id)
             .await?
             .ok_or_else(|| LensError::Validation(format!("no source with id {source_id}")))?;
+        // Resolve the OWNING notebook's embedding coordinate (R1) so the drop
+        // targets the right per-notebook table instead of the global default.
+        let notebook_id = NotebookId::from(source.notebook_id.clone());
+        let (model, dim) = self.resolve_notebook_embedding(&notebook_id).await?;
         let store = crate::vector_store::LanceVectorStore::new(&data_dir, pool.clone());
         store
-            .drop_source(&source.notebook_id, EMBED_MODEL_ID, EMBED_DIM, source_id)
+            .drop_source(&source.notebook_id, &model, dim, source_id)
             .await?;
         NotebookRepo::new(&pool).purge_source(source_id).await?;
         // Best-effort: remove the managed source file AND its `.extracted.txt`
@@ -969,13 +992,19 @@ impl LensEngine {
         self.enrichment_tx.capacity()
     }
 
-    /// Test-only seam: pre-fills the embedder `OnceCell` with a caller-supplied
+    /// Test-only seam: pre-fills the keyed embedder cache with a caller-supplied
     /// [`Embedder`] so integration tests can inject a `CountingEmbedder` (and so
     /// avoid the ~130 MB `FastembedEmbedder` model download).
     ///
+    /// The embedder is registered under its own [`Embedder::model_id`], so a
+    /// later [`embedder_for`](Self::embedder_for) for that id returns this
+    /// injected instance instead of building a real model. Inject one per model a
+    /// test exercises (e.g. a default-nomic embedder AND a 1024-dim mxbai
+    /// embedder, each under its own key).
+    ///
     /// Gated behind the `test-util` feature so it is NEVER present in a
-    /// production build. Returns `Err` if the embedder was already initialized
-    /// (e.g. a prior `ingest_source` already lazily constructed the real model).
+    /// production build. Returns `Err` if an embedder is already cached for that
+    /// model id (e.g. a prior `ingest_source` already lazily constructed it).
     ///
     /// The injected embedder is shared exactly like the lazily-constructed one,
     /// so the cached-once AC (`load_count == 1` across two ingests) and the
@@ -983,32 +1012,102 @@ impl LensEngine {
     /// the same `Arc` the pipeline reuses.
     #[cfg(feature = "test-util")]
     pub fn set_embedder_for_test(&self, embedder: Arc<dyn Embedder>) -> Result<(), LensError> {
-        self.embedder
-            .set(embedder)
-            .map_err(|_| LensError::Internal("embedder already initialized".into()))
+        let key = embedder.model_id().to_string();
+        // `try_lock` (not `blocking_lock`) keeps this a sync fn that is safe to
+        // call from inside a `#[tokio::test]` async context: the cache is
+        // uncontended at injection time, so the lock is always immediately
+        // available.
+        let mut cache = self
+            .embedders
+            .try_lock()
+            .map_err(|e| LensError::Internal(format!("embedder cache busy: {e}")))?;
+        if cache.contains_key(&key) {
+            return Err(LensError::Internal(format!(
+                "embedder already initialized for model {key}"
+            )));
+        }
+        cache.insert(key, embedder);
+        Ok(())
     }
 
-    /// Lazily constructs (once) and returns the shared embedding model.
+    /// Test-only seam: returns the cached/lazily-built embedder for `model_id`
+    /// (the `pub(crate)` [`embedder_for`](Self::embedder_for) is not reachable
+    /// from the integration-test crate). Gated behind `test-util`.
+    #[cfg(feature = "test-util")]
+    pub async fn embedder_for_test_get(
+        &self,
+        model_id: &str,
+    ) -> Result<Arc<dyn Embedder>, LensError> {
+        self.embedder_for(model_id).await
+    }
+
+    /// Lazily constructs (once per model id) and returns the shared embedder for
+    /// `model_id`, caching it in the keyed embedder cache (R8).
     ///
-    /// The first caller builds a [`FastembedEmbedder`] over `{data_dir}/models/
-    /// fastembed/` (a ~130 MB ONNX session, with a one-time HuggingFace download
-    /// on a cold cache); subsequent callers reuse the cached `Arc`. The
-    /// construction runs under [`tokio::task::spawn_blocking`] because fastembed
-    /// init is synchronous and CPU/IO-heavy.
-    pub(crate) async fn embedder(&self) -> Result<Arc<dyn Embedder>, LensError> {
-        self.embedder
-            .get_or_try_init(|| async {
-                let data_dir = self.data_dir().await;
-                let embedder =
-                    tokio::task::spawn_blocking(move || FastembedEmbedder::new(&data_dir))
-                        .await
-                        .map_err(|e| {
-                            LensError::Model(format!("embedder init task panicked: {e}"))
-                        })??;
-                Ok::<Arc<dyn Embedder>, LensError>(Arc::new(embedder))
-            })
-            .await
-            .cloned()
+    /// On a cache hit the cached `Arc` is cloned and returned. On a miss the
+    /// model id is resolved through the registry ([`crate::embedder::resolve`],
+    /// which falls back to the default for an unknown/empty id) and a
+    /// [`FastembedEmbedder`] is built for that spec over `{data_dir}/models/
+    /// fastembed/` (a ~130 MB–1.3 GB ONNX session, with a one-time HuggingFace
+    /// download on a cold cache). Construction runs under
+    /// [`tokio::task::spawn_blocking`] because fastembed init is synchronous and
+    /// CPU/IO-heavy.
+    ///
+    /// The cache is keyed by the *resolved* spec id so the legacy alias and an
+    /// unknown id both collapse onto the canonical entry rather than building
+    /// duplicate sessions. The whole construct-and-insert runs while holding the
+    /// cache `Mutex`, so concurrent callers for the same key serialize: the
+    /// expensive init runs exactly once (see the field's R8 doc).
+    pub(crate) async fn embedder_for(
+        &self,
+        model_id: &str,
+    ) -> Result<Arc<dyn Embedder>, LensError> {
+        let spec = crate::embedder::resolve(model_id);
+        let key = spec.id.to_string();
+        let mut cache = self.embedders.lock().await;
+        if let Some(existing) = cache.get(&key) {
+            return Ok(Arc::clone(existing));
+        }
+        let data_dir = self.data_dir().await;
+        // `spec` is a `&'static EmbeddingModelSpec` (Copy), so the closure can
+        // capture it directly without a clone or move of `key`.
+        let embedder =
+            tokio::task::spawn_blocking(move || FastembedEmbedder::new_with_spec(&data_dir, spec))
+                .await
+                .map_err(|e| LensError::Model(format!("embedder init task panicked: {e}")))??;
+        let embedder: Arc<dyn Embedder> = Arc::new(embedder);
+        cache.insert(key, Arc::clone(&embedder));
+        Ok(embedder)
+    }
+
+    /// Resolves a notebook's configured embedding model to its `(model_id, dim)`
+    /// coordinate components (R1).
+    ///
+    /// This is the SINGLE read-path entry point every query / ingest / re-embed
+    /// caller resolves through before touching the vector store: it reads the
+    /// notebook row's `embedding_model` (NULL/absent for pre-migration rows) and
+    /// runs it through the registry ([`crate::embedder::resolve`]), which falls
+    /// back to the default ([`DEFAULT_EMBED_MODEL_ID`]) for a NULL, empty, or
+    /// unknown value. The returned id is the *canonical* registry id (the legacy
+    /// alias and unknown ids collapse onto a canonical entry), so it is safe to
+    /// thread straight into [`embedder_for`](Self::embedder_for) and the
+    /// `VectorStore` coordinate APIs.
+    ///
+    /// The backend is implicitly `fastembed` in Phase 4b-A (it is NOT part of the
+    /// coordinate); a backend dimension lands with the selector UI in 4b-B.
+    pub async fn resolve_notebook_embedding(
+        &self,
+        notebook_id: &NotebookId,
+    ) -> Result<(String, usize), LensError> {
+        let pool = self.pool().await;
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT embedding_model FROM notebooks WHERE id = ?")
+                .bind(notebook_id.as_str())
+                .fetch_optional(&pool)
+                .await?
+                .flatten();
+        let spec = crate::embedder::resolve(stored.as_deref().unwrap_or(""));
+        Ok((spec.id.to_string(), spec.dim))
     }
 
     /// Lazily resolves (once) and returns the shared nomic tokenizer.
@@ -1016,7 +1115,7 @@ impl LensEngine {
     /// The first caller resolves the nomic `tokenizer.json` via the shared
     /// [`resolve_nomic_tokenizer`] resolver (locating a cached copy or
     /// downloading it once); subsequent callers reuse the cached `Arc`. This
-    /// mirrors [`LensEngine::embedder`] so the multi-MB tokenizer is parsed
+    /// mirrors [`LensEngine::embedder_for`] so the multi-MB tokenizer is parsed
     /// from disk exactly once per engine rather than on every ingest.
     pub(crate) async fn tokenizer(&self) -> Result<Arc<Tokenizer>, LensError> {
         #[cfg(feature = "test-util")]

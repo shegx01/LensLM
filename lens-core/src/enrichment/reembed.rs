@@ -28,7 +28,6 @@
 //! table that the startup-GC also reclaims (idempotently — a missing table is a
 //! no-op). The `active` row always points at a COMPLETE table at every boundary.
 
-use crate::embedder::{EMBED_DIM, EMBED_MODEL_ID};
 use crate::notebooks::{EnrichmentStatus, NotebookRepo, ReembedChunk};
 use crate::vector_store::{LanceVectorStore, VectorRow, VectorStore};
 use crate::{LensEngine, LensError};
@@ -70,14 +69,23 @@ pub(crate) async fn reembed_and_flip(
         return Ok(());
     }
 
+    // Resolve the OWNING notebook's embedding coordinate (R1) so this same-model
+    // re-embed builds, seeds, populates, and flips the notebook's OWN coordinate
+    // (model + dim) rather than the global default. The cross-model switch (a new
+    // coordinate) lands in Step 9; here the source's notebook always re-embeds
+    // under whatever model it is currently configured with.
+    let (embed_model, embed_dim) = engine
+        .resolve_notebook_embedding(&crate::NotebookId::from(notebook.to_string()))
+        .await?;
+
     // ── (3) Embed into a PRIVATE building table — LOCK-FREE (search reads only the
     // active table). The embedder `Mutex` is the only serialization point.
-    let embedder = engine.embedder().await?;
+    let embedder = engine.embedder_for(&embed_model).await?;
     let data_dir = engine.data_dir().await;
     let store = LanceVectorStore::new(&data_dir, pool.clone());
 
     let building_name = store
-        .create_building_table(notebook, EMBED_MODEL_ID, EMBED_DIM)
+        .create_building_table(notebook, &embed_model, embed_dim)
         .await?;
 
     // Seed the building table with every OTHER source's current vectors so this
@@ -96,13 +104,7 @@ pub(crate) async fn reembed_and_flip(
     // reworks this orchestration — kept out of this hotfix to preserve the
     // sub-second lock window (the seed copy is unbounded in size).
     store
-        .seed_building_from_active(
-            notebook,
-            EMBED_MODEL_ID,
-            EMBED_DIM,
-            &building_name,
-            source_id,
-        )
+        .seed_building_from_active(notebook, &embed_model, embed_dim, &building_name, source_id)
         .await?;
 
     for batch in chunks.chunks(REEMBED_BATCH) {
@@ -129,7 +131,7 @@ pub(crate) async fn reembed_and_flip(
                 vector,
             })
             .collect();
-        store.add_to_table(&building_name, rows, EMBED_DIM).await?;
+        store.add_to_table(&building_name, rows, embed_dim).await?;
     }
 
     // Test-only seam: pause here (after the lock-free populate, before the flip
@@ -170,7 +172,7 @@ pub(crate) async fn reembed_and_flip(
         }
 
         store
-            .flip_active(notebook, EMBED_MODEL_ID, EMBED_DIM, &building_name)
+            .flip_active(notebook, &embed_model, embed_dim, &building_name)
             .await?;
     }
 
