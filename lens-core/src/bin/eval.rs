@@ -79,13 +79,13 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use lens_core::chunk::{Chunk, chunk_blocks_deterministic};
-use lens_core::embedder::{DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, Embedder, FastembedEmbedder};
+use lens_core::embedder::{DEFAULT_EMBED_MODEL_ID, Embedder, FastembedEmbedder};
 use lens_core::enrichment::{
     CorefSub, apply_substitutions, compose_embedding_text, compose_prefix,
 };
 use lens_core::parse::{SourceKind, parse_blocks};
 use lens_core::vector_store::{LanceVectorStore, VectorRow, VectorStore};
-use lens_core::{LensEngine, LensError};
+use lens_core::{EmbeddingModelSpec, LensEngine, LensError};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokenizers::Tokenizer;
@@ -182,6 +182,18 @@ async fn run() -> Result<ExitCode, LensError> {
     let fixtures_dir = eval_fixtures_dir();
     let enriched_mode = std::env::args().any(|a| a == "--enriched");
 
+    // Parse --model <id> (default: DEFAULT_EMBED_MODEL_ID = nomic-embed-text-v1.5).
+    let model_id: String = {
+        let args: Vec<String> = std::env::args().collect();
+        args.windows(2)
+            .find(|w| w[0] == "--model")
+            .map(|w| w[1].clone())
+            .unwrap_or_else(|| DEFAULT_EMBED_MODEL_ID.to_string())
+    };
+    // Resolve the spec (unknown id falls back to nomic — same behaviour as the
+    // engine; the eval header will print the actual model used).
+    let spec: &'static EmbeddingModelSpec = lens_core::resolve(&model_id);
+
     // Authoring aid: dump deterministic ids and exit (no embedding/search).
     if std::env::args().any(|a| a == "--print-ids") {
         let dir = tempfile::tempdir().map_err(|e| LensError::Io(e.to_string()))?;
@@ -203,10 +215,13 @@ async fn run() -> Result<ExitCode, LensError> {
     let pool = engine.pool().await;
 
     println!(
-        "Building embedder ({DEFAULT_EMBED_MODEL_ID}); first run downloads ~130 MB from HuggingFace…"
+        "Building embedder ({}); first run downloads weights from HuggingFace…",
+        spec.id
     );
-    let embedder = FastembedEmbedder::new(data_dir)?;
+    let embedder = FastembedEmbedder::new_with_spec(data_dir, spec)?;
     let tokenizer = load_tokenizer(&engine).await?;
+
+    println!("Active embedding model : {} (dim={})", spec.id, spec.dim);
 
     // ── Main corpus: raw path always; enriched paths only under --enriched. ──
     let main_docs = load_corpus(&fixtures_dir, MAIN_DOCS)?;
@@ -225,6 +240,7 @@ async fn run() -> Result<ExitCode, LensError> {
             &main_docs,
             &main_queries,
             EmbedMode::Raw,
+            spec,
         )
         .await?;
         report_recall("raw", raw.hits, raw.total);
@@ -261,6 +277,7 @@ async fn run() -> Result<ExitCode, LensError> {
         &main_docs,
         &main_queries,
         EmbedMode::Raw,
+        spec,
     )
     .await?;
     report_recall("raw", main_raw.hits, main_raw.total);
@@ -275,6 +292,7 @@ async fn run() -> Result<ExitCode, LensError> {
         &main_docs,
         &main_queries,
         EmbedMode::PrefixOnly,
+        spec,
     )
     .await?;
     report_recall("prefix-only", main_prefix.hits, main_prefix.total);
@@ -293,6 +311,7 @@ async fn run() -> Result<ExitCode, LensError> {
         &pronoun_docs,
         &pronoun_queries,
         EmbedMode::Raw,
+        spec,
     )
     .await?;
     report_recall("raw", pron_raw.hits, pron_raw.total);
@@ -307,6 +326,7 @@ async fn run() -> Result<ExitCode, LensError> {
         &pronoun_docs,
         &pronoun_queries,
         EmbedMode::PrefixOnly,
+        spec,
     )
     .await?;
     report_recall("prefix-only", pron_prefix.hits, pron_prefix.total);
@@ -325,6 +345,7 @@ async fn run() -> Result<ExitCode, LensError> {
         &coref_docs,
         &coref_queries,
         EmbedMode::Raw,
+        spec,
     )
     .await?;
     report_recall("raw", coref_raw.hits, coref_raw.total);
@@ -339,6 +360,7 @@ async fn run() -> Result<ExitCode, LensError> {
         &coref_docs,
         &coref_queries,
         EmbedMode::PrefixOnly,
+        spec,
     )
     .await?;
     report_recall("prefix-only", coref_prefix.hits, coref_prefix.total);
@@ -353,6 +375,7 @@ async fn run() -> Result<ExitCode, LensError> {
         &coref_docs,
         &coref_queries,
         EmbedMode::PrefixCoref,
+        spec,
     )
     .await?;
     report_recall("prefix+coref", coref_full.hits, coref_full.total);
@@ -517,6 +540,7 @@ async fn measure(
     docs: &[Doc],
     queries: &[Query],
     mode: EmbedMode,
+    spec: &'static EmbeddingModelSpec,
 ) -> Result<Recall, LensError> {
     let store = LanceVectorStore::new(data_dir, pool.clone());
     let notebook = engine
@@ -594,9 +618,7 @@ async fn measure(
             });
         }
         let n = rows.len();
-        store
-            .add(notebook_id, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM, rows)
-            .await?;
+        store.add(notebook_id, spec.id, spec.dim, rows).await?;
         println!("ingested {} ({n} rows)", doc.name);
     }
 
@@ -605,13 +627,7 @@ async fn measure(
     for q in queries {
         let qvec = embedder.embed_query(&q.query)?;
         let results = store
-            .search(
-                notebook_id,
-                DEFAULT_EMBED_MODEL_ID,
-                DEFAULT_EMBED_DIM,
-                &qvec,
-                K,
-            )
+            .search(notebook_id, spec.id, spec.dim, &qvec, K)
             .await?;
         let top_ids: Vec<&str> = results.iter().map(|h| h.chunk_id.as_str()).collect();
         let hit = q
