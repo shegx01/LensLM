@@ -848,7 +848,7 @@ impl<'a> NotebookRepo<'a> {
             Some("pdf") => (SourceKind::Pdf.as_str(), "pdf"),
             Some("docx") => (SourceKind::Docx.as_str(), "docx"),
             Some("txt") => (SourceKind::Text.as_str(), "txt"),
-            Some("md") | Some("markdown") => (SourceKind::Markdown.as_str(), "md"),
+            Some("md") | Some("markdown") | Some("mdx") => (SourceKind::Markdown.as_str(), "md"),
             // Structured formats (M4 Phase 2.5c). The canonical managed-file
             // extension preserves the original so the on-disk locator round-trips.
             Some("json") => (SourceKind::Json.as_str(), "json"),
@@ -860,7 +860,7 @@ impl<'a> NotebookRepo<'a> {
             other => {
                 return Err(LensError::Validation(format!(
                     "unsupported file extension {other:?} for {}; expected one of \
-                     \".pdf\", \".docx\", \".txt\", \".md\", \".markdown\", \".json\", \
+                     \".pdf\", \".docx\", \".txt\", \".md\", \".markdown\", \".mdx\", \".json\", \
                      \".jsonl\", \".ndjson\", \".yaml\", \".yml\", \".xml\"",
                     src_path.display()
                 )));
@@ -1853,6 +1853,15 @@ mod tests {
     #[tokio::test]
     async fn add_file_source_xml_extension() {
         assert_eq!(kind_for_extension("xml").await, SourceKind::Xml.as_str());
+    }
+
+    #[tokio::test]
+    async fn add_file_source_mdx_extension() {
+        // MDX is a Markdown superset — treated as Markdown for extraction.
+        assert_eq!(
+            kind_for_extension("mdx").await,
+            SourceKind::Markdown.as_str()
+        );
     }
 
     // -----------------------------------------------------------------------
