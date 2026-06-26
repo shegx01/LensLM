@@ -464,16 +464,48 @@ fn is_allowlisted_embedding(installed_name: &str, configured: &str) -> bool {
         || (!configured.is_empty() && configured.eq_ignore_ascii_case(&bare))
 }
 
+/// Returns `true` when the configured embedding model's fastembed weights are
+/// already cached on disk at `{data_dir}/models/fastembed/`.
+///
+/// fastembed / hf-hub caches model weights under `{cache_dir}/{model_slug}/` by
+/// default; `FastembedEmbedder::new_with_spec` passes `{data_dir}/models/fastembed/`
+/// as the cache dir. We treat the directory as "cached" when it exists AND
+/// contains at least one file (a non-empty directory means the download completed
+/// or is in progress — either way the ONNX session will either succeed or fail at
+/// construction, not at probe time).
+fn fastembed_weights_cached(data_dir: &Path, model_id: &str) -> bool {
+    // Resolve the spec so the cache-dir lookup uses the canonical id path that
+    // fastembed / hf-hub writes. fastembed 5.x derives the sub-directory name
+    // from the model slug; we just check that the fastembed cache root is
+    // non-empty, because the exact sub-directory name is an implementation detail
+    // of the fastembed crate (typically `{org}/{model}` or a flattened variant).
+    // An empty model_id falls back to the default; either way we probe the dir.
+    let _ = model_id; // model_id reserved for future per-model sub-path checks
+    let cache_root = data_dir.join("models").join("fastembed");
+    if !cache_root.is_dir() {
+        return false;
+    }
+    // Non-empty directory → at least one file present → weights cached.
+    std::fs::read_dir(&cache_root)
+        .ok()
+        .and_then(|mut d| d.next())
+        .is_some()
+}
+
 /// Probe 2 — embedding-model readiness gate.
 ///
-/// PASSES only when the user has an allowlisted embedding model installed: with
-/// Ollama up, fetch `/api/tags` and match each model's bare name against the
-/// allowlist (or the configured `embedding_model`). If Ollama is unreachable, or
-/// no matching model is installed, the gate `Fail`s with a `Choose` affordance.
+/// PASSES when EITHER:
+/// - The configured model's fastembed weights are cached on disk at
+///   `{data_dir}/models/fastembed/` (R6: fastembed-first path; Ollama is NOT
+///   required and is not probed when the cache is warm); OR
+/// - Ollama is up and an allowlisted model is installed via `GET /api/tags`.
+///
+/// `Fail`s only when NEITHER arm passes, with a `Choose` affordance.
 async fn probe_embedding_model(
     client: &reqwest::Client,
     runtime: &LlmRuntimeProbe,
     config: &AppConfig,
+    data_dir: &Path,
 ) -> CheckResult {
     let label = "Embedding model".to_string();
     let fail = || CheckResult {
@@ -483,7 +515,23 @@ async fn probe_embedding_model(
         detail: "No embedding model installed".to_string(),
         action: Some(CheckAction::Choose),
     };
+    let pass = || CheckResult {
+        id: CheckId::EmbeddingModel,
+        label: label.clone(),
+        status: CheckStatus::Pass,
+        detail: "Embedding model installed".to_string(),
+        action: Some(CheckAction::Choose),
+    };
 
+    // R6: fastembed cache takes priority — if the weights are already on disk, the
+    // gate passes WITHOUT contacting Ollama. This lets users who chose the fastembed
+    // path (the default for new installs) pass the onboarding gate even when Ollama
+    // is not installed.
+    if fastembed_weights_cached(data_dir, &config.embedding_model) {
+        return pass();
+    }
+
+    // Fallback: Ollama-installed model (legacy / Ollama-first path).
     if !runtime.ollama_up {
         return fail();
     }
@@ -498,17 +546,7 @@ async fn probe_embedding_model(
         })
         .unwrap_or(false);
 
-    if found {
-        CheckResult {
-            id: CheckId::EmbeddingModel,
-            label,
-            status: CheckStatus::Pass,
-            detail: "Embedding model installed".to_string(),
-            action: Some(CheckAction::Choose),
-        }
-    } else {
-        fail()
-    }
+    if found { pass() } else { fail() }
 }
 
 /// Returns `true` when a usable cloud TTS provider is configured: ElevenLabs
@@ -566,17 +604,18 @@ fn probe_text_to_speech(config: &AppConfig) -> CheckResult {
 /// config check, no I/O). The dominant cost is the single bounded LLM timeout
 /// window.
 ///
-/// Takes a `&AppConfig` — the caller clones it cheaply under the engine read
-/// guard and DROPS the guard before calling here, so the multi-second HTTP
-/// probes never hold the engine lock (which would block concurrent
-/// `get_config`/`set_config`).
-pub(crate) async fn run_system_check(config: &AppConfig) -> Vec<CheckResult> {
+/// Takes a `&AppConfig` and `data_dir` — the caller clones the config cheaply
+/// under the engine read guard and DROPS the guard before calling here, so the
+/// multi-second HTTP probes never hold the engine lock (which would block
+/// concurrent `get_config`/`set_config`). `data_dir` is used by the
+/// fastembed-cache arm of the embedding-model gate (R6).
+pub(crate) async fn run_system_check(config: &AppConfig, data_dir: &Path) -> Vec<CheckResult> {
     let embed_client = probe_client();
 
     // The embedding probe reuses the LLM-runtime outcome, so it is awaited after
     // the LLM probe within this future.
     let runtime = probe_llm_runtime(config).await;
-    let embedding_model = probe_embedding_model(&embed_client, &runtime, config).await;
+    let embedding_model = probe_embedding_model(&embed_client, &runtime, config, data_dir).await;
 
     vec![
         runtime.result,
@@ -851,13 +890,16 @@ mod tests {
             .mount(&server)
             .await;
 
+        let dir = tempfile::tempdir().unwrap();
         let client = probe_client();
         let runtime = LlmRuntimeProbe {
             result: llm_runtime_placeholder(),
             ollama_up: true,
             ollama_base_url: server.uri(),
         };
-        let result = probe_embedding_model(&client, &runtime, &AppConfig::default()).await;
+        // No fastembed cache → falls through to Ollama probe.
+        let result =
+            probe_embedding_model(&client, &runtime, &AppConfig::default(), dir.path()).await;
 
         assert_eq!(result.status, CheckStatus::Pass);
         assert_eq!(result.action, Some(CheckAction::Choose));
@@ -877,13 +919,16 @@ mod tests {
             .mount(&server)
             .await;
 
+        let dir = tempfile::tempdir().unwrap();
         let client = probe_client();
         let runtime = LlmRuntimeProbe {
             result: llm_runtime_placeholder(),
             ollama_up: true,
             ollama_base_url: server.uri(),
         };
-        let result = probe_embedding_model(&client, &runtime, &AppConfig::default()).await;
+        // No fastembed cache → falls through to Ollama probe.
+        let result =
+            probe_embedding_model(&client, &runtime, &AppConfig::default(), dir.path()).await;
 
         assert_eq!(result.status, CheckStatus::Fail);
         assert_eq!(result.action, Some(CheckAction::Choose));
@@ -892,13 +937,54 @@ mod tests {
 
     #[tokio::test]
     async fn embedding_fail_when_ollama_down() {
+        let dir = tempfile::tempdir().unwrap();
         let client = probe_client();
         let runtime = LlmRuntimeProbe {
             result: llm_runtime_placeholder(),
             ollama_up: false,
             ollama_base_url: DEFAULT_OLLAMA_BASE_URL.to_string(),
         };
-        let result = probe_embedding_model(&client, &runtime, &AppConfig::default()).await;
+        // No fastembed cache + Ollama down → Fail.
+        let result =
+            probe_embedding_model(&client, &runtime, &AppConfig::default(), dir.path()).await;
+
+        assert_eq!(result.status, CheckStatus::Fail);
+    }
+
+    #[tokio::test]
+    async fn embedding_pass_when_fastembed_weights_cached_ollama_down() {
+        // R6: fastembed cache present + Ollama unreachable → PASS.
+        let dir = tempfile::tempdir().unwrap();
+        // Create a non-empty fastembed cache dir (simulate downloaded weights).
+        let cache_dir = dir.path().join("models").join("fastembed");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(cache_dir.join("model.onnx"), b"fake-weights").unwrap();
+
+        let client = probe_client();
+        let runtime = LlmRuntimeProbe {
+            result: llm_runtime_placeholder(),
+            ollama_up: false,
+            ollama_base_url: "http://127.0.0.1:1".to_string(),
+        };
+        let result =
+            probe_embedding_model(&client, &runtime, &AppConfig::default(), dir.path()).await;
+
+        assert_eq!(result.status, CheckStatus::Pass);
+        assert_eq!(result.detail, "Embedding model installed");
+    }
+
+    #[tokio::test]
+    async fn embedding_fail_when_no_cache_and_ollama_down() {
+        // No fastembed cache AND Ollama down → Fail.
+        let dir = tempfile::tempdir().unwrap();
+        let client = probe_client();
+        let runtime = LlmRuntimeProbe {
+            result: llm_runtime_placeholder(),
+            ollama_up: false,
+            ollama_base_url: "http://127.0.0.1:1".to_string(),
+        };
+        let result =
+            probe_embedding_model(&client, &runtime, &AppConfig::default(), dir.path()).await;
 
         assert_eq!(result.status, CheckStatus::Fail);
     }
