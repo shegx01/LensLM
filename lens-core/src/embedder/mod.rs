@@ -38,15 +38,25 @@ use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
 use crate::LensError;
 
+pub mod registry;
+
+pub use registry::{DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, EmbeddingModelSpec, resolve};
+
 // ---------------------------------------------------------------------------
 // Public constants
 // ---------------------------------------------------------------------------
 
-/// Canonical model id for the embedding model used in Phase 1.
-pub const EMBED_MODEL_ID: &str = "nomic-embed-text-v1.5";
+/// Canonical model id for the default embedding model used in Phase 1.
+///
+/// Legacy alias of [`DEFAULT_EMBED_MODEL_ID`]; kept until Step 7 renames the
+/// call sites. New code should reference [`DEFAULT_EMBED_MODEL_ID`].
+pub const EMBED_MODEL_ID: &str = DEFAULT_EMBED_MODEL_ID;
 
 /// Output dimension of [`EMBED_MODEL_ID`].
-pub const EMBED_DIM: usize = 768;
+///
+/// Legacy alias of [`DEFAULT_EMBED_DIM`]; kept until Step 7 renames the call
+/// sites. New code should reference [`DEFAULT_EMBED_DIM`].
+pub const EMBED_DIM: usize = DEFAULT_EMBED_DIM;
 
 /// Human-readable record of the prefix convention baked into [`Embedder`].
 /// `"search_document/search_query"` matches the `embedding_index.prefix_convention`

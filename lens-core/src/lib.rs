@@ -27,7 +27,10 @@ pub mod tts;
 pub mod vector_store;
 
 pub use config::{AppConfig, EnrichmentConfig, TaskModel};
-pub use embedder::{CountingEmbedder, EMBED_DIM, EMBED_MODEL_ID, Embedder, FastembedEmbedder};
+pub use embedder::{
+    CountingEmbedder, DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, EMBED_DIM, EMBED_MODEL_ID,
+    Embedder, EmbeddingModelSpec, FastembedEmbedder, resolve,
+};
 pub use embedding::{InstallProgress, pull_embedding_model};
 pub use enrichment::{ENRICHMENT_QUEUE_CAPACITY, EnrichmentJob};
 pub use error::LensError;
