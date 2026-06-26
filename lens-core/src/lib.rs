@@ -1110,6 +1110,26 @@ impl LensEngine {
         Ok((spec.id.to_string(), spec.dim))
     }
 
+    /// Re-embeds every chunk of `notebook_id` into the notebook's currently
+    /// configured embedding coordinate, flips it active, and retires the previous
+    /// coordinate(s) (M4 Phase 4b, Step 9 — the model-switch re-embed).
+    ///
+    /// Background-safe: the embed + populate runs lock-free; only the brief flip +
+    /// retirement take `ingest_lock`, and the OLD index keeps serving search until
+    /// the flip. A no-op when the configured model already matches the active
+    /// coordinate. `on_progress(done, total)` fires after each populated batch
+    /// (pass a no-op closure for headless callers). See
+    /// [`enrichment::reembed::reembed_notebook`] for the crash-safety + R2
+    /// coordinate-re-check details.
+    #[tracing::instrument(skip_all, fields(notebook = %notebook_id.as_str()))]
+    pub async fn reembed_notebook(
+        &self,
+        notebook_id: &NotebookId,
+        on_progress: impl FnMut(usize, usize) + Send,
+    ) -> Result<crate::enrichment::reembed::ReembedOutcome, LensError> {
+        crate::enrichment::reembed::reembed_notebook(self, notebook_id, on_progress).await
+    }
+
     /// Lazily resolves (once) and returns the shared nomic tokenizer.
     ///
     /// The first caller resolves the nomic `tokenizer.json` via the shared
