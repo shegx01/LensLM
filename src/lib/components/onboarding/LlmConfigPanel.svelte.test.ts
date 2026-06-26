@@ -75,6 +75,23 @@ function cloudCatalog(provider: string): Record<string, unknown> {
   };
 }
 
+/**
+ * Drive the Cloud provider combobox (bits-ui `Combobox`). The provider cards
+ * were replaced by a searchable combobox: options live in a portal that only
+ * mounts while the listbox is OPEN. In jsdom a plain `click` on the input does
+ * NOT mount the portal — opening it requires a `pointerdown` on the trigger
+ * (the chevron button, `aria-label="Show providers"`), and SELECTING an option
+ * requires a `pointerup` on it (a plain `click` does not fire `onValueChange`).
+ * This two-event sequence is the minimal one that surfaces + selects options in
+ * jsdom (verified empirically); no arbitrary timeouts are used.
+ */
+async function selectCloudProvider(name: RegExp | string): Promise<void> {
+  const trigger = screen.getByRole('button', { name: /show providers/i });
+  await fireEvent.pointerDown(trigger); // open the listbox (mounts the portal)
+  const option = await screen.findByRole('option', { name }); // options render once open
+  await fireEvent.pointerUp(option); // selecting fires onValueChange (click does not)
+}
+
 beforeEach(() => {
   // Activate the Tauri path in all helpers (isTauri() reads globalThis.isTauri).
   (globalThis as { isTauri?: boolean }).isTauri = true;
@@ -152,7 +169,9 @@ describe('LlmConfigPanel — Auto-detect', () => {
     await fireEvent.click(screen.getByRole('button', { name: /auto-detect/i }));
 
     // Provider-neutral reachability confirmation text appears (no vendor/version)
-    await waitFor(() => expect(screen.getByText(/local server reachable/i)).toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.getByText(/configure your preferred llm/i)).toBeInTheDocument()
+    );
 
     // Model select appears with detected models. Target the model picker by its
     // id (the panel also renders an enrichment "Pronoun resolution" combobox).
@@ -531,13 +550,15 @@ describe('LlmConfigPanel — Save (cloud tab)', () => {
     const save = screen.getByRole('button', { name: /save/i });
     const keyField = screen.getByLabelText(/api key/i);
 
-    // On the SAVED (OpenAI) card: masked + Save disabled until re-entry.
+    // The saved entry is `openai-compatible` → it maps to the combobox's
+    // "Custom (OpenAI-compatible)" provider, which is the masked/saved one. On
+    // that restored provider: masked + Save disabled until re-entry.
     await waitFor(() => expect(keyField).toHaveValue(''));
     expect(keyField).toHaveAttribute('placeholder', expect.stringMatching(/saved/i));
     expect(save).toBeDisabled();
 
-    // Switch to an UNSAVED provider card (Anthropic): no masking, normal entry.
-    await fireEvent.click(screen.getByRole('radio', { name: /anthropic/i }));
+    // Switch to an UNSAVED provider (Anthropic) via the combobox: no masking.
+    await selectCloudProvider(/anthropic/i);
 
     // Save is disabled with an empty field…
     expect(save).toBeDisabled();
@@ -614,6 +635,128 @@ describe('LlmConfigPanel — Save (cloud tab)', () => {
               expect.objectContaining({
                 provider: 'openai',
                 model: 'gpt-5-turbo'
+              })
+            ])
+          })
+        })
+      )
+    );
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// Cloud provider combobox (M4 Phase 3) — grouped, searchable, new providers
+// ──────────────────────────────────────────────────────────────────────────
+
+describe('LlmConfigPanel — cloud provider combobox', () => {
+  /** Mount, expand, switch to the Cloud API tab, then open the combobox listbox. */
+  async function openCloudCombobox() {
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return baseConfig();
+      if (cmd === 'set_config') return null;
+      if (cmd === 'list_provider_models')
+        return cloudCatalog((args as { provider: string }).provider);
+      if (cmd === 'list_ollama_models') return [];
+    });
+
+    render(SystemCheckRow, { props: { result: llmRow(), oncheck: vi.fn() } });
+    await fireEvent.click(screen.getByRole('button', { name: /configure/i }));
+    await waitFor(() =>
+      expect(screen.getByRole('tab', { name: /cloud api/i })).toBeInTheDocument()
+    );
+    await fireEvent.click(screen.getByRole('tab', { name: /cloud api/i }));
+
+    // Open the listbox (mounts the portal) so options + group headings render.
+    await fireEvent.pointerDown(screen.getByRole('button', { name: /show providers/i }));
+  }
+
+  it('renders grouped Popular + All headings and lists the new providers when open', async () => {
+    await openCloudCombobox();
+
+    // Both group headings render inside the open listbox.
+    await waitFor(() => expect(screen.getByText('Popular')).toBeInTheDocument());
+    expect(screen.getByText('All')).toBeInTheDocument();
+
+    // New providers (beyond the legacy OpenAI/Anthropic/Google cards) are listed.
+    expect(screen.getByRole('option', { name: /groq/i })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: /deepseek/i })).toBeInTheDocument();
+    // The custom escape-hatch entry is present too.
+    expect(
+      screen.getByRole('option', { name: /custom \(openai-compatible\)/i })
+    ).toBeInTheDocument();
+  });
+
+  it('type-to-filter narrows the list to DeepSeek and hides OpenAI', async () => {
+    await openCloudCombobox();
+
+    const input = screen.getByRole('combobox', { name: /cloud provider/i });
+    await fireEvent.input(input, { target: { value: 'deep' } });
+
+    // The matching provider stays; the non-matching OpenAI option is filtered out.
+    await waitFor(() =>
+      expect(screen.getByRole('option', { name: /deepseek/i })).toBeInTheDocument()
+    );
+    expect(screen.queryByRole('option', { name: /^openai$/i })).not.toBeInTheDocument();
+  });
+
+  it('selecting a NEW native provider (Groq) + Save persists provider:groq with an EMPTY base_url', async () => {
+    const setConfig = vi.fn();
+    const oncheck = vi.fn().mockResolvedValue(undefined);
+
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return baseConfig();
+      if (cmd === 'set_config') {
+        setConfig(args);
+        return null;
+      }
+      // Groq catalog with one model so the picker resolves a real model id.
+      if (cmd === 'list_provider_models') {
+        const prov = (args as { provider: string }).provider;
+        if (prov === 'groq')
+          return {
+            'llama-3.3-70b-versatile': {
+              id: 'llama-3.3-70b-versatile',
+              name: 'Llama 3.3 70B',
+              reasoning: false,
+              reasoning_options: [],
+              tool_call: true,
+              temperature: true,
+              modalities: { input: ['text'], output: ['text'] },
+              context_limit: 128000,
+              output_limit: 32768,
+              open_weights: true,
+              cost: { input: 0.59, output: 0.79 }
+            }
+          };
+        return cloudCatalog(prov);
+      }
+      if (cmd === 'list_ollama_models') return [];
+    });
+
+    render(SystemCheckRow, { props: { result: llmRow(), oncheck } });
+    await fireEvent.click(screen.getByRole('button', { name: /configure/i }));
+    await waitFor(() =>
+      expect(screen.getByRole('tab', { name: /cloud api/i })).toBeInTheDocument()
+    );
+    await fireEvent.click(screen.getByRole('tab', { name: /cloud api/i }));
+
+    // Pick Groq via the combobox.
+    await selectCloudProvider(/^groq$/i);
+
+    // Provide a key so Save enables.
+    await fireEvent.input(screen.getByLabelText(/api key/i), { target: { value: 'gsk-test-key' } });
+    await fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+    // Native providers persist an EMPTY base_url (the backend resolves genai's
+    // canonical endpoint); the real provider id reaches set_config.
+    await waitFor(() =>
+      expect(setConfig).toHaveBeenCalledWith(
+        expect.objectContaining({
+          config: expect.objectContaining({
+            models: expect.arrayContaining([
+              expect.objectContaining({
+                provider: 'groq',
+                base_url: ''
               })
             ])
           })
@@ -771,8 +914,8 @@ describe('LlmConfigPanel — capability-aware pickers', () => {
       expect(within(cloudSelect).getByRole('option', { name: 'GPT-4o' })).toBeInTheDocument()
     );
 
-    // Switching to Anthropic loads its catalog model (Claude 3.5 Sonnet).
-    await fireEvent.click(screen.getByRole('radio', { name: /anthropic/i }));
+    // Switching to Anthropic (via the combobox) loads its catalog model.
+    await selectCloudProvider(/anthropic/i);
     await waitFor(() =>
       expect(
         within(cloudSelect).getByRole('option', { name: 'Claude 3.5 Sonnet' })

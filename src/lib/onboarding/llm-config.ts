@@ -27,10 +27,14 @@ import { updateConfig } from '$lib/config.js';
 export type LlmProviderTab = 'local' | 'cloud';
 
 export interface LlmProviderInput {
-  /** The canonical provider id. `'ollama'` for the Local tab; the real cloud
-   * provider id (`'openai' | 'anthropic' | 'google'`) for the Cloud API cards;
-   * `'openai-compatible'` only for a genuinely custom/self-hosted endpoint. */
-  provider: 'ollama' | 'openai' | 'anthropic' | 'google' | 'openai-compatible';
+  /** The canonical provider id (= models.dev catalog key for first-class cloud
+   * providers). `'ollama'` for the Local tab; a real cloud provider id
+   * (`'openai' | 'anthropic' | 'google' | 'groq' | 'deepseek' | 'xai' |
+   * 'cohere' | 'zai' | 'ollama-cloud'`) for the Cloud combobox; or
+   * `'openai-compatible'` for a genuinely custom/self-hosted endpoint. Kept as a
+   * plain `string` so the single {@link CLOUD_PROVIDERS} source drives the set
+   * without a divergent union to maintain. */
+  provider: string;
   base_url: string;
   model: string;
   api_key: string;

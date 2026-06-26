@@ -351,6 +351,11 @@ const CLOUD_LLM_PROVIDERS: &[&str] = &[
     "google",
     "zai",
     "glm",
+    "groq",
+    "deepseek",
+    "xai",
+    "cohere",
+    "ollama-cloud",
     "openai-compatible",
 ];
 
@@ -418,7 +423,7 @@ async fn probe_llm_runtime(config: &AppConfig) -> LlmRuntimeProbe {
             id: CheckId::LlmRuntime,
             label: "LLM runtime".to_string(),
             status: CheckStatus::Pass,
-            detail: "Local LLM reachable".to_string(),
+            detail: "Configure your preferred LLM".to_string(),
             action: Some(CheckAction::Configure),
         },
         (false, false, true) => CheckResult {
@@ -655,7 +660,7 @@ mod tests {
 
         assert_eq!(probe.result.status, CheckStatus::Pass);
         assert!(!probe.ollama_up);
-        assert_eq!(probe.result.detail, "Local LLM reachable");
+        assert_eq!(probe.result.detail, "Configure your preferred LLM");
         assert_eq!(probe.result.action, Some(CheckAction::Configure));
     }
 
@@ -675,7 +680,7 @@ mod tests {
 
         assert_eq!(probe.result.status, CheckStatus::Pass);
         assert!(probe.ollama_up);
-        assert_eq!(probe.result.detail, "Local LLM reachable");
+        assert_eq!(probe.result.detail, "Configure your preferred LLM");
     }
 
     #[tokio::test]

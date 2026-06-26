@@ -1,9 +1,12 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { invoke, isTauri } from '@tauri-apps/api/core';
+  import { Combobox } from 'bits-ui';
   import { Input } from '$lib/components/ui/input/index.js';
   import { Button } from '$lib/components/ui/button/index.js';
   import LoaderCircle from '@lucide/svelte/icons/loader-circle';
+  import ChevronsUpDown from '@lucide/svelte/icons/chevrons-up-down';
+  import Check from '@lucide/svelte/icons/check';
   import { cn } from '$lib/utils.js';
   import { detectLlm } from '$lib/onboarding/system-check.js';
   import {
@@ -11,6 +14,12 @@
     saveEnrichmentPrefs,
     type LlmProviderTab
   } from '$lib/onboarding/llm-config.js';
+  import {
+    CLOUD_PROVIDERS,
+    CLOUD_PROVIDER_IDS,
+    findCloudProvider,
+    type CloudProvider
+  } from '$lib/onboarding/cloud-providers.js';
   import type { AppConfig, CorefStrategy, LlmRouting, TaskModel } from '$lib/theme/types.js';
   import {
     listCloudModelOptions,
@@ -49,8 +58,14 @@
   let testMessage = $state<string | null>(null);
 
   // --- Cloud API tab fields ---
-  let cloudProvider = $state<'openai' | 'anthropic' | 'google'>('openai');
-  let cloudBaseUrl = $state('https://api.openai.com/v1');
+  // The canonical provider id (= models.dev catalog key for first-class providers).
+  // Drives the searchable combobox; defaults to the first surfaced provider.
+  let cloudProvider = $state<string>(CLOUD_PROVIDERS[0].id);
+  // Type-to-filter query for the provider combobox (Combobox.Input value).
+  let providerQuery = $state('');
+  // Custom OpenAI-compatible endpoints take a user base_url; native providers
+  // leave this empty (the backend resolves genai's canonical endpoint).
+  let cloudBaseUrl = $state('');
   let cloudApiKey = $state('');
   // User-editable model id. Seeded from the provider default as an offline floor,
   // but the SMART DEFAULT (loadCloudModels) overrides it with the newest
@@ -145,48 +160,61 @@
     }
   ] as const;
 
-  // `models` is the card subtitle only — keep it a generic family name (not
-  // specific versions like "GPT-4o") so we don't have to ship a UI update every
-  // time a provider releases a new model. `defaultModel` is the actual id sent
-  // to the API and can be refined independently.
-  const CLOUD_PROVIDERS = [
-    {
-      id: 'openai' as const,
-      name: 'OpenAI',
-      models: 'GPT Models',
-      defaultModel: 'gpt-4o',
-      baseUrl: 'https://api.openai.com/v1'
-    },
-    {
-      id: 'anthropic' as const,
-      name: 'Anthropic',
-      models: 'Claude Models',
-      defaultModel: 'claude-3-5-sonnet-latest',
-      baseUrl: 'https://api.anthropic.com/v1'
-    },
-    {
-      id: 'google' as const,
-      name: 'Google',
-      models: 'Gemini Models',
-      defaultModel: 'gemini-1.5-pro',
-      baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai'
-    }
+  // The provider list is sourced from the single shared CLOUD_PROVIDERS table
+  // (mirrors the backend `adapter_for`/`catalog_key_for` set). The model picker
+  // is catalog-driven, so each entry needs no hand-maintained default-model id;
+  // a per-provider offline floor is derived below.
+  const PROVIDER_GROUPS = [
+    { key: 'popular' as const, label: 'Popular' },
+    { key: 'all' as const, label: 'All' }
   ] as const;
+
+  // Providers filtered by the combobox query (case-insensitive substring on the
+  // display name or id), grouped for the listbox — type-to-filter. The query
+  // mirrors the input text; once a provider is selected the input shows its name,
+  // so a query that exactly equals the current selection's name is treated as "no
+  // filter" (show the full grouped list) rather than narrowing to one row.
+  const filteredProviders = $derived.by(() => {
+    const raw = providerQuery.trim();
+    const q = raw.toLowerCase();
+    const isSelectionEcho = raw !== '' && raw === selectedProvider.name;
+    const matches = (p: CloudProvider) =>
+      q === '' ||
+      isSelectionEcho ||
+      p.name.toLowerCase().includes(q) ||
+      p.id.toLowerCase().includes(q);
+    return PROVIDER_GROUPS.map((g) => ({
+      ...g,
+      items: CLOUD_PROVIDERS.filter((p) => p.group === g.key && matches(p))
+    })).filter((g) => g.items.length > 0);
+  });
 
   const contextHelper = $derived(
     CONTEXT_OPTIONS.find((o) => o.value === contextWindow)?.helper ?? ''
   );
 
-  const selectedProvider = $derived(CLOUD_PROVIDERS.find((p) => p.id === cloudProvider)!);
+  const selectedProvider = $derived(findCloudProvider(cloudProvider) ?? CLOUD_PROVIDERS[0]);
 
-  // The cloud catalog key for the selected provider card (openai/anthropic/google
-  // map 1:1 to the models.dev catalog keys).
-  const cloudCatalogKey = $derived(cloudProvider);
+  // Whether the selected provider is the custom OpenAI-compatible escape hatch
+  // (reveals the base-URL field; the model is free-text, no catalog).
+  const isCustomProvider = $derived(selectedProvider.custom === true);
+
+  // A per-provider offline floor for the model id when the catalog is empty
+  // (offline / non-Tauri / no-catalog provider). OpenAI keeps 'gpt-4o' so the
+  // legacy cloud Save tests stay green; every other provider falls back to its id
+  // as a harmless placeholder the user can edit.
+  function defaultModelFor(id: string): string {
+    return id === 'openai' ? 'gpt-4o' : id;
+  }
+
+  // The cloud catalog key for the selected provider. `null` for providers with no
+  // models.dev namespace (Ollama Cloud — user-pulled; the custom endpoint —
+  // arbitrary), which switch the picker to a free-text model input.
+  const cloudCatalogKey = $derived(selectedProvider.catalogKey);
 
   // The canonical backend provider id for the ACTIVE tab — used for routing pins
   // and per-task TaskModel overrides. Local → 'ollama'; cloud → the REAL provider
-  // id of the selected card ('openai' | 'anthropic' | 'google'), matching the
-  // models.dev catalog key so the Rust factory validates against the right
+  // id (= models.dev catalog key) so the Rust factory validates against the right
   // namespace (NOT a blanket 'openai-compatible', which broke claude-*/gemini-*).
   const canonicalProviderId = $derived(activeTab === 'local' ? 'ollama' : cloudProvider);
 
@@ -197,7 +225,13 @@
   const cloudSelectOptions = $derived<ModelOption[]>(
     cloudModelOptions.length > 0
       ? cloudModelOptions
-      : [{ id: selectedProvider.defaultModel, label: selectedProvider.defaultModel, info: null }]
+      : [
+          {
+            id: defaultModelFor(cloudProvider),
+            label: defaultModelFor(cloudProvider),
+            info: null
+          }
+        ]
   );
 
   // The capability info for the currently-selected cloud model (drives the
@@ -244,6 +278,15 @@
   // filtered list is empty (offline), keep the seeded default so the field is
   // never blank.
   async function loadCloudModels(): Promise<void> {
+    // No catalog namespace (Ollama Cloud / custom endpoint): the model is
+    // free-text — leave options empty and don't clobber a user-entered id.
+    if (cloudCatalogKey === null) {
+      cloudModelOptions = [];
+      if (!cloudModelPicked && !cloudModel.trim()) {
+        cloudModel = defaultModelFor(cloudProvider);
+      }
+      return;
+    }
     try {
       const opts = await listCloudModelOptions(cloudCatalogKey);
       cloudModelOptions = opts.length > 0 ? opts : [];
@@ -253,7 +296,7 @@
     if (cloudModelOptions.length === 0) {
       // Offline / empty catalog: fall back to the per-provider seed so the field
       // is never blank (the picker renders the single seeded fallback option).
-      cloudModel = selectedProvider.defaultModel;
+      cloudModel = defaultModelFor(cloudProvider);
       return;
     }
     if (!cloudModelPicked) {
@@ -263,7 +306,7 @@
     }
     // User/saved choice: keep it if still in the catalog, else fall back to seed.
     if (!cloudModelOptions.some((o) => o.id === cloudModel)) {
-      cloudModel = selectedProvider.defaultModel;
+      cloudModel = defaultModelFor(cloudProvider);
     }
   }
 
@@ -380,16 +423,18 @@
     saving = true;
     saveError = null;
     try {
-      const provider = CLOUD_PROVIDERS.find((p) => p.id === cloudProvider)!;
       await saveLlmProvider({
-        // Persist the REAL provider id (openai/anthropic/google) so the Rust
+        // Persist the REAL provider id (= models.dev catalog key) so the Rust
         // factory validates the model against its OWN catalog namespace — a
         // blanket 'openai-compatible' validated claude-*/gemini-* against the
         // OpenAI namespace and silently broke routing (fix #1).
         provider: cloudProvider,
-        base_url: cloudBaseUrl || provider.baseUrl,
-        // User's chosen model id; fall back to the provider default if cleared.
-        model: cloudModel.trim() || provider.defaultModel,
+        // Native providers persist an EMPTY base_url so the backend uses genai's
+        // canonical endpoint; the custom OpenAI-compatible entry persists the
+        // user-supplied (or seeded) URL.
+        base_url: isCustomProvider ? cloudBaseUrl || selectedProvider.baseUrl : '',
+        // User's chosen model id; fall back to the provider floor if cleared.
+        model: cloudModel.trim() || defaultModelFor(cloudProvider),
         api_key: cloudApiKey,
         context: CLOUD_DEFAULT_CONTEXT
       });
@@ -412,16 +457,18 @@
     }
   }
 
-  async function selectProvider(id: typeof cloudProvider): Promise<void> {
+  async function selectProvider(id: string): Promise<void> {
     cloudProvider = id;
-    const p = CLOUD_PROVIDERS.find((p) => p.id === id)!;
+    const p = findCloudProvider(id) ?? CLOUD_PROVIDERS[0];
+    // Native providers carry an empty baseUrl (genai resolves the canonical
+    // endpoint); only the custom OpenAI-compatible entry seeds a base URL.
     cloudBaseUrl = p.baseUrl;
-    cloudModel = p.defaultModel;
-    // Switching cards starts the model selection clean: drop any prior explicit
-    // pick so loadCloudModels re-applies the smart default (newest text model)
-    // for the new provider.
+    cloudModel = defaultModelFor(id);
+    // Switching providers starts the model selection clean: drop any prior
+    // explicit pick so loadCloudModels re-applies the smart default (newest text
+    // model) for the new provider.
     cloudModelPicked = false;
-    // Switching cards starts clean: clear any typed/edited key. `hasSavedKey`
+    // Switching providers starts clean: clear any typed/edited key. `hasSavedKey`
     // recomputes from the derived (true only when `id` is the saved provider).
     editingKey = false;
     cloudApiKey = '';
@@ -462,31 +509,27 @@
   async function restoreSavedCloud(): Promise<void> {
     try {
       const cfg = await invoke<AppConfig>('get_config');
-      // A saved cloud entry now carries the REAL provider id (openai/anthropic/
-      // google); a legacy install may still carry 'openai-compatible' — match
-      // either to a card (by provider id first, then by base_url for the legacy
-      // shape). Only the matched card gets the per-provider saved/masked treatment.
-      const cloudIds = CLOUD_PROVIDERS.map((p) => p.id) as string[];
+      // A saved cloud entry carries the REAL provider id (= a CLOUD_PROVIDERS id,
+      // including the legacy 'openai-compatible'). Match it to a combobox entry by
+      // id; only the matched provider gets the per-provider saved/masked treatment.
       const saved = cfg.models?.find(
-        (m) =>
-          (cloudIds.includes(m.provider) || m.provider === 'openai-compatible') &&
-          m.api_key.trim() !== ''
+        (m) => CLOUD_PROVIDER_IDS.includes(m.provider) && m.api_key.trim() !== ''
       );
       if (!saved) return;
-      const match =
-        CLOUD_PROVIDERS.find((p) => p.id === saved.provider) ??
-        CLOUD_PROVIDERS.find((p) => p.baseUrl === saved.base_url);
+      const match = findCloudProvider(saved.provider);
       if (!match) return;
       savedProviderId = match.id;
       cloudProvider = match.id;
-      cloudBaseUrl = saved.base_url || match.baseUrl;
+      // The custom endpoint restores its saved base URL; native providers keep an
+      // empty base_url (genai resolves the canonical endpoint).
+      cloudBaseUrl = match.custom ? saved.base_url || match.baseUrl : '';
       // Preserve the user's prior model choice (don't override with the smart
       // default). A truthy saved model counts as an explicit pick.
       if (saved.model) {
         cloudModel = saved.model;
         cloudModelPicked = true;
       } else {
-        cloudModel = match.defaultModel;
+        cloudModel = defaultModelFor(match.id);
       }
       cloudApiKey = '';
       // Reload the catalog for the saved provider so the picker + capability
@@ -607,7 +650,7 @@
       </div>
 
       {#if detectStatus === 'found'}
-        <p class="text-primary text-[0.75rem]">Local server reachable</p>
+        <p class="text-primary text-[0.75rem]">Configure your preferred LLM</p>
       {:else if detectStatus === 'not-found'}
         <p class="text-muted-foreground text-[0.75rem]">
           {detectError ?? 'Not detected — check that your local server is running.'}
@@ -718,25 +761,78 @@
     tabindex={activeTab === 'cloud' ? 0 : -1}
     class={cn('mt-3 flex flex-col gap-3', activeTab !== 'cloud' && 'hidden')}
   >
-    <!-- Provider cards -->
-    <div class="grid grid-cols-3 gap-2" role="radiogroup" aria-label="Cloud LLM provider">
-      {#each CLOUD_PROVIDERS as provider (provider.id)}
-        {@const isSelected = cloudProvider === provider.id}
-        <button
-          role="radio"
-          aria-checked={isSelected}
-          onclick={() => selectProvider(provider.id)}
-          class={cn(
-            'rounded-lg border px-2.5 py-2 text-left transition-colors',
-            isSelected
-              ? 'border-primary bg-primary/10 ring-1 ring-primary'
-              : 'border-border bg-card hover:bg-muted/50'
-          )}
-        >
-          <p class="text-[0.8rem] font-semibold text-foreground">{provider.name}</p>
-          <p class="text-[0.7rem] text-muted-foreground mt-0.5">{provider.models}</p>
-        </button>
-      {/each}
+    <!-- Cloud provider — searchable combobox (type-to-filter, grouped). -->
+    <div class="flex flex-col gap-1.5">
+      <label
+        for="llm-cloud-provider"
+        class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase"
+      >
+        Cloud provider
+      </label>
+      <Combobox.Root
+        type="single"
+        value={cloudProvider}
+        onValueChange={(v) => {
+          if (v) void selectProvider(v);
+        }}
+        onOpenChange={(open) => {
+          // Reset the type-to-filter query when the menu closes so the next open
+          // shows the full grouped list (the input text reflects the selection).
+          if (!open) providerQuery = '';
+        }}
+      >
+        <div class="relative">
+          <Combobox.Input
+            id="llm-cloud-provider"
+            aria-label="Cloud provider"
+            defaultValue={selectedProvider.name}
+            oninput={(e) => (providerQuery = e.currentTarget.value)}
+            placeholder="Search providers…"
+            class="border-input bg-transparent dark:bg-input/30 focus-visible:border-ring focus-visible:ring-ring/50 text-foreground placeholder:text-muted-foreground h-9 w-full min-w-0 rounded-lg border px-2.5 py-1 pr-8 text-sm outline-none transition-colors focus-visible:ring-3"
+          />
+          <Combobox.Trigger
+            aria-label="Show providers"
+            class="text-muted-foreground absolute inset-y-0 right-0 flex items-center pr-2.5 outline-none"
+          >
+            <ChevronsUpDown class="size-4" aria-hidden="true" />
+          </Combobox.Trigger>
+        </div>
+        <Combobox.Portal>
+          <Combobox.Content
+            class="border-border bg-popover text-popover-foreground z-[70] max-h-64 w-[var(--bits-combobox-anchor-width)] overflow-y-auto rounded-lg border p-1 shadow-lg"
+            sideOffset={4}
+          >
+            {#each filteredProviders as group (group.key)}
+              <Combobox.Group>
+                <Combobox.GroupHeading
+                  class="text-muted-foreground px-2 pt-1.5 pb-1 text-[0.62rem] font-semibold tracking-widest uppercase"
+                >
+                  {group.label}
+                </Combobox.GroupHeading>
+                {#each group.items as provider (provider.id)}
+                  <Combobox.Item
+                    value={provider.id}
+                    label={provider.name}
+                    class="data-highlighted:bg-primary/10 data-highlighted:text-foreground text-foreground flex cursor-pointer items-center justify-between rounded-md px-2 py-1.5 text-sm outline-none"
+                  >
+                    {#snippet children({ selected })}
+                      <span>{provider.name}</span>
+                      {#if selected}
+                        <Check class="text-primary size-4" aria-hidden="true" />
+                      {/if}
+                    {/snippet}
+                  </Combobox.Item>
+                {/each}
+              </Combobox.Group>
+            {/each}
+            {#if filteredProviders.length === 0}
+              <div class="text-muted-foreground px-2 py-3 text-center text-[0.78rem]">
+                No providers found
+              </div>
+            {/if}
+          </Combobox.Content>
+        </Combobox.Portal>
+      </Combobox.Root>
     </div>
 
     <!-- MODEL -->
@@ -752,20 +848,37 @@
           <span class="text-muted-foreground text-[0.68rem]" aria-live="polite">updating…</span>
         {/if}
       </div>
-      <select
-        id="llm-cloud-model"
-        value={cloudModel}
-        onchange={(e) => {
-          cloudModel = e.currentTarget.value;
-          // An explicit pick: pin it so a background refresh won't re-default it.
-          cloudModelPicked = true;
-        }}
-        class={SELECT_CLASS}
-      >
-        {#each cloudSelectOptions as opt (opt.id)}
-          <option value={opt.id}>{opt.label}</option>
-        {/each}
-      </select>
+      {#if cloudCatalogKey === null}
+        <!-- No models.dev namespace (Ollama Cloud / custom endpoint): the model
+             is a free-text id the user supplies (their pulled / hosted model). -->
+        <Input
+          id="llm-cloud-model"
+          type="text"
+          value={cloudModel}
+          oninput={(e) => {
+            cloudModel = e.currentTarget.value;
+            cloudModelPicked = true;
+          }}
+          placeholder="model id (e.g. gpt-oss:20b)"
+          autocomplete="off"
+          spellcheck={false}
+        />
+      {:else}
+        <select
+          id="llm-cloud-model"
+          value={cloudModel}
+          onchange={(e) => {
+            cloudModel = e.currentTarget.value;
+            // An explicit pick: pin it so a background refresh won't re-default it.
+            cloudModelPicked = true;
+          }}
+          class={SELECT_CLASS}
+        >
+          {#each cloudSelectOptions as opt (opt.id)}
+            <option value={opt.id}>{opt.label}</option>
+          {/each}
+        </select>
+      {/if}
       {#if modelHint}
         <p class="text-muted-foreground text-[0.72rem] leading-relaxed">{modelHint}</p>
       {/if}
@@ -797,30 +910,30 @@
       {/if}
     </div>
 
-    <!-- BASE URL -->
-    <div class="flex flex-col gap-1.5">
-      <div class="flex items-baseline gap-1">
+    <!-- BASE URL — only for the custom OpenAI-compatible endpoint. Native cloud
+         providers use genai's built-in endpoint (no URL to configure). -->
+    {#if isCustomProvider}
+      <div class="flex flex-col gap-1.5">
         <label
           for="llm-cloud-url"
           class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase"
         >
           Base URL
         </label>
-        <span class="text-muted-foreground text-[0.68rem]">— optional override</span>
+        <Input
+          id="llm-cloud-url"
+          type="url"
+          bind:value={cloudBaseUrl}
+          placeholder="https://api.openai.com/v1"
+          autocomplete="off"
+          spellcheck={false}
+        />
+        <p class="text-muted-foreground text-[0.72rem] leading-relaxed">
+          The OpenAI-compatible endpoint to call — for LM Studio, vLLM, a proxy, or any other
+          self-hosted/compatible server.
+        </p>
       </div>
-      <Input
-        id="llm-cloud-url"
-        type="url"
-        bind:value={cloudBaseUrl}
-        placeholder="https://api.openai.com/v1"
-        autocomplete="off"
-        spellcheck={false}
-      />
-      <p class="text-muted-foreground text-[0.72rem] leading-relaxed">
-        Leave empty to use the default. Override for Groq, Together AI, Azure OpenAI, Anyscale and
-        other compatible providers.
-      </p>
-    </div>
+    {/if}
 
     <!-- Save error -->
     {#if saveError}

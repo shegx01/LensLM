@@ -72,6 +72,10 @@ const PROVIDER_GOOGLE: &str = "google";
 const PROVIDER_GLM: &str = "glm";
 const PROVIDER_ZAI: &str = "zai";
 const PROVIDER_OLLAMA_CLOUD: &str = "ollama-cloud";
+const PROVIDER_GROQ: &str = "groq";
+const PROVIDER_DEEPSEEK: &str = "deepseek";
+const PROVIDER_XAI: &str = "xai";
+const PROVIDER_COHERE: &str = "cohere";
 
 /// The thinking/reasoning effort exposed on [`LlmRequest`].
 ///
@@ -318,6 +322,41 @@ fn normalize_endpoint(adapter: AdapterKind, base_url: &str) -> String {
     }
 }
 
+/// The genai-default public endpoint for a NATIVE cloud adapter.
+///
+/// genai bakes a fixed `BASE_URL` into each native adapter (e.g. Groq's
+/// `https://api.groq.com/openai/v1/`) but exposes it only through the crate-private
+/// `AdapterDispatcher::default_endpoint` — there is no public accessor. We
+/// therefore mirror those defaults here so a native cloud provider configured with
+/// NO `base_url` resolves to its canonical endpoint (genai uses our `ServiceTarget`
+/// VERBATIM via `ModelSpec::Target`, so we must supply a concrete endpoint).
+///
+/// Returns `None` for adapters where the URL is user-supplied (the custom
+/// `openai-compatible` endpoint) or local (`Ollama` — the user's `base_url` is the
+/// runtime). When `Some`, a configured non-empty `base_url` still WINS (an explicit
+/// override), so this only fills the gap when the config omits a base URL.
+///
+/// **Pinned to genai 0.6.5.** On a genai bump, re-verify against
+/// `grep 'const BASE_URL' <genai>/src/adapter/adapters/*/adapter_impl.rs`.
+fn native_endpoint(adapter: AdapterKind) -> Option<Endpoint> {
+    match adapter {
+        AdapterKind::OpenAI => Some(Endpoint::from_static("https://api.openai.com/v1/")),
+        AdapterKind::Anthropic => Some(Endpoint::from_static("https://api.anthropic.com/v1/")),
+        AdapterKind::Gemini => Some(Endpoint::from_static(
+            "https://generativelanguage.googleapis.com/v1beta/",
+        )),
+        AdapterKind::Groq => Some(Endpoint::from_static("https://api.groq.com/openai/v1/")),
+        AdapterKind::DeepSeek => Some(Endpoint::from_static("https://api.deepseek.com/v1/")),
+        AdapterKind::Xai => Some(Endpoint::from_static("https://api.x.ai/v1/")),
+        AdapterKind::Cohere => Some(Endpoint::from_static("https://api.cohere.com/v1/")),
+        AdapterKind::Zai => Some(Endpoint::from_static("https://api.z.ai/api/paas/v4/")),
+        AdapterKind::OllamaCloud => Some(Endpoint::from_static("https://ollama.com/")),
+        // Local Ollama + the custom openai-compatible endpoint: the URL is supplied
+        // by the user's config, so there is no canonical default to fall back to.
+        _ => None,
+    }
+}
+
 impl GenaiProvider {
     /// Builds a provider from a fully-resolved adapter/model/endpoint/auth target,
     /// constructing its OWN genai [`Client`] (over our hardened reqwest client).
@@ -343,7 +382,18 @@ impl GenaiProvider {
         api_key: &str,
     ) -> Self {
         let model_iden = ModelIden::new(adapter, model.to_string());
-        let endpoint = Endpoint::from_owned(normalize_endpoint(adapter, base_url));
+        // A configured (non-empty) base_url WINS — it pins a custom/self-hosted
+        // backend (the openai-compatible case, a proxy, a local runtime) or an
+        // explicit override of a native provider. With NO base_url, a native cloud
+        // adapter falls back to its canonical genai endpoint; if even that is
+        // absent (a custom/local adapter with no URL), normalize an empty base
+        // (yields the old behavior) so construction stays infallible.
+        let endpoint = if base_url.is_empty() {
+            native_endpoint(adapter)
+                .unwrap_or_else(|| Endpoint::from_owned(normalize_endpoint(adapter, base_url)))
+        } else {
+            Endpoint::from_owned(normalize_endpoint(adapter, base_url))
+        };
         let auth = if api_key.is_empty() {
             // Local runtimes (Ollama / LM Studio) need no key; genai tolerates an
             // empty single key for those adapters.
@@ -565,8 +615,9 @@ fn is_local_provider(provider: &str) -> bool {
 /// Maps a canonical `ModelConfig.provider` id onto the genai [`AdapterKind`].
 ///
 /// First-class cloud providers map to their NATIVE genai adapter (genai 0.6.5
-/// ships `Anthropic`, `Gemini`, `OpenAI`, `Zai`, `Ollama`, `OllamaCloud`, so no
-/// provider falls back to a generic OpenAI-compatible adapter). `glm` is an alias
+/// ships `Anthropic`, `Gemini`, `OpenAI`, `Zai`, `Groq`, `DeepSeek`, `Xai`,
+/// `Cohere`, `Ollama`, `OllamaCloud`, so no provider falls back to a generic
+/// OpenAI-compatible adapter). `glm` is an alias
 /// for `zai` (the GLM models are Z.ai's). The custom `openai-compatible` endpoint
 /// speaks the OpenAI wire protocol, so it maps to [`AdapterKind::OpenAI`] with the
 /// user-supplied base URL pinning the actual backend. Returns `None` for an
@@ -579,6 +630,10 @@ fn adapter_for(provider: &str) -> Option<AdapterKind> {
         PROVIDER_GOOGLE => Some(AdapterKind::Gemini),
         PROVIDER_OPENAI => Some(AdapterKind::OpenAI),
         PROVIDER_ZAI | PROVIDER_GLM => Some(AdapterKind::Zai),
+        PROVIDER_GROQ => Some(AdapterKind::Groq),
+        PROVIDER_DEEPSEEK => Some(AdapterKind::DeepSeek),
+        PROVIDER_XAI => Some(AdapterKind::Xai),
+        PROVIDER_COHERE => Some(AdapterKind::Cohere),
         // A genuinely custom/self-hosted OpenAI-protocol endpoint (LM Studio, a
         // proxy): OpenAI adapter + the user's base URL.
         PROVIDER_OPENAI_COMPAT => Some(AdapterKind::OpenAI),
@@ -604,6 +659,8 @@ fn catalog_key_for(provider: &str) -> Option<&str> {
         PROVIDER_OLLAMA_CLOUD => Some(SupportedProvider::OllamaCloud.catalog_key()),
         // Custom self-hosted endpoint (or a local runtime): no catalog namespace.
         PROVIDER_OPENAI_COMPAT | PROVIDER_OLLAMA => None,
+        // groq / deepseek / xai / cohere (and any other first-class provider id):
+        // validate against the SAME-named models.dev namespace (anti-free-string).
         other => Some(other),
     }
 }
@@ -691,12 +748,12 @@ fn build_task_provider(
         .find(|m| {
             m.provider.to_ascii_lowercase() == want_provider
                 && m.model == task_model.model
-                && !m.base_url.is_empty()
+                && has_endpoint(m)
         })
         .or_else(|| {
-            models.iter().find(|m| {
-                m.provider.to_ascii_lowercase() == want_provider && !m.base_url.is_empty()
-            })
+            models
+                .iter()
+                .find(|m| m.provider.to_ascii_lowercase() == want_provider && has_endpoint(m))
         })?;
 
     // Apply the same consent + catalog gates as routing selection (anti-free-string):
@@ -740,7 +797,7 @@ fn select_provider(
     catalog: &ModelCatalog,
 ) -> Option<Arc<dyn LlmProvider>> {
     let usable = |m: &crate::config::ModelConfig| {
-        !m.base_url.is_empty() && !m.model.is_empty() && build_eligible(m, cloud_consent, catalog)
+        has_endpoint(m) && !m.model.is_empty() && build_eligible(m, cloud_consent, catalog)
     };
 
     match routing {
@@ -811,12 +868,29 @@ fn build_eligible(
 /// Builds a [`GenaiProvider`] for a single recognized entry (no gating — the
 /// caller applies [`build_eligible`] first). Returns `None` for an unrecognized
 /// provider or an empty endpoint/model.
+/// Whether an entry has a usable endpoint: a configured `base_url`, OR a native
+/// cloud adapter whose canonical endpoint [`native_endpoint`] supplies. Native
+/// cloud providers (`groq`/`deepseek`/`xai`/`cohere`/…) need no `base_url`; local
+/// Ollama and the custom `openai-compatible` endpoint still require one.
+fn has_endpoint(model: &crate::config::ModelConfig) -> bool {
+    if !model.base_url.is_empty() {
+        return true;
+    }
+    adapter_for(&model.provider.to_ascii_lowercase()).is_some_and(|a| native_endpoint(a).is_some())
+}
+
 fn build_provider(model: &crate::config::ModelConfig) -> Option<Arc<dyn LlmProvider>> {
-    if model.base_url.is_empty() || model.model.is_empty() {
+    if model.model.is_empty() {
         return None;
     }
     let provider = model.provider.to_ascii_lowercase();
     let adapter = adapter_for(&provider)?;
+    // A native cloud adapter resolves its canonical endpoint from `native_endpoint`,
+    // so an empty `base_url` is fine. Local Ollama / the custom openai-compatible
+    // endpoint have NO canonical default — they still require a configured base_url.
+    if model.base_url.is_empty() && native_endpoint(adapter).is_none() {
+        return None;
+    }
     Some(Arc::new(GenaiProvider::new(
         adapter,
         &model.model,
@@ -1325,6 +1399,135 @@ mod tests {
         );
         let p = provider_from_config(&cfg, true).expect("legacy openai-compatible resolves");
         assert_eq!(p.model_id(), "gpt-4o");
+    }
+
+    // --- newly-surfaced native cloud providers (M4 Phase 3) -----------------
+
+    #[test]
+    fn adapter_for_maps_new_native_providers() {
+        assert!(matches!(adapter_for("groq"), Some(AdapterKind::Groq)));
+        assert!(matches!(
+            adapter_for("deepseek"),
+            Some(AdapterKind::DeepSeek)
+        ));
+        assert!(matches!(adapter_for("xai"), Some(AdapterKind::Xai)));
+        assert!(matches!(adapter_for("cohere"), Some(AdapterKind::Cohere)));
+    }
+
+    #[test]
+    fn catalog_key_for_maps_new_native_providers_to_own_namespace() {
+        assert_eq!(catalog_key_for("groq"), Some("groq"));
+        assert_eq!(catalog_key_for("deepseek"), Some("deepseek"));
+        assert_eq!(catalog_key_for("xai"), Some("xai"));
+        assert_eq!(catalog_key_for("cohere"), Some("cohere"));
+    }
+
+    #[test]
+    fn native_endpoint_covers_new_providers_and_skips_custom_local() {
+        // Native cloud adapters expose a canonical endpoint (genai built-in).
+        for adapter in [
+            AdapterKind::Groq,
+            AdapterKind::DeepSeek,
+            AdapterKind::Xai,
+            AdapterKind::Cohere,
+            AdapterKind::OpenAI,
+            AdapterKind::Anthropic,
+            AdapterKind::Gemini,
+            AdapterKind::Zai,
+            AdapterKind::OllamaCloud,
+        ] {
+            assert!(
+                native_endpoint(adapter).is_some(),
+                "{adapter:?} must have a canonical endpoint"
+            );
+        }
+        // Local Ollama has no canonical default (the user's base_url IS the runtime).
+        assert!(native_endpoint(AdapterKind::Ollama).is_none());
+    }
+
+    /// A native cloud entry with NO `base_url` (the new combobox path): the
+    /// canonical genai endpoint is used; only the key + model are configured.
+    fn native_cloud_entry(provider: &str, model: &str) -> ModelConfig {
+        ModelConfig {
+            provider: provider.to_string(),
+            base_url: String::new(),
+            model: model.to_string(),
+            api_key: "k".to_string(),
+            ..ModelConfig::default()
+        }
+    }
+
+    #[test]
+    fn groq_selects_and_validates_against_groq_namespace() {
+        let model = catalog_model("groq");
+        // No base_url: the native Groq endpoint is resolved internally.
+        let cfg = config_with(
+            vec![native_cloud_entry("groq", &model)],
+            LlmRouting::CloudFirst,
+        );
+        let p = provider_from_config(&cfg, true).expect("groq must select with consent");
+        assert_eq!(p.model_id(), model);
+    }
+
+    #[test]
+    fn deepseek_selects_and_validates_against_deepseek_namespace() {
+        let model = catalog_model("deepseek");
+        let cfg = config_with(
+            vec![native_cloud_entry("deepseek", &model)],
+            LlmRouting::CloudFirst,
+        );
+        let p = provider_from_config(&cfg, true).expect("deepseek must select with consent");
+        assert_eq!(p.model_id(), model);
+    }
+
+    #[test]
+    fn new_native_cloud_provider_rejected_without_consent() {
+        let model = catalog_model("groq");
+        let cfg = config_with(
+            vec![native_cloud_entry("groq", &model)],
+            LlmRouting::CloudFirst,
+        );
+        assert!(
+            provider_from_config(&cfg, false).is_none(),
+            "groq is a cloud provider and must be consent-gated"
+        );
+    }
+
+    #[test]
+    fn new_native_cloud_model_rejected_when_not_in_catalog() {
+        let cfg = config_with(
+            vec![native_cloud_entry("groq", "totally-made-up-model")],
+            LlmRouting::CloudFirst,
+        );
+        assert!(
+            provider_from_config(&cfg, true).is_none(),
+            "uncatalogued groq model must be rejected"
+        );
+    }
+
+    #[test]
+    fn native_cloud_entry_with_empty_base_url_is_usable() {
+        // Regression: the old `usable`/`build_provider` guards rejected an empty
+        // base_url outright. Native cloud adapters must now be usable without one.
+        let model = catalog_model("xai");
+        assert!(has_endpoint(&native_cloud_entry("xai", &model)));
+        // Local Ollama with no base_url is still NOT usable (no canonical default).
+        assert!(!has_endpoint(&ModelConfig {
+            provider: "ollama".to_string(),
+            base_url: String::new(),
+            model: "llama3".to_string(),
+            ..ModelConfig::default()
+        }));
+    }
+
+    #[test]
+    fn existing_native_providers_still_use_configured_base_url() {
+        // The existing 3 (openai/anthropic/google) pass a full base_url from config;
+        // a non-empty base_url must still WIN (explicit override), unchanged.
+        let model = catalog_anthropic_model();
+        let cfg = config_with(vec![anthropic_entry(&model)], LlmRouting::CloudFirst);
+        let p = provider_from_config(&cfg, true).expect("anthropic with base_url still selects");
+        assert_eq!(p.model_id(), model);
     }
 
     #[test]
