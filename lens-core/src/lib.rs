@@ -153,12 +153,29 @@ pub struct LensEngine {
     /// provider on an unreachable→reachable transition, which `OnceCell` (write-
     /// once) forbids. Write the cell to swap the provider; read it to dispatch.
     llm_provider: Arc<RwLock<Option<Arc<dyn LlmProvider>>>>,
+    /// In-memory cache of the loaded model catalog (cached `models-catalog.json`,
+    /// else the bundled snapshot), behind an `Arc` so a hit is a cheap pointer
+    /// clone — NOT a ~2.6 MB read + parse on every picker open (fix #5). Populated
+    /// lazily by [`model_catalog`](Self::model_catalog) (the blocking read+parse
+    /// runs once, off the async runtime via `spawn_blocking`) and INVALIDATED by
+    /// [`refresh_model_catalog`](Self::refresh_model_catalog) when it actually
+    /// rewrites the cache file, so the next load re-reads the fresh catalog while
+    /// repeated opens between refreshes hit the cache. Lives OUTSIDE the inner
+    /// `RwLock` (like `embedder`) so a catalog load never serializes DB reads.
+    catalog_cache: Arc<RwLock<Option<Arc<crate::model_catalog::ModelCatalog>>>>,
     /// Test-only gate awaited inside the worker's stub job body so an AC3 test can
     /// hold a job "in flight" and assert the worker holds no `ingest_lock` permit
     /// during the body. `None` (the default) is a no-op. Compiled out of
     /// production builds.
     #[cfg(feature = "test-util")]
     enrichment_gate: Arc<RwLock<Option<Arc<tokio::sync::Notify>>>>,
+    /// Test-only gate awaited inside [`reembed::reembed_and_flip`] AFTER the
+    /// lock-free building-table populate but BEFORE the `ingest_lock` flip window,
+    /// so a test can deterministically interleave a `purge_source` (which fully
+    /// completes + releases the lock) into the sequential race the fix #2 re-check
+    /// closes. `None` (the default) is a no-op. Compiled out of production builds.
+    #[cfg(feature = "test-util")]
+    reembed_preflip_gate: Arc<RwLock<Option<Arc<tokio::sync::Notify>>>>,
     /// Test-only switch: when `true`, [`LensEngine::tokenizer`] fails fast instead
     /// of resolving/downloading the multi-MB nomic tokenizer. Enrichment tolerates
     /// a missing tokenizer (it falls back to a whitespace-word token count), so a
@@ -277,8 +294,11 @@ impl LensEngine {
             ingest_lock: Arc::new(Semaphore::new(1)),
             enrichment_tx,
             llm_provider: Arc::new(RwLock::new(None)),
+            catalog_cache: Arc::new(RwLock::new(None)),
             #[cfg(feature = "test-util")]
             enrichment_gate: Arc::new(RwLock::new(None)),
+            #[cfg(feature = "test-util")]
+            reembed_preflip_gate: Arc::new(RwLock::new(None)),
             #[cfg(feature = "test-util")]
             skip_tokenizer: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "test-util")]
@@ -361,8 +381,11 @@ impl LensEngine {
             ingest_lock: Arc::new(Semaphore::new(1)),
             enrichment_tx,
             llm_provider: Arc::new(RwLock::new(None)),
+            catalog_cache: Arc::new(RwLock::new(None)),
             #[cfg(feature = "test-util")]
             enrichment_gate: Arc::new(RwLock::new(None)),
+            #[cfg(feature = "test-util")]
+            reembed_preflip_gate: Arc::new(RwLock::new(None)),
             #[cfg(feature = "test-util")]
             skip_tokenizer: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "test-util")]
@@ -737,26 +760,64 @@ impl LensEngine {
     // ── Model catalog (Stage 1) ─────────────────────────────────────────────
 
     /// Loads the typed model catalog (cached `models-catalog.json`, else the
-    /// bundled snapshot). Never fails hard — always returns a usable catalog.
+    /// bundled snapshot), behind an `Arc`. Never fails hard — always returns a
+    /// usable catalog.
+    ///
+    /// Hits an in-memory cache so repeated picker opens are a cheap pointer clone
+    /// rather than a ~2.6 MB disk read + JSON parse each time (fix #5). On a cache
+    /// MISS the blocking read+parse runs on the blocking pool via
+    /// [`tokio::task::spawn_blocking`] — never on the async runtime — then the
+    /// result is memoized. [`refresh_model_catalog`](Self::refresh_model_catalog)
+    /// invalidates the cache when it rewrites the file, so the next call re-reads
+    /// the fresh catalog.
     #[tracing::instrument(skip_all)]
-    pub async fn model_catalog(&self) -> crate::model_catalog::ModelCatalog {
+    pub async fn model_catalog(&self) -> Arc<crate::model_catalog::ModelCatalog> {
+        // Fast path: a cache hit is a pointer clone under a read lock.
+        if let Some(catalog) = self.catalog_cache.read().await.as_ref() {
+            return catalog.clone();
+        }
+        // Miss: load off the async runtime, then memoize. The read+parse is the
+        // blocking work `spawn_blocking` keeps off the executor thread.
         let data_dir = self.data_dir().await;
-        crate::model_catalog::load_catalog(&data_dir)
+        let loaded =
+            tokio::task::spawn_blocking(move || crate::model_catalog::load_catalog(&data_dir))
+                .await
+                .map(Arc::new)
+                // A `JoinError` (the load task panicked) is non-fatal: fall back to the
+                // bundled snapshot so the catalog surface never fails hard.
+                .unwrap_or_else(|e| {
+                    tracing::warn!("model-catalog load task panicked; using bundled snapshot: {e}");
+                    Arc::new(crate::model_catalog::ModelCatalog::bundled())
+                });
+        // Populate the cache. If another task raced us, either copy is equivalent
+        // (both read the same on-disk/bundled catalog), so simply overwrite.
+        *self.catalog_cache.write().await = Some(loaded.clone());
+        loaded
     }
 
     /// Forces an on-demand model-catalog refresh (e.g. when a model picker
     /// opens). Best-effort: still gated by the staleness check, so a fresh cache
     /// is left untouched. Returns `Ok(true)` when the cache was refreshed.
+    ///
+    /// When the on-disk cache is actually rewritten (`Ok(true)`), the in-memory
+    /// catalog cache is INVALIDATED so the next [`model_catalog`](Self::model_catalog)
+    /// re-reads the fresh file (fix #5). A no-op refresh (fresh cache, `Ok(false)`)
+    /// leaves the in-memory cache intact.
     #[tracing::instrument(skip_all)]
     pub async fn refresh_model_catalog(&self) -> Result<bool, LensError> {
         let data_dir = self.data_dir().await;
         let client = crate::model_catalog::catalog_client();
-        crate::model_catalog::refresh_if_stale(
+        let refreshed = crate::model_catalog::refresh_if_stale(
             &data_dir,
             crate::model_catalog::MODELS_CATALOG_URL,
             &client,
         )
-        .await
+        .await?;
+        if refreshed {
+            // Invalidate so the next load re-reads the freshly-written cache.
+            *self.catalog_cache.write().await = None;
+        }
+        Ok(refreshed)
     }
 
     /// Startup-GC (AC7): drop every orphaned `building`/`stale` re-embed table and
@@ -815,12 +876,50 @@ impl LensEngine {
         *self.enrichment_gate.write().await = gate;
     }
 
+    /// Test-only: awaited inside [`reembed::reembed_and_flip`] after the lock-free
+    /// populate and before the `ingest_lock` flip window. Returns immediately when
+    /// no gate is installed. Lets a fix #2 test hold the reembed "just before the
+    /// flip" while it runs a `purge_source` to completion (sequential race).
+    /// Compiled out of production builds.
+    #[cfg(feature = "test-util")]
+    pub(crate) async fn reembed_preflip_gate(&self) {
+        let gate = self.reembed_preflip_gate.read().await.clone();
+        if let Some(notify) = gate {
+            notify.notified().await;
+        }
+    }
+
+    /// Test-only seam: installs (or clears) the reembed pre-flip gate. While
+    /// installed, [`reembed::reembed_and_flip`] blocks after populate (before the
+    /// flip) until the `Notify` is `notify_one`'d. Gated behind `test-util`; absent
+    /// from production builds.
+    #[cfg(feature = "test-util")]
+    pub async fn set_reembed_preflip_gate_for_test(&self, gate: Option<Arc<tokio::sync::Notify>>) {
+        *self.reembed_preflip_gate.write().await = gate;
+    }
+
     /// Test-only seam: directly enqueue a source onto the enrichment queue (the
     /// production enqueue is internal to the ingest path). Gated behind
     /// `test-util`; absent from production builds.
     #[cfg(feature = "test-util")]
     pub fn enqueue_enrichment_for_test(&self, source_id: &str) {
         self.enqueue_enrichment(source_id);
+    }
+
+    /// Test-only seam: runs the Step-5 re-embed new-table-flip directly (the
+    /// production path is internal to the worker). Lets a test drive the
+    /// purge-vs-flip race deterministically — populate the building table via this
+    /// call AFTER a `purge_source` has already removed the source — to assert the
+    /// in-lock re-check SKIPS the flip (fix #2). Gated behind `test-util`; absent
+    /// from production builds.
+    #[cfg(feature = "test-util")]
+    pub async fn reembed_and_flip_for_test(
+        &self,
+        source_id: &str,
+        notebook: &str,
+        doc_summary: &str,
+    ) -> Result<(), LensError> {
+        crate::enrichment::reembed::reembed_and_flip(self, source_id, notebook, doc_summary).await
     }
 
     /// Test-only seam: disables [`tokenizer`](Self::tokenizer) resolution so a

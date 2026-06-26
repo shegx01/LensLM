@@ -17,7 +17,7 @@ use lens_core::{LensEngine, LensError, ModelInfo, ProviderEntry};
 pub async fn list_models(
     engine: tauri::State<'_, LensEngine>,
 ) -> Result<BTreeMap<String, ProviderEntry>, LensError> {
-    Ok(engine.model_catalog().await.providers)
+    Ok(engine.model_catalog().await.providers.clone())
 }
 
 /// Returns the models for a single provider (model id → info), or an empty map
@@ -31,9 +31,8 @@ pub async fn list_provider_models(
     provider: String,
     engine: tauri::State<'_, LensEngine>,
 ) -> Result<BTreeMap<String, ModelInfo>, LensError> {
-    Ok(engine
-        .model_catalog()
-        .await
+    let catalog = engine.model_catalog().await;
+    Ok(catalog
         .provider(&provider)
         .map(|p| p.models.clone())
         .unwrap_or_default())

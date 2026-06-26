@@ -18,17 +18,22 @@
 use crate::error::LensError;
 use crate::llm::{LlmProvider, LlmRequest};
 
+use super::batching::batch_by_char_budget;
 use super::meta::{
-    Budget, BudgetCheck, ENRICHMENT_BATCH_CHAR_BUDGET, ENRICHMENT_MAP_MAX_TOKENS,
+    Budget, BudgetCheck, ENRICHMENT_BATCH_BYTE_BUDGET, ENRICHMENT_MAP_MAX_TOKENS,
     ENRICHMENT_MAX_RETRIES, StructuralMap,
 };
 
-/// Soft input-character budget for a single map batch (the shared enrichment batch
+/// Soft input-byte budget for a single map batch (the shared enrichment batch
 /// budget). Sized well under a typical local-model context so several parents batch
 /// together but a huge doc splits into multiple map calls (triggering the
 /// hierarchical reduce). Shared with the coref pass via
-/// [`ENRICHMENT_BATCH_CHAR_BUDGET`] so the two batchers stay in sync.
-const MAP_BATCH_CHAR_BUDGET: usize = ENRICHMENT_BATCH_CHAR_BUDGET;
+/// [`ENRICHMENT_BATCH_BYTE_BUDGET`] so the two batchers stay in sync.
+const MAP_BATCH_BYTE_BUDGET: usize = ENRICHMENT_BATCH_BYTE_BUDGET;
+
+/// The byte length of the `"\n\n"` separator joining batched parent texts. Shared
+/// with the batch-cost accounting so the budget reflects the rendered prompt size.
+const PARENT_SEPARATOR_LEN: usize = 2;
 
 /// The system prompt that pins the LLM to emit STRICT JSON matching
 /// [`StructuralMap`]. Kept terse; the strict serde validation is the real guard.
@@ -65,24 +70,26 @@ impl From<LensError> for MapError {
 }
 
 /// Splits parent texts into batches whose concatenated length stays under
-/// [`MAP_BATCH_CHAR_BUDGET`]. A single parent that alone exceeds the budget forms
-/// its own batch (the provider truncates if needed; never a panic).
+/// [`MAP_BATCH_BYTE_BUDGET`], then renders each batch as its `"\n\n"`-joined text.
+/// A single parent that alone exceeds the budget forms its own batch (the provider
+/// truncates if needed; never a panic). Delegates the accumulate-until-budget
+/// grouping to the shared [`batch_by_char_budget`] (DRY with the coref pass).
 fn batch_parents(parent_texts: &[String]) -> Vec<String> {
-    let mut batches: Vec<String> = Vec::new();
-    let mut current = String::new();
-    for text in parent_texts {
-        if !current.is_empty() && current.len() + text.len() + 2 > MAP_BATCH_CHAR_BUDGET {
-            batches.push(std::mem::take(&mut current));
-        }
-        if !current.is_empty() {
-            current.push_str("\n\n");
-        }
-        current.push_str(text);
-    }
-    if !current.is_empty() {
-        batches.push(current);
-    }
-    batches
+    batch_by_char_budget(
+        parent_texts.iter(),
+        MAP_BATCH_BYTE_BUDGET,
+        PARENT_SEPARATOR_LEN,
+        |text| text.len(),
+    )
+    .into_iter()
+    .map(|group| {
+        group
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    })
+    .collect()
 }
 
 /// Shared LLM retry/budget/parse loop for the enrichment passes (DRY across the
@@ -288,30 +295,8 @@ mod tests {
     use super::*;
     use crate::enrichment::meta::{Budget, SessionBudget};
     use crate::enrichment::test_util::ScriptedProvider;
-    use crate::error::LensError;
-    use crate::llm::{LlmProvider, LlmRequest, LlmResponse};
 
-    use async_trait::async_trait;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicU32, Ordering};
-
-    /// A provider that always errors (LLM death / 429).
-    struct DeadProvider {
-        calls: Arc<AtomicU32>,
-    }
-    #[async_trait]
-    impl LlmProvider for DeadProvider {
-        fn model_id(&self) -> &str {
-            "dead"
-        }
-        async fn reachable(&self) -> bool {
-            false
-        }
-        async fn generate(&self, _req: &LlmRequest) -> Result<LlmResponse, LensError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            Err(LensError::Network("connection refused".into()))
-        }
-    }
+    use std::sync::atomic::Ordering;
 
     fn valid_map() -> &'static str {
         r#"{"entities":["Ada"],"definitions":[],"dates":["1843"],"summary":"ok"}"#
@@ -387,10 +372,7 @@ mod tests {
 
     #[tokio::test]
     async fn provider_error_propagates_as_llm_error() {
-        let calls = Arc::new(AtomicU32::new(0));
-        let provider = DeadProvider {
-            calls: calls.clone(),
-        };
+        let (provider, _calls) = ScriptedProvider::dead();
         let mut budget = Budget::new(SessionBudget::new());
         let err = build_structural_map(&provider, &mut budget, &["doc".to_string()])
             .await
@@ -401,7 +383,7 @@ mod tests {
     #[tokio::test]
     async fn over_window_doc_hierarchically_reduces() {
         // Two huge parents force two map batches + one reduce = 3 calls.
-        let big = "x ".repeat(MAP_BATCH_CHAR_BUDGET);
+        let big = "x ".repeat(MAP_BATCH_BYTE_BUDGET);
         let parents = vec![big.clone(), big];
         let (provider, calls) = ScriptedProvider::new(vec![valid_map()]); // cycles valid_map
         let mut budget = Budget::new(SessionBudget::new());

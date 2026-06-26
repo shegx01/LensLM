@@ -24,9 +24,9 @@ use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use async_trait::async_trait;
+use lens_core::enrichment::test_util::ScriptedProvider;
 use lens_core::error::LensError;
-use lens_core::llm::{LlmProvider, LlmRequest, LlmResponse};
+use lens_core::llm::LlmProvider;
 use lens_core::vector_store::{
     CRASH_AFTER_FLIP_TXN_BEFORE_LANCE_DROP, LanceVectorStore, VectorStore,
 };
@@ -62,27 +62,10 @@ async fn flip_serial_guard() -> tokio::sync::MutexGuard<'static, ()> {
 // Mocks
 // ---------------------------------------------------------------------------
 
-/// Always-reachable provider returning one fixed valid structural map.
-struct MockProvider {
-    calls: Arc<AtomicU32>,
-}
-
-#[async_trait]
-impl LlmProvider for MockProvider {
-    fn model_id(&self) -> &str {
-        "mock-llm"
-    }
-    async fn reachable(&self) -> bool {
-        true
-    }
-    async fn generate(&self, _req: &LlmRequest) -> Result<LlmResponse, LensError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(LlmResponse {
-            text: r#"{"entities":["Ada"],"definitions":[{"term":"engine","definition":"a machine"}],"dates":["1843"],"summary":"Ada Lovelace wrote about the analytical engine."}"#
-                .to_string(),
-            tokens_used: 10,
-        })
-    }
+/// The fixed valid structural map the mock LLM returns on every call (a
+/// single-entry script cycles it forever, so every map/coref dispatch sees it).
+fn fixed_map() -> &'static str {
+    r#"{"entities":["Ada"],"definitions":[{"term":"engine","definition":"a machine"}],"dates":["1843"],"summary":"Ada Lovelace wrote about the analytical engine."}"#
 }
 
 /// An embedder that ALWAYS errors on `embed_documents` — used to simulate a crash
@@ -135,10 +118,8 @@ async fn reopen_engine(dir: &TempDir) -> LensEngine {
 }
 
 async fn install_mock_provider(engine: &LensEngine) -> Arc<AtomicU32> {
-    let calls = Arc::new(AtomicU32::new(0));
-    let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider {
-        calls: calls.clone(),
-    });
+    let (provider, calls) = ScriptedProvider::new(vec![fixed_map()]);
+    let provider: Arc<dyn LlmProvider> = Arc::new(provider.with_model("mock-llm"));
     engine.set_llm_provider(Some(provider)).await;
     calls
 }
@@ -622,5 +603,147 @@ async fn crash_during_building_table_populate() {
     assert!(
         tables.iter().any(|t| t == &format!("vec__{nb}__nomic_v15")),
         "the active raw gen-0 table must survive GC; tables: {tables:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Fix #2 — SEQUENTIAL purge-then-reembed race (orphaned phantom vectors)
+// ---------------------------------------------------------------------------
+
+/// Fix #2: the SEQUENTIAL purge-vs-flip race. The lock-free building-table
+/// populate completes; THEN `purge_source` runs to completion (deletes the source
+/// + its chunks + drops its active vectors, then RELEASES `ingest_lock`); THEN the
+/// re-embed acquires the lock for the flip. Without the in-lock re-check, the flip
+/// would promote the building table — resurrecting vectors for the now-deleted
+/// source into the active index (search returning dangling `chunk_id`s no source
+/// backs). With the fix, the in-lock `get_source` re-check finds the source gone
+/// and SKIPS the flip: the active table is untouched, the building table is left
+/// for startup-GC, and search returns NO dangling hits.
+#[tokio::test]
+async fn sequential_purge_then_reembed_skips_flip() {
+    let _flip_guard = flip_serial_guard().await;
+    let (dir, engine) = file_engine().await;
+    let _calls = install_mock_provider(&engine).await;
+    install_counting_embedder(&engine);
+    let (nb, source_id) = seed_indexed_prose_source(&engine).await;
+    let data_dir = engine.data_dir_for_test().await;
+
+    // Pre-state: the active table is the gen-0 raw table; no building row yet.
+    assert_eq!(
+        active_table_name(&engine, &nb).await,
+        format!("vec__{nb}__nomic_v15"),
+        "pre-flip active must be the gen-0 raw table"
+    );
+    assert_eq!(registry_count(&engine, "building").await, 0);
+
+    // Install the pre-flip gate so reembed blocks AFTER its lock-free populate and
+    // BEFORE acquiring `ingest_lock` for the flip — opening a deterministic window
+    // to run a full `purge_source` (which itself takes + releases `ingest_lock`).
+    let gate = Arc::new(tokio::sync::Notify::new());
+    engine
+        .set_reembed_preflip_gate_for_test(Some(gate.clone()))
+        .await;
+
+    // Drive the re-embed directly (empty doc_summary ⇒ no summary node, so the
+    // populate doesn't depend on the source row's FK). Spawn it: it populates the
+    // building table, then parks on the gate before the flip.
+    let reembed_engine = engine.clone();
+    let reembed_nb = nb.clone();
+    let reembed_src = source_id.clone();
+    let handle = tokio::spawn(async move {
+        reembed_engine
+            .reembed_and_flip_for_test(&reembed_src, &reembed_nb, "")
+            .await
+    });
+
+    // Wait until the building table is populated (the reembed reached the gate).
+    let mut populated = false;
+    for _ in 0..300 {
+        if registry_count(&engine, "building").await == 1 {
+            populated = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        populated,
+        "the building table must be populated before the gate (reembed parked pre-flip)"
+    );
+
+    // Now PURGE the source to completion (trash → purge). purge_source acquires +
+    // RELEASES `ingest_lock`; it deletes the source row, cascades its chunks, and
+    // drops its vectors from the ACTIVE table. This is the sequential interleave.
+    let pool = engine.pool().await;
+    sqlx::query("UPDATE sources SET trashed_at = ? WHERE id = ?")
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(&source_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    engine.purge_source(&source_id).await.expect("purge");
+    // Sanity: the source row is gone (the re-check below keys on this).
+    let source_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sources WHERE id = ?")
+        .bind(&source_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(source_rows, 0, "purge must delete the source row");
+
+    // Release the gate → the reembed acquires the lock, re-checks the source (gone),
+    // and SKIPS the flip. It returns Ok(()) (a purge is not a failure).
+    gate.notify_one();
+    let result = handle.await.expect("reembed task joins");
+    assert!(
+        result.is_ok(),
+        "a purged-before-flip reembed must return Ok (not promote, not error); got {result:?}"
+    );
+
+    // The flip was SKIPPED: the active row/table is STILL the untouched gen-0 raw
+    // table (never promoted to the building gen-1 table).
+    assert_eq!(
+        active_table_name(&engine, &nb).await,
+        format!("vec__{nb}__nomic_v15"),
+        "the flip must be skipped: active stays the gen-0 raw table"
+    );
+    assert_eq!(
+        registry_count(&engine, "active").await,
+        1,
+        "exactly one active row (the untouched gen-0)"
+    );
+    // The building table is LEFT for startup-GC (not promoted, not eagerly dropped).
+    assert_eq!(
+        registry_count(&engine, "building").await,
+        1,
+        "the building orphan must remain for startup-GC (not promoted)"
+    );
+    assert_eq!(registry_count(&engine, "stale").await, 0, "no stale row");
+
+    // Search returns NO dangling hits — the purged source's vectors are not in the
+    // active index (the flip never resurrected them; purge dropped the raw ones).
+    let hits = search_chunk_ids(&engine, &nb, "analytical engine").await;
+    assert!(
+        hits.is_empty(),
+        "no dangling hits for the purged source after the skipped flip; hits: {hits:?}"
+    );
+
+    // Startup-GC reclaims the building orphan on restart; the active row stays.
+    drop(engine);
+    let engine2 = reopen_engine(&dir).await;
+    assert_eq!(
+        registry_count(&engine2, "building").await,
+        0,
+        "startup-GC must reclaim the building orphan left by the skipped flip"
+    );
+    assert_eq!(
+        registry_count(&engine2, "active").await,
+        1,
+        "the active gen-0 row must survive GC"
+    );
+    let tables = live_lance_tables(&data_dir).await;
+    assert!(
+        !tables
+            .iter()
+            .any(|t| t == &format!("vec__{nb}__nomic_v15__1")),
+        "GC must drop the orphan building gen-1 table; tables: {tables:?}"
     );
 }

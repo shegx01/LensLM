@@ -141,4 +141,28 @@ describe('SystemCheck', () => {
     render(SystemCheck, { props: { onadvance: vi.fn() } });
     await waitFor(() => expect(screen.getByText('3 of 3 checks passed')).toBeInTheDocument());
   });
+
+  // ── macOS drag region (mirrors SourcesRail drag assertions) ─────────────────
+
+  it('outer <main> is a data-tauri-drag-region with the Card marked no-drag', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'run_system_check') return ALL_PASS;
+    });
+    const { container } = render(SystemCheck, { props: { onadvance: vi.fn() } });
+    const main = container.querySelector('main[data-tauri-drag-region]') as HTMLElement;
+    expect(main).not.toBeNull();
+    // The centered content block carries no-drag so its inner controls stay clickable.
+    const noDrag = main.querySelector('[style*="-webkit-app-region: no-drag"]');
+    expect(noDrag).not.toBeNull();
+  });
+
+  it('ThemeCycleButton wrapper carries -webkit-app-region: no-drag', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'run_system_check') return ALL_PASS;
+    });
+    const { container } = render(SystemCheck, { props: { onadvance: vi.fn() } });
+    const themeWrapper = container.querySelector('.absolute.top-4.right-4') as HTMLElement;
+    expect(themeWrapper).not.toBeNull();
+    expect(themeWrapper.getAttribute('style') ?? '').toContain('-webkit-app-region: no-drag');
+  });
 });

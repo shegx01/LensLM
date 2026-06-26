@@ -18,6 +18,7 @@
 //! against the held permit (a dropped job is recovered by the startup/rescan
 //! queue-rebuild). See [`crate::LensEngine::enqueue_enrichment`].
 
+mod batching;
 pub mod coref;
 pub mod embedding_text;
 pub mod map;
@@ -25,8 +26,11 @@ pub mod meta;
 pub mod reembed;
 pub mod worker;
 
-#[cfg(test)]
-pub(crate) mod test_util;
+/// Shared enrichment test mock ([`test_util::ScriptedProvider`]). Available to the
+/// in-crate unit tests (`#[cfg(test)]`) AND, under the `test-util` feature, to the
+/// separate integration-test crate so both share ONE configurable mock provider.
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_util;
 
 pub use coref::{ChunkCoref, CorefResponse, CorefSub, apply_substitutions, resolve_coref_batch};
 pub use embedding_text::{CorefStrategy, compose_embedding_text, compose_prefix};

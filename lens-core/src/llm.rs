@@ -281,10 +281,22 @@ fn genai_err(err: genai::Error) -> LensError {
 /// A resolved generation target: the genai [`ServiceTarget`] (adapter + model +
 /// endpoint + auth) plus a stable, cloned `model_id` string for the trait
 /// accessor / enrichment cache key.
+///
+/// Also carries the resolved `adapter`, the normalized `endpoint_base` (the genai
+/// endpoint string), and `has_key` (whether an API key was configured) so
+/// [`LlmProvider::reachable`] can probe cheaply WITHOUT a billed generation: a cheap
+/// free GET for local Ollama, and a no-network "configured + consented" answer for
+/// cloud providers (see the `reachable` impl).
 #[derive(Clone)]
 struct ResolvedTarget {
     target: ServiceTarget,
     model_id: String,
+    adapter: AdapterKind,
+    /// The normalized genai endpoint base (always ends in `/`). For local Ollama
+    /// this is the runtime root the cheap `api/version` probe is appended to.
+    endpoint_base: String,
+    /// Whether a non-empty API key was configured (a cloud reachability signal).
+    has_key: bool,
 }
 
 /// The single LLM backend over [`genai`].
@@ -388,11 +400,11 @@ impl GenaiProvider {
         // adapter falls back to its canonical genai endpoint; if even that is
         // absent (a custom/local adapter with no URL), normalize an empty base
         // (yields the old behavior) so construction stays infallible.
+        let normalized = normalize_endpoint(adapter, base_url);
         let endpoint = if base_url.is_empty() {
-            native_endpoint(adapter)
-                .unwrap_or_else(|| Endpoint::from_owned(normalize_endpoint(adapter, base_url)))
+            native_endpoint(adapter).unwrap_or_else(|| Endpoint::from_owned(normalized.clone()))
         } else {
-            Endpoint::from_owned(normalize_endpoint(adapter, base_url))
+            Endpoint::from_owned(normalized.clone())
         };
         let auth = if api_key.is_empty() {
             // Local runtimes (Ollama / LM Studio) need no key; genai tolerates an
@@ -411,6 +423,9 @@ impl GenaiProvider {
             resolved: ResolvedTarget {
                 target,
                 model_id: model.to_string(),
+                adapter,
+                endpoint_base: normalized,
+                has_key: !api_key.is_empty(),
             },
         }
     }
@@ -457,6 +472,22 @@ impl GenaiProvider {
     fn model_spec(&self) -> ModelSpec {
         ModelSpec::Target(self.resolved.target.clone())
     }
+
+    /// A cheap, FREE liveness probe for a LOCAL Ollama runtime: a hardened GET to
+    /// `{endpoint_base}api/version`. Ollama's `/api/version` is unauthenticated and
+    /// generates NO tokens, so this never bills (unlike a `generate` ping). Returns
+    /// `true` on any HTTP success; `false` on a connection refusal / timeout / non-
+    /// success (degrade to raw vectors instead of looping). `endpoint_base` always
+    /// ends in `/`, so the join is well-formed.
+    async fn ollama_alive(&self) -> bool {
+        let url = format!("{}api/version", self.resolved.endpoint_base);
+        crate::http::hardened_client(LLM_CONNECT_TIMEOUT, LLM_TIMEOUT)
+            .get(url)
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
+    }
 }
 
 /// genai usage is `Option<i32>` per field; collapse `prompt + completion` (falling
@@ -484,24 +515,27 @@ impl LlmProvider for GenaiProvider {
     }
 
     async fn reachable(&self) -> bool {
-        // A minimal generate ping (max_tokens=1, temp 0, no JSON/thinking). Any
-        // success → reachable; a `401`/`403` or a connection/timeout failure →
-        // unreachable (Decision G: a misconfigured key counts as unreachable so
-        // the source degrades to raw vectors instead of looping).
-        let ping = LlmRequest {
-            system: None,
-            prompt: "ping".to_string(),
-            max_tokens: 1,
-            temperature: 0.0,
-            json: false,
-            thinking: false,
-            reasoning_effort: None,
-        };
-        let (chat, opts) = Self::map_request(&ping);
-        self.client
-            .exec_chat(self.model_spec(), chat, Some(&opts))
-            .await
-            .is_ok()
+        // Reachability must NOT bill a token. The worker probes `reachable()` once
+        // per job, so the old `generate(max_tokens=1)` ping charged a billed
+        // generation on EVERY cloud job. Instead:
+        //
+        // * LOCAL Ollama: a cheap, FREE, unauthenticated GET to `/api/version`
+        //   (the runtime's liveness endpoint — no token cost). A success → up;
+        //   a connection refusal / timeout → down (degrade to raw vectors).
+        // * CLOUD providers: treat "configured (key present, or a keyless native
+        //   endpoint) + consented" as reachable WITHOUT any network call. We do NOT
+        //   probe — the real enrichment `generate()` is the single source of truth
+        //   for liveness: a genuinely-unreachable cloud provider (down host, bad
+        //   key → 401/403) surfaces as an `LlmError` from `generate()`, which the
+        //   worker already maps to `failed`/degrade. This trades a (rare) one-shot
+        //   wasted enrichment attempt for ZERO per-probe billing, and never hangs.
+        if matches!(self.resolved.adapter, AdapterKind::Ollama) {
+            return self.ollama_alive().await;
+        }
+        // Cloud: a configured key (or a keyless native endpoint, e.g. local-style
+        // setups) is the no-network reachability signal. The consent gate lives in
+        // the factory, so a provider only exists here when already consented.
+        self.resolved.has_key || native_endpoint(self.resolved.adapter).is_some()
     }
 
     async fn generate(&self, req: &LlmRequest) -> Result<LlmResponse, LensError> {
@@ -865,9 +899,6 @@ fn build_eligible(
     }
 }
 
-/// Builds a [`GenaiProvider`] for a single recognized entry (no gating — the
-/// caller applies [`build_eligible`] first). Returns `None` for an unrecognized
-/// provider or an empty endpoint/model.
 /// Whether an entry has a usable endpoint: a configured `base_url`, OR a native
 /// cloud adapter whose canonical endpoint [`native_endpoint`] supplies. Native
 /// cloud providers (`groq`/`deepseek`/`xai`/`cohere`/…) need no `base_url`; local
@@ -879,6 +910,9 @@ fn has_endpoint(model: &crate::config::ModelConfig) -> bool {
     adapter_for(&model.provider.to_ascii_lowercase()).is_some_and(|a| native_endpoint(a).is_some())
 }
 
+/// Builds a [`GenaiProvider`] for a single recognized entry (no gating — the
+/// caller applies [`build_eligible`] first). Returns `None` for an unrecognized
+/// provider or an empty endpoint/model.
 fn build_provider(model: &crate::config::ModelConfig) -> Option<Arc<dyn LlmProvider>> {
     if model.model.is_empty() {
         return None;
@@ -1065,10 +1099,21 @@ mod tests {
 
     #[tokio::test]
     async fn genai_reachable_true_on_ok() {
+        // LOCAL Ollama reachability is a FREE, unauthenticated GET to /api/version —
+        // NOT a billed `generate`. A /api/chat (POST) generate must NEVER fire on a
+        // probe: the chat mock asserts `expect(0)` so any billed dispatch fails.
         let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/version"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "version": "0.1.0"
+            })))
+            .mount(&server)
+            .await;
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(ollama_chat_body("ok")))
+            .expect(0)
             .mount(&server)
             .await;
 
@@ -1079,6 +1124,7 @@ mod tests {
             "",
         ));
         assert!(provider.reachable().await);
+        drop(server); // verifies the chat endpoint was NEVER hit by the probe.
     }
 
     #[tokio::test]
@@ -1093,10 +1139,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn genai_reachable_false_on_500() {
+    async fn cloud_reachable_does_not_perform_a_billed_generate() {
+        // A CLOUD provider (Anthropic) with a configured key is reachable WITHOUT
+        // any network call — no `generate` (which would bill a token) is dispatched
+        // on the probe. The mock asserts ZERO chat/messages hits.
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(GenaiProvider::new(
+            AdapterKind::Anthropic,
+            "claude-3-5-sonnet",
+            &server.uri(),
+            "sk-ant-key",
+        ));
+        assert!(
+            provider.reachable().await,
+            "a configured+consented cloud provider is reachable with no network probe"
+        );
+        drop(server); // verifies NO generate was dispatched (expect(0)).
+    }
+
+    #[tokio::test]
+    async fn cloud_generate_failure_still_degrades_gracefully() {
+        // Even though `reachable()` is a no-network `true` for cloud, a genuinely
+        // unreachable cloud endpoint still degrades via the REAL `generate()` call:
+        // it returns an `LlmError` (which the worker maps to `failed`/degrade),
+        // never a hang.
+        let provider: Arc<dyn LlmProvider> = Arc::new(GenaiProvider::new(
+            AdapterKind::Anthropic,
+            "claude-3-5-sonnet",
+            DEAD_URL,
+            "sk-ant-key",
+        ));
+        assert!(
+            provider.reachable().await,
+            "cloud reachable() is a cheap no-network signal"
+        );
+        let err = provider
+            .generate(&req())
+            .await
+            .expect_err("a dead cloud endpoint must error on the real generate");
+        assert!(
+            matches!(err, LensError::Network(_) | LensError::Model(_)),
+            "the real generate failure degrades gracefully; got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn genai_reachable_false_on_500() {
+        // A local Ollama whose /api/version probe returns a non-success status is
+        // treated as unreachable (degrade to raw vectors).
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/version"))
             .respond_with(ResponseTemplate::new(500))
             .mount(&server)
             .await;

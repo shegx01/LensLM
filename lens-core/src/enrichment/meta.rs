@@ -47,13 +47,14 @@ pub const ENRICHMENT_MAX_CALLS_PER_JOB: u32 = 8;
 /// → up to 3 total attempts per map call; then degrade to context-prefix-only.
 pub const ENRICHMENT_MAX_RETRIES: u32 = 2;
 
-/// Soft input-character budget for a single enrichment LLM batch (shared by the
+/// Soft input-BYTE budget for a single enrichment LLM batch (shared by the
 /// structural-map map-reduce and the coref pass so the two batchers stay in sync).
-/// Sized well under a typical local-model context so several parents/chunks batch
-/// together but a huge doc splits into multiple calls; a single chunk that alone
-/// exceeds the budget forms its own batch (the provider truncates if needed —
+/// Measured in bytes (`str::len`), not Unicode chars — the name reflects the actual
+/// unit. Sized well under a typical local-model context so several parents/chunks
+/// batch together but a huge doc splits into multiple calls; a single chunk that
+/// alone exceeds the budget forms its own batch (the provider truncates if needed —
 /// never a panic).
-pub(super) const ENRICHMENT_BATCH_CHAR_BUDGET: usize = 8 * 1024;
+pub(super) const ENRICHMENT_BATCH_BYTE_BUDGET: usize = 8 * 1024;
 
 /// Max output tokens requested for a single structural-map LLM call.
 pub const ENRICHMENT_MAP_MAX_TOKENS: u32 = 1_024;

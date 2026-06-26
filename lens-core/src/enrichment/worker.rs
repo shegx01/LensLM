@@ -262,12 +262,7 @@ async fn process_job(
             tokens_spent: budget.job_tokens(),
             calls_made: budget.job_calls(),
         };
-        repo.update_enrichment_status_and_meta(
-            &job.source_id,
-            EnrichmentStatus::Skipped,
-            &serde_json::to_string(&meta)?,
-        )
-        .await?;
+        persist_meta(&repo, &job.source_id, EnrichmentStatus::Skipped, &meta).await?;
         tracing::debug!(
             source_id = %job.source_id,
             prose = is_prose,
@@ -305,12 +300,7 @@ async fn process_job(
                     tokens_spent: budget.job_tokens(),
                     calls_made: budget.job_calls(),
                 };
-                repo.update_enrichment_status_and_meta(
-                    &job.source_id,
-                    EnrichmentStatus::Failed,
-                    &serde_json::to_string(&meta)?,
-                )
-                .await?;
+                persist_meta(&repo, &job.source_id, EnrichmentStatus::Failed, &meta).await?;
                 tracing::warn!(
                     source_id = %job.source_id,
                     calls = budget.job_calls(),
@@ -328,12 +318,7 @@ async fn process_job(
                     tokens_spent: budget.job_tokens(),
                     calls_made: budget.job_calls(),
                 };
-                repo.update_enrichment_status_and_meta(
-                    &job.source_id,
-                    EnrichmentStatus::Failed,
-                    &serde_json::to_string(&meta)?,
-                )
-                .await?;
+                persist_meta(&repo, &job.source_id, EnrichmentStatus::Failed, &meta).await?;
                 tracing::warn!(source_id = %job.source_id, "enrichment: LLM error, failed: {e}");
                 return Ok(());
             }
@@ -376,12 +361,7 @@ async fn process_job(
                     tokens_spent: budget.job_tokens(),
                     calls_made: budget.job_calls(),
                 };
-                repo.update_enrichment_status_and_meta(
-                    &job.source_id,
-                    EnrichmentStatus::Failed,
-                    &serde_json::to_string(&meta)?,
-                )
-                .await?;
+                persist_meta(&repo, &job.source_id, EnrichmentStatus::Failed, &meta).await?;
                 tracing::warn!(
                     source_id = %job.source_id,
                     calls = budget.job_calls(),
@@ -450,12 +430,7 @@ async fn process_job(
         tracing::debug!(source_id = %job.source_id, "enrichment: source purged before meta write, dropping");
         return Ok(());
     }
-    repo.update_enrichment_status_and_meta(
-        &job.source_id,
-        EnrichmentStatus::Enriching,
-        &serde_json::to_string(&meta)?,
-    )
-    .await?;
+    persist_meta(&repo, &job.source_id, EnrichmentStatus::Enriching, &meta).await?;
     tracing::debug!(
         source_id = %job.source_id,
         map_quality,
@@ -485,12 +460,7 @@ async fn process_job(
             tokens_spent: budget.job_tokens(),
             calls_made: budget.job_calls(),
         };
-        repo.update_enrichment_status_and_meta(
-            &job.source_id,
-            EnrichmentStatus::Failed,
-            &serde_json::to_string(&fail_meta)?,
-        )
-        .await?;
+        persist_meta(&repo, &job.source_id, EnrichmentStatus::Failed, &fail_meta).await?;
         tracing::warn!(source_id = %job.source_id, "enrichment: re-embed flip failed: {e}");
         return Ok(());
     }
@@ -501,6 +471,24 @@ async fn process_job(
         "enrichment: re-embed flip complete (enriched)"
     );
     Ok(())
+}
+
+/// Serializes `meta` and writes it alongside the terminal-ish `status` for the
+/// source, in one place (DRY across the worker's budget-exceeded / llm-error /
+/// skipped / success / re-embed-fallback paths — the construct→serialize→update
+/// triple was copy-pasted across ~6 sites).
+///
+/// Preserves the underlying no-op-on-missing-source semantics: a purge mid-flight
+/// makes [`NotebookRepo::update_enrichment_status_and_meta`] a no-op rather than an
+/// error, so callers that already re-checked existence keep their behavior.
+async fn persist_meta(
+    repo: &NotebookRepo<'_>,
+    source_id: &str,
+    status: EnrichmentStatus,
+    meta: &EnrichmentMeta,
+) -> Result<(), crate::LensError> {
+    repo.update_enrichment_status_and_meta(source_id, status, &serde_json::to_string(meta)?)
+        .await
 }
 
 /// Writes a context-prefix-only `embedding_text` to every chunk (the SKIPPED /

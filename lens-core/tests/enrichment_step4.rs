@@ -25,11 +25,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use async_trait::async_trait;
 use lens_core::LensEngine;
 use lens_core::enrichment::meta::EnrichmentMeta;
-use lens_core::error::LensError;
-use lens_core::llm::{LlmProvider, LlmRequest, LlmResponse};
+use lens_core::enrichment::test_util::ScriptedProvider;
+use lens_core::llm::LlmProvider;
 use sqlx::Row;
 use tempfile::TempDir;
 
@@ -37,47 +36,12 @@ use tempfile::TempDir;
 // Mock provider
 // ---------------------------------------------------------------------------
 
-/// A mock provider with a call-counter that serves a scripted body sequence
-/// (cycling the last entry once exhausted). `reachable()` is always `true`.
-struct MockProvider {
-    calls: Arc<AtomicU32>,
-    bodies: Vec<String>,
-    model: String,
-}
-
-impl MockProvider {
-    fn new(model: &str, bodies: Vec<&str>) -> (Arc<Self>, Arc<AtomicU32>) {
-        let calls = Arc::new(AtomicU32::new(0));
-        let me = Arc::new(Self {
-            calls: calls.clone(),
-            bodies: bodies.into_iter().map(|s| s.to_string()).collect(),
-            model: model.to_string(),
-        });
-        (me, calls)
-    }
-}
-
-#[async_trait]
-impl LlmProvider for MockProvider {
-    fn model_id(&self) -> &str {
-        &self.model
-    }
-    async fn reachable(&self) -> bool {
-        true
-    }
-    async fn generate(&self, _req: &LlmRequest) -> Result<LlmResponse, LensError> {
-        let n = self.calls.fetch_add(1, Ordering::SeqCst) as usize;
-        let text = self
-            .bodies
-            .get(n)
-            .or_else(|| self.bodies.last())
-            .cloned()
-            .unwrap_or_default();
-        Ok(LlmResponse {
-            text,
-            tokens_used: 10,
-        })
-    }
+/// Builds the shared [`ScriptedProvider`] mock (a call-counted, scripted-body
+/// provider; `reachable()` is always `true`) pinned to `model`, returning it as a
+/// trait object alongside the shared call-counter the assertions read.
+fn mock_provider(model: &str, bodies: Vec<&str>) -> (Arc<dyn LlmProvider>, Arc<AtomicU32>) {
+    let (provider, calls) = ScriptedProvider::new(bodies);
+    (Arc::new(provider.with_model(model)), calls)
 }
 
 fn valid_map() -> &'static str {
@@ -276,7 +240,7 @@ async fn ac4_valid_map_is_stored_on_parent_and_text_byte_identical() {
     // LlmInline. The exact coref-call count depends on how the bodies batch under
     // the char budget (a detail), so we assert the map fired + at least one coref
     // call, not a brittle exact total.
-    let (provider, calls) = MockProvider::new("mock-1", vec![valid_map(), empty_coref()]);
+    let (provider, calls) = mock_provider("mock-1", vec![valid_map(), empty_coref()]);
     engine.set_llm_provider(Some(provider)).await;
     engine.enqueue_enrichment_for_test(&source_id);
 
@@ -338,7 +302,7 @@ async fn ac4_malformed_thrice_degrades_to_fallback_source_not_failed() {
     .await;
 
     // 1 initial + 2 reprompts, all malformed → fallback (not failed).
-    let (provider, calls) = MockProvider::new("mock-1", vec!["nope", "still bad", "garbage"]);
+    let (provider, calls) = mock_provider("mock-1", vec!["nope", "still bad", "garbage"]);
     engine.set_llm_provider(Some(provider)).await;
     engine.enqueue_enrichment_for_test(&source_id);
 
@@ -381,7 +345,7 @@ async fn ac9_matching_cache_key_skips_llm_entirely() {
     )
     .await;
 
-    let (provider, calls) = MockProvider::new("mock-1", vec![valid_map(), empty_coref()]);
+    let (provider, calls) = mock_provider("mock-1", vec![valid_map(), empty_coref()]);
     engine.set_llm_provider(Some(provider)).await;
 
     // First run: one map + one coref call; the fused worker completes to `enriched`.
@@ -417,7 +381,7 @@ async fn ac9_model_change_invalidates_cache_key_and_reruns() {
     .await;
 
     // First provider (model "mock-A") enriches once (map + coref).
-    let (provider_a, calls_a) = MockProvider::new("mock-A", vec![valid_map(), empty_coref()]);
+    let (provider_a, calls_a) = mock_provider("mock-A", vec![valid_map(), empty_coref()]);
     engine.set_llm_provider(Some(provider_a)).await;
     engine.enqueue_enrichment_for_test(&source_id);
     assert!(wait_for_status(&engine, &source_id, "enriched").await);
@@ -429,7 +393,7 @@ async fn ac9_model_change_invalidates_cache_key_and_reruns() {
     // Swap to a DIFFERENT model id → the composite cache key changes (model_id is
     // a key component, exactly like a prompt_version bump) → it MUST re-run. The
     // re-run re-enriches and completes back to `enriched` with fresh LLM calls.
-    let (provider_b, calls_b) = MockProvider::new("mock-B", vec![valid_map(), empty_coref()]);
+    let (provider_b, calls_b) = mock_provider("mock-B", vec![valid_map(), empty_coref()]);
     engine.set_llm_provider(Some(provider_b)).await;
     // Move OFF `enriched` first so the re-run's completion back to `enriched` is
     // observable as a transition (the cache-key mismatch forces the LLM call).
@@ -477,7 +441,7 @@ async fn ac11_per_job_budget_one_call_second_generate_never_dispatched() {
 
     // Two malformed replies are scripted: the first is dispatched + malformed;
     // the worker would reprompt, but the budget refuses the 2nd dispatch.
-    let (provider, calls) = MockProvider::new("mock-1", vec!["bad json", "more bad", valid_map()]);
+    let (provider, calls) = mock_provider("mock-1", vec!["bad json", "more bad", valid_map()]);
     engine.set_llm_provider(Some(provider)).await;
     engine.enqueue_enrichment_for_test(&source_id);
 
@@ -531,7 +495,7 @@ async fn code_only_source_is_skipped_with_prefix_embedding_text() {
     )
     .await;
 
-    let (provider, calls) = MockProvider::new("mock-1", vec![valid_map()]);
+    let (provider, calls) = mock_provider("mock-1", vec![valid_map()]);
     engine.set_llm_provider(Some(provider)).await;
     engine.enqueue_enrichment_for_test(&source_id);
 
@@ -577,7 +541,7 @@ async fn tiny_prose_source_is_skipped_by_size_gate() {
     )
     .await;
 
-    let (provider, calls) = MockProvider::new("mock-1", vec![valid_map()]);
+    let (provider, calls) = mock_provider("mock-1", vec![valid_map()]);
     engine.set_llm_provider(Some(provider)).await;
     engine.enqueue_enrichment_for_test(&source_id);
 
@@ -620,7 +584,7 @@ async fn coref_substitution_resolves_embedding_text_body_canonical_text_untouche
     // map (valid; entities=["Ada Lovelace"]) then a coref reply substituting the
     // leading "It" (id=0, [0,2)) → "Ada Lovelace".
     let coref = r#"{"results":[{"id":0,"subs":[{"mention":"It","char_start":0,"char_end":2,"antecedent":"Ada Lovelace"}]}]}"#;
-    let (provider, calls) = MockProvider::new("mock-1", vec![valid_map(), coref]);
+    let (provider, calls) = mock_provider("mock-1", vec![valid_map(), coref]);
     engine.set_llm_provider(Some(provider)).await;
     engine.enqueue_enrichment_for_test(&source_id);
 

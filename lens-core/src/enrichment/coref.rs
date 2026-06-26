@@ -34,18 +34,23 @@ use serde::{Deserialize, Serialize};
 
 use crate::llm::LlmProvider;
 
+use super::batching::batch_by_char_budget;
 use super::map::{MapError, run_llm_with_retries};
 use super::meta::{
-    Budget, COREF_MAX_RESULTS, COREF_MAX_SUBS_PER_CHUNK, ENRICHMENT_BATCH_CHAR_BUDGET,
+    Budget, COREF_MAX_RESULTS, COREF_MAX_SUBS_PER_CHUNK, ENRICHMENT_BATCH_BYTE_BUDGET,
     ENRICHMENT_COREF_MAX_TOKENS, STRUCTURAL_MAP_MAX_FIELD_CHARS, truncate_chars,
 };
 
-/// Soft input-character budget for a single coref batch (the shared enrichment
+/// Soft input-byte budget for a single coref batch (the shared enrichment
 /// batch budget). Chunk bodies are batched under this ceiling (each tagged with its
 /// `id`); a single chunk larger than the budget forms its own batch (the provider
 /// truncates if needed; never a panic). Shared with the structural-map pass via
-/// [`ENRICHMENT_BATCH_CHAR_BUDGET`] so the two batchers stay in sync.
-const COREF_BATCH_CHAR_BUDGET: usize = ENRICHMENT_BATCH_CHAR_BUDGET;
+/// [`ENRICHMENT_BATCH_BYTE_BUDGET`] so the two batchers stay in sync.
+const COREF_BATCH_BYTE_BUDGET: usize = ENRICHMENT_BATCH_BYTE_BUDGET;
+
+/// Per-item byte overhead the coref batch-cost accounting adds for each chunk
+/// (mirrors the original `+ 2` separator allowance in the cost check).
+const COREF_SEPARATOR_LEN: usize = 2;
 
 /// The system prompt pinning the LLM to emit STRICT coref-substitution JSON.
 ///
@@ -142,24 +147,16 @@ impl CorefResponse {
 }
 
 /// Splits `(id, text)` chunks into batches whose concatenated text stays under
-/// [`COREF_BATCH_CHAR_BUDGET`]. A single chunk that alone exceeds the budget forms
-/// its own batch.
+/// [`COREF_BATCH_BYTE_BUDGET`]. A single chunk that alone exceeds the budget forms
+/// its own batch. Delegates the accumulate-until-budget grouping to the shared
+/// [`batch_by_char_budget`] (DRY with the structural-map pass).
 fn batch_chunks<'a>(chunks: &[(usize, &'a str)]) -> Vec<Vec<(usize, &'a str)>> {
-    let mut batches: Vec<Vec<(usize, &str)>> = Vec::new();
-    let mut current: Vec<(usize, &str)> = Vec::new();
-    let mut current_len = 0usize;
-    for &(id, text) in chunks {
-        if !current.is_empty() && current_len + text.len() + 2 > COREF_BATCH_CHAR_BUDGET {
-            batches.push(std::mem::take(&mut current));
-            current_len = 0;
-        }
-        current_len += text.len() + 2;
-        current.push((id, text));
-    }
-    if !current.is_empty() {
-        batches.push(current);
-    }
-    batches
+    batch_by_char_budget(
+        chunks.iter().copied(),
+        COREF_BATCH_BYTE_BUDGET,
+        COREF_SEPARATOR_LEN,
+        |&(_, text)| text.len(),
+    )
 }
 
 /// Renders one batch's `(id, text)` chunks + the doc entity list into the coref
@@ -695,7 +692,7 @@ mod tests {
         // Two batches (each chunk just over the batch budget), budget admits exactly
         // 1 call. The mock must see EXACTLY 1 generate() — the 2nd batch is never
         // dispatched — and the error is BudgetExceeded.
-        let big = "x ".repeat(COREF_BATCH_CHAR_BUDGET);
+        let big = "x ".repeat(COREF_BATCH_BYTE_BUDGET);
         let resp = valid_coref_for(0, "x", 0, 1, "Ada");
         let (provider, calls) = ScriptedProvider::new(vec![&resp]);
         let mut budget = Budget::with_caps(SessionBudget::new(), 1_000_000, 1);

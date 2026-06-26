@@ -18,6 +18,7 @@
     CLOUD_PROVIDERS,
     CLOUD_PROVIDER_IDS,
     findCloudProvider,
+    defaultModelFor,
     type CloudProvider
   } from '$lib/onboarding/cloud-providers.js';
   import type { AppConfig, CorefStrategy, LlmRouting, TaskModel } from '$lib/theme/types.js';
@@ -199,13 +200,11 @@
   // (reveals the base-URL field; the model is free-text, no catalog).
   const isCustomProvider = $derived(selectedProvider.custom === true);
 
-  // A per-provider offline floor for the model id when the catalog is empty
-  // (offline / non-Tauri / no-catalog provider). OpenAI keeps 'gpt-4o' so the
-  // legacy cloud Save tests stay green; every other provider falls back to its id
-  // as a harmless placeholder the user can edit.
-  function defaultModelFor(id: string): string {
-    return id === 'openai' ? 'gpt-4o' : id;
-  }
+  // The per-provider offline floor for the model id (when the catalog is empty:
+  // offline / non-Tauri / no-catalog provider) is `defaultModelFor` from the shared
+  // cloud-providers table — a catalog-valid recent model per provider so an offline
+  // save passes the backend `validate(provider, model)` gate (fix #3). The SMART
+  // default (loadCloudModels) still overrides it with the newest catalog model.
 
   // The cloud catalog key for the selected provider. `null` for providers with no
   // models.dev namespace (Ollama Cloud — user-pulled; the custom endpoint —
@@ -1008,8 +1007,9 @@
       </p>
     </div>
 
-    <!-- ROUTING select — how the enrichment LLM is chosen. -->
-    <div class="flex flex-col gap-1.5">
+    <!-- ROUTING select — how the enrichment LLM is chosen. Gated on enrichment
+         (grayed + disabled when off), matching the coref controls (fix #4). -->
+    <div class={cn('flex flex-col gap-1.5', !enrichmentEnabled && 'opacity-50')}>
       <label
         for="enrichment-routing"
         class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase"
@@ -1021,6 +1021,7 @@
         value={routingKind}
         onchange={(e) =>
           (routingKind = e.currentTarget.value as 'cloud_first' | 'local_first' | 'explicit')}
+        disabled={!enrichmentEnabled}
         class={SELECT_CLASS}
       >
         {#each ROUTING_OPTIONS as opt (opt.value)}

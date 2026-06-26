@@ -167,8 +167,11 @@
   }
 </script>
 
-<main class="flex min-h-svh items-center justify-center p-6">
-  <div class="w-full max-w-[520px]">
+<!-- macOS drag region (titleBarStyle Overlay): the empty canvas drags the window;
+     the Card carries -webkit-app-region: no-drag so every inner control (Back, the
+     dropzone, suggestions, footer buttons) stays clickable (mirrors SourcesRail.svelte). -->
+<main data-tauri-drag-region class="flex min-h-svh items-center justify-center p-6">
+  <div class="w-full max-w-[520px]" style="-webkit-app-region: no-drag;">
     <Card class="w-full gap-0 rounded-[14px] px-10 pt-9 pb-8 shadow-2xl ring-0">
       <!-- Header: Back + 3-dot progress -->
       <div class="mb-7 flex items-center justify-between">

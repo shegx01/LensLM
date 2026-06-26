@@ -103,6 +103,13 @@ pub(crate) async fn reembed_and_flip(
         store.add_to_table(&building_name, rows).await?;
     }
 
+    // Test-only seam: pause here (after the lock-free populate, before the flip
+    // window) so a fix #2 test can run a `purge_source` to completion — modeling
+    // the sequential purge-then-flip race the in-lock re-check below closes. A
+    // no-op in production (no gate installed) and compiled out without `test-util`.
+    #[cfg(feature = "test-util")]
+    engine.reembed_preflip_gate().await;
+
     // ── (4) FLIP-ONLY lock window (concurrency synthesis): hold `ingest_lock` ONLY
     // for the atomic flip txn + stale Lance drop (sub-second). The long populate
     // above ran lock-free.
@@ -112,6 +119,27 @@ pub(crate) async fn reembed_and_flip(
             .acquire()
             .await
             .map_err(|e| LensError::Internal(format!("ingest semaphore closed: {e}")))?;
+
+        // Purge-vs-flip race guard. `purge_source` deletes the source row + drops
+        // its vectors from the ACTIVE table under this SAME `ingest_lock`. The
+        // long lock-free populate above could have raced a purge that fully
+        // COMPLETED (and released the lock) before we acquired it — in which case
+        // the building table still holds vectors for a now-deleted source, and
+        // promoting it would resurrect dangling `chunk_id`s into the active index
+        // (search returns hits no source backs). Re-check the source still exists
+        // NOW, while holding the lock: because the re-check and the flip are both
+        // under the held lock (and purge also takes it), no purge can interleave
+        // between them. If the source is gone, SKIP the flip entirely and leave the
+        // building table for startup-GC to reclaim — never promote it.
+        if repo.get_source(source_id).await?.is_none() {
+            tracing::debug!(
+                source_id,
+                building = %building_name,
+                "enrichment: source purged before flip; skipping flip, leaving building table for GC"
+            );
+            return Ok(());
+        }
+
         store
             .flip_active(notebook, EMBED_MODEL_ID, EMBED_DIM, &building_name)
             .await?;
