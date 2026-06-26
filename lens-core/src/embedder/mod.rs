@@ -34,7 +34,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use fastembed::{InitOptions, TextEmbedding};
 
 use crate::LensError;
 
@@ -137,13 +137,25 @@ pub struct FastembedEmbedder {
     /// serialized by the engine's single-permit ingest semaphore, so the lock is
     /// effectively uncontended.
     inner: Mutex<TextEmbedding>,
+    /// Stable model id, copied from the spec this embedder was built from.
+    model_id: String,
+    /// Output dimension, copied from the spec.
+    dim: usize,
+    /// Document prefix from the spec (`""` = apply none).
+    prefix_doc: String,
+    /// Query prefix from the spec (`""` = apply none).
+    prefix_query: String,
 }
 
 impl FastembedEmbedder {
-    /// Builds a `FastembedEmbedder`.
+    /// Builds a `FastembedEmbedder` for the default model
+    /// ([`DEFAULT_EMBED_MODEL_ID`]).
+    ///
+    /// Convenience wrapper over [`FastembedEmbedder::new_with_spec`] that
+    /// resolves the default spec from the registry.
     ///
     /// The ONNX session is initialized here (~130 MB).  On first call, the
-    /// `nomic-embed-text-v1.5` weights are downloaded from HuggingFace into
+    /// model weights are downloaded from HuggingFace into
     /// `{data_dir}/models/fastembed/` and cached there for subsequent runs.
     ///
     /// # Errors
@@ -151,12 +163,31 @@ impl FastembedEmbedder {
     /// Returns [`LensError::Model`] if the fastembed session cannot be
     /// initialized (download failure, corrupt weights, onnxruntime error, …).
     pub fn new(data_dir: &Path) -> Result<Self, LensError> {
+        Self::new_with_spec(data_dir, resolve(DEFAULT_EMBED_MODEL_ID))
+    }
+
+    /// Builds a `FastembedEmbedder` for the model described by `spec`.
+    ///
+    /// The fastembed variant, dimension, and prefix convention are all taken
+    /// from `spec` (the registry is the single source of truth). Weights for
+    /// `spec.fastembed_variant` are downloaded into `{data_dir}/models/fastembed/`
+    /// on first use and cached there.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LensError::Model`] if the fastembed session cannot be
+    /// initialized (download failure, corrupt weights, onnxruntime error, …).
+    pub fn new_with_spec(data_dir: &Path, spec: &EmbeddingModelSpec) -> Result<Self, LensError> {
         let cache_dir = data_dir.join("models").join("fastembed");
-        let opts = InitOptions::new(EmbeddingModel::NomicEmbedTextV15).with_cache_dir(cache_dir);
+        let opts = InitOptions::new(spec.fastembed_variant.clone()).with_cache_dir(cache_dir);
         let inner = TextEmbedding::try_new(opts)
             .map_err(|e| LensError::Model(format!("fastembed init failed: {e}")))?;
         Ok(Self {
             inner: Mutex::new(inner),
+            model_id: spec.id.to_string(),
+            dim: spec.dim,
+            prefix_doc: spec.prefix_doc.to_string(),
+            prefix_query: spec.prefix_query.to_string(),
         })
     }
 
@@ -172,20 +203,21 @@ impl FastembedEmbedder {
             .map_err(|e| LensError::Model(format!("fastembed mutex poisoned: {e}")))?
             .embed(prefixed_refs, None)
             .map_err(|e| LensError::Model(format!("fastembed embed_documents failed: {e}")))?;
-        Self::assert_normalized(&result)?;
+        self.assert_normalized(&result)?;
         Ok(result)
     }
 
     /// Asserts that every vector in `vecs` is L2-normalized (‖v‖ ≈ 1.0 ± 1e-3)
-    /// and has the expected dimension.
+    /// and has this embedder's expected dimension (`self.dim()`).
     ///
     /// `fastembed` 5.17.2 normalizes unconditionally, so this should never fire.
     /// It is a cheap defensive canary, not a correctness dependency.
-    fn assert_normalized(vecs: &[Vec<f32>]) -> Result<(), LensError> {
+    fn assert_normalized(&self, vecs: &[Vec<f32>]) -> Result<(), LensError> {
+        let expected = self.dim();
         for (i, v) in vecs.iter().enumerate() {
-            if v.len() != EMBED_DIM {
+            if v.len() != expected {
                 return Err(LensError::Model(format!(
-                    "embedder returned vector {i} with dim {} (expected {EMBED_DIM})",
+                    "embedder returned vector {i} with dim {} (expected {expected})",
                     v.len()
                 )));
             }
@@ -202,43 +234,48 @@ impl FastembedEmbedder {
 
 impl Embedder for FastembedEmbedder {
     fn model_id(&self) -> &str {
-        EMBED_MODEL_ID
+        &self.model_id
     }
 
     fn dim(&self) -> usize {
-        EMBED_DIM
+        self.dim
     }
 
-    /// Prepends `"search_document: "` to each text, embeds the batch, validates
-    /// normalization + dimension, and returns the result.
+    /// Prepends this model's document prefix (`self.prefix_doc`, empty = none) to
+    /// each text, embeds the batch, validates normalization + dimension, and
+    /// returns the result.
     fn embed_documents(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, LensError> {
         let prefixed: Vec<String> = texts
             .iter()
-            .map(|t| format!("search_document: {t}"))
+            .map(|t| format!("{}{t}", self.prefix_doc))
             .collect();
         self.embed_prefixed_documents(prefixed)
     }
 
     /// Owned-input variant: prefixes each input **in place** (`insert_str`) so the
-    /// ingest hot path copies each chunk's text once instead of twice.
+    /// ingest hot path copies each chunk's text once instead of twice. A model
+    /// with an empty document prefix skips the insert entirely.
     fn embed_documents_owned(&self, mut texts: Vec<String>) -> Result<Vec<Vec<f32>>, LensError> {
-        for t in texts.iter_mut() {
-            t.insert_str(0, "search_document: ");
+        if !self.prefix_doc.is_empty() {
+            for t in texts.iter_mut() {
+                t.insert_str(0, &self.prefix_doc);
+            }
         }
         self.embed_prefixed_documents(texts)
     }
 
-    /// Prepends `"search_query: "` to the text, embeds it, validates normalization
-    /// + dimension, and returns the single result vector.
+    /// Prepends this model's query prefix (`self.prefix_query`, empty = none) to
+    /// the text, embeds it, validates normalization + dimension, and returns the
+    /// single result vector.
     fn embed_query(&self, text: &str) -> Result<Vec<f32>, LensError> {
-        let prefixed = format!("search_query: {text}");
+        let prefixed = format!("{}{text}", self.prefix_query);
         let result = self
             .inner
             .lock()
             .map_err(|e| LensError::Model(format!("fastembed mutex poisoned: {e}")))?
             .embed(vec![prefixed.as_str()], None)
             .map_err(|e| LensError::Model(format!("fastembed embed_query failed: {e}")))?;
-        Self::assert_normalized(&result)?;
+        self.assert_normalized(&result)?;
         result.into_iter().next().ok_or_else(|| {
             LensError::Model("fastembed returned empty batch for embed_query".into())
         })
@@ -297,28 +334,67 @@ pub struct CountingEmbedder {
     /// Instantaneous count of embed calls in progress.  Tests assert this never
     /// exceeds `1` (single-permit semaphore).
     pub in_flight: Arc<AtomicUsize>,
+    /// Stable model id reported by [`Embedder::model_id`].
+    model_id: String,
+    /// Output dimension of generated vectors and reported by [`Embedder::dim`].
+    dim: usize,
+    /// Document prefix applied in [`Embedder::embed_documents`] (`""` = none).
+    prefix_doc: String,
+    /// Query prefix applied in [`Embedder::embed_query`] (`""` = none).
+    prefix_query: String,
 }
 
 impl CountingEmbedder {
-    /// Constructs a new [`CountingEmbedder`], incrementing `load_count` by `1`.
+    /// Constructs a new default ([`DEFAULT_EMBED_MODEL_ID`], 768-dim,
+    /// nomic prefixes) [`CountingEmbedder`], incrementing `load_count` by `1`.
     ///
     /// Pass shared `Arc<AtomicUsize>` values so multiple embedder instances (or
     /// engine-level caching wrappers) all write to the same counters.
     pub fn new(load_count: Arc<AtomicUsize>, in_flight: Arc<AtomicUsize>) -> Self {
+        Self::new_with_dim(
+            DEFAULT_EMBED_DIM,
+            DEFAULT_EMBED_MODEL_ID,
+            "search_document: ",
+            "search_query: ",
+            load_count,
+            in_flight,
+        )
+    }
+
+    /// Constructs a [`CountingEmbedder`] for an arbitrary model, incrementing
+    /// `load_count` by `1`.
+    ///
+    /// `dim` controls the length of every generated vector (and what
+    /// [`Embedder::dim`] reports); `model_id` is echoed by
+    /// [`Embedder::model_id`]; `prefix_doc` / `prefix_query` (empty = none) are
+    /// applied in the embed calls so the deterministic output depends on the
+    /// model's prefix convention, matching [`FastembedEmbedder`].
+    pub fn new_with_dim(
+        dim: usize,
+        model_id: &str,
+        prefix_doc: &str,
+        prefix_query: &str,
+        load_count: Arc<AtomicUsize>,
+        in_flight: Arc<AtomicUsize>,
+    ) -> Self {
         load_count.fetch_add(1, Ordering::SeqCst);
         Self {
             load_count,
             in_flight,
+            model_id: model_id.to_string(),
+            dim,
+            prefix_doc: prefix_doc.to_string(),
+            prefix_query: prefix_query.to_string(),
         }
     }
 
-    /// Produces a deterministic, L2-normalized 768-dim vector from an arbitrary
-    /// string.
+    /// Produces a deterministic, L2-normalized `self.dim`-length vector from an
+    /// arbitrary string.
     ///
-    /// Uses a simple FNV-1a-style hash spread across 768 components, then
+    /// Uses a simple FNV-1a-style hash spread across `self.dim` components, then
     /// L2-normalizes.  The result is stable across runs for the same input.
-    fn deterministic_vector(text: &str) -> Vec<f32> {
-        let mut v = vec![0.0_f32; EMBED_DIM];
+    fn deterministic_vector(&self, text: &str) -> Vec<f32> {
+        let mut v = vec![0.0_f32; self.dim];
         // Spread the bytes of the input across the output dimensions with a
         // simple hash mix to ensure distinct strings produce distinct vectors.
         let bytes = text.as_bytes();
@@ -344,18 +420,18 @@ impl CountingEmbedder {
 
 impl Embedder for CountingEmbedder {
     fn model_id(&self) -> &str {
-        EMBED_MODEL_ID
+        &self.model_id
     }
 
     fn dim(&self) -> usize {
-        EMBED_DIM
+        self.dim
     }
 
     fn embed_documents(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, LensError> {
         self.in_flight.fetch_add(1, Ordering::SeqCst);
         let result = texts
             .iter()
-            .map(|t| Self::deterministic_vector(&format!("search_document: {t}")))
+            .map(|t| self.deterministic_vector(&format!("{}{t}", self.prefix_doc)))
             .collect();
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
         Ok(result)
@@ -363,7 +439,7 @@ impl Embedder for CountingEmbedder {
 
     fn embed_query(&self, text: &str) -> Result<Vec<f32>, LensError> {
         self.in_flight.fetch_add(1, Ordering::SeqCst);
-        let result = Self::deterministic_vector(&format!("search_query: {text}"));
+        let result = self.deterministic_vector(&format!("{}{text}", self.prefix_query));
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
         Ok(result)
     }
@@ -537,9 +613,139 @@ mod tests {
 
     #[test]
     fn deterministic_vector_is_stable_across_calls() {
-        let v1 = CountingEmbedder::deterministic_vector("stable input");
-        let v2 = CountingEmbedder::deterministic_vector("stable input");
+        let e = make_embedder();
+        let v1 = e.deterministic_vector("stable input");
+        let v2 = e.deterministic_vector("stable input");
         assert_eq!(v1, v2);
+    }
+
+    // --- Step 2: parameterized model id / dim / prefixes (R4) ---
+
+    fn make_embedder_for(spec: &EmbeddingModelSpec) -> CountingEmbedder {
+        CountingEmbedder::new_with_dim(
+            spec.dim,
+            spec.id,
+            spec.prefix_doc,
+            spec.prefix_query,
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        )
+    }
+
+    #[test]
+    fn default_counting_embedder_is_768_nomic() {
+        let e = make_embedder();
+        assert_eq!(e.dim(), 768);
+        assert_eq!(e.model_id(), "nomic-embed-text-v1.5");
+        let v = e.embed_query("anything").unwrap();
+        assert_eq!(v.len(), 768);
+    }
+
+    #[test]
+    fn counting_embedder_384_returns_correct_length_and_dim() {
+        let e = make_embedder_for(resolve("all-minilm"));
+        assert_eq!(e.dim(), 384);
+        assert_eq!(e.model_id(), "all-minilm");
+        let docs = e.embed_documents(&["a", "b"]).unwrap();
+        assert_eq!(docs.len(), 2);
+        for v in &docs {
+            assert_eq!(v.len(), 384);
+        }
+        assert_eq!(e.embed_query("q").unwrap().len(), 384);
+    }
+
+    #[test]
+    fn counting_embedder_1024_returns_correct_length_and_dim() {
+        let e = make_embedder_for(resolve("mxbai-embed-large"));
+        assert_eq!(e.dim(), 1024);
+        assert_eq!(e.model_id(), "mxbai-embed-large");
+        let docs = e.embed_documents(&["x"]).unwrap();
+        assert_eq!(docs[0].len(), 1024);
+        assert_eq!(e.embed_query("y").unwrap().len(), 1024);
+    }
+
+    #[test]
+    fn vectors_are_l2_normalized_at_384() {
+        let e = make_embedder_for(resolve("all-minilm"));
+        let v = e.embed_query("normalize me").unwrap();
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!(
+            (norm - 1.0).abs() < 1e-3,
+            "384-dim query vector norm {norm:.6} not within 1e-3 of 1.0"
+        );
+        let docs = e.embed_documents(&["also me"]).unwrap();
+        let dnorm: f32 = docs[0].iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!(
+            (dnorm - 1.0).abs() < 1e-3,
+            "384-dim doc vector norm {dnorm:.6} not within 1e-3 of 1.0"
+        );
+    }
+
+    #[test]
+    fn nomic_prefixes_make_doc_differ_from_query() {
+        // nomic applies both a doc prefix and a (different) query prefix, so the
+        // same raw text hashes differently across the two paths.
+        let e = make_embedder_for(resolve("nomic-embed-text-v1.5"));
+        let text = "shared sentence";
+        let doc = e.embed_documents(&[text]).unwrap();
+        let query = e.embed_query(text).unwrap();
+        assert_ne!(doc[0], query);
+    }
+
+    #[test]
+    fn mxbai_query_prefix_makes_doc_differ_from_query() {
+        // mxbai: doc prefix is empty, query prefix is non-empty, so doc != query.
+        let e = make_embedder_for(resolve("mxbai-embed-large"));
+        let text = "shared sentence";
+        let doc = e.embed_documents(&[text]).unwrap();
+        let query = e.embed_query(text).unwrap();
+        assert_ne!(doc[0], query);
+        // The empty doc prefix means the doc vector equals the raw-text hash.
+        assert_eq!(doc[0], e.deterministic_vector(text));
+    }
+
+    #[test]
+    fn all_minilm_no_prefix_makes_doc_equal_query() {
+        // all-minilm has empty prefixes on both sides, so the same raw text
+        // produces identical doc and query vectors (symmetric encoder).
+        let e = make_embedder_for(resolve("all-minilm"));
+        let text = "shared sentence";
+        let doc = e.embed_documents(&[text]).unwrap();
+        let query = e.embed_query(text).unwrap();
+        assert_eq!(doc[0], query);
+        assert_eq!(doc[0], e.deterministic_vector(text));
+    }
+
+    #[test]
+    fn new_with_dim_increments_load_count() {
+        let load = Arc::new(AtomicUsize::new(0));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let _e = CountingEmbedder::new_with_dim(
+            384,
+            "all-minilm",
+            "",
+            "",
+            Arc::clone(&load),
+            Arc::clone(&in_flight),
+        );
+        assert_eq!(load.load(Ordering::SeqCst), 1);
+    }
+
+    // --- Step 2: FastembedEmbedder real-model test (gated) ---
+
+    // Constructing a real FastembedEmbedder downloads ~130 MB of ONNX weights
+    // from HuggingFace, so it is #[ignore]d by default and only runs when
+    // invoked explicitly (e.g. `cargo test -- --ignored` with a warm cache).
+    // CountingEmbedder above covers the dim/prefix wiring deterministically.
+    #[test]
+    #[ignore = "downloads ~130 MB fastembed weights; run explicitly with a warm cache"]
+    fn fastembed_new_with_spec_selects_model_dim() {
+        let dir = std::env::temp_dir();
+        let e = FastembedEmbedder::new_with_spec(&dir, resolve("all-minilm")).unwrap();
+        assert_eq!(e.dim(), 384);
+        assert_eq!(e.model_id(), "all-minilm");
+        let v = e.embed_query("hello").unwrap();
+        assert_eq!(v.len(), 384);
     }
 
     // -----------------------------------------------------------------------
