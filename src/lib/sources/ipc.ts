@@ -36,6 +36,11 @@ export async function addTextSource(
 
 /**
  * Add a file-backed source to a notebook.
+ *
+ * Routes to `add_file_source`, which copies the file into managed storage and
+ * detects the source `kind` from the file EXTENSION (.md/.txt/.pdf/.docx/json/
+ * jsonl/yaml/xml); an unsupported extension is rejected. (The older `add_source`
+ * command recorded a generic `kind="file"` that the ingest pipeline rejects.)
  * Returns the created `Source` row.
  */
 export async function addFileSource(
@@ -44,7 +49,7 @@ export async function addFileSource(
   path: string
 ): Promise<Source> {
   if (!isTauri()) throw new Error('addFileSource: not running under Tauri');
-  return invoke<Source>('add_source', { notebookId, title, locator: path });
+  return invoke<Source>('add_file_source', { notebookId, path, title });
 }
 
 /**
