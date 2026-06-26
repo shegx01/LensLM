@@ -4782,9 +4782,11 @@ dependencies = [
 name = "lenslm"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "lens-core",
  "serde",
  "serde_json",
+ "sqlx",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
@@ -4792,6 +4794,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

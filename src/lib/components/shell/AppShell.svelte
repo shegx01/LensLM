@@ -143,3 +143,12 @@
 <CommandPalette />
 <TrashView />
 <NotebookCreateDialog open={createOpen} onOpenChange={(v) => (createOpen = v)} />
+
+<!-- Dev/QA Embeddings Inspector — DEV-gated dynamic import so the component is
+     tree-shaken out of release bundles (the backend command is also
+     debug_assertions-gated). -->
+{#if import.meta.env.DEV}
+  {#await import('$lib/components/inspector/EmbeddingsInspector.svelte') then { default: Inspector }}
+    <Inspector />
+  {/await}
+{/if}

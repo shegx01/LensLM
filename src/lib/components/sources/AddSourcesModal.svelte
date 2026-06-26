@@ -104,7 +104,11 @@
     try {
       const selected = await openFilePicker({
         multiple: false,
-        filters: [{ name: 'Documents', extensions: ['md', 'txt'] }]
+        filters: [
+          // Kinds the backend `add_file_source` resolves from the extension.
+          { name: 'Documents', extensions: ['md', 'markdown', 'mdx', 'txt', 'pdf', 'docx'] },
+          { name: 'Structured', extensions: ['json', 'jsonl', 'ndjson', 'yaml', 'yml', 'xml'] }
+        ]
       });
       if (!selected) return;
       const path = Array.isArray(selected) ? selected[0] : selected;
@@ -138,8 +142,8 @@
   async function handleDrop(e: DragEvent): Promise<void> {
     e.preventDefault();
     dragOver = false;
-    // For Phase 1 we only support md/txt — use browse flow instead of DataTransfer
-    // because Tauri requires the native path, not a File object.
+    // Delegate to the browse flow: Tauri needs the native file path, not a
+    // DataTransfer File object. The picker filter defines the accepted kinds.
     await handleBrowse();
   }
 
@@ -346,7 +350,11 @@
                 Audio &amp; video transcribed locally via Whisper.
               </p>
               <p class="mt-1 italic text-muted-foreground/40">
-                Phase 1: only .md and .txt files supported. More formats coming soon.
+                Supported: .md · .markdown · .mdx · .txt · .pdf · .docx · .json · .jsonl · .ndjson ·
+                .yaml · .yml · .xml
+              </p>
+              <p class="mt-1 italic text-muted-foreground/40">
+                Audio/video &amp; ebook (.mobi/.epub) formats coming soon.
               </p>
             </div>
 
