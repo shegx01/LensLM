@@ -99,6 +99,23 @@ impl std::fmt::Debug for TtsConfig {
     }
 }
 
+/// A per-task model pin (M4 Phase 3, Stage 3).
+///
+/// Names one exact `(provider, model)` for a single enrichment task (coref / map /
+/// chat). `provider` is a canonical id (`"anthropic"`, `"openai-compatible"`,
+/// `"ollama"`, …) and `model` is a catalog model id. For CLOUD providers the pair
+/// is validated against the [`crate::model_catalog::ModelCatalog`] before dispatch
+/// (anti-free-string guard); local Ollama is exempt (user-pulled models aren't in
+/// models.dev). Serde-stable snake_case so it round-trips in `config.json` and the
+/// TS mirror without leaking a Rust shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskModel {
+    /// Canonical provider id (matches `ModelConfig.provider`).
+    pub provider: String,
+    /// The model id to pin for this task.
+    pub model: String,
+}
+
 /// Optional, additive background-enrichment configuration (M4 Phase 3).
 ///
 /// Enrichment uses the configured LLM to improve RETRIEVAL after a source is
@@ -113,6 +130,13 @@ impl std::fmt::Debug for TtsConfig {
 /// stable snake_case strings (`none`/`llm_inline`) so the on-disk JSON and the
 /// TS mirror stay byte-compatible.
 ///
+/// ## Per-task model overrides (M4 Phase 3, Stage 3)
+/// `coref_model`/`map_model`/`chat_model` are OPTIONAL per-task pins ([`TaskModel`]).
+/// When unset (`None`, the default) the task uses the routing default; when set, the
+/// enrichment worker builds a cheap per-task provider pinned to that exact
+/// `(provider, model)`. They are `#[serde(default)]` so an older `config.json`
+/// written before Stage 3 (no per-task keys) reads back as `None` for each.
+///
 /// ## Provider-driven defaults
 /// The onboarding LLM step picks defaults from the configured provider (see
 /// [`EnrichmentConfig::for_provider`]): a reachable LOCAL provider (Ollama) →
@@ -124,6 +148,24 @@ pub struct EnrichmentConfig {
     /// Master toggle. When `false`, enrichment never runs (sources stay on raw
     /// vectors — `none`/`pending`, the same graceful path as no provider).
     pub enabled: bool,
+    /// OPTIONAL per-task model override for the COREF pass (M4 Phase 3, Stage 3).
+    /// When `Some`, the enrichment worker pins the coref pass to this exact
+    /// `(provider, model)` (catalog-validated for cloud providers; Ollama-local
+    /// exempt); when `None` the coref pass uses the routing default. The product
+    /// ask: a user may pick a coder model for coref while enrichment/chat default
+    /// to a generalist. `#[serde(default)]` for backward-compat.
+    #[serde(default)]
+    pub coref_model: Option<TaskModel>,
+    /// OPTIONAL per-task model override for the structural-MAP pass (Stage 3).
+    /// Same semantics as [`coref_model`](Self::coref_model): `Some` pins the map
+    /// pass to that model, `None` falls back to the routing default.
+    #[serde(default)]
+    pub map_model: Option<TaskModel>,
+    /// OPTIONAL per-task model override for the CHAT task (M5's concern; added now
+    /// only for symmetry). Defaulted `None`; NO chat wiring exists in Phase 3 —
+    /// the field is reserved so the config shape is stable when M5 lands chat.
+    #[serde(default)]
+    pub chat_model: Option<TaskModel>,
     /// Coreference-resolution strategy applied while composing `embedding_text`.
     /// Typed (the canonical [`CorefStrategy`]); defaults to `LlmInline`. Read
     /// through [`deserialize_coref_strategy`] so a legacy `"dedicated_model"`
@@ -135,7 +177,21 @@ pub struct EnrichmentConfig {
     /// (local-first): cloud enrichment is gated on this and never dispatches
     /// without it (AC11). Local (Ollama) enrichment ignores this flag.
     pub cloud_consent: bool,
+    /// Typed routing policy for selecting the enrichment LLM from `models[]`
+    /// (M4 Phase 3, Stage 2). Defaults to [`LlmRouting::CloudFirst`] (prefer a
+    /// configured + consented cloud provider, else local Ollama) per product
+    /// direction. An absent field in an older `config.json` reads back as the
+    /// default via `#[serde(default)]` (backward compatibility, mirroring the
+    /// other additive enrichment fields).
+    #[serde(default)]
+    pub routing: LlmRouting,
 }
+
+/// Re-export of the typed routing policy so `config::LlmRouting` resolves at the
+/// config layer without callers reaching into the `llm` module, and so there is
+/// exactly ONE definition (it lives in [`crate::llm`] with the provider factory
+/// that consumes it).
+pub use crate::llm::LlmRouting;
 
 /// Re-export of the canonical coref enum so `config::CorefStrategy` resolves at
 /// the config layer without callers reaching into the enrichment module, and so
@@ -164,8 +220,12 @@ impl Default for EnrichmentConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            coref_model: None,
+            map_model: None,
+            chat_model: None,
             coref_strategy: CorefStrategy::default(),
             cloud_consent: false,
+            routing: LlmRouting::default(),
         }
     }
 }
@@ -189,6 +249,8 @@ impl EnrichmentConfig {
                 enabled: true,
                 coref_strategy: CorefStrategy::LlmInline,
                 cloud_consent: false,
+                routing: LlmRouting::default(),
+                ..Self::default()
             }
         } else if has_cloud {
             // Cloud configured but consent must be explicit; default OFF.
@@ -196,6 +258,8 @@ impl EnrichmentConfig {
                 enabled: false,
                 coref_strategy: CorefStrategy::LlmInline,
                 cloud_consent: false,
+                routing: LlmRouting::default(),
+                ..Self::default()
             }
         } else {
             Self::default()
@@ -602,6 +666,25 @@ mod tests {
         assert!(!e.enabled, "enrichment defaults OFF (raw-vector floor)");
         assert_eq!(e.coref_strategy, CorefStrategy::LlmInline);
         assert!(!e.cloud_consent, "cloud consent defaults withheld");
+        assert_eq!(
+            e.routing,
+            LlmRouting::CloudFirst,
+            "routing defaults to cloud-first per product direction"
+        );
+    }
+
+    #[test]
+    fn missing_routing_deserializes_to_cloud_first() {
+        // An enrichment section written before the Stage-2 `routing` field existed
+        // has no `routing` key; it must read back as the default (cloud-first)
+        // rather than failing to deserialize (backward compatibility).
+        let json = r#"{
+            "enabled": true,
+            "coref_strategy": "llm_inline",
+            "cloud_consent": false
+        }"#;
+        let e: EnrichmentConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(e.routing, LlmRouting::CloudFirst);
     }
 
     #[test]
@@ -671,6 +754,8 @@ mod tests {
                 enabled: true,
                 coref_strategy: CorefStrategy::None,
                 cloud_consent: true,
+                routing: LlmRouting::LocalFirst,
+                ..EnrichmentConfig::default()
             },
             ..AppConfig::default()
         };
@@ -679,6 +764,8 @@ mod tests {
         assert!(loaded.enrichment.enabled);
         assert_eq!(loaded.enrichment.coref_strategy, CorefStrategy::None);
         assert!(loaded.enrichment.cloud_consent);
+        // The typed routing policy round-trips intact.
+        assert_eq!(loaded.enrichment.routing, LlmRouting::LocalFirst);
 
         // The persisted JSON carries the snake_case string, not a struct variant.
         let on_disk = std::fs::read_to_string(dir.path().join(CONFIG_FILE_NAME)).unwrap();
@@ -706,5 +793,101 @@ mod tests {
         let both = EnrichmentConfig::for_provider(true, true);
         assert!(both.enabled);
         assert_eq!(both.coref_strategy, CorefStrategy::LlmInline);
+    }
+
+    // ── Per-task model overrides (M4 Phase 3, Stage 3) ─────────────────────
+
+    #[test]
+    fn default_per_task_models_are_none() {
+        // The conservative default: no per-task pins ⇒ every task uses the routing
+        // default. This is what an onboarding "use the configured model" choice maps to.
+        let e = EnrichmentConfig::default();
+        assert_eq!(e.coref_model, None);
+        assert_eq!(e.map_model, None);
+        assert_eq!(e.chat_model, None);
+    }
+
+    #[test]
+    fn missing_per_task_models_deserialize_to_none() {
+        // An enrichment section written before Stage 3 (no `coref_model`/`map_model`/
+        // `chat_model` keys) must read back as `None` for each rather than failing
+        // to deserialize (backward compatibility — the Stage-3 additive shape).
+        let json = r#"{
+            "enabled": true,
+            "coref_strategy": "llm_inline",
+            "cloud_consent": false,
+            "routing": { "kind": "cloud_first" }
+        }"#;
+        let e: EnrichmentConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(e.coref_model, None);
+        assert_eq!(e.map_model, None);
+        assert_eq!(e.chat_model, None);
+    }
+
+    #[test]
+    fn explicit_per_task_models_round_trip() {
+        // serialize → deserialize preserves the per-task pins exactly.
+        let dir = tempfile::tempdir().unwrap();
+        let config = AppConfig {
+            enrichment: EnrichmentConfig {
+                enabled: true,
+                coref_model: Some(TaskModel {
+                    provider: "ollama".to_string(),
+                    model: "qwen2.5-coder".to_string(),
+                }),
+                map_model: Some(TaskModel {
+                    provider: "anthropic".to_string(),
+                    model: "claude-sonnet-4-5".to_string(),
+                }),
+                ..EnrichmentConfig::default()
+            },
+            ..AppConfig::default()
+        };
+        config.save(dir.path()).unwrap();
+        let loaded = AppConfig::load(dir.path()).unwrap();
+        assert_eq!(
+            loaded.enrichment.coref_model,
+            Some(TaskModel {
+                provider: "ollama".to_string(),
+                model: "qwen2.5-coder".to_string(),
+            })
+        );
+        assert_eq!(
+            loaded.enrichment.map_model,
+            Some(TaskModel {
+                provider: "anthropic".to_string(),
+                model: "claude-sonnet-4-5".to_string(),
+            })
+        );
+        // chat_model stays None (M5's concern; not set here).
+        assert_eq!(loaded.enrichment.chat_model, None);
+    }
+
+    #[test]
+    fn task_model_serializes_to_flat_snake_case() {
+        // The on-disk JSON + TS mirror depend on the flat `{provider, model}` shape.
+        let tm = TaskModel {
+            provider: "anthropic".to_string(),
+            model: "claude-sonnet-4-5".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(&tm).unwrap(),
+            serde_json::json!({ "provider": "anthropic", "model": "claude-sonnet-4-5" })
+        );
+    }
+
+    #[test]
+    fn per_task_model_validates_against_catalog() {
+        // A cloud per-task model must be a real catalog entry (anti-free-string).
+        let catalog = crate::model_catalog::ModelCatalog::bundled();
+        let coref = TaskModel {
+            provider: "anthropic".to_string(),
+            model: "claude-sonnet-4-5".to_string(),
+        };
+        assert!(catalog.validate(&coref.provider, &coref.model).is_ok());
+        // A made-up cloud model is rejected by the same guard.
+        assert!(catalog.validate("anthropic", "totally-made-up").is_err());
+        // Local Ollama is exempt (user-pulled): any non-empty id is valid.
+        assert!(catalog.is_valid("ollama", "qwen2.5-coder"));
     }
 }

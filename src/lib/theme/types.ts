@@ -34,6 +34,27 @@ export interface TtsConfig {
 // a legacy `"dedicated_model"` string back as `llm_inline` for config round-trip.)
 export type CorefStrategy = 'none' | 'llm_inline';
 
+// SYNC-CHECK: must match lens-core/src/llm.rs LlmRouting — the serde shape is
+// internally tagged on `kind` (snake_case); update both together.
+//
+// Typed routing policy for selecting the enrichment LLM. `cloud_first` (default)
+// prefers a consented cloud provider then local; `local_first` is the inverse;
+// `explicit` pins one exact (provider, model).
+export type LlmRouting =
+  | { kind: 'cloud_first' }
+  | { kind: 'local_first' }
+  | { kind: 'explicit'; provider: string; model: string };
+
+// SYNC-CHECK: must match lens-core/src/config.rs TaskModel — flat {provider, model}.
+//
+// A per-task model pin (M4 Phase 3, Stage 3): one exact (provider, model) for a
+// single enrichment task (coref / map / chat). Cloud pairs are catalog-validated
+// on the Rust side; local Ollama is exempt (user-pulled models aren't in models.dev).
+export interface TaskModel {
+  provider: string;
+  model: string;
+}
+
 // SYNC-CHECK: must match lens-core/src/config.rs EnrichmentConfig — update both together.
 //
 // Optional, additive background-enrichment config (M4 Phase 3). An older config
@@ -47,6 +68,17 @@ export interface EnrichmentConfig {
   // Explicit consent to send document text to a CLOUD LLM. Default false (local-first);
   // cloud enrichment never dispatches without it.
   cloud_consent: boolean;
+  // Typed routing policy (Stage 2). Optional in the TS mirror: an older config has
+  // no `routing` key and the Rust side defaults it to `{ kind: 'cloud_first' }` via
+  // `#[serde(default)]`. When present, it round-trips verbatim.
+  routing?: LlmRouting;
+  // OPTIONAL per-task model overrides (Stage 3). `null`/absent ⇒ the task uses the
+  // routing default; set ⇒ that task is pinned to the named (provider, model).
+  // The Rust side `#[serde(default)]`s each to `None`, so omitting them is safe.
+  coref_model?: TaskModel | null;
+  map_model?: TaskModel | null;
+  // chat_model is M5's concern (reserved for symmetry; no chat wiring in Phase 3).
+  chat_model?: TaskModel | null;
 }
 
 export interface PathConfig {

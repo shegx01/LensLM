@@ -18,13 +18,14 @@ pub mod error;
 pub mod extract;
 pub mod ingest;
 pub mod llm;
+pub mod model_catalog;
 pub mod notebooks;
 pub mod parse;
 pub mod system_check;
 pub mod tts;
 pub mod vector_store;
 
-pub use config::AppConfig;
+pub use config::{AppConfig, EnrichmentConfig, TaskModel};
 pub use embedder::{CountingEmbedder, EMBED_DIM, EMBED_MODEL_ID, Embedder, FastembedEmbedder};
 pub use embedding::{InstallProgress, pull_embedding_model};
 pub use enrichment::{ENRICHMENT_QUEUE_CAPACITY, EnrichmentJob};
@@ -35,13 +36,18 @@ pub use ingest::{
     resolve_nomic_tokenizer,
 };
 pub use llm::{
-    AnthropicProvider, LlmProvider, LlmRequest, LlmResponse, OllamaProvider, OpenAiCompatProvider,
+    GenaiProvider, LlmProvider, LlmRequest, LlmResponse, LlmRouting, ReasoningEffort, StreamChunk,
     provider_from_config,
+};
+pub use model_catalog::{
+    Cost, MODELS_CATALOG_REFRESH_INTERVAL, MODELS_CATALOG_RELPATH, MODELS_CATALOG_URL, Modalities,
+    ModelCatalog, ModelInfo, ProviderEntry, ReasoningOption, SupportedProvider, catalog_cache_path,
+    load_catalog, refresh_if_stale,
 };
 pub use notebooks::{Notebook, NotebookId, NotebookSummary, Source};
 pub use system_check::{
     ALLOWED_EMBEDDING_MODELS, CheckAction, CheckId, CheckResult, CheckStatus, LlmDetection,
-    detect_llm, ollama_base_url,
+    detect_llm, list_ollama_models, ollama_base_url,
 };
 pub use tts::{
     DownloadProgress, Gender, KOKORO_MODEL_FILENAME, KOKORO_MODEL_RELPATH, KOKORO_MODEL_URL,
@@ -279,6 +285,28 @@ impl LensEngine {
         };
 
         enrichment::spawn_worker(engine.clone(), enrichment_rx);
+
+        // ── Best-effort model-catalog refresh (Stage 1). Fire-and-forget on a
+        // detached task so a slow/failed fetch NEVER blocks init or panics: a
+        // network/parse error degrades to the cached/bundled copy (mirrors the
+        // startup-GC contract above). The 2-3×/day cadence is achieved by the
+        // staleness check here at startup plus on-demand
+        // `refresh_model_catalog` calls (e.g. when a picker opens).
+        {
+            let data_dir = std::path::PathBuf::from(&engine.config().await.paths.data_dir);
+            tokio::spawn(async move {
+                let client = crate::model_catalog::catalog_client();
+                if let Err(e) = crate::model_catalog::refresh_if_stale(
+                    &data_dir,
+                    crate::model_catalog::MODELS_CATALOG_URL,
+                    &client,
+                )
+                .await
+                {
+                    tracing::warn!("startup model-catalog refresh failed (non-fatal): {e}");
+                }
+            });
+        }
 
         // ── Install the enrichment LLM provider from the REAL config (Step 6).
         // When enrichment is enabled, build the provider from `AppConfig.models[]`
@@ -703,6 +731,31 @@ impl LensEngine {
             self.rebuild_enrichment_queue().await?;
         }
         Ok(())
+    }
+
+    // ── Model catalog (Stage 1) ─────────────────────────────────────────────
+
+    /// Loads the typed model catalog (cached `models-catalog.json`, else the
+    /// bundled snapshot). Never fails hard — always returns a usable catalog.
+    #[tracing::instrument(skip_all)]
+    pub async fn model_catalog(&self) -> crate::model_catalog::ModelCatalog {
+        let data_dir = self.data_dir().await;
+        crate::model_catalog::load_catalog(&data_dir)
+    }
+
+    /// Forces an on-demand model-catalog refresh (e.g. when a model picker
+    /// opens). Best-effort: still gated by the staleness check, so a fresh cache
+    /// is left untouched. Returns `Ok(true)` when the cache was refreshed.
+    #[tracing::instrument(skip_all)]
+    pub async fn refresh_model_catalog(&self) -> Result<bool, LensError> {
+        let data_dir = self.data_dir().await;
+        let client = crate::model_catalog::catalog_client();
+        crate::model_catalog::refresh_if_stale(
+            &data_dir,
+            crate::model_catalog::MODELS_CATALOG_URL,
+            &client,
+        )
+        .await
     }
 
     /// Startup-GC (AC7): drop every orphaned `building`/`stale` re-embed table and

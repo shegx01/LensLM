@@ -173,6 +173,34 @@ pub async fn detect_llm(base_url: &str) -> LlmDetection {
     }
 }
 
+/// Lists the LOCALLY-available Ollama models at `base_url` via `GET /api/tags`
+/// (M4 Phase 3, Stage 3 — the per-provider picker for local models).
+///
+/// models.dev only catalogs CLOUD providers; the user's pulled local models are
+/// known only to their running Ollama. This reuses the SAME hardened probe
+/// (`probe_ollama_endpoint`) the system-check + `detect_llm` use, so the picker and
+/// the readiness gate can never drift on how they speak Ollama.
+///
+/// **Graceful by contract:** when Ollama is unreachable (not running, wrong URL,
+/// non-Ollama endpoint) this returns an EMPTY `Vec` — never an `Err`. The picker
+/// surfaces that as a "no local models / Ollama not reachable" state rather than an
+/// error toast (the plan's never-error-toast requirement).
+pub async fn list_ollama_models(base_url: &str) -> Vec<String> {
+    let base_url = base_url.trim_end_matches('/');
+
+    // Scheme allowlist (self-SSRF defense-in-depth), mirroring `detect_llm`.
+    let scheme_ok = base_url.split_once("://").is_some_and(|(scheme, _)| {
+        scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+    });
+    if !scheme_ok {
+        return Vec::new();
+    }
+
+    let client = probe_client();
+    let (_version, models) = probe_ollama_endpoint(&client, base_url).await;
+    models
+}
+
 /// GETs `url` and deserializes a successful (2xx) response as `T`, capping the
 /// buffered body at [`MAX_PROBE_BODY_BYTES`] before parsing. Returns `None` on a
 /// connect/timeout error, a non-2xx status, an over-cap body, or a parse miss.
@@ -1189,6 +1217,62 @@ mod tests {
         assert!(!result.reachable);
         assert_eq!(result.version, None);
         assert!(result.models.is_empty());
+    }
+
+    // --- list_ollama_models tests (Stage 3 — live local picker) ------------
+
+    #[tokio::test]
+    async fn list_ollama_models_returns_pulled_models() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/version"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "version": "0.4.1"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [
+                    { "name": "qwen2.5-coder:latest" },
+                    { "name": "qwen2.5:7b" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let models = list_ollama_models(&server.uri()).await;
+        assert_eq!(models, vec!["qwen2.5-coder:latest", "qwen2.5:7b"]);
+    }
+
+    #[tokio::test]
+    async fn list_ollama_models_empty_when_unreachable() {
+        // Ollama not running (always-refused port) ⇒ empty list, NEVER an error.
+        let models = list_ollama_models("http://127.0.0.1:1").await;
+        assert!(models.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_ollama_models_empty_for_non_http_scheme() {
+        // A non-http(s) scheme short-circuits to empty (no probe), no panic/error.
+        let models = list_ollama_models("file:///etc/passwd").await;
+        assert!(models.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_ollama_models_empty_when_not_ollama_endpoint() {
+        // An endpoint with no /api/version (not Ollama) ⇒ empty list, never errors.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{ "id": "gpt-4o" }]
+            })))
+            .mount(&server)
+            .await;
+        let models = list_ollama_models(&server.uri()).await;
+        assert!(models.is_empty(), "no /api/version ⇒ Ollama absent ⇒ empty");
     }
 
     /// Snapshot the exact serde wire-format of `LlmDetection`. Locks the FROZEN

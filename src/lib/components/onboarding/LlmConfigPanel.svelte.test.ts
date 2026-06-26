@@ -1,4 +1,4 @@
-import { render, screen, fireEvent, waitFor } from '@testing-library/svelte';
+import { render, screen, fireEvent, waitFor, within } from '@testing-library/svelte';
 import { mockIPC, clearMocks } from '@tauri-apps/api/mocks';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import SystemCheckRow from './SystemCheckRow.svelte';
@@ -32,6 +32,46 @@ function baseConfig() {
     tier_thresholds: { tier1_token_cap: 4000, tier2_token_cap: 16000 },
     onboarding_complete: false,
     embedding_model: ''
+  };
+}
+
+/** A models.dev-style catalog map for `list_provider_models`. Includes a
+ * reasoning model (claude, with context_limit + cost.input) and a non-reasoning
+ * one (gpt-4o), so capability-keyed UI can be exercised both ways. */
+function cloudCatalog(provider: string): Record<string, unknown> {
+  if (provider === 'anthropic') {
+    return {
+      'claude-3-5-sonnet-latest': {
+        id: 'claude-3-5-sonnet-latest',
+        name: 'Claude 3.5 Sonnet',
+        reasoning: true,
+        reasoning_options: [{ type: 'toggle' }],
+        tool_call: true,
+        temperature: true,
+        modalities: { input: ['text'], output: ['text'] },
+        context_limit: 200000,
+        output_limit: 8192,
+        open_weights: false,
+        cost: { input: 3, output: 15 }
+      }
+    };
+  }
+  // Default: openai. Includes 'gpt-4o' (reasoning=false) so the legacy cloud Save
+  // test still resolves to model 'gpt-4o'.
+  return {
+    'gpt-4o': {
+      id: 'gpt-4o',
+      name: 'GPT-4o',
+      reasoning: false,
+      reasoning_options: [],
+      tool_call: true,
+      temperature: true,
+      modalities: { input: ['text'], output: ['text'] },
+      context_limit: 128000,
+      output_limit: 16384,
+      open_weights: false,
+      cost: { input: 2.5, output: 10 }
+    }
   };
 }
 
@@ -516,6 +556,25 @@ describe('LlmConfigPanel — Save (cloud tab)', () => {
         setConfig(args);
         return null;
       }
+      // Catalog with TWO openai models so the picker can select a non-default one.
+      if (cmd === 'list_provider_models')
+        return {
+          'gpt-4o': cloudCatalog('openai')['gpt-4o'],
+          'gpt-5-turbo': {
+            id: 'gpt-5-turbo',
+            name: 'GPT-5 Turbo',
+            reasoning: false,
+            reasoning_options: [],
+            tool_call: true,
+            temperature: true,
+            modalities: { input: ['text'], output: ['text'] },
+            context_limit: 256000,
+            output_limit: 16384,
+            open_weights: false,
+            cost: { input: 5, output: 15 }
+          }
+        };
+      if (cmd === 'list_ollama_models') return [];
     });
 
     render(SystemCheckRow, { props: { result: llmRow(), oncheck } });
@@ -527,10 +586,15 @@ describe('LlmConfigPanel — Save (cloud tab)', () => {
     );
     await fireEvent.click(screen.getByRole('tab', { name: /cloud api/i }));
 
-    // Override the seeded default with a model the app shipped without. (Both the
-    // Local and Cloud panels label a field "Model", so target the cloud input.)
-    const modelField = screen.getByLabelText('Model', { selector: '#llm-cloud-model' });
-    await fireEvent.input(modelField, { target: { value: 'gpt-5-turbo' } });
+    // Pick a non-default catalog model from the picker. (Both the Local and Cloud
+    // panels label a field "Model", so target the cloud select by id.)
+    const modelField = screen.getByLabelText('Model', {
+      selector: '#llm-cloud-model'
+    }) as HTMLSelectElement;
+    await waitFor(() =>
+      expect(within(modelField).getByRole('option', { name: 'GPT-5 Turbo' })).toBeInTheDocument()
+    );
+    await fireEvent.change(modelField, { target: { value: 'gpt-5-turbo' } });
 
     // A key must be entered for Save to enable.
     await fireEvent.input(screen.getByLabelText(/api key/i), {
@@ -539,7 +603,7 @@ describe('LlmConfigPanel — Save (cloud tab)', () => {
 
     await fireEvent.click(screen.getByRole('button', { name: /save/i }));
 
-    // The user's model id must reach set_config, not the hardcoded default.
+    // The user's chosen model id must reach set_config, not the seeded default.
     await waitFor(() =>
       expect(setConfig).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -668,6 +732,207 @@ describe('LlmConfigPanel — Enrichment prefs', () => {
               enabled: true,
               cloud_consent: true
             })
+          })
+        })
+      )
+    );
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// Capability-aware model pickers (M4 Phase 3, Stage 3)
+// ──────────────────────────────────────────────────────────────────────────
+
+describe('LlmConfigPanel — capability-aware pickers', () => {
+  it('renders catalog models in the cloud model select for the selected provider', async () => {
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return baseConfig();
+      if (cmd === 'set_config') return null;
+      if (cmd === 'list_provider_models')
+        return cloudCatalog((args as { provider: string }).provider);
+      if (cmd === 'list_ollama_models') return [];
+    });
+
+    render(SystemCheckRow, { props: { result: llmRow(), oncheck: vi.fn() } });
+    await fireEvent.click(screen.getByRole('button', { name: /configure/i }));
+    await waitFor(() =>
+      expect(screen.getByRole('tab', { name: /cloud api/i })).toBeInTheDocument()
+    );
+    await fireEvent.click(screen.getByRole('tab', { name: /cloud api/i }));
+
+    // The openai catalog model (GPT-4o) renders as an option in the cloud picker.
+    // Scope to the cloud model <select> (the coref-override picker also lists ids).
+    const cloudSelect = (await waitFor(() =>
+      screen.getByLabelText('Model', { selector: '#llm-cloud-model' })
+    )) as HTMLSelectElement;
+    await waitFor(() =>
+      expect(within(cloudSelect).getByRole('option', { name: 'GPT-4o' })).toBeInTheDocument()
+    );
+
+    // Switching to Anthropic loads its catalog model (Claude 3.5 Sonnet).
+    await fireEvent.click(screen.getByRole('radio', { name: /anthropic/i }));
+    await waitFor(() =>
+      expect(
+        within(cloudSelect).getByRole('option', { name: 'Claude 3.5 Sonnet' })
+      ).toBeInTheDocument()
+    );
+  });
+
+  it('shows the thinking toggle for a reasoning model and hides it for a non-reasoning model', async () => {
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return baseConfig();
+      if (cmd === 'set_config') return null;
+      if (cmd === 'list_provider_models')
+        return cloudCatalog((args as { provider: string }).provider);
+      if (cmd === 'list_ollama_models') return [];
+    });
+
+    render(SystemCheckRow, { props: { result: llmRow(), oncheck: vi.fn() } });
+    await fireEvent.click(screen.getByRole('button', { name: /configure/i }));
+    await waitFor(() =>
+      expect(screen.getByRole('tab', { name: /cloud api/i })).toBeInTheDocument()
+    );
+    await fireEvent.click(screen.getByRole('tab', { name: /cloud api/i }));
+
+    // Default provider (openai → gpt-4o, reasoning=false): toggle is HIDDEN.
+    const cloudSelect = (await waitFor(() =>
+      screen.getByLabelText('Model', { selector: '#llm-cloud-model' })
+    )) as HTMLSelectElement;
+    await waitFor(() =>
+      expect(within(cloudSelect).getByRole('option', { name: 'GPT-4o' })).toBeInTheDocument()
+    );
+    expect(screen.queryByRole('switch', { name: /enable thinking/i })).not.toBeInTheDocument();
+
+    // Switch to Anthropic (claude, reasoning=true): toggle becomes VISIBLE.
+    await fireEvent.click(screen.getByRole('radio', { name: /anthropic/i }));
+    await waitFor(() =>
+      expect(screen.getByRole('switch', { name: /enable thinking/i })).toBeInTheDocument()
+    );
+  });
+
+  it('shows context-window helper text for a model with a context_limit', async () => {
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return baseConfig();
+      if (cmd === 'set_config') return null;
+      if (cmd === 'list_provider_models')
+        return cloudCatalog((args as { provider: string }).provider);
+      if (cmd === 'list_ollama_models') return [];
+    });
+
+    render(SystemCheckRow, { props: { result: llmRow(), oncheck: vi.fn() } });
+    await fireEvent.click(screen.getByRole('button', { name: /configure/i }));
+    await waitFor(() =>
+      expect(screen.getByRole('tab', { name: /cloud api/i })).toBeInTheDocument()
+    );
+    await fireEvent.click(screen.getByRole('tab', { name: /cloud api/i }));
+
+    // gpt-4o reports context_limit 128000 → formatted "128,000 tokens".
+    await waitFor(() => expect(screen.getByText(/context: 128,000 tokens/i)).toBeInTheDocument());
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// Routing + coref-model override persistence (M4 Phase 3, Stage 3)
+// ──────────────────────────────────────────────────────────────────────────
+
+describe('LlmConfigPanel — routing + coref override', () => {
+  it('renders the routing selector and persists local_first on the local Test connection', async () => {
+    const setConfig = vi.fn();
+    const oncheck = vi.fn().mockResolvedValue(undefined);
+
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return baseConfig();
+      if (cmd === 'set_config') {
+        setConfig(args);
+        return null;
+      }
+      if (cmd === 'detect_llm') return { reachable: true, version: 'Ollama 0.3.2', models: [] };
+      if (cmd === 'list_provider_models')
+        return cloudCatalog((args as { provider: string }).provider);
+      if (cmd === 'list_ollama_models') return [];
+    });
+
+    render(SystemCheckRow, { props: { result: llmRow(), oncheck } });
+    await fireEvent.click(screen.getByRole('button', { name: /configure/i }));
+    await waitFor(() =>
+      expect(
+        screen.getByLabelText(/routing/i, { selector: '#enrichment-routing' })
+      ).toBeInTheDocument()
+    );
+
+    // Switch routing to Local-first.
+    await fireEvent.change(screen.getByLabelText(/routing/i, { selector: '#enrichment-routing' }), {
+      target: { value: 'local_first' }
+    });
+
+    await fireEvent.click(screen.getByRole('button', { name: /test connection/i }));
+
+    await waitFor(() =>
+      expect(setConfig).toHaveBeenCalledWith(
+        expect.objectContaining({
+          config: expect.objectContaining({
+            enrichment: expect.objectContaining({
+              routing: { kind: 'local_first' }
+            })
+          })
+        })
+      )
+    );
+  });
+
+  it('persists a picked coref model as a TaskModel and clears it to null on default', async () => {
+    const setConfig = vi.fn();
+    const oncheck = vi.fn().mockResolvedValue(undefined);
+
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return baseConfig();
+      if (cmd === 'set_config') {
+        setConfig(args);
+        return null;
+      }
+      if (cmd === 'detect_llm') return { reachable: true, version: 'Ollama 0.3.2', models: [] };
+      if (cmd === 'list_provider_models')
+        return cloudCatalog((args as { provider: string }).provider);
+      if (cmd === 'list_ollama_models') return ['llama3.2:3b', 'qwen2.5:7b'];
+    });
+
+    render(SystemCheckRow, { props: { result: llmRow(), oncheck } });
+    await fireEvent.click(screen.getByRole('button', { name: /configure/i }));
+
+    // Coref-model picker offers the live Ollama models on the local tab. Scope to
+    // the coref-override <select> (the local model picker also lists pulled ids).
+    const corefSelect = (await waitFor(() =>
+      screen.getByLabelText(/coreference model/i, { selector: '#enrichment-coref-model' })
+    )) as HTMLSelectElement;
+    await waitFor(() =>
+      expect(within(corefSelect).getByRole('option', { name: 'qwen2.5:7b' })).toBeInTheDocument()
+    );
+
+    // Pick a non-default coref model → forwards a TaskModel {provider, model}.
+    await fireEvent.change(corefSelect, { target: { value: 'qwen2.5:7b' } });
+    await fireEvent.click(screen.getByRole('button', { name: /test connection/i }));
+
+    await waitFor(() =>
+      expect(setConfig).toHaveBeenCalledWith(
+        expect.objectContaining({
+          config: expect.objectContaining({
+            enrichment: expect.objectContaining({
+              coref_model: { provider: 'ollama', model: 'qwen2.5:7b' }
+            })
+          })
+        })
+      )
+    );
+
+    // Reset to the default option ("") → forwards coref_model: null.
+    await fireEvent.change(corefSelect, { target: { value: '' } });
+    await fireEvent.click(screen.getByRole('button', { name: /test connection/i }));
+
+    await waitFor(() =>
+      expect(setConfig).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          config: expect.objectContaining({
+            enrichment: expect.objectContaining({ coref_model: null })
           })
         })
       )

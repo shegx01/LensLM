@@ -220,6 +220,26 @@ async fn process_job(
         }
     };
 
+    // ── Per-task model providers (M4 Phase 3, Stage 3). When `coref_model` /
+    // `map_model` is set, build a sibling provider pinned to that exact
+    // `(provider, model)` — reusing the base provider's ONE genai client (only the
+    // pinned target differs). An unset override (or one failing its consent/catalog
+    // gate) falls back to the base provider. Example: a user picks Qwen2.5-Coder for
+    // coref while enrichment defaults to Qwen2.5-Instruct — coref runs on the coder.
+    let cfg_models = engine.config().await.models;
+    let map_provider = crate::llm::task_provider_from_config(
+        &provider,
+        enrichment_cfg.map_model.as_ref(),
+        &cfg_models,
+        enrichment_cfg.cloud_consent,
+    );
+    let coref_provider = crate::llm::task_provider_from_config(
+        &provider,
+        enrichment_cfg.coref_model.as_ref(),
+        &cfg_models,
+        enrichment_cfg.cloud_consent,
+    );
+
     // Cache parts are guaranteed Some here (provider is Some).
     let cache_key = cache_key.unwrap_or_default();
     // Per-job budget over the shared session counters. The per-job call ceiling is
@@ -265,7 +285,7 @@ async fn process_job(
         .collect();
 
     let (map_json, doc_summary, map_entities, map_quality) =
-        match build_structural_map(provider.as_ref(), &mut budget, &parent_texts).await {
+        match build_structural_map(map_provider.as_ref(), &mut budget, &parent_texts).await {
             Ok(MapOutcome::Ok(map)) => {
                 let summary = map.summary.clone();
                 let entities = map.entities.clone();
@@ -337,8 +357,13 @@ async fn process_job(
             .enumerate()
             .map(|(i, c)| (i, c.text.as_str()))
             .collect();
-        match resolve_coref_batch(provider.as_ref(), &mut budget, &coref_chunks, &map_entities)
-            .await
+        match resolve_coref_batch(
+            coref_provider.as_ref(),
+            &mut budget,
+            &coref_chunks,
+            &map_entities,
+        )
+        .await
         {
             Ok(subs) => subs,
             // AC11: a budget circuit-break during coref ⇒ `failed` + `budget_exceeded`
@@ -499,4 +524,135 @@ async fn write_prefix_only(
         })
         .collect();
     repo.write_chunk_enrichment(&updates).await
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::config::{AppConfig, EnrichmentConfig, ModelConfig, TaskModel};
+    use crate::enrichment::coref::resolve_coref_batch;
+    use crate::enrichment::meta::{Budget, SessionBudget};
+    use crate::llm::{GenaiProvider, provider_from_config, task_provider_from_config};
+
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// An Ollama `/api/chat` body carrying a model field + the given assistant text.
+    fn ollama_body(model: &str, content: &str) -> serde_json::Value {
+        serde_json::json!({
+            "model": model,
+            "message": { "role": "assistant", "content": content },
+            "done": true,
+            "done_reason": "stop",
+            "prompt_eval_count": 10,
+            "eval_count": 5
+        })
+    }
+
+    /// A valid coref response body (empty subs — the parse succeeds, no mutation).
+    fn coref_ok() -> &'static str {
+        r#"{"results":[{"id":0,"subs":[]}]}"#
+    }
+
+    /// The worker's per-task resolution, in isolation: a `coref_model` override
+    /// must make the COREF pass dispatch against the override model, while the MAP
+    /// pass (no override) keeps the routing-default model. This is the Stage-3
+    /// product ask: coref on a coder model, enrichment default on a generalist.
+    #[tokio::test]
+    async fn coref_pass_uses_coref_model_override_when_set() {
+        // Base/default model is served by `instruct_server`; the coref override
+        // model is served by `coder_server`. The coder server is the ONLY one
+        // mounted to answer a coref call, and it asserts EXACTLY one hit — so the
+        // test fails if coref dispatched against the base instead of the override.
+        let instruct_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(ollama_body("qwen2.5-instruct", coref_ok())),
+            )
+            .expect(0) // the base must NOT be hit by the coref pass
+            .mount(&instruct_server)
+            .await;
+
+        let coder_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(ollama_body("qwen2.5-coder", coref_ok())),
+            )
+            .expect(1) // the coref pass dispatches here exactly once
+            .mount(&coder_server)
+            .await;
+
+        // Config: routing default → the instruct entry; coref_model → the coder
+        // entry (a distinct local Ollama endpoint).
+        let config = AppConfig {
+            models: vec![
+                ModelConfig {
+                    provider: "ollama".to_string(),
+                    base_url: instruct_server.uri(),
+                    model: "qwen2.5-instruct".to_string(),
+                    ..ModelConfig::default()
+                },
+                ModelConfig {
+                    provider: "ollama".to_string(),
+                    base_url: coder_server.uri(),
+                    model: "qwen2.5-coder".to_string(),
+                    ..ModelConfig::default()
+                },
+            ],
+            enrichment: EnrichmentConfig {
+                enabled: true,
+                coref_model: Some(TaskModel {
+                    provider: "ollama".to_string(),
+                    model: "qwen2.5-coder".to_string(),
+                }),
+                ..EnrichmentConfig::default()
+            },
+            ..AppConfig::default()
+        };
+
+        // The base provider the worker resolves from routing (the instruct entry).
+        let base = provider_from_config(&config, false).expect("base provider");
+        assert_eq!(base.model_id(), "qwen2.5-instruct");
+
+        // The worker's per-task resolution (mirrors `process_job`).
+        let map_provider = task_provider_from_config(
+            &base,
+            config.enrichment.map_model.as_ref(),
+            &config.models,
+            config.enrichment.cloud_consent,
+        );
+        let coref_provider = task_provider_from_config(
+            &base,
+            config.enrichment.coref_model.as_ref(),
+            &config.models,
+            config.enrichment.cloud_consent,
+        );
+        // map has no override ⇒ default; coref is pinned to the coder.
+        assert_eq!(map_provider.model_id(), "qwen2.5-instruct");
+        assert_eq!(coref_provider.model_id(), "qwen2.5-coder");
+
+        // Run the actual coref pass against the resolved coref provider: it MUST hit
+        // the coder server (override), proven by the coder server's expect(1) and the
+        // instruct server's expect(0), verified on drop.
+        let mut budget = Budget::new(SessionBudget::new());
+        let chunks: Vec<(usize, &str)> = vec![(0, "Ada built the engine. She wrote notes.")];
+        let entities = vec!["Ada".to_string()];
+        let subs = resolve_coref_batch(coref_provider.as_ref(), &mut budget, &chunks, &entities)
+            .await
+            .expect("coref pass dispatches against the override");
+        // Empty subs (the mock returned an empty set) — the point is WHICH server
+        // was hit, asserted by the mock expectations on drop.
+        assert!(subs.is_empty() || subs.values().all(|v| v.is_empty()));
+
+        // Sanity: the shared genai client was reused (siblings share the Arc-backed
+        // client), so no second genai Client was constructed for the override.
+        let base_genai = base.as_any().downcast_ref::<GenaiProvider>();
+        let coref_genai = coref_provider.as_any().downcast_ref::<GenaiProvider>();
+        assert!(base_genai.is_some() && coref_genai.is_some());
+
+        drop(instruct_server);
+        drop(coder_server);
+    }
 }

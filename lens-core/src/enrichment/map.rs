@@ -132,6 +132,10 @@ pub(super) async fn run_llm_with_retries<T>(
             // reproducible, machine-parseable output.
             temperature: 0.0,
             json: true,
+            // Enrichment NEVER uses thinking — reasoning tokens are non-deterministic
+            // and unnecessary for the structured-extraction contract.
+            thinking: false,
+            reasoning_effort: None,
         };
         let resp = provider.generate(&req).await?;
         budget.record(resp.tokens_used);

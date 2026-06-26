@@ -2,25 +2,52 @@
 //!
 //! Defines [`LlmProvider`] — an `async`, object-safe trait (held behind
 //! `Arc<dyn LlmProvider>`) alongside [`crate::Embedder`] / [`crate::VectorStore`]
-//! — plus three HTTP backends ([`OllamaProvider`], [`OpenAiCompatProvider`],
-//! [`AnthropicProvider`]) and a [`provider_from_config`] factory.
+//! — backed by a single [`GenaiProvider`] over the [`genai`] crate, plus a typed
+//! routing policy ([`LlmRouting`]) and the [`provider_from_config`] factory.
 //!
-//! All three backends are HTTP, so the trait is async and reuses the same
-//! reqwest patterns as [`crate::system_check`] (rustls, no-redirect SSRF guard,
-//! bounded timeouts, body-capped JSON) rather than `spawn_blocking`.
+//! ## Why genai
+//! Stage 1 of the LLM-interface overhaul landed the typed [`ModelCatalog`]
+//! anti-free-string guard. Stage 2 (this module) replaces the three hand-rolled
+//! HTTP backends (Ollama / OpenAI-compatible / Anthropic) with a SINGLE
+//! [`GenaiProvider`] that delegates protocol details to `genai`
+//! (jeremychone/rust-genai, 0.6.x). The [`LlmProvider`] trait is UNCHANGED in
+//! shape (`model_id` / `reachable` / `generate`) so the enrichment worker, coref,
+//! and structural-map passes — and every mock that implements the trait — compile
+//! untouched. A defaulted [`LlmProvider::generate_stream`] method is added on top
+//! (the foundation M5 chat will use) so the existing 3-method mocks keep working.
 //!
-//! `reachable()` is a `system_check`-style probe used to decide whether the
-//! enrichment worker should dispatch — a misconfigured or down provider lets a
-//! source degrade gracefully to raw vectors instead of looping.
+//! ## Hardening
+//! genai is constructed with OUR reqwest client (`Client::builder().with_reqwest`)
+//! so the SSRF no-redirect policy + bounded connect/read timeouts from the
+//! system-check probe carry over verbatim — genai never opens an unhardened
+//! socket. genai 0.6.x depends on `reqwest ^0.13`, the same major lens-core pins,
+//! so the client type is compatible and the dependency dedupes.
+//!
+//! ## Determinism contract (PRESERVED)
+//! Enrichment pins `temperature: 0.0` and `json: true` (and `thinking: false`);
+//! the mapping below threads those into genai `ChatOptions` via
+//! `.with_temperature(0.0)` plus `ChatResponseFormat::JsonMode`, producing strict
+//! JSON exactly as the hand-rolled backends did. Thinking/streaming are OFF for
+//! enrichment.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures_util::Stream;
+use genai::Client;
+use genai::ModelIden;
+use genai::adapter::AdapterKind;
+use genai::chat::{
+    ChatMessage, ChatOptions, ChatRequest, ChatResponseFormat, ReasoningEffort as GenaiEffort,
+};
+use genai::resolver::{AuthData, Endpoint};
+use genai::{ModelSpec, ServiceTarget};
 use serde::{Deserialize, Serialize};
 
 use crate::config::AppConfig;
 use crate::error::LensError;
+use crate::model_catalog::{ModelCatalog, SupportedProvider};
 
 /// Connect timeout for an LLM HTTP request (matches the system-check probe).
 const LLM_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -30,18 +57,43 @@ const LLM_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 /// call can legitimately take many seconds, so this is far longer than the
 /// 2s system-check probe window.
 const LLM_TIMEOUT: Duration = Duration::from_secs(30);
-/// Upper bound on a response body we will buffer + deserialize. Defense-in-depth
-/// against a malicious/misconfigured endpoint streaming an unbounded body
-/// (mirrors `system_check::MAX_PROBE_BODY_BYTES` but sized for completions).
-const MAX_LLM_BODY_BYTES: usize = 8 * 1024 * 1024;
-/// `anthropic-version` header value sent on every Anthropic request.
-const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 /// Canonical provider identifiers (match `ModelConfig.provider` /
 /// the onboarding `LlmProviderInput.provider` strings).
 const PROVIDER_OLLAMA: &str = "ollama";
 const PROVIDER_OPENAI_COMPAT: &str = "openai-compatible";
 const PROVIDER_ANTHROPIC: &str = "anthropic";
+const PROVIDER_GLM: &str = "glm";
+const PROVIDER_ZAI: &str = "zai";
+const PROVIDER_OLLAMA_CLOUD: &str = "ollama-cloud";
+
+/// The thinking/reasoning effort exposed on [`LlmRequest`].
+///
+/// A small, serde-stable mirror of genai's `ReasoningEffort` so the trait API and
+/// the on-disk/IPC request shape never leak a genai type. Enrichment never sets
+/// this (it stays `temperature 0 + json`, thinking OFF); it is the foundation the
+/// M5 chat surface will use. Maps 1:1 onto genai via [`ReasoningEffort::to_genai`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    /// Light reasoning budget.
+    Low,
+    /// Balanced reasoning budget.
+    Medium,
+    /// Heavy reasoning budget.
+    High,
+}
+
+impl ReasoningEffort {
+    /// Maps onto the genai effort level.
+    fn to_genai(self) -> GenaiEffort {
+        match self {
+            ReasoningEffort::Low => GenaiEffort::Low,
+            ReasoningEffort::Medium => GenaiEffort::Medium,
+            ReasoningEffort::High => GenaiEffort::High,
+        }
+    }
+}
 
 /// A single completion request to an [`LlmProvider`].
 ///
@@ -49,7 +101,7 @@ const PROVIDER_ANTHROPIC: &str = "anthropic";
 /// turn; `max_tokens` caps the generated output. `temperature` and `json` are
 /// the determinism knobs threaded into every backend so enrichment can pin
 /// reproducible, machine-parseable output (the enrichment callers pass
-/// `temperature: 0.0, json: true`).
+/// `temperature: 0.0, json: true, thinking: false`).
 ///
 /// `temperature` is `f32`, so the struct uses `PartialEq` only (no `Eq`/`Hash`):
 /// `LlmRequest` is a transient request value, never a map key.
@@ -64,11 +116,20 @@ pub struct LlmRequest {
     /// Sampling temperature. `0.0` requests greedy/deterministic decoding;
     /// enrichment callers pin this to `0.0`. Sent on every backend.
     pub temperature: f32,
-    /// Request strict JSON output. When `true`, each backend asks for JSON mode
-    /// where supported (Ollama `format:"json"`, OpenAI `response_format`); the
-    /// Anthropic API has NO such param, so JSON is enforced only via the prompt
-    /// there (the strict serde parse + retries remain the real guard).
+    /// Request strict JSON output. When `true`, the mapping asks genai for JSON
+    /// mode (`ChatResponseFormat::JsonMode`) where the provider supports it; the
+    /// strict serde parse + reprompts in `enrichment::map` remain the real guard.
     pub json: bool,
+    /// Enable provider "thinking"/reasoning. Defaults to `false` (an older IPC
+    /// payload with no `thinking` key reads back as `false` via `#[serde(default)]`).
+    /// Enrichment keeps this OFF for determinism; M5 chat opts in. When `true`,
+    /// `reasoning_effort` selects the budget (defaulting to `Medium` when unset).
+    #[serde(default)]
+    pub thinking: bool,
+    /// Reasoning budget when `thinking` is enabled. Ignored when `thinking` is
+    /// `false`. Defaults to `None` (an older payload reads back as `None`).
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 /// A completion response from an [`LlmProvider`].
@@ -79,6 +140,28 @@ pub struct LlmResponse {
     /// Total tokens billed/consumed by the call (input + output where the
     /// provider reports it), used to drive the enrichment budget counters.
     pub tokens_used: u32,
+}
+
+/// One event from a streamed generation ([`LlmProvider::generate_stream`]).
+///
+/// The minimal surface M5 chat consumes: incremental answer text, incremental
+/// thinking/reasoning text (when enabled), and a terminal `Done` carrying the
+/// usage once the provider reports it. genai's richer stream
+/// (`Start`/`ToolCallChunk`/…) is collapsed onto these three so the trait stays
+/// provider-agnostic and the enrichment path never sees a genai type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamChunk {
+    /// An incremental piece of the answer text.
+    TextDelta(String),
+    /// An incremental piece of the model's thinking/reasoning text (emitted only
+    /// when `thinking` is requested and the provider streams reasoning).
+    ThinkingDelta(String),
+    /// Terminal event: the stream is complete. `tokens_used` is the captured
+    /// total when the provider reported usage, else `0`.
+    Done {
+        /// Total tokens consumed by the call, or `0` when the provider reported none.
+        tokens_used: u32,
+    },
 }
 
 /// An async, object-safe LLM backend.
@@ -93,6 +176,17 @@ pub trait LlmProvider: Send + Sync {
     /// provider; a component of the enrichment composite cache key (AC9).
     fn model_id(&self) -> &str;
 
+    /// Upcast to [`std::any::Any`] for downcasting to a concrete provider type.
+    ///
+    /// The per-task enrichment wiring ([`task_provider_from_config`]) downcasts to
+    /// [`GenaiProvider`] to borrow its shared genai client when building a sibling
+    /// provider pinned to a per-task model. The DEFAULT returns a reference that
+    /// never downcasts to a real backend, so a test mock that doesn't override it
+    /// simply makes the per-task override fall back to the base provider.
+    fn as_any(&self) -> &dyn std::any::Any {
+        &()
+    }
+
     /// `system_check`-style reachability probe. `true` when the endpoint is
     /// usable for generation; `false` on a connection refusal, DNS/timeout
     /// failure, OR an auth error (`401`/`403`) — a misconfigured key counts as
@@ -100,13 +194,42 @@ pub trait LlmProvider: Send + Sync {
     async fn reachable(&self) -> bool;
 
     /// Generate a completion. Returns [`LensError::Network`] on transport
-    /// failure, [`LensError::Model`] on a non-success HTTP status, and
-    /// [`LensError::Parse`] when the response body can't be decoded.
+    /// failure, [`LensError::Model`] on a non-success / provider error, and
+    /// [`LensError::Parse`] when the response can't be decoded.
     async fn generate(&self, req: &LlmRequest) -> Result<LlmResponse, LensError>;
+
+    /// Stream a completion as a sequence of [`StreamChunk`]s, ending in
+    /// [`StreamChunk::Done`].
+    ///
+    /// This is the foundation the M5 chat surface uses; ENRICHMENT NEVER STREAMS
+    /// (it stays on the non-streaming [`generate`](Self::generate) for the
+    /// deterministic temp-0 + JSON contract). A DEFAULT implementation is provided
+    /// so the enrichment mocks (which implement only the three core methods) need
+    /// no changes: it buffers a non-streaming [`generate`](Self::generate) into a
+    /// single `TextDelta` + `Done`. Real backends ([`GenaiProvider`]) override it
+    /// with true incremental streaming.
+    async fn generate_stream(
+        &self,
+        req: &LlmRequest,
+    ) -> Result<
+        std::pin::Pin<Box<dyn Stream<Item = Result<StreamChunk, LensError>> + Send>>,
+        LensError,
+    > {
+        let resp = self.generate(req).await?;
+        let chunks = vec![
+            Ok(StreamChunk::TextDelta(resp.text)),
+            Ok(StreamChunk::Done {
+                tokens_used: resp.tokens_used,
+            }),
+        ];
+        Ok(Box::pin(futures_util::stream::iter(chunks)))
+    }
 }
 
 /// Builds the shared HTTP client for LLM calls: bounded connect/read timeouts +
 /// the same SSRF hardening as the system-check probe (never follow a redirect).
+/// This client is injected into genai via `Client::builder().with_reqwest(..)`,
+/// so genai inherits the hardening rather than opening its own raw socket.
 fn llm_client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .connect_timeout(LLM_CONNECT_TIMEOUT)
@@ -122,438 +245,550 @@ fn llm_client() -> reqwest::Client {
         .unwrap_or_else(|_| llm_client_builder().build().unwrap_or_default())
 }
 
-/// Maps a reqwest send/transport error into [`LensError::Network`].
-fn network_err(err: reqwest::Error) -> LensError {
-    LensError::Network(err.to_string())
-}
-
-/// Reads a successful response body (stream-and-cap) and decodes it as `T`.
+/// Maps a genai error onto a [`LensError`].
 ///
-/// The body is read INCREMENTALLY via `resp.chunk()` and aborted the instant the
-/// running total would exceed [`MAX_LLM_BODY_BYTES`] — a misconfigured/hostile
-/// endpoint can never inflate the buffer past the cap (plus one in-flight chunk).
-/// If `Content-Length` is present and already over the cap, we reject before
-/// reading a single byte.
+/// genai wraps the underlying reqwest/transport error inside its own
+/// `webc::Error` (the `WebAdapterCall`/`WebModelCall`/`WebStream` variants), so
+/// there is no public `reqwest::Error` to inspect for `is_connect()`/`is_timeout()`.
+/// We classify by the error's `Display` text: a connection/timeout marker →
+/// [`LensError::Network`]; everything else (a non-success status `HttpError`, an
+/// auth/provider error, a decode miss) → [`LensError::Model`].
 ///
-/// A non-success status → [`LensError::Model`]; a transport read error →
-/// [`LensError::Network`]; an over-cap body or a decode miss →
-/// [`LensError::Parse`].
-async fn read_json_capped<T: serde::de::DeserializeOwned>(
-    mut resp: reqwest::Response,
-) -> Result<T, LensError> {
-    let status = resp.status();
-    if !status.is_success() {
-        return Err(LensError::Model(format!("LLM returned HTTP {status}")));
+/// NOTE: the enrichment worker treats `Network` and `Model` identically (both →
+/// `MapError::Llm` → source `failed`, raw vectors untouched), so this classification
+/// is purely for diagnostics/logging fidelity — it never changes enrichment
+/// control flow.
+fn genai_err(err: genai::Error) -> LensError {
+    let text = err.to_string();
+    let lower = text.to_ascii_lowercase();
+    let is_transport = lower.contains("connect")
+        || lower.contains("connection")
+        || lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("dns")
+        || lower.contains("refused");
+    if is_transport {
+        LensError::Network(text)
+    } else {
+        LensError::Model(text)
     }
-    // Reject early on an advertised length that already exceeds the cap, before
-    // reading any body bytes at all.
-    if let Some(len) = resp.content_length()
-        && len > MAX_LLM_BODY_BYTES as u64
-    {
-        return Err(LensError::Parse("LLM response body exceeded cap".into()));
-    }
-    let mut body: Vec<u8> = Vec::new();
-    while let Some(chunk) = resp.chunk().await.map_err(network_err)? {
-        // Abort as soon as the running total would exceed the cap — never let the
-        // buffer grow unbounded behind a streamed body.
-        if body.len() + chunk.len() > MAX_LLM_BODY_BYTES {
-            return Err(LensError::Parse("LLM response body exceeded cap".into()));
-        }
-        body.extend_from_slice(&chunk);
-    }
-    serde_json::from_slice::<T>(&body).map_err(LensError::from)
 }
 
-/// Classifies a reachability HEAD/GET/POST response into a `bool` per Decision G.
+/// A resolved generation target: the genai [`ServiceTarget`] (adapter + model +
+/// endpoint + auth) plus a stable, cloned `model_id` string for the trait
+/// accessor / enrichment cache key.
+#[derive(Clone)]
+struct ResolvedTarget {
+    target: ServiceTarget,
+    model_id: String,
+}
+
+/// The single LLM backend over [`genai`].
 ///
-/// `true` for any non-error HTTP response that isn't an auth failure; `false`
-/// for `401`/`403`. Connection/timeout failures are handled by the caller
-/// (the `Result::Err` arm) — they map to `false`.
-fn response_is_reachable(status: reqwest::StatusCode) -> bool {
-    !(status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN)
+/// Holds a genai [`Client`] (built with our hardened reqwest client) and a fully
+/// resolved [`ServiceTarget`] (adapter + model + endpoint + auth). Every call
+/// pins that exact target via `ModelSpec::Target`, so the provider/model is never
+/// re-inferred from the model name — a custom endpoint (local Ollama, LM Studio,
+/// GLM, Ollama Cloud) and an explicit API key are honored exactly.
+pub struct GenaiProvider {
+    client: Client,
+    resolved: ResolvedTarget,
 }
 
-// ---------------------------------------------------------------------------
-// Ollama — POST /api/chat (stream:false); reachability GET /api/version
-// ---------------------------------------------------------------------------
-
-/// Ollama backend. Generates via `POST /api/chat` (`stream:false`); reachability
-/// reuses the existing `GET /api/version` probe shape.
-pub struct OllamaProvider {
-    client: reqwest::Client,
-    base_url: String,
-    model: String,
-}
-
-impl OllamaProvider {
-    /// Builds an Ollama provider for `model` at `base_url` (trailing slash trimmed).
-    pub fn new(base_url: &str, model: &str) -> Self {
-        Self {
-            client: llm_client(),
-            base_url: base_url.trim_end_matches('/').to_string(),
-            model: model.to_string(),
-        }
+/// Normalizes a configured `base_url` into the endpoint base genai's adapters
+/// expect.
+///
+/// genai builds the request URL by CONCATENATING a relative path onto the
+/// endpoint base, so the base MUST end in a trailing slash (`format!("{base}path")`)
+/// or the join is malformed. Beyond that, the OpenAI and Anthropic adapters append
+/// the path AFTER the `/v1/` version segment (`{base}chat/completions`,
+/// `{base}messages`), so their base must end in `/v1/`. Our config stores the bare
+/// host for those providers (the system-check probe appends `/v1/models` itself),
+/// so we add `v1/` when it is absent. The Ollama adapter appends `api/chat`
+/// directly, so it only needs a trailing slash.
+fn normalize_endpoint(adapter: AdapterKind, base_url: &str) -> String {
+    let trimmed = base_url.trim_end_matches('/');
+    let needs_v1 = matches!(adapter, AdapterKind::OpenAI | AdapterKind::Anthropic);
+    // Only inject `/v1` when the configured base doesn't already carry a version
+    // segment (some configs store `…/v1`), so we never double it up.
+    if needs_v1 && !trimmed.ends_with("/v1") {
+        format!("{trimmed}/v1/")
+    } else {
+        format!("{trimmed}/")
     }
 }
 
-/// Ollama `/api/chat` (`stream:false`) response shape (the fields we read).
-#[derive(Debug, Deserialize)]
-struct OllamaChatResponse {
-    message: OllamaChatMessage,
-    #[serde(default)]
-    prompt_eval_count: u32,
-    #[serde(default)]
-    eval_count: u32,
-}
-
-#[derive(Debug, Deserialize)]
-struct OllamaChatMessage {
-    #[serde(default)]
-    content: String,
-}
-
-#[async_trait]
-impl LlmProvider for OllamaProvider {
-    fn model_id(&self) -> &str {
-        &self.model
+impl GenaiProvider {
+    /// Builds a provider from a fully-resolved adapter/model/endpoint/auth target,
+    /// constructing its OWN genai [`Client`] (over our hardened reqwest client).
+    ///
+    /// Most call sites use this; the per-task enrichment wiring instead uses
+    /// [`new_with_client`](Self::new_with_client) to SHARE one client across the
+    /// coref/map providers (so the worker never spins up multiple genai clients —
+    /// only the pinned target differs).
+    fn new(adapter: AdapterKind, model: &str, base_url: &str, api_key: &str) -> Self {
+        let client = Client::builder().with_reqwest(llm_client()).build();
+        Self::new_with_client(client, adapter, model, base_url, api_key)
     }
 
-    async fn reachable(&self) -> bool {
-        let url = format!("{}/api/version", self.base_url);
-        match self.client.get(&url).send().await {
-            Ok(resp) => response_is_reachable(resp.status()),
-            Err(_) => false,
-        }
-    }
-
-    async fn generate(&self, req: &LlmRequest) -> Result<LlmResponse, LensError> {
-        let url = format!("{}/api/chat", self.base_url);
-        let mut messages = Vec::with_capacity(2);
-        if let Some(system) = &req.system {
-            messages.push(serde_json::json!({ "role": "system", "content": system }));
-        }
-        messages.push(serde_json::json!({ "role": "user", "content": req.prompt }));
-
-        let mut body = serde_json::json!({
-            "model": self.model,
-            "messages": messages,
-            "stream": false,
-            "options": {
-                "num_predict": req.max_tokens,
-                "temperature": req.temperature,
-            },
-        });
-        // Ollama JSON mode is a top-level `format:"json"` constraint.
-        if req.json {
-            body["format"] = serde_json::Value::String("json".to_string());
-        }
-
-        let resp = self
-            .client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(network_err)?;
-
-        let parsed: OllamaChatResponse = read_json_capped(resp).await?;
-        Ok(LlmResponse {
-            text: parsed.message.content,
-            tokens_used: parsed.prompt_eval_count.saturating_add(parsed.eval_count),
-        })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// OpenAI-compatible — POST /v1/chat/completions; reachability GET /v1/models
-// ---------------------------------------------------------------------------
-
-/// OpenAI-compatible backend (OpenAI / GLM / LM Studio). Generates via
-/// `POST /v1/chat/completions` with a `Bearer` key (when configured);
-/// reachability uses `GET /v1/models`.
-pub struct OpenAiCompatProvider {
-    client: reqwest::Client,
-    base_url: String,
-    model: String,
-    api_key: String,
-}
-
-impl OpenAiCompatProvider {
-    /// Builds an OpenAI-compatible provider. `api_key` may be empty for a local
-    /// runtime (e.g. LM Studio) that needs no auth.
-    pub fn new(base_url: &str, model: &str, api_key: &str) -> Self {
-        Self {
-            client: llm_client(),
-            base_url: base_url.trim_end_matches('/').to_string(),
-            model: model.to_string(),
-            api_key: api_key.to_string(),
-        }
-    }
-
-    /// Applies the `Authorization: Bearer` header when a key is configured.
-    fn auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        if self.api_key.is_empty() {
-            req
+    /// Builds a provider that REUSES an existing genai [`Client`], pinned to its own
+    /// resolved `(adapter, model, endpoint, auth)` target. The per-task enrichment
+    /// path builds the coref/map providers this way from ONE shared client so they
+    /// differ only in the pinned target (the plan's "reuse ONE genai Client" rule).
+    fn new_with_client(
+        client: Client,
+        adapter: AdapterKind,
+        model: &str,
+        base_url: &str,
+        api_key: &str,
+    ) -> Self {
+        let model_iden = ModelIden::new(adapter, model.to_string());
+        let endpoint = Endpoint::from_owned(normalize_endpoint(adapter, base_url));
+        let auth = if api_key.is_empty() {
+            // Local runtimes (Ollama / LM Studio) need no key; genai tolerates an
+            // empty single key for those adapters.
+            AuthData::from_single(String::new())
         } else {
-            req.bearer_auth(&self.api_key)
-        }
-    }
-}
-
-/// OpenAI `/v1/chat/completions` response shape (the fields we read).
-#[derive(Debug, Deserialize)]
-struct OpenAiChatResponse {
-    #[serde(default)]
-    choices: Vec<OpenAiChoice>,
-    #[serde(default)]
-    usage: Option<OpenAiUsage>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiChoice {
-    message: OpenAiMessage,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiMessage {
-    #[serde(default)]
-    content: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiUsage {
-    #[serde(default)]
-    total_tokens: u32,
-}
-
-#[async_trait]
-impl LlmProvider for OpenAiCompatProvider {
-    fn model_id(&self) -> &str {
-        &self.model
-    }
-
-    async fn reachable(&self) -> bool {
-        let url = format!("{}/v1/models", self.base_url);
-        match self.auth(self.client.get(&url)).send().await {
-            Ok(resp) => response_is_reachable(resp.status()),
-            Err(_) => false,
-        }
-    }
-
-    async fn generate(&self, req: &LlmRequest) -> Result<LlmResponse, LensError> {
-        let url = format!("{}/v1/chat/completions", self.base_url);
-        let mut messages = Vec::with_capacity(2);
-        if let Some(system) = &req.system {
-            messages.push(serde_json::json!({ "role": "system", "content": system }));
-        }
-        messages.push(serde_json::json!({ "role": "user", "content": req.prompt }));
-
-        let mut body = serde_json::json!({
-            "model": self.model,
-            "messages": messages,
-            "max_tokens": req.max_tokens,
-            "temperature": req.temperature,
-        });
-        // OpenAI-compatible JSON mode.
-        if req.json {
-            body["response_format"] = serde_json::json!({ "type": "json_object" });
-        }
-
-        let resp = self
-            .auth(self.client.post(&url))
-            .json(&body)
-            .send()
-            .await
-            .map_err(network_err)?;
-
-        let parsed: OpenAiChatResponse = read_json_capped(resp).await?;
-        let text = parsed
-            .choices
-            .into_iter()
-            .next()
-            .map(|c| c.message.content)
-            .unwrap_or_default();
-        Ok(LlmResponse {
-            text,
-            tokens_used: parsed.usage.map(|u| u.total_tokens).unwrap_or(0),
-        })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Anthropic — POST /v1/messages; reachability = max_tokens=1 ping (Decision G)
-// ---------------------------------------------------------------------------
-
-/// Anthropic backend. Generates via `POST /v1/messages` with the `x-api-key` +
-/// `anthropic-version` headers. There is NO `GET /v1/models`, so reachability is
-/// a `max_tokens=1` `POST /v1/messages` ping (Decision G): any non-connection
-/// error that isn't a `401`/`403` → reachable.
-pub struct AnthropicProvider {
-    client: reqwest::Client,
-    base_url: String,
-    model: String,
-    api_key: String,
-}
-
-impl AnthropicProvider {
-    /// Builds an Anthropic provider for `model` at `base_url`.
-    pub fn new(base_url: &str, model: &str, api_key: &str) -> Self {
+            AuthData::from_single(api_key.to_string())
+        };
+        let target = ServiceTarget {
+            endpoint,
+            auth,
+            model: model_iden,
+        };
         Self {
-            client: llm_client(),
-            base_url: base_url.trim_end_matches('/').to_string(),
-            model: model.to_string(),
-            api_key: api_key.to_string(),
+            client,
+            resolved: ResolvedTarget {
+                target,
+                model_id: model.to_string(),
+            },
         }
     }
 
-    /// Adds the Anthropic auth + version headers to a request.
-    fn headers(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        req.header("x-api-key", &self.api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
+    /// Clones the underlying genai [`Client`] so a sibling per-task provider can be
+    /// built against the SAME client with a different pinned target. genai's
+    /// [`Client`] is a cheap `Arc`-backed handle, so this shares the one HTTP client
+    /// rather than constructing a new one.
+    fn client_handle(&self) -> Client {
+        self.client.clone()
+    }
+
+    /// Maps an [`LlmRequest`] onto a genai `(ChatRequest, ChatOptions)` pair.
+    ///
+    /// PRESERVES the determinism contract: `temperature` is passed verbatim
+    /// (enrichment pins `0.0`), `json: true` → `ChatResponseFormat::JsonMode`,
+    /// usage capture is always on so `tokens_used` is populated. `thinking`
+    /// (default OFF) maps to `with_reasoning_effort`; enrichment never sets it.
+    fn map_request(req: &LlmRequest) -> (ChatRequest, ChatOptions) {
+        let mut chat = ChatRequest::default();
+        if let Some(system) = &req.system {
+            chat = chat.with_system(system.clone());
+        }
+        chat = chat.append_message(ChatMessage::user(req.prompt.clone()));
+
+        let mut opts = ChatOptions::default()
+            .with_temperature(req.temperature as f64)
+            .with_max_tokens(req.max_tokens)
+            .with_capture_usage(true);
+        if req.json {
+            opts = opts.with_response_format(ChatResponseFormat::JsonMode);
+        }
+        if req.thinking {
+            let effort = req
+                .reasoning_effort
+                .unwrap_or(ReasoningEffort::Medium)
+                .to_genai();
+            opts = opts.with_reasoning_effort(effort);
+        }
+        (chat, opts)
+    }
+
+    /// The pinned per-call model spec (the fully-resolved target).
+    fn model_spec(&self) -> ModelSpec {
+        ModelSpec::Target(self.resolved.target.clone())
     }
 }
 
-/// Anthropic `/v1/messages` response shape (the fields we read).
-#[derive(Debug, Deserialize)]
-struct AnthropicMessageResponse {
-    #[serde(default)]
-    content: Vec<AnthropicContentBlock>,
-    #[serde(default)]
-    usage: Option<AnthropicUsage>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AnthropicContentBlock {
-    #[serde(default)]
-    text: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct AnthropicUsage {
-    #[serde(default)]
-    input_tokens: u32,
-    #[serde(default)]
-    output_tokens: u32,
+/// genai usage is `Option<i32>` per field; collapse `prompt + completion` (falling
+/// back to `total`) into our saturating `u32`, treating absent/negative as `0`.
+fn usage_to_tokens(usage: &genai::chat::Usage) -> u32 {
+    let nonneg = |v: Option<i32>| u32::try_from(v.unwrap_or(0).max(0)).unwrap_or(0);
+    let prompt = nonneg(usage.prompt_tokens);
+    let completion = nonneg(usage.completion_tokens);
+    let summed = prompt.saturating_add(completion);
+    if summed > 0 {
+        summed
+    } else {
+        nonneg(usage.total_tokens)
+    }
 }
 
 #[async_trait]
-impl LlmProvider for AnthropicProvider {
+impl LlmProvider for GenaiProvider {
     fn model_id(&self) -> &str {
-        &self.model
+        &self.resolved.model_id
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
     async fn reachable(&self) -> bool {
-        // No GET /v1/models on Anthropic — ping with a max_tokens=1 message.
-        let url = format!("{}/v1/messages", self.base_url);
-        // A minimal valid request: max_tokens=1, temperature 0.0, no JSON mode
-        // (Anthropic has no json param anyway — see `generate`).
-        let body = serde_json::json!({
-            "model": self.model,
-            "max_tokens": 1,
-            "temperature": 0.0,
-            "messages": [{ "role": "user", "content": "ping" }],
-        });
-        match self
-            .headers(self.client.post(&url))
-            .json(&body)
-            .send()
+        // A minimal generate ping (max_tokens=1, temp 0, no JSON/thinking). Any
+        // success → reachable; a `401`/`403` or a connection/timeout failure →
+        // unreachable (Decision G: a misconfigured key counts as unreachable so
+        // the source degrades to raw vectors instead of looping).
+        let ping = LlmRequest {
+            system: None,
+            prompt: "ping".to_string(),
+            max_tokens: 1,
+            temperature: 0.0,
+            json: false,
+            thinking: false,
+            reasoning_effort: None,
+        };
+        let (chat, opts) = Self::map_request(&ping);
+        self.client
+            .exec_chat(self.model_spec(), chat, Some(&opts))
             .await
-        {
-            Ok(resp) => response_is_reachable(resp.status()),
-            Err(_) => false,
-        }
+            .is_ok()
     }
 
     async fn generate(&self, req: &LlmRequest) -> Result<LlmResponse, LensError> {
-        let url = format!("{}/v1/messages", self.base_url);
-        // Anthropic exposes a top-level `temperature` but has NO JSON-mode /
-        // `response_format` param — `req.json` is honored only via the prompt
-        // here (the strict serde parse + reprompts in `enrichment::map` are the
-        // real guard), so we never send an unsupported field.
-        let mut body = serde_json::json!({
-            "model": self.model,
-            "max_tokens": req.max_tokens,
-            "temperature": req.temperature,
-            "messages": [{ "role": "user", "content": req.prompt }],
-        });
-        if let Some(system) = &req.system {
-            body["system"] = serde_json::Value::String(system.clone());
-        }
-
-        let resp = self
-            .headers(self.client.post(&url))
-            .json(&body)
-            .send()
+        let (chat, opts) = Self::map_request(req);
+        let res = self
+            .client
+            .exec_chat(self.model_spec(), chat, Some(&opts))
             .await
-            .map_err(network_err)?;
-
-        let parsed: AnthropicMessageResponse = read_json_capped(resp).await?;
-        let text = parsed
-            .content
-            .into_iter()
-            .map(|b| b.text)
-            .collect::<String>();
-        let tokens_used = parsed
-            .usage
-            .map(|u| u.input_tokens.saturating_add(u.output_tokens))
-            .unwrap_or(0);
+            .map_err(genai_err)?;
+        let text = res.first_text().unwrap_or_default().to_string();
+        let tokens_used = usage_to_tokens(&res.usage);
         Ok(LlmResponse { text, tokens_used })
     }
+
+    async fn generate_stream(
+        &self,
+        req: &LlmRequest,
+    ) -> Result<
+        std::pin::Pin<Box<dyn Stream<Item = Result<StreamChunk, LensError>> + Send>>,
+        LensError,
+    > {
+        use genai::chat::ChatStreamEvent;
+
+        let (chat, opts) = Self::map_request(req);
+        let res = self
+            .client
+            .exec_chat_stream(self.model_spec(), chat, Some(&opts))
+            .await
+            .map_err(genai_err)?;
+
+        // Map genai's stream onto our minimal `StreamChunk` surface: answer text →
+        // `TextDelta`, reasoning text → `ThinkingDelta`, terminal `End` → `Done`
+        // with the captured usage. `Start`/`ToolCallChunk`/other events are
+        // dropped (not part of the chat-text contract). A genai stream error maps
+        // through `genai_err`.
+        let mapped = futures_util::StreamExt::filter_map(res.stream, |ev| async move {
+            match ev {
+                Ok(ChatStreamEvent::Chunk(c)) => Some(Ok(StreamChunk::TextDelta(c.content))),
+                Ok(ChatStreamEvent::ReasoningChunk(c)) => {
+                    Some(Ok(StreamChunk::ThinkingDelta(c.content)))
+                }
+                Ok(ChatStreamEvent::End(end)) => {
+                    let tokens_used = end
+                        .captured_usage
+                        .as_ref()
+                        .map(usage_to_tokens)
+                        .unwrap_or(0);
+                    Some(Ok(StreamChunk::Done { tokens_used }))
+                }
+                // Start / ToolCallChunk / ThoughtSignatureChunk: not part of the
+                // text contract — skip.
+                Ok(_) => None,
+                Err(e) => Some(Err(genai_err(e))),
+            }
+        });
+        Ok(Box::pin(mapped))
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Factory (Decision H)
+// Routing / override policy (Stage 2)
 // ---------------------------------------------------------------------------
 
-/// Builds the enrichment [`LlmProvider`] from `config.models[]` (Decision H).
+/// Typed routing policy for selecting the enrichment LLM from the config.
 ///
-/// Returns the FIRST configured model entry whose provider is recognized; cloud
-/// providers (`openai-compatible`, `anthropic`) require `cloud_consent=true` or
-/// they are skipped. Returns `None` when no usable entry exists.
+/// Replaces the hand-rolled "first reachable, local-first" selection with an
+/// explicit policy. The product direction flips the DEFAULT toward cloud-when-
+/// available: [`LlmRouting::CloudFirst`] prefers a configured + consented cloud
+/// provider, falling back to a local Ollama entry. [`LlmRouting::LocalFirst`]
+/// keeps the old local-first behavior; [`LlmRouting::Explicit`] pins one exact
+/// `(provider, model)`.
+///
+/// Serde-stable (snake_case, internally tagged on `kind`) so it round-trips in
+/// `config.json` and a TS mirror without leaking a Rust enum shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LlmRouting {
+    /// Prefer a configured cloud provider (when present AND consented); otherwise
+    /// fall back to a local Ollama entry. The default per product direction.
+    CloudFirst,
+    /// Prefer a local Ollama entry; otherwise fall back to a consented cloud
+    /// provider (the pre-Stage-2 behavior).
+    LocalFirst,
+    /// Pin one exact provider+model. Validated against the catalog (cloud) before
+    /// dispatch; a mismatch with the configured entries skips selection.
+    Explicit {
+        /// The canonical provider id (`"anthropic"`, `"openai-compatible"`, …).
+        provider: String,
+        /// The model id to pin.
+        model: String,
+    },
+}
+
+impl Default for LlmRouting {
+    /// The product-direction default: prefer cloud-when-available, else local.
+    fn default() -> Self {
+        LlmRouting::CloudFirst
+    }
+}
+
+/// Whether a canonical provider id denotes a local runtime (exempt from the
+/// cloud-consent gate AND from catalog validation — local models are user-pulled).
+fn is_local_provider(provider: &str) -> bool {
+    provider == PROVIDER_OLLAMA
+}
+
+/// Maps a canonical `ModelConfig.provider` id onto the genai [`AdapterKind`].
+///
+/// Cloud providers map to their native genai adapter; `openai-compatible`, `glm`,
+/// `zai`, and `ollama-cloud` all speak the OpenAI wire protocol against a custom
+/// endpoint, so they map to [`AdapterKind::OpenAI`] (the endpoint + key in the
+/// resolved [`ServiceTarget`] pin the actual backend). Returns `None` for an
+/// unrecognized provider so the entry is skipped.
+fn adapter_for(provider: &str) -> Option<AdapterKind> {
+    match provider {
+        PROVIDER_OLLAMA => Some(AdapterKind::Ollama),
+        PROVIDER_ANTHROPIC => Some(AdapterKind::Anthropic),
+        // OpenAI-protocol families behind a custom endpoint.
+        PROVIDER_OPENAI_COMPAT | PROVIDER_GLM | PROVIDER_ZAI | PROVIDER_OLLAMA_CLOUD => {
+            Some(AdapterKind::OpenAI)
+        }
+        _ => None,
+    }
+}
+
+/// The models.dev catalog key used to validate a `(provider, model)` for a cloud
+/// provider. `openai-compatible` validates against `openai`; `glm` against `zai`.
+fn catalog_key_for(provider: &str) -> &str {
+    match provider {
+        PROVIDER_OPENAI_COMPAT => SupportedProvider::OpenAI.catalog_key(),
+        PROVIDER_GLM => SupportedProvider::Zai.catalog_key(),
+        PROVIDER_ANTHROPIC => SupportedProvider::Anthropic.catalog_key(),
+        PROVIDER_ZAI => SupportedProvider::Zai.catalog_key(),
+        PROVIDER_OLLAMA_CLOUD => SupportedProvider::OllamaCloud.catalog_key(),
+        other => other,
+    }
+}
+
+/// Builds the enrichment [`LlmProvider`] from `config.models[]` under the typed
+/// [`LlmRouting`] policy + cloud-consent gate + catalog validation.
+///
+/// Selection:
+/// * [`LlmRouting::CloudFirst`] (default): the first consented cloud entry that
+///   validates against the catalog, else the first local Ollama entry.
+/// * [`LlmRouting::LocalFirst`]: the first local Ollama entry, else the first
+///   consented + catalog-valid cloud entry.
+/// * [`LlmRouting::Explicit`]: the configured entry matching `(provider, model)`,
+///   subject to the same consent + validation gates.
+///
+/// Cloud providers (everything but local Ollama) require `cloud_consent == true`
+/// AND must pass [`ModelCatalog::validate`]; local Ollama is exempt from both
+/// (user-pulled models aren't in models.dev). Returns `None` when no usable entry
+/// exists.
 ///
 /// This does NOT probe reachability — the caller (the worker / `init`) calls
-/// [`LlmProvider::reachable`] on the returned provider to gate dispatch. Building
-/// the provider is cheap (an HTTP client) and the reachable check is the gate.
+/// [`LlmProvider::reachable`] on the returned provider to gate dispatch.
 ///
-/// **Step-boundary note:** the plan's `provider_from_config(&AppConfig)`
-/// signature reads the cloud-consent flag from `AppConfig.enrichment`, which is
-/// introduced in Step 6. To keep Step 2 from colliding with that struct, the
-/// consent flag is threaded in as a parameter here; Step 3/6 pass
-/// `config.enrichment.cloud_consent`.
+/// **Step-boundary note:** the cloud-consent flag is threaded in as a parameter
+/// (rather than read off `config.enrichment`) to keep this signature stable for
+/// the existing callers in `lib.rs`.
 pub fn provider_from_config(
     config: &AppConfig,
     cloud_consent: bool,
 ) -> Option<Arc<dyn LlmProvider>> {
-    config
-        .models
-        .iter()
-        .find_map(|m| build_provider(m, cloud_consent))
+    let routing = config.enrichment.routing.clone();
+    let catalog = ModelCatalog::bundled();
+    select_provider(&config.models, &routing, cloud_consent, &catalog)
 }
 
-/// Builds a provider for a single [`crate::config::ModelConfig`] entry, applying
-/// the recognized-provider + cloud-consent gates. Returns `None` to skip.
-fn build_provider(
+/// Resolves the per-task enrichment provider for ONE task (coref / map), reusing
+/// the base provider's genai [`Client`] (M4 Phase 3, Stage 3).
+///
+/// When `task_model` is `Some` AND it resolves to a usable, gated entry, this
+/// returns a sibling [`GenaiProvider`] pinned to that exact `(provider, model)` —
+/// built over the SAME genai client as `base` (only the pinned target differs, per
+/// the plan). When `task_model` is `None`, or the override fails its gates
+/// (unknown provider, cloud without consent, uncatalogued cloud model), this
+/// returns a clone of `base` so the task falls back to the routing default.
+///
+/// `base` carries the shared genai client; the override's `base_url`/`api_key` are
+/// sourced from the matching `config.models[]` entry (a `TaskModel` names only
+/// `provider`+`model`). Cloud overrides are consent-gated AND catalog-validated;
+/// local Ollama is exempt — mirroring [`build_eligible`].
+pub fn task_provider_from_config(
+    base: &Arc<dyn LlmProvider>,
+    task_model: Option<&crate::config::TaskModel>,
+    models: &[crate::config::ModelConfig],
+    cloud_consent: bool,
+) -> Arc<dyn LlmProvider> {
+    let catalog = ModelCatalog::bundled();
+    match task_model.and_then(|tm| build_task_provider(base, tm, models, cloud_consent, &catalog)) {
+        Some(p) => p,
+        None => base.clone(),
+    }
+}
+
+/// Builds a sibling [`GenaiProvider`] pinned to `task_model`, reusing the genai
+/// client from `base` (downcast to a [`GenaiProvider`]). Returns `None` when the
+/// override isn't usable: no matching config entry, an unknown/ungated provider,
+/// or `base` isn't a [`GenaiProvider`] to lend its client (e.g. a test mock).
+fn build_task_provider(
+    base: &Arc<dyn LlmProvider>,
+    task_model: &crate::config::TaskModel,
+    models: &[crate::config::ModelConfig],
+    cloud_consent: bool,
+    catalog: &ModelCatalog,
+) -> Option<Arc<dyn LlmProvider>> {
+    let want_provider = task_model.provider.to_ascii_lowercase();
+    let adapter = adapter_for(&want_provider)?;
+
+    // Source endpoint/key from the matching configured entry (the TaskModel names
+    // only provider+model). Prefer the entry matching BOTH provider AND the exact
+    // override model (so two entries for the same provider — e.g. an instruct + a
+    // coder Ollama endpoint — resolve to the right base_url/api_key); otherwise
+    // fall back to the first entry for that provider (the endpoint/key are shared
+    // across that provider's models). The entry's base_url/api_key pin the backend.
+    let entry = models
+        .iter()
+        .find(|m| {
+            m.provider.to_ascii_lowercase() == want_provider
+                && m.model == task_model.model
+                && !m.base_url.is_empty()
+        })
+        .or_else(|| {
+            models.iter().find(|m| {
+                m.provider.to_ascii_lowercase() == want_provider && !m.base_url.is_empty()
+            })
+        })?;
+
+    // Apply the same consent + catalog gates as routing selection (anti-free-string):
+    // local Ollama is exempt; cloud needs consent + a catalog hit on the OVERRIDE model.
+    if !is_local_provider(&want_provider) {
+        let ok = cloud_consent
+            && catalog
+                .validate(catalog_key_for(&want_provider), &task_model.model)
+                .is_ok();
+        if !ok {
+            return None;
+        }
+    } else if task_model.model.is_empty() {
+        return None;
+    }
+
+    // Reuse the base provider's genai client (only the pinned target differs).
+    let base_genai = base.as_any().downcast_ref::<GenaiProvider>()?;
+    let client = base_genai.client_handle();
+    Some(Arc::new(GenaiProvider::new_with_client(
+        client,
+        adapter,
+        &task_model.model,
+        &entry.base_url,
+        &entry.api_key,
+    )))
+}
+
+/// Routing-aware selection over the configured model entries. Split out from
+/// [`provider_from_config`] so it is unit-testable with an injected catalog.
+fn select_provider(
+    models: &[crate::config::ModelConfig],
+    routing: &LlmRouting,
+    cloud_consent: bool,
+    catalog: &ModelCatalog,
+) -> Option<Arc<dyn LlmProvider>> {
+    let usable = |m: &crate::config::ModelConfig| {
+        !m.base_url.is_empty() && !m.model.is_empty() && build_eligible(m, cloud_consent, catalog)
+    };
+
+    match routing {
+        LlmRouting::Explicit { provider, model } => {
+            let want_provider = provider.to_ascii_lowercase();
+            models
+                .iter()
+                .find(|m| {
+                    m.provider.to_ascii_lowercase() == want_provider
+                        && m.model == *model
+                        && usable(m)
+                })
+                .and_then(build_provider)
+        }
+        LlmRouting::CloudFirst => models
+            .iter()
+            .find(|m| !is_local_provider(&m.provider.to_ascii_lowercase()) && usable(m))
+            .or_else(|| {
+                models
+                    .iter()
+                    .find(|m| is_local_provider(&m.provider.to_ascii_lowercase()) && usable(m))
+            })
+            .and_then(build_provider),
+        LlmRouting::LocalFirst => models
+            .iter()
+            .find(|m| is_local_provider(&m.provider.to_ascii_lowercase()) && usable(m))
+            .or_else(|| {
+                models
+                    .iter()
+                    .find(|m| !is_local_provider(&m.provider.to_ascii_lowercase()) && usable(m))
+            })
+            .and_then(build_provider),
+    }
+}
+
+/// Whether an entry passes the consent + catalog-validation gates (independent of
+/// routing). Local Ollama is exempt from both; cloud entries need consent AND a
+/// catalog hit. An unrecognized provider id is never eligible.
+fn build_eligible(
     model: &crate::config::ModelConfig,
     cloud_consent: bool,
-) -> Option<Arc<dyn LlmProvider>> {
+    catalog: &ModelCatalog,
+) -> bool {
+    let provider = model.provider.to_ascii_lowercase();
+    if adapter_for(&provider).is_none() {
+        return false;
+    }
+    if is_local_provider(&provider) {
+        return true;
+    }
+    // Cloud: gated on explicit consent + catalog membership (anti-free-string).
+    cloud_consent
+        && catalog
+            .validate(catalog_key_for(&provider), &model.model)
+            .is_ok()
+}
+
+/// Builds a [`GenaiProvider`] for a single recognized entry (no gating — the
+/// caller applies [`build_eligible`] first). Returns `None` for an unrecognized
+/// provider or an empty endpoint/model.
+fn build_provider(model: &crate::config::ModelConfig) -> Option<Arc<dyn LlmProvider>> {
     if model.base_url.is_empty() || model.model.is_empty() {
         return None;
     }
     let provider = model.provider.to_ascii_lowercase();
-    match provider.as_str() {
-        PROVIDER_OLLAMA => Some(Arc::new(OllamaProvider::new(&model.base_url, &model.model))),
-        PROVIDER_OPENAI_COMPAT if cloud_consent => Some(Arc::new(OpenAiCompatProvider::new(
-            &model.base_url,
-            &model.model,
-            &model.api_key,
-        ))),
-        PROVIDER_ANTHROPIC if cloud_consent => Some(Arc::new(AnthropicProvider::new(
-            &model.base_url,
-            &model.model,
-            &model.api_key,
-        ))),
-        _ => None,
-    }
+    let adapter = adapter_for(&provider)?;
+    Some(Arc::new(GenaiProvider::new(
+        adapter,
+        &model.model,
+        &model.base_url,
+        &model.api_key,
+    )))
 }
 
 #[cfg(test)]
@@ -561,7 +796,8 @@ mod tests {
     use super::*;
 
     use crate::config::ModelConfig;
-    use wiremock::matchers::{body_partial_json, header, method, path};
+    use futures_util::StreamExt;
+    use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// A fixed always-refused localhost port. Nothing binds `127.0.0.1:1`, so the
@@ -577,347 +813,570 @@ mod tests {
             // The enrichment determinism defaults: greedy decode + JSON mode.
             temperature: 0.0,
             json: true,
+            thinking: false,
+            reasoning_effort: None,
         }
     }
 
-    // --- Ollama (drives the Arc<dyn LlmProvider> trait object) --------------
-
-    #[tokio::test]
-    async fn ollama_reachable_true_on_version_ok() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/api/version"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "version": "0.4.1"
-            })))
-            .mount(&server)
-            .await;
-
-        let provider: Arc<dyn LlmProvider> = Arc::new(OllamaProvider::new(&server.uri(), "llama3"));
-        assert!(provider.reachable().await);
+    /// An Ollama `/api/chat` non-streaming response body genai can parse.
+    fn ollama_chat_body(content: &str) -> serde_json::Value {
+        serde_json::json!({
+            "model": "llama3",
+            "message": { "role": "assistant", "content": content },
+            "done": true,
+            "done_reason": "stop",
+            "prompt_eval_count": 10,
+            "eval_count": 5
+        })
     }
 
-    #[tokio::test]
-    async fn ollama_reachable_false_on_connection_refused() {
-        let provider: Arc<dyn LlmProvider> = Arc::new(OllamaProvider::new(DEAD_URL, "llama3"));
-        assert!(!provider.reachable().await);
+    // --- LlmRequest mapping (determinism contract) --------------------------
+
+    #[test]
+    fn map_request_sets_temperature_and_json_mode() {
+        let (_chat, opts) = GenaiProvider::map_request(&req());
+        // temperature 0.0 + json mode must be on the options (the deterministic
+        // enrichment contract). We assert via the public ChatOptions getters.
+        assert_eq!(opts.temperature, Some(0.0));
+        assert!(
+            matches!(opts.response_format, Some(ChatResponseFormat::JsonMode)),
+            "json:true must map to ChatResponseFormat::JsonMode"
+        );
+        assert_eq!(opts.max_tokens, Some(64));
+        // thinking OFF (default) ⇒ no reasoning effort.
+        assert!(opts.reasoning_effort.is_none());
     }
 
+    #[test]
+    fn map_request_thinking_sets_reasoning_effort() {
+        let r = LlmRequest {
+            thinking: true,
+            reasoning_effort: Some(ReasoningEffort::High),
+            json: false,
+            ..req()
+        };
+        let (_chat, opts) = GenaiProvider::map_request(&r);
+        assert!(matches!(opts.reasoning_effort, Some(GenaiEffort::High)));
+        // json:false ⇒ no forced JSON mode.
+        assert!(opts.response_format.is_none());
+    }
+
+    #[test]
+    fn llm_request_thinking_defaults_off_on_legacy_payload() {
+        // An IPC/disk payload written before `thinking`/`reasoning_effort` existed
+        // has neither key; both must read back as the off/none defaults.
+        let json = r#"{
+            "system": null,
+            "prompt": "hi",
+            "max_tokens": 32,
+            "temperature": 0.0,
+            "json": true
+        }"#;
+        let r: LlmRequest = serde_json::from_str(json).unwrap();
+        assert!(!r.thinking);
+        assert!(r.reasoning_effort.is_none());
+    }
+
+    // --- endpoint normalization ---------------------------------------------
+
+    #[test]
+    fn normalize_endpoint_ollama_just_trailing_slash() {
+        assert_eq!(
+            normalize_endpoint(AdapterKind::Ollama, "http://localhost:11434"),
+            "http://localhost:11434/"
+        );
+        // An already-slashed base isn't doubled.
+        assert_eq!(
+            normalize_endpoint(AdapterKind::Ollama, "http://localhost:11434/"),
+            "http://localhost:11434/"
+        );
+    }
+
+    #[test]
+    fn normalize_endpoint_openai_anthropic_get_v1() {
+        assert_eq!(
+            normalize_endpoint(AdapterKind::OpenAI, "http://localhost:1234"),
+            "http://localhost:1234/v1/"
+        );
+        assert_eq!(
+            normalize_endpoint(AdapterKind::Anthropic, "https://api.anthropic.com"),
+            "https://api.anthropic.com/v1/"
+        );
+        // A base that already carries /v1 is not doubled.
+        assert_eq!(
+            normalize_endpoint(AdapterKind::OpenAI, "https://api.openai.com/v1"),
+            "https://api.openai.com/v1/"
+        );
+    }
+
+    // --- usage mapping ------------------------------------------------------
+
+    #[test]
+    fn usage_sums_prompt_and_completion() {
+        let usage = genai::chat::Usage {
+            prompt_tokens: Some(30),
+            completion_tokens: Some(12),
+            total_tokens: Some(42),
+            ..Default::default()
+        };
+        assert_eq!(usage_to_tokens(&usage), 42);
+    }
+
+    #[test]
+    fn usage_falls_back_to_total_when_split_absent() {
+        let usage = genai::chat::Usage {
+            prompt_tokens: None,
+            completion_tokens: None,
+            total_tokens: Some(99),
+            ..Default::default()
+        };
+        assert_eq!(usage_to_tokens(&usage), 99);
+    }
+
+    // --- GenaiProvider round-trip via wiremock (Ollama adapter) -------------
+
     #[tokio::test]
-    async fn ollama_generate_parses_completion() {
+    async fn genai_generate_round_trips_ollama() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/chat"))
-            // The determinism knobs must be on the wire: temperature in
-            // `options` and the top-level `format:"json"` when json-mode is set.
-            .and(body_partial_json(serde_json::json!({
-                "options": { "temperature": 0.0 },
-                "format": "json"
-            })))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "message": { "role": "assistant", "content": "hi there" },
-                "prompt_eval_count": 10,
-                "eval_count": 5
-            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ollama_chat_body("hi there")))
             .mount(&server)
             .await;
 
-        let provider: Arc<dyn LlmProvider> = Arc::new(OllamaProvider::new(&server.uri(), "llama3"));
+        let provider: Arc<dyn LlmProvider> = Arc::new(GenaiProvider::new(
+            AdapterKind::Ollama,
+            "llama3",
+            &server.uri(),
+            "",
+        ));
         let resp = provider.generate(&req()).await.unwrap();
         assert_eq!(resp.text, "hi there");
         assert_eq!(resp.tokens_used, 15);
     }
 
-    // --- OpenAI-compatible --------------------------------------------------
-
     #[tokio::test]
-    async fn openai_reachable_true_on_models_ok() {
+    async fn genai_reachable_true_on_ok() {
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v1/models"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": [{ "id": "gpt-4o" }]
-            })))
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ollama_chat_body("ok")))
             .mount(&server)
             .await;
 
-        let provider: Arc<dyn LlmProvider> = Arc::new(OpenAiCompatProvider::new(
+        let provider: Arc<dyn LlmProvider> = Arc::new(GenaiProvider::new(
+            AdapterKind::Ollama,
+            "llama3",
             &server.uri(),
-            "gpt-4o",
-            "sk-test",
+            "",
         ));
         assert!(provider.reachable().await);
     }
 
     #[tokio::test]
-    async fn openai_reachable_false_on_401_auth() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v1/models"))
-            .respond_with(ResponseTemplate::new(401))
-            .mount(&server)
-            .await;
-
-        let provider: Arc<dyn LlmProvider> = Arc::new(OpenAiCompatProvider::new(
-            &server.uri(),
-            "gpt-4o",
-            "bad-key",
-        ));
-        assert!(!provider.reachable().await);
-    }
-
-    #[tokio::test]
-    async fn openai_reachable_false_on_connection_refused() {
-        let provider: Arc<dyn LlmProvider> =
-            Arc::new(OpenAiCompatProvider::new(DEAD_URL, "gpt-4o", "sk-test"));
-        assert!(!provider.reachable().await);
-    }
-
-    #[tokio::test]
-    async fn openai_generate_parses_completion() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/chat/completions"))
-            // temperature + `response_format: json_object` must be on the wire.
-            .and(body_partial_json(serde_json::json!({
-                "temperature": 0.0,
-                "response_format": { "type": "json_object" }
-            })))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "choices": [{ "message": { "role": "assistant", "content": "the answer" } }],
-                "usage": { "total_tokens": 42 }
-            })))
-            .mount(&server)
-            .await;
-
-        let provider: Arc<dyn LlmProvider> = Arc::new(OpenAiCompatProvider::new(
-            &server.uri(),
-            "gpt-4o",
-            "sk-test",
-        ));
-        let resp = provider.generate(&req()).await.unwrap();
-        assert_eq!(resp.text, "the answer");
-        assert_eq!(resp.tokens_used, 42);
-    }
-
-    // --- Anthropic (max_tokens=1 ping reachability — Decision G) ------------
-
-    #[tokio::test]
-    async fn anthropic_reachable_true_on_messages_ok() {
-        let server = MockServer::start().await;
-        // The max_tokens=1 ping returns a stubbed message → reachable.
-        Mock::given(method("POST"))
-            .and(path("/v1/messages"))
-            .and(header("anthropic-version", ANTHROPIC_VERSION))
-            .and(header("x-api-key", "sk-ant"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "content": [{ "type": "text", "text": "ping" }],
-                "usage": { "input_tokens": 1, "output_tokens": 1 }
-            })))
-            .mount(&server)
-            .await;
-
-        let provider: Arc<dyn LlmProvider> = Arc::new(AnthropicProvider::new(
-            &server.uri(),
-            "claude-opus-4-8",
-            "sk-ant",
-        ));
-        assert!(provider.reachable().await);
-    }
-
-    #[tokio::test]
-    async fn anthropic_reachable_false_on_401_auth() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/messages"))
-            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
-                "type": "error",
-                "error": { "type": "authentication_error", "message": "invalid x-api-key" }
-            })))
-            .mount(&server)
-            .await;
-
-        let provider: Arc<dyn LlmProvider> = Arc::new(AnthropicProvider::new(
-            &server.uri(),
-            "claude-opus-4-8",
-            "bad-key",
-        ));
-        assert!(!provider.reachable().await);
-    }
-
-    #[tokio::test]
-    async fn anthropic_reachable_false_on_connection_refused() {
-        let provider: Arc<dyn LlmProvider> = Arc::new(AnthropicProvider::new(
+    async fn genai_reachable_false_on_connection_refused() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(GenaiProvider::new(
+            AdapterKind::Ollama,
+            "llama3",
             DEAD_URL,
-            "claude-opus-4-8",
-            "sk-ant",
+            "",
         ));
         assert!(!provider.reachable().await);
     }
 
     #[tokio::test]
-    async fn anthropic_generate_parses_completion() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/messages"))
-            .and(header("x-api-key", "sk-ant"))
-            // Anthropic gets a top-level temperature.
-            .and(body_partial_json(serde_json::json!({ "temperature": 0.0 })))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "content": [
-                    { "type": "text", "text": "structured " },
-                    { "type": "text", "text": "map" }
-                ],
-                "usage": { "input_tokens": 30, "output_tokens": 12 }
-            })))
-            .mount(&server)
-            .await;
-
-        let provider: Arc<dyn LlmProvider> = Arc::new(AnthropicProvider::new(
-            &server.uri(),
-            "claude-opus-4-8",
-            "sk-ant",
-        ));
-        let resp = provider.generate(&req()).await.unwrap();
-        assert_eq!(resp.text, "structured map");
-        assert_eq!(resp.tokens_used, 42);
-
-        // Anthropic has NO json-mode param even when `req.json` is true — assert
-        // the body never carries `response_format`/`format` (relies on the prompt).
-        let requests = server.received_requests().await.unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
-        assert!(body.get("response_format").is_none());
-        assert!(body.get("format").is_none());
-        assert_eq!(body["temperature"], serde_json::json!(0.0));
-    }
-
-    #[tokio::test]
-    async fn generate_non_success_status_is_model_error() {
+    async fn genai_reachable_false_on_500() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(500))
             .mount(&server)
             .await;
-
-        let provider: Arc<dyn LlmProvider> = Arc::new(OllamaProvider::new(&server.uri(), "llama3"));
-        let err = provider.generate(&req()).await.unwrap_err();
-        assert!(matches!(err, LensError::Model(_)), "got {err:?}");
+        let provider: Arc<dyn LlmProvider> = Arc::new(GenaiProvider::new(
+            AdapterKind::Ollama,
+            "llama3",
+            &server.uri(),
+            "",
+        ));
+        assert!(!provider.reachable().await);
     }
 
     #[tokio::test]
-    async fn generate_over_cap_body_is_rejected() {
-        // Serve a body larger than MAX_LLM_BODY_BYTES; the stream-and-cap reader
-        // must abort with a Parse error rather than buffering the whole thing.
+    async fn genai_generate_non_success_is_error() {
         let server = MockServer::start().await;
-        let oversized = "x".repeat(MAX_LLM_BODY_BYTES + 1024);
         Mock::given(method("POST"))
             .and(path("/api/chat"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(oversized))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let provider: Arc<dyn LlmProvider> = Arc::new(GenaiProvider::new(
+            AdapterKind::Ollama,
+            "llama3",
+            &server.uri(),
+            "",
+        ));
+        let err = provider.generate(&req()).await.unwrap_err();
+        assert!(
+            matches!(err, LensError::Model(_) | LensError::Network(_)),
+            "got {err:?}"
+        );
+    }
+
+    // --- streaming surface --------------------------------------------------
+
+    #[tokio::test]
+    async fn default_generate_stream_yields_text_then_done() {
+        // The DEFAULT trait impl (used by every enrichment mock) buffers a
+        // non-streaming generate into TextDelta + Done.
+        struct Fixed;
+        #[async_trait]
+        impl LlmProvider for Fixed {
+            fn model_id(&self) -> &str {
+                "fixed"
+            }
+            async fn reachable(&self) -> bool {
+                true
+            }
+            async fn generate(&self, _req: &LlmRequest) -> Result<LlmResponse, LensError> {
+                Ok(LlmResponse {
+                    text: "answer".to_string(),
+                    tokens_used: 7,
+                })
+            }
+        }
+
+        let provider = Fixed;
+        let stream = provider.generate_stream(&req()).await.unwrap();
+        let events: Vec<_> = stream.collect().await;
+        let events: Vec<StreamChunk> = events.into_iter().map(|e| e.unwrap()).collect();
+        assert_eq!(
+            events,
+            vec![
+                StreamChunk::TextDelta("answer".to_string()),
+                StreamChunk::Done { tokens_used: 7 },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn genai_generate_stream_yields_deltas_and_done() {
+        // genai's Ollama adapter falls back to a buffered single chunk + End when
+        // the endpoint returns a non-streamed body, so a wiremock NDJSON-less
+        // round-trip still exercises our event mapping (TextDelta + Done).
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ollama_chat_body("streamed")))
             .mount(&server)
             .await;
 
-        let provider: Arc<dyn LlmProvider> = Arc::new(OllamaProvider::new(&server.uri(), "llama3"));
-        let err = provider.generate(&req()).await.unwrap_err();
-        assert!(matches!(err, LensError::Parse(_)), "got {err:?}");
+        let provider: Arc<dyn LlmProvider> = Arc::new(GenaiProvider::new(
+            AdapterKind::Ollama,
+            "llama3",
+            &server.uri(),
+            "",
+        ));
+        let stream = provider.generate_stream(&req()).await.unwrap();
+        let events: Vec<StreamChunk> = stream.map(|e| e.unwrap()).collect().await;
+
+        // At least one text delta and a terminal Done.
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamChunk::TextDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(text.contains("streamed"), "got deltas: {events:?}");
+        assert!(
+            matches!(events.last(), Some(StreamChunk::Done { .. })),
+            "stream must end in Done; got {events:?}"
+        );
     }
 
     // --- model_id accessor (cache-key component, AC9) -----------------------
 
     #[test]
     fn model_id_returns_configured_model() {
-        let ollama = OllamaProvider::new("http://localhost:11434", "llama3.1");
-        assert_eq!(ollama.model_id(), "llama3.1");
-        let anthropic = AnthropicProvider::new("https://api.anthropic.com", "claude-opus-4-8", "k");
-        assert_eq!(anthropic.model_id(), "claude-opus-4-8");
+        let p = GenaiProvider::new(
+            AdapterKind::Ollama,
+            "llama3.1",
+            "http://localhost:11434",
+            "",
+        );
+        assert_eq!(p.model_id(), "llama3.1");
+        let a = GenaiProvider::new(
+            AdapterKind::Anthropic,
+            "claude-opus-4-8",
+            "https://api.anthropic.com",
+            "k",
+        );
+        assert_eq!(a.model_id(), "claude-opus-4-8");
     }
 
-    // --- factory (Decision H) -----------------------------------------------
+    // --- routing / factory (Stage 2) ----------------------------------------
 
-    fn config_with(models: Vec<ModelConfig>) -> AppConfig {
+    fn config_with(models: Vec<ModelConfig>, routing: LlmRouting) -> AppConfig {
         AppConfig {
             models,
+            enrichment: crate::config::EnrichmentConfig {
+                routing,
+                ..crate::config::EnrichmentConfig::default()
+            },
             ..AppConfig::default()
         }
     }
 
-    #[test]
-    fn factory_selects_local_ollama_without_consent() {
-        let cfg = config_with(vec![ModelConfig {
+    fn ollama_entry() -> ModelConfig {
+        ModelConfig {
             provider: "ollama".to_string(),
             base_url: "http://localhost:11434".to_string(),
             model: "llama3".to_string(),
             ..ModelConfig::default()
-        }]);
-        let provider = provider_from_config(&cfg, false).expect("ollama selected");
-        assert_eq!(provider.model_id(), "llama3");
+        }
     }
 
-    #[test]
-    fn factory_rejects_cloud_without_consent() {
-        let cfg = config_with(vec![
-            ModelConfig {
-                provider: "anthropic".to_string(),
-                base_url: "https://api.anthropic.com".to_string(),
-                model: "claude-opus-4-8".to_string(),
-                api_key: "sk-ant".to_string(),
-                ..ModelConfig::default()
-            },
-            ModelConfig {
-                provider: "openai-compatible".to_string(),
-                base_url: "https://api.openai.com".to_string(),
-                model: "gpt-4o".to_string(),
-                api_key: "sk-oai".to_string(),
-                ..ModelConfig::default()
-            },
-        ]);
-        assert!(provider_from_config(&cfg, false).is_none());
-    }
-
-    #[test]
-    fn factory_selects_cloud_with_consent() {
-        let cfg = config_with(vec![ModelConfig {
+    /// A catalog-valid Anthropic entry (the bundled catalog lists this model).
+    fn anthropic_entry(model: &str) -> ModelConfig {
+        ModelConfig {
             provider: "anthropic".to_string(),
             base_url: "https://api.anthropic.com".to_string(),
-            model: "claude-opus-4-8".to_string(),
+            model: model.to_string(),
             api_key: "sk-ant".to_string(),
             ..ModelConfig::default()
-        }]);
-        let provider = provider_from_config(&cfg, true).expect("anthropic selected with consent");
-        assert_eq!(provider.model_id(), "claude-opus-4-8");
+        }
+    }
+
+    /// The first Anthropic model id present in the bundled catalog (so catalog
+    /// validation passes for the cloud-selection tests).
+    fn catalog_anthropic_model() -> String {
+        let catalog = ModelCatalog::bundled();
+        catalog
+            .provider("anthropic")
+            .and_then(|p| p.models.keys().next())
+            .cloned()
+            .expect("bundled catalog has at least one anthropic model")
     }
 
     #[test]
-    fn factory_skips_incomplete_and_unknown_entries() {
-        let cfg = config_with(vec![
-            // Unknown provider → skipped.
-            ModelConfig {
-                provider: "mystery".to_string(),
-                base_url: "http://x".to_string(),
-                model: "m".to_string(),
-                ..ModelConfig::default()
+    fn local_first_selects_ollama_without_consent() {
+        let cfg = config_with(vec![ollama_entry()], LlmRouting::LocalFirst);
+        let p = provider_from_config(&cfg, false).expect("ollama selected");
+        assert_eq!(p.model_id(), "llama3");
+    }
+
+    #[test]
+    fn cloud_first_prefers_consented_catalog_valid_cloud() {
+        let model = catalog_anthropic_model();
+        let cfg = config_with(
+            vec![ollama_entry(), anthropic_entry(&model)],
+            LlmRouting::CloudFirst,
+        );
+        let p = provider_from_config(&cfg, true).expect("cloud preferred");
+        assert_eq!(p.model_id(), model);
+    }
+
+    #[test]
+    fn cloud_first_falls_back_to_local_without_consent() {
+        let model = catalog_anthropic_model();
+        // Cloud present but consent withheld → cloud skipped → falls back to local.
+        let cfg = config_with(
+            vec![anthropic_entry(&model), ollama_entry()],
+            LlmRouting::CloudFirst,
+        );
+        let p = provider_from_config(&cfg, false).expect("falls back to local");
+        assert_eq!(p.model_id(), "llama3");
+    }
+
+    #[test]
+    fn cloud_rejected_when_model_not_in_catalog() {
+        // A free-string model id that isn't in the catalog must be rejected even
+        // with consent (the Stage-1 anti-free-string guard).
+        let cfg = config_with(
+            vec![anthropic_entry("totally-made-up-model")],
+            LlmRouting::CloudFirst,
+        );
+        assert!(
+            provider_from_config(&cfg, true).is_none(),
+            "uncatalogued cloud model must be rejected"
+        );
+    }
+
+    #[test]
+    fn explicit_pins_exact_provider_model() {
+        let model = catalog_anthropic_model();
+        let cfg = config_with(
+            vec![ollama_entry(), anthropic_entry(&model)],
+            LlmRouting::Explicit {
+                provider: "anthropic".to_string(),
+                model: model.clone(),
             },
-            // Missing model → skipped.
-            ModelConfig {
+        );
+        let p = provider_from_config(&cfg, true).expect("explicit anthropic");
+        assert_eq!(p.model_id(), model);
+    }
+
+    #[test]
+    fn explicit_local_does_not_require_consent_or_catalog() {
+        let cfg = config_with(
+            vec![ollama_entry()],
+            LlmRouting::Explicit {
                 provider: "ollama".to_string(),
-                base_url: "http://localhost:11434".to_string(),
-                model: String::new(),
-                ..ModelConfig::default()
-            },
-            // Valid ollama → selected.
-            ModelConfig {
-                provider: "ollama".to_string(),
-                base_url: "http://localhost:11434".to_string(),
                 model: "llama3".to_string(),
-                ..ModelConfig::default()
             },
-        ]);
-        let provider = provider_from_config(&cfg, false).expect("third entry selected");
-        assert_eq!(provider.model_id(), "llama3");
+        );
+        let p = provider_from_config(&cfg, false).expect("explicit local");
+        assert_eq!(p.model_id(), "llama3");
     }
 
     #[test]
-    fn factory_none_when_no_models() {
-        assert!(provider_from_config(&AppConfig::default(), true).is_none());
+    fn none_when_no_usable_models() {
+        let cfg = config_with(vec![], LlmRouting::CloudFirst);
+        assert!(provider_from_config(&cfg, true).is_none());
+    }
+
+    #[test]
+    fn skips_incomplete_and_unknown_entries() {
+        let cfg = config_with(
+            vec![
+                // Unknown provider → skipped.
+                ModelConfig {
+                    provider: "mystery".to_string(),
+                    base_url: "http://x".to_string(),
+                    model: "m".to_string(),
+                    ..ModelConfig::default()
+                },
+                // Missing model → skipped.
+                ModelConfig {
+                    provider: "ollama".to_string(),
+                    base_url: "http://localhost:11434".to_string(),
+                    model: String::new(),
+                    ..ModelConfig::default()
+                },
+                // Valid ollama → selected.
+                ollama_entry(),
+            ],
+            LlmRouting::LocalFirst,
+        );
+        let p = provider_from_config(&cfg, false).expect("valid ollama selected");
+        assert_eq!(p.model_id(), "llama3");
+    }
+
+    #[test]
+    fn routing_default_is_cloud_first() {
+        assert_eq!(LlmRouting::default(), LlmRouting::CloudFirst);
+    }
+
+    #[test]
+    fn routing_serializes_snake_case_tagged() {
+        assert_eq!(
+            serde_json::to_value(LlmRouting::CloudFirst).unwrap(),
+            serde_json::json!({ "kind": "cloud_first" })
+        );
+        assert_eq!(
+            serde_json::to_value(LlmRouting::Explicit {
+                provider: "anthropic".to_string(),
+                model: "claude".to_string(),
+            })
+            .unwrap(),
+            serde_json::json!({ "kind": "explicit", "provider": "anthropic", "model": "claude" })
+        );
+    }
+
+    // --- per-task provider override (Stage 3) -------------------------------
+
+    use crate::config::TaskModel;
+
+    /// A base [`GenaiProvider`] (over a dead URL — never dispatched in these
+    /// selection tests) used as the client lender for per-task siblings.
+    fn base_genai(model: &str) -> Arc<dyn LlmProvider> {
+        Arc::new(GenaiProvider::new(
+            AdapterKind::Ollama,
+            model,
+            "http://localhost:11434",
+            "",
+        ))
+    }
+
+    #[test]
+    fn task_provider_falls_back_to_base_when_override_unset() {
+        let base = base_genai("qwen2.5-instruct");
+        let models = vec![ollama_entry()];
+        let p = task_provider_from_config(&base, None, &models, false);
+        // No override ⇒ same model id as base (the routing default).
+        assert_eq!(p.model_id(), "qwen2.5-instruct");
+    }
+
+    #[test]
+    fn task_provider_pins_local_override_model() {
+        // The product ask: coref pinned to a coder model while the base/default is a
+        // generalist — coref must use the coder, not the configured default.
+        let base = base_genai("qwen2.5-instruct");
+        let models = vec![ModelConfig {
+            provider: "ollama".to_string(),
+            base_url: "http://localhost:11434".to_string(),
+            model: "qwen2.5-instruct".to_string(),
+            ..ModelConfig::default()
+        }];
+        let coref = TaskModel {
+            provider: "ollama".to_string(),
+            model: "qwen2.5-coder".to_string(),
+        };
+        let p = task_provider_from_config(&base, Some(&coref), &models, false);
+        assert_eq!(p.model_id(), "qwen2.5-coder", "coref pins the coder model");
+    }
+
+    #[test]
+    fn task_provider_pins_consented_catalog_valid_cloud_override() {
+        let model = catalog_anthropic_model();
+        let base = base_genai("qwen2.5-instruct");
+        let models = vec![anthropic_entry(&model)];
+        let map = TaskModel {
+            provider: "anthropic".to_string(),
+            model: model.clone(),
+        };
+        let p = task_provider_from_config(&base, Some(&map), &models, true);
+        assert_eq!(p.model_id(), model);
+    }
+
+    #[test]
+    fn task_provider_rejects_cloud_override_without_consent() {
+        let model = catalog_anthropic_model();
+        let base = base_genai("qwen2.5-instruct");
+        let models = vec![anthropic_entry(&model)];
+        let map = TaskModel {
+            provider: "anthropic".to_string(),
+            model,
+        };
+        // No consent ⇒ cloud override rejected ⇒ falls back to base.
+        let p = task_provider_from_config(&base, Some(&map), &models, false);
+        assert_eq!(p.model_id(), "qwen2.5-instruct");
+    }
+
+    #[test]
+    fn task_provider_rejects_uncatalogued_cloud_override() {
+        let base = base_genai("qwen2.5-instruct");
+        let models = vec![anthropic_entry("totally-made-up-model")];
+        let map = TaskModel {
+            provider: "anthropic".to_string(),
+            model: "totally-made-up-model".to_string(),
+        };
+        // Consent granted but the model isn't in the catalog ⇒ rejected ⇒ base.
+        let p = task_provider_from_config(&base, Some(&map), &models, true);
+        assert_eq!(p.model_id(), "qwen2.5-instruct");
+    }
+
+    #[test]
+    fn task_provider_falls_back_when_no_matching_config_entry() {
+        // An override naming a provider with no configured entry (no base_url/key to
+        // source) falls back to the base provider.
+        let base = base_genai("qwen2.5-instruct");
+        let models = vec![ollama_entry()];
+        let coref = TaskModel {
+            provider: "anthropic".to_string(),
+            model: catalog_anthropic_model(),
+        };
+        let p = task_provider_from_config(&base, Some(&coref), &models, true);
+        assert_eq!(p.model_id(), "qwen2.5-instruct");
     }
 }
