@@ -81,7 +81,7 @@ use std::process::ExitCode;
 use lens_core::chunk::{Chunk, chunk_blocks_deterministic};
 use lens_core::embedder::{EMBED_DIM, EMBED_MODEL_ID, Embedder, FastembedEmbedder};
 use lens_core::enrichment::{
-    CorefStrategy, CorefSub, apply_substitutions, compose_embedding_text, compose_prefix,
+    CorefSub, apply_substitutions, compose_embedding_text, compose_prefix,
 };
 use lens_core::parse::{SourceKind, parse_blocks};
 use lens_core::vector_store::{LanceVectorStore, VectorRow, VectorStore};
@@ -152,13 +152,6 @@ const K: usize = 5;
 /// Title for the eval-corpus notebook (a REAL notebook row is created at runtime
 /// because `embedding_index.notebook_id` has a FK to `notebooks(id)`).
 const EVAL_NOTEBOOK_TITLE: &str = "eval-corpus";
-
-/// The coref strategy the enriched eval path composes the PREFIX with — the
-/// production default ([`CorefStrategy::LlmInline`], `config.rs` enrichment default).
-/// Note: under the current composition the prefix is identical for `None` and
-/// `LlmInline`; coref now resolves in the BODY (via `apply_substitutions`), which is
-/// exactly what the `PrefixCoref` mode below exercises.
-const EVAL_COREF: CorefStrategy = CorefStrategy::LlmInline;
 
 // ---------------------------------------------------------------------------
 // queries.json schema
@@ -558,7 +551,7 @@ async fn measure(
                 EmbedMode::PrefixOnly => {
                     // EXACT production composition: compose_prefix → compose_embedding_text,
                     // with the canonical body (NO coref).
-                    let prefix = compose_prefix(&doc_summary, &chunk.section_path, EVAL_COREF);
+                    let prefix = compose_prefix(&doc_summary, &chunk.section_path);
                     compose_embedding_text(&prefix, &chunk.text, Some(tokenizer))
                 }
                 EmbedMode::PrefixCoref => {
@@ -568,7 +561,7 @@ async fn measure(
                     let subs = fixture_coref_subs(&doc.name, &chunk.text);
                     let resolved_body =
                         apply_substitutions(&chunk.text, &subs, &allowed_antecedents);
-                    let prefix = compose_prefix(&doc_summary, &chunk.section_path, EVAL_COREF);
+                    let prefix = compose_prefix(&doc_summary, &chunk.section_path);
                     compose_embedding_text(&prefix, &resolved_body, Some(tokenizer))
                 }
             };
@@ -744,12 +737,13 @@ fn fixture_entities(doc_name: &str) -> Vec<String> {
 
 /// Builds the production-shape [`CorefSub`] list for `chunk_text` from the authored
 /// per-doc `(mention → antecedent)` edits. For each authored edit, EVERY
-/// non-overlapping byte occurrence of `mention` in this chunk's text becomes a
-/// substitution at its real byte offsets — i.e. the exact `{mention, char_start,
-/// char_end, antecedent}` records a perfect coref model would emit for this chunk.
-/// The offsets are computed by `str::find` (byte indices on UTF-8 char boundaries),
-/// which is exactly what [`apply_substitutions`] validates against; the eval never
-/// re-implements the substitution itself.
+/// non-overlapping occurrence of `mention` in this chunk's text becomes a
+/// substitution at its real CHARACTER (Unicode codepoint) offsets — i.e. the exact
+/// `{mention, char_start, char_end, antecedent}` records a perfect coref model would
+/// emit for this chunk, matching the real `CorefSub` codepoint-offset contract that
+/// [`apply_substitutions`] converts to bytes internally. The byte position from
+/// `str::find` is converted to a codepoint index so the eval exercises the true
+/// production contract; the eval never re-implements the substitution itself.
 fn fixture_coref_subs(doc_name: &str, chunk_text: &str) -> Vec<CorefSub> {
     let Some((_, edits)) = COREF_MAP.iter().find(|(name, _)| *name == doc_name) else {
         return Vec::new();
@@ -758,15 +752,20 @@ fn fixture_coref_subs(doc_name: &str, chunk_text: &str) -> Vec<CorefSub> {
     for (mention, antecedent) in *edits {
         let mut from = 0usize;
         while let Some(rel) = chunk_text[from..].find(mention) {
-            let start = from + rel;
-            let end = start + mention.len();
+            let byte_start = from + rel;
+            let byte_end = byte_start + mention.len();
+            // Convert the byte positions to CODEPOINT indices (the production
+            // `CorefSub` contract). `[..byte_start]` is on a char boundary because
+            // `find` returns one, so its char count is the codepoint index.
+            let char_start = chunk_text[..byte_start].chars().count();
+            let char_end = chunk_text[..byte_end].chars().count();
             subs.push(CorefSub {
                 mention: (*mention).to_string(),
-                char_start: start,
-                char_end: end,
+                char_start,
+                char_end,
                 antecedent: (*antecedent).to_string(),
             });
-            from = end;
+            from = byte_end;
         }
     }
     subs

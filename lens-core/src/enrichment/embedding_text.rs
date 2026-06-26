@@ -86,22 +86,22 @@ pub(crate) fn count_tokens(text: &str, tokenizer: Option<&Tokenizer>) -> usize {
     }
 }
 
-/// The composed context prefix for a chunk, given the per-doc summary, the
-/// chunk's section path, and the coref strategy.
+/// The composed context prefix for a chunk, given the per-doc summary and the
+/// chunk's section path.
 ///
 /// Shape: `"[Document: {summary}] [Section: {section_path}] "`. Each clause is
 /// omitted when its input is empty, so a skipped/non-prose chunk (empty summary)
 /// still gets a `[Section: …]`-only prefix (Decision B). The trailing space
 /// separates the prefix from the body.
 ///
-/// **Coref no longer changes the PREFIX.** Real coref resolution now happens in
-/// the BODY: under [`CorefStrategy::LlmInline`] the worker applies validated
-/// coref substitutions to the chunk text before composing `embedding_text` (the
-/// old static "[Resolve pronouns…]" hint clause was a no-op placeholder and has
-/// been removed). The `coref` parameter is therefore retained for API stability
-/// but the prefix is now IDENTICAL for `None` and `LlmInline` — the strategy is
-/// applied by the caller to the body, not here.
-pub fn compose_prefix(doc_summary: &str, section_path: &str, _coref: CorefStrategy) -> String {
+/// **Coref does NOT affect the prefix.** Real coref resolution happens in the BODY:
+/// under [`CorefStrategy::LlmInline`] the worker applies validated coref
+/// substitutions to the chunk text before composing `embedding_text` (the old
+/// static "[Resolve pronouns…]" hint clause was a no-op placeholder and has been
+/// removed). The prefix is identical regardless of coref strategy, so this function
+/// no longer takes a `CorefStrategy` — a caller that needs to branch on strategy
+/// does so at the worker level (on the body), not here.
+pub fn compose_prefix(doc_summary: &str, section_path: &str) -> String {
     let mut clauses: Vec<String> = Vec::with_capacity(2);
     let summary = doc_summary.trim();
     if !summary.is_empty() {
@@ -208,7 +208,7 @@ mod tests {
 
     #[test]
     fn prefix_includes_summary_and_section() {
-        let p = compose_prefix("A doc about Ada", "Intro > Bio", CorefStrategy::None);
+        let p = compose_prefix("A doc about Ada", "Intro > Bio");
         assert!(p.contains("[Document: A doc about Ada]"));
         assert!(p.contains("[Section: Intro > Bio]"));
         assert!(p.ends_with(' '), "prefix must end with a separating space");
@@ -218,7 +218,7 @@ mod tests {
     fn prefix_omits_empty_clauses_but_keeps_section_for_skipped() {
         // Decision B: a skipped/non-prose chunk has an empty summary but still gets
         // a section-only prefix.
-        let p = compose_prefix("", "Appendix", CorefStrategy::LlmInline);
+        let p = compose_prefix("", "Appendix");
         assert!(!p.contains("[Document:"));
         assert!(p.contains("[Section: Appendix]"));
         // The static coref hint is gone — coref now resolves in the body.
@@ -226,19 +226,17 @@ mod tests {
     }
 
     #[test]
-    fn prefix_is_identical_for_none_and_llm_inline() {
-        // Coref no longer changes the PREFIX (real resolution happens in the body).
-        // `None` and `LlmInline` must compose the SAME prefix for the same context.
-        let p_none = compose_prefix("ctx", "S", CorefStrategy::None);
-        let p_inline = compose_prefix("ctx", "S", CorefStrategy::LlmInline);
-        assert_eq!(p_none, p_inline);
-        // And neither carries the obsolete static hint clause.
-        assert!(!p_inline.contains("Resolve pronouns"));
+    fn prefix_carries_no_coref_hint() {
+        // Coref no longer changes the PREFIX (real resolution happens in the body),
+        // so `compose_prefix` no longer takes a strategy and never emits the
+        // obsolete static hint clause.
+        let p = compose_prefix("ctx", "S");
+        assert!(!p.contains("Resolve pronouns"));
     }
 
     #[test]
     fn embedding_text_is_prefix_plus_body_and_superset_of_body() {
-        let prefix = compose_prefix("ctx summary", "Sec", CorefStrategy::LlmInline);
+        let prefix = compose_prefix("ctx summary", "Sec");
         let body = "The canonical chunk body.";
         let et = compose_embedding_text(&prefix, body, None);
         assert!(

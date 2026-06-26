@@ -22,6 +22,8 @@
 //! (budget/LLM death), and `enriched` (only via the cache-key short-circuit of an
 //! already-fully-enriched source).
 
+use std::collections::HashMap;
+
 use tokio::sync::mpsc;
 
 use crate::LensEngine;
@@ -232,7 +234,7 @@ async fn process_job(
     // compose a lightweight context-prefix `embedding_text` (Decision B). Zero
     // LLM calls. Terminal status `skipped`.
     if !is_prose || below_size_gate {
-        write_prefix_only(&repo, &chunks, "", coref, tokenizer.as_deref()).await?;
+        write_prefix_only(&repo, &chunks, "", tokenizer.as_deref()).await?;
         let meta = EnrichmentMeta {
             cache_key,
             map_quality: MAP_QUALITY_SKIPPED.to_string(),
@@ -326,8 +328,7 @@ async fn process_job(
     // breach fails the source exactly like the map; any other coref miss
     // (malformed/transport) DEGRADES to empty subs so the body falls back to raw —
     // coref is strictly additive and never fails the source on its own.
-    let coref_subs: std::collections::HashMap<usize, Vec<CorefSub>> = if coref
-        == CorefStrategy::LlmInline
+    let coref_subs: HashMap<usize, Vec<CorefSub>> = if coref == CorefStrategy::LlmInline
         && map_quality == MAP_QUALITY_OK
         && !map_entities.is_empty()
     {
@@ -370,11 +371,11 @@ async fn process_job(
                     source_id = %job.source_id,
                     "enrichment: coref LLM error, degrading to raw bodies: {e}"
                 );
-                std::collections::HashMap::new()
+                HashMap::new()
             }
         }
     } else {
-        std::collections::HashMap::new()
+        HashMap::new()
     };
 
     // ── Compose `embedding_text` for every chunk (AC5) + attach the map JSON to
@@ -382,7 +383,7 @@ async fn process_job(
     let mut updates: Vec<ChunkEnrichmentUpdate> = Vec::with_capacity(chunks.len());
     let mut map_attached = map_json.is_none();
     for (i, chunk) in chunks.iter().enumerate() {
-        let prefix = compose_prefix(&doc_summary, &chunk.section_path, coref);
+        let prefix = compose_prefix(&doc_summary, &chunk.section_path);
         // The body sourced into `embedding_text` is the canonical text with this
         // chunk's surviving coref substitutions applied (RIGHT-TO-LEFT, validated).
         // `chunks.text` itself stays byte-identical — only `embedding_text` carries
@@ -483,13 +484,12 @@ async fn write_prefix_only(
     repo: &NotebookRepo<'_>,
     chunks: &[EnrichmentChunk],
     doc_summary: &str,
-    coref: CorefStrategy,
     tokenizer: Option<&tokenizers::Tokenizer>,
 ) -> Result<(), crate::LensError> {
     let updates: Vec<ChunkEnrichmentUpdate> = chunks
         .iter()
         .map(|chunk| {
-            let prefix = compose_prefix(doc_summary, &chunk.section_path, coref);
+            let prefix = compose_prefix(doc_summary, &chunk.section_path);
             let embedding_text = compose_embedding_text(&prefix, &chunk.text, tokenizer);
             ChunkEnrichmentUpdate {
                 chunk_id: chunk.id.clone(),

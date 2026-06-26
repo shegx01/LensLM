@@ -25,6 +25,9 @@ pub mod meta;
 pub mod reembed;
 pub mod worker;
 
+#[cfg(test)]
+pub(crate) mod test_util;
+
 pub use coref::{ChunkCoref, CorefResponse, CorefSub, apply_substitutions, resolve_coref_batch};
 pub use embedding_text::{CorefStrategy, compose_embedding_text, compose_prefix};
 pub use map::{MapError, MapOutcome, build_structural_map};

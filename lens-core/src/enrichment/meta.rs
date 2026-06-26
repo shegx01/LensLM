@@ -47,6 +47,14 @@ pub const ENRICHMENT_MAX_CALLS_PER_JOB: u32 = 8;
 /// → up to 3 total attempts per map call; then degrade to context-prefix-only.
 pub const ENRICHMENT_MAX_RETRIES: u32 = 2;
 
+/// Soft input-character budget for a single enrichment LLM batch (shared by the
+/// structural-map map-reduce and the coref pass so the two batchers stay in sync).
+/// Sized well under a typical local-model context so several parents/chunks batch
+/// together but a huge doc splits into multiple calls; a single chunk that alone
+/// exceeds the budget forms its own batch (the provider truncates if needed —
+/// never a panic).
+pub(super) const ENRICHMENT_BATCH_CHAR_BUDGET: usize = 8 * 1024;
+
 /// Max output tokens requested for a single structural-map LLM call.
 pub const ENRICHMENT_MAP_MAX_TOKENS: u32 = 1_024;
 
@@ -81,8 +89,20 @@ pub const STRUCTURAL_MAP_MAX_DATES: usize = 200;
 /// Max chars retained in a [`StructuralMap`]'s `summary`; truncated to this.
 pub const STRUCTURAL_MAP_MAX_SUMMARY_CHARS: usize = 4_000;
 /// Max chars retained in any individual string field (entity / date / definition
-/// term + definition); each over-long string is truncated to this.
+/// term + definition); each over-long string is truncated to this. Also reused as
+/// the per-field cap for [`CorefResponse`](super::coref::CorefResponse)'s
+/// `mention`/`antecedent` strings.
 pub const STRUCTURAL_MAP_MAX_FIELD_CHARS: usize = 1_000;
+
+/// Max [`ChunkCoref`](super::coref::ChunkCoref) results retained in a
+/// [`CorefResponse`](super::coref::CorefResponse); the vec is truncated to this.
+/// Defense-in-depth against a prompt-injected/bloated LLM response inflating
+/// SQLite — applied AFTER parse by TRUNCATING (not rejecting) so coref degrades
+/// rather than failing the source.
+pub const COREF_MAX_RESULTS: usize = 256;
+/// Max [`CorefSub`](super::coref::CorefSub)s retained per
+/// [`ChunkCoref`](super::coref::ChunkCoref); the vec is truncated to this.
+pub const COREF_MAX_SUBS_PER_CHUNK: usize = 128;
 
 // ---------------------------------------------------------------------------
 // StructuralMap — the strict serde schema validated from the LLM JSON (AC4)
@@ -154,8 +174,9 @@ impl StructuralMap {
 }
 
 /// Truncates `s` in place to at most `max_chars` characters, on a UTF-8 char
-/// boundary (never panics on multibyte input).
-fn truncate_chars(s: &mut String, max_chars: usize) {
+/// boundary (never panics on multibyte input). Shared with the coref bounder
+/// ([`super::coref::CorefResponse::bound_sizes`]).
+pub(super) fn truncate_chars(s: &mut String, max_chars: usize) {
     if let Some((byte_idx, _)) = s.char_indices().nth(max_chars) {
         s.truncate(byte_idx);
     }

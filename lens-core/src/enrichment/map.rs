@@ -19,13 +19,16 @@ use crate::error::LensError;
 use crate::llm::{LlmProvider, LlmRequest};
 
 use super::meta::{
-    Budget, BudgetCheck, ENRICHMENT_MAP_MAX_TOKENS, ENRICHMENT_MAX_RETRIES, StructuralMap,
+    Budget, BudgetCheck, ENRICHMENT_BATCH_CHAR_BUDGET, ENRICHMENT_MAP_MAX_TOKENS,
+    ENRICHMENT_MAX_RETRIES, StructuralMap,
 };
 
-/// Soft input-character budget for a single map batch. Sized well under a typical
-/// local-model context so several parents batch together but a huge doc splits
-/// into multiple map calls (triggering the hierarchical reduce).
-const MAP_BATCH_CHAR_BUDGET: usize = 8 * 1024;
+/// Soft input-character budget for a single map batch (the shared enrichment batch
+/// budget). Sized well under a typical local-model context so several parents batch
+/// together but a huge doc splits into multiple map calls (triggering the
+/// hierarchical reduce). Shared with the coref pass via
+/// [`ENRICHMENT_BATCH_CHAR_BUDGET`] so the two batchers stay in sync.
+const MAP_BATCH_CHAR_BUDGET: usize = ENRICHMENT_BATCH_CHAR_BUDGET;
 
 /// The system prompt that pins the LLM to emit STRICT JSON matching
 /// [`StructuralMap`]. Kept terse; the strict serde validation is the real guard.
@@ -280,55 +283,13 @@ fn merge_partials(partials: Vec<StructuralMap>) -> StructuralMap {
 mod tests {
     use super::*;
     use crate::enrichment::meta::{Budget, SessionBudget};
+    use crate::enrichment::test_util::ScriptedProvider;
     use crate::error::LensError;
     use crate::llm::{LlmProvider, LlmRequest, LlmResponse};
 
     use async_trait::async_trait;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
-
-    /// A mock provider with a call-counter that returns a scripted sequence of
-    /// response bodies (cycling the last one if calls exceed the script).
-    struct ScriptedProvider {
-        calls: Arc<AtomicU32>,
-        responses: Vec<String>,
-    }
-
-    impl ScriptedProvider {
-        fn new(responses: Vec<&str>) -> (Self, Arc<AtomicU32>) {
-            let calls = Arc::new(AtomicU32::new(0));
-            (
-                Self {
-                    calls: calls.clone(),
-                    responses: responses.into_iter().map(|s| s.to_string()).collect(),
-                },
-                calls,
-            )
-        }
-    }
-
-    #[async_trait]
-    impl LlmProvider for ScriptedProvider {
-        fn model_id(&self) -> &str {
-            "mock-model"
-        }
-        async fn reachable(&self) -> bool {
-            true
-        }
-        async fn generate(&self, _req: &LlmRequest) -> Result<LlmResponse, LensError> {
-            let n = self.calls.fetch_add(1, Ordering::SeqCst) as usize;
-            let text = self
-                .responses
-                .get(n)
-                .or_else(|| self.responses.last())
-                .cloned()
-                .unwrap_or_default();
-            Ok(LlmResponse {
-                text,
-                tokens_used: 10,
-            })
-        }
-    }
 
     /// A provider that always errors (LLM death / 429).
     struct DeadProvider {
