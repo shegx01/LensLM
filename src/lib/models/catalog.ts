@@ -135,3 +135,33 @@ export async function listOllamaModelOptions(baseUrl: string): Promise<ModelOpti
   const ids = await invoke<string[]>('list_ollama_models', { base_url: baseUrl });
   return ids.map((id) => ({ id, label: id, info: null }));
 }
+
+/**
+ * Formats a magnitude as a compact, human-readable string with a K/M/B suffix:
+ * 8_000 → "8K", 200_000 → "200K", 1_050_000 → "1.05M", 1_000_000_000 → "1B".
+ * Up to 2 significant decimals are kept and trailing zeros trimmed (so 1.05M and
+ * 128K, but 2M not 2.00M). Values below 1000 render as-is. Used for the cloud
+ * model context-window hint. */
+export function formatCompact(n: number): string {
+  const units = [
+    { value: 1_000_000_000, suffix: 'B' },
+    { value: 1_000_000, suffix: 'M' },
+    { value: 1_000, suffix: 'K' }
+  ] as const;
+  for (const { value, suffix } of units) {
+    if (Math.abs(n) >= value) {
+      // toFixed(2) then strip trailing zeros (and a dangling dot) so 1.05 stays
+      // "1.05", 2.00 collapses to "2", 200.00 to "200".
+      const scaled = (n / value).toFixed(2).replace(/\.?0+$/, '');
+      return `${scaled}${suffix}`;
+    }
+  }
+  return String(n);
+}
+
+/** Formats a per-1M-token USD figure cleanly: drops a trailing ".0" (5 → "5"),
+ * keeps cents when present (0.5 → "0.5"). The catalog cost fields are already
+ * per-1M-token USD values. */
+export function formatUsd(n: number): string {
+  return String(n);
+}

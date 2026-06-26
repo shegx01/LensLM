@@ -18,7 +18,7 @@ vi.mock('@tauri-apps/api/core', () => ({
 }));
 
 import { invoke } from '@tauri-apps/api/core';
-import { listCloudModelOptions } from './catalog.js';
+import { listCloudModelOptions, formatCompact, formatUsd } from './catalog.js';
 
 /** Builds a minimal `ModelInfo` with only the fields the sort reads. Defaults to
  * TEXT-capable modalities so ordering fixtures survive the text-capability
@@ -156,5 +156,35 @@ describe('listCloudModelOptions text-capability filter', () => {
 
     const options = await listCloudModelOptions('openai');
     expect(options.map((o) => o.label)).toEqual(['Newest Text', 'Older Text']);
+  });
+});
+
+describe('formatCompact', () => {
+  it('formats K/M/B magnitude boundaries', () => {
+    expect(formatCompact(8_000)).toBe('8K');
+    expect(formatCompact(200_000)).toBe('200K');
+    expect(formatCompact(1_000_000)).toBe('1M');
+    expect(formatCompact(1_000_000_000)).toBe('1B');
+  });
+
+  it('keeps up to 2 significant decimals and trims trailing zeros', () => {
+    expect(formatCompact(1_050_000)).toBe('1.05M');
+    expect(formatCompact(128_000)).toBe('128K');
+    expect(formatCompact(2_000_000)).toBe('2M');
+    expect(formatCompact(1_050_000_000)).toBe('1.05B');
+  });
+
+  it('renders values below 1000 as-is', () => {
+    expect(formatCompact(0)).toBe('0');
+    expect(formatCompact(512)).toBe('512');
+  });
+});
+
+describe('formatUsd', () => {
+  it('drops a trailing .0 and keeps cents when present', () => {
+    expect(formatUsd(5)).toBe('5');
+    expect(formatUsd(25)).toBe('25');
+    expect(formatUsd(2.5)).toBe('2.5');
+    expect(formatUsd(0.5)).toBe('0.5');
   });
 });

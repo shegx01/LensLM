@@ -883,7 +883,7 @@ describe('LlmConfigPanel — capability-aware pickers', () => {
     expect(within(cloudSelect).getByRole('option', { name: 'GPT-4o' })).toBeInTheDocument();
   });
 
-  it('shows context-window helper text for a model with a context_limit', async () => {
+  it('shows the compact capability/cost helper (context + input + output cost)', async () => {
     mockIPC((cmd, args) => {
       if (cmd === 'get_config') return baseConfig();
       if (cmd === 'set_config') return null;
@@ -899,8 +899,93 @@ describe('LlmConfigPanel — capability-aware pickers', () => {
     );
     await fireEvent.click(screen.getByRole('tab', { name: /cloud api/i }));
 
-    // gpt-4o reports context_limit 128000 → formatted "128,000 tokens".
-    await waitFor(() => expect(screen.getByText(/context: 128,000 tokens/i)).toBeInTheDocument());
+    // gpt-4o: context_limit 128000, cost { input: 2.5, output: 10 } →
+    // "128K Context · ~$2.5/1M input · ~$10/1M output".
+    await waitFor(() =>
+      expect(screen.getByText('128K Context · ~$2.5/1M input · ~$10/1M output')).toBeInTheDocument()
+    );
+  });
+
+  it('omits the cost clauses for a model with no cost (Context clause only)', async () => {
+    // A single-model openai catalog with a context_limit but NO cost.
+    const noCost = (provider: string) =>
+      provider === 'openai'
+        ? {
+            'gpt-4o': {
+              id: 'gpt-4o',
+              name: 'GPT-4o',
+              reasoning: false,
+              reasoning_options: [],
+              tool_call: true,
+              temperature: true,
+              modalities: { input: ['text'], output: ['text'] },
+              context_limit: 1_050_000,
+              output_limit: 16384,
+              open_weights: false
+            }
+          }
+        : {};
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return baseConfig();
+      if (cmd === 'set_config') return null;
+      if (cmd === 'list_provider_models') return noCost((args as { provider: string }).provider);
+      if (cmd === 'list_ollama_models') return [];
+    });
+
+    render(SystemCheckRow, { props: { result: llmRow(), oncheck: vi.fn() } });
+    await fireEvent.click(screen.getByRole('button', { name: /configure/i }));
+    await waitFor(() =>
+      expect(screen.getByRole('tab', { name: /cloud api/i })).toBeInTheDocument()
+    );
+    await fireEvent.click(screen.getByRole('tab', { name: /cloud api/i }));
+
+    // 1,050,000 → "1.05M"; no cost → only the Context clause renders.
+    await waitFor(() => expect(screen.getByText('1.05M Context')).toBeInTheDocument());
+    expect(screen.queryByText(/1M input/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/1M output/)).not.toBeInTheDocument();
+  });
+
+  it('omits the Context clause for a model with no context_limit', async () => {
+    // A single-model openai catalog with cost but NO context_limit.
+    const noLimit = (provider: string) =>
+      provider === 'openai'
+        ? {
+            'gpt-4o': {
+              id: 'gpt-4o',
+              name: 'GPT-4o',
+              reasoning: false,
+              reasoning_options: [],
+              tool_call: true,
+              temperature: true,
+              modalities: { input: ['text'], output: ['text'] },
+              context_limit: null,
+              output_limit: null,
+              open_weights: false,
+              cost: { input: 5, output: 25 }
+            }
+          }
+        : {};
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return baseConfig();
+      if (cmd === 'set_config') return null;
+      if (cmd === 'list_provider_models') return noLimit((args as { provider: string }).provider);
+      if (cmd === 'list_ollama_models') return [];
+    });
+
+    render(SystemCheckRow, { props: { result: llmRow(), oncheck: vi.fn() } });
+    await fireEvent.click(screen.getByRole('button', { name: /configure/i }));
+    await waitFor(() =>
+      expect(screen.getByRole('tab', { name: /cloud api/i })).toBeInTheDocument()
+    );
+    await fireEvent.click(screen.getByRole('tab', { name: /cloud api/i }));
+
+    // No context_limit → no Context clause; both cost clauses still render.
+    await waitFor(() =>
+      expect(screen.getByText('~$5/1M input · ~$25/1M output')).toBeInTheDocument()
+    );
+    // The compact "<n>K/M/B Context" clause is absent (the unrelated "Context
+    // Window" label on the Local tab is intentionally not matched).
+    expect(screen.queryByText(/[\d.]+[KMB] Context/)).not.toBeInTheDocument();
   });
 });
 

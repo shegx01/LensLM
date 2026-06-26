@@ -16,6 +16,8 @@
     listCloudModelOptions,
     listOllamaModelOptions,
     refreshCatalog,
+    formatCompact,
+    formatUsd,
     type ModelOption
   } from '$lib/models/catalog.js';
   import { SELECT_CLASS } from './styles.js';
@@ -204,21 +206,26 @@
   // (offline fallback) or the id isn't in the catalog.
   const selectedCloudModel = $derived(cloudModelOptions.find((o) => o.id === cloudModel) ?? null);
 
-  // Pretty context-window string for the helper text (e.g. "Context: 1,000,000
-  // tokens"). Empty when the selected model has no context limit.
-  const contextHint = $derived(
-    selectedCloudModel?.info?.context_limit != null
-      ? `Context: ${selectedCloudModel.info.context_limit.toLocaleString('en-US')} tokens`
-      : ''
-  );
-
-  // Small per-1M input-token cost hint (e.g. "~$3/1M input tokens"). Empty when
-  // the model reports no input cost.
-  const costHint = $derived(
-    selectedCloudModel?.info?.cost?.input != null
-      ? `~$${selectedCloudModel.info.cost.input}/1M input tokens`
-      : ''
-  );
+  // Compact capability/cost helper for the selected cloud model, e.g.
+  // "1.05M Context · ~$5/1M input · ~$25/1M output". Each clause is included only
+  // when its datum is present (no context_limit → no Context clause; no input/
+  // output cost → that cost clause is omitted), and the present clauses are
+  // joined with " · ". Empty string when the model exposes neither.
+  const modelHint = $derived.by(() => {
+    const info = selectedCloudModel?.info;
+    if (!info) return '';
+    const clauses: string[] = [];
+    if (info.context_limit != null) {
+      clauses.push(`${formatCompact(info.context_limit)} Context`);
+    }
+    if (info.cost?.input != null) {
+      clauses.push(`~$${formatUsd(info.cost.input)}/1M input`);
+    }
+    if (info.cost?.output != null) {
+      clauses.push(`~$${formatUsd(info.cost.output)}/1M output`);
+    }
+    return clauses.join(' · ');
+  });
 
   // The model options offered for the coref-override picker on the active tab.
   const corefModelOptions = $derived(
@@ -762,10 +769,8 @@
           <option value={opt.id}>{opt.label}</option>
         {/each}
       </select>
-      {#if contextHint || costHint}
-        <p class="text-muted-foreground text-[0.72rem] leading-relaxed">
-          {contextHint}{#if contextHint && costHint}{' · '}{/if}{costHint}
-        </p>
+      {#if modelHint}
+        <p class="text-muted-foreground text-[0.72rem] leading-relaxed">{modelHint}</p>
       {/if}
     </div>
 
