@@ -14,6 +14,9 @@ export interface Notebook {
   title: string;
   description: string | null;
   focus_mode: FocusMode | null;
+  /** Embedding model id this notebook is indexed with (M4 Phase 4b). `null` on
+   * pre-migration rows; the backend resolves `null` to the global default. */
+  embedding_model: string | null;
   created_at: string;
   updated_at: string;
   trashed_at: string | null;
@@ -27,6 +30,9 @@ export interface NotebookSummary {
   title: string;
   description: string | null;
   focus_mode: FocusMode | null;
+  /** Embedding model id this notebook is indexed with (M4 Phase 4b). `null` on
+   * pre-migration rows; the backend resolves `null` to the global default. */
+  embedding_model: string | null;
   created_at: string;
   updated_at: string;
   trashed_at: string | null;

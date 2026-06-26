@@ -63,7 +63,7 @@ async fn migration_is_idempotent_second_run_is_noop() {
         .unwrap();
 
     assert_eq!(count_before, count_after);
-    assert_eq!(count_after, 5, "all migration files applied");
+    assert_eq!(count_after, 6, "all migration files applied");
 }
 
 #[tokio::test]
@@ -410,6 +410,53 @@ async fn migration_0005_clean_on_populated_phase2_db() {
 }
 
 #[tokio::test]
+async fn migration_0006_adds_notebook_embedding_model_column() {
+    use sqlx::Row;
+    let engine = LensEngine::for_test().await;
+    let pool = engine.pool().await;
+
+    // A raw INSERT that includes the new column must succeed, and the column
+    // reads back the written value — proves migration 0006 applied on a fresh DB.
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO notebooks \
+             (id, title, description, focus_mode, embedding_model, created_at, updated_at, trashed_at) \
+         VALUES ('nb-0006', 'T', NULL, NULL, 'mxbai-embed-large', ?, ?, NULL)",
+    )
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let model: Option<String> =
+        sqlx::query("SELECT embedding_model FROM notebooks WHERE id = 'nb-0006'")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .get("embedding_model");
+    assert_eq!(model.as_deref(), Some("mxbai-embed-large"));
+
+    // A row inserted WITHOUT the column reads NULL (nullable, no DEFAULT).
+    sqlx::query(
+        "INSERT INTO notebooks (id, title, created_at, updated_at) \
+         VALUES ('nb-0006-null', 'T2', ?, ?)",
+    )
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let null_model: Option<String> =
+        sqlx::query("SELECT embedding_model FROM notebooks WHERE id = 'nb-0006-null'")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .get("embedding_model");
+    assert!(null_model.is_none(), "absent embedding_model reads NULL");
+}
+
+#[tokio::test]
 async fn purging_notebook_cascades_to_children() {
     let engine = LensEngine::for_test().await;
     let pool = engine.pool().await;
@@ -550,7 +597,7 @@ async fn cold_init_under_budget_on_empty_temp_db() {
     let engine = LensEngine::init(dir.path()).await.unwrap();
     let elapsed = start.elapsed();
     // Sanity: the engine works.
-    assert_eq!(engine.migration_count().await.unwrap(), 5);
+    assert_eq!(engine.migration_count().await.unwrap(), 6);
     // Generous smoke guard against accidentally-expensive migrations (e.g. a
     // future migration that scans/rewrites large tables on cold start). This is
     // NOT a tight perf benchmark — the wide 2s budget keeps it non-flaky on
