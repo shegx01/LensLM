@@ -3,9 +3,32 @@
 use lens_core::{
     IngestProgress, LensEngine, LensError, Notebook, NotebookId, NotebookSummary, Source,
 };
+use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
 
 use crate::stream::{StreamEvent, send_event};
+
+/// Progress event streamed by [`set_notebook_embedding_model`] while re-embedding
+/// chunks under the new coordinate. Mirrors [`IngestProgress`]'s shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReembedProgress {
+    /// Chunks processed so far.
+    pub done: usize,
+    /// Total chunks to process.
+    pub total: usize,
+}
+
+/// IPC return type for [`get_notebook_embedding_model`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingModelInfo {
+    /// Canonical model id (e.g. `"nomic-embed-text-v1.5"`).
+    pub model_id: String,
+    /// Output vector dimension (e.g. `768`).
+    pub dim: usize,
+    /// Whether an active embedding_index row exists for this (model, dim):
+    /// `"active"` when the coordinate is live, `"none"` when no index exists yet.
+    pub status: String,
+}
 
 /// Lists live (non-trashed) notebooks with their source counts, newest first.
 #[tracing::instrument(skip_all)]
@@ -268,6 +291,89 @@ pub async fn purge_notebook(
     engine.purge_notebook(&NotebookId::from(id)).await
 }
 
+/// Sets a notebook's embedding model and re-embeds all chunks under the new
+/// coordinate, streaming progress over `on_progress` as
+/// `StreamEvent<ReembedProgress>`.
+///
+/// Validates the `model_id` against the registry (unknown ids are rejected).
+/// Persists `notebooks.embedding_model = model_id`, then kicks off
+/// [`LensEngine::reembed_notebook`] which re-embeds lock-free and flips active.
+///
+/// Emits `Started`, then `Chunk(ReembedProgress)` + `Progress { done, total }`
+/// for each batch, then `Done` on success or `Failed(LensError)` on failure.
+#[tracing::instrument(skip(on_progress, engine))]
+#[tauri::command]
+pub async fn set_notebook_embedding_model(
+    notebook_id: String,
+    model_id: String,
+    on_progress: Channel<StreamEvent<ReembedProgress>>,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<(), LensError> {
+    let nb_id = NotebookId::from(notebook_id);
+
+    // Persist the new model id first (validates against the registry).
+    engine
+        .set_notebook_embedding_model(&nb_id, &model_id)
+        .await?;
+
+    if let Err(e) = send_event(&on_progress, StreamEvent::Started) {
+        tracing::warn!("set_notebook_embedding_model: started event send failed: {e}");
+    }
+
+    let result = engine
+        .reembed_notebook(&nb_id, |done, total| {
+            let progress = ReembedProgress { done, total };
+            if let Err(e) = send_event(&on_progress, StreamEvent::Chunk(progress)) {
+                tracing::warn!("set_notebook_embedding_model: progress chunk send failed: {e}");
+            }
+            if let Err(e) = send_event(
+                &on_progress,
+                StreamEvent::Progress {
+                    done: done as u64,
+                    total: Some(total as u64),
+                },
+            ) {
+                tracing::warn!("set_notebook_embedding_model: progress event send failed: {e}");
+            }
+        })
+        .await;
+
+    match &result {
+        Ok(_outcome) => {
+            if let Err(e) = send_event(&on_progress, StreamEvent::Done) {
+                tracing::warn!("set_notebook_embedding_model: done event send failed: {e}");
+            }
+        }
+        Err(err) => {
+            if let Err(e) = send_event(&on_progress, StreamEvent::Failed(err.clone())) {
+                tracing::warn!("set_notebook_embedding_model: failed event send failed: {e}");
+            }
+        }
+    }
+
+    result.map(|_| ())
+}
+
+/// Returns the notebook's current embedding model id, dimension, and whether
+/// an active `embedding_index` row exists for that coordinate.
+///
+/// `status` is `"active"` when a live index row exists for `(model, dim)`,
+/// or `"none"` when the coordinate has not been indexed yet.
+#[tracing::instrument(skip(engine))]
+#[tauri::command]
+pub async fn get_notebook_embedding_model(
+    notebook_id: String,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<EmbeddingModelInfo, LensError> {
+    let nb_id = NotebookId::from(notebook_id);
+    let (model_id, dim, status) = engine.get_notebook_embedding_info(&nb_id).await?;
+    Ok(EmbeddingModelInfo {
+        model_id,
+        dim,
+        status,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,5 +550,68 @@ mod tests {
             .unwrap();
         assert!(list_notebooks(engine.clone()).await.unwrap().is_empty());
         assert!(list_trashed(engine).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn set_embedding_model_persists_and_get_returns_it() {
+        let app = tauri::test::mock_app();
+        app.manage(LensEngine::for_test().await);
+        let engine = app.state::<LensEngine>();
+
+        let nb = create_notebook("Embed Test".into(), None, None, engine.clone())
+            .await
+            .unwrap();
+
+        // Default model before any explicit set.
+        let info = get_notebook_embedding_model(nb.id.to_string(), engine.clone())
+            .await
+            .unwrap();
+        assert_eq!(info.model_id, "nomic-embed-text-v1.5");
+        assert_eq!(info.dim, 768);
+        // No index built yet → status = "none".
+        assert_eq!(info.status, "none");
+
+        // Call set_notebook_embedding_model on the engine directly to avoid
+        // needing a real Channel in the unit test (the full Tauri channel needs
+        // the runtime). The lens-core method is what we are testing here.
+        engine
+            .set_notebook_embedding_model(
+                &lens_core::NotebookId::from(nb.id.to_string()),
+                "mxbai-embed-large",
+            )
+            .await
+            .unwrap();
+
+        let info2 = get_notebook_embedding_model(nb.id.to_string(), engine.clone())
+            .await
+            .unwrap();
+        assert_eq!(info2.model_id, "mxbai-embed-large");
+        assert_eq!(info2.dim, 1024);
+        assert_eq!(info2.status, "none");
+    }
+
+    #[tokio::test]
+    async fn set_embedding_model_rejects_unknown_id() {
+        let app = tauri::test::mock_app();
+        app.manage(LensEngine::for_test().await);
+        let engine = app.state::<LensEngine>();
+
+        let nb = create_notebook("Reject Test".into(), None, None, engine.clone())
+            .await
+            .unwrap();
+
+        let err = engine
+            .set_notebook_embedding_model(
+                &lens_core::NotebookId::from(nb.id.to_string()),
+                "totally-unknown-model",
+            )
+            .await
+            .unwrap_err();
+        // Should be a Validation error mentioning the unknown id.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown embedding model id"),
+            "expected validation error, got: {msg}"
+        );
     }
 }

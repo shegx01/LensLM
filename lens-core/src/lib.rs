@@ -474,7 +474,8 @@ impl LensEngine {
         // holding the read guard would block any concurrent writer (`set_config`)
         // for the whole probe window. The clone is cheap.
         let config = self.read().await.config.clone();
-        Ok(system_check::run_system_check(&config).await)
+        let data_dir = self.data_dir().await;
+        Ok(system_check::run_system_check(&config, &data_dir).await)
     }
 
     /// Lists all live (non-trashed) notebooks, newest first.
@@ -1108,6 +1109,72 @@ impl LensEngine {
                 .flatten();
         let spec = crate::embedder::resolve(stored.as_deref().unwrap_or(""));
         Ok((spec.id.to_string(), spec.dim))
+    }
+
+    /// Persists a new embedding model choice for a notebook.
+    ///
+    /// Validates that `model_id` is a known registry entry (unknown ids are
+    /// rejected with a [`LensError::Validation`] rather than silently falling
+    /// through to the nomic default). Writes `notebooks.embedding_model = model_id`
+    /// so subsequent [`resolve_notebook_embedding`](Self::resolve_notebook_embedding)
+    /// calls return the new coordinate.
+    ///
+    /// This does NOT kick off re-embedding — the Tauri command layer calls
+    /// [`reembed_notebook`](Self::reembed_notebook) after persisting.
+    pub async fn set_notebook_embedding_model(
+        &self,
+        notebook_id: &NotebookId,
+        model_id: &str,
+    ) -> Result<(), LensError> {
+        // Reject unknown ids (resolve() falls back to nomic for anything unknown;
+        // we compare the resolved id against the input to detect the silent fallback).
+        let spec = crate::embedder::resolve(model_id);
+        if spec.id != model_id {
+            return Err(LensError::Validation(format!(
+                "unknown embedding model id: {model_id:?}; known ids: nomic-embed-text-v1.5, \
+                 mxbai-embed-large, all-minilm, bge-m3"
+            )));
+        }
+        let pool = self.pool().await;
+        let result = sqlx::query(
+            "UPDATE notebooks SET embedding_model = ?, updated_at = ? \
+             WHERE id = ? AND trashed_at IS NULL",
+        )
+        .bind(model_id)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(notebook_id.as_str())
+        .execute(&pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(LensError::Validation(format!(
+                "no live notebook with id {notebook_id}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Returns `(model_id, dim, status)` for a notebook's current embedding
+    /// coordinate, where `status` is `"active"` when a live `embedding_index` row
+    /// exists for `(model, dim)`, or `"none"` otherwise.
+    ///
+    /// Used by [`get_notebook_embedding_model`] in the Tauri command layer.
+    pub async fn get_notebook_embedding_info(
+        &self,
+        notebook_id: &NotebookId,
+    ) -> Result<(String, usize, String), LensError> {
+        let (model_id, dim) = self.resolve_notebook_embedding(notebook_id).await?;
+        let pool = self.pool().await;
+        let active: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM embedding_index \
+             WHERE notebook_id = ? AND model = ? AND dim = ? AND status = 'active'",
+        )
+        .bind(notebook_id.as_str())
+        .bind(&model_id)
+        .bind(dim as i64)
+        .fetch_optional(&pool)
+        .await?;
+        let status = if active.is_some() { "active" } else { "none" }.to_string();
+        Ok((model_id, dim, status))
     }
 
     /// Re-embeds every chunk of `notebook_id` into the notebook's currently

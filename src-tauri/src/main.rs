@@ -52,6 +52,8 @@ fn main() {
             commands::notebooks::restore_source,
             commands::notebooks::purge_source,
             commands::notebooks::ingest_source,
+            commands::notebooks::set_notebook_embedding_model,
+            commands::notebooks::get_notebook_embedding_model,
             commands::system::health_check,
             commands::system::list_recent_documents,
             commands::system::run_system_check,
