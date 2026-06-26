@@ -5,10 +5,13 @@
 //!
 //! 1. inserts the doc-summary RAPTOR node (AC6) — `kind="summary"`, `level=2`,
 //!    `parent_id=NULL`, `source_id` SET — as a single `INSERT`;
-//! 2. re-embeds EVERY chunk from `COALESCE(embedding_text, text)` PLUS the summary
-//!    node into a PRIVATE, gen-suffixed `building` Lance table (lock-free — search
-//!    resolves `status='active'` only, so a half-populated building table is
-//!    unobservable; only the embedder `Mutex` serializes the populate);
+//! 2. SEEDS the gen-suffixed `building` Lance table with every OTHER source's
+//!    current vectors copied from the active table (so the flip — which promotes
+//!    the building table to be the notebook's WHOLE active table — preserves them),
+//!    then re-embeds EVERY chunk of THIS source from `COALESCE(embedding_text,
+//!    text)` PLUS the summary node into it (lock-free — search resolves
+//!    `status='active'` only, so a half-populated building table is unobservable;
+//!    only the embedder `Mutex` serializes the populate);
 //! 3. acquires `ingest_lock` for the FLIP-ONLY window (concurrency synthesis): the
 //!    ONE SQLite flip txn (`active→stale`, `building→active`) + the stale Lance
 //!    drop (sub-second);
@@ -16,8 +19,9 @@
 //!
 //! ## Crash-safety (AC7, pre-mortem 1)
 //!
-//! The `active` Lance table is NEVER mutated. All enriched vectors accumulate in
-//! the building table; the swap is one SQLite txn. ANY failure BEFORE the flip txn
+//! The `active` Lance table is NEVER mutated. The other sources' copied vectors and
+//! this source's enriched vectors accumulate in the building table; the swap is one
+//! SQLite txn. ANY failure BEFORE the flip txn
 //! leaves the raw vectors untouched (the source degrades to `failed`); the orphan
 //! `building` row + table are reclaimed by the Step-3 startup-GC. A crash AFTER the
 //! flip-txn commit but BEFORE the stale Lance drop leaves a `stale` row + orphan
@@ -74,6 +78,31 @@ pub(crate) async fn reembed_and_flip(
 
     let building_name = store
         .create_building_table(notebook, EMBED_MODEL_ID, EMBED_DIM)
+        .await?;
+
+    // Seed the building table with every OTHER source's current vectors so this
+    // per-source flip PRESERVES them. The flip promotes the building table to be
+    // the notebook's whole active table; populating it with only THIS source's
+    // chunks would wipe every other source from search (the Phase-3 multi-source
+    // data-loss bug). A no-op for a notebook's first source (no active table yet).
+    //
+    // KNOWN NARROW RACE (tracked for M4 Phase 4b reindex): the seed runs lock-free
+    // (like the populate below). If a DIFFERENT source is purged in the window
+    // between this seed and the flip, that source's just-copied vectors survive the
+    // flip as phantom hits (dangling chunk_ids) until the next enrichment re-seeds.
+    // This is strictly better than the data loss it replaces and self-heals on the
+    // next flip; closing it fully (re-verify seeded sources under `ingest_lock`, or
+    // drop purged source_ids from the building table pre-flip) lands with 4b, which
+    // reworks this orchestration — kept out of this hotfix to preserve the
+    // sub-second lock window (the seed copy is unbounded in size).
+    store
+        .seed_building_from_active(
+            notebook,
+            EMBED_MODEL_ID,
+            EMBED_DIM,
+            &building_name,
+            source_id,
+        )
         .await?;
 
     for batch in chunks.chunks(REEMBED_BATCH) {

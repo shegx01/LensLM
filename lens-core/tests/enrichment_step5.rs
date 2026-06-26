@@ -144,15 +144,27 @@ async fn seed_indexed_prose_source(engine: &LensEngine) -> (String, String) {
         .expect("create notebook")
         .id
         .to_string();
+    let source_id = seed_prose_source_in(engine, &nb).await;
+    (nb, source_id)
+}
+
+/// Inserts an `indexed` prose source (+ parent/child chunks + raw gen-0 vectors via
+/// the production `add` path) into an EXISTING notebook and returns its source id.
+/// Used to build MULTI-source notebooks that exercise the per-source re-embed flip's
+/// seed-from-active fix (the first source uses [`seed_indexed_prose_source`]).
+async fn seed_prose_source_in(engine: &LensEngine, nb: &str) -> String {
     let pool = engine.pool().await;
     let source_id = uuid::Uuid::now_v7().to_string();
     sqlx::query(
         "INSERT INTO sources (id, notebook_id, kind, title, status, locator, selected, \
          content_hash, enrichment_status, created_at) \
-         VALUES (?, ?, 'text', 'seed', 'indexed', '/tmp/seed.txt', 1, 'hash-1', NULL, ?)",
+         VALUES (?, ?, 'text', 'seed', 'indexed', '/tmp/seed.txt', 1, ?, NULL, ?)",
     )
     .bind(&source_id)
-    .bind(&nb)
+    .bind(nb)
+    // Unique per source (the enrichment cache key folds in content_hash) so a
+    // multi-source notebook never accidentally cross-hits another source's cache.
+    .bind(format!("hash-{source_id}"))
     .bind(chrono::Utc::now().to_rfc3339())
     .execute(&pool)
     .await
@@ -220,15 +232,15 @@ async fn seed_indexed_prose_source(engine: &LensEngine) -> (String, String) {
     let data_dir = engine.data_dir_for_test().await;
     let store = LanceVectorStore::new(&data_dir, pool.clone());
     let rows = vec![
-        row(&parent_id, &source_id, &nb, 0),
-        row(&child_id, &source_id, &nb, 1),
+        row(&parent_id, &source_id, nb, 0),
+        row(&child_id, &source_id, nb, 1),
     ];
     store
-        .add(&nb, EMBED_MODEL_ID, EMBED_DIM, rows)
+        .add(nb, EMBED_MODEL_ID, EMBED_DIM, rows)
         .await
         .expect("seed raw active vectors");
 
-    (nb, source_id)
+    source_id
 }
 
 fn row(
@@ -745,5 +757,140 @@ async fn sequential_purge_then_reembed_skips_flip() {
             .iter()
             .any(|t| t == &format!("vec__{nb}__nomic_v15__1")),
         "GC must drop the orphan building gen-1 table; tables: {tables:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// REGRESSION — multi-source re-embed must NOT wipe the other sources
+// ---------------------------------------------------------------------------
+
+/// REGRESSION (Phase-3 multi-source data loss): a notebook's per-source re-embed
+/// flip rebuilds the WHOLE notebook table, so enriching a SECOND source must not
+/// drop the first source's vectors. The fix seeds the building table from the
+/// current active table (every row EXCEPT the source being re-embedded) before
+/// adding this source's freshly re-embedded vectors — so all sources survive each
+/// flip. Before the fix, enriching source B replaced the active table with B's
+/// chunks alone and source A vanished from search.
+#[tokio::test]
+async fn multi_source_reembed_preserves_other_sources() {
+    let _flip_guard = flip_serial_guard().await;
+    let (_dir, engine) = file_engine().await;
+    let _calls = install_mock_provider(&engine).await;
+    install_counting_embedder(&engine);
+
+    let nb = engine
+        .create_notebook("nb", None, None)
+        .await
+        .expect("create notebook")
+        .id
+        .to_string();
+
+    // Source A: ingest + enrich (flip → gen-1 active holds A's enriched vectors).
+    let src_a = seed_prose_source_in(&engine, &nb).await;
+    engine.enqueue_enrichment_for_test(&src_a);
+    assert!(
+        wait_for_status(&engine, &src_a, "enriched").await,
+        "source A must enrich; got {:?}",
+        enrichment_status(&engine, &src_a).await
+    );
+
+    // Source B: ingest (its raw vectors must land in the gen-1 ACTIVE table — the
+    // `ensure_table` registry-resolution fix) + enrich (flip → gen-2 holds A + B).
+    let src_b = seed_prose_source_in(&engine, &nb).await;
+    engine.enqueue_enrichment_for_test(&src_b);
+    assert!(
+        wait_for_status(&engine, &src_b, "enriched").await,
+        "source B must enrich; got {:?}",
+        enrichment_status(&engine, &src_b).await
+    );
+
+    // Source C: a THIRD source — its enrichment seeds the building table from an
+    // active table already holding TWO other sources (A + B), exercising the O(N)
+    // multi-source seed path, then flips → gen-3 holds A + B + C.
+    let src_c = seed_prose_source_in(&engine, &nb).await;
+    engine.enqueue_enrichment_for_test(&src_c);
+    assert!(
+        wait_for_status(&engine, &src_c, "enriched").await,
+        "source C must enrich; got {:?}",
+        enrichment_status(&engine, &src_c).await
+    );
+
+    // After enriching ALL THREE, search must return chunks from every source. (k=10
+    // over 9 rows returns them all; the bug would leave only source C's chunks.)
+    let hits = search_chunk_ids(&engine, &nb, "analytical engine").await;
+    for want in [
+        format!("{src_a}-p0"),
+        format!("{src_a}-c0"),
+        format!("{src_b}-p0"),
+        format!("{src_b}-c0"),
+        format!("{src_c}-p0"),
+        format!("{src_c}-c0"),
+    ] {
+        assert!(
+            hits.iter().any(|c| c == &want),
+            "chunk {want} must survive every flip; hits: {hits:?}"
+        );
+    }
+}
+
+/// REGRESSION (ensure_table registry bypass): a NEW source added to a notebook
+/// AFTER a re-embed flip must land in the gen-suffixed ACTIVE table (resolved via
+/// the registry), not a recreated gen-0 orphan the search path never reads. Before
+/// the fix, `ensure_table` recomputed the bare formula name (a dropped stale
+/// table), recreated it as an unregistered gen-0, and the appended vectors were
+/// invisible to search.
+#[tokio::test]
+async fn add_after_flip_targets_registered_active_table() {
+    let _flip_guard = flip_serial_guard().await;
+    let (_dir, engine) = file_engine().await;
+    let _calls = install_mock_provider(&engine).await;
+    install_counting_embedder(&engine);
+    let (nb, src_a) = seed_indexed_prose_source(&engine).await;
+
+    // Enrich A → flip → active becomes the gen-1 table.
+    engine.enqueue_enrichment_for_test(&src_a);
+    assert!(
+        wait_for_status(&engine, &src_a, "enriched").await,
+        "source A must enrich; got {:?}",
+        enrichment_status(&engine, &src_a).await
+    );
+    assert_eq!(
+        active_table_name(&engine, &nb).await,
+        format!("vec__{nb}__nomic_v15__1"),
+        "post-flip active must be the gen-1 table"
+    );
+
+    // Add a NEW source's vectors via the production `add` path (no enrichment).
+    let pool = engine.pool().await;
+    let data_dir = engine.data_dir_for_test().await;
+    let store = LanceVectorStore::new(&data_dir, pool);
+    let new_src = uuid::Uuid::now_v7().to_string();
+    let new_chunk = format!("{new_src}-x0");
+    store
+        .add(
+            &nb,
+            EMBED_MODEL_ID,
+            EMBED_DIM,
+            vec![row(&new_chunk, &new_src, &nb, 0)],
+        )
+        .await
+        .expect("add new source vectors");
+
+    // The new vector is searchable (it landed in the registered active gen-1 table),
+    // and `add` did not create a fresh gen-0 active.
+    let hits = search_chunk_ids(&engine, &nb, "analytical engine").await;
+    assert!(
+        hits.iter().any(|c| c == &new_chunk),
+        "post-flip add must land in the active table; hits: {hits:?}"
+    );
+    assert_eq!(
+        active_table_name(&engine, &nb).await,
+        format!("vec__{nb}__nomic_v15__1"),
+        "post-flip add must not create a new gen-0 active"
+    );
+    assert_eq!(
+        registry_count(&engine, "active").await,
+        1,
+        "exactly one active row after the post-flip add"
     );
 }
