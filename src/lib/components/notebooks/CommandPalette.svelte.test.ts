@@ -50,6 +50,7 @@ function makeNotebook(overrides?: Partial<NotebookSummary>): NotebookSummary {
     created_at: new Date(Date.now() - 7_200_000).toISOString(),
     updated_at: new Date(Date.now() - 7_200_000).toISOString(),
     trashed_at: null,
+    embedding_model: null,
     source_count: 3,
     ...overrides
   };

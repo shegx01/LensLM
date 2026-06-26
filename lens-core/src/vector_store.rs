@@ -26,7 +26,8 @@
 //!
 //! One LanceDB table per `(notebook, model, dim)`. Each row is
 //! `{chunk_id: Utf8, source_id: Utf8, notebook_id: Utf8, level: Int32,
-//! vector: FixedSizeList<Float32, 768>}`. Searches pin the distance metric to
+//! vector: FixedSizeList<Float32, dim>}` where `dim` is the coordinate's
+//! embedding dimension (384/768/1024 per model). Searches pin the distance metric to
 //! cosine **explicitly** and additionally run `.only_if("notebook_id = '…'")`
 //! as cheap defense-in-depth (the AC asserts notebook isolation directly).
 //! Brute-force kNN below [`ANN_INDEX_MIN_ROWS`]; above it an IVF_PQ cosine index is
@@ -51,7 +52,10 @@ use uuid::Uuid;
 
 use crate::LensError;
 
-/// Embedding dimension for nomic-embed-text-v1.5. Phase 1 is fixed at 768.
+/// The default embedding dimension (nomic-embed-text-v1.5 = 768). NOT a global
+/// constraint since M4 Phase 4b: each coordinate carries its own `dim` (384/768/
+/// 1024), threaded through the write/read paths. Retained for the default-model
+/// schema in unit tests; prefer [`crate::DEFAULT_EMBED_DIM`] in new code.
 pub const VECTOR_DIM: usize = 768;
 
 /// Row count at/above which an active (or building) table gets an IVF_PQ ANN
@@ -83,6 +87,16 @@ const REGISTRY_STATUS_ACTIVE: &str = "active";
 pub static CRASH_AFTER_FLIP_TXN_BEFORE_LANCE_DROP: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// When set to `true`, [`VectorStore::retire_coordinate`] commits the demotion of
+/// the OLD coordinate's `active` row to `stale` and then returns EARLY — BEFORE
+/// dropping the stale Lance table or deleting its row — simulating a process crash
+/// in exactly the crash window the startup-GC must recover (R3). The flag is
+/// consumed (reset to `false`) on use so a single test can arm it once. Compiled
+/// out of production builds.
+#[cfg(feature = "test-util")]
+pub static CRASH_AFTER_RETIRE_STALE_BEFORE_LANCE_DROP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// A single vector row to insert, addressed by its owning logical coordinates.
 ///
 /// `chunk_id` is the SQLite `chunks.id` — the LanceDB→SQLite link is keyed by
@@ -97,7 +111,7 @@ pub struct VectorRow {
     pub notebook_id: String,
     /// Chunk level: `0` = parent, `1` = child.
     pub level: i32,
-    /// The embedding vector. MUST be length [`VECTOR_DIM`].
+    /// The embedding vector. MUST match the coordinate's dim.
     pub vector: Vec<f32>,
 }
 
@@ -178,8 +192,14 @@ pub trait VectorStore: Send + Sync {
     /// [`create_building_table`](VectorStore::create_building_table) by its
     /// EXPLICIT name (the active read path resolves names from the registry, so a
     /// half-populated building table is unobservable). Errors if the table does
-    /// not exist. An empty `rows` is a no-op.
-    async fn add_to_table(&self, table_name: &str, rows: Vec<VectorRow>) -> Result<(), LensError>;
+    /// not exist. An empty `rows` is a no-op. `dim` is the coordinate's vector
+    /// dimension (used to build the Arrow batch / index — must match every row).
+    async fn add_to_table(
+        &self,
+        table_name: &str,
+        rows: Vec<VectorRow>,
+        dim: usize,
+    ) -> Result<(), LensError>;
 
     /// Atomically flips the `building` table to `active` for a coordinate, then
     /// drops the now-`stale` Lance table (M4 Phase 3, Step 5 / AC7).
@@ -198,6 +218,24 @@ pub trait VectorStore: Send + Sync {
         model: &str,
         dim: usize,
         building_name: &str,
+    ) -> Result<(), LensError>;
+
+    /// Retires an OLD-model coordinate after a model/dim-change re-embed has
+    /// flipped the NEW coordinate `active` (M4 Phase 4b, Step 9 / R3).
+    ///
+    /// The partial-unique `uq_embidx_active` constrains `active` rows per
+    /// coordinate, and the OLD and NEW coordinates differ in `(model, dim)`, so
+    /// both can be `active` simultaneously during the swap; this call removes the
+    /// OLD one afterwards. Three idempotent steps — demote the OLD `active` row to
+    /// `stale` (committed), drop its physical Lance table, delete its registry row.
+    /// A crash between any two leaves a `stale` row + (possibly already-dropped)
+    /// table that the startup-GC `gc_orphan_embedding_tables` reclaims. A no-op
+    /// when the coordinate has no `active` row (already retired).
+    async fn retire_coordinate(
+        &self,
+        notebook: &str,
+        model: &str,
+        dim: usize,
     ) -> Result<(), LensError>;
 }
 
@@ -226,38 +264,37 @@ fn model_slug(model: &str) -> String {
     }
 }
 
-/// Resolves the physical LanceDB table name for a logical coordinate.
+/// Resolves the physical LanceDB table name for a logical coordinate
+/// `(notebook, model, dim)`.
 ///
-/// **`dim` is intentionally absent from the physical name** even though it is part
-/// of the *logical* key `(notebook, model, dim)`. Phase 1 relies on the invariant
-/// `model ⇒ dim` (the only registered model, `nomic-embed-text-v1.5`, is fixed at
-/// [`VECTOR_DIM`] = 768), so `vec__{notebook}__{model_slug}` uniquely identifies a
-/// table. The table-resolution path ([`LanceVectorStore::ensure_table`]) carries a
-/// `debug_assert_eq!(dim, VECTOR_DIM, …)` guard documenting this assumption.
+/// The `dim` is encoded as a `__d{dim}` segment so two coordinates that share a
+/// `(notebook, model)` but differ in `dim` (M4 Phase 4b: the same notebook may be
+/// re-embedded with a different model/dim) never collide on one physical table:
+/// `vec__{notebook}__{model_slug}__d{dim}`.
 ///
-/// If a future model is ever registered at *two* dims, two logical registry rows
-/// would collide on this one physical table name — at that point the scheme MUST
-/// be extended to include `dim` (e.g. `vec__{notebook}__{model_slug}__{dim}`).
-fn table_name(notebook: &str, model: &str) -> String {
-    format!("vec__{notebook}__{}", model_slug(model))
+/// CRITICAL: this generator names NEW coordinates only. EXISTING tables keep their
+/// stored physical name — every read/write path resolves a coordinate to a table
+/// via the registry's `lance_table_name` column, never by re-deriving it here. A
+/// nomic-768 table created before this segment existed (`vec__{nb}__nomic_v15`)
+/// stays valid because its name lives in the registry; only freshly-created
+/// coordinates flow through this function.
+fn table_name(notebook: &str, model: &str, dim: usize) -> String {
+    format!("vec__{notebook}__{}__d{dim}", model_slug(model))
 }
 
 /// Resolves the gen-suffixed physical table name for a coordinate + generation
 /// (Decision A: the re-embed new-table-flip).
 ///
-/// **gen-0 == [`table_name`] (byte-identical).** The Phase-1/2 tables shipped
-/// before the flip existed; they are gen-0 *by convention*, so resolving gen-0
-/// must reproduce the exact formula name or pre-flip search would point at a
-/// table that does not exist. A non-zero generation appends `__{gen}` so a
-/// freshly-built `building` table co-exists beside the live `active` table for
-/// the SAME coordinate (the partial-unique registry from migration `0005` allows
-/// it). Enrichment never changes model/dim, so the `dim`-absent caveat on
-/// [`table_name`] is irrelevant here — only the generation differs.
-fn gen_table_name(notebook: &str, model: &str, generation: u32) -> String {
+/// **gen-0 == [`table_name`] (byte-identical).** A non-zero generation appends
+/// `__{gen}` AFTER the dim segment (`vec__{nb}__{slug}__d{dim}__{gen}`, R7
+/// ordering: dim before gen) so a freshly-built `building` table co-exists beside
+/// the live `active` table for the SAME coordinate (the partial-unique registry
+/// from migration `0005` allows it).
+fn gen_table_name(notebook: &str, model: &str, dim: usize, generation: u32) -> String {
     if generation == 0 {
-        table_name(notebook, model)
+        table_name(notebook, model, dim)
     } else {
-        format!("{}__{generation}", table_name(notebook, model))
+        format!("{}__{generation}", table_name(notebook, model, dim))
     }
 }
 
@@ -391,8 +428,11 @@ impl EmbeddingIndexRepo {
 
     /// Fetches the registry row for a logical coordinate, if registered.
     ///
-    /// Part of the registry surface mandated by the plan (Step c.3); consumed by
-    /// the Phase-4 model-switch flow, hence `allow(dead_code)` in Phase 1.
+    /// Speculative registry surface from the Phase-1 plan (Step c.3). The Phase-4b
+    /// model-switch flow ended up resolving coordinates via the purpose-built
+    /// [`active_lance_table_name`](Self::active_lance_table_name) instead, so this
+    /// remains unused — kept (`allow(dead_code)`) as a complete registry API; may
+    /// be removed if no consumer emerges.
     #[allow(dead_code)]
     async fn get(
         &self,
@@ -429,11 +469,13 @@ impl EmbeddingIndexRepo {
         Ok(names)
     }
 
-    /// Updates the `status` of an existing registry row (Phase-4 model-switch
-    /// lifecycle: `active`/`building`/`stale`). Errors if no row matches.
+    /// Updates the `status` of EVERY row for a coordinate (not status-scoped).
+    /// Errors if no row matches.
     ///
-    /// Reserved for the Phase-4 model-switch flow; hence `allow(dead_code)` in
-    /// Phase 1, where status is always `active`.
+    /// Superseded by the purpose-built [`demote_active_to_stale`](Self::demote_active_to_stale)
+    /// for the Phase-4b retire path (R3 deliberately left this generic helper
+    /// untouched rather than narrowing it), so it is currently unused — kept
+    /// (`allow(dead_code)`) as a complete registry API.
     #[allow(dead_code)]
     async fn set_status(
         &self,
@@ -567,6 +609,47 @@ impl EmbeddingIndexRepo {
 
         tx.commit().await?;
         Ok(stale_name)
+    }
+
+    /// Demotes ONLY the `status='active'` row of a coordinate to `stale`,
+    /// returning its physical `lance_table_name` (or `None` when the coordinate
+    /// has no active row — an idempotent no-op). The retirement counterpart to the
+    /// flip's in-txn demote.
+    ///
+    /// Deliberately distinct from [`set_status`](Self::set_status): `set_status`
+    /// rewrites EVERY row for a coordinate regardless of status (it is used for
+    /// arbitrary lifecycle transitions), whereas retiring an OLD-model coordinate
+    /// must touch the live `active` row only — never a transient `building`/`stale`
+    /// row that may coexist for the same coordinate during a concurrent flip (R3).
+    async fn demote_active_to_stale(
+        &self,
+        notebook: &str,
+        model: &str,
+        dim: usize,
+    ) -> Result<Option<String>, LensError> {
+        let mut tx = self.pool.begin().await?;
+        let active = sqlx::query_scalar::<_, String>(
+            "SELECT lance_table_name FROM embedding_index \
+             WHERE notebook_id = ? AND model = ? AND dim = ? AND status = 'active'",
+        )
+        .bind(notebook)
+        .bind(model)
+        .bind(dim as i64)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if active.is_some() {
+            sqlx::query(
+                "UPDATE embedding_index SET status = 'stale' \
+                 WHERE notebook_id = ? AND model = ? AND dim = ? AND status = 'active'",
+            )
+            .bind(notebook)
+            .bind(model)
+            .bind(dim as i64)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(active)
     }
 
     /// Deletes the registry row naming `table` for a coordinate (the stale row
@@ -753,18 +836,6 @@ impl LanceVectorStore {
         model: &str,
         dim: usize,
     ) -> Result<Table, LensError> {
-        // PHASE-1 INVARIANT (see `table_name`): the physical table name omits
-        // `dim` and relies on `model ⇒ dim`. The only registered model is fixed
-        // at `VECTOR_DIM`, so a `dim` other than that would silently resolve to a
-        // table built for a different dimension. Guard it here at the resolution
-        // path; registering a second dim for the same model must first extend the
-        // table-name scheme to include `dim`.
-        debug_assert_eq!(
-            dim, VECTOR_DIM,
-            "table_name omits dim and relies on model⇒dim (Phase 1): a second dim \
-             for the same model must extend the table-name scheme to include dim"
-        );
-
         let conn = self.connect().await?;
 
         // REGISTRY-DRIVEN resolution (mirror of `open_active_table`): if a
@@ -806,7 +877,7 @@ impl LanceVectorStore {
         // name. Open a pre-existing (unregistered, e.g. crash-orphaned) table or
         // create a fresh one, then register the mapping `active` (the register is a
         // no-op on conflict, so a concurrent create is self-healing).
-        let name = table_name(notebook, model);
+        let name = table_name(notebook, model, dim);
         let existing = conn
             .table_names()
             .execute()
@@ -830,7 +901,7 @@ impl LanceVectorStore {
                 notebook,
                 model,
                 dim,
-                crate::embedder::PREFIX_CONVENTION,
+                &crate::embedder::resolve(model).prefix_convention(),
                 &name,
                 REGISTRY_STATUS_ACTIVE,
             )
@@ -925,7 +996,7 @@ impl LanceVectorStore {
     /// logged and swallowed — search degrades to exact brute-force kNN (correct,
     /// only slower), so a transient index error never fails an ingest or re-embed.
     /// `dim` selects the PQ sub-vector count; it MUST match the table's vector
-    /// width (callers pass the coordinate dim — [`VECTOR_DIM`] in Phase 1).
+    /// width (callers pass the coordinate's `dim`, resolved per notebook model).
     ///
     /// Takes the JUST-WRITTEN handle so the threshold gate (`count_rows`, which DOES
     /// reflect the rows this call appended) costs nothing extra in the common case —
@@ -1216,13 +1287,6 @@ impl VectorStore for LanceVectorStore {
         model: &str,
         dim: usize,
     ) -> Result<String, LensError> {
-        // PHASE-1 INVARIANT (see `table_name`): the physical name omits `dim`. The
-        // re-embed never changes model/dim, so the same guard applies.
-        debug_assert_eq!(
-            dim, VECTOR_DIM,
-            "gen_table_name omits dim and relies on model⇒dim (Phase 1)"
-        );
-
         // Compute the next free generation above every name registered for the
         // coordinate (gen-0 is the live active table; prior building/stale rows may
         // linger until the startup-GC sweeps them).
@@ -1232,13 +1296,13 @@ impl VectorStore for LanceVectorStore {
             .await?;
         let mut generation = 1u32;
         loop {
-            let candidate = gen_table_name(notebook, model, generation);
+            let candidate = gen_table_name(notebook, model, dim, generation);
             if !existing.iter().any(|n| n == &candidate) {
                 break;
             }
             generation += 1;
         }
-        let building_name = gen_table_name(notebook, model, generation);
+        let building_name = gen_table_name(notebook, model, dim, generation);
 
         // Create the empty physical table, then register the `building` row. The
         // physical table is created FIRST so a crash before the registry insert
@@ -1255,7 +1319,7 @@ impl VectorStore for LanceVectorStore {
                 notebook,
                 model,
                 dim,
-                crate::embedder::PREFIX_CONVENTION,
+                &crate::embedder::resolve(model).prefix_convention(),
                 &building_name,
                 "building",
             )
@@ -1263,7 +1327,12 @@ impl VectorStore for LanceVectorStore {
         Ok(building_name)
     }
 
-    async fn add_to_table(&self, table_name: &str, rows: Vec<VectorRow>) -> Result<(), LensError> {
+    async fn add_to_table(
+        &self,
+        table_name: &str,
+        rows: Vec<VectorRow>,
+        dim: usize,
+    ) -> Result<(), LensError> {
         if rows.is_empty() {
             return Ok(());
         }
@@ -1271,7 +1340,7 @@ impl VectorStore for LanceVectorStore {
             .open_table_by_name(table_name)
             .await?
             .ok_or_else(|| LensError::Vector(format!("no table named {table_name} to add to")))?;
-        let batch = rows_to_batch(&rows, VECTOR_DIM)?;
+        let batch = rows_to_batch(&rows, dim)?;
         table
             .add(batch)
             .execute()
@@ -1283,7 +1352,7 @@ impl VectorStore for LanceVectorStore {
         // The bulk seed copy in `seed_building_from_active` goes through the raw
         // table handle (not this path), so the index is built once the per-source
         // populate begins — over the complete row set, not the half-seeded one.
-        self.maybe_build_or_refresh_index(&table, VECTOR_DIM).await;
+        self.maybe_build_or_refresh_index(&table, dim).await;
         Ok(())
     }
 
@@ -1321,6 +1390,44 @@ impl VectorStore for LanceVectorStore {
         }
         Ok(())
     }
+
+    async fn retire_coordinate(
+        &self,
+        notebook: &str,
+        model: &str,
+        dim: usize,
+    ) -> Result<(), LensError> {
+        // (1) Demote ONLY the OLD coordinate's active row to stale (committed).
+        // Returns its physical table name, or None when there is nothing to retire
+        // (idempotent no-op — e.g. a retried retire after the GC already swept it).
+        let Some(stale) = self
+            .registry
+            .demote_active_to_stale(notebook, model, dim)
+            .await?
+        else {
+            return Ok(());
+        };
+
+        // ── CRASH WINDOW (R3): the stale Lance drop + the stale registry-row
+        // delete happen AFTER the demote has committed. A crash here leaves a
+        // `stale` row + orphan Lance table that the startup-GC reclaims; the NEW
+        // coordinate's active row (already flipped) keeps serving search.
+        #[cfg(feature = "test-util")]
+        if CRASH_AFTER_RETIRE_STALE_BEFORE_LANCE_DROP
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(());
+        }
+
+        // (2) Drop the stale physical table FIRST (idempotent), then delete its
+        // registry row — so a crash between the two leaves only a dangling `stale`
+        // row whose (already-gone) table the GC drops as a no-op.
+        self.drop_tables(std::slice::from_ref(&stale)).await?;
+        self.registry
+            .delete_row_by_table(notebook, model, dim, &stale)
+            .await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1345,10 +1452,42 @@ mod tests {
     }
 
     #[test]
-    fn table_name_format() {
+    fn table_name_includes_dim_segment() {
         assert_eq!(
-            table_name("nb1", "nomic-embed-text-v1.5"),
-            "vec__nb1__nomic_v15"
+            table_name("nb1", "nomic-embed-text-v1.5", 768),
+            "vec__nb1__nomic_v15__d768"
+        );
+        assert_eq!(
+            table_name("nb1", "all-minilm", 384),
+            "vec__nb1__all_minilm__d384"
+        );
+    }
+
+    #[test]
+    fn gen_table_name_dim_before_gen_ordering() {
+        // gen-0 == table_name (no gen suffix).
+        assert_eq!(
+            gen_table_name("nb1", "mxbai-embed-large", 1024, 0),
+            "vec__nb1__mxbai_embed_large__d1024"
+        );
+        // Non-zero generation appends `__{gen}` AFTER the dim segment (R7).
+        assert_eq!(
+            gen_table_name("nb1", "mxbai-embed-large", 1024, 2),
+            "vec__nb1__mxbai_embed_large__d1024__2"
+        );
+    }
+
+    #[test]
+    fn different_dims_never_collide_for_same_notebook() {
+        // A 384 and a 768 coordinate for the same notebook must produce distinct
+        // physical names so two active coordinates never share a Lance table.
+        let n384 = table_name("nb1", "all-minilm", 384);
+        let n768 = table_name("nb1", "nomic-embed-text-v1.5", 768);
+        assert_ne!(n384, n768);
+        // Same property holds across generations.
+        assert_ne!(
+            gen_table_name("nb1", "all-minilm", 384, 1),
+            gen_table_name("nb1", "nomic-embed-text-v1.5", 768, 1)
         );
     }
 
@@ -1405,5 +1544,25 @@ mod tests {
         let batch = rows_to_batch(&rows, 4).expect("batch builds");
         assert_eq!(batch.num_rows(), 2);
         assert_eq!(batch.num_columns(), 5);
+    }
+
+    #[test]
+    fn rows_to_batch_builds_correct_384_dim_schema() {
+        let rows = vec![VectorRow {
+            chunk_id: "c1".into(),
+            source_id: "s1".into(),
+            notebook_id: "n1".into(),
+            level: 0,
+            vector: vec![0.1; 384],
+        }];
+        let batch = rows_to_batch(&rows, 384).expect("384-dim batch builds");
+        assert_eq!(batch.num_rows(), 1);
+        match batch.schema().field(4).data_type() {
+            DataType::FixedSizeList(item, len) => {
+                assert_eq!(item.data_type(), &DataType::Float32);
+                assert_eq!(*len, 384);
+            }
+            other => panic!("vector field is not a 384-wide FixedSizeList: {other:?}"),
+        }
     }
 }

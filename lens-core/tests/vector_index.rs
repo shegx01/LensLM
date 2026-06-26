@@ -19,13 +19,13 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use lens_core::vector_store::{VectorRow, VectorStore};
-use lens_core::{EMBED_DIM, EMBED_MODEL_ID, LanceVectorStore, LensEngine};
+use lens_core::{DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, LanceVectorStore, LensEngine};
 
-/// A deterministic, well-spread unit vector of length [`EMBED_DIM`]. Each
+/// A deterministic, well-spread unit vector of length [`DEFAULT_EMBED_DIM`]. Each
 /// component is a sine of `(seed, dim)` so PQ/IVF k-means training sees real
 /// variety across every dimension (a near-constant corpus would collapse it).
 fn unit_vector(seed: usize) -> Vec<f32> {
-    let mut v: Vec<f32> = (0..EMBED_DIM)
+    let mut v: Vec<f32> = (0..DEFAULT_EMBED_DIM)
         .map(|j| ((seed as f32) * 0.013 + (j as f32) * 0.0007).sin())
         .collect();
     let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -51,8 +51,9 @@ fn make_rows(notebook: &str, n: usize) -> Vec<VectorRow> {
 }
 
 /// The physical table name the store resolves for the default nomic coordinate.
+/// Step 4 generalizes the scheme to embed the dim: `vec__{nb}__{slug}__d{dim}`.
 fn nomic_table(notebook: &str) -> String {
-    format!("vec__{notebook}__nomic_v15")
+    format!("vec__{notebook}__nomic_v15__d{DEFAULT_EMBED_DIM}")
 }
 
 /// Connects to the physical Lance table and returns its index configs (public
@@ -121,7 +122,12 @@ async fn below_threshold_creates_no_index() {
     let store = LanceVectorStore::new(dir.path(), pool).with_ann_index_min_rows(256);
 
     store
-        .add(&nb, EMBED_MODEL_ID, EMBED_DIM, make_rows(&nb, 100))
+        .add(
+            &nb,
+            DEFAULT_EMBED_MODEL_ID,
+            DEFAULT_EMBED_DIM,
+            make_rows(&nb, 100),
+        )
         .await
         .unwrap();
 
@@ -139,7 +145,12 @@ async fn crossing_threshold_builds_one_ivfpq_index() {
     let store = LanceVectorStore::new(dir.path(), pool).with_ann_index_min_rows(256);
 
     store
-        .add(&nb, EMBED_MODEL_ID, EMBED_DIM, make_rows(&nb, 400))
+        .add(
+            &nb,
+            DEFAULT_EMBED_MODEL_ID,
+            DEFAULT_EMBED_DIM,
+            make_rows(&nb, 400),
+        )
         .await
         .unwrap();
 
@@ -163,7 +174,12 @@ async fn second_add_past_threshold_does_not_duplicate_index() {
     let store = LanceVectorStore::new(dir.path(), pool).with_ann_index_min_rows(256);
 
     store
-        .add(&nb, EMBED_MODEL_ID, EMBED_DIM, make_rows(&nb, 400))
+        .add(
+            &nb,
+            DEFAULT_EMBED_MODEL_ID,
+            DEFAULT_EMBED_DIM,
+            make_rows(&nb, 400),
+        )
         .await
         .unwrap();
 
@@ -179,7 +195,7 @@ async fn second_add_past_threshold_does_not_duplicate_index() {
         })
         .collect();
     store
-        .add(&nb, EMBED_MODEL_ID, EMBED_DIM, more)
+        .add(&nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM, more)
         .await
         .unwrap();
 
@@ -202,7 +218,13 @@ async fn second_add_past_threshold_does_not_duplicate_index() {
 
     // Rows stay searchable (the index serves without error).
     let hits = store
-        .search(&nb, EMBED_MODEL_ID, EMBED_DIM, &unit_vector(450), 5)
+        .search(
+            &nb,
+            DEFAULT_EMBED_MODEL_ID,
+            DEFAULT_EMBED_DIM,
+            &unit_vector(450),
+            5,
+        )
         .await
         .unwrap();
     assert!(!hits.is_empty(), "indexed table still returns hits");
@@ -239,7 +261,7 @@ async fn recall_canary_ann_returns_exact_matches_in_top_k() {
         });
     }
     store
-        .add(&nb, EMBED_MODEL_ID, EMBED_DIM, rows)
+        .add(&nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM, rows)
         .await
         .unwrap();
 
@@ -253,7 +275,7 @@ async fn recall_canary_ann_returns_exact_matches_in_top_k() {
     let mut found = 0usize;
     for (id, qvec) in planted_ids.iter().zip(&planted_vecs) {
         let hits = store
-            .search(&nb, EMBED_MODEL_ID, EMBED_DIM, qvec, 10)
+            .search(&nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM, qvec, 10)
             .await
             .unwrap();
         if hits.iter().any(|h| &h.chunk_id == id) {
@@ -275,7 +297,7 @@ async fn building_table_indexed_then_serves_after_flip() {
 
     // Populate a building table past threshold through the public flip APIs.
     let building = store
-        .create_building_table(&nb, EMBED_MODEL_ID, EMBED_DIM)
+        .create_building_table(&nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM)
         .await
         .unwrap();
     let mut rows = make_rows(&nb, 400);
@@ -287,7 +309,10 @@ async fn building_table_indexed_then_serves_after_flip() {
         level: 1,
         vector: planted.clone(),
     });
-    store.add_to_table(&building, rows).await.unwrap();
+    store
+        .add_to_table(&building, rows, DEFAULT_EMBED_DIM)
+        .await
+        .unwrap();
 
     // The building table is indexed BEFORE the flip, so it serves ANN the moment
     // it becomes active (the reason 4a lands before the 4b reindex flow).
@@ -298,17 +323,166 @@ async fn building_table_indexed_then_serves_after_flip() {
     );
 
     store
-        .flip_active(&nb, EMBED_MODEL_ID, EMBED_DIM, &building)
+        .flip_active(&nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM, &building)
         .await
         .unwrap();
 
     let hits = store
-        .search(&nb, EMBED_MODEL_ID, EMBED_DIM, &planted, 10)
+        .search(&nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM, &planted, 10)
         .await
         .unwrap();
     let ids: HashSet<String> = hits.into_iter().map(|h| h.chunk_id).collect();
     assert!(
         ids.contains("planted"),
         "post-flip ANN search returns the planted hit: {ids:?}"
+    );
+}
+
+/// A deterministic unit vector of an arbitrary dimension (Step 4: variable-dim
+/// coordinates). Mirrors [`unit_vector`] but parameterized on `dim`.
+fn unit_vector_dim(seed: usize, dim: usize) -> Vec<f32> {
+    let mut v: Vec<f32> = (0..dim)
+        .map(|j| ((seed as f32) * 0.013 + (j as f32) * 0.0007).sin())
+        .collect();
+    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for x in &mut v {
+            *x /= norm;
+        }
+    }
+    v
+}
+
+#[tokio::test]
+async fn add_to_table_accepts_1024_dim_rows() {
+    // Step 4: add_to_table threads the coordinate dim (no hard-coded VECTOR_DIM /
+    // debug_assert), so a non-768 coordinate populates without an assertion panic.
+    let (dir, _engine, pool, nb) = engine_and_notebook().await;
+    let store = LanceVectorStore::new(dir.path(), pool);
+
+    let model = "mxbai-embed-large";
+    let dim = 1024usize;
+    let building = store.create_building_table(&nb, model, dim).await.unwrap();
+
+    let rows: Vec<VectorRow> = (0..5)
+        .map(|i| VectorRow {
+            chunk_id: format!("chunk-{i}"),
+            source_id: "src-1".to_string(),
+            notebook_id: nb.clone(),
+            level: 1,
+            vector: unit_vector_dim(i, dim),
+        })
+        .collect();
+
+    store
+        .add_to_table(&building, rows, dim)
+        .await
+        .expect("1024-dim rows append without an assertion failure");
+
+    store.flip_active(&nb, model, dim, &building).await.unwrap();
+    let hits = store
+        .search(&nb, model, dim, &unit_vector_dim(0, dim), 5)
+        .await
+        .unwrap();
+    assert!(
+        !hits.is_empty(),
+        "1024-dim coordinate is searchable after flip"
+    );
+}
+
+#[tokio::test]
+async fn existing_gen0_table_resolved_by_stored_name_not_regenerated() {
+    // CRITICAL invariant: a coordinate is resolved by its STORED lance_table_name
+    // in the registry, never by re-deriving a name. We register a coordinate
+    // whose stored physical name is the LEGACY dim-less form (`vec__{nb}__nomic_v15`,
+    // what shipped before Step 4) and create exactly that physical table; search
+    // must open the stored name, not the new dim-suffixed name the generator now
+    // produces (`vec__{nb}__nomic_v15__d768`).
+    let (dir, _engine, pool, nb) = engine_and_notebook().await;
+    let store = LanceVectorStore::new(dir.path(), pool.clone());
+
+    let legacy_name = format!("vec__{nb}__nomic_v15");
+
+    // Build the legacy physical table directly under the store's lance root.
+    {
+        use arrow_array::types::Float32Type;
+        use arrow_array::{FixedSizeListArray, Int32Array, RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        let conn = lancedb::connect(dir.path().join("lancedb").to_str().unwrap())
+            .execute()
+            .await
+            .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("chunk_id", DataType::Utf8, false),
+            Field::new("source_id", DataType::Utf8, false),
+            Field::new("notebook_id", DataType::Utf8, false),
+            Field::new("level", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    DEFAULT_EMBED_DIM as i32,
+                ),
+                false,
+            ),
+        ]));
+        let v = unit_vector(7);
+        let vectors = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+            vec![Some(v.into_iter().map(Some).collect::<Vec<_>>())],
+            DEFAULT_EMBED_DIM as i32,
+        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["legacy-chunk"])),
+                Arc::new(StringArray::from(vec!["src-1"])),
+                Arc::new(StringArray::from(vec![nb.as_str()])),
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(vectors),
+            ],
+        )
+        .unwrap();
+        // Mirror the store's own pattern: create the empty schema-only table, then
+        // append the batch (avoids the create_table Scannable bound on a reader).
+        let table = conn
+            .create_empty_table(&legacy_name, schema.clone())
+            .execute()
+            .await
+            .unwrap();
+        table.add(batch).execute().await.unwrap();
+    }
+
+    // Register the legacy physical name as the active coordinate.
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO embedding_index \
+         (id, notebook_id, model, dim, prefix_convention, lance_table_name, status, created_at) \
+         VALUES (?, ?, 'nomic-embed-text-v1.5', 768, 'search_document/search_query', ?, 'active', ?)",
+    )
+    .bind(uuid::Uuid::now_v7().to_string())
+    .bind(&nb)
+    .bind(&legacy_name)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Resolution must open the STORED legacy table — the planted hit proves it.
+    let hits = store
+        .search(
+            &nb,
+            DEFAULT_EMBED_MODEL_ID,
+            DEFAULT_EMBED_DIM,
+            &unit_vector(7),
+            5,
+        )
+        .await
+        .unwrap();
+    let ids: HashSet<String> = hits.into_iter().map(|h| h.chunk_id).collect();
+    assert!(
+        ids.contains("legacy-chunk"),
+        "search resolved the stored legacy table name (not a regenerated one): {ids:?}"
     );
 }

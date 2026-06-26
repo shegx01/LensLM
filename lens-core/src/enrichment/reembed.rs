@@ -28,7 +28,6 @@
 //! table that the startup-GC also reclaims (idempotently — a missing table is a
 //! no-op). The `active` row always points at a COMPLETE table at every boundary.
 
-use crate::embedder::{EMBED_DIM, EMBED_MODEL_ID};
 use crate::notebooks::{EnrichmentStatus, NotebookRepo, ReembedChunk};
 use crate::vector_store::{LanceVectorStore, VectorRow, VectorStore};
 use crate::{LensEngine, LensError};
@@ -70,14 +69,23 @@ pub(crate) async fn reembed_and_flip(
         return Ok(());
     }
 
+    // Resolve the OWNING notebook's embedding coordinate (R1) so this same-model
+    // re-embed builds, seeds, populates, and flips the notebook's OWN coordinate
+    // (model + dim) rather than the global default. The cross-model switch (a new
+    // coordinate) lands in Step 9; here the source's notebook always re-embeds
+    // under whatever model it is currently configured with.
+    let (embed_model, embed_dim) = engine
+        .resolve_notebook_embedding(&crate::NotebookId::from(notebook.to_string()))
+        .await?;
+
     // ── (3) Embed into a PRIVATE building table — LOCK-FREE (search reads only the
     // active table). The embedder `Mutex` is the only serialization point.
-    let embedder = engine.embedder().await?;
+    let embedder = engine.embedder_for(&embed_model).await?;
     let data_dir = engine.data_dir().await;
     let store = LanceVectorStore::new(&data_dir, pool.clone());
 
     let building_name = store
-        .create_building_table(notebook, EMBED_MODEL_ID, EMBED_DIM)
+        .create_building_table(notebook, &embed_model, embed_dim)
         .await?;
 
     // Seed the building table with every OTHER source's current vectors so this
@@ -96,13 +104,7 @@ pub(crate) async fn reembed_and_flip(
     // reworks this orchestration — kept out of this hotfix to preserve the
     // sub-second lock window (the seed copy is unbounded in size).
     store
-        .seed_building_from_active(
-            notebook,
-            EMBED_MODEL_ID,
-            EMBED_DIM,
-            &building_name,
-            source_id,
-        )
+        .seed_building_from_active(notebook, &embed_model, embed_dim, &building_name, source_id)
         .await?;
 
     for batch in chunks.chunks(REEMBED_BATCH) {
@@ -129,7 +131,7 @@ pub(crate) async fn reembed_and_flip(
                 vector,
             })
             .collect();
-        store.add_to_table(&building_name, rows).await?;
+        store.add_to_table(&building_name, rows, embed_dim).await?;
     }
 
     // Test-only seam: pause here (after the lock-free populate, before the flip
@@ -170,7 +172,7 @@ pub(crate) async fn reembed_and_flip(
         }
 
         store
-            .flip_active(notebook, EMBED_MODEL_ID, EMBED_DIM, &building_name)
+            .flip_active(notebook, &embed_model, embed_dim, &building_name)
             .await?;
     }
 
@@ -180,4 +182,189 @@ pub(crate) async fn reembed_and_flip(
     repo.update_enrichment_status(source_id, EnrichmentStatus::Enriched)
         .await?;
     Ok(())
+}
+
+/// Outcome of a notebook-wide model-switch re-embed ([`reembed_notebook`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReembedOutcome {
+    /// The notebook is already embedded under its configured coordinate (or has no
+    /// existing vectors to migrate) — nothing was changed.
+    NoOp,
+    /// Re-embedded every chunk into the new `(model, dim)` coordinate, flipped it
+    /// active, and retired `retired` previous coordinate(s).
+    Switched {
+        /// The now-active model id.
+        model: String,
+        /// The now-active embedding dimension.
+        dim: usize,
+        /// How many OLD coordinates were retired.
+        retired: usize,
+    },
+    /// The notebook's configured model changed AGAIN while the new coordinate was
+    /// building; the flip was skipped (building table left for the startup-GC) so
+    /// the newest model's own re-embed wins (R2 coordinate re-check guard).
+    RaceAborted,
+}
+
+/// Re-embeds EVERY chunk of `notebook_id` into the notebook's currently-configured
+/// embedding coordinate, flips it active, and retires the previous coordinate(s)
+/// (M4 Phase 4b, Step 9 — the model-switch re-embed).
+///
+/// Background-safe and crash-safe, reusing the Phase-3 flip machinery: the (long)
+/// embed + populate of the NEW coordinate's building table runs LOCK-FREE (search
+/// resolves `status='active'` only, so a half-built coordinate is unobservable);
+/// only the atomic flip + the old-coordinate retirement run under `ingest_lock`.
+/// The OLD index keeps serving search until the flip.
+///
+/// Returns [`ReembedOutcome::NoOp`] when the configured model already matches the
+/// active coordinate (or there is nothing to migrate), and
+/// [`ReembedOutcome::RaceAborted`] when a second model switch landed mid-build (R2).
+///
+/// `on_progress(done, total)` is called after each populated batch (the Tauri
+/// command streams it as `ReembedProgress`); pass a no-op for headless callers.
+pub(crate) async fn reembed_notebook(
+    engine: &LensEngine,
+    notebook_id: &crate::NotebookId,
+    mut on_progress: impl FnMut(usize, usize) + Send,
+) -> Result<ReembedOutcome, LensError> {
+    let pool = engine.pool().await;
+    let repo = NotebookRepo::new(&pool);
+    let nb = notebook_id.to_string();
+
+    // The NEW configured coordinate (notebooks.embedding_model → registry, R1).
+    let (new_model, new_dim) = engine.resolve_notebook_embedding(notebook_id).await?;
+
+    // The OLD active coordinate(s) currently backing the notebook's search, minus
+    // any that already equal the configured coordinate (the user re-picked the same
+    // model). What remains are coordinates to migrate away from + retire.
+    let active: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT DISTINCT model, dim FROM embedding_index \
+         WHERE notebook_id = ? AND status = 'active'",
+    )
+    .bind(&nb)
+    .fetch_all(&pool)
+    .await?;
+    let old_coords: Vec<(String, usize)> = active
+        .into_iter()
+        .map(|(m, d)| (m, d as usize))
+        .filter(|(m, d)| !(m == &new_model && *d == new_dim))
+        .collect();
+    if old_coords.is_empty() {
+        // Nothing embedded yet, or the active coordinate already matches the
+        // configured model/dim — no re-embed needed.
+        return Ok(ReembedOutcome::NoOp);
+    }
+
+    // Gather every chunk across the notebook's sources, tagged with its owning
+    // source_id (per-source `list_chunks_for_reembed` carries id/level/embed_text;
+    // the source_id comes from the iteration). COALESCE(embedding_text, text) means
+    // enriched chunks re-embed from their contextual text.
+    let sources = repo.list_sources(notebook_id).await?;
+    let mut items: Vec<(String, ReembedChunk)> = Vec::new();
+    for src in &sources {
+        for chunk in repo.list_chunks_for_reembed(&src.id).await? {
+            items.push((src.id.clone(), chunk));
+        }
+    }
+    if items.is_empty() {
+        // Old coordinate(s) registered but no chunks to embed — leave the existing
+        // index untouched rather than promote an empty active table.
+        return Ok(ReembedOutcome::NoOp);
+    }
+    let total = items.len();
+
+    // Build + populate the NEW coordinate's building table LOCK-FREE. No seed copy:
+    // the new coordinate has a different (model, dim), so every chunk is embedded
+    // fresh by the new model's embedder (the cross-coordinate analogue of the
+    // same-coordinate seed in `reembed_and_flip`).
+    let embedder = engine.embedder_for(&new_model).await?;
+    let data_dir = engine.data_dir().await;
+    let store = LanceVectorStore::new(&data_dir, pool.clone());
+    let building_name = store
+        .create_building_table(&nb, &new_model, new_dim)
+        .await?;
+
+    let mut done = 0usize;
+    for batch in items.chunks(REEMBED_BATCH) {
+        let texts: Vec<String> = batch.iter().map(|(_, c)| c.embed_text.clone()).collect();
+        let embedder = embedder.clone();
+        let vectors = tokio::task::spawn_blocking(move || embedder.embed_documents_owned(texts))
+            .await
+            .map_err(|e| LensError::Model(format!("re-embed task panicked: {e}")))??;
+        if vectors.len() != batch.len() {
+            return Err(LensError::Model(format!(
+                "re-embed embedder returned {} vectors for {} inputs",
+                vectors.len(),
+                batch.len()
+            )));
+        }
+        let rows: Vec<VectorRow> = batch
+            .iter()
+            .zip(vectors.into_iter())
+            .map(|((source_id, chunk), vector)| VectorRow {
+                chunk_id: chunk.id.clone(),
+                source_id: source_id.clone(),
+                notebook_id: nb.clone(),
+                level: chunk.level,
+                vector,
+            })
+            .collect();
+        store.add_to_table(&building_name, rows, new_dim).await?;
+        done += batch.len();
+        on_progress(done, total);
+    }
+
+    // Test-only seam: park after the lock-free populate, before the flip window, so
+    // an R2 test can change the notebook's configured model AGAIN and exercise the
+    // in-lock coordinate re-check below. No-op in production / without `test-util`.
+    #[cfg(feature = "test-util")]
+    engine.reembed_preflip_gate().await;
+
+    // FLIP-ONLY lock window: hold `ingest_lock` ONLY for the atomic flip txn + the
+    // old-coordinate retirement (sub-second). The long populate above ran lock-free.
+    {
+        let _permit = engine
+            .ingest_lock()
+            .acquire()
+            .await
+            .map_err(|e| LensError::Internal(format!("ingest semaphore closed: {e}")))?;
+
+        // ── R2 coordinate re-check guard. The long lock-free populate could have
+        // raced a SECOND model switch that landed (and committed the new
+        // `notebooks.embedding_model`) before we acquired the lock. Promoting our
+        // building table would then make a STALE target coordinate active. Re-resolve
+        // the configured coordinate NOW, under the held lock: if it no longer matches
+        // what we built, SKIP the flip and leave the building table for the
+        // startup-GC — the newer switch's own re-embed wins. Mirrors the purge-vs-flip
+        // guard in `reembed_and_flip`.
+        let (configured_model, configured_dim) =
+            engine.resolve_notebook_embedding(notebook_id).await?;
+        if configured_model != new_model || configured_dim != new_dim {
+            tracing::debug!(
+                notebook = %nb,
+                building = %building_name,
+                built = %format!("{new_model}/{new_dim}"),
+                now = %format!("{configured_model}/{configured_dim}"),
+                "reembed_notebook: configured model changed under flip; skipping flip, leaving building table for GC"
+            );
+            return Ok(ReembedOutcome::RaceAborted);
+        }
+
+        store
+            .flip_active(&nb, &new_model, new_dim, &building_name)
+            .await?;
+    }
+
+    // Retire each OLD coordinate now that the NEW one is active. Each call is
+    // idempotent + crash-recoverable (R3): a crash mid-retire leaves a `stale` row
+    // the startup-GC reclaims, and the new coordinate already serves search.
+    for (old_model, old_dim) in &old_coords {
+        store.retire_coordinate(&nb, old_model, *old_dim).await?;
+    }
+
+    Ok(ReembedOutcome::Switched {
+        model: new_model,
+        dim: new_dim,
+        retired: old_coords.len(),
+    })
 }

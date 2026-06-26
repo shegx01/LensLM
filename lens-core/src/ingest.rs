@@ -61,7 +61,6 @@ use sha2::{Digest, Sha256};
 use tokenizers::Tokenizer;
 
 use crate::chunk::{Chunk, chunk_blocks};
-use crate::embedder::{EMBED_DIM, EMBED_MODEL_ID};
 use crate::vector_store::{LanceVectorStore, VectorRow, VectorStore};
 use crate::{LensEngine, LensError};
 
@@ -512,6 +511,13 @@ async fn run_ingest(
     // ── Construct the vector store (per-ingest; cheap embedded connection) ─
     let store = LanceVectorStore::new(&data_dir, pool.clone());
     let notebook = source.notebook_id.clone();
+    // Resolve the OWNING notebook's embedding coordinate (R1) ONCE, here at the
+    // boundary: every drop/add/embed below threads this per-notebook model+dim
+    // instead of the global default, so a notebook configured with a non-nomic
+    // model is indexed under its own coordinate.
+    let (embed_model, embed_dim) = engine
+        .resolve_notebook_embedding(&crate::NotebookId::from(notebook.clone()))
+        .await?;
 
     // ── PARSE ─────────────────────────────────────────────────────────────
     {
@@ -573,7 +579,7 @@ async fn run_ingest(
     // mid-insert can never leave a half-written set of chunk rows: the tx either
     // commits the full fresh set or rolls back to the prior state.
     store
-        .drop_source(&notebook, EMBED_MODEL_ID, EMBED_DIM, source_id)
+        .drop_source(&notebook, &embed_model, embed_dim, source_id)
         .await?;
 
     let mut tx = pool.begin().await?;
@@ -621,7 +627,7 @@ async fn run_ingest(
     // Lazily get the cached embedder. Emit a `model_download` phase BEFORE the
     // first construction so a cold-cache download surfaces in the UI.
     on_progress(IngestProgress::new(ingest_phase::MODEL_DOWNLOAD, 0, None));
-    let embedder = engine.embedder().await?;
+    let embedder = engine.embedder_for(&embed_model).await?;
     on_progress(IngestProgress::new(
         ingest_phase::MODEL_DOWNLOAD,
         1,
@@ -672,9 +678,7 @@ async fn run_ingest(
 
     // ── INDEX ─────────────────────────────────────────────────────────────
     on_progress(IngestProgress::new(ingest_phase::INDEXING, 0, Some(1)));
-    store
-        .add(&notebook, EMBED_MODEL_ID, EMBED_DIM, rows)
-        .await?;
+    store.add(&notebook, &embed_model, embed_dim, rows).await?;
     on_progress(IngestProgress::new(ingest_phase::INDEXING, 1, Some(1)));
 
     // ── Finalize: metadata + indexed status ──────────────────────────────
@@ -1115,13 +1119,41 @@ async fn wipe_source_content(
     source_id: &str,
 ) -> Result<(), LensError> {
     let store = LanceVectorStore::new(data_dir, pool.clone());
+    // Resolve the OWNING notebook's embedding coordinate (R1) so the wipe drops
+    // the right per-notebook table. This helper has only the pool (no engine
+    // handle), so resolve straight off the notebook row through the registry —
+    // identical semantics to `LensEngine::resolve_notebook_embedding`.
+    let (embed_model, embed_dim) = resolve_notebook_embedding_from_pool(pool, notebook_id).await?;
     store
-        .drop_source(notebook_id, EMBED_MODEL_ID, EMBED_DIM, source_id)
+        .drop_source(notebook_id, &embed_model, embed_dim, source_id)
         .await?;
     let mut tx = pool.begin().await?;
     delete_chunks_for_source(&mut tx, source_id).await?;
     tx.commit().await?;
     Ok(())
+}
+
+/// Resolves a notebook's `(model_id, dim)` embedding coordinate directly from the
+/// pool (the pool-only twin of [`crate::LensEngine::resolve_notebook_embedding`]).
+///
+/// Used by the ingest helpers that hold a `&SqlitePool` but no engine handle. A
+/// NULL `embedding_model` (the column exists but is unset) or an unknown value
+/// falls back to the registry default; a MISSING notebook row fails fast, matching
+/// [`crate::LensEngine::resolve_notebook_embedding`].
+async fn resolve_notebook_embedding_from_pool(
+    pool: &sqlx::SqlitePool,
+    notebook_id: &str,
+) -> Result<(String, usize), LensError> {
+    // `fetch_optional` → None means NO such notebook (fail fast); `Some(None)` means
+    // the row exists with a NULL `embedding_model` (resolve to the default).
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT embedding_model FROM notebooks WHERE id = ?")
+            .bind(notebook_id)
+            .fetch_optional(pool)
+            .await?
+            .ok_or_else(|| LensError::Validation(format!("no notebook with id {notebook_id}")))?;
+    let spec = crate::embedder::resolve(stored.as_deref().unwrap_or(""));
+    Ok((spec.id.to_string(), spec.dim))
 }
 
 /// Deletes every `chunks` row for `source_id`.

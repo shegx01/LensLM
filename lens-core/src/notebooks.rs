@@ -352,6 +352,11 @@ pub struct Notebook {
     /// Optional focus mode (`"research"` | `"coding"` | `"notes"`) captured
     /// during onboarding. Write-only in M1; M3 extends it. `None` when unset.
     pub focus_mode: Option<String>,
+    /// Embedding model id this notebook is indexed with (M4 Phase 4b). A stable
+    /// registry id (`embedder::registry`). `None` on pre-migration rows; the
+    /// read path resolves `None` to [`DEFAULT_EMBED_MODEL_ID`] via the registry.
+    /// New notebooks are stamped with the current global default at create time.
+    pub embedding_model: Option<String>,
     /// RFC3339 creation timestamp.
     pub created_at: String,
     /// RFC3339 last-update timestamp.
@@ -414,7 +419,8 @@ impl<'a> NotebookRepo<'a> {
     /// Lists all live (non-trashed) notebooks, newest first.
     pub async fn list(&self) -> Result<Vec<Notebook>, LensError> {
         let rows = sqlx::query_as::<_, Notebook>(
-            "SELECT id, title, description, focus_mode, created_at, updated_at, trashed_at \
+            "SELECT id, title, description, focus_mode, embedding_model, created_at, updated_at, \
+                    trashed_at \
              FROM notebooks WHERE trashed_at IS NULL ORDER BY created_at DESC",
         )
         .fetch_all(self.pool)
@@ -431,8 +437,8 @@ impl<'a> NotebookRepo<'a> {
     /// backing column, so `query_as::<_, Notebook>` cannot populate it.
     pub async fn list_with_counts(&self) -> Result<Vec<NotebookSummary>, LensError> {
         self.list_summaries(
-            "SELECT n.id, n.title, n.description, n.focus_mode, n.created_at, n.updated_at, \
-                    n.trashed_at, COALESCE(COUNT(s.id), 0) AS source_count \
+            "SELECT n.id, n.title, n.description, n.focus_mode, n.embedding_model, n.created_at, \
+                    n.updated_at, n.trashed_at, COALESCE(COUNT(s.id), 0) AS source_count \
              FROM notebooks n \
              LEFT JOIN sources s ON s.notebook_id = n.id \
              WHERE n.trashed_at IS NULL \
@@ -446,8 +452,8 @@ impl<'a> NotebookRepo<'a> {
     /// `trashed_at` first.
     pub async fn list_trashed_with_counts(&self) -> Result<Vec<NotebookSummary>, LensError> {
         self.list_summaries(
-            "SELECT n.id, n.title, n.description, n.focus_mode, n.created_at, n.updated_at, \
-                    n.trashed_at, COALESCE(COUNT(s.id), 0) AS source_count \
+            "SELECT n.id, n.title, n.description, n.focus_mode, n.embedding_model, n.created_at, \
+                    n.updated_at, n.trashed_at, COALESCE(COUNT(s.id), 0) AS source_count \
              FROM notebooks n \
              LEFT JOIN sources s ON s.notebook_id = n.id \
              WHERE n.trashed_at IS NOT NULL \
@@ -462,8 +468,8 @@ impl<'a> NotebookRepo<'a> {
     /// Shared by [`list_with_counts`](Self::list_with_counts) and
     /// [`list_trashed_with_counts`](Self::list_trashed_with_counts), which differ
     /// only in their `WHERE`/`ORDER BY`. The `SELECT` projection must expose the
-    /// columns `id, title, description, focus_mode, created_at, updated_at,
-    /// trashed_at, source_count` in any order.
+    /// columns `id, title, description, focus_mode, embedding_model, created_at,
+    /// updated_at, trashed_at, source_count` in any order.
     async fn list_summaries(&self, query: &str) -> Result<Vec<NotebookSummary>, LensError> {
         use sqlx::Row;
         let rows = sqlx::query(query).fetch_all(self.pool).await?;
@@ -476,6 +482,7 @@ impl<'a> NotebookRepo<'a> {
                         title: row.try_get("title")?,
                         description: row.try_get("description")?,
                         focus_mode: row.try_get("focus_mode")?,
+                        embedding_model: row.try_get("embedding_model")?,
                         created_at: row.try_get("created_at")?,
                         updated_at: row.try_get("updated_at")?,
                         trashed_at: row.try_get("trashed_at")?,
@@ -501,16 +508,22 @@ impl<'a> NotebookRepo<'a> {
         let title = validate_title(title)?;
         let description = description.map(str::to_string);
         let focus_mode = focus_mode.map(str::to_string);
+        // Stamp the current global default embedding model so a notebook's
+        // coordinate is pinned to a concrete model from birth (the read path
+        // still tolerates a NULL on pre-migration rows by resolving to default).
+        let embedding_model = crate::embedder::registry::DEFAULT_EMBED_MODEL_ID.to_string();
         let id = NotebookId::new();
         let now = chrono::Utc::now().to_rfc3339();
         sqlx::query(
-            "INSERT INTO notebooks (id, title, description, focus_mode, created_at, updated_at, trashed_at) \
-             VALUES (?, ?, ?, ?, ?, ?, NULL)",
+            "INSERT INTO notebooks \
+                 (id, title, description, focus_mode, embedding_model, created_at, updated_at, trashed_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, NULL)",
         )
         .bind(&id)
         .bind(&title)
         .bind(&description)
         .bind(&focus_mode)
+        .bind(&embedding_model)
         .bind(&now)
         .bind(&now)
         .execute(self.pool)
@@ -520,6 +533,7 @@ impl<'a> NotebookRepo<'a> {
             title,
             description,
             focus_mode,
+            embedding_model: Some(embedding_model),
             created_at: now.clone(),
             updated_at: now,
             trashed_at: None,
@@ -1334,6 +1348,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_stamps_global_default_embedding_model() {
+        let pool = test_pool().await;
+        let repo = NotebookRepo::new(&pool);
+        let nb = repo.create("Notebook", None, None).await.unwrap();
+        // The created notebook carries the current global default model id.
+        assert_eq!(
+            nb.embedding_model.as_deref(),
+            Some(crate::embedder::registry::DEFAULT_EMBED_MODEL_ID)
+        );
+        assert_eq!(nb.embedding_model.as_deref(), Some("nomic-embed-text-v1.5"));
+
+        // It is persisted, not just returned in-memory: re-list reads it back.
+        let listed = repo.list().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].embedding_model.as_deref(),
+            Some(crate::embedder::registry::DEFAULT_EMBED_MODEL_ID)
+        );
+    }
+
+    #[tokio::test]
+    async fn notebook_stores_and_reads_embedding_model() {
+        let pool = test_pool().await;
+        let repo = NotebookRepo::new(&pool);
+        let nb = repo.create("Notebook", None, None).await.unwrap();
+
+        // Write a non-default model id directly, then read it back through the
+        // repo's SELECT projection.
+        sqlx::query("UPDATE notebooks SET embedding_model = ? WHERE id = ?")
+            .bind("mxbai-embed-large")
+            .bind(&nb.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let listed = repo.list().await.unwrap();
+        assert_eq!(
+            listed[0].embedding_model.as_deref(),
+            Some("mxbai-embed-large")
+        );
+    }
+
+    #[tokio::test]
+    async fn null_embedding_model_reads_back_as_none_and_resolves_to_default() {
+        let pool = test_pool().await;
+        let repo = NotebookRepo::new(&pool);
+        let nb = repo.create("Notebook", None, None).await.unwrap();
+
+        // Simulate a pre-migration row: NULL embedding_model.
+        sqlx::query("UPDATE notebooks SET embedding_model = NULL WHERE id = ?")
+            .bind(&nb.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let listed = repo.list().await.unwrap();
+        assert_eq!(listed[0].embedding_model, None);
+
+        // The registry resolves a None/absent id to the default model.
+        let resolved =
+            crate::embedder::registry::resolve(listed[0].embedding_model.as_deref().unwrap_or(""));
+        assert_eq!(
+            resolved.id,
+            crate::embedder::registry::DEFAULT_EMBED_MODEL_ID
+        );
+        assert_eq!(resolved.dim, crate::embedder::registry::DEFAULT_EMBED_DIM);
+    }
+
+    #[test]
+    fn notebook_ipc_json_includes_embedding_model() {
+        let nb = Notebook {
+            id: NotebookId::from("nb-1".to_string()),
+            title: "T".into(),
+            description: None,
+            focus_mode: None,
+            embedding_model: Some("bge-m3".into()),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            trashed_at: None,
+        };
+        let json = serde_json::to_value(&nb).unwrap();
+        assert_eq!(json["embedding_model"], "bge-m3");
+
+        // A None embedding_model serializes as JSON null (still present on the wire).
+        let nb_none = Notebook {
+            embedding_model: None,
+            ..nb
+        };
+        let json_none = serde_json::to_value(&nb_none).unwrap();
+        assert!(json_none.get("embedding_model").is_some());
+        assert!(json_none["embedding_model"].is_null());
+    }
+
+    #[tokio::test]
     async fn update_enrichment_status_missing_source_is_noop() {
         // A concurrent purge_source can delete the row between the worker's
         // enrichment steps; updating a gone source must be a benign Ok no-op, NOT
@@ -1558,6 +1666,7 @@ mod tests {
                 title: "Title".to_string(),
                 description: Some("desc".to_string()),
                 focus_mode: Some("research".to_string()),
+                embedding_model: Some("nomic-embed-text-v1.5".to_string()),
                 created_at: "2026-06-23T00:00:00+00:00".to_string(),
                 updated_at: "2026-06-23T00:00:00+00:00".to_string(),
                 trashed_at: None,
@@ -1578,6 +1687,7 @@ mod tests {
             vec![
                 "created_at",
                 "description",
+                "embedding_model",
                 "focus_mode",
                 "id",
                 "source_count",

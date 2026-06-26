@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use lens_core::vector_store::{LanceVectorStore, VectorRow, VectorStore};
-use lens_core::{EMBED_DIM, EMBED_MODEL_ID, LensEngine};
+use lens_core::{DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, LensEngine};
 use sqlx::Row;
 use tempfile::TempDir;
 use tokio::sync::Notify;
@@ -114,8 +114,8 @@ async fn seed_registry_row(engine: &LensEngine, notebook: &str, table: &str, sta
     )
     .bind(uuid::Uuid::now_v7().to_string())
     .bind(notebook)
-    .bind(EMBED_MODEL_ID)
-    .bind(EMBED_DIM as i64)
+    .bind(DEFAULT_EMBED_MODEL_ID)
+    .bind(DEFAULT_EMBED_DIM as i64)
     .bind(table)
     .bind(status)
     .bind(chrono::Utc::now().to_rfc3339())
@@ -135,7 +135,7 @@ async fn registry_count(engine: &LensEngine, status: &str) -> i64 {
 }
 
 fn unit_vector(axis: usize) -> Vec<f32> {
-    let mut v = vec![0.0_f32; EMBED_DIM];
+    let mut v = vec![0.0_f32; DEFAULT_EMBED_DIM];
     v[axis] = 1.0;
     v
 }
@@ -290,8 +290,8 @@ async fn startup_gc_reclaims_building_and_stale_rows() {
     store
         .add(
             &nb,
-            EMBED_MODEL_ID,
-            EMBED_DIM,
+            DEFAULT_EMBED_MODEL_ID,
+            DEFAULT_EMBED_DIM,
             vec![VectorRow {
                 chunk_id: "live".into(),
                 source_id: "s-live".into(),
@@ -306,10 +306,13 @@ async fn startup_gc_reclaims_building_and_stale_rows() {
     //    created via the real Step-5 `create_building_table` (gen-suffixed name +
     //    registered `building` row) then populated via `add_to_table`.
     let building_table = store
-        .create_building_table(&nb, EMBED_MODEL_ID, EMBED_DIM)
+        .create_building_table(&nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM)
         .await
         .expect("create building table");
-    assert_eq!(building_table, format!("vec__{nb}__nomic_v15__1"));
+    assert_eq!(
+        building_table,
+        format!("vec__{nb}__nomic_v15__d{DEFAULT_EMBED_DIM}__1")
+    );
     store
         .add_to_table(
             &building_table,
@@ -320,6 +323,7 @@ async fn startup_gc_reclaims_building_and_stale_rows() {
                 level: 1,
                 vector: unit_vector(1),
             }],
+            DEFAULT_EMBED_DIM,
         )
         .await
         .expect("seed building table");
@@ -364,7 +368,9 @@ async fn startup_gc_reclaims_building_and_stale_rows() {
         "the building Lance table must be dropped by GC; live tables: {names:?}"
     );
     assert!(
-        names.iter().any(|n| n == &format!("vec__{nb}__nomic_v15")),
+        names
+            .iter()
+            .any(|n| n == &format!("vec__{nb}__nomic_v15__d{DEFAULT_EMBED_DIM}")),
         "the active Lance table must survive GC; live tables: {names:?}"
     );
 }

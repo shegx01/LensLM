@@ -1,0 +1,13 @@
+-- M4 Phase 4b: per-notebook embedding model.
+--
+-- A notebook records which embedding model it was indexed with. The value is a
+-- stable registry id (`lens-core/src/embedder/registry.rs`), e.g.
+-- `nomic-embed-text-v1.5`, `mxbai-embed-large`, `all-minilm`, `bge-m3`.
+--
+-- Nullable with no DEFAULT: a SQLite `ADD COLUMN` of a nullable column is a
+-- safe, O(1) metadata-only operation (no table rewrite); pre-migration rows
+-- read NULL. The read path treats NULL as "the global default", resolving it
+-- through the registry (`DEFAULT_EMBED_MODEL_ID`) at access time. New rows are
+-- stamped with the current global default at create time, so a notebook's
+-- coordinate is always pinned to a concrete model from birth.
+ALTER TABLE notebooks ADD COLUMN embedding_model TEXT;

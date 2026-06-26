@@ -36,13 +36,13 @@ use lens_core::chunk::{
 use lens_core::embedder::{CountingEmbedder, Embedder, FastembedEmbedder};
 use lens_core::parse::{Block, SourceKind, parse_blocks};
 use lens_core::vector_store::{LanceVectorStore, VectorRow, VectorStore};
-use lens_core::{EMBED_DIM, EMBED_MODEL_ID, IngestProgress, LensEngine};
+use lens_core::{DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, IngestProgress, LensEngine};
 use sqlx::Row;
 
 mod support;
 use support::{
-    file_engine, inject_counting_engine, tokenizer_available, tokenizer_for, vector_chunk_ids,
-    vector_row_count,
+    file_engine, inject_counting_engine, inject_fake_embedder, tokenizer_available, tokenizer_for,
+    vector_chunk_ids, vector_row_count,
 };
 
 // ===========================================================================
@@ -64,11 +64,11 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-/// A unit vector of length [`EMBED_DIM`] with all weight on dimension `axis`.
+/// A unit vector of length [`DEFAULT_EMBED_DIM`] with all weight on dimension `axis`.
 /// Lets isolation/registry tests build deterministic, model-free vectors.
 fn unit_vector(axis: usize) -> Vec<f32> {
-    let mut v = vec![0.0_f32; EMBED_DIM];
-    v[axis % EMBED_DIM] = 1.0;
+    let mut v = vec![0.0_f32; DEFAULT_EMBED_DIM];
+    v[axis % DEFAULT_EMBED_DIM] = 1.0;
     v
 }
 
@@ -280,8 +280,8 @@ async fn vector_store_notebook_isolation() {
     store
         .add(
             &nb1,
-            EMBED_MODEL_ID,
-            EMBED_DIM,
+            DEFAULT_EMBED_MODEL_ID,
+            DEFAULT_EMBED_DIM,
             vec![
                 VectorRow {
                     chunk_id: "nb1-a".into(),
@@ -307,8 +307,8 @@ async fn vector_store_notebook_isolation() {
     store
         .add(
             &nb2,
-            EMBED_MODEL_ID,
-            EMBED_DIM,
+            DEFAULT_EMBED_MODEL_ID,
+            DEFAULT_EMBED_DIM,
             vec![VectorRow {
                 chunk_id: "nb2-a".into(),
                 source_id: "s2".into(),
@@ -321,7 +321,13 @@ async fn vector_store_notebook_isolation() {
         .expect("add nb2");
 
     let hits = store
-        .search(&nb1, EMBED_MODEL_ID, EMBED_DIM, &unit_vector(0), 5)
+        .search(
+            &nb1,
+            DEFAULT_EMBED_MODEL_ID,
+            DEFAULT_EMBED_DIM,
+            &unit_vector(0),
+            5,
+        )
         .await
         .expect("search nb1");
 
@@ -357,8 +363,8 @@ async fn vector_store_search_orders_by_ascending_cosine() {
     store
         .add(
             &nbx,
-            EMBED_MODEL_ID,
-            EMBED_DIM,
+            DEFAULT_EMBED_MODEL_ID,
+            DEFAULT_EMBED_DIM,
             vec![
                 VectorRow {
                     chunk_id: "near".into(),
@@ -380,7 +386,13 @@ async fn vector_store_search_orders_by_ascending_cosine() {
         .unwrap();
 
     let hits = store
-        .search(&nbx, EMBED_MODEL_ID, EMBED_DIM, &unit_vector(0), 2)
+        .search(
+            &nbx,
+            DEFAULT_EMBED_MODEL_ID,
+            DEFAULT_EMBED_DIM,
+            &unit_vector(0),
+            2,
+        )
         .await
         .unwrap();
     assert_eq!(hits.len(), 2);
@@ -412,8 +424,8 @@ async fn embedding_index_registers_once_per_notebook() {
     store
         .add(
             &nb1,
-            EMBED_MODEL_ID,
-            EMBED_DIM,
+            DEFAULT_EMBED_MODEL_ID,
+            DEFAULT_EMBED_DIM,
             vec![VectorRow {
                 chunk_id: "c1".into(),
                 source_id: "s1".into(),
@@ -429,8 +441,8 @@ async fn embedding_index_registers_once_per_notebook() {
     store
         .add(
             &nb1,
-            EMBED_MODEL_ID,
-            EMBED_DIM,
+            DEFAULT_EMBED_MODEL_ID,
+            DEFAULT_EMBED_DIM,
             vec![VectorRow {
                 chunk_id: "c2".into(),
                 source_id: "s2".into(),
@@ -457,15 +469,17 @@ async fn embedding_index_registers_once_per_notebook() {
         "exactly one registry row per (notebook, model, dim)"
     );
     let r = &rows[0];
-    assert_eq!(r.get::<String, _>("model"), EMBED_MODEL_ID);
-    assert_eq!(r.get::<i64, _>("dim"), EMBED_DIM as i64);
+    assert_eq!(r.get::<String, _>("model"), DEFAULT_EMBED_MODEL_ID);
+    assert_eq!(r.get::<i64, _>("dim"), DEFAULT_EMBED_DIM as i64);
+    // Per-spec convention string (M4 Phase 4b): the actual prefix tokens, joined
+    // doc/query ("none" when a model has no prefix). Nomic = the search_* prefixes.
     assert_eq!(
         r.get::<String, _>("prefix_convention"),
-        "search_document/search_query"
+        "search_document:/search_query:"
     );
     assert_eq!(
         r.get::<String, _>("lance_table_name"),
-        format!("vec__{nb1}__nomic_v15")
+        format!("vec__{nb1}__nomic_v15__d{DEFAULT_EMBED_DIM}")
     );
     assert_eq!(r.get::<String, _>("status"), "active");
 }
@@ -684,6 +698,131 @@ async fn ingest_streaming_phases_and_indexed_status() {
     );
 }
 
+/// Injects a 1024-dim mxbai `CountingEmbedder` under the `mxbai-embed-large`
+/// key so a per-notebook ingest on an mxbai notebook embeds at the right dim
+/// without downloading real weights.
+fn inject_mxbai_embedder(engine: &LensEngine) {
+    let spec = lens_core::embedder::resolve("mxbai-embed-large");
+    let e: Arc<dyn Embedder> = Arc::new(CountingEmbedder::new_with_dim(
+        spec.dim,
+        spec.id,
+        spec.prefix_doc,
+        spec.prefix_query,
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(0)),
+    ));
+    engine
+        .set_embedder_for_test(e)
+        .expect("inject mxbai embedder");
+}
+
+/// Step 7 AC: ingest on a notebook configured with `mxbai-embed-large` writes an
+/// `embedding_index` row with model="mxbai-embed-large", dim=1024, and a
+/// `d1024` table name — i.e. the ingest path resolves the model PER NOTEBOOK
+/// (not the global nomic default) and embeds with the matching embedder.
+#[tokio::test]
+async fn ingest_uses_per_notebook_model_mxbai() {
+    if !tokenizer_available().await {
+        eprintln!("skipping ingest_uses_per_notebook_model_mxbai: no tokenizer (offline)");
+        return;
+    }
+    let (_dir, engine) = file_engine().await;
+    // Default nomic + mxbai embedders both available in the keyed cache.
+    inject_fake_embedder(&engine);
+    inject_mxbai_embedder(&engine);
+
+    let nb = engine
+        .create_notebook("mxbai-nb", None, None)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE notebooks SET embedding_model = ? WHERE id = ?")
+        .bind("mxbai-embed-large")
+        .bind(nb.id.as_str())
+        .execute(&engine.pool().await)
+        .await
+        .unwrap();
+
+    let src = engine
+        .add_text_source(
+            &nb.id,
+            "doc",
+            "# Title\n\nBody text for mxbai.\n",
+            "markdown",
+        )
+        .await
+        .unwrap();
+    engine
+        .ingest_source(&src.id, |_p| {})
+        .await
+        .expect("ingest");
+
+    let pool = engine.pool().await;
+    let row = sqlx::query(
+        "SELECT model, dim, lance_table_name, status FROM embedding_index \
+         WHERE notebook_id = ? AND status = 'active'",
+    )
+    .bind(nb.id.as_str())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.get::<String, _>("model"), "mxbai-embed-large");
+    assert_eq!(row.get::<i64, _>("dim"), 1024);
+    assert!(
+        row.get::<String, _>("lance_table_name").contains("__d1024"),
+        "table name must encode the 1024 dim"
+    );
+}
+
+/// Step 7 AC: purge on a non-nomic notebook resolves the notebook's model and
+/// drops the correct coordinate's vectors without error (it must NOT hard-code
+/// the global nomic default).
+#[tokio::test]
+async fn purge_resolves_per_notebook_model() {
+    if !tokenizer_available().await {
+        eprintln!("skipping purge_resolves_per_notebook_model: no tokenizer (offline)");
+        return;
+    }
+    let (_dir, engine) = file_engine().await;
+    inject_fake_embedder(&engine);
+    inject_mxbai_embedder(&engine);
+
+    let nb = engine
+        .create_notebook("mxbai-purge-nb", None, None)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE notebooks SET embedding_model = ? WHERE id = ?")
+        .bind("mxbai-embed-large")
+        .bind(nb.id.as_str())
+        .execute(&engine.pool().await)
+        .await
+        .unwrap();
+
+    let src = engine
+        .add_text_source(&nb.id, "doc", "# T\n\nBody.\n", "markdown")
+        .await
+        .unwrap();
+    engine
+        .ingest_source(&src.id, |_p| {})
+        .await
+        .expect("ingest");
+
+    // Trash then purge: purge requires a trashed source.
+    engine.trash_source(&src.id).await.expect("trash");
+    engine
+        .purge_source(&src.id)
+        .await
+        .expect("purge mxbai source");
+
+    // The source row is gone and no error was raised resolving the coordinate.
+    let pool = engine.pool().await;
+    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sources WHERE id = ?")
+        .bind(&src.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(remaining, 0, "purged source row removed");
+}
+
 /// AC: a failing ingest sets `sources.status = "error"`. We force the failure by
 /// deleting the managed source file out from under the pipeline (read fails).
 #[tokio::test]
@@ -830,7 +969,7 @@ fn real_model_cosine_self_similarity_and_prefixing() {
         .unwrap();
 
     // 768-dim, L2-normalized.
-    assert_eq!(doc1[0].len(), EMBED_DIM);
+    assert_eq!(doc1[0].len(), DEFAULT_EMBED_DIM);
     let norm: f32 = doc1[0].iter().map(|x| x * x).sum::<f32>().sqrt();
     assert!((norm - 1.0).abs() < 1e-3, "‖v‖ ≈ 1, got {norm}");
 
@@ -1212,7 +1351,13 @@ async fn real_model_end_to_end_ingest_and_search() {
         .embed_query("what makes energy in a cell?")
         .unwrap();
     let hits = store
-        .search(&nb.id.to_string(), EMBED_MODEL_ID, EMBED_DIM, &qvec, 5)
+        .search(
+            &nb.id.to_string(),
+            DEFAULT_EMBED_MODEL_ID,
+            DEFAULT_EMBED_DIM,
+            &qvec,
+            5,
+        )
         .await
         .unwrap();
     assert!(!hits.is_empty(), "real-model search returns hits");

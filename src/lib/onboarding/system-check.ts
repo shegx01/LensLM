@@ -97,9 +97,11 @@ export interface EmbeddingModelSpec {
   description: string;
 }
 
-// SYNC-CHECK: the `id`s here must stay in lockstep with the single source of
-// truth `ALLOWED_EMBEDDING_MODELS` in lens-core/src/system_check.rs (the install
-// allowlist). Adding/removing a model means editing the Rust slice too.
+// SYNC-CHECK: keep in sync with lens-core/src/embedder/registry.rs REGISTRY
+// (fastembed model specs) and `ALLOWED_EMBEDDING_MODELS` in
+// lens-core/src/system_check.rs (the install allowlist). The `dims` here must
+// match `EmbeddingModelSpec.dim` in the registry. Adding/removing a model means
+// editing both Rust files too.
 export const EMBEDDING_MODELS: EmbeddingModelSpec[] = [
   {
     id: 'nomic-embed-text',

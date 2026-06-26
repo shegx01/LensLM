@@ -30,7 +30,9 @@ use lens_core::llm::LlmProvider;
 use lens_core::vector_store::{
     CRASH_AFTER_FLIP_TXN_BEFORE_LANCE_DROP, LanceVectorStore, VectorStore,
 };
-use lens_core::{CountingEmbedder, EMBED_DIM, EMBED_MODEL_ID, Embedder, LensEngine};
+use lens_core::{
+    CountingEmbedder, DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, Embedder, LensEngine,
+};
 use sqlx::Row;
 use tempfile::TempDir;
 
@@ -74,10 +76,10 @@ struct FailingEmbedder;
 
 impl Embedder for FailingEmbedder {
     fn model_id(&self) -> &str {
-        EMBED_MODEL_ID
+        DEFAULT_EMBED_MODEL_ID
     }
     fn dim(&self) -> usize {
-        EMBED_DIM
+        DEFAULT_EMBED_DIM
     }
     fn embed_documents(&self, _texts: &[&str]) -> Result<Vec<Vec<f32>>, LensError> {
         Err(LensError::Model("injected embed failure".into()))
@@ -236,7 +238,7 @@ async fn seed_prose_source_in(engine: &LensEngine, nb: &str) -> String {
         row(&child_id, &source_id, nb, 1),
     ];
     store
-        .add(nb, EMBED_MODEL_ID, EMBED_DIM, rows)
+        .add(nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM, rows)
         .await
         .expect("seed raw active vectors");
 
@@ -251,8 +253,8 @@ fn row(
 ) -> lens_core::vector_store::VectorRow {
     // Distinct raw vectors per chunk (axis-aligned) so a "raw vs enriched" diff is
     // observable; the enriched re-embed overwrites these in a NEW table.
-    let mut v = vec![0.0_f32; EMBED_DIM];
-    v[(level as usize) % EMBED_DIM] = 1.0;
+    let mut v = vec![0.0_f32; DEFAULT_EMBED_DIM];
+    v[(level as usize) % DEFAULT_EMBED_DIM] = 1.0;
     lens_core::vector_store::VectorRow {
         chunk_id: chunk_id.to_string(),
         source_id: source_id.to_string(),
@@ -321,7 +323,7 @@ async fn search_chunk_ids(engine: &LensEngine, notebook: &str, query_text: &str)
     let q = embedder.embed_query(query_text).expect("embed query");
     let store = LanceVectorStore::new(&data_dir, pool);
     store
-        .search(notebook, EMBED_MODEL_ID, EMBED_DIM, &q, 10)
+        .search(notebook, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM, &q, 10)
         .await
         .expect("search")
         .into_iter()
@@ -418,7 +420,7 @@ async fn search_resolves_gen_suffixed_active_table_after_flip() {
     // Pre-flip: the active table is the gen-0 formula name.
     assert_eq!(
         active_table_name(&engine, &nb).await,
-        format!("vec__{nb}__nomic_v15"),
+        format!("vec__{nb}__nomic_v15__d{DEFAULT_EMBED_DIM}"),
         "pre-flip active must be the gen-0 formula name"
     );
 
@@ -433,7 +435,7 @@ async fn search_resolves_gen_suffixed_active_table_after_flip() {
     assert_eq!(registry_count(&engine, "active").await, 1);
     assert_eq!(
         active_table_name(&engine, &nb).await,
-        format!("vec__{nb}__nomic_v15__1"),
+        format!("vec__{nb}__nomic_v15__d{DEFAULT_EMBED_DIM}__1"),
         "post-flip active must be the gen-1 enriched table"
     );
     assert_eq!(registry_count(&engine, "stale").await, 0, "stale dropped");
@@ -446,13 +448,15 @@ async fn search_resolves_gen_suffixed_active_table_after_flip() {
     // The gen-0 raw table is physically dropped; the gen-1 enriched table lives.
     let tables = live_lance_tables(&data_dir).await;
     assert!(
-        !tables.iter().any(|t| t == &format!("vec__{nb}__nomic_v15")),
+        !tables
+            .iter()
+            .any(|t| t == &format!("vec__{nb}__nomic_v15__d{DEFAULT_EMBED_DIM}")),
         "the stale gen-0 table must be dropped; tables: {tables:?}"
     );
     assert!(
         tables
             .iter()
-            .any(|t| t == &format!("vec__{nb}__nomic_v15__1")),
+            .any(|t| t == &format!("vec__{nb}__nomic_v15__d{DEFAULT_EMBED_DIM}__1")),
         "the enriched gen-1 table must exist; tables: {tables:?}"
     );
 
@@ -499,7 +503,7 @@ async fn crash_between_flip_txn_commit_and_lance_drop() {
     // (a) active row points at the COMPLETE enriched gen-1 table.
     assert_eq!(
         active_table_name(&engine, &nb).await,
-        format!("vec__{nb}__nomic_v15__1"),
+        format!("vec__{nb}__nomic_v15__d{DEFAULT_EMBED_DIM}__1"),
         "active must point at the enriched gen-1 table after the committed flip"
     );
     // (b) a stale row + orphan gen-0 Lance table remain (the crash skipped the drop).
@@ -510,7 +514,9 @@ async fn crash_between_flip_txn_commit_and_lance_drop() {
     );
     let tables = live_lance_tables(&data_dir).await;
     assert!(
-        tables.iter().any(|t| t == &format!("vec__{nb}__nomic_v15")),
+        tables
+            .iter()
+            .any(|t| t == &format!("vec__{nb}__nomic_v15__d{DEFAULT_EMBED_DIM}")),
         "the orphan gen-0 Lance table must still exist; tables: {tables:?}"
     );
     // (d) search never mixed/empty — it resolves the active gen-1 table only.
@@ -535,13 +541,15 @@ async fn crash_between_flip_txn_commit_and_lance_drop() {
     );
     let tables = live_lance_tables(&data_dir).await;
     assert!(
-        !tables.iter().any(|t| t == &format!("vec__{nb}__nomic_v15")),
+        !tables
+            .iter()
+            .any(|t| t == &format!("vec__{nb}__nomic_v15__d{DEFAULT_EMBED_DIM}")),
         "GC must drop the orphan gen-0 Lance table; tables: {tables:?}"
     );
     assert!(
         tables
             .iter()
-            .any(|t| t == &format!("vec__{nb}__nomic_v15__1")),
+            .any(|t| t == &format!("vec__{nb}__nomic_v15__d{DEFAULT_EMBED_DIM}__1")),
         "the enriched gen-1 table must survive GC; tables: {tables:?}"
     );
     // Search still works after GC.
@@ -580,7 +588,7 @@ async fn crash_during_building_table_populate() {
     // The active row is still the gen-0 raw table (never touched by the flip).
     assert_eq!(
         active_table_name(&engine, &nb).await,
-        format!("vec__{nb}__nomic_v15"),
+        format!("vec__{nb}__nomic_v15__d{DEFAULT_EMBED_DIM}"),
         "active must remain the raw gen-0 table"
     );
     // A building orphan row exists (the empty gen-1 table was created before the
@@ -613,7 +621,9 @@ async fn crash_during_building_table_populate() {
     );
     let tables = live_lance_tables(&data_dir).await;
     assert!(
-        tables.iter().any(|t| t == &format!("vec__{nb}__nomic_v15")),
+        tables
+            .iter()
+            .any(|t| t == &format!("vec__{nb}__nomic_v15__d{DEFAULT_EMBED_DIM}")),
         "the active raw gen-0 table must survive GC; tables: {tables:?}"
     );
 }
@@ -643,7 +653,7 @@ async fn sequential_purge_then_reembed_skips_flip() {
     // Pre-state: the active table is the gen-0 raw table; no building row yet.
     assert_eq!(
         active_table_name(&engine, &nb).await,
-        format!("vec__{nb}__nomic_v15"),
+        format!("vec__{nb}__nomic_v15__d{DEFAULT_EMBED_DIM}"),
         "pre-flip active must be the gen-0 raw table"
     );
     assert_eq!(registry_count(&engine, "building").await, 0);
@@ -714,7 +724,7 @@ async fn sequential_purge_then_reembed_skips_flip() {
     // table (never promoted to the building gen-1 table).
     assert_eq!(
         active_table_name(&engine, &nb).await,
-        format!("vec__{nb}__nomic_v15"),
+        format!("vec__{nb}__nomic_v15__d{DEFAULT_EMBED_DIM}"),
         "the flip must be skipped: active stays the gen-0 raw table"
     );
     assert_eq!(
@@ -755,7 +765,7 @@ async fn sequential_purge_then_reembed_skips_flip() {
     assert!(
         !tables
             .iter()
-            .any(|t| t == &format!("vec__{nb}__nomic_v15__1")),
+            .any(|t| t == &format!("vec__{nb}__nomic_v15__d{DEFAULT_EMBED_DIM}__1")),
         "GC must drop the orphan building gen-1 table; tables: {tables:?}"
     );
 }
@@ -856,7 +866,7 @@ async fn add_after_flip_targets_registered_active_table() {
     );
     assert_eq!(
         active_table_name(&engine, &nb).await,
-        format!("vec__{nb}__nomic_v15__1"),
+        format!("vec__{nb}__nomic_v15__d{DEFAULT_EMBED_DIM}__1"),
         "post-flip active must be the gen-1 table"
     );
 
@@ -869,8 +879,8 @@ async fn add_after_flip_targets_registered_active_table() {
     store
         .add(
             &nb,
-            EMBED_MODEL_ID,
-            EMBED_DIM,
+            DEFAULT_EMBED_MODEL_ID,
+            DEFAULT_EMBED_DIM,
             vec![row(&new_chunk, &new_src, &nb, 0)],
         )
         .await
@@ -885,7 +895,7 @@ async fn add_after_flip_targets_registered_active_table() {
     );
     assert_eq!(
         active_table_name(&engine, &nb).await,
-        format!("vec__{nb}__nomic_v15__1"),
+        format!("vec__{nb}__nomic_v15__d{DEFAULT_EMBED_DIM}__1"),
         "post-flip add must not create a new gen-0 active"
     );
     assert_eq!(
