@@ -92,6 +92,7 @@ describe('MakeItYours', () => {
           endpoints: {},
           voices: { host: '', guest: '' },
           tts: { provider: '', api_key: '' },
+          enrichment: { enabled: false, coref_strategy: 'llm_inline', cloud_consent: false },
           paths: { data_dir: '' },
           tier_thresholds: { tier1_token_cap: 0, tier2_token_cap: 0 },
           onboarding_complete: false,

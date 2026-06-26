@@ -11,7 +11,7 @@
 //
 // No new Rust command, no main.rs touch.
 
-import type { ModelConfig } from '$lib/theme/types.js';
+import type { ModelConfig, CorefStrategy, EnrichmentConfig } from '$lib/theme/types.js';
 import { updateConfig } from '$lib/config.js';
 
 export type LlmProviderTab = 'local' | 'cloud';
@@ -52,4 +52,29 @@ export async function saveLlmProvider(input: LlmProviderInput): Promise<void> {
       idx >= 0 ? existing.map((m, i) => (i === idx ? entry : m)) : [...existing, entry];
     return { ...cfg, models };
   });
+}
+
+/** The enrichment preferences captured by the onboarding LLM step. */
+export interface EnrichmentPrefsInput {
+  enabled: boolean;
+  coref_strategy: CorefStrategy;
+  /** Cloud-LLM consent. Ignored (and forced false) for local-only setups. */
+  cloud_consent: boolean;
+}
+
+/**
+ * Read-modify-write `enrichment` while preserving every other AppConfig field
+ * (mirrors {@link saveLlmProvider}). Replaces the whole `enrichment` section —
+ * the three fields are co-owned by this onboarding step, so there is nothing else
+ * to merge. A no-op outside Tauri (the `updateConfig` guard), so onboarding stays
+ * non-blocking: a skipped step simply never calls this and the Rust-side
+ * `#[serde(default)]` keeps the conservative defaults.
+ */
+export async function saveEnrichmentPrefs(input: EnrichmentPrefsInput): Promise<void> {
+  const enrichment: EnrichmentConfig = {
+    enabled: input.enabled,
+    coref_strategy: input.coref_strategy,
+    cloud_consent: input.cloud_consent
+  };
+  await updateConfig((cfg) => ({ ...cfg, enrichment }));
 }

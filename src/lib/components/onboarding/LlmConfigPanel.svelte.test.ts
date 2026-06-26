@@ -27,6 +27,7 @@ function baseConfig() {
     endpoints: {},
     voices: { host: '', guest: '' },
     tts: { provider: '', api_key: '' },
+    enrichment: { enabled: false, coref_strategy: 'llm_inline' as const, cloud_consent: false },
     paths: { data_dir: '' },
     tier_thresholds: { tier1_token_cap: 4000, tier2_token_cap: 16000 },
     onboarding_complete: false,
@@ -113,8 +114,9 @@ describe('LlmConfigPanel — Auto-detect', () => {
     // Version confirmation text appears
     await waitFor(() => expect(screen.getByText(/ollama 0\.3\.2 detected/i)).toBeInTheDocument());
 
-    // Model select appears with detected models
-    const select = screen.getByRole('combobox');
+    // Model select appears with detected models. Target the model picker by its
+    // id (the panel also renders an enrichment "Pronoun resolution" combobox).
+    const select = screen.getByLabelText('Model', { selector: '#llm-model-local' });
     expect(select).toBeInTheDocument();
     expect(screen.getByRole('option', { name: 'llama3.2:3b' })).toBeInTheDocument();
     expect(screen.getByRole('option', { name: 'mistral:7b' })).toBeInTheDocument();
@@ -548,6 +550,124 @@ describe('LlmConfigPanel — Save (cloud tab)', () => {
                 model: 'gpt-5-turbo'
               })
             ])
+          })
+        })
+      )
+    );
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// Enrichment (M4 Phase 3) — toggle + coref select + cloud consent
+// ──────────────────────────────────────────────────────────────────────────
+
+describe('LlmConfigPanel — Enrichment prefs', () => {
+  it('renders the enable toggle + coref select; cloud consent is HIDDEN on the local tab', async () => {
+    render(SystemCheckRow, { props: { result: llmRow(), oncheck: vi.fn() } });
+    await fireEvent.click(screen.getByRole('button', { name: /configure/i }));
+
+    await waitFor(() =>
+      expect(screen.getByRole('switch', { name: /enable enrichment/i })).toBeInTheDocument()
+    );
+    // Coref select present.
+    expect(
+      screen.getByLabelText(/pronoun resolution/i, { selector: '#enrichment-coref' })
+    ).toBeInTheDocument();
+    // The cloud consent checkbox only appears on the Cloud API tab.
+    expect(screen.queryByRole('checkbox', { name: /send document text/i })).not.toBeInTheDocument();
+  });
+
+  it('shows the cloud privacy/cost consent note ONLY on the Cloud API tab', async () => {
+    render(SystemCheckRow, { props: { result: llmRow(), oncheck: vi.fn() } });
+    await fireEvent.click(screen.getByRole('button', { name: /configure/i }));
+    await waitFor(() =>
+      expect(screen.getByRole('tab', { name: /cloud api/i })).toBeInTheDocument()
+    );
+
+    await fireEvent.click(screen.getByRole('tab', { name: /cloud api/i }));
+
+    const consent = screen.getByRole('checkbox', { name: /send document text/i });
+    expect(consent).toBeInTheDocument();
+    // Defaults OFF (explicit-enable, not a dark pattern).
+    expect(consent).not.toBeChecked();
+    // The disclosure names the cost + that text leaves the machine.
+    expect(screen.getByText(/leaves your machine/i)).toBeInTheDocument();
+    expect(screen.getByText(/api costs/i)).toBeInTheDocument();
+  });
+
+  it('persists enrichment prefs on the local Test connection (consent forced false)', async () => {
+    const setConfig = vi.fn();
+    const oncheck = vi.fn().mockResolvedValue(undefined);
+
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return baseConfig();
+      if (cmd === 'set_config') {
+        setConfig(args);
+        return null;
+      }
+      if (cmd === 'detect_llm') return { reachable: true, version: 'Ollama 0.3.2', models: [] };
+    });
+
+    render(SystemCheckRow, { props: { result: llmRow(), oncheck } });
+    await fireEvent.click(screen.getByRole('button', { name: /configure/i }));
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: /test connection/i })).toBeInTheDocument()
+    );
+
+    await fireEvent.click(screen.getByRole('button', { name: /test connection/i }));
+
+    // The enrichment section was persisted (local defaults: enabled + llm_inline,
+    // consent forced false because local text never leaves the machine).
+    await waitFor(() =>
+      expect(setConfig).toHaveBeenCalledWith(
+        expect.objectContaining({
+          config: expect.objectContaining({
+            enrichment: expect.objectContaining({
+              enabled: true,
+              coref_strategy: 'llm_inline',
+              cloud_consent: false
+            })
+          })
+        })
+      )
+    );
+  });
+
+  it('cloud Save persists cloud_consent and gates enabled on it', async () => {
+    const setConfig = vi.fn();
+    const oncheck = vi.fn().mockResolvedValue(undefined);
+
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return baseConfig();
+      if (cmd === 'set_config') {
+        setConfig(args);
+        return null;
+      }
+    });
+
+    render(SystemCheckRow, { props: { result: llmRow(), oncheck } });
+    await fireEvent.click(screen.getByRole('button', { name: /configure/i }));
+    await waitFor(() =>
+      expect(screen.getByRole('tab', { name: /cloud api/i })).toBeInTheDocument()
+    );
+    await fireEvent.click(screen.getByRole('tab', { name: /cloud api/i }));
+
+    // Grant consent + provide a key.
+    await fireEvent.click(screen.getByRole('checkbox', { name: /send document text/i }));
+    await fireEvent.input(screen.getByLabelText(/api key/i), {
+      target: { value: 'sk-test-key' }
+    });
+
+    await fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+    await waitFor(() =>
+      expect(setConfig).toHaveBeenCalledWith(
+        expect.objectContaining({
+          config: expect.objectContaining({
+            enrichment: expect.objectContaining({
+              enabled: true,
+              cloud_consent: true
+            })
           })
         })
       )

@@ -25,6 +25,29 @@ export interface TtsConfig {
   api_key: string;
 }
 
+// SYNC-CHECK: must match lens-core/src/enrichment/embedding_text.rs CorefStrategy —
+// the snake_case serde strings are the on-disk JSON + cache-key contract; update both.
+//
+// The coreference-resolution strategy applied while composing `embedding_text`.
+// `dedicated_model` is a config-level stub in Phase 3 (falls back to `llm_inline`
+// at runtime — Decision I), but the value is still persisted/round-tripped.
+export type CorefStrategy = 'none' | 'llm_inline' | 'dedicated_model';
+
+// SYNC-CHECK: must match lens-core/src/config.rs EnrichmentConfig — update both together.
+//
+// Optional, additive background-enrichment config (M4 Phase 3). An older config
+// written before Phase 3 has no `enrichment` key and reads back as the Rust
+// `EnrichmentConfig::default` via `#[serde(default)]`.
+export interface EnrichmentConfig {
+  // Master toggle. When false, enrichment never runs (sources stay on raw vectors).
+  enabled: boolean;
+  // Coref strategy (snake_case to match the Rust serde mirror). Default 'llm_inline'.
+  coref_strategy: CorefStrategy;
+  // Explicit consent to send document text to a CLOUD LLM. Default false (local-first);
+  // cloud enrichment never dispatches without it.
+  cloud_consent: boolean;
+}
+
 export interface PathConfig {
   data_dir: string;
 }
@@ -44,6 +67,8 @@ export interface AppConfig {
   voices: VoiceConfig;
   // SYNC-CHECK: must match lens-core/src/config.rs AppConfig.tts (default empty).
   tts: TtsConfig;
+  // SYNC-CHECK: must match lens-core/src/config.rs AppConfig.enrichment (default disabled).
+  enrichment: EnrichmentConfig;
   paths: PathConfig;
   tier_thresholds: TierThresholds;
   onboarding_complete: boolean;

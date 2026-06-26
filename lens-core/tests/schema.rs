@@ -63,7 +63,7 @@ async fn migration_is_idempotent_second_run_is_noop() {
         .unwrap();
 
     assert_eq!(count_before, count_after);
-    assert_eq!(count_after, 4, "all migration files applied");
+    assert_eq!(count_after, 5, "all migration files applied");
 }
 
 #[tokio::test]
@@ -207,7 +207,7 @@ async fn embedding_index_unique_constraint_rejects_duplicates() {
     let nb = engine.create_notebook("embidx", None, None).await.unwrap();
     let now = chrono::Utc::now().to_rfc3339();
 
-    let insert = |id: String| {
+    let insert = |id: String, status: &'static str, table: &'static str| {
         let pool = pool.clone();
         let nb_id = nb.id.clone();
         let now = now.clone();
@@ -215,31 +215,198 @@ async fn embedding_index_unique_constraint_rejects_duplicates() {
             sqlx::query(
                 "INSERT INTO embedding_index \
                  (id, notebook_id, model, dim, prefix_convention, lance_table_name, status, created_at) \
-                 VALUES (?, ?, 'bge-m3', 1024, 'query:', 'vec__nb__bge', 'active', ?)",
+                 VALUES (?, ?, 'bge-m3', 1024, 'query:', ?, ?, ?)",
             )
             .bind(id)
             .bind(nb_id)
+            .bind(table)
+            .bind(status)
             .bind(now)
             .execute(&pool)
             .await
         }
     };
 
-    insert(Uuid::now_v7().to_string()).await.unwrap();
-    let dup = insert(Uuid::now_v7().to_string()).await;
+    insert(Uuid::now_v7().to_string(), "active", "vec__nb__bge")
+        .await
+        .unwrap();
+    // Under the partial unique index `uq_embidx_active`, a SECOND `active` row
+    // for the same (notebook, model, dim) coordinate is still rejected.
+    let dup = insert(Uuid::now_v7().to_string(), "active", "vec__nb__bge2").await;
     assert!(
         dup.is_err(),
-        "duplicate (notebook,model,dim) must be rejected"
+        "duplicate active (notebook,model,dim) must be rejected"
     );
 
-    // lance_table_name round-trips.
-    let name: String =
-        sqlx::query_scalar("SELECT lance_table_name FROM embedding_index WHERE notebook_id = ?")
-            .bind(&nb.id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    // ...but a `building` row for the SAME coordinate is now ACCEPTED (the
+    // relaxation in 0005 — co-existing active + building during a flip).
+    insert(Uuid::now_v7().to_string(), "building", "vec__nb__bge__g1")
+        .await
+        .expect("a building row for the same coordinate must now insert");
+
+    // lance_table_name round-trips for the active row.
+    let name: String = sqlx::query_scalar(
+        "SELECT lance_table_name FROM embedding_index \
+         WHERE notebook_id = ? AND status = 'active'",
+    )
+    .bind(&nb.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(name, "vec__nb__bge");
+}
+
+/// AC1: the new nullable columns exist after `0005` and read NULL on pre-existing
+/// rows; the registry table-rebuild preserves every existing row (the
+/// `lance_table_name`/`status`/`created_at` round-trip intact).
+#[tokio::test]
+async fn migration_0005_adds_enrichment_columns_and_preserves_registry() {
+    let engine = LensEngine::for_test().await;
+    let pool = engine.pool().await;
+
+    // New chunks column.
+    let chunk_cols: HashSet<String> = sqlx::query("PRAGMA table_info(chunks)")
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.get::<String, _>("name"))
+        .collect();
+    assert!(
+        chunk_cols.contains("embedding_text"),
+        "chunks.embedding_text must exist after 0005"
+    );
+    // Canonical text column is untouched.
+    assert!(chunk_cols.contains("text"));
+
+    // New sources columns.
+    let source_cols: HashSet<String> = sqlx::query("PRAGMA table_info(sources)")
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.get::<String, _>("name"))
+        .collect();
+    assert!(
+        source_cols.contains("enrichment_status"),
+        "sources.enrichment_status must exist after 0005"
+    );
+    assert!(
+        source_cols.contains("enrichment_meta"),
+        "sources.enrichment_meta must exist after 0005"
+    );
+
+    // The lookup index survived the rebuild.
+    let indexes: HashSet<String> = sqlx::query("PRAGMA index_list(embedding_index)")
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.get::<String, _>("name"))
+        .collect();
+    assert!(
+        indexes.contains("idx_embidx_notebook"),
+        "idx_embidx_notebook must be recreated after the rebuild, found: {indexes:?}"
+    );
+    assert!(
+        indexes.contains("uq_embidx_active"),
+        "the partial unique uq_embidx_active must exist, found: {indexes:?}"
+    );
+}
+
+/// AC1: applying `0005` on a POPULATED Phase-2 DB preserves existing chunk,
+/// source, and registry rows; the new columns read NULL on those rows.
+#[tokio::test]
+async fn migration_0005_clean_on_populated_phase2_db() {
+    let engine = LensEngine::for_test().await;
+    let pool = engine.pool().await;
+
+    let nb = engine
+        .create_notebook("populated", None, None)
+        .await
+        .unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+
+    // Seed a source + chunk + a registry row (the Phase-2 shape).
+    let source_id = Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO sources (id, notebook_id, kind, title, status, locator, created_at) \
+         VALUES (?, ?, 'text', 't', 'indexed', 'loc', ?)",
+    )
+    .bind(&source_id)
+    .bind(&nb.id)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let chunk_id = Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO chunks (id, source_id, kind, level, section_path, text, created_at) \
+         VALUES (?, ?, 'parent', 0, '[]', 'canonical body', ?)",
+    )
+    .bind(&chunk_id)
+    .bind(&source_id)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let idx_id = Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO embedding_index \
+         (id, notebook_id, model, dim, prefix_convention, lance_table_name, status, created_at) \
+         VALUES (?, ?, 'nomic-embed-text-v1.5', 768, 'search_document: ', 'vec__nb__nomic_v15', 'active', ?)",
+    )
+    .bind(&idx_id)
+    .bind(&nb.id)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // `for_test` already ran 0001..0005, so this asserts the migration is clean
+    // against a populated DB shape (rows survive, new columns read NULL).
+    let row = sqlx::query("SELECT text, embedding_text FROM chunks WHERE id = ?")
+        .bind(&chunk_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(row.get::<String, _>("text"), "canonical body");
+    assert!(
+        row.get::<Option<String>, _>("embedding_text").is_none(),
+        "embedding_text must read NULL on pre-existing chunk rows"
+    );
+
+    let src = sqlx::query("SELECT enrichment_status, enrichment_meta FROM sources WHERE id = ?")
+        .bind(&source_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(
+        src.get::<Option<String>, _>("enrichment_status").is_none(),
+        "enrichment_status must read NULL (≡ none) on pre-existing source rows"
+    );
+    assert!(
+        src.get::<Option<String>, _>("enrichment_meta").is_none(),
+        "enrichment_meta must read NULL on pre-existing source rows"
+    );
+
+    // The registry row survived the table-rebuild intact.
+    let reg = sqlx::query(
+        "SELECT lance_table_name, status, created_at FROM embedding_index WHERE id = ?",
+    )
+    .bind(&idx_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        reg.get::<String, _>("lance_table_name"),
+        "vec__nb__nomic_v15",
+        "lance_table_name must round-trip through the rebuild"
+    );
+    assert_eq!(reg.get::<String, _>("status"), "active");
+    assert_eq!(reg.get::<String, _>("created_at"), now);
 }
 
 #[tokio::test]
@@ -383,7 +550,7 @@ async fn cold_init_under_budget_on_empty_temp_db() {
     let engine = LensEngine::init(dir.path()).await.unwrap();
     let elapsed = start.elapsed();
     // Sanity: the engine works.
-    assert_eq!(engine.migration_count().await.unwrap(), 4);
+    assert_eq!(engine.migration_count().await.unwrap(), 5);
     // Generous smoke guard against accidentally-expensive migrations (e.g. a
     // future migration that scans/rewrites large tables on cold start). This is
     // NOT a tight perf benchmark — the wide 2s budget keeps it non-flaky on

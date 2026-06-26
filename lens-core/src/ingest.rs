@@ -207,29 +207,46 @@ pub async fn ingest_source(
     source_id: &str,
     on_progress: impl FnMut(IngestProgress),
 ) -> Result<(), LensError> {
-    // Serialize the whole pipeline (single ONNX session — Decision D1 / M2).
-    let _permit = engine
-        .ingest_lock()
-        .acquire()
-        .await
-        .map_err(|e| LensError::Internal(format!("ingest semaphore closed: {e}")))?;
-
-    let result = run_ingest(engine, source_id, on_progress).await;
-
-    // On any failure, best-effort flip the source to `error` (Risk R10: treat a
-    // missing/cascade-deleted row as a graceful no-op, never a panic).
-    if result.is_err() {
-        let pool = engine.pool().await;
-        let repo = crate::notebooks::NotebookRepo::new(&pool);
-        if let Err(e) = repo
-            .update_source_status(source_id, crate::notebooks::SourceStatus::Error.as_str())
+    // Serialize the whole pipeline (single ONNX session — Decision D1 / M2). The
+    // permit is bound to an explicit scope so it is RELEASED before the enrichment
+    // enqueue below: the enqueue (AC3) must happen OUTSIDE the held permit so it
+    // never blocks under the lock and a full channel can never deadlock against it.
+    let result = {
+        let _permit = engine
+            .ingest_lock()
+            .acquire()
             .await
-        {
-            tracing::warn!(
-                source_id,
-                "failed to mark source as error after ingest failure: {e}"
-            );
+            .map_err(|e| LensError::Internal(format!("ingest semaphore closed: {e}")))?;
+
+        let result = run_ingest(engine, source_id, on_progress).await;
+
+        // On any failure, best-effort flip the source to `error` (Risk R10: treat a
+        // missing/cascade-deleted row as a graceful no-op, never a panic).
+        if result.is_err() {
+            let pool = engine.pool().await;
+            let repo = crate::notebooks::NotebookRepo::new(&pool);
+            if let Err(e) = repo
+                .update_source_status(source_id, crate::notebooks::SourceStatus::Error.as_str())
+                .await
+            {
+                tracing::warn!(
+                    source_id,
+                    "failed to mark source as error after ingest failure: {e}"
+                );
+            }
         }
+
+        result
+    }; // `_permit` dropped HERE — the ingest_lock is now released.
+
+    // ── Enqueue background enrichment (AC3) — STRICTLY after the permit drop ──
+    // A successful ingest left the source `Indexed` (set inside `run_ingest`). Now
+    // that the permit is released, issue the non-blocking `try_send`: it never
+    // awaits the lock, and a full channel is recovered by the startup/rescan
+    // queue-rebuild. On a failed ingest the source is `error`, so there is nothing
+    // to enrich — skip the enqueue.
+    if result.is_ok() {
+        engine.enqueue_enrichment(source_id);
     }
 
     result
@@ -548,6 +565,17 @@ async fn run_ingest(
     // NOTE: `&mut tx` coerces to `&mut SqliteConnection` via `Transaction`'s
     // `DerefMut`; the helpers take `&mut SqliteConnection` so they run inside
     // this transaction rather than against the pool directly.
+
+    // ── Reset enrichment on content change (AC12) ─────────────────────────
+    // Reaching here means the content changed (the unchanged-content paths above
+    // returned early): the chunks + vectors were just re-written, so any prior
+    // enrichment (`chunks.enrichment`, `embedding_text`, the cache key in
+    // `enrichment_meta`) is now stale. Reset `enrichment_status` to `none` so the
+    // post-`Indexed` enqueue (issued OUTSIDE the held permit by `ingest_source`)
+    // re-runs the pass. This UPDATE runs UNDER the held `ingest_lock` permit (we
+    // are inside `run_ingest`), distinct from the non-blocking enqueue.
+    repo.update_enrichment_status(source_id, crate::notebooks::EnrichmentStatus::None)
+        .await?;
 
     // ── Empty-doc short-circuit ───────────────────────────────────────────
     // An empty/whitespace-only source produces zero chunks. There is nothing to
@@ -1064,11 +1092,12 @@ async fn delete_chunks_for_source(
 
 /// Number of `chunks` rows inserted per multi-row `INSERT` statement.
 ///
-/// Each row binds 15 variables (16 columns; `enrichment` is a literal `NULL`,
-/// `page` is always bound — to the PDF page or `NULL` — and `source_anchor` is
-/// bound), so the per-statement variable count is at most `60 * 15 = 900`,
-/// comfortably under SQLite's default 999-bound-variable limit
-/// (`SQLITE_MAX_VARIABLE_NUMBER`).
+/// Each row binds 15 variables (17 columns; both `enrichment` and
+/// `embedding_text` are literal `NULL`s — `embedding_text` is populated later by
+/// the M4 Phase-3 enrichment worker via UPDATE — `page` is always bound to the
+/// PDF page or `NULL`, and `source_anchor` is bound), so the per-statement
+/// variable count is at most `60 * 15 = 900`, comfortably under SQLite's default
+/// 999-bound-variable limit (`SQLITE_MAX_VARIABLE_NUMBER`).
 const CHUNK_INSERT_BATCH: usize = 60;
 
 /// Inserts the parent + child chunk rows for `source_id`.
@@ -1100,8 +1129,9 @@ async fn insert_chunks(
 
 /// Inserts one batch of `chunks` rows in a single multi-row `INSERT` statement.
 ///
-/// `enrichment` stays a literal `NULL` (reserved for the M4 Phase-3 enrichment
-/// pass; do NOT write here).  `page` is derived from `chunk.source_anchor` when
+/// `enrichment` and `embedding_text` stay literal `NULL`s (both reserved for the
+/// M4 Phase-3 enrichment pass — `embedding_text` is populated later via UPDATE;
+/// do NOT write either here).  `page` is derived from `chunk.source_anchor` when
 /// it carries a `SourceAnchor::Pdf { page, .. }` — so PDF chunks get a non-NULL
 /// `page` for free and all other chunks get a literal `NULL`.  `source_anchor`
 /// is bound from `chunk.source_anchor` (JSON text or NULL).
@@ -1118,7 +1148,7 @@ async fn insert_chunk_batch(
         "INSERT INTO chunks \
              (id, source_id, parent_id, kind, level, section_path, text, \
               token_start, token_end, page, char_start, char_end, block_type, \
-              enrichment, source_anchor, created_at) ",
+              enrichment, embedding_text, source_anchor, created_at) ",
     );
     qb.push_values(chunks, |mut b, chunk| {
         // Derive the page number from the anchor when it is a PDF anchor; all
@@ -1149,6 +1179,7 @@ async fn insert_chunk_batch(
             .push_bind(chunk.char_end)
             .push_bind(&chunk.block_type)
             .push("NULL") // enrichment — reserved for Phase-3
+            .push("NULL") // embedding_text — populated later by the Phase-3 worker
             .push_bind(&chunk.source_anchor) // JSON text or NULL
             .push_bind(now);
     });

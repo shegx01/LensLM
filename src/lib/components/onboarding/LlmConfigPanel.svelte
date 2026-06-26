@@ -6,8 +6,12 @@
   import LoaderCircle from '@lucide/svelte/icons/loader-circle';
   import { cn } from '$lib/utils.js';
   import { detectLlm } from '$lib/onboarding/system-check.js';
-  import { saveLlmProvider, type LlmProviderTab } from '$lib/onboarding/llm-config.js';
-  import type { AppConfig } from '$lib/theme/types.js';
+  import {
+    saveLlmProvider,
+    saveEnrichmentPrefs,
+    type LlmProviderTab
+  } from '$lib/onboarding/llm-config.js';
+  import type { AppConfig, CorefStrategy } from '$lib/theme/types.js';
   import { SELECT_CLASS } from './styles.js';
 
   // Cloud config has no Context Window picker (it's Local-only), so cloud saves
@@ -61,6 +65,27 @@
   let savedProviderId = $state<string | null>(null);
   let editingKey = $state(false);
   const hasSavedKey = $derived(cloudProvider === savedProviderId);
+
+  // --- Enrichment preferences (M4 Phase 3) ---
+  // Non-blocking: the toggle defaults to ON for the local tab (provider-driven
+  // default — local Ollama → enrichment on + LlmInline) and OFF for the cloud tab
+  // (cloud is explicit-enable + requires consent). Saving the provider above also
+  // persists these prefs via `saveEnrichmentPrefs` (RMW), so a user who completes
+  // (or skips) the step lands on the conservative Rust-side defaults regardless.
+  let enrichmentEnabled = $state(true);
+  let corefStrategy = $state<CorefStrategy>('llm_inline');
+  // Explicit, separate consent for sending document text to a CLOUD LLM. Shown
+  // only on the Cloud API tab; forced false on the local save path.
+  let cloudConsent = $state(false);
+
+  // Coref strategy options. `dedicated_model` is a Phase-3 stub that behaves like
+  // `llm_inline` at runtime (Decision I) — surfaced so the choice round-trips, but
+  // labeled honestly as falling back today.
+  const COREF_OPTIONS = [
+    { value: 'llm_inline' as const, label: 'Inline (recommended)' },
+    { value: 'none' as const, label: 'Off' },
+    { value: 'dedicated_model' as const, label: 'Dedicated model (falls back to inline)' }
+  ] as const;
 
   const CONTEXT_OPTIONS = [
     { label: '4K', value: 4096, helper: '~3,000 words. For very small models only.' },
@@ -148,6 +173,12 @@
         api_key: '',
         context: contextWindow
       });
+      // Local provider never sends text off-machine → consent is irrelevant (false).
+      await saveEnrichmentPrefs({
+        enabled: enrichmentEnabled,
+        coref_strategy: corefStrategy,
+        cloud_consent: false
+      });
       const result = await detectLlm(localEndpoint);
       if (result.reachable) {
         testStatus = 'success';
@@ -176,6 +207,14 @@
         model: cloudModel.trim() || provider.defaultModel,
         api_key: cloudApiKey,
         context: CLOUD_DEFAULT_CONTEXT
+      });
+      // Cloud enrichment is gated on explicit consent: without it, enrichment
+      // stays OFF so document text is never sent to a cloud LLM (and the Rust
+      // factory rejects a cloud provider without consent regardless).
+      await saveEnrichmentPrefs({
+        enabled: enrichmentEnabled && cloudConsent,
+        coref_strategy: corefStrategy,
+        cloud_consent: cloudConsent
       });
       await oncheck();
       oncollapse();
@@ -542,5 +581,95 @@
     <Button class="h-10 w-full" onclick={handleSave} disabled={cloudSaveDisabled}>
       {saving ? 'Saving…' : 'Save'}
     </Button>
+  </div>
+
+  <!-- ── Enrichment (M4 Phase 3) ──────────────────────────────────────────────
+       Shared across both tabs (the chosen provider runs the optional, additive
+       enrichment pass). Saved alongside the provider above; non-blocking. -->
+  <div class="border-border mt-4 flex flex-col gap-3 border-t pt-4">
+    <!-- ENABLE toggle row -->
+    <div class="flex items-start justify-between gap-3">
+      <div class="flex flex-col gap-0.5">
+        <label for="enrichment-enabled" class="text-foreground text-[0.82rem] font-medium">
+          Improve retrieval with enrichment
+        </label>
+        <p class="text-muted-foreground text-[0.72rem] leading-relaxed">
+          After a source is indexed, your LLM builds context (entities, sections, a summary) in the
+          background to sharpen search. Canonical text is never changed; sources stay usable
+          throughout.
+        </p>
+      </div>
+      <button
+        id="enrichment-enabled"
+        type="button"
+        role="switch"
+        aria-checked={enrichmentEnabled}
+        aria-label="Enable enrichment"
+        onclick={() => (enrichmentEnabled = !enrichmentEnabled)}
+        class={cn(
+          'relative mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors',
+          'focus-visible:ring-ring/50 outline-none focus-visible:ring-3',
+          enrichmentEnabled ? 'bg-primary' : 'bg-muted'
+        )}
+      >
+        <span
+          class={cn(
+            'bg-background inline-block size-4 transform rounded-full shadow-sm transition-transform',
+            enrichmentEnabled ? 'translate-x-4' : 'translate-x-0.5'
+          )}
+        ></span>
+      </button>
+    </div>
+
+    <!-- COREF STRATEGY select -->
+    <div class={cn('flex flex-col gap-1.5', !enrichmentEnabled && 'opacity-50')}>
+      <label
+        for="enrichment-coref"
+        class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase"
+      >
+        Pronoun resolution
+      </label>
+      <select
+        id="enrichment-coref"
+        bind:value={corefStrategy}
+        disabled={!enrichmentEnabled}
+        class={SELECT_CLASS}
+      >
+        {#each COREF_OPTIONS as opt (opt.value)}
+          <option value={opt.value}>{opt.label}</option>
+        {/each}
+      </select>
+      <p class="text-muted-foreground text-[0.72rem] leading-relaxed">
+        Resolves pronouns to their referents while building context, so a query like “what did she
+        invent?” still matches the right passage.
+      </p>
+    </div>
+
+    <!-- CLOUD CONSENT — only when a cloud provider is selected. Honest privacy +
+         cost disclosure (not a dark pattern): defaults OFF, explicit-enable. -->
+    {#if activeTab === 'cloud'}
+      <div class="border-border bg-muted/40 flex flex-col gap-2 rounded-lg border p-3">
+        <label class="flex items-start gap-2.5">
+          <input
+            type="checkbox"
+            bind:checked={cloudConsent}
+            class="border-input text-primary focus-visible:ring-ring/50 mt-0.5 size-4 shrink-0 rounded border outline-none focus-visible:ring-3"
+            aria-describedby="enrichment-cloud-note"
+          />
+          <span class="text-foreground text-[0.8rem] font-medium">
+            Send document text to this cloud provider for enrichment
+          </span>
+        </label>
+        <p
+          id="enrichment-cloud-note"
+          class="text-muted-foreground pl-[1.625rem] text-[0.72rem] leading-relaxed"
+        >
+          Enrichment sends the full text of your sources to {selectedProvider.name} so it can build context.
+          That text leaves your machine and may incur API costs billed by the provider per token. Local-first
+          is the default — leave this off to keep enrichment on-device only (no cloud enrichment runs
+          without your consent).
+        </p>
+      </div>
+    {/if}
   </div>
 </div>

@@ -13,9 +13,11 @@ pub mod config;
 pub(crate) mod db;
 pub mod embedder;
 pub mod embedding;
+pub mod enrichment;
 pub mod error;
 pub mod extract;
 pub mod ingest;
+pub mod llm;
 pub mod notebooks;
 pub mod parse;
 pub mod system_check;
@@ -25,11 +27,16 @@ pub mod vector_store;
 pub use config::AppConfig;
 pub use embedder::{CountingEmbedder, EMBED_DIM, EMBED_MODEL_ID, Embedder, FastembedEmbedder};
 pub use embedding::{InstallProgress, pull_embedding_model};
+pub use enrichment::{ENRICHMENT_QUEUE_CAPACITY, EnrichmentJob};
 pub use error::LensError;
 pub use extract::{ExtractOutput, Extractor, SourceAnchor, extractor_for};
 pub use ingest::{
     IngestProgress, NEEDS_JS_MIN_CHARS, NEEDS_JS_MIN_TEXT_RATIO, URL_FETCH_TIMEOUT, ingest_source,
     resolve_nomic_tokenizer,
+};
+pub use llm::{
+    AnthropicProvider, LlmProvider, LlmRequest, LlmResponse, OllamaProvider, OpenAiCompatProvider,
+    provider_from_config,
 };
 pub use notebooks::{Notebook, NotebookId, NotebookSummary, Source};
 pub use system_check::{
@@ -52,9 +59,9 @@ use std::sync::Arc;
 
 use sqlx::SqlitePool;
 use tokenizers::Tokenizer;
-use tokio::sync::{OnceCell, RwLock, RwLockReadGuard, RwLockWriteGuard, Semaphore};
+use tokio::sync::{OnceCell, RwLock, RwLockReadGuard, RwLockWriteGuard, Semaphore, mpsc};
 
-use crate::notebooks::NotebookRepo;
+use crate::notebooks::{EnrichmentStatus, NotebookRepo};
 
 /// Lowercase-hex encoding of a byte slice.
 ///
@@ -125,6 +132,39 @@ pub struct LensEngine {
     /// Single-permit gate serializing ingest runs (the ONNX session is
     /// single-threaded; concurrent `embed()` calls must not overlap).
     ingest_lock: Arc<Semaphore>,
+    /// Sender half of the background enrichment queue (M4 Phase 3, Step 3).
+    ///
+    /// `mpsc::Sender` is `Clone`, so it rides the `#[derive(Clone)]` engine
+    /// handle. Enqueue is a non-blocking [`try_send`](mpsc::Sender::try_send)
+    /// issued OUTSIDE the `ingest_lock` permit (see [`enqueue_enrichment`]).
+    /// Dropping every clone closes the channel and stops the worker.
+    enrichment_tx: mpsc::Sender<EnrichmentJob>,
+    /// The active enrichment LLM provider, or `None` when none is reachable.
+    ///
+    /// `Arc<RwLock<Option<Arc<dyn LlmProvider>>>>` rather than `OnceCell` (the
+    /// plan's ratified deviation from lock #4): AC10 requires REBINDING the
+    /// provider on an unreachable→reachable transition, which `OnceCell` (write-
+    /// once) forbids. Write the cell to swap the provider; read it to dispatch.
+    llm_provider: Arc<RwLock<Option<Arc<dyn LlmProvider>>>>,
+    /// Test-only gate awaited inside the worker's stub job body so an AC3 test can
+    /// hold a job "in flight" and assert the worker holds no `ingest_lock` permit
+    /// during the body. `None` (the default) is a no-op. Compiled out of
+    /// production builds.
+    #[cfg(feature = "test-util")]
+    enrichment_gate: Arc<RwLock<Option<Arc<tokio::sync::Notify>>>>,
+    /// Test-only switch: when `true`, [`LensEngine::tokenizer`] fails fast instead
+    /// of resolving/downloading the multi-MB nomic tokenizer. Enrichment tolerates
+    /// a missing tokenizer (it falls back to a whitespace-word token count), so a
+    /// Step-4 integration test can run fully offline. `false` (default) is a no-op.
+    /// Compiled out of production builds.
+    #[cfg(feature = "test-util")]
+    skip_tokenizer: Arc<std::sync::atomic::AtomicBool>,
+    /// Test-only override for the per-job LLM-call ceiling (AC11 budget seam). `0`
+    /// (the default) means "use [`ENRICHMENT_MAX_CALLS_PER_JOB`]"; a non-zero value
+    /// tightens the per-job budget so a test can assert the circuit-break fires
+    /// after exactly N admitted calls. Compiled out of production builds.
+    #[cfg(feature = "test-util")]
+    enrichment_max_calls_override: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl LensEngine {
@@ -186,15 +226,85 @@ impl LensEngine {
             query = query.bind(s.as_str());
         }
         query.execute(&db).await?;
+
+        // ── Enrichment crash-recovery (AC12) — SEPARATE from the SourceStatus
+        // reset above and deliberately AFTER it. `enrichment_status` is orthogonal
+        // to `SourceStatus` (lock #2): a source mid-enrichment when the process
+        // died is left `enriching` with no task to advance it. Reset it to
+        // `pending` so the queue-rebuild below re-enqueues it; `SourceStatus`
+        // (which stays `indexed` — the source is still searchable on raw vectors)
+        // is untouched, so the compile-locked SourceStatus invariant above is not
+        // affected.
+        sqlx::query("UPDATE sources SET enrichment_status = ? WHERE enrichment_status = ?")
+            .bind(EnrichmentStatus::Pending.as_str())
+            .bind(EnrichmentStatus::Enriching.as_str())
+            .execute(&db)
+            .await?;
+
         let mut config = AppConfig::load(data_dir)?;
         config.paths.data_dir = data_dir.display().to_string();
-        tracing::info!("engine initialized");
-        Ok(Self {
+
+        // ── Startup-GC of orphaned transient re-embed tables (AC7). A crash
+        // during the Step-5 re-embed leaves either a `building` row (crash mid-
+        // populate, before the flip) or a `stale` row (crash after the flip-txn
+        // commit but before the Lance-drop). Reclaim BOTH: drop the physical Lance
+        // table (idempotent — a missing table is a no-op) and delete the registry
+        // row even when its Lance table is already gone. The `active` row is never
+        // touched. Best-effort: a GC failure must NOT prevent the engine from
+        // starting (raw vectors still serve search), so it is logged, not fatal.
+        let gc_data_dir = std::path::PathBuf::from(&config.paths.data_dir);
+        if let Err(e) = Self::gc_orphan_embedding_tables(&db, &gc_data_dir).await {
+            tracing::warn!("startup-GC of orphan embedding tables failed (non-fatal): {e}");
+        }
+
+        // ── Build the bounded enrichment queue + spawn the worker. The worker
+        // owns the receiver; the engine keeps the sender. The provider cell starts
+        // empty (the worker / a later detect_llm transition installs a provider).
+        let (enrichment_tx, enrichment_rx) =
+            mpsc::channel::<EnrichmentJob>(enrichment::ENRICHMENT_QUEUE_CAPACITY);
+
+        let engine = Self {
             inner: Arc::new(RwLock::new(LensEngineInner { db, config })),
             embedder: Arc::new(OnceCell::new()),
             tokenizer: Arc::new(OnceCell::new()),
             ingest_lock: Arc::new(Semaphore::new(1)),
-        })
+            enrichment_tx,
+            llm_provider: Arc::new(RwLock::new(None)),
+            #[cfg(feature = "test-util")]
+            enrichment_gate: Arc::new(RwLock::new(None)),
+            #[cfg(feature = "test-util")]
+            skip_tokenizer: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(feature = "test-util")]
+            enrichment_max_calls_override: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        };
+
+        enrichment::spawn_worker(engine.clone(), enrichment_rx);
+
+        // ── Install the enrichment LLM provider from the REAL config (Step 6).
+        // When enrichment is enabled, build the provider from `AppConfig.models[]`
+        // gating cloud backends on `enrichment.cloud_consent` (the factory rejects
+        // a cloud provider without consent). When disabled the cell stays empty
+        // and the worker no-ops on each job — sources stay on raw vectors. A later
+        // `detect_llm` unreachable→reachable transition can still rebind via
+        // [`rescan_enrichment_on_provider_change`].
+        {
+            let cfg = engine.config().await;
+            if cfg.enrichment.enabled {
+                let provider = crate::llm::provider_from_config(&cfg, cfg.enrichment.cloud_consent);
+                engine.set_llm_provider(provider).await;
+            }
+        }
+
+        // ── Queue-rebuild (AC10/AC12): enqueue every indexed-but-not-yet-enriched
+        // source so a restart (or a back-fill after a provider becomes reachable)
+        // resumes enrichment. Best-effort — a full channel or a transient DB error
+        // is recovered by the next rescan, so it never blocks startup.
+        if let Err(e) = engine.rebuild_enrichment_queue().await {
+            tracing::warn!("enrichment queue-rebuild at startup failed (non-fatal): {e}");
+        }
+
+        tracing::info!("engine initialized");
+        Ok(engine)
     }
 
     /// Test constructor: a fully-migrated in-memory engine with a default config.
@@ -210,7 +320,9 @@ impl LensEngine {
         db::run_migrations(&db)
             .await
             .expect("migrations should apply to a fresh in-memory db");
-        Self {
+        let (enrichment_tx, enrichment_rx) =
+            mpsc::channel::<EnrichmentJob>(enrichment::ENRICHMENT_QUEUE_CAPACITY);
+        let engine = Self {
             inner: Arc::new(RwLock::new(LensEngineInner {
                 db,
                 config: AppConfig::default(),
@@ -218,7 +330,19 @@ impl LensEngine {
             embedder: Arc::new(OnceCell::new()),
             tokenizer: Arc::new(OnceCell::new()),
             ingest_lock: Arc::new(Semaphore::new(1)),
-        }
+            enrichment_tx,
+            llm_provider: Arc::new(RwLock::new(None)),
+            #[cfg(feature = "test-util")]
+            enrichment_gate: Arc::new(RwLock::new(None)),
+            #[cfg(feature = "test-util")]
+            skip_tokenizer: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(feature = "test-util")]
+            enrichment_max_calls_override: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        };
+        // Spawn the (stub) worker so the enrichment surface behaves identically to
+        // a production engine; it is inert unless a test explicitly enqueues a job.
+        enrichment::spawn_worker(engine.clone(), enrichment_rx);
+        engine
     }
 
     /// Acquires a shared read guard over the engine state.
@@ -480,6 +604,215 @@ impl LensEngine {
         &self.ingest_lock
     }
 
+    // ── Enrichment wiring (M4 Phase 3, Step 3) ──────────────────────────────
+
+    /// Installs (or replaces) the active enrichment LLM provider under the
+    /// `RwLock` cell. `None` clears it (degrade to raw vectors).
+    ///
+    /// This is the AC10 rebinding seam: on a `detect_llm` unreachable→reachable
+    /// transition (or a config change), call this to swap the provider so the
+    /// queue-rebuild can enrich the back-fill. `OnceCell` could not model this —
+    /// hence the ratified `RwLock` cell.
+    pub async fn set_llm_provider(&self, provider: Option<Arc<dyn LlmProvider>>) {
+        *self.llm_provider.write().await = provider;
+    }
+
+    /// Returns a clone of the active enrichment provider handle (the worker reads
+    /// this to decide whether to dispatch; `None` → degrade to raw vectors).
+    pub async fn llm_provider(&self) -> Option<Arc<dyn LlmProvider>> {
+        self.llm_provider.read().await.clone()
+    }
+
+    /// Non-blocking enqueue of a source for background enrichment (AC3).
+    ///
+    /// A [`try_send`](mpsc::Sender::try_send) — it NEVER awaits and NEVER blocks,
+    /// so the ingest path can call it without holding the `ingest_lock` permit and
+    /// a full channel can never deadlock against a held permit. A full/closed
+    /// channel logs and drops the job; the startup/rescan
+    /// [`rebuild_enrichment_queue`](Self::rebuild_enrichment_queue) recovers any
+    /// dropped source. This is intentionally infallible at the call site.
+    pub fn enqueue_enrichment(&self, source_id: &str) {
+        let job = EnrichmentJob {
+            source_id: source_id.to_string(),
+        };
+        match self.enrichment_tx.try_send(job) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!(
+                    source_id,
+                    "enrichment queue full; dropping enqueue (recovered by rescan)"
+                );
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::warn!(source_id, "enrichment queue closed; worker stopped");
+            }
+        }
+    }
+
+    /// Scans for sources eligible for enrichment and enqueues them (AC10/AC12).
+    ///
+    /// Eligibility: `SourceStatus::Indexed` (searchable on raw vectors) AND
+    /// `enrichment_status IN (NULL/none, 'pending', 'failed')` (never enriched, or
+    /// reset by crash-recovery, or previously failed). Excludes `enriched`,
+    /// `enriching`, and `skipped`. Called at startup and as the AC10 back-fill
+    /// rescan hook on a provider unreachable→reachable transition.
+    pub async fn rebuild_enrichment_queue(&self) -> Result<(), LensError> {
+        let pool = self.pool().await;
+        let ids: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM sources \
+             WHERE status = ? AND trashed_at IS NULL \
+               AND (enrichment_status IS NULL OR enrichment_status IN (?, ?, ?))",
+        )
+        .bind(notebooks::SourceStatus::Indexed.as_str())
+        .bind(EnrichmentStatus::None.as_str())
+        .bind(EnrichmentStatus::Pending.as_str())
+        .bind(EnrichmentStatus::Failed.as_str())
+        .fetch_all(&pool)
+        .await?;
+        for id in &ids {
+            self.enqueue_enrichment(id);
+        }
+        tracing::debug!(
+            count = ids.len(),
+            "enrichment queue-rebuild enqueued sources"
+        );
+        Ok(())
+    }
+
+    /// AC10 back-fill hook: re-binds the provider from the current config and, if a
+    /// provider is now installed, re-scans the queue. Intended to be called on a
+    /// `detect_llm` unreachable→reachable transition. Full `system_check`
+    /// integration is deferred (Step 4+); this provides the engine-side seam.
+    ///
+    /// The cloud-consent flag is now sourced from the REAL config
+    /// (`AppConfig.enrichment.cloud_consent`, Step 6) rather than threaded in by
+    /// the caller; `enabled=false` clears the provider (enrichment off ⇒ raw
+    /// vectors). `cloud_consent` gates cloud providers via
+    /// [`crate::llm::provider_from_config`].
+    pub async fn rescan_enrichment_on_provider_change(&self) -> Result<(), LensError> {
+        let config = self.config().await;
+        // Honor the master toggle: disabled enrichment clears any provider.
+        let provider = if config.enrichment.enabled {
+            crate::llm::provider_from_config(&config, config.enrichment.cloud_consent)
+        } else {
+            None
+        };
+        let installed = provider.is_some();
+        self.set_llm_provider(provider).await;
+        if installed {
+            self.rebuild_enrichment_queue().await?;
+        }
+        Ok(())
+    }
+
+    /// Startup-GC (AC7): drop every orphaned `building`/`stale` re-embed table and
+    /// delete its registry row, idempotently.
+    ///
+    /// A static helper (takes the raw pool/data_dir) so `init` can call it BEFORE
+    /// the engine handle exists. Sweeps `embedding_index` rows where
+    /// `status IN ('building','stale')`: `drop_tables` removes the physical Lance
+    /// tables (a missing table is a no-op), then a single DELETE removes the rows —
+    /// even when the Lance table was already gone (crash between the flip-txn
+    /// commit and the Lance-drop). The `active` row is never selected, so the live
+    /// index is untouched.
+    async fn gc_orphan_embedding_tables(db: &SqlitePool, data_dir: &Path) -> Result<(), LensError> {
+        let table_names: Vec<String> = sqlx::query_scalar(
+            "SELECT lance_table_name FROM embedding_index WHERE status IN ('building', 'stale')",
+        )
+        .fetch_all(db)
+        .await?;
+        if table_names.is_empty() {
+            return Ok(());
+        }
+        let store = crate::vector_store::LanceVectorStore::new(data_dir, db.clone());
+        // Drop the physical tables first (idempotent), THEN delete the registry
+        // rows. If the drop fails the rows survive and a later GC retries; if the
+        // process dies between the drop and the delete, the rows are reclaimed on
+        // the next startup (the table is already gone, so drop_tables no-ops).
+        crate::vector_store::VectorStore::drop_tables(&store, &table_names).await?;
+        sqlx::query("DELETE FROM embedding_index WHERE status IN ('building', 'stale')")
+            .execute(db)
+            .await?;
+        tracing::info!(
+            count = table_names.len(),
+            "startup-GC reclaimed orphan building/stale embedding tables"
+        );
+        Ok(())
+    }
+
+    /// Test-only: awaited inside the worker's stub job body so a test can hold a
+    /// job "in flight". Returns immediately when no gate is installed. Compiled out
+    /// of production builds.
+    #[cfg(feature = "test-util")]
+    pub(crate) async fn enrichment_job_gate(&self) {
+        let gate = self.enrichment_gate.read().await.clone();
+        if let Some(notify) = gate {
+            notify.notified().await;
+        }
+    }
+
+    /// Test-only seam: installs (or clears) the worker job gate. While a gate is
+    /// installed, the worker blocks in its job body until the returned `Notify` is
+    /// `notify_one`'d — letting an AC3 test assert the worker holds no
+    /// `ingest_lock` permit during the body (a concurrent `purge_source`
+    /// proceeds). Gated behind `test-util`; absent from production builds.
+    #[cfg(feature = "test-util")]
+    pub async fn set_enrichment_gate_for_test(&self, gate: Option<Arc<tokio::sync::Notify>>) {
+        *self.enrichment_gate.write().await = gate;
+    }
+
+    /// Test-only seam: directly enqueue a source onto the enrichment queue (the
+    /// production enqueue is internal to the ingest path). Gated behind
+    /// `test-util`; absent from production builds.
+    #[cfg(feature = "test-util")]
+    pub fn enqueue_enrichment_for_test(&self, source_id: &str) {
+        self.enqueue_enrichment(source_id);
+    }
+
+    /// Test-only seam: disables [`tokenizer`](Self::tokenizer) resolution so a
+    /// Step-4 enrichment test runs fully offline (the worker falls back to a
+    /// whitespace-word token count). Gated behind `test-util`; absent from
+    /// production builds.
+    #[cfg(feature = "test-util")]
+    pub fn disable_tokenizer_for_test(&self) {
+        self.skip_tokenizer
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Test-only seam (AC11 budget): override the worker's per-job LLM-call ceiling
+    /// so a test can assert the circuit-break fires after exactly `max_calls`
+    /// admitted calls (`0` restores the default). Gated behind `test-util`; absent
+    /// from production builds.
+    #[cfg(feature = "test-util")]
+    pub fn set_enrichment_max_calls_for_test(&self, max_calls: u32) {
+        self.enrichment_max_calls_override
+            .store(max_calls, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The effective per-job LLM-call ceiling: the test override when non-zero,
+    /// else the production default. Read by the worker when it builds the per-job
+    /// [`enrichment::Budget`](crate::enrichment::Budget).
+    pub(crate) fn enrichment_max_calls_per_job(&self) -> u32 {
+        #[cfg(feature = "test-util")]
+        {
+            let o = self
+                .enrichment_max_calls_override
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if o != 0 {
+                return o;
+            }
+        }
+        enrichment::meta::ENRICHMENT_MAX_CALLS_PER_JOB
+    }
+
+    /// Test-only seam: the enrichment queue's spare capacity right now. Lets a test
+    /// fill the channel and assert a `try_send` overflow does not deadlock. Gated
+    /// behind `test-util`; absent from production builds.
+    #[cfg(feature = "test-util")]
+    pub fn enrichment_queue_capacity(&self) -> usize {
+        self.enrichment_tx.capacity()
+    }
+
     /// Test-only seam: pre-fills the embedder `OnceCell` with a caller-supplied
     /// [`Embedder`] so integration tests can inject a `CountingEmbedder` (and so
     /// avoid the ~130 MB `FastembedEmbedder` model download).
@@ -530,6 +863,15 @@ impl LensEngine {
     /// mirrors [`LensEngine::embedder`] so the multi-MB tokenizer is parsed
     /// from disk exactly once per engine rather than on every ingest.
     pub(crate) async fn tokenizer(&self) -> Result<Arc<Tokenizer>, LensError> {
+        #[cfg(feature = "test-util")]
+        if self
+            .skip_tokenizer
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(LensError::Model(
+                "tokenizer disabled for test (skip_tokenizer)".into(),
+            ));
+        }
         self.tokenizer
             .get_or_try_init(|| async {
                 let data_dir = self.data_dir().await;
