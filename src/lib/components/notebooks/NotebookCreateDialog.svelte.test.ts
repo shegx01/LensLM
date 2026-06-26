@@ -43,7 +43,8 @@ const CREATED: Notebook = {
   focus_mode: 'research',
   created_at: new Date().toISOString(),
   updated_at: new Date().toISOString(),
-  trashed_at: null
+  trashed_at: null,
+  embedding_model: null
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
