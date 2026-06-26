@@ -413,29 +413,22 @@ async fn probe_llm_runtime(config: &AppConfig) -> LlmRuntimeProbe {
     let ollama_up = ollama_version.is_some();
     let cloud_ok = has_cloud_llm(config);
 
-    let result = match (ollama_version, lmstudio_up, cloud_ok) {
-        (Some(version), _, _) => CheckResult {
+    let result = match (ollama_up, lmstudio_up, cloud_ok) {
+        (true, _, _) | (_, true, _) => CheckResult {
             id: CheckId::LlmRuntime,
             label: "LLM runtime".to_string(),
             status: CheckStatus::Pass,
-            detail: format!("Ollama {version} detected"),
+            detail: "Local LLM reachable".to_string(),
             action: Some(CheckAction::Configure),
         },
-        (None, true, _) => CheckResult {
-            id: CheckId::LlmRuntime,
-            label: "LLM runtime".to_string(),
-            status: CheckStatus::Pass,
-            detail: "LM Studio detected".to_string(),
-            action: Some(CheckAction::Configure),
-        },
-        (None, false, true) => CheckResult {
+        (false, false, true) => CheckResult {
             id: CheckId::LlmRuntime,
             label: "LLM runtime".to_string(),
             status: CheckStatus::Pass,
             detail: "Cloud provider configured".to_string(),
             action: Some(CheckAction::Configure),
         },
-        (None, false, false) => CheckResult {
+        (false, false, false) => CheckResult {
             id: CheckId::LlmRuntime,
             label: "LLM runtime".to_string(),
             status: CheckStatus::Fail,
@@ -662,7 +655,7 @@ mod tests {
 
         assert_eq!(probe.result.status, CheckStatus::Pass);
         assert!(!probe.ollama_up);
-        assert_eq!(probe.result.detail, "LM Studio detected");
+        assert_eq!(probe.result.detail, "Local LLM reachable");
         assert_eq!(probe.result.action, Some(CheckAction::Configure));
     }
 
@@ -682,7 +675,7 @@ mod tests {
 
         assert_eq!(probe.result.status, CheckStatus::Pass);
         assert!(probe.ollama_up);
-        assert_eq!(probe.result.detail, "Ollama 0.3.2 detected");
+        assert_eq!(probe.result.detail, "Local LLM reachable");
     }
 
     #[tokio::test]

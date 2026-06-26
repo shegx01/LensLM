@@ -44,7 +44,6 @@
   // Detected models list (populated by Auto-detect)
   let detectedModels = $state<string[]>([]);
   let detectStatus = $state<'idle' | 'detecting' | 'found' | 'not-found'>('idle');
-  let detectVersion = $state<string | null>(null);
   let detectError = $state<string | null>(null);
   let testStatus = $state<'idle' | 'testing' | 'success' | 'fail'>('idle');
   let testMessage = $state<string | null>(null);
@@ -323,12 +322,10 @@
   async function handleAutoDetect(): Promise<void> {
     detectStatus = 'detecting';
     detectError = null;
-    detectVersion = null;
     try {
       const result = await detectLlm(localEndpoint);
       if (result.reachable) {
         detectStatus = 'found';
-        detectVersion = result.version;
         detectedModels = result.models;
         if (result.models.length > 0 && !result.models.includes(localModel)) {
           localModel = result.models[0];
@@ -609,8 +606,8 @@
         </Button>
       </div>
 
-      {#if detectStatus === 'found' && detectVersion}
-        <p class="text-primary text-[0.75rem]">{detectVersion} detected</p>
+      {#if detectStatus === 'found'}
+        <p class="text-primary text-[0.75rem]">Local server reachable</p>
       {:else if detectStatus === 'not-found'}
         <p class="text-muted-foreground text-[0.75rem]">
           {detectError ?? 'Not detected — check that your local server is running.'}

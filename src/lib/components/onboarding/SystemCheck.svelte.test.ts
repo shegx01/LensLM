@@ -10,7 +10,7 @@ const ALL_PASS: CheckResult[] = [
     id: 'llm_runtime',
     label: 'LLM runtime',
     status: 'pass',
-    detail: 'Ollama 0.3.2 detected',
+    detail: 'Local LLM reachable',
     action: 'configure'
   },
   {

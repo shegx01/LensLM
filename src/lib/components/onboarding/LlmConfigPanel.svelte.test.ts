@@ -12,7 +12,7 @@ function llmRow(over: Partial<CheckResult> = {}): CheckResult {
     id: 'llm_runtime',
     label: 'LLM runtime',
     status: 'pass',
-    detail: 'Auto-detected: Ollama 0.3.2',
+    detail: 'Local LLM reachable',
     action: 'configure',
     ...over
   };
@@ -151,8 +151,8 @@ describe('LlmConfigPanel — Auto-detect', () => {
     // Click Auto-detect
     await fireEvent.click(screen.getByRole('button', { name: /auto-detect/i }));
 
-    // Version confirmation text appears
-    await waitFor(() => expect(screen.getByText(/ollama 0\.3\.2 detected/i)).toBeInTheDocument());
+    // Provider-neutral reachability confirmation text appears (no vendor/version)
+    await waitFor(() => expect(screen.getByText(/local server reachable/i)).toBeInTheDocument());
 
     // Model select appears with detected models. Target the model picker by its
     // id (the panel also renders an enrichment "Pronoun resolution" combobox).
