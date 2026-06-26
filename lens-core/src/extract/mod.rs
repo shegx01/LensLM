@@ -21,8 +21,12 @@
 //! [`LensError`] for kinds not yet implemented.
 
 pub mod docx;
+pub mod json;
+pub mod jsonl;
 pub mod pdf;
 pub mod url;
+pub mod xml;
+pub mod yaml;
 
 use serde::{Deserialize, Serialize};
 
@@ -50,6 +54,13 @@ pub enum SourceAnchor {
     /// No format-native coordinate is meaningful — the whole document IS the
     /// canonical buffer (plain text & Markdown).
     Text,
+    /// A block from a structured data format (JSON/JSONL/YAML/XML): its
+    /// JSON-pointer-ish `path` within the source document (e.g. `/users/0/name`).
+    ///
+    /// Additive to the `#[serde(tag = "kind")]` enum — each variant serializes
+    /// independently under its own `kind` tag, so adding `Structured` cannot
+    /// change the wire shape of `Text`/`Pdf`/`Docx`/`Url`.
+    Structured { path: String },
 }
 
 /// The canonical extraction result for a single source.
@@ -140,6 +151,12 @@ pub fn extractor_for(kind: &str) -> Result<Box<dyn Extractor>, LensError> {
         // no-text-layer (scanned) PDF yields empty output → run_ingest sets
         // needs_ocr (Ok-with-status, never Err).
         SourceKind::Pdf => Ok(Box::new(pdf::PdfExtractor)),
+        // Structured-format extractors (M4 Phase 2.5c): key-path verbalization
+        // with byte-identity offsets and `SourceAnchor::Structured` anchors.
+        SourceKind::Json => Ok(Box::new(json::JsonExtractor)),
+        SourceKind::Jsonl => Ok(Box::new(jsonl::JsonlExtractor)),
+        SourceKind::Yaml => Ok(Box::new(yaml::YamlExtractor)),
+        SourceKind::Xml => Ok(Box::new(xml::XmlExtractor)),
     }
 }
 
@@ -372,5 +389,72 @@ mod tests {
             let back: SourceAnchor = serde_json::from_str(&json).expect("deserialize anchor");
             assert_eq!(a, back, "anchor must round-trip through serde_json");
         }
+    }
+
+    #[test]
+    fn source_anchor_structured_roundtrips_through_serde_json() {
+        let a = SourceAnchor::Structured {
+            path: "/a/b".to_string(),
+        };
+        let json = serde_json::to_string(&a).expect("serialize structured anchor");
+        let back: SourceAnchor =
+            serde_json::from_str(&json).expect("deserialize structured anchor");
+        assert_eq!(
+            a, back,
+            "Structured anchor must round-trip through serde_json"
+        );
+    }
+
+    #[test]
+    fn source_anchor_structured_does_not_change_existing_wire_shape() {
+        // Regression guard: adding `Structured` must NOT change the serialized
+        // JSON of any pre-existing variant. These literals are the exact wire
+        // shapes locked before Phase 2.5c.
+        assert_eq!(
+            serde_json::to_string(&SourceAnchor::Text).unwrap(),
+            r#"{"kind":"Text"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&SourceAnchor::Pdf {
+                page: 3,
+                bbox: [1.0, 2.5, 100.0, 200.25],
+            })
+            .unwrap(),
+            r#"{"kind":"Pdf","page":3,"bbox":[1.0,2.5,100.0,200.25]}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&SourceAnchor::Docx {
+                node_path: "body/p[4]".to_string(),
+            })
+            .unwrap(),
+            r#"{"kind":"Docx","node_path":"body/p[4]"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&SourceAnchor::Url {
+                text_offset: "42".to_string(),
+            })
+            .unwrap(),
+            r#"{"kind":"Url","text_offset":"42"}"#
+        );
+    }
+
+    #[test]
+    fn json_kind_resolves_to_extractor() {
+        assert!(extractor_for("json").is_ok());
+    }
+
+    #[test]
+    fn jsonl_kind_resolves_to_extractor() {
+        assert!(extractor_for("jsonl").is_ok());
+    }
+
+    #[test]
+    fn yaml_kind_resolves_to_extractor() {
+        assert!(extractor_for("yaml").is_ok());
+    }
+
+    #[test]
+    fn xml_kind_resolves_to_extractor() {
+        assert!(extractor_for("xml").is_ok());
     }
 }

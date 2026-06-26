@@ -782,10 +782,19 @@ impl<'a> NotebookRepo<'a> {
             Some("docx") => (SourceKind::Docx.as_str(), "docx"),
             Some("txt") => (SourceKind::Text.as_str(), "txt"),
             Some("md") | Some("markdown") => (SourceKind::Markdown.as_str(), "md"),
+            // Structured formats (M4 Phase 2.5c). The canonical managed-file
+            // extension preserves the original so the on-disk locator round-trips.
+            Some("json") => (SourceKind::Json.as_str(), "json"),
+            Some("jsonl") => (SourceKind::Jsonl.as_str(), "jsonl"),
+            Some("ndjson") => (SourceKind::Jsonl.as_str(), "ndjson"),
+            Some("yaml") => (SourceKind::Yaml.as_str(), "yaml"),
+            Some("yml") => (SourceKind::Yaml.as_str(), "yml"),
+            Some("xml") => (SourceKind::Xml.as_str(), "xml"),
             other => {
                 return Err(LensError::Validation(format!(
                     "unsupported file extension {other:?} for {}; expected one of \
-                     \".pdf\", \".docx\", \".txt\", \".md\", \".markdown\"",
+                     \".pdf\", \".docx\", \".txt\", \".md\", \".markdown\", \".json\", \
+                     \".jsonl\", \".ndjson\", \".yaml\", \".yml\", \".xml\"",
                     src_path.display()
                 )));
             }
@@ -1581,5 +1590,64 @@ mod tests {
         // Round-trips back to an equal value.
         let back: NotebookSummary = serde_json::from_value(value).unwrap();
         assert_eq!(back, summary);
+    }
+
+    // -----------------------------------------------------------------------
+    // M4 Phase 2.5c — add_file_source extension → SourceKind detection
+    // -----------------------------------------------------------------------
+
+    /// Writes a tiny source file with the given extension into `dir` and runs
+    /// `add_file_source`, returning the inserted source's persisted `kind`.
+    async fn kind_for_extension(ext: &str) -> String {
+        let pool = test_pool().await;
+        let repo = NotebookRepo::new(&pool);
+        let nb = repo.create("Notebook", None, None).await.unwrap();
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let data_dir = tmp.path();
+        let src_path = data_dir.join(format!("input.{ext}"));
+        std::fs::write(&src_path, b"placeholder content").expect("write source file");
+
+        let source = repo
+            .add_file_source(data_dir, &nb.id, &src_path, None)
+            .await
+            .expect("add_file_source must accept the extension");
+        source.kind
+    }
+
+    #[tokio::test]
+    async fn add_file_source_json_extension() {
+        assert_eq!(kind_for_extension("json").await, SourceKind::Json.as_str());
+    }
+
+    #[tokio::test]
+    async fn add_file_source_jsonl_extension() {
+        assert_eq!(
+            kind_for_extension("jsonl").await,
+            SourceKind::Jsonl.as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn add_file_source_ndjson_extension() {
+        assert_eq!(
+            kind_for_extension("ndjson").await,
+            SourceKind::Jsonl.as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn add_file_source_yaml_extension() {
+        assert_eq!(kind_for_extension("yaml").await, SourceKind::Yaml.as_str());
+    }
+
+    #[tokio::test]
+    async fn add_file_source_yml_extension() {
+        assert_eq!(kind_for_extension("yml").await, SourceKind::Yaml.as_str());
+    }
+
+    #[tokio::test]
+    async fn add_file_source_xml_extension() {
+        assert_eq!(kind_for_extension("xml").await, SourceKind::Xml.as_str());
     }
 }

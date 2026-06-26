@@ -38,6 +38,14 @@ pub enum SourceKind {
     Docx,
     /// A remote URL (HTML fetched then content-extracted).
     Url,
+    /// A JSON document (single value: object/array/scalar).
+    Json,
+    /// A JSON Lines / NDJSON document (one JSON value per line).
+    Jsonl,
+    /// A YAML document (one or more `---`-separated documents).
+    Yaml,
+    /// An XML document (roxmltree DOM walk).
+    Xml,
 }
 
 impl SourceKind {
@@ -52,6 +60,10 @@ impl SourceKind {
             Self::Pdf => "pdf",
             Self::Docx => "docx",
             Self::Url => "url",
+            Self::Json => "json",
+            Self::Jsonl => "jsonl",
+            Self::Yaml => "yaml",
+            Self::Xml => "xml",
         }
     }
 
@@ -64,8 +76,12 @@ impl SourceKind {
             "pdf" => Ok(Self::Pdf),
             "docx" => Ok(Self::Docx),
             "url" => Ok(Self::Url),
+            "json" => Ok(Self::Json),
+            "jsonl" => Ok(Self::Jsonl),
+            "yaml" => Ok(Self::Yaml),
+            "xml" => Ok(Self::Xml),
             other => Err(LensError::Validation(format!(
-                "unknown source kind: {other:?}; expected one of \"text\", \"markdown\", \"pdf\", \"docx\", \"url\""
+                "unknown source kind: {other:?}; expected one of \"text\", \"markdown\", \"pdf\", \"docx\", \"url\", \"json\", \"jsonl\", \"yaml\", \"xml\""
             ))),
         }
     }
@@ -78,6 +94,10 @@ impl SourceKind {
         match self {
             Self::Text | Self::Markdown => true,
             Self::Pdf | Self::Docx | Self::Url => false,
+            // Structured formats (JSON/JSONL/YAML/XML) are DERIVED: their
+            // canonical buffer is a verbalization produced by a dedicated
+            // Extractor, persisted as the `.extracted.txt` sibling.
+            Self::Json | Self::Jsonl | Self::Yaml | Self::Xml => false,
         }
     }
 }
@@ -251,7 +271,13 @@ pub fn parse_blocks(src: &str, kind: SourceKind) -> Vec<Block> {
         // `TextExtractor` (see `extract::extractor_for`). A `debug_assert!`
         // catches a mis-call in debug/test builds; release falls through to
         // `parse_text` as a safe, non-panicking default rather than crashing.
-        SourceKind::Pdf | SourceKind::Docx | SourceKind::Url => {
+        SourceKind::Pdf
+        | SourceKind::Docx
+        | SourceKind::Url
+        | SourceKind::Json
+        | SourceKind::Jsonl
+        | SourceKind::Yaml
+        | SourceKind::Xml => {
             debug_assert!(
                 false,
                 "parse_blocks called with derived kind {kind:?} — use an Extractor"
@@ -988,6 +1014,42 @@ mod tests {
         assert!(!SourceKind::Pdf.is_text_like());
         assert!(!SourceKind::Docx.is_text_like());
         assert!(!SourceKind::Url.is_text_like());
+    }
+
+    #[test]
+    fn source_kind_json_roundtrip() {
+        assert_eq!(SourceKind::from_kind_str("json").unwrap(), SourceKind::Json);
+        assert_eq!(SourceKind::Json.as_str(), "json");
+    }
+
+    #[test]
+    fn source_kind_jsonl_roundtrip() {
+        assert_eq!(
+            SourceKind::from_kind_str("jsonl").unwrap(),
+            SourceKind::Jsonl
+        );
+        assert_eq!(SourceKind::Jsonl.as_str(), "jsonl");
+    }
+
+    #[test]
+    fn source_kind_yaml_roundtrip() {
+        assert_eq!(SourceKind::from_kind_str("yaml").unwrap(), SourceKind::Yaml);
+        assert_eq!(SourceKind::Yaml.as_str(), "yaml");
+    }
+
+    #[test]
+    fn source_kind_xml_roundtrip() {
+        assert_eq!(SourceKind::from_kind_str("xml").unwrap(), SourceKind::Xml);
+        assert_eq!(SourceKind::Xml.as_str(), "xml");
+    }
+
+    #[test]
+    fn source_kind_structured_not_text_like() {
+        // All four structured kinds are DERIVED (not text-like).
+        assert!(!SourceKind::Json.is_text_like());
+        assert!(!SourceKind::Jsonl.is_text_like());
+        assert!(!SourceKind::Yaml.is_text_like());
+        assert!(!SourceKind::Xml.is_text_like());
     }
 
     #[test]

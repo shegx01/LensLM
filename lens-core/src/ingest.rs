@@ -348,8 +348,26 @@ async fn run_ingest(
         }
     }
 
+    // ── JSON-vs-JSONL content-sniff fallback ──────────────────────────────
+    // A `.json` extension is the common case, but some tools emit JSON Lines
+    // (one object per line) with a `.json` name. If the content (first 64 KB)
+    // parses as >= 2 newline-delimited JSON values, treat it as `jsonl` so each
+    // record becomes its own block. A `.jsonl`/`.ndjson` extension already maps
+    // to `Jsonl` in `add_file_source` and is left untouched here.
+    let effective_kind: String = if kind == Some(crate::parse::SourceKind::Json)
+        && sniff_is_jsonl(&raw)
+    {
+        tracing::info!(
+            source_id,
+            "`.json` source sniffed as JSON Lines (>=2 newline-delimited JSON values); using jsonl extractor"
+        );
+        crate::parse::SourceKind::Jsonl.as_str().to_string()
+    } else {
+        source.kind.clone()
+    };
+
     // ── Dispatch through the Extractor seam ───────────────────────────────
-    let extractor = crate::extract::extractor_for(&source.kind)?;
+    let extractor = crate::extract::extractor_for(&effective_kind)?;
     // DERIVED (pdf/docx/url) extraction is blocking, CPU-bound work (pdfium
     // decode, docx-rs XML parse, trafilatura DOM walk). Run it under
     // `spawn_blocking` so it never stalls a tokio worker — mirroring the embed
@@ -671,6 +689,43 @@ async fn run_ingest(
 /// SHA-256 of `bytes`, lowercase hex.
 fn sha256_hex(bytes: &[u8]) -> String {
     crate::hex_encode(&Sha256::digest(bytes))
+}
+
+/// Number of leading bytes inspected by the JSON-vs-JSONL content sniff.
+const JSONL_SNIFF_WINDOW: usize = 64 * 1024;
+
+/// Heuristic: does `raw` look like JSON Lines rather than a single JSON value?
+///
+/// Inspects the first [`JSONL_SNIFF_WINDOW`] bytes: if `raw` is valid UTF-8 and
+/// at least two non-empty newline-delimited lines EACH parse as a standalone
+/// JSON value, it is treated as JSONL. A single JSON value (even a multi-line
+/// pretty-printed object) fails this test because its interior lines are not
+/// themselves valid JSON. Non-UTF-8 or fewer than two parseable lines → `false`
+/// (stay on the `.json` extractor).
+fn sniff_is_jsonl(raw: &[u8]) -> bool {
+    let window = &raw[..raw.len().min(JSONL_SNIFF_WINDOW)];
+    let Ok(s) = std::str::from_utf8(window) else {
+        return false;
+    };
+    let s = s.strip_prefix('\u{FEFF}').unwrap_or(s);
+    let mut parsed_lines = 0usize;
+    for line in s.split('\n') {
+        let line = line.trim_end_matches('\r').trim();
+        if line.is_empty() {
+            continue;
+        }
+        if serde_json::from_str::<serde_json::Value>(line).is_ok() {
+            parsed_lines += 1;
+            if parsed_lines >= 2 {
+                return true;
+            }
+        } else {
+            // A line that does not parse standalone means this is a single
+            // (possibly multi-line) JSON value, not JSONL.
+            return false;
+        }
+    }
+    false
 }
 
 /// The canonical `.extracted.txt` sibling path for a DERIVED (pdf/docx/url)
@@ -1359,6 +1414,38 @@ async fn download_tokenizer(url: &str, dest: &Path) -> Result<(), LensError> {
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    // ── JSON-vs-JSONL content sniff (M4 Phase 2.5c) ───────────────────────
+
+    #[test]
+    fn kind_detection_json_vs_jsonl_sniff() {
+        // A single JSON object (even pretty-printed) is NOT JSONL.
+        assert!(!sniff_is_jsonl(b"{\"a\":1}"));
+        assert!(!sniff_is_jsonl(b"{\n  \"a\": 1,\n  \"b\": 2\n}"));
+        // A JSON array on one line is a single value → not JSONL.
+        assert!(!sniff_is_jsonl(b"[1, 2, 3]"));
+        // Two newline-delimited JSON values → JSONL.
+        assert!(sniff_is_jsonl(b"{\"a\":1}\n{\"b\":2}\n"));
+        // CRLF endings still sniff correctly.
+        assert!(sniff_is_jsonl(b"{\"a\":1}\r\n{\"b\":2}\r\n"));
+        // Non-UTF-8 bytes never sniff as JSONL.
+        assert!(!sniff_is_jsonl(&[0xFF, 0xFE]));
+    }
+
+    #[test]
+    fn structured_kinds_follow_derived_path() {
+        // All four structured kinds are DERIVED (not text-like), so they take
+        // the raw-bytes-hash / `.extracted.txt` ingest branch.
+        use crate::parse::SourceKind;
+        for k in [
+            SourceKind::Json,
+            SourceKind::Jsonl,
+            SourceKind::Yaml,
+            SourceKind::Xml,
+        ] {
+            assert!(!k.is_text_like(), "{k:?} must be a derived (non-text) kind");
+        }
+    }
 
     // ── SSRF IP guard (item 1) ────────────────────────────────────────────
 
