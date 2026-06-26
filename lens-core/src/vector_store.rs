@@ -29,7 +29,8 @@
 //! vector: FixedSizeList<Float32, 768>}`. Searches pin the distance metric to
 //! cosine **explicitly** and additionally run `.only_if("notebook_id = '…'")`
 //! as cheap defense-in-depth (the AC asserts notebook isolation directly).
-//! Brute-force kNN only — no IvfPq in Phase 1 (corpora < ~100k vectors).
+//! Brute-force kNN below [`ANN_INDEX_MIN_ROWS`]; above it an IVF_PQ cosine index is
+//! built and refreshed automatically on the write paths (M4 Phase 4a).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -40,7 +41,10 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures_util::TryStreamExt;
+use lancedb::index::Index;
+use lancedb::index::vector::IvfPqIndexBuilder;
 use lancedb::query::{ExecutableQuery, QueryBase};
+use lancedb::table::{OptimizeAction, OptimizeOptions};
 use lancedb::{Connection, DistanceType, Table};
 use sqlx::SqlitePool;
 use uuid::Uuid;
@@ -49,6 +53,18 @@ use crate::LensError;
 
 /// Embedding dimension for nomic-embed-text-v1.5. Phase 1 is fixed at 768.
 pub const VECTOR_DIM: usize = 768;
+
+/// Row count at/above which an active (or building) table gets an IVF_PQ ANN
+/// index on its `vector` column (M4 Phase 4a).
+///
+/// Below this, brute-force kNN is both exact and faster (an ANN index over a few
+/// thousand vectors only adds quantization error and build cost); above it, the
+/// index keeps search sub-linear as a notebook scales. The threshold is a
+/// per-store field defaulting to this constant; tests lower it via
+/// [`LanceVectorStore::with_ann_index_min_rows`] to exercise the path at a few
+/// hundred rows. There is intentionally NO env-var/runtime override on the
+/// production path — the only seam is the test-only setter.
+const ANN_INDEX_MIN_ROWS: usize = 100_000;
 
 /// `embedding_index.status` for a live, usable index. The only status written
 /// in Phase 1 (`building`/`stale` are reserved for the Phase-4 model-switch
@@ -611,6 +627,10 @@ pub struct LanceVectorStore {
     root: PathBuf,
     /// The owned registry repository (private collaborator, never exposed).
     registry: EmbeddingIndexRepo,
+    /// Row count at/above which `add`/`add_to_table` build (or refresh) the
+    /// IVF_PQ index on the `vector` column. Defaults to [`ANN_INDEX_MIN_ROWS`];
+    /// tests lower it via [`with_ann_index_min_rows`](Self::with_ann_index_min_rows).
+    ann_index_min_rows: usize,
 }
 
 impl LanceVectorStore {
@@ -620,7 +640,20 @@ impl LanceVectorStore {
         Self {
             root: data_dir.join("lancedb"),
             registry: EmbeddingIndexRepo::new(pool),
+            ann_index_min_rows: ANN_INDEX_MIN_ROWS,
         }
+    }
+
+    /// Overrides the ANN-index row threshold (test-only seam).
+    ///
+    /// Lets integration tests trigger IVF_PQ creation at a few hundred rows
+    /// instead of the production [`ANN_INDEX_MIN_ROWS`] (100k) — building a real
+    /// 100k-vector table per test would be prohibitively slow. Compiled out of
+    /// production builds; there is no runtime/env override on the production path.
+    #[cfg(feature = "test-util")]
+    pub fn with_ann_index_min_rows(mut self, min_rows: usize) -> Self {
+        self.ann_index_min_rows = min_rows;
+        self
     }
 
     /// Drops every per-notebook Lance table registered for `notebook`.
@@ -639,9 +672,19 @@ impl LanceVectorStore {
     }
 
     /// Opens a LanceDB connection at the store root.
+    ///
+    /// Pins `read_consistency_interval = 0` so EVERY table open re-reads the latest
+    /// committed dataset version. The default (`None`) caches a table's version on
+    /// open and never refreshes, which means a second connection (or a reopened
+    /// handle) can miss a commit another just made — e.g. an index built by the
+    /// previous `add` would be invisible to the next, producing a duplicate index;
+    /// likewise a post-flip search could read a stale version. Strong read
+    /// consistency costs only a cheap version check per op on this local embedded
+    /// store, and it keeps the registry (SQLite, always current) and Lance in step.
     async fn connect(&self) -> Result<Connection, LensError> {
         let root = self.root.to_string_lossy();
         lancedb::connect(&root)
+            .read_consistency_interval(std::time::Duration::ZERO)
             .execute()
             .await
             .map_err(|e| LensError::Vector(format!("lancedb connect failed: {e}")))
@@ -865,6 +908,135 @@ impl LanceVectorStore {
         );
         Ok(())
     }
+
+    /// Builds or refreshes the IVF_PQ ANN index on `table`'s `vector` column once
+    /// the row count crosses [`ann_index_min_rows`](Self::ann_index_min_rows);
+    /// below threshold (and unindexed) it is a no-op (M4 Phase 4a).
+    ///
+    /// Invoked at the END of every row-landing path ([`add`](VectorStore::add) and
+    /// [`add_to_table`](VectorStore::add_to_table)), never on the search hot path:
+    ///
+    /// - no index yet + rows ≥ threshold ⇒ `create_index` (cosine, `replace(true)`);
+    /// - index already present ⇒ `optimize(append)` to fold the just-appended
+    ///   fragments into it;
+    /// - no index + below threshold ⇒ nothing.
+    ///
+    /// NON-FATAL by design: any `list_indices`/`count_rows`/build/refresh failure is
+    /// logged and swallowed — search degrades to exact brute-force kNN (correct,
+    /// only slower), so a transient index error never fails an ingest or re-embed.
+    /// `dim` selects the PQ sub-vector count; it MUST match the table's vector
+    /// width (callers pass the coordinate dim — [`VECTOR_DIM`] in Phase 1).
+    ///
+    /// Takes the JUST-WRITTEN handle so the threshold gate (`count_rows`, which DOES
+    /// reflect the rows this call appended) costs nothing extra in the common case —
+    /// a notebook far below the threshold returns immediately, with no table reopen
+    /// and no index-metadata read. Only once the threshold is crossed does it reopen
+    /// a FRESH handle for the index work: `list_indices`/`create_index` on the same
+    /// handle just mutated by `add()` return stale (pre-create) metadata, so a prior
+    /// add's index would be invisible and we'd build a duplicate; the reopen reads
+    /// the committed on-disk index state.
+    async fn maybe_build_or_refresh_index(&self, table: &Table, dim: usize) {
+        // Cheap gate on the just-written handle. The overwhelmingly common path — a
+        // corpus below the threshold — stops HERE, adding only a row count per add.
+        let n = match table.count_rows(None).await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(error = %e, "count_rows failed; skipping ANN index maintenance");
+                return;
+            }
+        };
+        if n < self.ann_index_min_rows {
+            return;
+        }
+
+        // At/above threshold: reopen so the index metadata is the committed state.
+        let table = match self.open_table_by_name(table.name()).await {
+            Ok(Some(t)) => t,
+            Ok(None) => {
+                // The caller just appended to this table, so it must exist; a miss
+                // here is an unexpected registry/Lance divergence — skip, non-fatal.
+                tracing::warn!(
+                    table = table.name(),
+                    "ANN index maintenance: table not found on reopen; skipping"
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "ANN index maintenance: reopen failed; skipping");
+                return;
+            }
+        };
+
+        let has_vector_index = match table.list_indices().await {
+            Ok(indices) => indices
+                .iter()
+                .any(|i| i.columns.iter().any(|c| c == "vector")),
+            Err(e) => {
+                tracing::warn!(error = %e, "list_indices failed; skipping ANN index maintenance");
+                return;
+            }
+        };
+
+        if has_vector_index {
+            // Fold the fragments appended since the last optimize into the index.
+            // A failure here just leaves the newest rows on the brute-force path
+            // until the next refresh — never fatal (mirrors the plan's contract).
+            if let Err(e) = table
+                .optimize(OptimizeAction::Index(OptimizeOptions::append()))
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    "optimize(append) failed; newly-appended rows stay on brute-force until the next refresh"
+                );
+            }
+            return;
+        }
+
+        // `num_partitions ≈ √rows` (Lance guidance). `as u32` truncation is fine —
+        // partition count is a tuning knob, not a correctness input. `f64::sqrt`
+        // keeps the MSRV (no `usize::isqrt`, stabilized later).
+        let num_partitions = ((n as f64).sqrt() as u32).max(1);
+        // PQ sub-vectors: `dim/16` (each spans 16 dims) when divisible, else `dim/8`,
+        // else 1. `num_sub_vectors` MUST divide `dim`; for 768 this is 48.
+        let num_sub_vectors = if dim.is_multiple_of(16) {
+            (dim / 16) as u32
+        } else if dim.is_multiple_of(8) {
+            (dim / 8) as u32
+        } else {
+            1
+        };
+
+        let index = Index::IvfPq(
+            IvfPqIndexBuilder::default()
+                // Pin cosine to MATCH the query metric (`search` pins it too); the
+                // builder defaults to L2, which would silently mis-rank.
+                .distance_type(DistanceType::Cosine)
+                .num_partitions(num_partitions)
+                .num_sub_vectors(num_sub_vectors)
+                .num_bits(8),
+        );
+        match table
+            .create_index(&["vector"], index)
+            .replace(true)
+            .execute()
+            .await
+        {
+            Ok(()) => tracing::info!(
+                rows = n,
+                num_partitions,
+                num_sub_vectors,
+                "built IVF_PQ cosine index on the vector column"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                rows = n,
+                num_partitions,
+                num_sub_vectors,
+                "IVF_PQ create_index failed; search stays on brute-force kNN"
+            ),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -888,6 +1060,10 @@ impl VectorStore for LanceVectorStore {
             .execute()
             .await
             .map_err(|e| LensError::Vector(format!("lancedb add failed: {e}")))?;
+        // Maintain the ANN index once this table crosses the row threshold (a
+        // no-op for the small corpora that never approach it). Non-fatal — a
+        // failure leaves search on exact brute-force kNN.
+        self.maybe_build_or_refresh_index(&table, dim).await;
         Ok(())
     }
 
@@ -1101,6 +1277,13 @@ impl VectorStore for LanceVectorStore {
             .execute()
             .await
             .map_err(|e| LensError::Vector(format!("lancedb add failed: {e}")))?;
+        // Same ANN maintenance as `add`: a `building` table populated past the
+        // threshold is indexed BEFORE the flip promotes it to active, so it serves
+        // ANN immediately on becoming active (why 4a lands before the 4b reindex).
+        // The bulk seed copy in `seed_building_from_active` goes through the raw
+        // table handle (not this path), so the index is built once the per-source
+        // populate begins — over the complete row set, not the half-seeded one.
+        self.maybe_build_or_refresh_index(&table, VECTOR_DIM).await;
         Ok(())
     }
 
