@@ -309,7 +309,10 @@ async fn startup_gc_reclaims_building_and_stale_rows() {
         .create_building_table(&nb, EMBED_MODEL_ID, EMBED_DIM)
         .await
         .expect("create building table");
-    assert_eq!(building_table, format!("vec__{nb}__nomic_v15__1"));
+    assert_eq!(
+        building_table,
+        format!("vec__{nb}__nomic_v15__d{EMBED_DIM}__1")
+    );
     store
         .add_to_table(
             &building_table,
@@ -320,6 +323,7 @@ async fn startup_gc_reclaims_building_and_stale_rows() {
                 level: 1,
                 vector: unit_vector(1),
             }],
+            EMBED_DIM,
         )
         .await
         .expect("seed building table");
@@ -364,7 +368,9 @@ async fn startup_gc_reclaims_building_and_stale_rows() {
         "the building Lance table must be dropped by GC; live tables: {names:?}"
     );
     assert!(
-        names.iter().any(|n| n == &format!("vec__{nb}__nomic_v15")),
+        names
+            .iter()
+            .any(|n| n == &format!("vec__{nb}__nomic_v15__d{EMBED_DIM}")),
         "the active Lance table must survive GC; live tables: {names:?}"
     );
 }

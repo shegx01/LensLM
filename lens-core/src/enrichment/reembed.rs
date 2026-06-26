@@ -129,7 +129,7 @@ pub(crate) async fn reembed_and_flip(
                 vector,
             })
             .collect();
-        store.add_to_table(&building_name, rows).await?;
+        store.add_to_table(&building_name, rows, EMBED_DIM).await?;
     }
 
     // Test-only seam: pause here (after the lock-free populate, before the flip

@@ -178,8 +178,14 @@ pub trait VectorStore: Send + Sync {
     /// [`create_building_table`](VectorStore::create_building_table) by its
     /// EXPLICIT name (the active read path resolves names from the registry, so a
     /// half-populated building table is unobservable). Errors if the table does
-    /// not exist. An empty `rows` is a no-op.
-    async fn add_to_table(&self, table_name: &str, rows: Vec<VectorRow>) -> Result<(), LensError>;
+    /// not exist. An empty `rows` is a no-op. `dim` is the coordinate's vector
+    /// dimension (used to build the Arrow batch / index — must match every row).
+    async fn add_to_table(
+        &self,
+        table_name: &str,
+        rows: Vec<VectorRow>,
+        dim: usize,
+    ) -> Result<(), LensError>;
 
     /// Atomically flips the `building` table to `active` for a coordinate, then
     /// drops the now-`stale` Lance table (M4 Phase 3, Step 5 / AC7).
@@ -226,38 +232,37 @@ fn model_slug(model: &str) -> String {
     }
 }
 
-/// Resolves the physical LanceDB table name for a logical coordinate.
+/// Resolves the physical LanceDB table name for a logical coordinate
+/// `(notebook, model, dim)`.
 ///
-/// **`dim` is intentionally absent from the physical name** even though it is part
-/// of the *logical* key `(notebook, model, dim)`. Phase 1 relies on the invariant
-/// `model ⇒ dim` (the only registered model, `nomic-embed-text-v1.5`, is fixed at
-/// [`VECTOR_DIM`] = 768), so `vec__{notebook}__{model_slug}` uniquely identifies a
-/// table. The table-resolution path ([`LanceVectorStore::ensure_table`]) carries a
-/// `debug_assert_eq!(dim, VECTOR_DIM, …)` guard documenting this assumption.
+/// The `dim` is encoded as a `__d{dim}` segment so two coordinates that share a
+/// `(notebook, model)` but differ in `dim` (M4 Phase 4b: the same notebook may be
+/// re-embedded with a different model/dim) never collide on one physical table:
+/// `vec__{notebook}__{model_slug}__d{dim}`.
 ///
-/// If a future model is ever registered at *two* dims, two logical registry rows
-/// would collide on this one physical table name — at that point the scheme MUST
-/// be extended to include `dim` (e.g. `vec__{notebook}__{model_slug}__{dim}`).
-fn table_name(notebook: &str, model: &str) -> String {
-    format!("vec__{notebook}__{}", model_slug(model))
+/// CRITICAL: this generator names NEW coordinates only. EXISTING tables keep their
+/// stored physical name — every read/write path resolves a coordinate to a table
+/// via the registry's `lance_table_name` column, never by re-deriving it here. A
+/// nomic-768 table created before this segment existed (`vec__{nb}__nomic_v15`)
+/// stays valid because its name lives in the registry; only freshly-created
+/// coordinates flow through this function.
+fn table_name(notebook: &str, model: &str, dim: usize) -> String {
+    format!("vec__{notebook}__{}__d{dim}", model_slug(model))
 }
 
 /// Resolves the gen-suffixed physical table name for a coordinate + generation
 /// (Decision A: the re-embed new-table-flip).
 ///
-/// **gen-0 == [`table_name`] (byte-identical).** The Phase-1/2 tables shipped
-/// before the flip existed; they are gen-0 *by convention*, so resolving gen-0
-/// must reproduce the exact formula name or pre-flip search would point at a
-/// table that does not exist. A non-zero generation appends `__{gen}` so a
-/// freshly-built `building` table co-exists beside the live `active` table for
-/// the SAME coordinate (the partial-unique registry from migration `0005` allows
-/// it). Enrichment never changes model/dim, so the `dim`-absent caveat on
-/// [`table_name`] is irrelevant here — only the generation differs.
-fn gen_table_name(notebook: &str, model: &str, generation: u32) -> String {
+/// **gen-0 == [`table_name`] (byte-identical).** A non-zero generation appends
+/// `__{gen}` AFTER the dim segment (`vec__{nb}__{slug}__d{dim}__{gen}`, R7
+/// ordering: dim before gen) so a freshly-built `building` table co-exists beside
+/// the live `active` table for the SAME coordinate (the partial-unique registry
+/// from migration `0005` allows it).
+fn gen_table_name(notebook: &str, model: &str, dim: usize, generation: u32) -> String {
     if generation == 0 {
-        table_name(notebook, model)
+        table_name(notebook, model, dim)
     } else {
-        format!("{}__{generation}", table_name(notebook, model))
+        format!("{}__{generation}", table_name(notebook, model, dim))
     }
 }
 
@@ -753,18 +758,6 @@ impl LanceVectorStore {
         model: &str,
         dim: usize,
     ) -> Result<Table, LensError> {
-        // PHASE-1 INVARIANT (see `table_name`): the physical table name omits
-        // `dim` and relies on `model ⇒ dim`. The only registered model is fixed
-        // at `VECTOR_DIM`, so a `dim` other than that would silently resolve to a
-        // table built for a different dimension. Guard it here at the resolution
-        // path; registering a second dim for the same model must first extend the
-        // table-name scheme to include `dim`.
-        debug_assert_eq!(
-            dim, VECTOR_DIM,
-            "table_name omits dim and relies on model⇒dim (Phase 1): a second dim \
-             for the same model must extend the table-name scheme to include dim"
-        );
-
         let conn = self.connect().await?;
 
         // REGISTRY-DRIVEN resolution (mirror of `open_active_table`): if a
@@ -806,7 +799,7 @@ impl LanceVectorStore {
         // name. Open a pre-existing (unregistered, e.g. crash-orphaned) table or
         // create a fresh one, then register the mapping `active` (the register is a
         // no-op on conflict, so a concurrent create is self-healing).
-        let name = table_name(notebook, model);
+        let name = table_name(notebook, model, dim);
         let existing = conn
             .table_names()
             .execute()
@@ -1216,13 +1209,6 @@ impl VectorStore for LanceVectorStore {
         model: &str,
         dim: usize,
     ) -> Result<String, LensError> {
-        // PHASE-1 INVARIANT (see `table_name`): the physical name omits `dim`. The
-        // re-embed never changes model/dim, so the same guard applies.
-        debug_assert_eq!(
-            dim, VECTOR_DIM,
-            "gen_table_name omits dim and relies on model⇒dim (Phase 1)"
-        );
-
         // Compute the next free generation above every name registered for the
         // coordinate (gen-0 is the live active table; prior building/stale rows may
         // linger until the startup-GC sweeps them).
@@ -1232,13 +1218,13 @@ impl VectorStore for LanceVectorStore {
             .await?;
         let mut generation = 1u32;
         loop {
-            let candidate = gen_table_name(notebook, model, generation);
+            let candidate = gen_table_name(notebook, model, dim, generation);
             if !existing.iter().any(|n| n == &candidate) {
                 break;
             }
             generation += 1;
         }
-        let building_name = gen_table_name(notebook, model, generation);
+        let building_name = gen_table_name(notebook, model, dim, generation);
 
         // Create the empty physical table, then register the `building` row. The
         // physical table is created FIRST so a crash before the registry insert
@@ -1263,7 +1249,12 @@ impl VectorStore for LanceVectorStore {
         Ok(building_name)
     }
 
-    async fn add_to_table(&self, table_name: &str, rows: Vec<VectorRow>) -> Result<(), LensError> {
+    async fn add_to_table(
+        &self,
+        table_name: &str,
+        rows: Vec<VectorRow>,
+        dim: usize,
+    ) -> Result<(), LensError> {
         if rows.is_empty() {
             return Ok(());
         }
@@ -1271,7 +1262,7 @@ impl VectorStore for LanceVectorStore {
             .open_table_by_name(table_name)
             .await?
             .ok_or_else(|| LensError::Vector(format!("no table named {table_name} to add to")))?;
-        let batch = rows_to_batch(&rows, VECTOR_DIM)?;
+        let batch = rows_to_batch(&rows, dim)?;
         table
             .add(batch)
             .execute()
@@ -1283,7 +1274,7 @@ impl VectorStore for LanceVectorStore {
         // The bulk seed copy in `seed_building_from_active` goes through the raw
         // table handle (not this path), so the index is built once the per-source
         // populate begins — over the complete row set, not the half-seeded one.
-        self.maybe_build_or_refresh_index(&table, VECTOR_DIM).await;
+        self.maybe_build_or_refresh_index(&table, dim).await;
         Ok(())
     }
 
@@ -1345,10 +1336,42 @@ mod tests {
     }
 
     #[test]
-    fn table_name_format() {
+    fn table_name_includes_dim_segment() {
         assert_eq!(
-            table_name("nb1", "nomic-embed-text-v1.5"),
-            "vec__nb1__nomic_v15"
+            table_name("nb1", "nomic-embed-text-v1.5", 768),
+            "vec__nb1__nomic_v15__d768"
+        );
+        assert_eq!(
+            table_name("nb1", "all-minilm", 384),
+            "vec__nb1__all_minilm__d384"
+        );
+    }
+
+    #[test]
+    fn gen_table_name_dim_before_gen_ordering() {
+        // gen-0 == table_name (no gen suffix).
+        assert_eq!(
+            gen_table_name("nb1", "mxbai-embed-large", 1024, 0),
+            "vec__nb1__mxbai_embed_large__d1024"
+        );
+        // Non-zero generation appends `__{gen}` AFTER the dim segment (R7).
+        assert_eq!(
+            gen_table_name("nb1", "mxbai-embed-large", 1024, 2),
+            "vec__nb1__mxbai_embed_large__d1024__2"
+        );
+    }
+
+    #[test]
+    fn different_dims_never_collide_for_same_notebook() {
+        // A 384 and a 768 coordinate for the same notebook must produce distinct
+        // physical names so two active coordinates never share a Lance table.
+        let n384 = table_name("nb1", "all-minilm", 384);
+        let n768 = table_name("nb1", "nomic-embed-text-v1.5", 768);
+        assert_ne!(n384, n768);
+        // Same property holds across generations.
+        assert_ne!(
+            gen_table_name("nb1", "all-minilm", 384, 1),
+            gen_table_name("nb1", "nomic-embed-text-v1.5", 768, 1)
         );
     }
 
@@ -1405,5 +1428,25 @@ mod tests {
         let batch = rows_to_batch(&rows, 4).expect("batch builds");
         assert_eq!(batch.num_rows(), 2);
         assert_eq!(batch.num_columns(), 5);
+    }
+
+    #[test]
+    fn rows_to_batch_builds_correct_384_dim_schema() {
+        let rows = vec![VectorRow {
+            chunk_id: "c1".into(),
+            source_id: "s1".into(),
+            notebook_id: "n1".into(),
+            level: 0,
+            vector: vec![0.1; 384],
+        }];
+        let batch = rows_to_batch(&rows, 384).expect("384-dim batch builds");
+        assert_eq!(batch.num_rows(), 1);
+        match batch.schema().field(4).data_type() {
+            DataType::FixedSizeList(item, len) => {
+                assert_eq!(item.data_type(), &DataType::Float32);
+                assert_eq!(*len, 384);
+            }
+            other => panic!("vector field is not a 384-wide FixedSizeList: {other:?}"),
+        }
     }
 }

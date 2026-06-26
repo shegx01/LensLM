@@ -148,7 +148,7 @@ pub async fn vector_chunk_ids(
         Ok(c) => c,
         Err(_) => return std::collections::HashSet::new(),
     };
-    let table_name = format!("vec__{notebook}__nomic_v15");
+    let table_name = format!("vec__{notebook}__nomic_v15__d{}", lens_core::EMBED_DIM);
     let names = conn.table_names().execute().await.unwrap_or_default();
     if !names.iter().any(|n| n == &table_name) {
         return std::collections::HashSet::new();

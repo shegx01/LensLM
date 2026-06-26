@@ -465,7 +465,7 @@ async fn embedding_index_registers_once_per_notebook() {
     );
     assert_eq!(
         r.get::<String, _>("lance_table_name"),
-        format!("vec__{nb1}__nomic_v15")
+        format!("vec__{nb1}__nomic_v15__d{EMBED_DIM}")
     );
     assert_eq!(r.get::<String, _>("status"), "active");
 }
