@@ -7,7 +7,11 @@
 //
 // Provider mapping (per spec):
 //   Local tab  → provider: 'ollama'
-//   Cloud API tab → provider: 'openai-compatible'
+//   Cloud API tab → the REAL provider id matching the models.dev catalog key
+//     ('openai' | 'anthropic' | 'google'), so a claude-*/gemini-* model validates
+//     against its OWN catalog namespace on the Rust side. 'openai-compatible' is
+//     reserved for a genuinely custom/self-hosted endpoint (exempt from catalog
+//     validation) — the cloud cards are all first-class providers.
 //
 // No new Rust command, no main.rs touch.
 
@@ -23,8 +27,10 @@ import { updateConfig } from '$lib/config.js';
 export type LlmProviderTab = 'local' | 'cloud';
 
 export interface LlmProviderInput {
-  /** 'ollama' for Local tab, 'openai-compatible' for Cloud API tab. */
-  provider: 'ollama' | 'openai-compatible';
+  /** The canonical provider id. `'ollama'` for the Local tab; the real cloud
+   * provider id (`'openai' | 'anthropic' | 'google'`) for the Cloud API cards;
+   * `'openai-compatible'` only for a genuinely custom/self-hosted endpoint. */
+  provider: 'ollama' | 'openai' | 'anthropic' | 'google' | 'openai-compatible';
   base_url: string;
   model: string;
   api_key: string;

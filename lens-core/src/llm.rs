@@ -59,10 +59,16 @@ const LLM_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 const LLM_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Canonical provider identifiers (match `ModelConfig.provider` /
-/// the onboarding `LlmProviderInput.provider` strings).
+/// the onboarding `LlmProviderInput.provider` strings). First-class cloud
+/// providers carry their REAL models.dev catalog key (`anthropic`, `google`,
+/// `openai`, `zai`); `openai-compatible` is reserved for a genuinely
+/// custom/self-hosted OpenAI-protocol endpoint (LM Studio, a proxy, …) where the
+/// user supplies the base URL and the served models are arbitrary.
 const PROVIDER_OLLAMA: &str = "ollama";
 const PROVIDER_OPENAI_COMPAT: &str = "openai-compatible";
+const PROVIDER_OPENAI: &str = "openai";
 const PROVIDER_ANTHROPIC: &str = "anthropic";
+const PROVIDER_GOOGLE: &str = "google";
 const PROVIDER_GLM: &str = "glm";
 const PROVIDER_ZAI: &str = "zai";
 const PROVIDER_OLLAMA_CLOUD: &str = "ollama-cloud";
@@ -226,26 +232,17 @@ pub trait LlmProvider: Send + Sync {
     }
 }
 
-/// Builds the shared HTTP client for LLM calls: bounded connect/read timeouts +
-/// the same SSRF hardening as the system-check probe (never follow a redirect).
-/// This client is injected into genai via `Client::builder().with_reqwest(..)`,
-/// so genai inherits the hardening rather than opening its own raw socket.
-fn llm_client_builder() -> reqwest::ClientBuilder {
-    reqwest::Client::builder()
-        .connect_timeout(LLM_CONNECT_TIMEOUT)
-        .timeout(LLM_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::none())
-}
-
-/// Builds the LLM HTTP client, degrading to a default client if the (pure-Rust
-/// rustls) TLS backend somehow fails to initialize — never panics.
+/// Builds the shared HTTP client for LLM calls via the one hardened builder
+/// ([`crate::http::hardened_client`]): bounded connect/read timeouts + the same
+/// SSRF no-redirect hardening as the system-check probe. This client is injected
+/// into genai via `Client::builder().with_reqwest(..)`, so genai inherits the
+/// hardening rather than opening its own raw socket.
 fn llm_client() -> reqwest::Client {
-    llm_client_builder()
-        .build()
-        .unwrap_or_else(|_| llm_client_builder().build().unwrap_or_default())
+    crate::http::hardened_client(LLM_CONNECT_TIMEOUT, LLM_TIMEOUT)
 }
 
-/// Maps a genai error onto a [`LensError`].
+/// Maps a genai error onto a [`LensError`], SANITIZING the message before it can
+/// cross the Tauri IPC boundary.
 ///
 /// genai wraps the underlying reqwest/transport error inside its own
 /// `webc::Error` (the `WebAdapterCall`/`WebModelCall`/`WebStream` variants), so
@@ -254,23 +251,26 @@ fn llm_client() -> reqwest::Client {
 /// [`LensError::Network`]; everything else (a non-success status `HttpError`, an
 /// auth/provider error, a decode miss) → [`LensError::Model`].
 ///
-/// NOTE: the enrichment worker treats `Network` and `Model` identically (both →
-/// `MapError::Llm` → source `failed`, raw vectors untouched), so this classification
-/// is purely for diagnostics/logging fidelity — it never changes enrichment
-/// control flow.
+/// The raw genai `Display` text can carry the configured endpoint URL or (in
+/// future request shapes) an echoed API key, so — mirroring the `sqlx`-error
+/// sanitization in [`crate::error`] — the FULL error is logged server-side via
+/// `tracing` and only a GENERIC, fixed message is surfaced over IPC. The
+/// Network/Model classification (and thus enrichment control flow, which treats
+/// both identically) is UNCHANGED.
 fn genai_err(err: genai::Error) -> LensError {
-    let text = err.to_string();
-    let lower = text.to_ascii_lowercase();
+    let lower = err.to_string().to_ascii_lowercase();
     let is_transport = lower.contains("connect")
         || lower.contains("connection")
         || lower.contains("timed out")
         || lower.contains("timeout")
         || lower.contains("dns")
         || lower.contains("refused");
+    // Log the full detail for operators; never surface it across IPC.
+    tracing::error!(error = %err, transport = is_transport, "LLM request failed");
     if is_transport {
-        LensError::Network(text)
+        LensError::Network("LLM request failed (network)".to_string())
     } else {
-        LensError::Model(text)
+        LensError::Model("LLM request failed (model)".to_string())
     }
 }
 
@@ -554,39 +554,57 @@ impl Default for LlmRouting {
 
 /// Whether a canonical provider id denotes a local runtime (exempt from the
 /// cloud-consent gate AND from catalog validation — local models are user-pulled).
+///
+/// Delegates to the SINGLE locality predicate ([`SupportedProvider::is_local`]) so
+/// the consent-gate exemption here can never drift from the catalog-validation
+/// exemption in `model_catalog` (they guard the same privacy/consent bypass).
 fn is_local_provider(provider: &str) -> bool {
-    provider == PROVIDER_OLLAMA
+    SupportedProvider::is_local(provider)
 }
 
 /// Maps a canonical `ModelConfig.provider` id onto the genai [`AdapterKind`].
 ///
-/// Cloud providers map to their native genai adapter; `openai-compatible`, `glm`,
-/// `zai`, and `ollama-cloud` all speak the OpenAI wire protocol against a custom
-/// endpoint, so they map to [`AdapterKind::OpenAI`] (the endpoint + key in the
-/// resolved [`ServiceTarget`] pin the actual backend). Returns `None` for an
+/// First-class cloud providers map to their NATIVE genai adapter (genai 0.6.5
+/// ships `Anthropic`, `Gemini`, `OpenAI`, `Zai`, `Ollama`, `OllamaCloud`, so no
+/// provider falls back to a generic OpenAI-compatible adapter). `glm` is an alias
+/// for `zai` (the GLM models are Z.ai's). The custom `openai-compatible` endpoint
+/// speaks the OpenAI wire protocol, so it maps to [`AdapterKind::OpenAI`] with the
+/// user-supplied base URL pinning the actual backend. Returns `None` for an
 /// unrecognized provider so the entry is skipped.
 fn adapter_for(provider: &str) -> Option<AdapterKind> {
     match provider {
         PROVIDER_OLLAMA => Some(AdapterKind::Ollama),
+        PROVIDER_OLLAMA_CLOUD => Some(AdapterKind::OllamaCloud),
         PROVIDER_ANTHROPIC => Some(AdapterKind::Anthropic),
-        // OpenAI-protocol families behind a custom endpoint.
-        PROVIDER_OPENAI_COMPAT | PROVIDER_GLM | PROVIDER_ZAI | PROVIDER_OLLAMA_CLOUD => {
-            Some(AdapterKind::OpenAI)
-        }
+        PROVIDER_GOOGLE => Some(AdapterKind::Gemini),
+        PROVIDER_OPENAI => Some(AdapterKind::OpenAI),
+        PROVIDER_ZAI | PROVIDER_GLM => Some(AdapterKind::Zai),
+        // A genuinely custom/self-hosted OpenAI-protocol endpoint (LM Studio, a
+        // proxy): OpenAI adapter + the user's base URL.
+        PROVIDER_OPENAI_COMPAT => Some(AdapterKind::OpenAI),
         _ => None,
     }
 }
 
-/// The models.dev catalog key used to validate a `(provider, model)` for a cloud
-/// provider. `openai-compatible` validates against `openai`; `glm` against `zai`.
-fn catalog_key_for(provider: &str) -> &str {
+/// The models.dev catalog key used to validate a first-class cloud
+/// `(provider, model)`. Each real provider id validates against its OWN namespace
+/// (anthropic→anthropic, google→google, openai→openai, zai→zai, …), so a
+/// `claude-*` model validates against `anthropic` and a `gemini-*` against
+/// `google`. `glm` validates against `zai`.
+///
+/// Returns `None` for the custom `openai-compatible` endpoint case (and any local
+/// runtime), signalling the caller to SKIP catalog validation entirely — that
+/// endpoint serves arbitrary models with no catalog namespace.
+fn catalog_key_for(provider: &str) -> Option<&str> {
     match provider {
-        PROVIDER_OPENAI_COMPAT => SupportedProvider::OpenAI.catalog_key(),
-        PROVIDER_GLM => SupportedProvider::Zai.catalog_key(),
-        PROVIDER_ANTHROPIC => SupportedProvider::Anthropic.catalog_key(),
-        PROVIDER_ZAI => SupportedProvider::Zai.catalog_key(),
-        PROVIDER_OLLAMA_CLOUD => SupportedProvider::OllamaCloud.catalog_key(),
-        other => other,
+        PROVIDER_OPENAI => Some(SupportedProvider::OpenAI.catalog_key()),
+        PROVIDER_ANTHROPIC => Some(SupportedProvider::Anthropic.catalog_key()),
+        PROVIDER_GOOGLE => Some(SupportedProvider::Google.catalog_key()),
+        PROVIDER_ZAI | PROVIDER_GLM => Some(SupportedProvider::Zai.catalog_key()),
+        PROVIDER_OLLAMA_CLOUD => Some(SupportedProvider::OllamaCloud.catalog_key()),
+        // Custom self-hosted endpoint (or a local runtime): no catalog namespace.
+        PROVIDER_OPENAI_COMPAT | PROVIDER_OLLAMA => None,
+        other => Some(other),
     }
 }
 
@@ -682,17 +700,23 @@ fn build_task_provider(
         })?;
 
     // Apply the same consent + catalog gates as routing selection (anti-free-string):
-    // local Ollama is exempt; cloud needs consent + a catalog hit on the OVERRIDE model.
-    if !is_local_provider(&want_provider) {
-        let ok = cloud_consent
-            && catalog
-                .validate(catalog_key_for(&want_provider), &task_model.model)
-                .is_ok();
+    // local Ollama is exempt; the custom openai-compatible endpoint is consent-gated
+    // but NOT catalog-validated; a first-class cloud provider needs consent + a
+    // catalog hit on the OVERRIDE model in its OWN namespace.
+    if is_local_provider(&want_provider) {
+        if task_model.model.is_empty() {
+            return None;
+        }
+    } else if !cloud_consent {
+        return None;
+    } else {
+        let ok = match catalog_key_for(&want_provider) {
+            Some(key) => catalog.validate(key, &task_model.model).is_ok(),
+            None => !task_model.model.is_empty(),
+        };
         if !ok {
             return None;
         }
-    } else if task_model.model.is_empty() {
-        return None;
     }
 
     // Reuse the base provider's genai client (only the pinned target differs).
@@ -753,8 +777,10 @@ fn select_provider(
 }
 
 /// Whether an entry passes the consent + catalog-validation gates (independent of
-/// routing). Local Ollama is exempt from both; cloud entries need consent AND a
-/// catalog hit. An unrecognized provider id is never eligible.
+/// routing). Local Ollama is exempt from both. The custom `openai-compatible`
+/// endpoint is consent-gated but EXEMPT from catalog validation (it serves
+/// arbitrary models). Every other (first-class) cloud entry needs consent AND a
+/// catalog hit in its OWN namespace. An unrecognized provider id is never eligible.
 fn build_eligible(
     model: &crate::config::ModelConfig,
     cloud_consent: bool,
@@ -767,11 +793,19 @@ fn build_eligible(
     if is_local_provider(&provider) {
         return true;
     }
-    // Cloud: gated on explicit consent + catalog membership (anti-free-string).
-    cloud_consent
-        && catalog
-            .validate(catalog_key_for(&provider), &model.model)
-            .is_ok()
+    // Cloud: always consent-gated.
+    if !cloud_consent {
+        return false;
+    }
+    match catalog_key_for(&provider) {
+        // First-class cloud provider: validate against its OWN catalog namespace
+        // (anti-free-string), so e.g. a `claude-*` validates against `anthropic`.
+        Some(key) => catalog.validate(key, &model.model).is_ok(),
+        // Custom self-hosted OpenAI-compatible endpoint: consent-gated above, but
+        // NOT catalog-validated (arbitrary models). A non-empty model is required
+        // (enforced by the caller's `usable` check / `build_provider`).
+        None => !model.model.is_empty(),
+    }
 }
 
 /// Builds a [`GenaiProvider`] for a single recognized entry (no gating — the
@@ -1147,15 +1181,45 @@ mod tests {
         }
     }
 
+    /// A catalog-valid Google entry (the bundled catalog lists Gemini models).
+    fn google_entry(model: &str) -> ModelConfig {
+        ModelConfig {
+            provider: "google".to_string(),
+            base_url: "https://generativelanguage.googleapis.com/v1beta/openai".to_string(),
+            model: model.to_string(),
+            api_key: "g-key".to_string(),
+            ..ModelConfig::default()
+        }
+    }
+
+    /// A custom self-hosted OpenAI-compatible entry (e.g. LM Studio): a
+    /// user-supplied base_url serving an ARBITRARY model that is NOT in any
+    /// models.dev namespace.
+    fn custom_openai_entry(model: &str) -> ModelConfig {
+        ModelConfig {
+            provider: "openai-compatible".to_string(),
+            base_url: "http://localhost:1234/v1".to_string(),
+            model: model.to_string(),
+            api_key: "sk-local".to_string(),
+            ..ModelConfig::default()
+        }
+    }
+
+    /// The first model id present in the bundled catalog for `provider` (so
+    /// catalog validation passes for the cloud-selection tests).
+    fn catalog_model(provider: &str) -> String {
+        let catalog = ModelCatalog::bundled();
+        catalog
+            .provider(provider)
+            .and_then(|p| p.models.keys().next())
+            .cloned()
+            .unwrap_or_else(|| panic!("bundled catalog has at least one {provider} model"))
+    }
+
     /// The first Anthropic model id present in the bundled catalog (so catalog
     /// validation passes for the cloud-selection tests).
     fn catalog_anthropic_model() -> String {
-        let catalog = ModelCatalog::bundled();
-        catalog
-            .provider("anthropic")
-            .and_then(|p| p.models.keys().next())
-            .cloned()
-            .expect("bundled catalog has at least one anthropic model")
+        catalog_model("anthropic")
     }
 
     #[test]
@@ -1200,6 +1264,67 @@ mod tests {
             provider_from_config(&cfg, true).is_none(),
             "uncatalogued cloud model must be rejected"
         );
+    }
+
+    #[test]
+    fn anthropic_provider_validates_against_own_namespace() {
+        // Fix #1 regression guard: a first-class Anthropic entry (provider id
+        // "anthropic") must validate the claude-* model against the ANTHROPIC
+        // catalog namespace and be selected — NOT validated against "openai" (the
+        // old openai-compatible→openai mapping that silently broke routing).
+        let model = catalog_model("anthropic");
+        assert!(model.starts_with("claude"), "expected a claude-* model");
+        let cfg = config_with(vec![anthropic_entry(&model)], LlmRouting::CloudFirst);
+        let p = provider_from_config(&cfg, true).expect("anthropic (claude-*) must select");
+        assert_eq!(p.model_id(), model);
+    }
+
+    #[test]
+    fn google_provider_validates_against_own_namespace() {
+        // Fix #1: a Google entry (provider id "google") validates its gemini-*
+        // model against the GOOGLE namespace and selects (maps to genai's native
+        // Gemini adapter).
+        let model = catalog_model("google");
+        assert!(model.starts_with("gemini"), "expected a gemini-* model");
+        let cfg = config_with(vec![google_entry(&model)], LlmRouting::CloudFirst);
+        let p = provider_from_config(&cfg, true).expect("google (gemini-*) must select");
+        assert_eq!(p.model_id(), model);
+    }
+
+    #[test]
+    fn custom_openai_compatible_is_consent_gated_but_unvalidated() {
+        // Fix #1: the custom openai-compatible endpoint serves arbitrary models, so
+        // a model id absent from any catalog still selects — PROVIDED consent is
+        // granted (it is still consent-gated, unlike local Ollama).
+        let cfg = config_with(
+            vec![custom_openai_entry("some-self-hosted-model-v3")],
+            LlmRouting::CloudFirst,
+        );
+        // With consent: selected despite not being in the catalog.
+        let p = provider_from_config(&cfg, true).expect("custom endpoint selects with consent");
+        assert_eq!(p.model_id(), "some-self-hosted-model-v3");
+        // Without consent: rejected (still a cloud-bound endpoint).
+        assert!(
+            provider_from_config(&cfg, false).is_none(),
+            "custom endpoint is consent-gated"
+        );
+    }
+
+    #[test]
+    fn legacy_openai_compatible_config_still_works_as_custom_endpoint() {
+        // Backward-compat: a legacy config persisted with provider "openai-compatible"
+        // + a base_url (the pre-fix blanket cloud id) must still resolve as the
+        // custom-endpoint case — no catalog validation — so existing installs keep
+        // enriching.
+        let cfg = config_with(
+            vec![custom_openai_entry("gpt-4o")],
+            LlmRouting::Explicit {
+                provider: "openai-compatible".to_string(),
+                model: "gpt-4o".to_string(),
+            },
+        );
+        let p = provider_from_config(&cfg, true).expect("legacy openai-compatible resolves");
+        assert_eq!(p.model_id(), "gpt-4o");
     }
 
     #[test]

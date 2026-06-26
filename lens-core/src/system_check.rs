@@ -301,31 +301,15 @@ struct LlmRuntimeProbe {
     ollama_base_url: String,
 }
 
-/// Builds a short-timeout HTTP client for runtime detection.
-///
-/// Both connect and read timeouts are bounded so a closed port or a black-hole
-/// host fails fast rather than hanging the onboarding screen.
-/// The shared probe-client builder: bounded connect/read timeouts plus SSRF
-/// hardening (never follow a redirect — a malicious / misconfigured endpoint
+/// Builds a short-timeout HTTP client for runtime detection via the one hardened
+/// builder ([`crate::http::hardened_client`]): bounded connect/read timeouts plus
+/// SSRF hardening (never follow a redirect — a malicious / misconfigured endpoint
 /// could 30x a probe toward an internal host; a probe only ever inspects the
-/// directly-addressed service). Centralized so the primary build and its
-/// fallback can never drift apart.
-fn probe_builder() -> reqwest::ClientBuilder {
-    reqwest::Client::builder()
-        .connect_timeout(PROBE_CONNECT_TIMEOUT)
-        .timeout(PROBE_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::none())
-}
-
+/// directly-addressed service). Centralized so the primary build and its fallback
+/// can never drift apart, and so the fallback never degrades to a
+/// redirect-following default.
 fn probe_client() -> reqwest::Client {
-    // The builder only fails if the TLS backend can't initialize. Retry the
-    // identical (timeout + no-redirect) builder once; the final
-    // `unwrap_or_default` is a last-resort guard that can realistically never
-    // run (rustls is pure Rust with no system deps) so a probe degrades to a
-    // clean Fail, never a panic.
-    probe_builder()
-        .build()
-        .unwrap_or_else(|_| probe_builder().build().unwrap_or_default())
+    crate::http::hardened_client(PROBE_CONNECT_TIMEOUT, PROBE_TIMEOUT)
 }
 
 /// Resolves the configured Ollama base URL, defaulting to localhost.
@@ -358,12 +342,28 @@ fn provider_base_url(config: &AppConfig, provider: &str) -> Option<String> {
         .map(|m| m.base_url.trim_end_matches('/').to_string())
 }
 
-/// Returns `true` when `config.models` carries a usable cloud LLM entry: an
-/// `openai-compatible` provider with a non-empty `api_key` AND `model`. This is
-/// the cloud arm of the LLM-runtime gate (the local arm is runtime detection).
+/// Canonical cloud LLM provider ids (real models.dev keys) plus the legacy/custom
+/// `openai-compatible` endpoint id. Used by [`has_cloud_llm`] to recognize a
+/// configured cloud provider regardless of which first-class card the user picked.
+const CLOUD_LLM_PROVIDERS: &[&str] = &[
+    "openai",
+    "anthropic",
+    "google",
+    "zai",
+    "glm",
+    "openai-compatible",
+];
+
+/// Returns `true` when `config.models` carries a usable cloud LLM entry: a
+/// recognized cloud provider (a real models.dev id `openai`/`anthropic`/`google`/
+/// `zai`, or a custom `openai-compatible` endpoint) with a non-empty `api_key` AND
+/// `model`. This is the cloud arm of the LLM-runtime gate (the local arm is
+/// runtime detection).
 fn has_cloud_llm(config: &AppConfig) -> bool {
     config.models.iter().any(|m| {
-        m.provider.eq_ignore_ascii_case("openai-compatible")
+        CLOUD_LLM_PROVIDERS
+            .iter()
+            .any(|p| m.provider.eq_ignore_ascii_case(p))
             && !m.api_key.is_empty()
             && !m.model.is_empty()
     })
@@ -741,6 +741,27 @@ mod tests {
         // Both present ⇒ usable.
         config.models[0].model = "gpt-4o".to_string();
         assert!(has_cloud_llm(&config));
+    }
+
+    #[test]
+    fn has_cloud_llm_recognizes_first_class_cloud_providers() {
+        // Fix #1: a first-class cloud entry now carries its REAL provider id, not a
+        // blanket 'openai-compatible'. The LLM-runtime cloud arm must still
+        // recognize it (else a configured Anthropic/Google cloud provider would
+        // fail the readiness gate).
+        for provider in ["anthropic", "google", "openai", "zai"] {
+            let mut config = AppConfig::default();
+            config.models.push(ModelConfig {
+                provider: provider.to_string(),
+                model: "some-model".to_string(),
+                api_key: "k".to_string(),
+                ..ModelConfig::default()
+            });
+            assert!(
+                has_cloud_llm(&config),
+                "{provider} cloud entry must be recognized"
+            );
+        }
     }
 
     #[test]

@@ -63,10 +63,6 @@
   // The locally-pulled Ollama models at the current endpoint (info: null). Loaded
   // on expand; surfaces pulled models in the model picker without Auto-detect.
   let ollamaModelOptions = $state<ModelOption[]>([]);
-  // Local UI control for reasoning models: a "thinking" toggle shown only when the
-  // selected cloud model advertises `reasoning`. Enrichment stays deterministic on
-  // the backend, so this has no persistence wiring (no enrichment field for it).
-  let thinkingEnabled = $state(false);
 
   // --- Save state (cloud) ---
   let saving = $state(false);
@@ -174,8 +170,11 @@
   const cloudCatalogKey = $derived(cloudProvider);
 
   // The canonical backend provider id for the ACTIVE tab — used for routing pins
-  // and per-task TaskModel overrides (local → 'ollama'; cloud → 'openai-compatible').
-  const canonicalProviderId = $derived(activeTab === 'local' ? 'ollama' : 'openai-compatible');
+  // and per-task TaskModel overrides. Local → 'ollama'; cloud → the REAL provider
+  // id of the selected card ('openai' | 'anthropic' | 'google'), matching the
+  // models.dev catalog key so the Rust factory validates against the right
+  // namespace (NOT a blanket 'openai-compatible', which broke claude-*/gemini-*).
+  const canonicalProviderId = $derived(activeTab === 'local' ? 'ollama' : cloudProvider);
 
   // The options actually rendered in the cloud model <select>. When the catalog
   // is empty (offline / non-Tauri / mock returns nothing), fall back to a single
@@ -327,7 +326,11 @@
     try {
       const provider = CLOUD_PROVIDERS.find((p) => p.id === cloudProvider)!;
       await saveLlmProvider({
-        provider: 'openai-compatible',
+        // Persist the REAL provider id (openai/anthropic/google) so the Rust
+        // factory validates the model against its OWN catalog namespace — a
+        // blanket 'openai-compatible' validated claude-*/gemini-* against the
+        // OpenAI namespace and silently broke routing (fix #1).
+        provider: cloudProvider,
         base_url: cloudBaseUrl || provider.baseUrl,
         // User's chosen model id; fall back to the provider default if cleared.
         model: cloudModel.trim() || provider.defaultModel,
@@ -397,14 +400,20 @@
     await Promise.all([loadCloudModels(), loadOllamaModels()]);
     try {
       const cfg = await invoke<AppConfig>('get_config');
+      // A saved cloud entry now carries the REAL provider id (openai/anthropic/
+      // google); a legacy install may still carry 'openai-compatible' — match
+      // either to a card (by provider id first, then by base_url for the legacy
+      // shape). Only the matched card gets the per-provider saved/masked treatment.
+      const cloudIds = CLOUD_PROVIDERS.map((p) => p.id) as string[];
       const saved = cfg.models?.find(
-        (m) => m.provider === 'openai-compatible' && m.api_key.trim() !== ''
+        (m) =>
+          (cloudIds.includes(m.provider) || m.provider === 'openai-compatible') &&
+          m.api_key.trim() !== ''
       );
       if (!saved) return;
-      // Map the saved entry to a provider card by base_url. Only a recognized
-      // provider gets the per-provider saved/masked treatment; an unmatched
-      // base_url leaves every card in the normal (unsaved) entry state.
-      const match = CLOUD_PROVIDERS.find((p) => p.baseUrl === saved.base_url);
+      const match =
+        CLOUD_PROVIDERS.find((p) => p.id === saved.provider) ??
+        CLOUD_PROVIDERS.find((p) => p.baseUrl === saved.base_url);
       if (!match) return;
       savedProviderId = match.id;
       cloudProvider = match.id;
@@ -667,42 +676,6 @@
         </p>
       {/if}
     </div>
-
-    <!-- THINKING / REASONING toggle — only for models that advertise reasoning.
-         Local UI control (enrichment stays deterministic; no backend field). -->
-    {#if selectedCloudModel?.info?.reasoning === true}
-      <div class="flex items-start justify-between gap-3">
-        <div class="flex flex-col gap-0.5">
-          <label for="llm-cloud-thinking" class="text-foreground text-[0.82rem] font-medium">
-            Extended thinking
-          </label>
-          <p class="text-muted-foreground text-[0.72rem] leading-relaxed">
-            Let this reasoning model think step-by-step before answering. Higher quality on hard
-            tasks; slower and may cost more.
-          </p>
-        </div>
-        <button
-          id="llm-cloud-thinking"
-          type="button"
-          role="switch"
-          aria-checked={thinkingEnabled}
-          aria-label="Enable thinking"
-          onclick={() => (thinkingEnabled = !thinkingEnabled)}
-          class={cn(
-            'relative mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors',
-            'focus-visible:ring-ring/50 outline-none focus-visible:ring-3',
-            thinkingEnabled ? 'bg-primary' : 'bg-muted'
-          )}
-        >
-          <span
-            class={cn(
-              'bg-background inline-block size-4 transform rounded-full shadow-sm transition-transform',
-              thinkingEnabled ? 'translate-x-4' : 'translate-x-0.5'
-            )}
-          ></span>
-        </button>
-      </div>
-    {/if}
 
     <!-- API KEY -->
     <div class="flex flex-col gap-1.5">

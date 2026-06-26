@@ -352,7 +352,7 @@ describe('LlmConfigPanel — Test connection (local tab)', () => {
 // ──────────────────────────────────────────────────────────────────────────
 
 describe('LlmConfigPanel — Save (cloud tab)', () => {
-  it('calls set_config with openai-compatible provider when Cloud API tab is active', async () => {
+  it('calls set_config with the real cloud provider id when Cloud API tab is active', async () => {
     const setConfig = vi.fn();
     const oncheck = vi.fn().mockResolvedValue(undefined);
 
@@ -387,7 +387,9 @@ describe('LlmConfigPanel — Save (cloud tab)', () => {
           config: expect.objectContaining({
             models: expect.arrayContaining([
               expect.objectContaining({
-                provider: 'openai-compatible',
+                // The REAL provider id of the selected card (default OpenAI), not a
+                // blanket 'openai-compatible' (fix #1).
+                provider: 'openai',
                 // Real OpenAI API model id (default provider), not a derived slug.
                 model: 'gpt-4o',
                 context: 128000
@@ -427,14 +429,14 @@ describe('LlmConfigPanel — Save (cloud tab)', () => {
     // Save.
     await fireEvent.click(screen.getByRole('button', { name: /save/i }));
 
-    // The entered api_key must reach set_config on the openai-compatible entry.
+    // The entered api_key must reach set_config on the real-provider entry.
     await waitFor(() =>
       expect(setConfig).toHaveBeenCalledWith(
         expect.objectContaining({
           config: expect.objectContaining({
             models: expect.arrayContaining([
               expect.objectContaining({
-                provider: 'openai-compatible',
+                provider: 'openai',
                 api_key: 'sk-test-1234'
               })
             ])
@@ -610,7 +612,7 @@ describe('LlmConfigPanel — Save (cloud tab)', () => {
           config: expect.objectContaining({
             models: expect.arrayContaining([
               expect.objectContaining({
-                provider: 'openai-compatible',
+                provider: 'openai',
                 model: 'gpt-5-turbo'
               })
             ])
@@ -775,38 +777,6 @@ describe('LlmConfigPanel — capability-aware pickers', () => {
       expect(
         within(cloudSelect).getByRole('option', { name: 'Claude 3.5 Sonnet' })
       ).toBeInTheDocument()
-    );
-  });
-
-  it('shows the thinking toggle for a reasoning model and hides it for a non-reasoning model', async () => {
-    mockIPC((cmd, args) => {
-      if (cmd === 'get_config') return baseConfig();
-      if (cmd === 'set_config') return null;
-      if (cmd === 'list_provider_models')
-        return cloudCatalog((args as { provider: string }).provider);
-      if (cmd === 'list_ollama_models') return [];
-    });
-
-    render(SystemCheckRow, { props: { result: llmRow(), oncheck: vi.fn() } });
-    await fireEvent.click(screen.getByRole('button', { name: /configure/i }));
-    await waitFor(() =>
-      expect(screen.getByRole('tab', { name: /cloud api/i })).toBeInTheDocument()
-    );
-    await fireEvent.click(screen.getByRole('tab', { name: /cloud api/i }));
-
-    // Default provider (openai → gpt-4o, reasoning=false): toggle is HIDDEN.
-    const cloudSelect = (await waitFor(() =>
-      screen.getByLabelText('Model', { selector: '#llm-cloud-model' })
-    )) as HTMLSelectElement;
-    await waitFor(() =>
-      expect(within(cloudSelect).getByRole('option', { name: 'GPT-4o' })).toBeInTheDocument()
-    );
-    expect(screen.queryByRole('switch', { name: /enable thinking/i })).not.toBeInTheDocument();
-
-    // Switch to Anthropic (claude, reasoning=true): toggle becomes VISIBLE.
-    await fireEvent.click(screen.getByRole('radio', { name: /anthropic/i }));
-    await waitFor(() =>
-      expect(screen.getByRole('switch', { name: /enable thinking/i })).toBeInTheDocument()
     );
   });
 

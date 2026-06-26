@@ -117,9 +117,13 @@ pub struct ProviderEntry {
 /// evolving catalog can never fail the parse.
 ///
 /// `context_limit`/`output_limit` are flattened from the catalog's nested
-/// `limit: { context, output }` object by a manual [`Deserialize`] impl (the
-/// public struct stays flat for an easy TS mirror); serialization re-nests them
-/// under `limit` so the cached round-trip is faithful.
+/// `limit: { context, output }` object by a manual [`Deserialize`] impl (which
+/// parses the source schema), and serialized FLAT as `context_limit` /
+/// `output_limit` numeric fields. The flat serialization is what the IPC layer
+/// emits and what the TS mirror (`src/lib/models/types.ts`) + the Svelte picker
+/// consume (the picker calls `.toLocaleString()` on the numbers), so the derived
+/// `Serialize` keeps both in lockstep — no custom serializer that would emit a
+/// nested object or drop `output_limit`.
 #[derive(Debug, Clone, PartialEq, Default, Serialize)]
 pub struct ModelInfo {
     /// Fully-qualified model id (e.g. `"anthropic/claude-sonnet-4-5"`).
@@ -141,36 +145,17 @@ pub struct ModelInfo {
     pub temperature: bool,
     /// Input/output modalities.
     pub modalities: Modalities,
-    /// Maximum context window in tokens (`limit.context`), when known.
-    #[serde(serialize_with = "serialize_limit")]
+    /// Maximum context window in tokens (`limit.context`), when known. Serialized
+    /// FLAT as a `context_limit` number (or `null`) for the TS mirror / IPC.
     pub context_limit: Option<u32>,
-    /// Maximum output tokens (`limit.output`), when known. Re-nested under
-    /// `limit` on serialize together with `context_limit`, so this field is
-    /// skipped to avoid emitting a duplicate.
-    #[serde(skip_serializing)]
+    /// Maximum output tokens (`limit.output`), when known. Serialized FLAT as an
+    /// `output_limit` number (or `null`) for the TS mirror / IPC.
     pub output_limit: Option<u32>,
     /// Whether the model's weights are openly available.
     pub open_weights: bool,
     /// Per-token cost (USD per 1M tokens), when the catalog reports it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost: Option<Cost>,
-}
-
-/// Serializes the flat `context_limit`/`output_limit` back into the catalog's
-/// nested `limit` object so a cached round-trip stays faithful to the source
-/// schema. Reads `output_limit` off the surrounding struct is not possible from
-/// a field serializer, so this emits only `{ "context": ... }`; `output_limit`
-/// is intentionally NOT round-tripped on serialize (the cache is always
-/// re-fetched from the source, never re-uploaded — serialize exists only for
-/// tests / IPC, which read the flat fields directly).
-fn serialize_limit<S>(context: &Option<u32>, ser: S) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    use serde::ser::SerializeStruct;
-    let mut s = ser.serialize_struct("limit", 1)?;
-    s.serialize_field("context", context)?;
-    s.end()
 }
 
 impl<'de> Deserialize<'de> for ModelInfo {
@@ -350,12 +335,16 @@ impl SupportedProvider {
         }
     }
 
-    /// Whether this provider's models are validated against the live catalog at
-    /// all. Local Ollama models are user-pulled and not in models.dev, so they
-    /// are exempt from the catalog membership check (see
-    /// [`ModelCatalog::validate`]).
-    fn is_local_ollama(key: &str) -> bool {
-        key == "ollama"
+    /// The SINGLE locality predicate: whether `key` denotes a local runtime that
+    /// is exempt from the cloud-consent gate AND from catalog validation (its
+    /// models are user-pulled and not in models.dev).
+    ///
+    /// This is the one source of truth shared by `model_catalog` (the validation
+    /// exemption) and `llm` (the consent-gate exemption) — they MUST agree, since
+    /// both guard the same consent/privacy bypass. `crate::llm` calls this rather
+    /// than re-hardcoding the `"ollama"` string.
+    pub(crate) fn is_local(key: &str) -> bool {
+        key == SupportedProvider::Ollama.catalog_key()
     }
 }
 
@@ -373,9 +362,18 @@ impl ModelCatalog {
     /// The bundled fallback snapshot (small curated slice of the real catalog).
     /// Infallible in practice — the snapshot is a committed, valid fixture; a
     /// parse failure here is a build-time error caught by the unit tests.
+    ///
+    /// The embedded JSON is parsed ONCE (memoized in a [`std::sync::LazyLock`])
+    /// and cloned on each call. `bundled()` is hit on the enrichment hot path
+    /// (`provider_from_config` / `task_provider_from_config`), so re-parsing the
+    /// snapshot per call was wasted work; the `expect` stays (a malformed bundled
+    /// snapshot is a build-time catastrophe).
     pub fn bundled() -> Self {
-        Self::from_json(BUNDLED_CATALOG_JSON.as_bytes())
-            .expect("bundled model catalog must be valid JSON")
+        static BUNDLED: std::sync::LazyLock<ModelCatalog> = std::sync::LazyLock::new(|| {
+            ModelCatalog::from_json(BUNDLED_CATALOG_JSON.as_bytes())
+                .expect("bundled model catalog must be valid JSON")
+        });
+        BUNDLED.clone()
     }
 
     /// Looks up a provider entry by its models.dev key.
@@ -404,7 +402,7 @@ impl ModelCatalog {
         // happens to be listed; otherwise a synthetic stand-in is not returned —
         // callers that need the &ModelInfo for an unlisted local model must fall
         // back to defaults until stage 2 wires live /api/tags validation).
-        if SupportedProvider::is_local_ollama(provider_key) {
+        if SupportedProvider::is_local(provider_key) {
             if let Some(info) = self
                 .providers
                 .get(provider_key)
@@ -434,7 +432,7 @@ impl ModelCatalog {
     /// [`validate`](Self::validate) that discards the matched info). For local
     /// Ollama, ANY non-empty id is treated as valid (the user-pull exception).
     pub fn is_valid(&self, provider_key: &str, model_id: &str) -> bool {
-        if SupportedProvider::is_local_ollama(provider_key) {
+        if SupportedProvider::is_local(provider_key) {
             return !model_id.is_empty();
         }
         self.validate(provider_key, model_id).is_ok()
@@ -536,21 +534,12 @@ pub async fn refresh_if_stale(
     Ok(true)
 }
 
-/// Builds the hardened HTTP client for catalog fetches: bounded connect/read
-/// timeouts + the same no-redirect SSRF guard as the system-check probe.
-///
-/// Degrades to a default client if the (pure-Rust rustls) TLS backend somehow
-/// fails to initialize — never panics.
+/// Builds the hardened HTTP client for catalog fetches via the one hardened
+/// builder ([`crate::http::hardened_client`]): bounded connect/read timeouts +
+/// the same no-redirect SSRF guard as the system-check probe (its fallback
+/// preserves the hardening rather than degrading to a redirect-following default).
 pub fn catalog_client() -> reqwest::Client {
-    let builder = || {
-        reqwest::Client::builder()
-            .connect_timeout(CATALOG_CONNECT_TIMEOUT)
-            .timeout(CATALOG_FETCH_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none())
-    };
-    builder()
-        .build()
-        .unwrap_or_else(|_| builder().build().unwrap_or_default())
+    crate::http::hardened_client(CATALOG_CONNECT_TIMEOUT, CATALOG_FETCH_TIMEOUT)
 }
 
 /// Streams the catalog body from `url`, aborting if it would exceed
@@ -787,6 +776,46 @@ mod tests {
     }
 
     #[test]
+    fn model_info_serializes_flat_numeric_limits() {
+        // Fix #2 regression guard: ModelInfo must serialize `context_limit` /
+        // `output_limit` as FLAT numbers (what the TS mirror + Svelte picker read,
+        // calling `.toLocaleString()`), NOT a nested `{ "context": N }` object that
+        // would render `[object Object]`, and NOT drop `output_limit`.
+        let catalog = fixture();
+        let sonnet = &catalog.providers["anthropic"].models["claude-sonnet-4-5"];
+        let value = serde_json::to_value(sonnet).expect("serializes");
+
+        assert_eq!(
+            value.get("context_limit"),
+            Some(&serde_json::json!(1_000_000)),
+            "context_limit must be a flat number"
+        );
+        assert_eq!(
+            value.get("output_limit"),
+            Some(&serde_json::json!(64_000)),
+            "output_limit must be a flat number, not dropped"
+        );
+        // No nested `limit` object leaks into the IPC shape.
+        assert!(
+            value.get("limit").is_none(),
+            "must not emit a nested `limit` object"
+        );
+
+        // A model with no limits serializes both as JSON null (the TS mirror types
+        // them `number | null`).
+        let glm = &catalog.providers["zai"].models["glm-4.6"];
+        let glm_value = serde_json::to_value(glm).expect("serializes");
+        assert_eq!(
+            glm_value.get("context_limit"),
+            Some(&serde_json::Value::Null)
+        );
+        assert_eq!(
+            glm_value.get("output_limit"),
+            Some(&serde_json::Value::Null)
+        );
+    }
+
+    #[test]
     fn handles_missing_optional_fields_with_defaults() {
         let catalog = fixture();
         // GLM-4.6 omits modalities, limit, cost, family, temperature, open_weights.
@@ -837,6 +866,25 @@ mod tests {
         // exception) even though `validate` can't return a &ModelInfo for it.
         assert!(catalog.is_valid("ollama", "my-custom-pull:latest"));
         assert!(!catalog.is_valid("ollama", ""));
+    }
+
+    #[test]
+    fn is_local_is_the_single_locality_predicate() {
+        // Fix #3: the ONE shared locality predicate. Only the local ollama runtime
+        // is local; every cloud provider (including ollama-cloud, which is hosted)
+        // is not. `crate::llm::is_local_provider` delegates here, so the
+        // consent-gate exemption and the catalog-validation exemption agree.
+        assert!(SupportedProvider::is_local("ollama"));
+        for key in [
+            "anthropic",
+            "openai",
+            "google",
+            "zai",
+            "ollama-cloud",
+            "openai-compatible",
+        ] {
+            assert!(!SupportedProvider::is_local(key), "{key} must not be local");
+        }
     }
 
     #[test]
