@@ -4717,6 +4717,7 @@ dependencies = [
  "chrono",
  "docx-rs",
  "fastembed",
+ "flate2",
  "futures-util",
  "genai",
  "insta",

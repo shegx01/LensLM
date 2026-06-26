@@ -15,6 +15,7 @@
   import {
     listCloudModelOptions,
     listOllamaModelOptions,
+    refreshCatalog,
     type ModelOption
   } from '$lib/models/catalog.js';
   import { SELECT_CLASS } from './styles.js';
@@ -50,9 +51,17 @@
   let cloudProvider = $state<'openai' | 'anthropic' | 'google'>('openai');
   let cloudBaseUrl = $state('https://api.openai.com/v1');
   let cloudApiKey = $state('');
-  // User-editable model id (seeded from the provider default, like the Local
-  // tab's model field). 'gpt-4o' matches the initial 'openai' provider.
+  // User-editable model id. Seeded from the provider default as an offline floor,
+  // but the SMART DEFAULT (loadCloudModels) overrides it with the newest
+  // text-capable catalog model when the user hasn't explicitly picked one.
+  // 'gpt-4o' matches the initial 'openai' provider.
   let cloudModel = $state('gpt-4o');
+  // Whether the user has EXPLICITLY chosen a cloud model (via the picker) or
+  // restored a saved one. While false, the smart default re-resolves to the
+  // newest text-capable model on every (re)load — so a background catalog
+  // refresh converges the default to the live newest model. Once the user picks
+  // (or a saved model is restored), their choice is preserved across reloads.
+  let cloudModelPicked = $state(false);
 
   // --- Capability-aware model pickers (M4 Phase 3, Stage 3) ---
   // The CLOUD catalog options for the selected provider (models.dev). Loaded on
@@ -63,6 +72,10 @@
   // The locally-pulled Ollama models at the current endpoint (info: null). Loaded
   // on expand; surfaces pulled models in the model picker without Auto-detect.
   let ollamaModelOptions = $state<ModelOption[]>([]);
+  // Whether a live catalog refresh (models.dev) is in flight. Drives the subtle
+  // "updating…" affordance under the cloud picker. NEVER blocks selection: the
+  // already-loaded options stay rendered + selectable while this is true.
+  let catalogUpdating = $state(false);
 
   // --- Save state (cloud) ---
   let saving = $state(false);
@@ -212,9 +225,18 @@
     activeTab === 'local' ? ollamaModelOptions : cloudModelOptions
   );
 
-  // Loads the cloud catalog for the selected provider. Resilient: any throw /
-  // empty map leaves a single default-model option so the picker still works
-  // offline and the legacy "gpt-4o" save tests stay green.
+  // Loads the cloud catalog (text-capable models only, newest first) for the
+  // selected provider and resolves the selected model. Resilient: any throw /
+  // empty map leaves the options empty so the picker falls back to the seeded
+  // default option offline (and the legacy "gpt-4o" save tests stay green).
+  //
+  // Smart default: when the user hasn't explicitly picked (or restored) a model,
+  // select the FIRST option — the newest text-capable model for the provider —
+  // so the default reflects the live catalog and re-resolves after a background
+  // refresh. When the user HAS picked one, preserve it (keep it if still valid;
+  // only fall back to the seed if it vanished from the catalog). When the
+  // filtered list is empty (offline), keep the seeded default so the field is
+  // never blank.
   async function loadCloudModels(): Promise<void> {
     try {
       const opts = await listCloudModelOptions(cloudCatalogKey);
@@ -222,12 +244,42 @@
     } catch {
       cloudModelOptions = [];
     }
-    // Keep the selected model valid: prefer the saved/seeded id when present in
-    // the catalog, else fall back to the provider default (preserves 'gpt-4o').
+    if (cloudModelOptions.length === 0) {
+      // Offline / empty catalog: fall back to the per-provider seed so the field
+      // is never blank (the picker renders the single seeded fallback option).
+      cloudModel = selectedProvider.defaultModel;
+      return;
+    }
+    if (!cloudModelPicked) {
+      // Smart default: newest text-capable model (the list is sorted desc).
+      cloudModel = cloudModelOptions[0].id;
+      return;
+    }
+    // User/saved choice: keep it if still in the catalog, else fall back to seed.
     if (!cloudModelOptions.some((o) => o.id === cloudModel)) {
-      if (!cloudModelOptions.some((o) => o.id === selectedProvider.defaultModel)) {
-        cloudModel = selectedProvider.defaultModel;
-      }
+      cloudModel = selectedProvider.defaultModel;
+    }
+  }
+
+  // Triggers a LIVE catalog refresh from models.dev, then RE-READS the loaded
+  // catalog so the cloud picker converges to the CURRENT full list (new models
+  // appear, removed ones disappear) — the data-driven contract. Fire-and-forget
+  // from the caller's view: the loaded list is already rendered (loadCloudModels
+  // ran first), so this only ever ADDS freshness, never blocks selection.
+  //
+  // Graceful: refreshCatalog() swallows offline/HTTP errors (resolves false), so
+  // we always re-read whatever the backend now serves — the existing list when
+  // offline, the freshly-fetched one when online. The backend gates the fetch on
+  // staleness, so repeated opens don't trigger a refetch storm. Never throws.
+  async function refreshAndReloadCloud(): Promise<void> {
+    catalogUpdating = true;
+    try {
+      await refreshCatalog();
+      // Re-read regardless of the refresh result: on success the cache now holds
+      // the fresh catalog; on failure we harmlessly re-read the unchanged one.
+      await loadCloudModels();
+    } finally {
+      catalogUpdating = false;
     }
   }
 
@@ -361,6 +413,10 @@
     const p = CLOUD_PROVIDERS.find((p) => p.id === id)!;
     cloudBaseUrl = p.baseUrl;
     cloudModel = p.defaultModel;
+    // Switching cards starts the model selection clean: drop any prior explicit
+    // pick so loadCloudModels re-applies the smart default (newest text model)
+    // for the new provider.
+    cloudModelPicked = false;
     // Switching cards starts clean: clear any typed/edited key. `hasSavedKey`
     // recomputes from the derived (true only when `id` is the saved provider).
     editingKey = false;
@@ -368,7 +424,11 @@
     // The catalog (and thus the coref-override list) is provider-specific, so a
     // stale override id may no longer exist — clear it and reload the catalog.
     corefModelId = '';
+    // Render the loaded list for the new provider immediately, then refresh live
+    // in the background so the switched-to provider also converges to the current
+    // models.dev list. Graceful when offline.
     await loadCloudModels();
+    void refreshAndReloadCloud();
   }
 
   // The local model picker draws from Auto-detect results first, then the live
@@ -389,15 +449,13 @@
     saving || (hasSavedKey ? !editingKey || !cloudApiKey.trim() : !cloudApiKey.trim())
   );
 
-  // On mount, pre-fill the Cloud tab from a previously-saved openai-compatible
-  // config (provider/model) but keep the real api_key OUT of the DOM — we only
-  // record that a key exists so the field renders masked and Save stays disabled
-  // until the user re-enters one.
-  onMount(async () => {
-    if (!isTauri()) return;
-    // Populate the capability-aware pickers on expand. Both are resilient (any
-    // throw ⇒ empty options + fallback), so onboarding stays non-blocking.
-    await Promise.all([loadCloudModels(), loadOllamaModels()]);
+  // Pre-fills the Cloud tab from a previously-saved openai-compatible config
+  // (provider/model) but keeps the real api_key OUT of the DOM — we only record
+  // that a key exists so the field renders masked and Save stays disabled until
+  // the user re-enters one. Its early `return`s are SELF-CONTAINED (this is a
+  // dedicated function, not inline in onMount) so they never short-circuit the
+  // background catalog refresh that runs after it.
+  async function restoreSavedCloud(): Promise<void> {
     try {
       const cfg = await invoke<AppConfig>('get_config');
       // A saved cloud entry now carries the REAL provider id (openai/anthropic/
@@ -418,7 +476,14 @@
       savedProviderId = match.id;
       cloudProvider = match.id;
       cloudBaseUrl = saved.base_url || match.baseUrl;
-      cloudModel = saved.model || match.defaultModel;
+      // Preserve the user's prior model choice (don't override with the smart
+      // default). A truthy saved model counts as an explicit pick.
+      if (saved.model) {
+        cloudModel = saved.model;
+        cloudModelPicked = true;
+      } else {
+        cloudModel = match.defaultModel;
+      }
       cloudApiKey = '';
       // Reload the catalog for the saved provider so the picker + capability
       // controls reflect the restored selection.
@@ -426,6 +491,24 @@
     } catch {
       // Non-fatal: fall back to the default empty Cloud form.
     }
+  }
+
+  // On mount, populate the pickers from the loaded catalog, restore any saved
+  // cloud config, then refresh the catalog live in the background.
+  onMount(async () => {
+    if (!isTauri()) return;
+    // Populate the capability-aware pickers on expand from the ALREADY-LOADED
+    // catalog (cache-or-bundled-floor), so the picker is never empty. Both are
+    // resilient (any throw ⇒ empty options + fallback), so onboarding stays
+    // non-blocking.
+    await Promise.all([loadCloudModels(), loadOllamaModels()]);
+    await restoreSavedCloud();
+    // After the immediate (loaded) options are on screen and any saved provider
+    // is restored, trigger a LIVE refresh + re-read in the background so an online
+    // user converges to the CURRENT full models.dev list. Fire-and-forget: NOT
+    // awaited so the loaded options render instantly; the picker updates in place
+    // when the fetch completes. Graceful when offline (keeps the loaded list).
+    void refreshAndReloadCloud();
   });
 
   // Entering "editing" mode clears the masked field so the user types a fresh key.
@@ -654,16 +737,25 @@
 
     <!-- MODEL -->
     <div class="flex flex-col gap-1.5">
-      <label
-        for="llm-cloud-model"
-        class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase"
-      >
-        Model
-      </label>
+      <div class="flex items-baseline gap-1.5">
+        <label
+          for="llm-cloud-model"
+          class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase"
+        >
+          Model
+        </label>
+        {#if catalogUpdating}
+          <span class="text-muted-foreground text-[0.68rem]" aria-live="polite">updating…</span>
+        {/if}
+      </div>
       <select
         id="llm-cloud-model"
         value={cloudModel}
-        onchange={(e) => (cloudModel = e.currentTarget.value)}
+        onchange={(e) => {
+          cloudModel = e.currentTarget.value;
+          // An explicit pick: pin it so a background refresh won't re-default it.
+          cloudModelPicked = true;
+        }}
         class={SELECT_CLASS}
       >
         {#each cloudSelectOptions as opt (opt.id)}

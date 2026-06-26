@@ -52,6 +52,12 @@ export interface ModelInfo {
   output_limit: number | null;
   open_weights: boolean;
   cost?: Cost | null;
+  // SYNC-CHECK: must match lens-core/src/model_catalog/mod.rs ModelInfo struct
+  /** Catalog `last_updated` date (ISO `YYYY-MM-DD`), or null. The cloud picker
+   * sorts options by this (newest first). */
+  last_updated: string | null;
+  /** Catalog `release_date` (ISO `YYYY-MM-DD`), or null. Tiebreaker for the sort. */
+  release_date: string | null;
 }
 
 /** One provider's entry (Anthropic, OpenAI, …). `models` is keyed by model id.

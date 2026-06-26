@@ -77,10 +77,11 @@ mod tests {
         app.manage(LensEngine::for_test().await);
         let engine = app.state::<LensEngine>();
 
-        // With no cache written, the engine degrades to the bundled snapshot,
-        // which must cover the core providers.
+        // With no cache written, the engine degrades to the bundled (full)
+        // catalog, which must cover the supported CLOUD providers. (models.dev has
+        // no plain `ollama` key — local models are validated live via /api/tags.)
         let providers = list_models(engine).await.unwrap();
-        for key in ["anthropic", "openai", "google", "zai", "ollama"] {
+        for key in ["anthropic", "openai", "google", "zai", "ollama-cloud"] {
             assert!(providers.contains_key(key), "missing provider {key}");
         }
     }
@@ -94,12 +95,18 @@ mod tests {
         let models = list_provider_models("anthropic".to_string(), engine)
             .await
             .unwrap();
-        assert!(models.contains_key("claude-sonnet-4-5"));
-        // The picker shape carries the fields it needs.
-        let sonnet = &models["claude-sonnet-4-5"];
-        assert_eq!(sonnet.id, "anthropic/claude-sonnet-4-5");
-        assert!(sonnet.reasoning);
-        assert_eq!(sonnet.context_limit, Some(1_000_000));
+        // The FULL bundled catalog carries many Anthropic models (lower-bound
+        // assertion, NOT a frozen list — model ids rotate as the catalog refreshes).
+        assert!(
+            models.len() >= 5,
+            "anthropic should carry many models, got {}",
+            models.len()
+        );
+        // The picker shape carries the fields it needs: each entry's `id` matches
+        // its map key, a human `name`, and a numeric `context_limit` when known.
+        let (key, info) = models.iter().next().expect("at least one model");
+        assert_eq!(&info.id, key, "ModelInfo.id mirrors the map key");
+        assert!(!info.name.is_empty(), "model carries a display name");
     }
 
     #[tokio::test]

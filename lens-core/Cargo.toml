@@ -55,6 +55,13 @@ reqwest = { version = "=0.13.4", default-features = false, features = [
 # Stream combinators (`StreamExt::next`) for consuming `reqwest`'s byte stream.
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
+# Gunzip the committed `bundled-catalog.json.gz` offline-floor catalog in
+# `model_catalog::ModelCatalog::bundled()`. flate2 is ALREADY in the lock tree
+# (transitive via fastembed/lancedb), so this pulls NO new external crate — it
+# just makes the already-compiled crate a direct dependency. Pinned to that
+# resolved version so no second copy is added. MIT OR Apache-2.0 (deny.toml).
+flate2 = "=1.1.9"
+
 # --- M4 Phase 3 (Stage 2): unified LLM client behind the `LlmProvider` trait ---
 # `genai` is the multi-provider LLM client (Anthropic/OpenAI/Gemini/Ollama/GLM/
 # Ollama-Cloud/LM Studio) that replaces the three hand-rolled HTTP backends.

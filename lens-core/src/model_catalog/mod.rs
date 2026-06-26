@@ -22,10 +22,22 @@
 //! ## Fetch / cache / refresh
 //!
 //! [`load_catalog`] reads the cached `models-catalog.json` under
-//! `{data_dir}/models/` when present, else falls back to the bundled snapshot —
+//! `{data_dir}/models/` when present, else falls back to the bundled catalog —
 //! it NEVER fails hard. [`refresh_if_stale`] re-fetches the live catalog when the
 //! cache is older than [`MODELS_CATALOG_REFRESH_INTERVAL`], mirroring the
 //! hardened streamed/size-capped download pattern from [`crate::tts`].
+//!
+//! ## Bundled offline floor (the full catalog, not a curated slice)
+//!
+//! The bundled fallback is the FULL `https://models.dev/api.json` catalog
+//! (~2.4 MB raw, ~200 KB gzipped), vendored at build time by
+//! `scripts/fetch-models-catalog.sh` and committed as `bundled-catalog.json.gz`.
+//! It is decompressed in [`ModelCatalog::bundled`] via `flate2` (already in the
+//! dependency tree — no new crate). This is the offline floor used on first run
+//! before any live fetch completes; it is refreshed per release by re-running
+//! the script, and SUPERSEDED at runtime by the live fetch + cache, so an online
+//! user always converges to the current full models.dev list (new models appear,
+//! removed ones disappear) with no code change.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -63,15 +75,16 @@ const CATALOG_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// catalog is ~2.4 MB; this leaves generous headroom for growth).
 const MAX_CATALOG_BODY_BYTES: u64 = 16 * 1024 * 1024;
 
-/// The bundled fallback snapshot. A small curated slice of the real catalog
-/// (our core supported providers, sourced from <https://models.dev/api.json>
-/// 2026-06), redistributed under models.dev's MIT license (github.com/sst/
-/// models.dev). This is NOT the full 2.4 MB catalog — it carries only a handful
-/// of models per core provider so the typed validation guard works fully offline.
-/// The live catalog is fetched + cached at runtime ([`refresh_if_stale`]); this
-/// snapshot is the last-resort degrade target when no cache exists and the
-/// network is unavailable.
-const BUNDLED_CATALOG_JSON: &str = include_str!("bundled-catalog.json");
+/// The bundled offline floor: the FULL `https://models.dev/api.json` catalog,
+/// gzipped at build time by `scripts/fetch-models-catalog.sh` and committed as
+/// `bundled-catalog.json.gz` (redistributed under models.dev's MIT license,
+/// github.com/sst/models.dev). NOT a curated slice — every provider + model the
+/// live catalog carried at vendor time is present, so the typed validation guard
+/// works fully offline against the real surface. Gzipped (~200 KB vs ~2.4 MB raw)
+/// and decompressed in [`ModelCatalog::bundled`] via the already-present `flate2`
+/// crate. The live catalog is fetched + cached at runtime ([`refresh_if_stale`])
+/// and supersedes this floor whenever the user is online.
+const BUNDLED_CATALOG_GZ: &[u8] = include_bytes!("bundled-catalog.json.gz");
 
 // ---------------------------------------------------------------------------
 // Typed schema (tolerant subset of models.dev)
@@ -156,6 +169,12 @@ pub struct ModelInfo {
     /// Per-token cost (USD per 1M tokens), when the catalog reports it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost: Option<Cost>,
+    /// Catalog `last_updated` date (ISO `YYYY-MM-DD`), when present. The picker
+    /// sorts cloud options by this (newest first). Serialized FLAT for IPC.
+    pub last_updated: Option<String>,
+    /// Catalog `release_date` (ISO `YYYY-MM-DD`), when present. Tiebreaker for the
+    /// picker sort when `last_updated` matches. Serialized FLAT for IPC.
+    pub release_date: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for ModelInfo {
@@ -189,6 +208,10 @@ impl<'de> Deserialize<'de> for ModelInfo {
             open_weights: bool,
             #[serde(default)]
             cost: Option<Cost>,
+            #[serde(default)]
+            last_updated: Option<String>,
+            #[serde(default)]
+            release_date: Option<String>,
         }
         let raw = Raw::deserialize(de)?;
         Ok(ModelInfo {
@@ -204,6 +227,8 @@ impl<'de> Deserialize<'de> for ModelInfo {
             output_limit: raw.limit.and_then(|l| l.output),
             open_weights: raw.open_weights,
             cost: raw.cost,
+            last_updated: raw.last_updated,
+            release_date: raw.release_date,
         })
     }
 }
@@ -220,18 +245,23 @@ impl<'de> Deserialize<'de> for ModelInfo {
 pub enum ReasoningOption {
     /// Discrete effort levels (e.g. `["low", "medium", "high"]`).
     Effort {
-        /// Selectable effort level strings.
-        #[serde(default)]
+        /// Selectable effort level strings. Tolerant: the real catalog sometimes
+        /// includes a `null` element in this array; nulls are dropped rather than
+        /// failing the parse (the schema-tolerance contract).
+        #[serde(default, deserialize_with = "deserialize_tolerant_strings")]
         values: Vec<String>,
     },
     /// A reasoning token budget. `min`/`max` are independently optional because
     /// providers report one, the other, or both.
     BudgetTokens {
-        /// Minimum reasoning token budget, when reported.
-        #[serde(default)]
+        /// Minimum reasoning token budget, when reported. Tolerant of a sentinel
+        /// negative (e.g. `-1` = "no minimum") in the real catalog — it degrades
+        /// to `None` rather than failing the parse (the schema-tolerance contract).
+        #[serde(default, deserialize_with = "deserialize_tolerant_u32")]
         min: Option<u32>,
-        /// Maximum reasoning token budget, when reported.
-        #[serde(default)]
+        /// Maximum reasoning token budget, when reported. Same negative tolerance
+        /// as `min`.
+        #[serde(default, deserialize_with = "deserialize_tolerant_u32")]
         max: Option<u32>,
     },
     /// A bare on/off reasoning toggle (no parameters).
@@ -275,10 +305,38 @@ pub struct Cost {
 /// the manual [`ModelInfo`] deserializer so the public struct stays flat.
 #[derive(Debug, Deserialize)]
 struct Limit {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_tolerant_u32")]
     context: Option<u32>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_tolerant_u32")]
     output: Option<u32>,
+}
+
+/// Deserializes an optional `u32` that TOLERATES out-of-range integers in the
+/// real catalog (the schema-tolerance contract). models.dev occasionally reports
+/// a sentinel like `-1` ("no minimum/unlimited") or a value beyond `u32`; rather
+/// than failing the whole parse, such a value degrades to `None`. A clean
+/// in-range integer parses normally; an explicit JSON `null` stays `None`.
+fn deserialize_tolerant_u32<'de, D>(de: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Accept any JSON number (or null) without erroring, then narrow to u32.
+    let raw: Option<serde_json::Value> = Option::deserialize(de)?;
+    Ok(raw
+        .and_then(|v| v.as_u64())
+        .and_then(|n| u32::try_from(n).ok()))
+}
+
+/// Deserializes a `Vec<String>` that TOLERATES `null` array elements (the
+/// schema-tolerance contract). The real catalog occasionally seeds an effort
+/// `values` array with a leading `null`; such elements are dropped rather than
+/// failing the parse. A clean array of strings is preserved verbatim.
+fn deserialize_tolerant_strings<'de, D>(de: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw: Vec<Option<String>> = Vec::deserialize(de)?;
+    Ok(raw.into_iter().flatten().collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -359,19 +417,25 @@ impl ModelCatalog {
         serde_json::from_slice(bytes).map_err(LensError::from)
     }
 
-    /// The bundled fallback snapshot (small curated slice of the real catalog).
-    /// Infallible in practice — the snapshot is a committed, valid fixture; a
-    /// parse failure here is a build-time error caught by the unit tests.
+    /// The bundled offline floor: the FULL models.dev catalog, decompressed from
+    /// the committed `bundled-catalog.json.gz`. Infallible in practice — the
+    /// bundle is a committed, valid fixture; a gunzip/parse failure here is a
+    /// build-time error caught by the unit tests.
     ///
-    /// The embedded JSON is parsed ONCE (memoized in a [`std::sync::LazyLock`])
-    /// and cloned on each call. `bundled()` is hit on the enrichment hot path
-    /// (`provider_from_config` / `task_provider_from_config`), so re-parsing the
-    /// snapshot per call was wasted work; the `expect` stays (a malformed bundled
-    /// snapshot is a build-time catastrophe).
+    /// The gzipped bundle is gunzipped + parsed ONCE (memoized in a
+    /// [`std::sync::LazyLock`]) and cloned on each call. `bundled()` is hit on the
+    /// enrichment hot path (`provider_from_config` / `task_provider_from_config`),
+    /// so doing the work per call would be wasted; the `expect`s stay (a malformed
+    /// bundled catalog is a build-time catastrophe).
     pub fn bundled() -> Self {
         static BUNDLED: std::sync::LazyLock<ModelCatalog> = std::sync::LazyLock::new(|| {
-            ModelCatalog::from_json(BUNDLED_CATALOG_JSON.as_bytes())
-                .expect("bundled model catalog must be valid JSON")
+            use std::io::Read;
+            let mut decoder = flate2::read::GzDecoder::new(BUNDLED_CATALOG_GZ);
+            let mut json = Vec::new();
+            decoder
+                .read_to_end(&mut json)
+                .expect("bundled model catalog must gunzip");
+            ModelCatalog::from_json(&json).expect("bundled model catalog must be valid JSON")
         });
         BUNDLED.clone()
     }
@@ -732,6 +796,9 @@ mod tests {
         let cost = sonnet.cost.as_ref().expect("cost present");
         assert_eq!(cost.input, Some(3.0));
         assert_eq!(cost.cache_write, Some(3.75));
+        // Catalog dates parse when present (the picker sorts cloud options by them).
+        assert_eq!(sonnet.last_updated.as_deref(), Some("2025-09-29"));
+        assert_eq!(sonnet.release_date.as_deref(), Some("2025-09-29"));
     }
 
     #[test]
@@ -762,6 +829,51 @@ mod tests {
         let unknown =
             &catalog.providers["mystery-provider-9000"].models["future-model"].reasoning_options;
         assert_eq!(unknown, &vec![ReasoningOption::Other]);
+    }
+
+    #[test]
+    fn tolerates_out_of_range_reasoning_budget_and_limits() {
+        // Schema-tolerance regression guard: the FULL models.dev catalog carries a
+        // sentinel negative `budget_tokens.min` (e.g. `-1` = "no minimum"). A
+        // negative/out-of-range integer in any tolerant-u32 field must degrade to
+        // `None`, NEVER fail the parse (which would poison the bundled() LazyLock).
+        const SLICE: &str = r#"{
+            "weird": {
+                "id": "weird",
+                "name": "Weird",
+                "models": {
+                    "m": {
+                        "id": "weird/m",
+                        "name": "M",
+                        "reasoning": true,
+                        "reasoning_options": [
+                            { "type": "budget_tokens", "min": -1, "max": 32768 },
+                            { "type": "effort", "values": [null, "low", "high"] }
+                        ],
+                        "limit": { "context": -5, "output": 64000 }
+                    }
+                }
+            }
+        }"#;
+        let catalog = ModelCatalog::from_json(SLICE.as_bytes()).expect("parses despite negatives");
+        let m = &catalog.providers["weird"].models["m"];
+        // Negative budget min degraded to None; valid max preserved; the null
+        // effort value is dropped, leaving the real levels.
+        assert_eq!(
+            m.reasoning_options,
+            vec![
+                ReasoningOption::BudgetTokens {
+                    min: None,
+                    max: Some(32768)
+                },
+                ReasoningOption::Effort {
+                    values: vec!["low".into(), "high".into()]
+                }
+            ]
+        );
+        // Negative context degraded to None; valid output preserved.
+        assert_eq!(m.context_limit, None);
+        assert_eq!(m.output_limit, Some(64_000));
     }
 
     #[test]
@@ -801,6 +913,19 @@ mod tests {
             "must not emit a nested `limit` object"
         );
 
+        // Catalog dates serialize FLAT as strings (the picker sorts cloud options
+        // by `last_updated`; the TS mirror types them `string | null`).
+        assert_eq!(
+            value.get("last_updated"),
+            Some(&serde_json::json!("2025-09-29")),
+            "last_updated must be a flat string"
+        );
+        assert_eq!(
+            value.get("release_date"),
+            Some(&serde_json::json!("2025-09-29")),
+            "release_date must be a flat string"
+        );
+
         // A model with no limits serializes both as JSON null (the TS mirror types
         // them `number | null`).
         let glm = &catalog.providers["zai"].models["glm-4.6"];
@@ -811,6 +936,15 @@ mod tests {
         );
         assert_eq!(
             glm_value.get("output_limit"),
+            Some(&serde_json::Value::Null)
+        );
+        // Absent dates serialize as JSON null (not dropped), matching the TS mirror.
+        assert_eq!(
+            glm_value.get("last_updated"),
+            Some(&serde_json::Value::Null)
+        );
+        assert_eq!(
+            glm_value.get("release_date"),
             Some(&serde_json::Value::Null)
         );
     }
@@ -827,6 +961,9 @@ mod tests {
         assert_eq!(glm.output_limit, None);
         assert!(glm.cost.is_none());
         assert!(glm.modalities.input.is_empty());
+        // Absent catalog dates default to None rather than failing the parse.
+        assert_eq!(glm.last_updated, None);
+        assert_eq!(glm.release_date, None);
     }
 
     #[test]
@@ -907,16 +1044,39 @@ mod tests {
     }
 
     #[test]
-    fn bundled_snapshot_is_valid_and_covers_core_providers() {
+    fn bundled_catalog_decompresses_parses_and_covers_supported_providers() {
+        // The bundled offline floor is the FULL models.dev catalog, gzipped +
+        // decompressed via flate2. It must gunzip, parse, and cover the CLOUD
+        // supported providers (models.dev has no plain `ollama` key — local
+        // models are user-pulled + validated live via /api/tags, never catalogued).
         let catalog = ModelCatalog::bundled();
-        for key in ["anthropic", "openai", "google", "zai", "ollama"] {
+        for key in ["anthropic", "openai", "google", "zai", "ollama-cloud"] {
             assert!(
                 catalog.provider(key).is_some(),
-                "bundled snapshot must cover {key}"
+                "bundled catalog must cover supported cloud provider {key}"
             );
         }
-        // The bundled snapshot's models validate through the guard.
-        assert!(catalog.validate("anthropic", "claude-sonnet-4-5").is_ok());
+
+        // Structural lower bounds (NOT a frozen list — the file refreshes per
+        // release, so specific model ids may be deprecated; we assert the bundle
+        // is the FULL catalog, not the old hand-curated handful of ~1 model each).
+        assert!(
+            catalog.providers.len() >= 50,
+            "full catalog should carry many providers, got {}",
+            catalog.providers.len()
+        );
+        let total_models: usize = catalog.providers.values().map(|p| p.models.len()).sum();
+        assert!(
+            total_models >= 1000,
+            "full catalog should carry thousands of models, got {total_models}"
+        );
+        for key in ["anthropic", "openai", "google"] {
+            let n = catalog.provider(key).unwrap().models.len();
+            assert!(
+                n >= 5,
+                "{key} should carry many models in the full catalog, got {n}"
+            );
+        }
     }
 
     // --- staleness policy ---------------------------------------------------

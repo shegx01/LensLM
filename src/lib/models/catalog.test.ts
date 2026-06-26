@@ -1,0 +1,160 @@
+// Unit tests for the cloud model-picker ordering in catalog.ts.
+//
+// The Tauri IPC layer (`@tauri-apps/api/core`) is mocked so the test runs
+// without a host: `isTauri()` returns true and `invoke` is stubbed to return a
+// `list_provider_models` map. The ordering contract under test:
+//   - `last_updated` DESC (newest first; ISO YYYY-MM-DD compares lexically),
+//   - tiebreak `release_date` DESC,
+//   - then `label` ASC,
+//   - and any model with NO `last_updated`/`release_date` sorts LAST,
+//     alphabetically among the undated.
+
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { ModelInfo } from './types.js';
+
+vi.mock('@tauri-apps/api/core', () => ({
+  isTauri: () => true,
+  invoke: vi.fn()
+}));
+
+import { invoke } from '@tauri-apps/api/core';
+import { listCloudModelOptions } from './catalog.js';
+
+/** Builds a minimal `ModelInfo` with only the fields the sort reads. Defaults to
+ * TEXT-capable modalities so ordering fixtures survive the text-capability
+ * filter; the filter tests below override `modalities` to exercise exclusion. */
+function model(overrides: Partial<ModelInfo> & { name: string }): ModelInfo {
+  return {
+    id: overrides.name,
+    reasoning: false,
+    reasoning_options: [],
+    tool_call: false,
+    temperature: false,
+    modalities: { input: ['text'], output: ['text'] },
+    context_limit: null,
+    output_limit: null,
+    open_weights: false,
+    last_updated: null,
+    release_date: null,
+    ...overrides
+  };
+}
+
+beforeEach(() => {
+  vi.mocked(invoke).mockReset();
+});
+
+describe('listCloudModelOptions ordering', () => {
+  it('orders by last_updated desc, with release_date then label tiebreaks, undated last', async () => {
+    // Insertion order is deliberately NOT the expected order, so a passing
+    // result proves the comparator (not Object.entries order) drives it.
+    vi.mocked(invoke).mockResolvedValue({
+      // dated, oldest last_updated
+      older: model({ name: 'Older', last_updated: '2025-01-01', release_date: '2025-01-01' }),
+      // undated entirely → must sort last
+      undatedB: model({ name: 'Zeta Undated' }),
+      // newest last_updated → must sort first
+      newest: model({ name: 'Newest', last_updated: '2025-11-24', release_date: '2025-10-01' }),
+      // another undated → alphabetical among undated
+      undatedA: model({ name: 'Alpha Undated' }),
+      // same last_updated as `tieOlderRelease`; newer release_date wins
+      tieNewerRelease: model({
+        name: 'Tie Newer Release',
+        last_updated: '2025-06-01',
+        release_date: '2025-06-01'
+      }),
+      tieOlderRelease: model({
+        name: 'Tie Older Release',
+        last_updated: '2025-06-01',
+        release_date: '2025-05-01'
+      })
+    } satisfies Record<string, ModelInfo>);
+
+    const options = await listCloudModelOptions('anthropic');
+
+    expect(options.map((o) => o.label)).toEqual([
+      'Newest', // 2025-11-24
+      'Tie Newer Release', // 2025-06-01, release 2025-06-01
+      'Tie Older Release', // 2025-06-01, release 2025-05-01
+      'Older', // 2025-01-01
+      'Alpha Undated', // undated, alphabetical
+      'Zeta Undated'
+    ]);
+  });
+
+  it('falls back to label asc when last_updated matches and release_date matches', async () => {
+    vi.mocked(invoke).mockResolvedValue({
+      b: model({ name: 'Bravo', last_updated: '2025-06-01', release_date: '2025-06-01' }),
+      a: model({ name: 'Alpha', last_updated: '2025-06-01', release_date: '2025-06-01' })
+    } satisfies Record<string, ModelInfo>);
+
+    const options = await listCloudModelOptions('openai');
+    expect(options.map((o) => o.label)).toEqual(['Alpha', 'Bravo']);
+  });
+
+  it('treats a model with only release_date as dated (sorts ahead of fully undated)', async () => {
+    vi.mocked(invoke).mockResolvedValue({
+      undated: model({ name: 'Undated' }),
+      releaseOnly: model({ name: 'Release Only', release_date: '2025-03-01' })
+    } satisfies Record<string, ModelInfo>);
+
+    const options = await listCloudModelOptions('google');
+    expect(options.map((o) => o.label)).toEqual(['Release Only', 'Undated']);
+  });
+});
+
+describe('listCloudModelOptions text-capability filter', () => {
+  it('keeps text-in/text-out models and drops non-text models', async () => {
+    vi.mocked(invoke).mockResolvedValue({
+      chat: model({ name: 'Chat', modalities: { input: ['text'], output: ['text'] } }),
+      // Multimodal-in but still text-out → a usable chat model, kept.
+      vision: model({ name: 'Vision', modalities: { input: ['text', 'image'], output: ['text'] } }),
+      // Audio/TTS-only output → not a chat model, dropped.
+      tts: model({ name: 'Speech', modalities: { input: ['text'], output: ['audio'] } }),
+      // Image-input only (no text input) → dropped.
+      imageOnly: model({ name: 'Image In', modalities: { input: ['image'], output: ['text'] } }),
+      // Embedding-style: text-in but no text-out → dropped.
+      embed: model({ name: 'Embed', modalities: { input: ['text'], output: [] } })
+    } satisfies Record<string, ModelInfo>);
+
+    const options = await listCloudModelOptions('openai');
+    expect(options.map((o) => o.label)).toEqual(['Chat', 'Vision']);
+  });
+
+  it('excludes a model with missing/empty modalities (strict: undated AND non-text)', async () => {
+    vi.mocked(invoke).mockResolvedValue({
+      // Empty modalities → not text-capable, excluded.
+      bare: model({ name: 'Bare', modalities: { input: [], output: [] } }),
+      // Missing modalities object entirely → excluded (tolerant of malformed entry).
+      malformed: model({ name: 'Malformed', modalities: undefined as never }),
+      keep: model({ name: 'Keep', modalities: { input: ['text'], output: ['text'] } })
+    } satisfies Record<string, ModelInfo>);
+
+    const options = await listCloudModelOptions('anthropic');
+    expect(options.map((o) => o.label)).toEqual(['Keep']);
+  });
+
+  it('keeps the newest text-capable model FIRST after filtering', async () => {
+    vi.mocked(invoke).mockResolvedValue({
+      newestText: model({
+        name: 'Newest Text',
+        last_updated: '2025-12-01',
+        modalities: { input: ['text'], output: ['text'] }
+      }),
+      // Newer date, but audio-only output → filtered out, must NOT win the slot.
+      newestAudio: model({
+        name: 'Newest Audio',
+        last_updated: '2025-12-31',
+        modalities: { input: ['text'], output: ['audio'] }
+      }),
+      olderText: model({
+        name: 'Older Text',
+        last_updated: '2025-01-01',
+        modalities: { input: ['text'], output: ['text'] }
+      })
+    } satisfies Record<string, ModelInfo>);
+
+    const options = await listCloudModelOptions('openai');
+    expect(options.map((o) => o.label)).toEqual(['Newest Text', 'Older Text']);
+  });
+});

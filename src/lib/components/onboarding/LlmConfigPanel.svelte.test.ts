@@ -780,6 +780,109 @@ describe('LlmConfigPanel — capability-aware pickers', () => {
     );
   });
 
+  it('on open: renders the loaded list immediately, then calls refresh_models and re-reads list_provider_models to converge to the fresh catalog', async () => {
+    // First `list_provider_models` read returns the LOADED (stale) catalog: just
+    // GPT-4o. After `refresh_models` runs, the SAME command returns a fresh
+    // catalog that adds a new model and drops the old one — proving the picker
+    // re-reads after the refresh and converges to the live list.
+    let refreshed = false;
+    const refreshCalled = vi.fn();
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return baseConfig();
+      if (cmd === 'set_config') return null;
+      if (cmd === 'list_ollama_models') return [];
+      if (cmd === 'refresh_models') {
+        refreshCalled();
+        refreshed = true;
+        return true;
+      }
+      if (cmd === 'list_provider_models') {
+        if ((args as { provider: string }).provider !== 'openai') return {};
+        // Before refresh: only the loaded GPT-4o. After refresh: a NEW model
+        // appears and GPT-4o is gone (catalog rotated live).
+        return refreshed
+          ? {
+              'gpt-6-omega': {
+                id: 'gpt-6-omega',
+                name: 'GPT-6 Omega',
+                reasoning: true,
+                reasoning_options: [],
+                tool_call: true,
+                temperature: true,
+                modalities: { input: ['text'], output: ['text'] },
+                context_limit: 512000,
+                output_limit: 32768,
+                open_weights: false,
+                cost: { input: 8, output: 24 }
+              }
+            }
+          : (cloudCatalog('openai') as Record<string, unknown>);
+      }
+    });
+
+    render(SystemCheckRow, { props: { result: llmRow(), oncheck: vi.fn() } });
+    await fireEvent.click(screen.getByRole('button', { name: /configure/i }));
+    await waitFor(() =>
+      expect(screen.getByRole('tab', { name: /cloud api/i })).toBeInTheDocument()
+    );
+    await fireEvent.click(screen.getByRole('tab', { name: /cloud api/i }));
+
+    const cloudSelect = (await waitFor(() =>
+      screen.getByLabelText('Model', { selector: '#llm-cloud-model' })
+    )) as HTMLSelectElement;
+
+    // The loaded list is rendered immediately (GPT-4o present right away).
+    await waitFor(() =>
+      expect(within(cloudSelect).getByRole('option', { name: 'GPT-4o' })).toBeInTheDocument()
+    );
+
+    // refresh_models is invoked on open…
+    await waitFor(() => expect(refreshCalled).toHaveBeenCalled());
+
+    // …and after the refresh the picker re-reads and converges to the FRESH
+    // catalog: the new model appears, the removed one disappears.
+    await waitFor(() =>
+      expect(within(cloudSelect).getByRole('option', { name: 'GPT-6 Omega' })).toBeInTheDocument()
+    );
+    expect(within(cloudSelect).queryByRole('option', { name: 'GPT-4o' })).not.toBeInTheDocument();
+  });
+
+  it('on open: keeps the loaded list and does NOT error when the live refresh fails (offline)', async () => {
+    const refreshCalled = vi.fn();
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return baseConfig();
+      if (cmd === 'set_config') return null;
+      if (cmd === 'list_ollama_models') return [];
+      // refresh_models REJECTS (offline / HTTP error) — the picker must swallow it.
+      if (cmd === 'refresh_models') {
+        refreshCalled();
+        throw new Error('network unreachable');
+      }
+      if (cmd === 'list_provider_models')
+        return cloudCatalog((args as { provider: string }).provider);
+    });
+
+    render(SystemCheckRow, { props: { result: llmRow(), oncheck: vi.fn() } });
+    await fireEvent.click(screen.getByRole('button', { name: /configure/i }));
+    await waitFor(() =>
+      expect(screen.getByRole('tab', { name: /cloud api/i })).toBeInTheDocument()
+    );
+    await fireEvent.click(screen.getByRole('tab', { name: /cloud api/i }));
+
+    const cloudSelect = (await waitFor(() =>
+      screen.getByLabelText('Model', { selector: '#llm-cloud-model' })
+    )) as HTMLSelectElement;
+
+    // The loaded list renders and SURVIVES the failed refresh (offline floor).
+    await waitFor(() =>
+      expect(within(cloudSelect).getByRole('option', { name: 'GPT-4o' })).toBeInTheDocument()
+    );
+    await waitFor(() => expect(refreshCalled).toHaveBeenCalled());
+    // No error surfaced (onboarding stays non-blocking) and the option remains.
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(within(cloudSelect).getByRole('option', { name: 'GPT-4o' })).toBeInTheDocument();
+  });
+
   it('shows context-window helper text for a model with a context_limit', async () => {
     mockIPC((cmd, args) => {
       if (cmd === 'get_config') return baseConfig();
@@ -798,6 +901,162 @@ describe('LlmConfigPanel — capability-aware pickers', () => {
 
     // gpt-4o reports context_limit 128000 → formatted "128,000 tokens".
     await waitFor(() => expect(screen.getByText(/context: 128,000 tokens/i)).toBeInTheDocument());
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// Smart default — newest text-capable model (M4 Phase 3, enrichment)
+// ──────────────────────────────────────────────────────────────────────────
+
+describe('LlmConfigPanel — smart default model', () => {
+  /** A two-model openai catalog: an OLDER model and a NEWER one, so the smart
+   * default (newest text-capable) must resolve to the newer id, NOT the seeded
+   * 'gpt-4o'. The newer one carries a distinct id to prove the seed was beaten. */
+  function datedOpenaiCatalog(): Record<string, unknown> {
+    return {
+      'gpt-4o': {
+        id: 'gpt-4o',
+        name: 'GPT-4o',
+        reasoning: false,
+        reasoning_options: [],
+        tool_call: true,
+        temperature: true,
+        modalities: { input: ['text'], output: ['text'] },
+        context_limit: 128000,
+        output_limit: 16384,
+        open_weights: false,
+        last_updated: '2024-08-01',
+        release_date: '2024-08-01',
+        cost: { input: 2.5, output: 10 }
+      },
+      'gpt-5-pro': {
+        id: 'gpt-5-pro',
+        name: 'GPT-5 Pro',
+        reasoning: true,
+        reasoning_options: [],
+        tool_call: true,
+        temperature: true,
+        modalities: { input: ['text'], output: ['text'] },
+        context_limit: 400000,
+        output_limit: 32768,
+        open_weights: false,
+        last_updated: '2026-01-15',
+        release_date: '2026-01-10',
+        cost: { input: 5, output: 20 }
+      }
+    };
+  }
+
+  it('defaults a no-saved-model provider to the NEWEST text-capable model (not the seed)', async () => {
+    const setConfig = vi.fn();
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return baseConfig();
+      if (cmd === 'set_config') {
+        setConfig(args);
+        return null;
+      }
+      if (cmd === 'list_ollama_models') return [];
+      if (cmd === 'list_provider_models') {
+        return (args as { provider: string }).provider === 'openai' ? datedOpenaiCatalog() : {};
+      }
+    });
+
+    render(SystemCheckRow, { props: { result: llmRow(), oncheck: vi.fn() } });
+    await fireEvent.click(screen.getByRole('button', { name: /configure/i }));
+    await waitFor(() =>
+      expect(screen.getByRole('tab', { name: /cloud api/i })).toBeInTheDocument()
+    );
+    await fireEvent.click(screen.getByRole('tab', { name: /cloud api/i }));
+
+    const cloudSelect = (await waitFor(() =>
+      screen.getByLabelText('Model', { selector: '#llm-cloud-model' })
+    )) as HTMLSelectElement;
+
+    // The select value resolves to the NEWEST text model, not the 'gpt-4o' seed.
+    await waitFor(() => expect(cloudSelect.value).toBe('gpt-5-pro'));
+
+    // And saving forwards that smart default (no explicit pick needed).
+    await fireEvent.input(screen.getByLabelText(/api key/i), { target: { value: 'sk-test-key' } });
+    await fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    await waitFor(() =>
+      expect(setConfig).toHaveBeenCalledWith(
+        expect.objectContaining({
+          config: expect.objectContaining({
+            models: expect.arrayContaining([
+              expect.objectContaining({ provider: 'openai', model: 'gpt-5-pro' })
+            ])
+          })
+        })
+      )
+    );
+  });
+
+  it('preserves a previously-saved model instead of overriding with the smart default', async () => {
+    // A saved openai config pins the OLDER 'gpt-4o'; the catalog also offers the
+    // newer 'gpt-5-pro'. The restored choice must be kept (not re-defaulted).
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') {
+        const cfg = baseConfig();
+        return {
+          ...cfg,
+          models: [
+            {
+              provider: 'openai',
+              base_url: 'https://api.openai.com/v1',
+              model: 'gpt-4o',
+              context: 128000,
+              temperature: 0.7,
+              api_key: 'sk-saved-secret'
+            }
+          ]
+        };
+      }
+      if (cmd === 'set_config') return null;
+      if (cmd === 'list_ollama_models') return [];
+      if (cmd === 'list_provider_models') {
+        return (args as { provider: string }).provider === 'openai' ? datedOpenaiCatalog() : {};
+      }
+    });
+
+    render(SystemCheckRow, { props: { result: llmRow(), oncheck: vi.fn() } });
+    await fireEvent.click(screen.getByRole('button', { name: /configure/i }));
+    await waitFor(() =>
+      expect(screen.getByRole('tab', { name: /cloud api/i })).toBeInTheDocument()
+    );
+    await fireEvent.click(screen.getByRole('tab', { name: /cloud api/i }));
+
+    const cloudSelect = (await waitFor(() =>
+      screen.getByLabelText('Model', { selector: '#llm-cloud-model' })
+    )) as HTMLSelectElement;
+
+    // The saved 'gpt-4o' is kept even though 'gpt-5-pro' is newer.
+    await waitFor(() => expect(cloudSelect.value).toBe('gpt-4o'));
+  });
+
+  it('falls back to the per-provider seed when the catalog is empty/offline', async () => {
+    // list_provider_models returns an empty map (filtered/offline) → the picker
+    // must seed the field with the provider default so it is never blank.
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return baseConfig();
+      if (cmd === 'set_config') return null;
+      if (cmd === 'list_ollama_models') return [];
+      if (cmd === 'list_provider_models') return {};
+    });
+
+    render(SystemCheckRow, { props: { result: llmRow(), oncheck: vi.fn() } });
+    await fireEvent.click(screen.getByRole('button', { name: /configure/i }));
+    await waitFor(() =>
+      expect(screen.getByRole('tab', { name: /cloud api/i })).toBeInTheDocument()
+    );
+    await fireEvent.click(screen.getByRole('tab', { name: /cloud api/i }));
+
+    const cloudSelect = (await waitFor(() =>
+      screen.getByLabelText('Model', { selector: '#llm-cloud-model' })
+    )) as HTMLSelectElement;
+
+    // The seeded openai default renders as the single fallback option.
+    await waitFor(() => expect(cloudSelect.value).toBe('gpt-4o'));
+    expect(within(cloudSelect).getByRole('option', { name: 'gpt-4o' })).toBeInTheDocument();
   });
 });
 
