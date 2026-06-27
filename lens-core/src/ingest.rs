@@ -827,10 +827,32 @@ pub(crate) fn is_loopback_ip(ip: IpAddr) -> bool {
     }
 }
 
+/// A validated loopback base URL: the lowercased host string plus the resolved,
+/// guard-approved loopback [`SocketAddr`]s to pin reqwest to (the inverse of
+/// [`ValidatedFetchUrl`] for the local-service direction).
+///
+/// `pinned_addrs` carries the addresses a HOSTNAME resolved to so the caller can
+/// pin reqwest's connection via `resolve_to_addrs` — closing the same DNS-rebinding
+/// TOCTOU the URL-fetch guard defends against (resolve here, then reqwest
+/// re-resolves at connect time). It is EMPTY for an IP-literal host, where reqwest
+/// performs no DNS lookup and there is nothing to rebind.
+#[derive(Debug)]
+pub(crate) struct LoopbackTarget {
+    /// The lowercased host string used as the `resolve_to_addrs` DNS-override key.
+    pub host: String,
+    /// Guard-approved resolved loopback addresses to pin reqwest to (empty ⇒
+    /// IP-literal host, no DNS step to pin).
+    pub pinned_addrs: Vec<std::net::SocketAddr>,
+}
+
 /// Loopback-ONLY gate for a local-service base URL (the inverse of the SSRF
 /// guard): parses `base_url`, requires an `http`/`https` scheme, resolves the
 /// host, and rejects unless EVERY resolved address is loopback
 /// ([`is_loopback_ip`]).
+///
+/// On success returns the [`LoopbackTarget`] (host + resolved loopback addrs) so
+/// the caller can pin reqwest to exactly those addresses and avoid a second,
+/// unchecked DNS resolution at connect time (DNS-rebinding TOCTOU).
 ///
 /// This is the safety contract for the Ollama embedder: the app will only ever
 /// POST embedding inputs to a server bound to this machine's loopback
@@ -839,7 +861,7 @@ pub(crate) fn is_loopback_ip(ip: IpAddr) -> bool {
 /// a hostname is resolved and EVERY candidate must be loopback (so a host with
 /// one loopback and one non-loopback A record is rejected). A host that resolves
 /// to NO address is rejected.
-pub(crate) fn require_loopback(base_url: &str) -> Result<(), LensError> {
+pub(crate) fn require_loopback(base_url: &str) -> Result<LoopbackTarget, LensError> {
     let parsed = url::Url::parse(base_url)
         .map_err(|e| LensError::Validation(format!("invalid base URL {base_url:?}: {e}")))?;
     let scheme = parsed.scheme();
@@ -861,7 +883,12 @@ pub(crate) fn require_loopback(base_url: &str) -> Result<(), LensError> {
                      accepts loopback-only addresses"
                 )));
             }
-            return Ok(());
+            // IP-literal: reqwest connects to the literal directly (no DNS), so
+            // there is nothing to pin.
+            return Ok(LoopbackTarget {
+                host: v4.to_string(),
+                pinned_addrs: Vec::new(),
+            });
         }
         url::Host::Ipv6(v6) => {
             if !is_loopback_ip(IpAddr::V6(v6)) {
@@ -870,7 +897,10 @@ pub(crate) fn require_loopback(base_url: &str) -> Result<(), LensError> {
                      accepts loopback-only addresses"
                 )));
             }
-            return Ok(());
+            return Ok(LoopbackTarget {
+                host: v6.to_string(),
+                pinned_addrs: Vec::new(),
+            });
         }
         url::Host::Domain(d) => d.to_string(),
     };
@@ -878,9 +908,8 @@ pub(crate) fn require_loopback(base_url: &str) -> Result<(), LensError> {
     let addrs = (domain.as_str(), port).to_socket_addrs().map_err(|e| {
         LensError::Network(format!("failed to resolve base URL host {domain}: {e}"))
     })?;
-    let mut any = false;
+    let mut pinned_addrs = Vec::new();
     for addr in addrs {
-        any = true;
         if !is_loopback_ip(addr.ip()) {
             return Err(LensError::Validation(format!(
                 "embedding base URL host {domain} resolves to a non-loopback address ({}); \
@@ -888,13 +917,17 @@ pub(crate) fn require_loopback(base_url: &str) -> Result<(), LensError> {
                 addr.ip()
             )));
         }
+        pinned_addrs.push(addr);
     }
-    if !any {
+    if pinned_addrs.is_empty() {
         return Err(LensError::Network(format!(
             "embedding base URL host {domain} did not resolve to any address"
         )));
     }
-    Ok(())
+    Ok(LoopbackTarget {
+        host: domain.to_ascii_lowercase(),
+        pinned_addrs,
+    })
 }
 
 /// A validated URL-source locator: the parsed [`url::Url`] plus the exact
