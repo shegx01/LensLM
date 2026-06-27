@@ -2,18 +2,15 @@
 //! model/dim-change re-embed flips the NEW coordinate active (M4 Phase 4b,
 //! Step 8 / R3).
 //!
-//! Builds a FILE-BACKED engine via [`LensEngine::init`] so the startup-GC
-//! (`gc_orphan_embedding_tables`, which sweeps `building`/`stale` rows) runs on
-//! `reopen`, exercising the crash-recovery path. The external [`LanceVectorStore`]
-//! shares the engine's pool + lancedb root (same `data_dir`), mirroring the
-//! existing `vector_index`/`enrichment_step5` integration tests.
+//! Builds a FILE-BACKED engine via [`LensEngine::init`]; the external
+//! [`LanceVectorStore`] shares the engine's pool + lancedb root (same `data_dir`),
+//! mirroring the existing `vector_index`/`enrichment_step5` integration tests.
+//!
+//! The crash-recovery variant (`retire_crash_before_drop_recovered_by_gc`) lives
+//! in its OWN binary `retire_coordinate_crash.rs` so the process-global crash seam
+//! it arms never leaks into the parallel sibling tests here.
 
-use std::sync::atomic::Ordering;
-
-use lens_core::vector_store::{
-    CRASH_AFTER_RETIRE_STALE_BEFORE_LANCE_DROP, Coordinate, LanceVectorStore, VectorRow,
-    VectorStore,
-};
+use lens_core::vector_store::{Coordinate, LanceVectorStore, VectorRow, VectorStore};
 use lens_core::{DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, EmbeddingBackend, LensEngine};
 
 fn coord(nb: &str, model: &str, dim: usize) -> Coordinate {
@@ -223,51 +220,4 @@ async fn retire_idempotent_when_no_active() {
         row_count(&pool, &nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM, None).await,
         0
     );
-}
-
-/// A crash AFTER the active→stale demote commits but BEFORE the Lance drop leaves
-/// a `stale` row + orphan table that the startup-GC reclaims on reopen.
-#[tokio::test]
-async fn retire_crash_before_drop_recovered_by_gc() {
-    let (dir, engine, pool, nb) = engine_and_notebook().await;
-    let store = LanceVectorStore::new(dir.path(), pool.clone());
-
-    store
-        .add(
-            &coord(&nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM),
-            make_rows(&nb, 4, DEFAULT_EMBED_DIM),
-        )
-        .await
-        .unwrap();
-    let nomic_table = format!("vec__{nb}__fastembed__nomic_v15__d{DEFAULT_EMBED_DIM}");
-
-    // Arm the crash seam: demote commits, then retire returns early.
-    CRASH_AFTER_RETIRE_STALE_BEFORE_LANCE_DROP.store(true, Ordering::SeqCst);
-    store
-        .retire_coordinate(&coord(&nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM))
-        .await
-        .unwrap();
-
-    // Post-crash: a stale row + its table linger.
-    assert_eq!(
-        row_count(
-            &pool,
-            &nb,
-            DEFAULT_EMBED_MODEL_ID,
-            DEFAULT_EMBED_DIM,
-            Some("stale")
-        )
-        .await,
-        1
-    );
-    assert!(table_exists(dir.path(), &nomic_table).await);
-
-    // Reopen → startup-GC sweeps building/stale rows + their physical tables.
-    drop(engine);
-    let _engine2 = LensEngine::init(dir.path()).await.unwrap();
-    assert_eq!(
-        row_count(&pool, &nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM, None).await,
-        0
-    );
-    assert!(!table_exists(dir.path(), &nomic_table).await);
 }
