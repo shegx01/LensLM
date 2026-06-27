@@ -122,25 +122,24 @@
         'overflow-hidden py-1'
       )}
     >
-      <!-- Settings — disabled, tooltip "Available soon" -->
-      <TooltipProvider>
-        <Tooltip>
-          <TooltipTrigger
-            class={cn(
-              'flex w-full cursor-not-allowed items-center gap-2.5 px-3 py-2',
-              'text-sm text-sidebar-foreground/40 select-none'
-            )}
-            disabled
-            aria-disabled="true"
-            role="menuitem"
-            data-settings-item
-          >
-            <Settings class="size-4 shrink-0" aria-hidden="true" />
-            <span>Settings</span>
-          </TooltipTrigger>
-          <TooltipContent side="right">Available soon</TooltipContent>
-        </Tooltip>
-      </TooltipProvider>
+      <!-- Settings — opens the global Preferences shell (Settings>Embeddings live). -->
+      <button
+        type="button"
+        class={cn(
+          'flex w-full cursor-pointer items-center gap-2.5 px-3 py-2',
+          'text-sm text-sidebar-foreground select-none',
+          'hover:bg-sidebar-accent/60 transition-colors'
+        )}
+        role="menuitem"
+        data-settings-item
+        onclick={() => {
+          notebookStore.settingsOpen = true;
+          open = false;
+        }}
+      >
+        <Settings class="size-4 shrink-0" aria-hidden="true" />
+        <span>Settings</span>
+      </button>
 
       <!-- Switch theme — real, embeds ThemeCycleButton as a menu row -->
       <div

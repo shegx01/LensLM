@@ -1,19 +1,48 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  // Onboarding embedding-config panel (plan Step 9). The inline expansion under
+  // the system-check "Embedding model" row.
+  //
+  // Reworked for M4 Phase 4b-B (backend dimension):
+  //   - Per-notebook re-embed warning (verbatim design copy) — embedding models
+  //     are permanently linked to the notebook's vector index.
+  //   - Provider selector ("Select your local embeddings provider": fastembed |
+  //     Ollama) + a bottom note that Ollama must be installed if chosen.
+  //   - fastembed: cards light up "Ready" from on-disk cache detection
+  //     (fastembed_models_cached); Install warms (downloads) the weights with a
+  //     phase spinner (Downloading → Extracting → Configuring → Almost ready).
+  //   - Ollama: DETECT-ONLY via /api/tags + a Refresh action + a pull hint (the
+  //     app NEVER pulls Ollama models).
+  //   - Sets the GLOBAL default (config.embedding_model + config.embedding_backend),
+  //     which new notebooks adopt.
+  //
+  // Tokens only — light + dark + every accent ([[theming-light-dark-accent]]).
+
+  import { onMount, onDestroy } from 'svelte';
   import { invoke, isTauri } from '@tauri-apps/api/core';
   import { Button } from '$lib/components/ui/button/index.js';
   import { cn } from '$lib/utils.js';
   import TriangleAlert from '@lucide/svelte/icons/triangle-alert';
   import CircleCheck from '@lucide/svelte/icons/circle-check';
   import LoaderCircle from '@lucide/svelte/icons/loader-circle';
-  import {
-    EMBEDDING_MODELS,
-    installEmbeddingModel,
-    detectLlm,
-    type EmbeddingModelId
-  } from '$lib/onboarding/system-check.js';
+  import RefreshCw from '@lucide/svelte/icons/refresh-cw';
+  import Download from '@lucide/svelte/icons/download';
   import type { AppConfig } from '$lib/theme/types.js';
   import { updateConfig } from '$lib/config.js';
+  import {
+    EMBEDDING_MODELS,
+    DEFAULT_EMBEDDING_MODEL,
+    resolveModel,
+    resolveBackend,
+    modelMeta,
+    ollamaMatches,
+    type EmbeddingBackend,
+    type EmbeddingModelId
+  } from '$lib/embeddings/models.js';
+  import {
+    fastembedModelsCached,
+    listOllamaModels,
+    warmFastembedModel
+  } from '$lib/embeddings/ipc.js';
 
   let {
     oncheck,
@@ -23,199 +52,275 @@
     oncollapse: () => void;
   } = $props();
 
-  let selectedModel = $state<EmbeddingModelId>('nomic-embed-text');
-  let installProgress = $state<number | null>(null); // null = idle, 0-100 = installing
-  let installed = $state(false);
-  let installError = $state<string | null>(null);
+  let backend = $state<EmbeddingBackend>('fastembed');
+  let selectedModel = $state<EmbeddingModelId>(DEFAULT_EMBEDDING_MODEL);
+  let activeModel = $state<EmbeddingModelId | ''>('');
+  let activeBackend = $state<EmbeddingBackend>('fastembed');
 
-  // The currently-active (persisted) embedding model id, read on mount. '' = none.
-  let activeModel = $state<string>('');
-  // The allowlisted models actually installed on the Ollama runtime (intersection
-  // of the runtime's `models` list with EMBEDDING_MODELS), read on mount.
-  let installedModels = $state<Set<EmbeddingModelId>>(new Set());
-  // The Ollama endpoint to probe (configured or default).
+  let fastembedCached = $state<Set<EmbeddingModelId>>(new Set());
+  let ollamaInstalled = $state<Set<EmbeddingModelId>>(new Set());
   let endpoint = $state('http://localhost:11434');
-  // Tracks which model's "Set as active" is in flight (disables that card's button).
-  let settingActive = $state<EmbeddingModelId | null>(null);
+  let refreshing = $state(false);
 
-  const selected = $derived(EMBEDDING_MODELS.find((m) => m.id === selectedModel)!);
+  let installing = $state(false);
+  let installPhase = $state('');
+  let actionError = $state<string | null>(null);
+  let phaseTimer: ReturnType<typeof setInterval> | null = null;
 
-  // Ollama reports model names with a tag (e.g. "nomic-embed-text:latest"); match
-  // an allowlist id when a detected name equals it or starts with "<id>:".
-  function isAllowlistMatch(detected: string, id: EmbeddingModelId): boolean {
-    return detected === id || detected.startsWith(`${id}:`);
-  }
+  // Clear the phase ticker if the panel collapses/unmounts mid-install so the
+  // interval never fires against a destroyed reactive graph.
+  onDestroy(() => {
+    if (phaseTimer) clearInterval(phaseTimer);
+  });
 
-  async function refreshInstalled(): Promise<void> {
+  const installed = $derived(backend === 'fastembed' ? fastembedCached : ollamaInstalled);
+  const selectedReady = $derived(installed.has(selectedModel));
+  const isActive = $derived(
+    activeModel === selectedModel && activeBackend === backend && selectedReady
+  );
+
+  async function refreshOllama(): Promise<void> {
+    refreshing = true;
     try {
-      const result = await detectLlm(endpoint);
+      const names = await listOllamaModels(endpoint);
       const found = new Set<EmbeddingModelId>();
-      for (const model of EMBEDDING_MODELS) {
-        if (result.models.some((d) => isAllowlistMatch(d, model.id))) found.add(model.id);
+      for (const m of EMBEDDING_MODELS) {
+        if (names.some((d) => ollamaMatches(d, m))) found.add(m.id);
       }
-      installedModels = found;
+      ollamaInstalled = found;
     } catch {
-      installedModels = new Set();
+      ollamaInstalled = new Set();
+    } finally {
+      refreshing = false;
     }
   }
 
-  // On mount: read the ACTIVE model from config and detect which allowlisted
-  // models are installed on the runtime, so each card renders its correct state.
+  async function refreshFastembed(): Promise<void> {
+    try {
+      const ids = await fastembedModelsCached();
+      fastembedCached = new Set(ids.map((id) => resolveModel(id).id));
+    } catch {
+      fastembedCached = new Set();
+    }
+  }
+
   onMount(async () => {
     if (isTauri()) {
       try {
         const cfg = await invoke<AppConfig>('get_config');
-        if (cfg.embedding_model) activeModel = cfg.embedding_model;
-        const configured = cfg.endpoints?.ollama;
-        if (configured) endpoint = configured;
-        // Seed the selection from the active model so the Install button (if the
-        // active model somehow isn't installed) targets the right one.
-        const match = EMBEDDING_MODELS.find((m) => m.id === cfg.embedding_model);
-        if (match) selectedModel = match.id;
+        if (cfg.embedding_model) {
+          activeModel = resolveModel(cfg.embedding_model).id;
+          selectedModel = activeModel;
+        }
+        activeBackend = resolveBackend(cfg.embedding_backend);
+        backend = activeBackend;
+        const ep = cfg.endpoints?.ollama;
+        if (ep) endpoint = ep;
       } catch {
         // Non-fatal: fall back to defaults.
       }
     }
-    await refreshInstalled();
+    await Promise.all([refreshFastembed(), refreshOllama()]);
   });
 
-  async function handleInstall(): Promise<void> {
-    installError = null;
-    installProgress = 0;
+  function pickBackend(b: EmbeddingBackend): void {
+    backend = b;
+    actionError = null;
+  }
+
+  function pickModel(id: EmbeddingModelId): void {
+    selectedModel = id;
+    actionError = null;
+  }
+
+  // Persist the GLOBAL default (model + backend), re-run the check, collapse.
+  async function setGlobalDefault(): Promise<void> {
+    actionError = null;
     try {
-      await installEmbeddingModel(selectedModel, (pct) => {
-        installProgress = pct;
-      });
-      installProgress = 100;
-      installed = true;
-      // Persist the chosen embedding model so the backend TTS/embedding check and
-      // later source-add flow know which model is bound to this notebook's store.
-      // On success the installed model becomes active.
-      await updateConfig((cfg) => ({ ...cfg, embedding_model: selectedModel }));
+      await updateConfig((cfg) => ({
+        ...cfg,
+        embedding_model: selectedModel,
+        embedding_backend: backend
+      }));
       activeModel = selectedModel;
+      activeBackend = backend;
       await oncheck();
       oncollapse();
     } catch (err) {
-      installError = err instanceof Error ? err.message : 'Installation failed.';
-      installProgress = null;
+      actionError = err instanceof Error ? err.message : 'Could not set the default.';
     }
   }
 
-  // Switch the active model to an ALREADY-INSTALLED one: persist embedding_model
-  // (no re-download), re-run the check, then collapse. The green border follows.
-  async function handleSetActive(id: EmbeddingModelId): Promise<void> {
-    installError = null;
-    settingActive = id;
+  // fastembed Install = warm (download) the weights, then set the default.
+  async function handleInstall(): Promise<void> {
+    actionError = null;
+    installing = true;
+    const phases = ['Downloading…', 'Extracting…', 'Configuring…', 'Almost ready…'];
+    let i = 0;
+    installPhase = phases[0];
+    phaseTimer = setInterval(() => {
+      i = Math.min(i + 1, phases.length - 1);
+      installPhase = phases[i];
+    }, 1200);
     try {
-      await updateConfig((cfg) => ({ ...cfg, embedding_model: id }));
-      activeModel = id;
-      await oncheck();
-      oncollapse();
+      await warmFastembedModel(selectedModel);
+      await refreshFastembed();
+      await setGlobalDefault();
     } catch (err) {
-      installError = err instanceof Error ? err.message : 'Could not set the active model.';
+      actionError = err instanceof Error ? err.message : 'Installation failed.';
     } finally {
-      settingActive = null;
+      if (phaseTimer) clearInterval(phaseTimer);
+      phaseTimer = null;
+      installing = false;
     }
   }
 </script>
 
-<div class="pt-3 flex flex-col gap-3">
-  <!-- Amber warning banner -->
+<div class="flex flex-col gap-3 pt-3">
+  <!-- Re-embed warning banner (verbatim design copy) -->
   <div
-    class="bg-amber-500/15 border border-amber-500/30 rounded-lg px-3 py-2.5 flex gap-2 items-start"
+    class="flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/15 px-3 py-2.5"
   >
-    <TriangleAlert class="size-4 shrink-0 mt-0.5 text-amber-500" />
+    <TriangleAlert class="mt-0.5 size-4 shrink-0 text-amber-500" />
     <p class="text-[0.78rem] leading-relaxed text-amber-500">
-      Switching the active model applies to <strong>new sources only</strong>. Sources already
-      embedded with another model must be re-embedded from scratch to use it.
+      Embedding models are <strong>permanently linked</strong> to this notebook's vector index. Switching
+      models later requires re-embedding all sources from scratch. Choose carefully.
     </p>
   </div>
 
-  <!-- Model cards -->
+  <!-- Provider selector -->
+  <div>
+    <p class="text-[0.65rem] font-bold uppercase tracking-[0.08em] text-muted-foreground/70">
+      Select your local embeddings provider
+    </p>
+    <div class="mt-2 grid grid-cols-2 gap-2" role="radiogroup" aria-label="Embeddings provider">
+      {#each [{ id: 'fastembed', label: 'fastembed' }, { id: 'ollama', label: 'Ollama' }] as p (p.id)}
+        {@const isSel = backend === p.id}
+        <button
+          type="button"
+          role="radio"
+          aria-checked={isSel}
+          onclick={() => pickBackend(p.id as EmbeddingBackend)}
+          class={cn(
+            'h-9 rounded-lg border px-3 text-sm font-semibold transition-colors',
+            'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+            isSel
+              ? 'border-primary bg-primary/10 text-foreground ring-1 ring-primary'
+              : 'border-border bg-card text-muted-foreground hover:text-foreground'
+          )}
+        >
+          {p.label}
+        </button>
+      {/each}
+    </div>
+  </div>
+
+  <!-- Model radio-list -->
   <div class="flex flex-col gap-2" role="radiogroup" aria-label="Embedding model">
     {#each EMBEDDING_MODELS as model (model.id)}
-      {@const isActive = activeModel === model.id}
-      {@const isInstalled = installedModels.has(model.id)}
       {@const isSelected = selectedModel === model.id}
+      {@const isReady = installed.has(model.id)}
       <div
         class={cn(
           'w-full rounded-lg border px-3 py-2.5 transition-colors',
-          isActive
-            ? // Active model: design-system GREEN (not the accent --primary).
-              'border-green-primary bg-green-primary/10 ring-1 ring-green-primary'
-            : isSelected && !isInstalled
-              ? 'border-primary bg-primary/10 ring-1 ring-primary'
-              : 'border-border bg-card'
+          isSelected ? 'border-primary bg-primary/10 ring-1 ring-primary' : 'border-border bg-card'
         )}
       >
-        <div class="flex items-start justify-between gap-2">
-          <button
-            type="button"
-            role="radio"
-            aria-checked={isSelected}
-            aria-disabled={isActive || isInstalled}
-            onclick={() => {
-              if (!isActive && !isInstalled) selectedModel = model.id;
-            }}
-            class={cn('min-w-0 flex-1 text-left', (isActive || isInstalled) && 'cursor-default')}
+        <button
+          type="button"
+          role="radio"
+          aria-checked={isSelected}
+          onclick={() => pickModel(model.id)}
+          class="flex w-full items-center gap-2.5 text-left"
+        >
+          <span class="min-w-0 flex-1">
+            <span class="block text-sm font-semibold text-foreground">{model.label}</span>
+            <span class="mt-0.5 block text-[0.72rem] text-muted-foreground">{modelMeta(model)}</span
+            >
+          </span>
+          {#if isReady}
+            <span
+              class="flex shrink-0 items-center gap-1 text-[0.7rem] font-semibold text-green-primary"
+              aria-label={`${model.label} ready`}
+            >
+              <CircleCheck class="size-3.5" />
+              Ready
+            </span>
+          {/if}
+          <span
+            class={cn(
+              'flex size-4 shrink-0 items-center justify-center rounded-full border-[1.5px]',
+              isSelected ? 'border-primary' : 'border-muted-foreground/40'
+            )}
           >
-            <p class="text-sm font-semibold text-foreground">{model.name}</p>
-            <p class="text-[0.75rem] text-muted-foreground mt-0.5">
-              {model.dims} dims · {model.sizeMb >= 1000
-                ? (model.sizeMb / 1000).toFixed(1) + ' GB'
-                : model.sizeMb + ' MB'} · {model.speed}
-            </p>
-            <p class="text-[0.75rem] text-muted-foreground mt-0.5">{model.description}</p>
-          </button>
-
-          <div class="flex shrink-0 items-center gap-2">
-            {#if isActive}
-              <!-- Active model: green badge, no action. -->
-              <span
-                class="flex items-center gap-1 text-[0.72rem] font-semibold text-green-primary"
-                aria-label="Active embedding model"
-              >
-                <CircleCheck class="size-4" />
-                Active
-              </span>
-            {:else if isInstalled}
-              <!-- Installed but not active: switch without re-downloading. -->
-              <Button
-                variant="outline"
-                size="sm"
-                onclick={() => handleSetActive(model.id)}
-                disabled={settingActive !== null}
-                aria-label={`Set ${model.name} as active`}
-              >
-                {settingActive === model.id ? 'Setting…' : 'Set as active'}
-              </Button>
-            {:else if isSelected}
-              <CircleCheck class="size-4 mt-0.5 text-primary" />
+            {#if isSelected}
+              <span class="size-2 rounded-full bg-primary"></span>
             {/if}
-          </div>
-        </div>
+          </span>
+        </button>
       </div>
     {/each}
   </div>
 
-  <!-- Install error -->
-  {#if installError}
-    <p class="text-destructive text-[0.75rem]" role="alert">{installError}</p>
+  {#if actionError}
+    <p class="text-[0.75rem] text-destructive" role="alert">{actionError}</p>
   {/if}
 
-  <!-- Install button with progress — installs the SELECTED not-installed model. -->
-  {#if !installedModels.has(selectedModel) && activeModel !== selectedModel}
+  <!-- Action row, by backend + readiness -->
+  {#if backend === 'ollama'}
+    <div class="flex flex-col gap-2">
+      <div class="flex items-center justify-between gap-2">
+        <Button
+          variant="outline"
+          size="sm"
+          onclick={refreshOllama}
+          disabled={refreshing}
+          aria-label="Refresh Ollama models"
+        >
+          {#if refreshing}
+            <LoaderCircle class="size-4 animate-spin" /> Refreshing…
+          {:else}
+            <RefreshCw class="size-4" /> Refresh
+          {/if}
+        </Button>
+        {#if selectedReady && !isActive}
+          <Button size="sm" onclick={setGlobalDefault} aria-label="Use selected model">
+            Use {resolveModel(selectedModel).label}
+          </Button>
+        {/if}
+      </div>
+      {#if !selectedReady}
+        <p class="text-[0.72rem] text-muted-foreground">
+          Not detected on your Ollama runtime. Pull it with
+          <code class="rounded bg-muted px-1 py-0.5 text-[0.7rem] text-foreground"
+            >ollama pull {resolveModel(selectedModel).ollamaName}</code
+          >, then Refresh.
+        </p>
+      {/if}
+    </div>
+  {:else if !selectedReady}
     <Button
       class="h-10 w-full"
       onclick={handleInstall}
-      disabled={installProgress !== null && !installed}
+      disabled={installing}
+      aria-label={`Install ${resolveModel(selectedModel).label}`}
     >
-      {#if installProgress !== null && installProgress < 100}
+      {#if installing}
         <LoaderCircle class="size-4 animate-spin" />
-        Installing… {installProgress}%
+        {installPhase}
       {:else}
-        Install {selected.name}
+        <Download class="size-4" />
+        Install {resolveModel(selectedModel).label}
       {/if}
     </Button>
+  {:else if !isActive}
+    <Button class="h-10 w-full" onclick={setGlobalDefault} aria-label="Use selected model">
+      Use {resolveModel(selectedModel).label}
+    </Button>
   {/if}
+
+  <!-- Provider helper note -->
+  <p class="text-[0.7rem] leading-relaxed text-muted-foreground">
+    Ollama must be installed if chosen — Lens detects your local models but never downloads them.
+  </p>
 </div>

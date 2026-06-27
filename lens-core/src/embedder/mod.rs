@@ -43,8 +43,8 @@ pub mod registry;
 
 pub use ollama::OllamaEmbedder;
 pub use registry::{
-    DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, EmbeddingBackend, EmbeddingModelSpec, resolve,
-    resolve_opt,
+    DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, EmbeddingBackend, EmbeddingModelSpec, REGISTRY,
+    resolve, resolve_opt,
 };
 
 // ---------------------------------------------------------------------------

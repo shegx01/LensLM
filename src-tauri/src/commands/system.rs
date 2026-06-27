@@ -173,6 +173,56 @@ pub async fn kokoro_downloaded(app: tauri::AppHandle) -> Result<bool, LensError>
     Ok(data_dir.join(lens_core::KOKORO_MODEL_RELPATH).is_file())
 }
 
+/// Returns the set of registry embedding-model ids whose fastembed weights are
+/// already cached on disk under `{app_data_dir}/models/fastembed/`.
+///
+/// This is the per-model, fastembed-side counterpart to `list_ollama_models`
+/// (the Ollama-side `/api/tags` probe): the onboarding + Settings Embeddings
+/// surfaces use it to light up a fastembed model card as "Ready" without forcing
+/// a re-download. Reuses the SAME per-model cache predicate the readiness gate
+/// uses ([`lens_core::fastembed_weights_cached`]) so the card state and the gate
+/// can never disagree. Best-effort: an unresolvable data dir yields an empty list.
+///
+/// Invoked as `invoke("fastembed_models_cached")`.
+#[tracing::instrument(skip_all)]
+#[tauri::command]
+pub async fn fastembed_models_cached(app: tauri::AppHandle) -> Result<Vec<String>, LensError> {
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| LensError::Io(e.to_string()))?;
+    let cached = lens_core::REGISTRY
+        .iter()
+        .filter(|spec| lens_core::fastembed_weights_cached(&data_dir, spec.id))
+        .map(|spec| spec.id.to_string())
+        .collect();
+    Ok(cached)
+}
+
+/// Warms (downloads + caches) a fastembed model's weights so a fastembed
+/// selection can pass the onboarding readiness gate without a first ingest.
+///
+/// `model` is validated against the registry (unknown ids are rejected). On a
+/// warm cache this returns immediately; on a cold cache it blocks while fastembed
+/// fetches the weights from HuggingFace (the `tokio::spawn_blocking` lives inside
+/// `LensEngine::warm_fastembed_model`). There is no byte-level progress (fastembed
+/// init is synchronous + opaque), so the UI shows an indeterminate phase spinner.
+///
+/// Invoked as `invoke("warm_fastembed_model", { model })`.
+#[tracing::instrument(skip(engine), fields(model = %model))]
+#[tauri::command]
+pub async fn warm_fastembed_model(
+    model: String,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<(), LensError> {
+    if lens_core::resolve_opt(&model).is_none() {
+        return Err(LensError::Validation(format!(
+            "unsupported embedding model: {model}"
+        )));
+    }
+    engine.warm_fastembed_model(&model).await
+}
+
 /// Allowed document extensions (lowercased, no dot) for recent-doc suggestions.
 const RECENT_DOC_EXTS: [&str; 4] = ["pdf", "docx", "txt", "md"];
 

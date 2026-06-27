@@ -482,7 +482,12 @@ fn is_allowlisted_embedding(installed_name: &str, configured: &str) -> bool {
 /// entry (a non-empty repo dir means the download completed or is in progress —
 /// either way construction, not this probe, is the final arbiter). An unknown /
 /// empty `model_id` resolves to the default via the registry.
-fn fastembed_weights_cached(data_dir: &Path, model_id: &str) -> bool {
+///
+/// `pub` (re-exported from `lib.rs`) so the per-model cache state can be surfaced
+/// to the frontend (the `fastembed_models_cached` Tauri command) without forcing a
+/// duplicate path-derivation that could drift from the gate's own definition of
+/// "cached".
+pub fn fastembed_weights_cached(data_dir: &Path, model_id: &str) -> bool {
     let spec = crate::embedder::resolve(model_id);
     let model_dir = data_dir
         .join("models")

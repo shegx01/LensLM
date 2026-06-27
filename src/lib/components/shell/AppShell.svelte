@@ -10,6 +10,8 @@
   import NotebookCreateDialog from '$lib/components/notebooks/NotebookCreateDialog.svelte';
   import { notebookStore, loadNotebooks } from '$lib/notebooks/index.js';
   import SourcesRail from '$lib/components/sources/SourcesRail.svelte';
+  import PreferencesShell from '$lib/components/embeddings/PreferencesShell.svelte';
+  import NotebookSettingsSheet from '$lib/components/embeddings/NotebookSettingsSheet.svelte';
 
   // ---------------------------------------------------------------------------
   // Local state
@@ -143,6 +145,10 @@
 <CommandPalette />
 <TrashView />
 <NotebookCreateDialog open={createOpen} onOpenChange={(v) => (createOpen = v)} />
+
+<!-- Settings surfaces (M4 4b-B): global Preferences shell + per-notebook sheet. -->
+<PreferencesShell />
+<NotebookSettingsSheet />
 
 <!-- Dev/QA Embeddings Inspector — DEV-gated dynamic import so the component is
      tree-shaken out of release bundles (the backend command is also

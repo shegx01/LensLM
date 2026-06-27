@@ -86,56 +86,14 @@ export interface DownloadProgress {
   done: boolean;
 }
 
-export type EmbeddingModelId = 'nomic-embed-text' | 'mxbai-embed-large' | 'all-minilm' | 'bge-m3';
+// SYNC-CHECK: the embedding-model catalog now lives in `$lib/embeddings/models`
+// (the single source of truth shared by onboarding + Settings). These re-exports
+// keep the onboarding install path's older imports working. The canonical
+// storage-facing ids (e.g. `nomic-embed-text-v1.5`) match the Rust registry.
+export type { EmbeddingModelId, EmbeddingModelSpec } from '$lib/embeddings/models.js';
+export { EMBEDDING_MODELS } from '$lib/embeddings/models.js';
 
-export interface EmbeddingModelSpec {
-  id: EmbeddingModelId;
-  name: string;
-  dims: number;
-  sizeMb: number;
-  speed: 'Very fast' | 'Fast' | 'Medium';
-  description: string;
-}
-
-// SYNC-CHECK: keep in sync with lens-core/src/embedder/registry.rs REGISTRY
-// (fastembed model specs) and `ALLOWED_EMBEDDING_MODELS` in
-// lens-core/src/system_check.rs (the install allowlist). The `dims` here must
-// match `EmbeddingModelSpec.dim` in the registry. Adding/removing a model means
-// editing both Rust files too.
-export const EMBEDDING_MODELS: EmbeddingModelSpec[] = [
-  {
-    id: 'nomic-embed-text',
-    name: 'nomic-embed-text',
-    dims: 768,
-    sizeMb: 274,
-    speed: 'Fast',
-    description: 'Best general-purpose. Default recommendation.'
-  },
-  {
-    id: 'mxbai-embed-large',
-    name: 'mxbai-embed-large',
-    dims: 1024,
-    sizeMb: 670,
-    speed: 'Medium',
-    description: 'Higher accuracy, better semantic recall.'
-  },
-  {
-    id: 'all-minilm',
-    name: 'all-minilm',
-    dims: 384,
-    sizeMb: 46,
-    speed: 'Very fast',
-    description: 'Lightweight. Ideal for constrained environments.'
-  },
-  {
-    id: 'bge-m3',
-    name: 'bge-m3',
-    dims: 1024,
-    sizeMb: 1300,
-    speed: 'Medium',
-    description: 'Multilingual. Best for non-English content.'
-  }
-];
+import type { EmbeddingModelId } from '$lib/embeddings/models.js';
 
 /** Clamp a 0..1 ratio to an integer 0..100 percentage. */
 function toPct(completed: number | null, total: number | null): number | null {

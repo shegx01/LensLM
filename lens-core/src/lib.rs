@@ -29,7 +29,7 @@ pub mod vector_store;
 pub use config::{AppConfig, EnrichmentConfig, TaskModel};
 pub use embedder::{
     CountingEmbedder, DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, Embedder, EmbeddingBackend,
-    EmbeddingModelSpec, FastembedEmbedder, OllamaEmbedder, resolve, resolve_opt,
+    EmbeddingModelSpec, FastembedEmbedder, OllamaEmbedder, REGISTRY, resolve, resolve_opt,
 };
 pub use embedding::{InstallProgress, pull_embedding_model};
 pub use enrichment::{ENRICHMENT_QUEUE_CAPACITY, EnrichmentJob};
@@ -53,7 +53,7 @@ pub use notebooks::{
 };
 pub use system_check::{
     ALLOWED_EMBEDDING_MODELS, CheckAction, CheckId, CheckResult, CheckStatus, LlmDetection,
-    detect_llm, list_ollama_models, ollama_base_url,
+    detect_llm, fastembed_weights_cached, list_ollama_models, ollama_base_url,
 };
 pub use tts::{
     DownloadProgress, Gender, KOKORO_MODEL_FILENAME, KOKORO_MODEL_RELPATH, KOKORO_MODEL_URL,
@@ -1162,6 +1162,22 @@ impl LensEngine {
         };
         cache.insert(key, Arc::clone(&embedder));
         Ok(embedder)
+    }
+
+    /// Warms (constructs + caches) the fastembed embedder for `model_id`,
+    /// downloading its HuggingFace weights to `{data_dir}/models/fastembed/` on a
+    /// cold cache. Idempotent: a warm cache hit returns immediately.
+    ///
+    /// This is the onboarding/Settings "Install [fastembed model]" path: fastembed
+    /// has no separate download step (weights land lazily on first embedder
+    /// construction), so warming up-front lets onboarding pass the per-backend
+    /// readiness gate ([`crate::fastembed_weights_cached`]) for a fastembed
+    /// selection on a fresh, Ollama-less machine. Always `Fastembed` (Ollama is
+    /// detect-only — the app never pulls).
+    pub async fn warm_fastembed_model(&self, model_id: &str) -> Result<(), LensError> {
+        self.embedder_for(model_id, crate::embedder::EmbeddingBackend::Fastembed)
+            .await
+            .map(|_| ())
     }
 
     /// Resolves a notebook's configured embedding coordinate components
