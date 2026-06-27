@@ -1065,6 +1065,182 @@ async fn purge_source_removes_rows_and_vectors() {
     );
 }
 
+/// Counts the Lance rows for `source_id` in the active table of a SPECIFIC
+/// `(notebook, backend, model, dim)` coordinate (the `support::vector_chunk_ids`
+/// helper is hardcoded to the fastembed table; R7b must inspect BOTH backends'
+/// tables). Reads `lance_table_name` from the registry then queries the table.
+async fn source_rows_in_coord(
+    engine: &LensEngine,
+    data_dir: &std::path::Path,
+    nb: &str,
+    backend: EmbeddingBackend,
+    source_id: &str,
+) -> usize {
+    use futures_util::TryStreamExt;
+    use lancedb::query::{ExecutableQuery, QueryBase};
+
+    let table_name: Option<String> = sqlx::query_scalar(
+        "SELECT lance_table_name FROM embedding_index \
+         WHERE notebook_id = ? AND backend = ? AND model = ? AND dim = ? AND status = 'active'",
+    )
+    .bind(nb)
+    .bind(backend.as_str())
+    .bind(DEFAULT_EMBED_MODEL_ID)
+    .bind(DEFAULT_EMBED_DIM as i64)
+    .fetch_optional(&engine.pool().await)
+    .await
+    .unwrap();
+    let Some(table_name) = table_name else {
+        return 0;
+    };
+    let root = data_dir.join("lancedb");
+    let conn = lancedb::connect(root.to_string_lossy().as_ref())
+        .execute()
+        .await
+        .unwrap();
+    if !conn
+        .table_names()
+        .execute()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .any(|n| n == &table_name)
+    {
+        return 0;
+    }
+    let table = conn.open_table(&table_name).execute().await.unwrap();
+    let batches: Vec<_> = table
+        .query()
+        .only_if(format!("source_id = '{source_id}'"))
+        .execute()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    batches.iter().map(|b| b.num_rows()).sum()
+}
+
+/// R7b — `purge_source` drops the source from ALL active coordinates, including a
+/// SAME-DIM cross-backend pair. Two active coordinates for one notebook differ
+/// ONLY by backend — `(nb, Fastembed, nomic, 768)` + `(nb, Ollama, nomic, 768)` —
+/// each holding the same source's chunks. Purging the source must remove it from
+/// BOTH (a naive single-coordinate resolve would leave the other backend's vectors
+/// dangling).
+#[tokio::test]
+async fn purge_source_drops_from_all_active_coordinates() {
+    let (_dir, engine) = inject_counting_engine().await;
+    let data_dir = engine.data_dir_for_test().await;
+
+    let nb = engine
+        .create_notebook("purge-all-coords", None, None)
+        .await
+        .unwrap();
+    let nb_id = nb.id.to_string();
+    let pool = engine.pool().await;
+
+    // A trashed source (purge requires a trashed source).
+    let source_id = uuid::Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO sources (id, notebook_id, kind, title, status, locator, selected, \
+         content_hash, enrichment_status, created_at, trashed_at) \
+         VALUES (?, ?, 'text', 'seed', 'indexed', '/tmp/seed.txt', 1, ?, NULL, ?, ?)",
+    )
+    .bind(&source_id)
+    .bind(&nb_id)
+    .bind(format!("hash-{source_id}"))
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Build TWO active coordinates differing ONLY by backend, each holding this
+    // source's two chunks.
+    let store = LanceVectorStore::new(&data_dir, pool.clone());
+    let mk_rows = || {
+        (0..2)
+            .map(|i| VectorRow {
+                chunk_id: format!("{source_id}-c{i}"),
+                source_id: source_id.clone(),
+                notebook_id: nb_id.clone(),
+                level: 1,
+                vector: {
+                    let mut v = vec![0.0_f32; DEFAULT_EMBED_DIM];
+                    v[i % DEFAULT_EMBED_DIM] = 1.0;
+                    v
+                },
+            })
+            .collect::<Vec<_>>()
+    };
+    for backend in [EmbeddingBackend::Fastembed, EmbeddingBackend::Ollama] {
+        store
+            .add(
+                &Coordinate::new(
+                    nb_id.clone(),
+                    backend,
+                    DEFAULT_EMBED_MODEL_ID,
+                    DEFAULT_EMBED_DIM,
+                ),
+                mk_rows(),
+            )
+            .await
+            .unwrap();
+    }
+
+    // Both coordinates hold the source before purge.
+    assert_eq!(
+        source_rows_in_coord(
+            &engine,
+            &data_dir,
+            &nb_id,
+            EmbeddingBackend::Fastembed,
+            &source_id
+        )
+        .await,
+        2
+    );
+    assert_eq!(
+        source_rows_in_coord(
+            &engine,
+            &data_dir,
+            &nb_id,
+            EmbeddingBackend::Ollama,
+            &source_id
+        )
+        .await,
+        2
+    );
+
+    engine.purge_source(&source_id).await.expect("purge");
+
+    // Gone from BOTH active coordinates.
+    assert_eq!(
+        source_rows_in_coord(
+            &engine,
+            &data_dir,
+            &nb_id,
+            EmbeddingBackend::Fastembed,
+            &source_id
+        )
+        .await,
+        0,
+        "fastembed coordinate must be purged"
+    );
+    assert_eq!(
+        source_rows_in_coord(
+            &engine,
+            &data_dir,
+            &nb_id,
+            EmbeddingBackend::Ollama,
+            &source_id
+        )
+        .await,
+        0,
+        "ollama coordinate must ALSO be purged (R7b: all active coordinates)"
+    );
+}
+
 /// AC: `trash_source` sets `trashed_at` and the source is EXCLUDED from
 /// `list_sources`, but chunks and Lance vectors are preserved.
 #[tokio::test]

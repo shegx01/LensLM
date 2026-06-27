@@ -25,8 +25,11 @@ pub struct EmbeddingModelInfo {
     pub model_id: String,
     /// Output vector dimension (e.g. `768`).
     pub dim: usize,
-    /// Whether an active embedding_index row exists for this (model, dim):
-    /// `"active"` when the coordinate is live, `"none"` when no index exists yet.
+    /// Embedding backend serving this coordinate (`"fastembed"` | `"ollama"`).
+    pub backend: String,
+    /// Whether an active embedding_index row exists for this
+    /// (notebook, backend, model, dim) coordinate: `"active"` when the coordinate
+    /// is live, `"none"` when no index exists yet.
     pub status: String,
 }
 
@@ -306,14 +309,18 @@ pub async fn purge_notebook(
 pub async fn set_notebook_embedding_model(
     notebook_id: String,
     model_id: String,
+    backend: String,
     on_progress: Channel<StreamEvent<ReembedProgress>>,
     engine: tauri::State<'_, LensEngine>,
 ) -> Result<(), LensError> {
     let nb_id = NotebookId::from(notebook_id);
+    // An unknown/empty backend string resolves to the default (`fastembed`) via the
+    // enum — same lenient resolution as the model id + the global config.
+    let backend = lens_core::EmbeddingBackend::from_opt_str(Some(&backend));
 
-    // Persist the new model id first (validates against the registry).
+    // Persist the new model id + backend first (validates against the registry).
     engine
-        .set_notebook_embedding_model(&nb_id, &model_id)
+        .set_notebook_embedding_model(&nb_id, &model_id, backend)
         .await?;
 
     if let Err(e) = send_event(&on_progress, StreamEvent::Started) {
@@ -354,11 +361,12 @@ pub async fn set_notebook_embedding_model(
     result.map(|_| ())
 }
 
-/// Returns the notebook's current embedding model id, dimension, and whether
-/// an active `embedding_index` row exists for that coordinate.
+/// Returns the notebook's current embedding model id, dimension, backend, and
+/// whether an active `embedding_index` row exists for that coordinate.
 ///
-/// `status` is `"active"` when a live index row exists for `(model, dim)`,
-/// or `"none"` when the coordinate has not been indexed yet.
+/// `status` is `"active"` when a live index row exists for the FULL
+/// `(notebook, backend, model, dim)` coordinate, or `"none"` when the coordinate
+/// has not been indexed yet (the status query is backend-scoped per R4/R7a).
 #[tracing::instrument(skip(engine))]
 #[tauri::command]
 pub async fn get_notebook_embedding_model(
@@ -366,13 +374,11 @@ pub async fn get_notebook_embedding_model(
     engine: tauri::State<'_, LensEngine>,
 ) -> Result<EmbeddingModelInfo, LensError> {
     let nb_id = NotebookId::from(notebook_id);
-    // NOTE (Step 6): `backend` is resolved here but not yet surfaced on
-    // `EmbeddingModelInfo` — the struct + TS mirror gain the `backend` field when
-    // the backend-aware `set_notebook_embedding_model` command lands.
-    let (model_id, dim, _backend, status) = engine.get_notebook_embedding_info(&nb_id).await?;
+    let (model_id, dim, backend, status) = engine.get_notebook_embedding_info(&nb_id).await?;
     Ok(EmbeddingModelInfo {
         model_id,
         dim,
+        backend: backend.as_str().to_string(),
         status,
     })
 }
@@ -571,6 +577,7 @@ mod tests {
             .unwrap();
         assert_eq!(info.model_id, "nomic-embed-text-v1.5");
         assert_eq!(info.dim, 768);
+        assert_eq!(info.backend, "fastembed");
         // No index built yet → status = "none".
         assert_eq!(info.status, "none");
 
@@ -581,6 +588,7 @@ mod tests {
             .set_notebook_embedding_model(
                 &lens_core::NotebookId::from(nb.id.to_string()),
                 "mxbai-embed-large",
+                lens_core::EmbeddingBackend::Fastembed,
             )
             .await
             .unwrap();
@@ -590,6 +598,7 @@ mod tests {
             .unwrap();
         assert_eq!(info2.model_id, "mxbai-embed-large");
         assert_eq!(info2.dim, 1024);
+        assert_eq!(info2.backend, "fastembed");
         assert_eq!(info2.status, "none");
     }
 
@@ -607,6 +616,7 @@ mod tests {
             .set_notebook_embedding_model(
                 &lens_core::NotebookId::from(nb.id.to_string()),
                 "totally-unknown-model",
+                lens_core::EmbeddingBackend::Fastembed,
             )
             .await
             .unwrap_err();

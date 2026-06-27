@@ -660,16 +660,32 @@ impl LensEngine {
             .get_source(source_id)
             .await?
             .ok_or_else(|| LensError::Validation(format!("no source with id {source_id}")))?;
-        // Resolve the OWNING notebook's embedding coordinate (R1) so the drop
-        // targets the right per-notebook table instead of the global default.
-        let notebook_id = NotebookId::from(source.notebook_id.clone());
-        let (model, dim, backend) = self.resolve_notebook_embedding(&notebook_id).await?;
         let store = crate::vector_store::LanceVectorStore::new(&data_dir, pool.clone());
-        // NOTE (Steps 7): for now this drops from the single resolved coordinate;
-        // the ALL-active-coordinates enumeration (R7b) lands in Step 7.
-        let coord =
-            crate::vector_store::Coordinate::new(source.notebook_id.clone(), backend, model, dim);
-        store.drop_source(&coord, source_id).await?;
+        // R7b: drop the source from EVERY active coordinate the notebook holds, not
+        // just the currently-configured one. A same-(model, dim) cross-backend
+        // switch (or a re-embed mid-flight) can leave MULTIPLE active coordinates
+        // for one notebook (e.g. a lingering fastembed row alongside a new ollama
+        // one); resolving only the configured coordinate would leave the other
+        // backend's vectors dangling (search would return hits no source backs).
+        // Enumerate the active registry rows — each yields its own backend — and
+        // drop from each. A coordinate with no active row is a no-op inside
+        // `drop_source`.
+        let active_coords: Vec<(String, i64, String)> = sqlx::query_as(
+            "SELECT DISTINCT model, dim, backend FROM embedding_index \
+             WHERE notebook_id = ? AND status = 'active'",
+        )
+        .bind(&source.notebook_id)
+        .fetch_all(&pool)
+        .await?;
+        for (model, dim, backend) in active_coords {
+            let coord = crate::vector_store::Coordinate::new(
+                source.notebook_id.clone(),
+                crate::embedder::EmbeddingBackend::from_opt_str(Some(&backend)),
+                model,
+                dim as usize,
+            );
+            store.drop_source(&coord, source_id).await?;
+        }
         NotebookRepo::new(&pool).purge_source(source_id).await?;
         // Best-effort: remove the managed source file AND its `.extracted.txt`
         // sibling so "Delete forever" does not leak either on disk. A missing
@@ -1198,10 +1214,16 @@ impl LensEngine {
     ///
     /// This does NOT kick off re-embedding — the Tauri command layer calls
     /// [`reembed_notebook`](Self::reembed_notebook) after persisting.
+    ///
+    /// `backend` (M4 Phase 4b-B) is the THIRD coordinate axis: it is persisted to
+    /// `notebooks.embedding_backend` alongside the model so a same-(model, dim)
+    /// backend switch is a genuine coordinate change that
+    /// [`reembed_notebook`](Self::reembed_notebook) re-embeds + retires (R2).
     pub async fn set_notebook_embedding_model(
         &self,
         notebook_id: &NotebookId,
         model_id: &str,
+        backend: crate::embedder::EmbeddingBackend,
     ) -> Result<(), LensError> {
         // Reject genuinely-unknown ids via the registry's strict lookup (which
         // accepts the legacy alias `nomic-embed-text` → nomic). Persist the
@@ -1215,10 +1237,11 @@ impl LensEngine {
         })?;
         let pool = self.pool().await;
         let result = sqlx::query(
-            "UPDATE notebooks SET embedding_model = ?, updated_at = ? \
+            "UPDATE notebooks SET embedding_model = ?, embedding_backend = ?, updated_at = ? \
              WHERE id = ? AND trashed_at IS NULL",
         )
         .bind(spec.id)
+        .bind(backend.as_str())
         .bind(chrono::Utc::now().to_rfc3339())
         .bind(notebook_id.as_str())
         .execute(&pool)

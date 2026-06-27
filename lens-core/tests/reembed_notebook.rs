@@ -27,6 +27,11 @@ const BGE_DIM: usize = 1024;
 /// Injects a model-free `CountingEmbedder` keyed by `model_id`'s registry spec so
 /// `embedder_for(model_id)` returns the right-dim deterministic embedder.
 fn inject_embedder(engine: &LensEngine, model_id: &str) {
+    inject_embedder_for(engine, model_id, EmbeddingBackend::Fastembed);
+}
+
+/// Injects a model-free `CountingEmbedder` for a `(model_id, backend)` cache slot.
+fn inject_embedder_for(engine: &LensEngine, model_id: &str, backend: EmbeddingBackend) {
     let spec = resolve(model_id);
     let e: Arc<dyn Embedder> = Arc::new(CountingEmbedder::new_with_dim(
         spec.dim,
@@ -37,7 +42,7 @@ fn inject_embedder(engine: &LensEngine, model_id: &str) {
         Arc::new(AtomicUsize::new(0)),
     ));
     engine
-        .set_embedder_for_test(e, lens_core::EmbeddingBackend::Fastembed)
+        .set_embedder_for_test(e, backend)
         .expect("inject embedder");
 }
 
@@ -139,6 +144,38 @@ async fn set_model(engine: &LensEngine, nb: &str, model: &str) {
         .execute(&engine.pool().await)
         .await
         .unwrap();
+}
+
+async fn set_backend(engine: &LensEngine, nb: &str, backend: EmbeddingBackend) {
+    sqlx::query("UPDATE notebooks SET embedding_backend = ? WHERE id = ?")
+        .bind(backend.as_str())
+        .bind(nb)
+        .execute(&engine.pool().await)
+        .await
+        .unwrap();
+}
+
+/// COUNT of `embedding_index` rows for the FULL 4-tuple coordinate + status.
+async fn coord_count_backend(
+    engine: &LensEngine,
+    nb: &str,
+    backend: EmbeddingBackend,
+    model: &str,
+    dim: usize,
+    status: &str,
+) -> i64 {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM embedding_index \
+         WHERE notebook_id = ? AND backend = ? AND model = ? AND dim = ? AND status = ?",
+    )
+    .bind(nb)
+    .bind(backend.as_str())
+    .bind(model)
+    .bind(dim as i64)
+    .bind(status)
+    .fetch_one(&engine.pool().await)
+    .await
+    .unwrap()
 }
 
 async fn coord_count(engine: &LensEngine, nb: &str, model: &str, dim: usize, status: &str) -> i64 {
@@ -302,4 +339,173 @@ async fn r2_second_switch_mid_build_aborts_flip() {
     );
     // No bge-m3 active coordinate was promoted (the building row is left for GC).
     assert_eq!(coord_count(&engine, &nb, BGE, BGE_DIM, "active").await, 0);
+}
+
+/// R2 SAME-DIM CROSS-BACKEND switch (the headline data-integrity test): a notebook
+/// on `fastembed`/nomic/768 switches to `ollama`/nomic/768 — SAME model id, SAME
+/// dim, DIFFERENT backend. The re-embed must NOT NoOp (a backend-blind
+/// `(model, dim)`-only discovery would wrongly NoOp since model+dim are unchanged),
+/// must re-embed into the NEW `(nb, Ollama, nomic, 768)` coordinate, and must
+/// retire the OLD `(nb, Fastembed, nomic, 768)` coordinate (the CORRECT old
+/// coordinate, not the new one).
+#[tokio::test]
+async fn r2_same_dim_cross_backend_switch_reembeds_and_retires_old() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = LensEngine::init(dir.path()).await.unwrap();
+    // The TARGET embedder is the SAME model id but under the OLLAMA backend slot.
+    inject_embedder_for(&engine, DEFAULT_EMBED_MODEL_ID, EmbeddingBackend::Ollama);
+    let (nb, _src) = seed_nomic_notebook(&engine).await;
+
+    // Before: fastembed/nomic/768 is the lone active coordinate.
+    assert_eq!(
+        coord_count_backend(
+            &engine,
+            &nb,
+            EmbeddingBackend::Fastembed,
+            DEFAULT_EMBED_MODEL_ID,
+            DEFAULT_EMBED_DIM,
+            "active"
+        )
+        .await,
+        1
+    );
+
+    // Switch ONLY the backend (model + dim unchanged).
+    set_backend(&engine, &nb, EmbeddingBackend::Ollama).await;
+    let outcome = engine
+        .reembed_notebook(&NotebookId::from(nb.clone()), |_, _| {})
+        .await
+        .expect("reembed");
+
+    // NOT a NoOp — the backend changed even though model + dim did not.
+    assert_eq!(
+        outcome,
+        ReembedOutcome::Switched {
+            model: DEFAULT_EMBED_MODEL_ID.to_string(),
+            dim: DEFAULT_EMBED_DIM,
+            retired: 1,
+        },
+        "a same-(model,dim) backend switch must re-embed + retire, never NoOp"
+    );
+
+    // NEW coordinate (ollama) active; OLD coordinate (fastembed) fully retired.
+    assert_eq!(
+        coord_count_backend(
+            &engine,
+            &nb,
+            EmbeddingBackend::Ollama,
+            DEFAULT_EMBED_MODEL_ID,
+            DEFAULT_EMBED_DIM,
+            "active"
+        )
+        .await,
+        1,
+        "the ollama coordinate is now active"
+    );
+    let old_total: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM embedding_index \
+         WHERE notebook_id = ? AND backend = 'fastembed' AND model = ? AND dim = ?",
+    )
+    .bind(&nb)
+    .bind(DEFAULT_EMBED_MODEL_ID)
+    .bind(DEFAULT_EMBED_DIM as i64)
+    .fetch_one(&engine.pool().await)
+    .await
+    .unwrap();
+    assert_eq!(
+        old_total, 0,
+        "the OLD fastembed coordinate row is deleted (retired), not the new ollama one"
+    );
+
+    // Search on the NEW ollama coordinate returns both chunks.
+    let store = LanceVectorStore::new(&engine.data_dir_for_test().await, engine.pool().await);
+    let q = vec![0.1_f32; DEFAULT_EMBED_DIM];
+    let hits = store
+        .search(
+            &Coordinate::new(
+                nb.clone(),
+                EmbeddingBackend::Ollama,
+                DEFAULT_EMBED_MODEL_ID,
+                DEFAULT_EMBED_DIM,
+            ),
+            &q,
+            4,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        hits.len(),
+        2,
+        "both chunks searchable under the new ollama coordinate"
+    );
+}
+
+/// R2 flip guard is BACKEND-AWARE: a concurrent second switch that changes the
+/// BACKEND (same model + dim) under the in-flight flip → `RaceAborted`. A guard
+/// that compared only `(model, dim)` would let the stale-backend building table
+/// flip active.
+#[tokio::test]
+async fn r2_flip_guard_aborts_on_concurrent_backend_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = LensEngine::init(dir.path()).await.unwrap();
+    // First switch targets the OLLAMA backend; the second targets a THIRD model so
+    // the in-lock re-resolve disagrees with what we built.
+    inject_embedder_for(&engine, DEFAULT_EMBED_MODEL_ID, EmbeddingBackend::Ollama);
+    let (nb, _src) = seed_nomic_notebook(&engine).await;
+
+    let gate = Arc::new(tokio::sync::Notify::new());
+    engine
+        .set_reembed_preflip_gate_for_test(Some(gate.clone()))
+        .await;
+
+    // First switch: fastembed/nomic -> ollama/nomic. Build then park.
+    set_backend(&engine, &nb, EmbeddingBackend::Ollama).await;
+    let engine2 = engine.clone();
+    let nb2 = nb.clone();
+    let handle = tokio::spawn(async move {
+        engine2
+            .reembed_notebook(&NotebookId::from(nb2), |_, _| {})
+            .await
+    });
+
+    // While parked, a SECOND switch lands: ollama/nomic -> fastembed/nomic (back to
+    // the original backend). The configured coordinate no longer matches what the
+    // parked task built (ollama).
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    set_backend(&engine, &nb, EmbeddingBackend::Fastembed).await;
+
+    gate.notify_one();
+    let outcome = handle.await.unwrap().expect("reembed");
+    assert_eq!(
+        outcome,
+        ReembedOutcome::RaceAborted,
+        "a concurrent backend change must abort the flip (backend-aware R2 guard)"
+    );
+
+    // The original fastembed coordinate was never flipped away — it still serves.
+    assert_eq!(
+        coord_count_backend(
+            &engine,
+            &nb,
+            EmbeddingBackend::Fastembed,
+            DEFAULT_EMBED_MODEL_ID,
+            DEFAULT_EMBED_DIM,
+            "active"
+        )
+        .await,
+        1
+    );
+    // No ollama coordinate was promoted (building left for GC).
+    assert_eq!(
+        coord_count_backend(
+            &engine,
+            &nb,
+            EmbeddingBackend::Ollama,
+            DEFAULT_EMBED_MODEL_ID,
+            DEFAULT_EMBED_DIM,
+            "active"
+        )
+        .await,
+        0
+    );
 }

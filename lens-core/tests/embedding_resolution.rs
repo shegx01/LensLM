@@ -227,7 +227,7 @@ async fn set_embedding_model_accepts_legacy_alias_and_persists_canonical() {
         .expect("create notebook");
 
     engine
-        .set_notebook_embedding_model(&nb.id, "nomic-embed-text")
+        .set_notebook_embedding_model(&nb.id, "nomic-embed-text", EmbeddingBackend::Fastembed)
         .await
         .expect("legacy alias accepted");
 
@@ -251,7 +251,7 @@ async fn set_embedding_model_rejects_unknown_id() {
         .expect("create notebook");
 
     let err = engine
-        .set_notebook_embedding_model(&nb.id, "totally-made-up-model")
+        .set_notebook_embedding_model(&nb.id, "totally-made-up-model", EmbeddingBackend::Fastembed)
         .await
         .expect_err("unknown id rejected");
     assert!(format!("{err}").contains("unknown embedding model id"));

@@ -236,30 +236,37 @@ pub(crate) async fn reembed_notebook(
     let repo = NotebookRepo::new(&pool);
     let nb = notebook_id.to_string();
 
-    // The NEW configured coordinate (notebooks.embedding_model → registry, R1).
-    // NOTE (Step 6): the backend axis is resolved here but the OLD-coordinate
-    // discovery + NoOp filter below remain (model, dim)-only; Step 6 widens them to
-    // the full `(model, dim, backend)` triple (R2 same-dim cross-backend switch).
-    // For Steps 1-2 the workspace must compile and existing (same-backend) tests
-    // must not regress — retirement therefore stamps the resolved `new_backend`.
+    // The NEW configured coordinate (notebooks.embedding_model + embedding_backend
+    // → registry, R1 + R2). The backend is a FIRST-CLASS axis here: a same-(model,
+    // dim) BACKEND switch (fastembed/nomic/768 → ollama/nomic/768) is a genuine
+    // coordinate change, so the OLD-coordinate discovery + NoOp filter below compare
+    // the FULL `(model, dim, backend)` triple.
     let (new_model, new_dim, new_backend) = engine.resolve_notebook_embedding(notebook_id).await?;
     let new_coord =
         crate::vector_store::Coordinate::new(nb.clone(), new_backend, new_model.clone(), new_dim);
 
     // The OLD active coordinate(s) currently backing the notebook's search, minus
     // any that already equal the configured coordinate (the user re-picked the same
-    // model). What remains are coordinates to migrate away from + retire.
-    let active: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT DISTINCT model, dim FROM embedding_index \
+    // model AND backend). What remains are coordinates to migrate away from + retire.
+    // R2: discover `backend` too, so a same-(model, dim) backend switch is NOT
+    // wrongly collapsed into a NoOp.
+    let active: Vec<(String, i64, String)> = sqlx::query_as(
+        "SELECT DISTINCT model, dim, backend FROM embedding_index \
          WHERE notebook_id = ? AND status = 'active'",
     )
     .bind(&nb)
     .fetch_all(&pool)
     .await?;
-    let old_coords: Vec<(String, usize)> = active
+    let old_coords: Vec<(String, usize, crate::embedder::EmbeddingBackend)> = active
         .into_iter()
-        .map(|(m, d)| (m, d as usize))
-        .filter(|(m, d)| !(m == &new_model && *d == new_dim))
+        .map(|(m, d, b)| {
+            (
+                m,
+                d as usize,
+                crate::embedder::EmbeddingBackend::from_opt_str(Some(&b)),
+            )
+        })
+        .filter(|(m, d, b)| !(m == &new_model && *d == new_dim && *b == new_backend))
         .collect();
     if old_coords.is_empty() {
         // Nothing embedded yet, or the active coordinate already matches the
@@ -347,17 +354,21 @@ pub(crate) async fn reembed_notebook(
         // what we built, SKIP the flip and leave the building table for the
         // startup-GC — the newer switch's own re-embed wins. Mirrors the purge-vs-flip
         // guard in `reembed_and_flip`.
-        // (Step 6 extends this guard to compare `backend` too; for now it stays
-        // model/dim-scoped — `_configured_backend` is intentionally unused here.)
-        let (configured_model, configured_dim, _configured_backend) =
+        // R2: the guard compares `backend` too — a same-(model, dim) backend switch
+        // landing under the flip must abort (otherwise a stale-backend building
+        // table flips active).
+        let (configured_model, configured_dim, configured_backend) =
             engine.resolve_notebook_embedding(notebook_id).await?;
-        if configured_model != new_model || configured_dim != new_dim {
+        if configured_model != new_model
+            || configured_dim != new_dim
+            || configured_backend != new_backend
+        {
             tracing::debug!(
                 notebook = %nb,
                 building = %building_name,
-                built = %format!("{new_model}/{new_dim}"),
-                now = %format!("{configured_model}/{configured_dim}"),
-                "reembed_notebook: configured model changed under flip; skipping flip, leaving building table for GC"
+                built = %format!("{}/{new_model}/{new_dim}", new_backend.as_str()),
+                now = %format!("{}/{configured_model}/{configured_dim}", configured_backend.as_str()),
+                "reembed_notebook: configured coordinate changed under flip; skipping flip, leaving building table for GC"
             );
             return Ok(ReembedOutcome::RaceAborted);
         }
@@ -368,13 +379,13 @@ pub(crate) async fn reembed_notebook(
     // Retire each OLD coordinate now that the NEW one is active. Each call is
     // idempotent + crash-recoverable (R3): a crash mid-retire leaves a `stale` row
     // the startup-GC reclaims, and the new coordinate already serves search.
-    for (old_model, old_dim) in &old_coords {
-        // Step 6 sources `backend` from the OLD-coordinate discovery; for now the
-        // retirement stamps the resolved `new_backend` (correct for all
-        // same-backend switches, which is every existing 4b-A case + test).
+    for (old_model, old_dim, old_backend) in &old_coords {
+        // R2: each old coordinate carries its OWN backend (discovered above), so a
+        // same-(model, dim) backend switch retires the CORRECT old coordinate
+        // (fastembed) rather than the new one.
         let old_coord = crate::vector_store::Coordinate::new(
             nb.clone(),
-            new_backend,
+            *old_backend,
             old_model.clone(),
             *old_dim,
         );

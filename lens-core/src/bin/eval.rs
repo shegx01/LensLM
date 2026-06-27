@@ -79,7 +79,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use lens_core::chunk::{Chunk, chunk_blocks_deterministic};
-use lens_core::embedder::{DEFAULT_EMBED_MODEL_ID, Embedder, FastembedEmbedder};
+use lens_core::embedder::{
+    DEFAULT_EMBED_MODEL_ID, Embedder, EmbeddingBackend, FastembedEmbedder, OllamaEmbedder,
+};
 use lens_core::enrichment::{
     CorefSub, apply_substitutions, compose_embedding_text, compose_prefix,
 };
@@ -190,6 +192,17 @@ async fn run() -> Result<ExitCode, LensError> {
             .map(|w| w[1].clone())
             .unwrap_or_else(|| DEFAULT_EMBED_MODEL_ID.to_string())
     };
+    // Parse --backend <fastembed|ollama> (default: fastembed — the hard-gate path).
+    // An unknown/absent value resolves to the default via the enum, same lenient
+    // resolution as the rest of the app.
+    let backend: EmbeddingBackend = {
+        let args: Vec<String> = std::env::args().collect();
+        let raw = args
+            .windows(2)
+            .find(|w| w[0] == "--backend")
+            .map(|w| w[1].clone());
+        EmbeddingBackend::from_opt_str(raw.as_deref())
+    };
     // Resolve the spec, REJECTING an unknown id (mirrors the
     // `set_notebook_embedding_model` command) so a typo'd `--model` fails loudly
     // instead of silently measuring nomic. The legacy alias is accepted.
@@ -225,13 +238,30 @@ async fn run() -> Result<ExitCode, LensError> {
     let pool = engine.pool().await;
 
     println!(
-        "Building embedder ({}); first run downloads weights from HuggingFace…",
-        spec.id
+        "Building embedder ({} via {}); a cold fastembed run downloads weights from HuggingFace…",
+        spec.id,
+        backend.as_str()
     );
-    let embedder = FastembedEmbedder::new_with_spec(data_dir, spec)?;
+    // Construct the embedder for the selected backend. fastembed is the default +
+    // the hard-gate path (recall@5 == 1.0); ollama targets the loopback-only daemon
+    // (availability-gated — a missing daemon surfaces as a construction/embed error
+    // the harness reports rather than silently passing).
+    let embedder: Box<dyn Embedder> = match backend {
+        EmbeddingBackend::Fastembed => Box::new(FastembedEmbedder::new_with_spec(data_dir, spec)?),
+        EmbeddingBackend::Ollama => {
+            let base_url = lens_core::system_check::ollama_base_url(&engine.config().await);
+            Box::new(OllamaEmbedder::new(&base_url, spec)?)
+        }
+    };
+    let embedder: &dyn Embedder = embedder.as_ref();
     let tokenizer = load_tokenizer(&engine).await?;
 
-    println!("Active embedding model : {} (dim={})", spec.id, spec.dim);
+    println!(
+        "Active embedding model : {} (dim={}, backend={})",
+        spec.id,
+        spec.dim,
+        backend.as_str()
+    );
 
     // ── Main corpus: raw path always; enriched paths only under --enriched. ──
     let main_docs = load_corpus(&fixtures_dir, MAIN_DOCS)?;
@@ -243,7 +273,8 @@ async fn run() -> Result<ExitCode, LensError> {
         println!("\n############ MAIN CORPUS — RAW ############");
         let raw = measure(
             &engine,
-            &embedder,
+            embedder,
+            backend,
             &tokenizer,
             data_dir,
             &pool,
@@ -280,7 +311,8 @@ async fn run() -> Result<ExitCode, LensError> {
     println!("\n--- raw ---");
     let main_raw = measure(
         &engine,
-        &embedder,
+        embedder,
+        backend,
         &tokenizer,
         data_dir,
         &pool,
@@ -295,7 +327,8 @@ async fn run() -> Result<ExitCode, LensError> {
     println!("\n--- prefix-only ---");
     let main_prefix = measure(
         &engine,
-        &embedder,
+        embedder,
+        backend,
         &tokenizer,
         data_dir,
         &pool,
@@ -314,7 +347,8 @@ async fn run() -> Result<ExitCode, LensError> {
     println!("\n--- raw ---");
     let pron_raw = measure(
         &engine,
-        &embedder,
+        embedder,
+        backend,
         &tokenizer,
         data_dir,
         &pool,
@@ -329,7 +363,8 @@ async fn run() -> Result<ExitCode, LensError> {
     println!("\n--- prefix-only ---");
     let pron_prefix = measure(
         &engine,
-        &embedder,
+        embedder,
+        backend,
         &tokenizer,
         data_dir,
         &pool,
@@ -348,7 +383,8 @@ async fn run() -> Result<ExitCode, LensError> {
     println!("\n--- raw ---");
     let coref_raw = measure(
         &engine,
-        &embedder,
+        embedder,
+        backend,
         &tokenizer,
         data_dir,
         &pool,
@@ -363,7 +399,8 @@ async fn run() -> Result<ExitCode, LensError> {
     println!("\n--- prefix-only (NO coref) ---");
     let coref_prefix = measure(
         &engine,
-        &embedder,
+        embedder,
+        backend,
         &tokenizer,
         data_dir,
         &pool,
@@ -378,7 +415,8 @@ async fn run() -> Result<ExitCode, LensError> {
     println!("\n--- prefix+coref (production apply_substitutions) ---");
     let coref_full = measure(
         &engine,
-        &embedder,
+        embedder,
+        backend,
         &tokenizer,
         data_dir,
         &pool,
@@ -543,7 +581,8 @@ impl Recall {
 #[allow(clippy::too_many_arguments)]
 async fn measure(
     engine: &LensEngine,
-    embedder: &FastembedEmbedder,
+    embedder: &dyn Embedder,
+    backend: EmbeddingBackend,
     tokenizer: &Tokenizer,
     data_dir: &Path,
     pool: &sqlx::SqlitePool,
@@ -557,10 +596,9 @@ async fn measure(
         .create_notebook(EVAL_NOTEBOOK_TITLE, None, None)
         .await?;
     let notebook_id = notebook.id.as_str();
-    // The eval harness is fastembed-only until Step 8 adds a `--backend` flag.
     let coord = lens_core::vector_store::Coordinate::new(
         notebook_id.to_string(),
-        lens_core::EmbeddingBackend::Fastembed,
+        backend,
         spec.id.to_string(),
         spec.dim,
     );
@@ -624,7 +662,10 @@ async fn measure(
         }
 
         let text_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
-        let vectors = embedder.embed_documents(&text_refs)?;
+        // `block_in_place` so the Ollama backend's internal `Handle::block_on`
+        // (driving the HTTP request) does not panic when invoked from this async
+        // worker thread; a no-op cost for the CPU-bound fastembed backend.
+        let vectors = tokio::task::block_in_place(|| embedder.embed_documents(&text_refs))?;
         for ((id, level), vector) in ids.into_iter().zip(levels).zip(vectors.into_iter()) {
             rows.push(VectorRow {
                 chunk_id: id,
@@ -642,7 +683,7 @@ async fn measure(
     let mut hits = 0usize;
     println!("=== Retrieval (k = {K}) ===");
     for q in queries {
-        let qvec = embedder.embed_query(&q.query)?;
+        let qvec = tokio::task::block_in_place(|| embedder.embed_query(&q.query))?;
         let results = store.search(&coord, &qvec, K).await?;
         let top_ids: Vec<&str> = results.iter().map(|h| h.chunk_id.as_str()).collect();
         let hit = q
