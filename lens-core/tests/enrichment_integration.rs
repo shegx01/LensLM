@@ -14,8 +14,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use lens_core::vector_store::{LanceVectorStore, VectorRow, VectorStore};
-use lens_core::{DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, LensEngine};
+use lens_core::vector_store::{Coordinate, LanceVectorStore, VectorRow, VectorStore};
+use lens_core::{DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, EmbeddingBackend, LensEngine};
+
+fn coord(nb: &str, model: &str, dim: usize) -> Coordinate {
+    Coordinate::new(nb, EmbeddingBackend::Fastembed, model, dim)
+}
 use sqlx::Row;
 use tempfile::TempDir;
 use tokio::sync::Notify;
@@ -289,9 +293,7 @@ async fn startup_gc_reclaims_building_and_stale_rows() {
     let store = LanceVectorStore::new(&data_dir, engine.pool().await);
     store
         .add(
-            &nb,
-            DEFAULT_EMBED_MODEL_ID,
-            DEFAULT_EMBED_DIM,
+            &coord(&nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM),
             vec![VectorRow {
                 chunk_id: "live".into(),
                 source_id: "s-live".into(),
@@ -306,12 +308,12 @@ async fn startup_gc_reclaims_building_and_stale_rows() {
     //    created via the real Step-5 `create_building_table` (gen-suffixed name +
     //    registered `building` row) then populated via `add_to_table`.
     let building_table = store
-        .create_building_table(&nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM)
+        .create_building_table(&coord(&nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM))
         .await
         .expect("create building table");
     assert_eq!(
         building_table,
-        format!("vec__{nb}__nomic_v15__d{DEFAULT_EMBED_DIM}__1")
+        format!("vec__{nb}__fastembed__nomic_v15__d{DEFAULT_EMBED_DIM}__1")
     );
     store
         .add_to_table(
@@ -370,7 +372,7 @@ async fn startup_gc_reclaims_building_and_stale_rows() {
     assert!(
         names
             .iter()
-            .any(|n| n == &format!("vec__{nb}__nomic_v15__d{DEFAULT_EMBED_DIM}")),
+            .any(|n| n == &format!("vec__{nb}__fastembed__nomic_v15__d{DEFAULT_EMBED_DIM}")),
         "the active Lance table must survive GC; live tables: {names:?}"
     );
 }

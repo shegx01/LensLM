@@ -17,6 +17,10 @@ export interface Notebook {
   /** Embedding model id this notebook is indexed with (M4 Phase 4b). `null` on
    * pre-migration rows; the backend resolves `null` to the global default. */
   embedding_model: string | null;
+  /** Embedding backend this notebook is indexed with (M4 Phase 4b-B):
+   * `"fastembed"` | `"ollama"`. `null` on pre-migration rows; the backend
+   * resolves `null` to the global default backend (`fastembed`). */
+  embedding_backend: string | null;
   created_at: string;
   updated_at: string;
   trashed_at: string | null;
@@ -33,6 +37,10 @@ export interface NotebookSummary {
   /** Embedding model id this notebook is indexed with (M4 Phase 4b). `null` on
    * pre-migration rows; the backend resolves `null` to the global default. */
   embedding_model: string | null;
+  /** Embedding backend this notebook is indexed with (M4 Phase 4b-B):
+   * `"fastembed"` | `"ollama"`. `null` on pre-migration rows; the backend
+   * resolves `null` to the global default backend (`fastembed`). */
+  embedding_backend: string | null;
   created_at: string;
   updated_at: string;
   trashed_at: string | null;

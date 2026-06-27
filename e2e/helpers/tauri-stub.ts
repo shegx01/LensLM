@@ -37,6 +37,7 @@ export type AppConfig = {
   tier_thresholds: TierThresholds;
   onboarding_complete: boolean;
   embedding_model: string;
+  embedding_backend: string;
 };
 
 // SYNC-CHECK: must match src/lib/onboarding/system-check.ts CheckResult
@@ -61,7 +62,8 @@ export function makeConfig(onboardingComplete: boolean): AppConfig {
     paths: { data_dir: '' },
     tier_thresholds: { tier1_token_cap: 4000, tier2_token_cap: 16000 },
     onboarding_complete: onboardingComplete,
-    embedding_model: ''
+    embedding_model: '',
+    embedding_backend: ''
   };
 }
 
@@ -101,6 +103,14 @@ export type InstallTauriStubOptions = {
   onboardingComplete: boolean;
   /** Rows returned by run_system_check (defaults to DEFAULT_CHECKS). */
   checks?: CheckResult[];
+  /** Model ids `fastembed_models_cached` reports as cached (defaults to none). */
+  fastembedCached?: string[];
+  /** Model names `list_ollama_models` reports (defaults to none — Ollama down). */
+  ollamaModels?: string[];
+  /** A notebook embedding coordinate returned by `get_notebook_embedding_model`. */
+  notebookEmbedding?: { model_id: string; dim: number; backend: string; status: string };
+  /** Notebook summaries returned by `list_notebooks` (defaults to none). */
+  notebooks?: { id: string; title: string }[];
 };
 
 /**
@@ -109,18 +119,27 @@ export type InstallTauriStubOptions = {
  */
 export async function installTauriStub(
   page: Page,
-  { onboardingComplete, checks = DEFAULT_CHECKS }: InstallTauriStubOptions
+  {
+    onboardingComplete,
+    checks = DEFAULT_CHECKS,
+    fastembedCached = [],
+    ollamaModels = [],
+    notebookEmbedding,
+    notebooks = []
+  }: InstallTauriStubOptions
 ): Promise<void> {
   await page.addInitScript(
-    ({ cfg, checks }) => {
+    ({ cfg, checks, fastembedCached, ollamaModels, notebookEmbedding, notebooks }) => {
       const w = window as unknown as {
         isTauri?: boolean;
         __TAURI_INTERNALS__?: Record<string, unknown>;
         __SET_CONFIG_CALLS__?: unknown[];
+        __REEMBED_CALLS__?: unknown[];
       };
       w.isTauri = true;
       (globalThis as unknown as { isTauri?: boolean }).isTauri = true;
       w.__SET_CONFIG_CALLS__ = [];
+      w.__REEMBED_CALLS__ = [];
 
       let currentCfg = cfg;
 
@@ -192,6 +211,58 @@ export async function installTauriStub(
             case 'list_recent_documents':
               // Empty → the "Suggested from your library" section stays hidden.
               return Promise.resolve([]);
+            case 'list_notebooks':
+              // NotebookSummary-shaped rows so the sidebar can render + select.
+              return Promise.resolve(
+                notebooks.map((n) => ({
+                  id: n.id,
+                  title: n.title,
+                  description: null,
+                  focus_mode: null,
+                  embedding_model: null,
+                  embedding_backend: null,
+                  created_at: '2026-01-01T00:00:00Z',
+                  updated_at: '2026-01-01T00:00:00Z',
+                  trashed_at: null,
+                  source_count: 2
+                }))
+              );
+            case 'list_trashed':
+              return Promise.resolve([]);
+            case 'fastembed_models_cached':
+              // Per-model fastembed on-disk cache probe (M4 4b-B).
+              return Promise.resolve(fastembedCached);
+            case 'list_ollama_models':
+              // Detect-only Ollama /api/tags probe (graceful empty when down).
+              return Promise.resolve(ollamaModels);
+            case 'warm_fastembed_model':
+              // fastembed Install = warm (download) the weights. No-op stub: by
+              // resolving we also pretend the model is now cached for any later
+              // fastembed_models_cached read in the same test (handled per-test).
+              return Promise.resolve(null);
+            case 'get_notebook_embedding_model':
+              return Promise.resolve(
+                notebookEmbedding ?? {
+                  model_id: 'nomic-embed-text-v1.5',
+                  dim: 768,
+                  backend: 'fastembed',
+                  status: 'none'
+                }
+              );
+            case 'set_notebook_embedding_model': {
+              // Records the change + streams a StreamEvent<ReembedProgress> run.
+              w.__REEMBED_CALLS__!.push({
+                notebookId: args?.notebookId,
+                modelId: args?.modelId,
+                backend: args?.backend
+              });
+              const ch = args?.onProgress as { onmessage?: (m: unknown) => void } | undefined;
+              ch?.onmessage?.({ type: 'started' });
+              ch?.onmessage?.({ type: 'chunk', data: { done: 1, total: 2 } });
+              ch?.onmessage?.({ type: 'chunk', data: { done: 2, total: 2 } });
+              ch?.onmessage?.({ type: 'done' });
+              return Promise.resolve(null);
+            }
             default:
               return Promise.resolve(null);
           }
@@ -205,15 +276,47 @@ export async function installTauriStub(
         }
       };
     },
-    { cfg: makeConfig(onboardingComplete), checks }
+    {
+      cfg: makeConfig(onboardingComplete),
+      checks,
+      fastembedCached,
+      ollamaModels,
+      notebookEmbedding,
+      notebooks
+    }
   );
 }
 
 /** Reads back the recorded set_config payloads from the page. */
-export function readSetConfigCalls(page: Page): Promise<{ onboarding_complete?: boolean }[]> {
+export function readSetConfigCalls(
+  page: Page
+): Promise<
+  { onboarding_complete?: boolean; embedding_model?: string; embedding_backend?: string }[]
+> {
   return page.evaluate(
     () =>
-      (window as unknown as { __SET_CONFIG_CALLS__?: { onboarding_complete?: boolean }[] })
-        .__SET_CONFIG_CALLS__ ?? []
+      (
+        window as unknown as {
+          __SET_CONFIG_CALLS__?: {
+            onboarding_complete?: boolean;
+            embedding_model?: string;
+            embedding_backend?: string;
+          }[];
+        }
+      ).__SET_CONFIG_CALLS__ ?? []
+  );
+}
+
+/** Reads back the recorded set_notebook_embedding_model calls from the page. */
+export function readReembedCalls(
+  page: Page
+): Promise<{ notebookId?: string; modelId?: string; backend?: string }[]> {
+  return page.evaluate(
+    () =>
+      (
+        window as unknown as {
+          __REEMBED_CALLS__?: { notebookId?: string; modelId?: string; backend?: string }[];
+        }
+      ).__REEMBED_CALLS__ ?? []
   );
 }

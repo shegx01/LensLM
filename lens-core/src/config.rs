@@ -329,6 +329,16 @@ pub struct AppConfig {
     /// `config.json` reads back as `""` via `#[serde(default)]`.
     #[serde(default)]
     pub embedding_model: String,
+    /// Selected embedding *backend* (`"fastembed"` | `"ollama"`). Empty when the
+    /// user has not yet chosen one. Defaults to `""`; an absent field in an older
+    /// `config.json` reads back as `""` via `#[serde(default)]`. An empty value
+    /// resolves to the default backend (`fastembed`) via
+    /// [`crate::embedder::EmbeddingBackend::from_opt_str`] — the SAME
+    /// empty-string-resolves-to-default pattern as `embedding_model`. This is the
+    /// app-wide default applied to NEW notebooks (M4 Phase 4b-B, R5/m2); it lives
+    /// here, NOT in SQL.
+    #[serde(default)]
+    pub embedding_backend: String,
     /// Configured chat/inference models keyed by role.
     pub models: Vec<ModelConfig>,
     /// Arbitrary named endpoints (label -> URL).
@@ -360,6 +370,7 @@ impl Default for AppConfig {
             accent: default_accent(),
             user_name: String::default(),
             embedding_model: String::default(),
+            embedding_backend: String::default(),
             models: Vec::default(),
             endpoints: BTreeMap::default(),
             voices: VoiceConfig::default(),
@@ -577,6 +588,45 @@ mod tests {
         config.save(dir.path()).unwrap();
         let loaded = AppConfig::load(dir.path()).unwrap();
         assert_eq!(loaded.embedding_model, "nomic-embed-text");
+    }
+
+    #[test]
+    fn default_embedding_backend_is_empty() {
+        assert_eq!(AppConfig::default().embedding_backend, "");
+    }
+
+    #[test]
+    fn missing_embedding_backend_deserializes_to_empty() {
+        // A config.json written before the `embedding_backend` field existed has
+        // no `embedding_backend` key; it must read back as the empty string (the
+        // serde default) rather than failing to deserialize (backward
+        // compatibility — the SAME pattern as `embedding_model`). An empty value
+        // resolves to the default backend (`fastembed`) at the resolver boundary.
+        let json = r#"{
+            "theme": "dark",
+            "accent": "purple",
+            "embedding_model": "",
+            "models": [],
+            "endpoints": {},
+            "voices": { "host": "", "guest": "" },
+            "paths": { "data_dir": "" },
+            "tier_thresholds": { "tier1_token_cap": 4000, "tier2_token_cap": 16000 },
+            "onboarding_complete": true
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.embedding_backend, "");
+    }
+
+    #[test]
+    fn explicit_embedding_backend_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = AppConfig {
+            embedding_backend: "ollama".to_string(),
+            ..AppConfig::default()
+        };
+        config.save(dir.path()).unwrap();
+        let loaded = AppConfig::load(dir.path()).unwrap();
+        assert_eq!(loaded.embedding_backend, "ollama");
     }
 
     #[test]

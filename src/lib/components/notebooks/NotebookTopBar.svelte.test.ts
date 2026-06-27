@@ -43,6 +43,8 @@ const { mockStore } = vi.hoisted(() => {
       set activeTab(v: 'chat' | 'notes') {
         _activeTab = v;
       },
+      // Per-notebook settings sheet visibility (enabled by the gear, M4 4b-B).
+      notebookSettingsOpen: false,
       // Test helper: directly set the underlying value for setup
       _setActiveNotebook(v: { id: string; title: string } | null) {
         _activeNotebook = v;
@@ -127,10 +129,13 @@ describe('NotebookTopBar', () => {
       expect(shareBtn).toBeDisabled();
     });
 
-    it('Settings button is disabled', () => {
+    it('Settings gear is enabled and opens the per-notebook settings sheet', async () => {
+      mockStore.notebookSettingsOpen = false;
       render(NotebookTopBar);
       const settingsBtn = screen.getByRole('button', { name: /notebook settings/i });
-      expect(settingsBtn).toBeDisabled();
+      expect(settingsBtn).not.toBeDisabled();
+      await fireEvent.click(settingsBtn);
+      expect(mockStore.notebookSettingsOpen).toBe(true);
     });
 
     it('Share button has aria-label mentioning availability', () => {
@@ -138,13 +143,6 @@ describe('NotebookTopBar', () => {
       const shareBtn = screen.getByRole('button', { name: /share notebook/i });
       expect(shareBtn).toHaveAttribute('aria-label');
       expect(shareBtn.getAttribute('aria-label')).toMatch(/available soon/i);
-    });
-
-    it('Settings button has aria-label mentioning availability', () => {
-      render(NotebookTopBar);
-      const settingsBtn = screen.getByRole('button', { name: /notebook settings/i });
-      expect(settingsBtn).toHaveAttribute('aria-label');
-      expect(settingsBtn.getAttribute('aria-label')).toMatch(/available soon/i);
     });
 
     it('has the toolbar landmark', () => {

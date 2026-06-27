@@ -107,4 +107,7 @@ export interface AppConfig {
   onboarding_complete: boolean;
   // SYNC-CHECK: must match lens-core/src/config.rs AppConfig.embedding_model (default "").
   embedding_model: string;
+  // SYNC-CHECK: must match lens-core/src/config.rs AppConfig.embedding_backend (default "").
+  // Empty resolves to the default backend ("fastembed") at the resolver boundary.
+  embedding_backend: string;
 }

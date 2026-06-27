@@ -23,15 +23,47 @@ use std::time::Duration;
 /// hardening (timeouts + `redirect(none)`) rather than degrading to a bare
 /// default — so a redirect-following, timeout-less client can never escape.
 pub fn hardened_client(connect: Duration, read: Duration) -> reqwest::Client {
+    build_hardened(connect, read, |b| b)
+}
+
+/// Builds a hardened client (same timeouts + `redirect(none)` as
+/// [`hardened_client`]) whose connection is PINNED to `addrs` for `host` via
+/// `resolve_to_addrs`, so reqwest connects ONLY to the supplied addresses and
+/// performs NO second DNS resolution at connect time.
+///
+/// This closes the DNS-rebinding TOCTOU on a loopback-validated base URL: the
+/// host is resolved + guard-checked once (e.g. by `ingest::require_loopback`), and
+/// the resulting loopback addresses are pinned here so a short-TTL / attacker
+/// record cannot rebind to a non-loopback address between validation and connect.
+/// `addrs` MUST be non-empty (an IP-literal host needs no pinning and should use
+/// [`hardened_client`] directly).
+pub fn hardened_client_pinned(
+    connect: Duration,
+    read: Duration,
+    host: &str,
+    addrs: &[std::net::SocketAddr],
+) -> reqwest::Client {
+    build_hardened(connect, read, |b| b.resolve_to_addrs(host, addrs))
+}
+
+/// Shared hardened-builder core: applies the timeouts + no-redirect policy, then
+/// runs `customize` on the builder (e.g. to pin `resolve_to_addrs`). The fallback
+/// rebuilds the identical hardened client. The final `expect` is a last-resort
+/// guard on an unreachable path (rustls has no system deps): we never substitute a
+/// bare default that would silently follow redirects.
+fn build_hardened(
+    connect: Duration,
+    read: Duration,
+    customize: impl Fn(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
+) -> reqwest::Client {
     let builder = || {
-        reqwest::Client::builder()
-            .connect_timeout(connect)
-            .timeout(read)
-            .redirect(reqwest::redirect::Policy::none())
+        customize(
+            reqwest::Client::builder()
+                .connect_timeout(connect)
+                .timeout(read)
+                .redirect(reqwest::redirect::Policy::none()),
+        )
     };
-    // The fallback rebuilds the identical hardened client. The final `expect` is a
-    // last-resort guard on an unreachable path (rustls has no system deps): we
-    // never substitute a bare default that would silently follow redirects.
     builder().build().unwrap_or_else(|_| {
         builder()
             .build()

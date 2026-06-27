@@ -35,6 +35,8 @@ let activeNotebookId = $state<string | null>(null); // session-only
 let activeTab = $state<'chat' | 'notes'>('chat'); // session-only
 let trashOpen = $state(false); // Trash modal visibility (centered dialog)
 let inspectorOpen = $state(false); // dev/QA Embeddings Inspector overlay visibility
+let settingsOpen = $state(false); // global Preferences shell (Settings>Embeddings) visibility
+let notebookSettingsOpen = $state(false); // per-notebook "{notebook} settings" sheet visibility
 let sidebarCollapsed = $state(false); // session-only; localStorage deferred to follow-up
 let rightRailCollapsed = $state(false); // session-only; persisted same way as sidebarCollapsed
 let paletteOpen = $state(false); // command palette visibility
@@ -115,6 +117,18 @@ export const notebookStore = {
   },
   set inspectorOpen(v: boolean) {
     inspectorOpen = v;
+  },
+  get settingsOpen() {
+    return settingsOpen;
+  },
+  set settingsOpen(v: boolean) {
+    settingsOpen = v;
+  },
+  get notebookSettingsOpen() {
+    return notebookSettingsOpen;
+  },
+  set notebookSettingsOpen(v: boolean) {
+    notebookSettingsOpen = v;
   },
   get sidebarCollapsed() {
     return sidebarCollapsed;
