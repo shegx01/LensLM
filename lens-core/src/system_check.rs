@@ -58,8 +58,9 @@ pub static ALLOWED_EMBEDDING_MODELS: LazyLock<Vec<&'static str>> = LazyLock::new
 /// canonical registry id OR the legacy Ollama alias `"nomic-embed-text"`, both
 /// recognized by the registry's [`resolve_opt`](crate::embedder::registry::resolve_opt)
 /// (which bridges the alias to the canonical nomic entry). Single source of truth
-/// for "is this a model we support", derived entirely from the registry so it can
-/// never drift from [`ALLOWED_EMBEDDING_MODELS`].
+/// for "is this a model we support", derived entirely from the registry — the same
+/// `REGISTRY` that [`ALLOWED_EMBEDDING_MODELS`] is derived from, so the two cover
+/// the identical canonical set (plus the alias bridge here) and cannot diverge.
 pub fn is_allowlisted_embedding_id(id: &str) -> bool {
     crate::embedder::registry::resolve_opt(id).is_some()
 }
@@ -482,15 +483,15 @@ fn is_allowlisted_embedding(installed_name: &str, configured: &str) -> bool {
         .split_once(':')
         .map_or(installed_name, |(name, _tag)| name)
         .to_ascii_lowercase();
-    // Registry-derived allowlist (canonical ids) PLUS the Ollama alias bridge:
-    // `resolve_opt` maps `"nomic-embed-text"` → the canonical nomic entry, so an
-    // Ollama tag reported under the alias is accepted without a hardcoded literal
-    // (the 4b-B desync fix). Both the canonical id check and the alias bridge are
-    // case-insensitive against the bare (tag-stripped) name.
+    // `is_allowlisted_embedding_id` is the single registry-derived check: it
+    // accepts every canonical id (the same set `ALLOWED_EMBEDDING_MODELS` is
+    // derived from) AND bridges the Ollama alias `"nomic-embed-text"` →
+    // canonical via `resolve_opt` (the 4b-B desync fix). A separate scan of
+    // `ALLOWED_EMBEDDING_MODELS` would be fully redundant, so we omit it. The
+    // configured-id escape hatch lets a user's chosen model pass even if it is
+    // not (yet) in the registry. All comparisons are case-insensitive against
+    // the bare (tag-stripped) name.
     is_allowlisted_embedding_id(&bare)
-        || ALLOWED_EMBEDDING_MODELS
-            .iter()
-            .any(|m| m.eq_ignore_ascii_case(&bare))
         || (!configured.is_empty() && configured.eq_ignore_ascii_case(&bare))
 }
 

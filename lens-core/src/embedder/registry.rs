@@ -160,8 +160,9 @@ impl EmbeddingModelSpec {
 /// The complete set of supported embedding models. The first entry is the
 /// default and is what unknown / empty ids resolve to.
 ///
-/// SYNC-CHECK: keep in sync with `src/lib/onboarding/system-check.ts`
-/// `EMBEDDING_MODELS`. The **dims** must match the TS `EmbeddingModelSpec` array.
+/// SYNC-CHECK: keep in sync with `src/lib/embeddings/models.ts`
+/// `EMBEDDING_MODELS` (re-exported by `src/lib/onboarding/system-check.ts`). The
+/// **dims** must match the TS `EmbeddingModelSpec` array.
 /// The **ids** intentionally differ for nomic: the TS/Ollama-facing id is the
 /// alias `"nomic-embed-text"`, which [`LEGACY_DEFAULT_ALIAS`] bridges to the
 /// canonical `"nomic-embed-text-v1.5"` here (the value persisted on a notebook).

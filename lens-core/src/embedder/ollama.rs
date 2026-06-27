@@ -53,8 +53,11 @@ const OLLAMA_READ_TIMEOUT: Duration = Duration::from_secs(120);
 /// the app. We cap the buffered bytes and abort the stream once it is exceeded
 /// (mirroring the URL-ingest streaming cap in `ingest.rs`).
 ///
-/// Sizing: a single embed request POSTs at most `EMBED_BATCH` (32) inputs, so the
-/// response is at most 32 vectors of the largest registry dim (1024) of `f32`s.
+/// Sizing: the ≤32-input bound is the CALLER's contract — `ingest.rs` batches by
+/// `EMBED_BATCH` (32) and `reembed.rs` by `REEMBED_BATCH` (32); `post_embed` itself
+/// accepts an unbounded slice, so this cap is sized against that caller convention,
+/// not an internal limit. A single embed request thus POSTs at most 32 inputs, so
+/// the response is at most 32 vectors of the largest registry dim (1024) of `f32`s.
 /// Each float serializes to ~12 JSON bytes (sign/digits/`.`/exponent + a `,`
 /// delimiter), so a worst-case legitimate body is `32 * 1024 * 12 ≈ 393 KiB`. We
 /// set an 8 MiB cap — ~20x headroom for whitespace / extra fields / future batch
@@ -115,12 +118,27 @@ impl OllamaEmbedder {
     /// Every production construction site (`LensEngine::embedder_for`) is async,
     /// so a runtime is always present.
     pub fn new(base_url: &str, spec: &EmbeddingModelSpec) -> Result<Self, LensError> {
-        // Loopback gate FIRST — a rejected URL must make NO request.
-        crate::ingest::require_loopback(base_url)?;
+        // Loopback gate FIRST — a rejected URL must make NO request. On success it
+        // returns the resolved loopback addrs so we can PIN reqwest to them.
+        let target = crate::ingest::require_loopback(base_url)?;
         let base = base_url.trim_end_matches('/');
         let embed_url = format!("{base}/api/embed");
+        // DNS-rebinding TOCTOU defense: for a HOSTNAME base URL, pin reqwest to the
+        // exact loopback addresses `require_loopback` resolved + checked, so reqwest
+        // does NOT run a second, unchecked DNS lookup at connect time. An IP-literal
+        // host has no DNS step (empty `pinned_addrs`) → the plain hardened client.
+        let client = if target.pinned_addrs.is_empty() {
+            hardened_client(OLLAMA_CONNECT_TIMEOUT, OLLAMA_READ_TIMEOUT)
+        } else {
+            crate::http::hardened_client_pinned(
+                OLLAMA_CONNECT_TIMEOUT,
+                OLLAMA_READ_TIMEOUT,
+                &target.host,
+                &target.pinned_addrs,
+            )
+        };
         Ok(Self {
-            client: hardened_client(OLLAMA_CONNECT_TIMEOUT, OLLAMA_READ_TIMEOUT),
+            client,
             handle: tokio::runtime::Handle::current(),
             embed_url,
             model: spec.id.to_string(),
@@ -392,6 +410,75 @@ mod tests {
             ),
             other => panic!("expected LensError::Parse, got {other:?}"),
         }
+    }
+
+    // --- DNS-rebinding pin: the embedder builds a connection PINNED to the
+    // loopback addrs `require_loopback` resolved (no second unchecked resolve) ---
+
+    /// A HOSTNAME base URL (`localhost`) makes `require_loopback` return non-empty
+    /// `pinned_addrs`, so `OllamaEmbedder::new` takes the PINNED-client branch
+    /// rather than the plain hardened client. An IP-literal host returns empty
+    /// (no DNS step to pin).
+    #[test]
+    fn require_loopback_returns_pinned_addrs_for_hostname() {
+        let hostname = crate::ingest::require_loopback("http://localhost:11434")
+            .expect("localhost is loopback");
+        assert!(
+            !hostname.pinned_addrs.is_empty(),
+            "a hostname must yield resolved loopback addrs to pin"
+        );
+        assert!(
+            hostname.pinned_addrs.iter().all(|a| a.ip().is_loopback()),
+            "every pinned addr must be loopback"
+        );
+
+        let literal = crate::ingest::require_loopback("http://127.0.0.1:11434")
+            .expect("127.0.0.1 is loopback");
+        assert!(
+            literal.pinned_addrs.is_empty(),
+            "an IP-literal host has no DNS step to pin"
+        );
+    }
+
+    /// Proves the embedder's pinned-client builder (`hardened_client_pinned`, the
+    /// branch `OllamaEmbedder::new` takes for a hostname) connects to the PINNED
+    /// address and does NOT re-resolve the host — the DNS-rebinding TOCTOU defense.
+    /// A bogus host with NO DNS record is pinned to the mock's loopback addr; the
+    /// request succeeds ONLY because reqwest honors the pin.
+    #[tokio::test]
+    async fn pinned_client_connects_only_to_pinned_addr() {
+        use std::net::ToSocketAddrs;
+        let server = MockServer::start().await;
+        let body = serde_json::json!({ "embeddings": [mock_vec(1.0, 768)] });
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+
+        let mock_url = url::Url::parse(&server.uri()).unwrap();
+        let port = mock_url.port().unwrap();
+        let addrs: Vec<std::net::SocketAddr> = (mock_url.host_str().unwrap(), port)
+            .to_socket_addrs()
+            .unwrap()
+            .collect();
+
+        // A hostname that does NOT resolve via DNS — only the pin can reach the mock.
+        let bogus_host = "ollama-pinned.invalid";
+        let client = crate::http::hardened_client_pinned(
+            OLLAMA_CONNECT_TIMEOUT,
+            OLLAMA_READ_TIMEOUT,
+            bogus_host,
+            &addrs,
+        );
+        let url = format!("http://{bogus_host}:{port}/api/embed");
+        let resp = client
+            .post(&url)
+            .json(&serde_json::json!({ "model": "m", "input": ["x"] }))
+            .send()
+            .await
+            .expect("pinned client must reach the mock via the pinned addr");
+        assert!(resp.status().is_success(), "got {}", resp.status());
     }
 
     #[tokio::test]
