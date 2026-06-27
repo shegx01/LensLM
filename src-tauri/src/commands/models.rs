@@ -48,7 +48,11 @@ pub async fn list_provider_models(
 ///
 /// Invoked as `invoke("list_ollama_models", { base_url })`.
 #[tracing::instrument(skip_all, fields(base_url = %base_url))]
-#[tauri::command]
+// `rename_all = "snake_case"` so the snake_case JS arg key `base_url` binds.
+// Tauri v2's default convention is camelCase, so without this the `base_url`
+// param silently fails to bind, the command rejects, and the JS `catch` returns
+// `[]` — i.e. no Ollama models are ever detected.
+#[tauri::command(rename_all = "snake_case")]
 pub async fn list_ollama_models(base_url: String) -> Result<Vec<String>, LensError> {
     Ok(lens_core::list_ollama_models(&base_url).await)
 }

@@ -67,7 +67,9 @@ pub async fn run_system_check(
 /// `base_url`: a user could paste a URL embedding `user:password@` userinfo, and
 /// `%base_url` would leak those credentials into the trace/log stream.
 #[tracing::instrument(skip_all, fields(target = %sanitize_url_for_log(&base_url)))]
-#[tauri::command]
+// `rename_all = "snake_case"` so the snake_case JS arg key `base_url` binds
+// (Tauri v2 defaults to camelCase; without this, auto-detect silently no-ops).
+#[tauri::command(rename_all = "snake_case")]
 pub async fn detect_llm(base_url: String) -> Result<LlmDetection, LensError> {
     Ok(lens_core::detect_llm(&base_url).await)
 }
