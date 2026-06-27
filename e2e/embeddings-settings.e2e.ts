@@ -60,8 +60,9 @@ test('onboarding embed panel sets the global default (model + backend)', async (
   await page.goto('/');
   await expect(page.getByText('System check', { exact: true })).toBeVisible();
 
-  // Expand the embedding row (the "Choose" action button on a failing row).
-  await page.getByText('Embedding model', { exact: true }).click();
+  // Expand the embedding row via its action button. A failing row's action is
+  // "Choose"; the button is accessibly named "{action} {row label}".
+  await page.getByRole('button', { name: 'Choose Embedding model' }).click();
 
   // The reworked panel shows the provider selector + the verbatim warning.
   await expect(page.getByText('Select your local embeddings provider')).toBeVisible();
@@ -132,8 +133,10 @@ test('per-notebook settings change → confirm → re-embed streams progress', a
   // Select the notebook so it becomes active (the gear targets the active one).
   await page.getByText('Q3 Earnings').click();
 
-  // Open the per-notebook settings sheet via the pill's gear.
-  await page.getByRole('button', { name: /notebook settings/i }).click();
+  // Open the per-notebook settings sheet via the pill's gear. Target the gear
+  // by its exact aria-label — `getByRole('button', { name: /notebook settings/i })`
+  // is ambiguous (it also matches the bits-ui tooltip-trigger wrapper button).
+  await page.getByLabel('Notebook settings', { exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Notebook settings' })).toBeVisible();
 
   // Change the model → the re-embed confirm dialog (with the warning) appears.
