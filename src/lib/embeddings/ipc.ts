@@ -45,7 +45,7 @@ export interface EmbeddingModelInfo {
   /** Output vector dimension (e.g. `768`). */
   dim: number;
   /** Embedding backend serving this coordinate (`"fastembed"` | `"ollama"`). */
-  backend: string;
+  backend: EmbeddingBackend;
   /** `"active"` when the coordinate is live, `"none"` when not yet indexed. */
   status: 'active' | 'none';
 }

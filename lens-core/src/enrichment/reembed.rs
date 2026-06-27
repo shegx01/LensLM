@@ -71,15 +71,17 @@ pub(crate) async fn reembed_and_flip(
 
     // Resolve the OWNING notebook's embedding coordinate (R1) so this same-model
     // re-embed builds, seeds, populates, and flips the notebook's OWN coordinate
-    // (model + dim) rather than the global default. The cross-model switch (a new
-    // coordinate) lands in Step 9; here the source's notebook always re-embeds
-    // under whatever model it is currently configured with.
+    // (model + dim) rather than the global default. This per-source enrichment
+    // re-embed always stays on whatever model the notebook is currently configured
+    // with; the explicit model/backend SWITCH (which retires the old coordinate
+    // and builds a new one) is handled separately by `reembed_notebook`.
     let (embed_model, embed_dim, embed_backend) = engine
         .resolve_notebook_embedding(&crate::NotebookId::from(notebook.to_string()))
         .await?;
     // Full backend-aware coordinate (M4 Phase 4b-B): every build/seed/flip below
-    // threads the notebook's OWN backend (Step 6 widens the cross-backend switch
-    // logic; here the source re-embeds under whatever backend it is configured).
+    // threads the notebook's OWN backend. The cross-backend switch logic lives in
+    // `reembed_notebook`; here the source re-embeds under whatever backend it is
+    // currently configured with.
     let coord = crate::vector_store::Coordinate::new(
         notebook.to_string(),
         embed_backend,

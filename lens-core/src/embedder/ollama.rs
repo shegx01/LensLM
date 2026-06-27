@@ -30,6 +30,7 @@
 
 use std::time::Duration;
 
+use futures_util::StreamExt;
 use serde::Deserialize;
 
 use crate::LensError;
@@ -44,6 +45,21 @@ const OLLAMA_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// `read` timeout for an Ollama embed request. Embedding a batch of chunks on a
 /// CPU-only Ollama server can take several seconds, so this is generous.
 const OLLAMA_READ_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Upper bound on the embed-response body we will buffer before deserializing.
+///
+/// Defense-in-depth: the Ollama server is loopback, but a hostile or compromised
+/// local process bound to the port could stream a multi-gigabyte body and OOM
+/// the app. We cap the buffered bytes and abort the stream once it is exceeded
+/// (mirroring the URL-ingest streaming cap in `ingest.rs`).
+///
+/// Sizing: a single embed request POSTs at most `EMBED_BATCH` (32) inputs, so the
+/// response is at most 32 vectors of the largest registry dim (1024) of `f32`s.
+/// Each float serializes to ~12 JSON bytes (sign/digits/`.`/exponent + a `,`
+/// delimiter), so a worst-case legitimate body is `32 * 1024 * 12 ≈ 393 KiB`. We
+/// set an 8 MiB cap — ~20x headroom for whitespace / extra fields / future batch
+/// growth — well below anything that could pressure memory.
+const MAX_OLLAMA_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Response shape of Ollama's `POST /api/embed`: a list of embedding vectors,
 /// one per input, in order.
@@ -122,22 +138,47 @@ impl OllamaEmbedder {
         let client = self.client.clone();
         let url = self.embed_url.clone();
         let body = serde_json::json!({ "model": self.model, "input": inputs });
-        let resp: OllamaEmbedResponse =
-            self.handle.block_on(async move {
-                let r =
-                    client.post(&url).json(&body).send().await.map_err(|e| {
-                        LensError::Network(format!("ollama embed request failed: {e}"))
-                    })?;
-                if !r.status().is_success() {
-                    return Err(LensError::Network(format!(
-                        "ollama embed returned HTTP {}",
-                        r.status()
+        let resp: OllamaEmbedResponse = self.handle.block_on(async move {
+            let r = client
+                .post(&url)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| LensError::Network(format!("ollama embed request failed: {e}")))?;
+            if !r.status().is_success() {
+                return Err(LensError::Network(format!(
+                    "ollama embed returned HTTP {}",
+                    r.status()
+                )));
+            }
+            // Short-circuit on a declared Content-Length over the cap (avoids
+            // streaming a body the server already admits is oversized).
+            if let Some(len) = r.content_length()
+                && len > MAX_OLLAMA_RESPONSE_BYTES as u64
+            {
+                return Err(LensError::Parse(format!(
+                    "ollama embed response declares {len} bytes, exceeding the \
+                         {MAX_OLLAMA_RESPONSE_BYTES}-byte cap"
+                )));
+            }
+            // Stream the body, enforcing the cap as bytes arrive so a server
+            // that lies about (or omits) Content-Length cannot OOM the app.
+            let mut buf: Vec<u8> = Vec::new();
+            let mut stream = r.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|e| {
+                    LensError::Network(format!("ollama embed body read failed: {e}"))
+                })?;
+                if buf.len() + chunk.len() > MAX_OLLAMA_RESPONSE_BYTES {
+                    return Err(LensError::Parse(format!(
+                        "ollama embed response exceeds the {MAX_OLLAMA_RESPONSE_BYTES}-byte cap"
                     )));
                 }
-                r.json::<OllamaEmbedResponse>().await.map_err(|e| {
-                    LensError::Parse(format!("ollama embed response decode failed: {e}"))
-                })
-            })?;
+                buf.extend_from_slice(&chunk);
+            }
+            serde_json::from_slice::<OllamaEmbedResponse>(&buf)
+                .map_err(|e| LensError::Parse(format!("ollama embed response decode failed: {e}")))
+        })?;
         Ok(resp.embeddings)
     }
 
@@ -146,6 +187,10 @@ impl OllamaEmbedder {
     /// cosine distance).
     fn normalize(v: &mut [f32]) {
         let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        // Zero-norm guard in f32 space: a near-zero vector (all components ~0)
+        // would divide by ~0 and produce NaNs/Inf; `1e-9` is comfortably above
+        // f32 rounding noise yet far below any real unit-vector norm, so a genuine
+        // embedding always normalizes while a degenerate zero vector is left as-is.
         if norm > 1e-9 {
             for x in v.iter_mut() {
                 *x /= norm;
@@ -316,6 +361,37 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(vecs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn over_cap_response_body_is_rejected_without_oom() {
+        let server = MockServer::start().await;
+        // A body well over MAX_OLLAMA_RESPONSE_BYTES (8 MiB). We do NOT set
+        // Content-Length deliberately small — the streaming accumulator must abort
+        // on byte count regardless of the declared length. Use a raw oversized
+        // string body (not valid JSON shape) so a successful decode is impossible;
+        // the cap must trip before any parse.
+        let oversized = "x".repeat(MAX_OLLAMA_RESPONSE_BYTES + 1024);
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(oversized, "application/json"))
+            .mount(&server)
+            .await;
+
+        let embedder =
+            OllamaEmbedder::new(&server.uri(), resolve("nomic-embed-text-v1.5")).unwrap();
+        let err = tokio::task::spawn_blocking(move || embedder.embed_documents(&["x"]))
+            .await
+            .unwrap()
+            .expect_err("an over-cap body must be rejected");
+        // A clear Parse error mentioning the cap, NOT a panic / unbounded alloc.
+        match err {
+            LensError::Parse(msg) => assert!(
+                msg.contains("cap"),
+                "expected a cap-related Parse error, got: {msg}"
+            ),
+            other => panic!("expected LensError::Parse, got {other:?}"),
+        }
     }
 
     #[tokio::test]

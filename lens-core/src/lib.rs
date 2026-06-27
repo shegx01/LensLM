@@ -53,7 +53,8 @@ pub use notebooks::{
 };
 pub use system_check::{
     ALLOWED_EMBEDDING_MODELS, CheckAction, CheckId, CheckResult, CheckStatus, LlmDetection,
-    detect_llm, fastembed_weights_cached, list_ollama_models, ollama_base_url,
+    detect_llm, fastembed_weights_cached, is_allowlisted_embedding_id, list_ollama_models,
+    ollama_base_url,
 };
 pub use tts::{
     DownloadProgress, Gender, KOKORO_MODEL_FILENAME, KOKORO_MODEL_RELPATH, KOKORO_MODEL_URL,
@@ -517,9 +518,24 @@ impl LensEngine {
         description: Option<&str>,
         focus_mode: Option<&str>,
     ) -> Result<Notebook, LensError> {
+        // Resolve the app-wide global default coordinate so a NEW notebook adopts
+        // whatever default was set in Settings (M4 Phase 4b-B, AC7). Both fields
+        // collapse an empty / unset config value to the registry/enum default, so
+        // an unconfigured app stamps the same `nomic-embed-text-v1.5`/`fastembed`
+        // pair the previous compile-time consts produced.
+        let cfg = self.config().await;
+        let embedding_model = crate::embedder::registry::resolve(&cfg.embedding_model).id;
+        let embedding_backend =
+            crate::embedder::EmbeddingBackend::from_opt_str(Some(&cfg.embedding_backend)).as_str();
         let pool = self.pool().await;
         NotebookRepo::new(&pool)
-            .create(title, description, focus_mode)
+            .create(
+                title,
+                description,
+                focus_mode,
+                embedding_model,
+                embedding_backend,
+            )
             .await
     }
 

@@ -165,7 +165,9 @@ impl EmbeddingModelSpec {
 /// The **ids** intentionally differ for nomic: the TS/Ollama-facing id is the
 /// alias `"nomic-embed-text"`, which [`LEGACY_DEFAULT_ALIAS`] bridges to the
 /// canonical `"nomic-embed-text-v1.5"` here (the value persisted on a notebook).
-/// Also keep `ALLOWED_EMBEDDING_MODELS` in `system_check.rs` in sync.
+/// `ALLOWED_EMBEDDING_MODELS` in `system_check.rs` is now DERIVED from this
+/// `REGISTRY` at init (no longer a hand-maintained parallel list), so adding a
+/// model here automatically extends the system-check allowlist.
 pub static REGISTRY: &[EmbeddingModelSpec] = &[
     EmbeddingModelSpec {
         id: "nomic-embed-text-v1.5",

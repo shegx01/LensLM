@@ -16,6 +16,7 @@
 //! failures.
 
 use std::path::Path;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -30,15 +31,38 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434";
 /// Default LM Studio OpenAI-compatible base URL.
 const DEFAULT_LMSTUDIO_BASE_URL: &str = "http://localhost:1234";
-/// Allowlisted embedding model ids the embedding-model gate accepts. Single
-/// source of truth: the Tauri install command imports this same slice, and the
-/// UI's `EMBEDDING_MODELS` list mirrors it (see the SYNC-CHECK there).
-pub const ALLOWED_EMBEDDING_MODELS: &[&str] = &[
-    "nomic-embed-text",
-    "mxbai-embed-large",
-    "all-minilm",
-    "bge-m3",
-];
+/// Allowlisted embedding model ids the embedding-model gate accepts.
+///
+/// DERIVED from [`crate::embedder::registry::REGISTRY`] at init time (NOT a
+/// hand-maintained parallel literal) so adding a model to the registry can never
+/// desync the allowlist — this was the 4b-B divergence: the old hardcoded slice
+/// listed the Ollama alias `"nomic-embed-text"` instead of the canonical registry
+/// id `"nomic-embed-text-v1.5"`, so the install path and the warm/probe path
+/// disagreed on what was allowed.
+///
+/// This holds the CANONICAL registry ids (e.g. `nomic-embed-text-v1.5`). The
+/// legacy Ollama alias `"nomic-embed-text"` is NOT in this list; it is accepted
+/// separately via the registry's alias bridge ([`is_allowlisted_embedding_id`],
+/// which delegates to [`crate::embedder::registry::resolve_opt`]) so callers that
+/// receive the Ollama-facing alias still validate. The Tauri install command and
+/// the UI's `EMBEDDING_MODELS` mirror these ids (see the SYNC-CHECK in the
+/// registry).
+pub static ALLOWED_EMBEDDING_MODELS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+    crate::embedder::registry::REGISTRY
+        .iter()
+        .map(|s| s.id)
+        .collect()
+});
+
+/// Returns `true` when `id` is an accepted embedding-model id — either a
+/// canonical registry id OR the legacy Ollama alias `"nomic-embed-text"`, both
+/// recognized by the registry's [`resolve_opt`](crate::embedder::registry::resolve_opt)
+/// (which bridges the alias to the canonical nomic entry). Single source of truth
+/// for "is this a model we support", derived entirely from the registry so it can
+/// never drift from [`ALLOWED_EMBEDDING_MODELS`].
+pub fn is_allowlisted_embedding_id(id: &str) -> bool {
+    crate::embedder::registry::resolve_opt(id).is_some()
+}
 /// Upper bound on a probe response body we will buffer + deserialize. A version
 /// string or a model list is tiny; this cap (1 MiB) is defense-in-depth so a
 /// malicious/misconfigured endpoint can't stream an unbounded body into memory.
@@ -458,9 +482,15 @@ fn is_allowlisted_embedding(installed_name: &str, configured: &str) -> bool {
         .split_once(':')
         .map_or(installed_name, |(name, _tag)| name)
         .to_ascii_lowercase();
-    ALLOWED_EMBEDDING_MODELS
-        .iter()
-        .any(|m| m.eq_ignore_ascii_case(&bare))
+    // Registry-derived allowlist (canonical ids) PLUS the Ollama alias bridge:
+    // `resolve_opt` maps `"nomic-embed-text"` → the canonical nomic entry, so an
+    // Ollama tag reported under the alias is accepted without a hardcoded literal
+    // (the 4b-B desync fix). Both the canonical id check and the alias bridge are
+    // case-insensitive against the bare (tag-stripped) name.
+    is_allowlisted_embedding_id(&bare)
+        || ALLOWED_EMBEDDING_MODELS
+            .iter()
+            .any(|m| m.eq_ignore_ascii_case(&bare))
         || (!configured.is_empty() && configured.eq_ignore_ascii_case(&bare))
 }
 
@@ -1148,8 +1178,12 @@ mod tests {
 
     #[test]
     fn allowlisted_embedding_matches_bare_name_and_config() {
-        // Tagged allowlist name matches its bare form.
+        // Tagged Ollama ALIAS name matches via the registry alias bridge.
         assert!(is_allowlisted_embedding("nomic-embed-text:latest", ""));
+        // The CANONICAL registry id is ALSO accepted (4b-B desync fix: the old
+        // hardcoded list only had the alias, so the canonical id slipped through).
+        assert!(is_allowlisted_embedding("nomic-embed-text-v1.5", ""));
+        assert!(is_allowlisted_embedding("nomic-embed-text-v1.5:latest", ""));
         assert!(is_allowlisted_embedding("BGE-M3", ""));
         // A non-allowlisted name only matches when it equals the configured id.
         assert!(!is_allowlisted_embedding("my-custom-embed:latest", ""));
@@ -1159,6 +1193,23 @@ mod tests {
         ));
         // A non-embed chat model never matches.
         assert!(!is_allowlisted_embedding("llama3:latest", ""));
+    }
+
+    #[test]
+    fn allowlist_is_derived_from_registry_and_accepts_canonical_and_alias() {
+        // The derived allowlist holds the CANONICAL registry ids (NOT the alias).
+        assert!(ALLOWED_EMBEDDING_MODELS.contains(&"nomic-embed-text-v1.5"));
+        assert!(!ALLOWED_EMBEDDING_MODELS.contains(&"nomic-embed-text"));
+        assert_eq!(
+            ALLOWED_EMBEDDING_MODELS.len(),
+            crate::embedder::registry::REGISTRY.len(),
+            "allowlist must not drift from the registry"
+        );
+        // The id-level allowlist accepts canonical ids AND the Ollama alias.
+        assert!(is_allowlisted_embedding_id("nomic-embed-text-v1.5"));
+        assert!(is_allowlisted_embedding_id("nomic-embed-text")); // alias bridge
+        assert!(is_allowlisted_embedding_id("bge-m3"));
+        assert!(!is_allowlisted_embedding_id("totally-made-up-model"));
     }
 
     /// Test helper: materialize the Kokoro model file at the exact path the

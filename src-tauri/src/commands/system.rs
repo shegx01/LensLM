@@ -1,8 +1,7 @@
 //! System / diagnostic commands.
 
 use lens_core::{
-    ALLOWED_EMBEDDING_MODELS, CheckResult, DownloadProgress, InstallProgress, LensEngine,
-    LensError, LlmDetection, TtsVoice,
+    CheckResult, DownloadProgress, InstallProgress, LensEngine, LensError, LlmDetection, TtsVoice,
 };
 use serde::Serialize;
 use tauri::Manager;
@@ -103,8 +102,16 @@ pub async fn list_tts_voices() -> Result<Vec<TtsVoice>, LensError> {
 /// configured Ollama base URL (same resolution as the system-check probe). If
 /// Ollama is unreachable the command returns an `Err` for the UI to surface.
 ///
-/// `model` is validated against [`ALLOWED_EMBEDDING_MODELS`]; anything else is
+/// `model` is validated via [`lens_core::is_allowlisted_embedding_id`] (the
+/// registry-derived allowlist plus the Ollama alias bridge); anything else is
 /// rejected with a [`LensError::Validation`] before any network call.
+///
+/// RESERVED FOR FUTURE USE (M5+): this command is REGISTERED (`main.rs`) but
+/// currently has no frontend caller — the onboarding/Settings embedding UX moved
+/// to the fastembed warm path + Ollama detect-only flow (4b-B), which never pulls
+/// from Ollama. It is kept (not removed) as the intended consumer is the planned
+/// "pull an Ollama embedding model from the UI" affordance; removing a registered
+/// Tauri command is higher-risk churn than documenting its dormant status.
 ///
 /// Invoked as `invoke("install_embedding_model", { model, onProgress })` where
 /// `onProgress` is a `Channel<InstallProgress>`.
@@ -115,7 +122,7 @@ pub async fn install_embedding_model(
     on_progress: Channel<InstallProgress>,
     engine: tauri::State<'_, LensEngine>,
 ) -> Result<(), LensError> {
-    if !ALLOWED_EMBEDDING_MODELS.contains(&model.as_str()) {
+    if !lens_core::is_allowlisted_embedding_id(&model) {
         return Err(LensError::Validation(format!(
             "unsupported embedding model: {model}"
         )));

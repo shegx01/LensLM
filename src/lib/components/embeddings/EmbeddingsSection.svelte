@@ -62,13 +62,30 @@
   let {
     mode,
     notebookId = null,
+    compact = false,
+    showHeader = true,
     onchange
   }: {
     mode: 'global' | 'notebook';
     /** Required in notebook mode — the notebook whose coordinate this edits. */
     notebookId?: string | null;
-    /** Optional callback after a successful persist/re-embed (e.g. close sheet). */
-    onchange?: () => void;
+    /**
+     * Compact layout (onboarding inline expansion): tighter spacing + `h-9`
+     * provider buttons. The default (`false`) is the roomy Settings/sheet layout
+     * with `h-10` buttons. Behavior is identical; only the chrome differs so the
+     * onboarding panel can reuse this component instead of forking it.
+     */
+    compact?: boolean;
+    /**
+     * Render the "Embeddings" title + "Local only…" subtitle. The onboarding
+     * panel supplies its own row label, so it sets this `false`.
+     */
+    showHeader?: boolean;
+    /**
+     * Callback after a successful persist/re-embed (e.g. close the sheet, or
+     * re-run the onboarding system-check and collapse the panel). May be async.
+     */
+    onchange?: () => void | Promise<void>;
   } = $props();
 
   // ── Selection state ────────────────────────────────────────────────────────
@@ -220,7 +237,7 @@
       }));
       activeModel = selectedModel;
       activeBackend = backend;
-      onchange?.();
+      await onchange?.();
     } catch (err) {
       actionError = err instanceof Error ? err.message : 'Could not save the default.';
     }
@@ -251,7 +268,7 @@
       activeModel = selectedModel;
       activeBackend = backend;
       coordinateIndexed = true;
-      onchange?.();
+      await onchange?.();
     } catch (err) {
       actionError = err instanceof Error ? err.message : 'Re-embedding failed.';
     } finally {
@@ -269,14 +286,16 @@
 </script>
 
 <section class="flex flex-col" aria-label="Embeddings settings">
-  <!-- Title + subtitle (verbatim design copy) -->
-  <h2 class="text-xl font-extrabold tracking-[-0.4px] text-foreground">Embeddings</h2>
-  <p class="mt-1 text-[0.8rem] text-muted-foreground">
-    Local only — all vectors computed on-device.
-  </p>
+  {#if showHeader}
+    <!-- Title + subtitle (verbatim design copy) -->
+    <h2 class="text-xl font-extrabold tracking-[-0.4px] text-foreground">Embeddings</h2>
+    <p class="mt-1 text-[0.8rem] text-muted-foreground">
+      Local only — all vectors computed on-device.
+    </p>
+  {/if}
 
   <!-- ── Provider selector (the design extension the user specified) ── -->
-  <div class="mt-6">
+  <div class={compact ? '' : 'mt-6'}>
     <p class="text-[0.65rem] font-bold uppercase tracking-[0.08em] text-muted-foreground/70">
       Select your local embeddings provider
     </p>
@@ -291,7 +310,8 @@
           disabled={pickerDisabled}
           onclick={() => pickBackend(p.id as EmbeddingBackend)}
           class={cn(
-            'h-10 rounded-lg border px-3 text-sm font-semibold transition-colors',
+            'rounded-lg border px-3 text-sm font-semibold transition-colors',
+            compact ? 'h-9' : 'h-10',
             'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
             isSel
               ? 'border-primary bg-primary/10 text-foreground ring-1 ring-primary'

@@ -396,10 +396,11 @@ fn rows_to_batch(rows: &[VectorRow], dim: usize) -> Result<RecordBatch, LensErro
 ///
 /// Owned by [`LanceVectorStore`] as a private collaborator (Decision M1) — the
 /// ingest pipeline never touches it directly. Maps each logical
-/// `(notebook, model, dim)` to its physical `lance_table_name`, plus a status
-/// lifecycle (`active` in Phase 1; `building`/`stale` reserved for the Phase-4
-/// model-switch flow). Mirrors the `notebooks.rs` repo conventions: borrows a
-/// pool, holds no other state, UUIDv7 ids, RFC3339 `created_at`.
+/// `(notebook, backend, model, dim)` coordinate (the 4b-B backend axis) to its
+/// physical `lance_table_name`, plus a status lifecycle (`active`; `building`/
+/// `stale` during the model/backend-switch flip). Mirrors the `notebooks.rs` repo
+/// conventions: borrows a pool, holds no other state, UUIDv7 ids, RFC3339
+/// `created_at`.
 struct EmbeddingIndexRepo {
     pool: SqlitePool,
 }
@@ -463,19 +464,19 @@ impl EmbeddingIndexRepo {
     /// remains unused — kept (`allow(dead_code)`) as a complete registry API; may
     /// be removed if no consumer emerges.
     #[allow(dead_code)]
-    async fn get(
-        &self,
-        notebook: &str,
-        model: &str,
-        dim: usize,
-    ) -> Result<Option<EmbeddingIndexRow>, LensError> {
+    async fn get(&self, coord: &Coordinate) -> Result<Option<EmbeddingIndexRow>, LensError> {
+        // Filters the FULL backend-aware coordinate: without `AND backend = ?` a
+        // future reviver of this dead helper would reintroduce the cross-backend
+        // collision class (a fastembed-768 and an ollama-768 row for the same
+        // model/dim would be indistinguishable). The 4-tuple keeps it correct.
         let row = sqlx::query_as::<_, EmbeddingIndexRow>(
             "SELECT id, notebook_id, model, dim, prefix_convention, lance_table_name, status, created_at \
-             FROM embedding_index WHERE notebook_id = ? AND model = ? AND dim = ?",
+             FROM embedding_index WHERE notebook_id = ? AND backend = ? AND model = ? AND dim = ?",
         )
-        .bind(notebook)
-        .bind(model)
-        .bind(dim as i64)
+        .bind(&coord.notebook)
+        .bind(coord.backend.as_str())
+        .bind(&coord.model)
+        .bind(coord.dim as i64)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row)
@@ -506,26 +507,28 @@ impl EmbeddingIndexRepo {
     /// untouched rather than narrowing it), so it is currently unused — kept
     /// (`allow(dead_code)`) as a complete registry API.
     #[allow(dead_code)]
-    async fn set_status(
-        &self,
-        notebook: &str,
-        model: &str,
-        dim: usize,
-        status: &str,
-    ) -> Result<(), LensError> {
+    async fn set_status(&self, coord: &Coordinate, status: &str) -> Result<(), LensError> {
+        // Filters the FULL backend-aware coordinate (see `get`): the `AND backend
+        // = ?` clause prevents a future reviver from flipping the wrong backend's
+        // rows for a same-model/dim coordinate.
         let result = sqlx::query(
             "UPDATE embedding_index SET status = ? \
-             WHERE notebook_id = ? AND model = ? AND dim = ?",
+             WHERE notebook_id = ? AND backend = ? AND model = ? AND dim = ?",
         )
         .bind(status)
-        .bind(notebook)
-        .bind(model)
-        .bind(dim as i64)
+        .bind(&coord.notebook)
+        .bind(coord.backend.as_str())
+        .bind(&coord.model)
+        .bind(coord.dim as i64)
         .execute(&self.pool)
         .await?;
         if result.rows_affected() == 0 {
             return Err(LensError::Validation(format!(
-                "no embedding_index row for ({notebook}, {model}, {dim})"
+                "no embedding_index row for ({}, {}, {}, {})",
+                coord.notebook,
+                coord.backend.as_str(),
+                coord.model,
+                coord.dim
             )));
         }
         Ok(())
@@ -720,7 +723,9 @@ struct EmbeddingIndexRow {
     dim: i64,
     /// Prefix convention applied at embed time (`search_document/search_query`).
     prefix_convention: String,
-    /// Physical LanceDB table name (`vec__{notebook}__{model_slug}`).
+    /// Physical LanceDB table name
+    /// (`vec__{notebook}__{backend}__{model_slug}__d{dim}`, the 4b-B slug shape;
+    /// building/stale tables carry a `__{gen}` suffix).
     lance_table_name: String,
     /// Lifecycle status (`active` in Phase 1).
     status: String,
@@ -1288,7 +1293,7 @@ impl VectorStore for LanceVectorStore {
             .lance_table_names_for_coordinate(coord)
             .await?;
         let mut generation = 1u32;
-        loop {
+        let building_name = loop {
             let candidate = gen_table_name(
                 &coord.notebook,
                 coord.backend,
@@ -1297,17 +1302,10 @@ impl VectorStore for LanceVectorStore {
                 generation,
             );
             if !existing.iter().any(|n| n == &candidate) {
-                break;
+                break candidate;
             }
             generation += 1;
-        }
-        let building_name = gen_table_name(
-            &coord.notebook,
-            coord.backend,
-            &coord.model,
-            dim,
-            generation,
-        );
+        };
 
         // Create the empty physical table, then register the `building` row. The
         // physical table is created FIRST so a crash before the registry insert

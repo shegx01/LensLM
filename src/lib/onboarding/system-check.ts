@@ -90,10 +90,13 @@ export interface DownloadProgress {
 // (the single source of truth shared by onboarding + Settings). These re-exports
 // keep the onboarding install path's older imports working. The canonical
 // storage-facing ids (e.g. `nomic-embed-text-v1.5`) match the Rust registry.
+//
+// Import the type locally first (used by `installEmbeddingModel` below), then
+// re-export the public surface — import-before-export ordering.
+import type { EmbeddingModelId } from '$lib/embeddings/models.js';
+
 export type { EmbeddingModelId, EmbeddingModelSpec } from '$lib/embeddings/models.js';
 export { EMBEDDING_MODELS } from '$lib/embeddings/models.js';
-
-import type { EmbeddingModelId } from '$lib/embeddings/models.js';
 
 /** Clamp a 0..1 ratio to an integer 0..100 percentage. */
 function toPct(completed: number | null, total: number | null): number | null {

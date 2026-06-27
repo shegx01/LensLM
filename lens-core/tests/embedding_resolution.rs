@@ -257,6 +257,63 @@ async fn set_embedding_model_rejects_unknown_id() {
     assert!(format!("{err}").contains("unknown embedding model id"));
 }
 
+/// AC7 — a NEW notebook adopts the app-wide GLOBAL default coordinate set in
+/// Settings (`AppConfig::embedding_model` + `embedding_backend`), NOT the
+/// compile-time `nomic`/`fastembed` consts. Setting the global default to a
+/// non-default model+backend and then creating a notebook must stamp that pair,
+/// so `get_notebook_embedding_info` reports it.
+#[tokio::test]
+async fn new_notebook_adopts_global_default_model_and_backend() {
+    let engine = LensEngine::for_test().await;
+
+    // Set the global default to a NON-default model + backend.
+    let mut cfg = engine.config().await;
+    cfg.embedding_model = "mxbai-embed-large".to_string();
+    cfg.embedding_backend = "ollama".to_string();
+    engine.set_config(cfg).await;
+
+    let nb = engine
+        .create_notebook("Adopts Default NB", None, None)
+        .await
+        .expect("create notebook");
+
+    let (model, dim, backend, _status) = engine
+        .get_notebook_embedding_info(&nb.id)
+        .await
+        .expect("embedding info");
+    assert_eq!(
+        model, "mxbai-embed-large",
+        "adopts configured default model"
+    );
+    assert_eq!(dim, 1024);
+    assert_eq!(
+        backend,
+        EmbeddingBackend::Ollama,
+        "adopts configured default backend"
+    );
+}
+
+/// AC7 (negative) — with an UNSET global default (the fresh-install state), a new
+/// notebook still gets the registry/enum default (`nomic-embed-text-v1.5` /
+/// `fastembed`), preserving the prior compile-time-const behavior.
+#[tokio::test]
+async fn new_notebook_with_unset_global_default_uses_registry_default() {
+    let engine = LensEngine::for_test().await;
+    // `for_test` config has empty embedding_model/backend (fresh-install state).
+    let nb = engine
+        .create_notebook("Default NB", None, None)
+        .await
+        .expect("create notebook");
+
+    let (model, dim, backend, _status) = engine
+        .get_notebook_embedding_info(&nb.id)
+        .await
+        .expect("embedding info");
+    assert_eq!(model, "nomic-embed-text-v1.5");
+    assert_eq!(dim, 768);
+    assert_eq!(backend, EmbeddingBackend::Fastembed);
+}
+
 /// `resolve_notebook_embedding` fails fast for a non-existent notebook (rather
 /// than silently returning the default), so callers get a clear error.
 #[tokio::test]

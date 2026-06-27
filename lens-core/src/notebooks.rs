@@ -562,28 +562,29 @@ impl<'a> NotebookRepo<'a> {
     /// The title is trimmed and validated (non-empty, length-capped).
     /// `description` and `focus_mode` are optional onboarding fields persisted
     /// verbatim (write-only in M1); pass `None` to leave them unset.
+    ///
+    /// `embedding_model` / `embedding_backend` are the canonical coordinate the
+    /// notebook is pinned to from birth — the caller resolves these from the
+    /// app-wide global default ([`crate::config::AppConfig::embedding_model`] /
+    /// [`crate::config::AppConfig::embedding_backend`]) so that setting a new
+    /// default in Settings is adopted by NEW notebooks (M4 Phase 4b-B, AC7). They
+    /// are stamped verbatim; the resolver upstream already collapses an empty /
+    /// unset config to the registry/enum default, so passing the resolved values
+    /// preserves the prior behavior when config is unset. The read path still
+    /// tolerates a NULL on pre-migration rows by resolving to the default.
     pub async fn create(
         &self,
         title: &str,
         description: Option<&str>,
         focus_mode: Option<&str>,
+        embedding_model: &str,
+        embedding_backend: &str,
     ) -> Result<Notebook, LensError> {
         let title = validate_title(title)?;
         let description = description.map(str::to_string);
         let focus_mode = focus_mode.map(str::to_string);
-        // Stamp the current global default embedding model so a notebook's
-        // coordinate is pinned to a concrete model from birth (the read path
-        // still tolerates a NULL on pre-migration rows by resolving to default).
-        let embedding_model = crate::embedder::registry::DEFAULT_EMBED_MODEL_ID.to_string();
-        // Stamp the current global default embedding backend (M4 Phase 4b-B) so a
-        // notebook's coordinate is pinned to a concrete backend from birth. The
-        // resolved global default mirrors the `embedding_model` default-const
-        // pattern: with an unset `AppConfig::embedding_backend` it is the enum
-        // default (`fastembed`); the read path still tolerates a NULL on
-        // pre-migration rows by resolving to the default.
-        let embedding_backend = crate::embedder::EmbeddingBackend::default()
-            .as_str()
-            .to_string();
+        let embedding_model = embedding_model.to_string();
+        let embedding_backend = embedding_backend.to_string();
         let id = NotebookId::new();
         let now = chrono::Utc::now().to_rfc3339();
         sqlx::query(
@@ -1440,7 +1441,16 @@ mod tests {
     async fn source_count_correct_after_add() {
         let pool = test_pool().await;
         let repo = NotebookRepo::new(&pool);
-        let nb = repo.create("Notebook", None, None).await.unwrap();
+        let nb = repo
+            .create(
+                "Notebook",
+                None,
+                None,
+                crate::embedder::registry::DEFAULT_EMBED_MODEL_ID,
+                "fastembed",
+            )
+            .await
+            .unwrap();
 
         // No sources yet -> count is 0.
         let summaries = repo.list_with_counts().await.unwrap();
@@ -1467,7 +1477,16 @@ mod tests {
     async fn create_stamps_global_default_embedding_model() {
         let pool = test_pool().await;
         let repo = NotebookRepo::new(&pool);
-        let nb = repo.create("Notebook", None, None).await.unwrap();
+        let nb = repo
+            .create(
+                "Notebook",
+                None,
+                None,
+                crate::embedder::registry::DEFAULT_EMBED_MODEL_ID,
+                "fastembed",
+            )
+            .await
+            .unwrap();
         // The created notebook carries the current global default model id.
         assert_eq!(
             nb.embedding_model.as_deref(),
@@ -1492,7 +1511,16 @@ mod tests {
     async fn notebook_stores_and_reads_embedding_model() {
         let pool = test_pool().await;
         let repo = NotebookRepo::new(&pool);
-        let nb = repo.create("Notebook", None, None).await.unwrap();
+        let nb = repo
+            .create(
+                "Notebook",
+                None,
+                None,
+                crate::embedder::registry::DEFAULT_EMBED_MODEL_ID,
+                "fastembed",
+            )
+            .await
+            .unwrap();
 
         // Write a non-default model id directly, then read it back through the
         // repo's SELECT projection.
@@ -1514,7 +1542,16 @@ mod tests {
     async fn null_embedding_model_reads_back_as_none_and_resolves_to_default() {
         let pool = test_pool().await;
         let repo = NotebookRepo::new(&pool);
-        let nb = repo.create("Notebook", None, None).await.unwrap();
+        let nb = repo
+            .create(
+                "Notebook",
+                None,
+                None,
+                crate::embedder::registry::DEFAULT_EMBED_MODEL_ID,
+                "fastembed",
+            )
+            .await
+            .unwrap();
 
         // Simulate a pre-migration row: NULL embedding_model.
         sqlx::query("UPDATE notebooks SET embedding_model = NULL WHERE id = ?")
@@ -1594,7 +1631,16 @@ mod tests {
     async fn update_enrichment_status_persists_for_real_source() {
         let pool = test_pool().await;
         let repo = NotebookRepo::new(&pool);
-        let nb = repo.create("Notebook", None, None).await.unwrap();
+        let nb = repo
+            .create(
+                "Notebook",
+                None,
+                None,
+                crate::embedder::registry::DEFAULT_EMBED_MODEL_ID,
+                "fastembed",
+            )
+            .await
+            .unwrap();
         let src = repo
             .add_source(&nb.id, "file.pdf", "/abs/file.pdf")
             .await
@@ -1616,8 +1662,26 @@ mod tests {
     async fn list_with_counts_only_live_newest_first() {
         let pool = test_pool().await;
         let repo = NotebookRepo::new(&pool);
-        let first = repo.create("First", None, None).await.unwrap();
-        let second = repo.create("Second", None, None).await.unwrap();
+        let first = repo
+            .create(
+                "First",
+                None,
+                None,
+                crate::embedder::registry::DEFAULT_EMBED_MODEL_ID,
+                "fastembed",
+            )
+            .await
+            .unwrap();
+        let second = repo
+            .create(
+                "Second",
+                None,
+                None,
+                crate::embedder::registry::DEFAULT_EMBED_MODEL_ID,
+                "fastembed",
+            )
+            .await
+            .unwrap();
 
         let summaries = repo.list_with_counts().await.unwrap();
         // Newest created_at first.
@@ -1629,7 +1693,16 @@ mod tests {
     async fn create_rename_roundtrip() {
         let pool = test_pool().await;
         let repo = NotebookRepo::new(&pool);
-        let nb = repo.create("Original", None, None).await.unwrap();
+        let nb = repo
+            .create(
+                "Original",
+                None,
+                None,
+                crate::embedder::registry::DEFAULT_EMBED_MODEL_ID,
+                "fastembed",
+            )
+            .await
+            .unwrap();
         repo.rename(&nb.id, "Renamed").await.unwrap();
         let summaries = repo.list_with_counts().await.unwrap();
         assert_eq!(summaries[0].notebook.title, "Renamed");
@@ -1639,7 +1712,16 @@ mod tests {
     async fn trash_and_restore_roundtrip() {
         let pool = test_pool().await;
         let repo = NotebookRepo::new(&pool);
-        let nb = repo.create("Notebook", None, None).await.unwrap();
+        let nb = repo
+            .create(
+                "Notebook",
+                None,
+                None,
+                crate::embedder::registry::DEFAULT_EMBED_MODEL_ID,
+                "fastembed",
+            )
+            .await
+            .unwrap();
 
         repo.trash(&nb.id).await.unwrap();
         // Disappears from live list, appears in trashed list.
@@ -1662,7 +1744,16 @@ mod tests {
     async fn trash_already_trashed_errors() {
         let pool = test_pool().await;
         let repo = NotebookRepo::new(&pool);
-        let nb = repo.create("Notebook", None, None).await.unwrap();
+        let nb = repo
+            .create(
+                "Notebook",
+                None,
+                None,
+                crate::embedder::registry::DEFAULT_EMBED_MODEL_ID,
+                "fastembed",
+            )
+            .await
+            .unwrap();
         repo.trash(&nb.id).await.unwrap();
         assert!(matches!(
             repo.trash(&nb.id).await,
@@ -1674,7 +1765,16 @@ mod tests {
     async fn restore_non_trashed_errors() {
         let pool = test_pool().await;
         let repo = NotebookRepo::new(&pool);
-        let nb = repo.create("Notebook", None, None).await.unwrap();
+        let nb = repo
+            .create(
+                "Notebook",
+                None,
+                None,
+                crate::embedder::registry::DEFAULT_EMBED_MODEL_ID,
+                "fastembed",
+            )
+            .await
+            .unwrap();
         assert!(matches!(
             repo.restore(&nb.id).await,
             Err(LensError::Validation(_))
@@ -1685,7 +1785,16 @@ mod tests {
     async fn list_trashed_with_counts_carries_source_count() {
         let pool = test_pool().await;
         let repo = NotebookRepo::new(&pool);
-        let nb = repo.create("Notebook", None, None).await.unwrap();
+        let nb = repo
+            .create(
+                "Notebook",
+                None,
+                None,
+                crate::embedder::registry::DEFAULT_EMBED_MODEL_ID,
+                "fastembed",
+            )
+            .await
+            .unwrap();
         repo.add_source(&nb.id, "a.pdf", "/abs/a.pdf")
             .await
             .unwrap();
@@ -1703,7 +1812,16 @@ mod tests {
     async fn purge_removes_permanently() {
         let pool = test_pool().await;
         let repo = NotebookRepo::new(&pool);
-        let nb = repo.create("Notebook", None, None).await.unwrap();
+        let nb = repo
+            .create(
+                "Notebook",
+                None,
+                None,
+                crate::embedder::registry::DEFAULT_EMBED_MODEL_ID,
+                "fastembed",
+            )
+            .await
+            .unwrap();
         repo.add_source(&nb.id, "a.pdf", "/abs/a.pdf")
             .await
             .unwrap();
@@ -1726,7 +1844,16 @@ mod tests {
     async fn purge_live_notebook_errors() {
         let pool = test_pool().await;
         let repo = NotebookRepo::new(&pool);
-        let nb = repo.create("Notebook", None, None).await.unwrap();
+        let nb = repo
+            .create(
+                "Notebook",
+                None,
+                None,
+                crate::embedder::registry::DEFAULT_EMBED_MODEL_ID,
+                "fastembed",
+            )
+            .await
+            .unwrap();
 
         // Purging a LIVE (non-trashed) notebook must be rejected and must NOT
         // hard-delete the row.
@@ -1744,7 +1871,16 @@ mod tests {
     async fn delete_is_now_soft() {
         let pool = test_pool().await;
         let repo = NotebookRepo::new(&pool);
-        let nb = repo.create("Notebook", None, None).await.unwrap();
+        let nb = repo
+            .create(
+                "Notebook",
+                None,
+                None,
+                crate::embedder::registry::DEFAULT_EMBED_MODEL_ID,
+                "fastembed",
+            )
+            .await
+            .unwrap();
 
         // The deprecated `delete` now soft-deletes (sets trashed_at).
         #[allow(deprecated)]
@@ -1759,7 +1895,16 @@ mod tests {
     async fn purge_source_requires_trashed() {
         let pool = test_pool().await;
         let repo = NotebookRepo::new(&pool);
-        let nb = repo.create("Notebook", None, None).await.unwrap();
+        let nb = repo
+            .create(
+                "Notebook",
+                None,
+                None,
+                crate::embedder::registry::DEFAULT_EMBED_MODEL_ID,
+                "fastembed",
+            )
+            .await
+            .unwrap();
         let src = repo
             .add_source(&nb.id, "a.pdf", "/abs/a.pdf")
             .await
@@ -1839,7 +1984,16 @@ mod tests {
     async fn kind_for_extension(ext: &str) -> String {
         let pool = test_pool().await;
         let repo = NotebookRepo::new(&pool);
-        let nb = repo.create("Notebook", None, None).await.unwrap();
+        let nb = repo
+            .create(
+                "Notebook",
+                None,
+                None,
+                crate::embedder::registry::DEFAULT_EMBED_MODEL_ID,
+                "fastembed",
+            )
+            .await
+            .unwrap();
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let data_dir = tmp.path();
@@ -1983,7 +2137,16 @@ mod tests {
     async fn test_list_source_chunks_returns_ordered_chunks() {
         let pool = test_pool().await;
         let repo = NotebookRepo::new(&pool);
-        let nb = repo.create("Notebook", None, None).await.unwrap();
+        let nb = repo
+            .create(
+                "Notebook",
+                None,
+                None,
+                crate::embedder::registry::DEFAULT_EMBED_MODEL_ID,
+                "fastembed",
+            )
+            .await
+            .unwrap();
         let src = repo
             .add_source(&nb.id, "doc.md", "/abs/doc.md")
             .await
@@ -2084,7 +2247,16 @@ mod tests {
     async fn test_get_embedding_stats() {
         let pool = test_pool().await;
         let repo = NotebookRepo::new(&pool);
-        let nb = repo.create("Notebook", None, None).await.unwrap();
+        let nb = repo
+            .create(
+                "Notebook",
+                None,
+                None,
+                crate::embedder::registry::DEFAULT_EMBED_MODEL_ID,
+                "fastembed",
+            )
+            .await
+            .unwrap();
 
         // (a) No embedding_index rows → empty Vec.
         let empty = repo.get_embedding_stats(nb.id.as_str()).await.unwrap();
