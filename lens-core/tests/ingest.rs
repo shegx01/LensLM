@@ -509,7 +509,7 @@ async fn embedder_cached_once_and_ingest_serialized() {
         max_in_flight: Arc::clone(&max_in_flight),
     });
     engine
-        .set_embedder_for_test(probe)
+        .set_embedder_for_test(probe, lens_core::EmbeddingBackend::Fastembed)
         .expect("inject test embedder");
 
     // Two sources in the same notebook.
@@ -704,7 +704,7 @@ fn inject_mxbai_embedder(engine: &LensEngine) {
         Arc::new(AtomicUsize::new(0)),
     ));
     engine
-        .set_embedder_for_test(e)
+        .set_embedder_for_test(e, lens_core::EmbeddingBackend::Fastembed)
         .expect("inject mxbai embedder");
 }
 

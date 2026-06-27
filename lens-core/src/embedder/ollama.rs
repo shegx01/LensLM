@@ -1,0 +1,340 @@
+//! [`OllamaEmbedder`] — the [`EmbeddingBackend::Ollama`] arm of the
+//! [`Embedder`] trait (M4 Phase 4b-B, Step 3).
+//!
+//! Computes embeddings via a LOCAL Ollama server's `POST /api/embed` endpoint
+//! instead of the on-device fastembed ONNX session. The same registry model
+//! (e.g. `nomic-embed-text-v1.5`/768) can be served by either backend, and the
+//! two are physically distinct vector sets (different numerical embeddings) that
+//! live in separate LanceDB tables — see the `Coordinate` backend axis.
+//!
+//! ## Loopback-only (security contract)
+//!
+//! The embedder is constructed with a base URL that is validated to be
+//! LOOPBACK-ONLY ([`crate::ingest::require_loopback`]) — the inverse of the URL
+//! source's SSRF guard, which *rejects* loopback. We POST the document/query
+//! text being embedded to this server; allowing a LAN/public host would let a
+//! misconfigured or malicious endpoint exfiltrate the user's documents or act as
+//! an SSRF pivot. The loopback check happens in [`OllamaEmbedder::new`] BEFORE
+//! any request is made, so a non-loopback URL fails construction with no
+//! network traffic.
+//!
+//! ## Blocking contract
+//!
+//! The [`Embedder`] trait is synchronous (it mirrors fastembed's sync `embed`),
+//! and every production caller already wraps embed calls in
+//! [`tokio::task::spawn_blocking`]. The Ollama HTTP client is async, so this
+//! embedder captures a [`tokio::runtime::Handle`] at construction and drives each
+//! request with [`tokio::runtime::Handle::block_on`]. That is sound ONLY off a
+//! runtime worker thread — which is exactly where `spawn_blocking` runs the trait
+//! methods. A direct call on a Tokio worker would panic.
+
+use std::time::Duration;
+
+use serde::Deserialize;
+
+use crate::LensError;
+use crate::embedder::Embedder;
+use crate::embedder::registry::EmbeddingModelSpec;
+use crate::http::hardened_client;
+
+/// `connect` timeout for an Ollama embed request (the server is loopback, so a
+/// connect should be near-instant; a longer connect means the server is down).
+const OLLAMA_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// `read` timeout for an Ollama embed request. Embedding a batch of chunks on a
+/// CPU-only Ollama server can take several seconds, so this is generous.
+const OLLAMA_READ_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Response shape of Ollama's `POST /api/embed`: a list of embedding vectors,
+/// one per input, in order.
+#[derive(Debug, Deserialize)]
+struct OllamaEmbedResponse {
+    embeddings: Vec<Vec<f32>>,
+}
+
+/// An [`Embedder`] backed by a LOCAL Ollama server's `/api/embed` endpoint.
+///
+/// Construction validates the base URL is loopback-only and stores the model id,
+/// dimension, and prefix convention from the registry [`EmbeddingModelSpec`].
+/// Embedding requests apply the spec's document/query prefixes, L2-normalize the
+/// returned vectors, and verify the dimension against the spec (a wrong-dim
+/// response — e.g. the wrong Ollama model tag installed — is an error, never
+/// silently stored).
+#[derive(Debug)]
+pub struct OllamaEmbedder {
+    /// Async HTTP client (hardened: bounded timeouts + no redirects).
+    client: reqwest::Client,
+    /// Runtime handle captured at construction so the sync trait methods can
+    /// drive the async request via `block_on` from a `spawn_blocking` thread.
+    handle: tokio::runtime::Handle,
+    /// Loopback-validated `POST {base}/api/embed` URL.
+    embed_url: String,
+    /// The Ollama model tag to embed with (the registry model id).
+    model: String,
+    /// Stable registry model id reported by [`Embedder::model_id`].
+    model_id: String,
+    /// Output dimension to validate every response against.
+    dim: usize,
+    /// Document prefix from the spec (`""` = none).
+    prefix_doc: String,
+    /// Query prefix from the spec (`""` = none).
+    prefix_query: String,
+}
+
+impl OllamaEmbedder {
+    /// Builds an `OllamaEmbedder` targeting `base_url` for the model in `spec`.
+    ///
+    /// Validates `base_url` is LOOPBACK-ONLY before doing anything else (no
+    /// request is made on a rejected URL). Captures the current Tokio runtime
+    /// handle for the sync→async bridge.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LensError::Validation`] if `base_url` is not a loopback
+    /// `http`/`https` address.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside a Tokio runtime context (no current handle).
+    /// Every production construction site (`LensEngine::embedder_for`) is async,
+    /// so a runtime is always present.
+    pub fn new(base_url: &str, spec: &EmbeddingModelSpec) -> Result<Self, LensError> {
+        // Loopback gate FIRST — a rejected URL must make NO request.
+        crate::ingest::require_loopback(base_url)?;
+        let base = base_url.trim_end_matches('/');
+        let embed_url = format!("{base}/api/embed");
+        Ok(Self {
+            client: hardened_client(OLLAMA_CONNECT_TIMEOUT, OLLAMA_READ_TIMEOUT),
+            handle: tokio::runtime::Handle::current(),
+            embed_url,
+            model: spec.id.to_string(),
+            model_id: spec.id.to_string(),
+            dim: spec.dim,
+            prefix_doc: spec.prefix_doc.to_string(),
+            prefix_query: spec.prefix_query.to_string(),
+        })
+    }
+
+    /// POSTs `inputs` to `/api/embed`, returning the raw embedding vectors.
+    ///
+    /// Drives the async request to completion on the captured runtime handle.
+    fn post_embed(&self, inputs: Vec<String>) -> Result<Vec<Vec<f32>>, LensError> {
+        let client = self.client.clone();
+        let url = self.embed_url.clone();
+        let body = serde_json::json!({ "model": self.model, "input": inputs });
+        let resp: OllamaEmbedResponse =
+            self.handle.block_on(async move {
+                let r =
+                    client.post(&url).json(&body).send().await.map_err(|e| {
+                        LensError::Network(format!("ollama embed request failed: {e}"))
+                    })?;
+                if !r.status().is_success() {
+                    return Err(LensError::Network(format!(
+                        "ollama embed returned HTTP {}",
+                        r.status()
+                    )));
+                }
+                r.json::<OllamaEmbedResponse>().await.map_err(|e| {
+                    LensError::Parse(format!("ollama embed response decode failed: {e}"))
+                })
+            })?;
+        Ok(resp.embeddings)
+    }
+
+    /// L2-normalizes `v` in place (Ollama does NOT normalize; fastembed does, so
+    /// we normalize here to keep both backends' vectors directly comparable by
+    /// cosine distance).
+    fn normalize(v: &mut [f32]) {
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 1e-9 {
+            for x in v.iter_mut() {
+                *x /= norm;
+            }
+        }
+    }
+
+    /// Validates each returned vector has the expected dimension, then normalizes
+    /// it. A wrong-dim response (the wrong Ollama model tag) is an error.
+    fn finalize(&self, mut vecs: Vec<Vec<f32>>) -> Result<Vec<Vec<f32>>, LensError> {
+        for (i, v) in vecs.iter_mut().enumerate() {
+            if v.len() != self.dim {
+                return Err(LensError::Model(format!(
+                    "ollama returned vector {i} with dim {} (expected {})",
+                    v.len(),
+                    self.dim
+                )));
+            }
+            Self::normalize(v);
+        }
+        Ok(vecs)
+    }
+}
+
+impl Embedder for OllamaEmbedder {
+    fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn embed_documents(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, LensError> {
+        let inputs: Vec<String> = texts
+            .iter()
+            .map(|t| format!("{}{t}", self.prefix_doc))
+            .collect();
+        let vecs = self.post_embed(inputs)?;
+        self.finalize(vecs)
+    }
+
+    fn embed_query(&self, text: &str) -> Result<Vec<f32>, LensError> {
+        let input = format!("{}{text}", self.prefix_query);
+        let vecs = self.post_embed(vec![input])?;
+        let vecs = self.finalize(vecs)?;
+        vecs.into_iter()
+            .next()
+            .ok_or_else(|| LensError::Model("ollama returned empty batch for embed_query".into()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::embedder::registry::resolve;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // --- Loopback gate: rejected URLs make NO request (validated in `new`) ---
+
+    #[tokio::test]
+    async fn rejects_private_lan_url() {
+        let err = OllamaEmbedder::new("http://10.0.0.5:11434", resolve("nomic-embed-text-v1.5"))
+            .expect_err("a private LAN URL must be rejected");
+        assert!(matches!(err, LensError::Validation(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn rejects_public_hostname_url() {
+        let err = OllamaEmbedder::new("http://evil.example", resolve("nomic-embed-text-v1.5"))
+            .expect_err("a public hostname must be rejected");
+        // Either a Validation (resolved to non-loopback) or a Network (DNS) error,
+        // but NEVER an Ok — and crucially no embed request is ever issued.
+        assert!(
+            matches!(err, LensError::Validation(_) | LensError::Network(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn accepts_localhost_127_and_ipv6_loopback() {
+        for base in [
+            "http://localhost:11434",
+            "http://127.0.0.1:11434",
+            "http://[::1]:11434",
+        ] {
+            OllamaEmbedder::new(base, resolve("nomic-embed-text-v1.5"))
+                .unwrap_or_else(|e| panic!("{base} should be accepted: {e:?}"));
+        }
+    }
+
+    // --- Happy path against a loopback wiremock server ---
+
+    /// 768-dim L2-normalized vector with a marker in the first slot so we can
+    /// assert the request landed.
+    fn mock_vec(marker: f32, dim: usize) -> Vec<f32> {
+        let mut v = vec![0.5_f32; dim];
+        v[0] = marker;
+        v
+    }
+
+    #[tokio::test]
+    async fn embed_documents_happy_path_normalizes_and_checks_dim() {
+        let server = MockServer::start().await;
+        let body = serde_json::json!({
+            "embeddings": [mock_vec(1.0, 768), mock_vec(2.0, 768)]
+        });
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+
+        let embedder =
+            OllamaEmbedder::new(&server.uri(), resolve("nomic-embed-text-v1.5")).unwrap();
+        // The embed call is sync + blocks on the runtime; run it off the worker.
+        let vecs = tokio::task::spawn_blocking(move || embedder.embed_documents(&["a", "b"]))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(vecs.len(), 2);
+        for v in &vecs {
+            assert_eq!(v.len(), 768);
+            let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            assert!((norm - 1.0).abs() < 1e-3, "vector not normalized: {norm}");
+        }
+    }
+
+    #[tokio::test]
+    async fn embed_query_applies_prefix_in_request_body() {
+        use wiremock::matchers::body_string_contains;
+        let server = MockServer::start().await;
+        let body = serde_json::json!({ "embeddings": [mock_vec(1.0, 768)] });
+        // nomic's query prefix is "search_query: " — assert it is sent in the body.
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .and(body_string_contains("search_query: hello"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+
+        let embedder =
+            OllamaEmbedder::new(&server.uri(), resolve("nomic-embed-text-v1.5")).unwrap();
+        let v = tokio::task::spawn_blocking(move || embedder.embed_query("hello"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(v.len(), 768);
+    }
+
+    #[tokio::test]
+    async fn embed_documents_applies_doc_prefix_in_request_body() {
+        use wiremock::matchers::body_string_contains;
+        let server = MockServer::start().await;
+        let body = serde_json::json!({ "embeddings": [mock_vec(1.0, 768)] });
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .and(body_string_contains("search_document: doc text"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+
+        let embedder =
+            OllamaEmbedder::new(&server.uri(), resolve("nomic-embed-text-v1.5")).unwrap();
+        let vecs = tokio::task::spawn_blocking(move || embedder.embed_documents(&["doc text"]))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(vecs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn wrong_dim_response_is_error() {
+        let server = MockServer::start().await;
+        // Server returns 512-dim but the spec wants 768 → error.
+        let body = serde_json::json!({ "embeddings": [mock_vec(1.0, 512)] });
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+
+        let embedder =
+            OllamaEmbedder::new(&server.uri(), resolve("nomic-embed-text-v1.5")).unwrap();
+        let err = tokio::task::spawn_blocking(move || embedder.embed_documents(&["x"]))
+            .await
+            .unwrap()
+            .expect_err("a 512-dim response for a 768 spec must error");
+        assert!(matches!(err, LensError::Model(_)), "got {err:?}");
+    }
+}

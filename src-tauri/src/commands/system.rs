@@ -357,8 +357,9 @@ mod tests {
         assert!(status.db_ok);
         // All migrations are recorded: 0001_init, 0002_notebook_personalize,
         // 0003_source_soft_delete, 0004_source_anchor, 0005_enrichment,
-        // 0006_notebook_embedding_model.
-        assert_eq!(status.migration_count, 6);
+        // 0006_notebook_embedding_model, 0007_notebook_embedding_backend (M4
+        // Phase 4b-B).
+        assert_eq!(status.migration_count, 7);
     }
 
     #[tokio::test]

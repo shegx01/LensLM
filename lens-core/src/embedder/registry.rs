@@ -119,6 +119,14 @@ pub struct EmbeddingModelSpec {
     pub prefix_doc: &'static str,
     /// Prefix prepended to each query at retrieval time (`""` = none).
     pub prefix_query: &'static str,
+    /// The HuggingFace repo id (`{org}/{model}`) fastembed downloads this model's
+    /// weights from — the SAME value as fastembed's internal `model_code` for
+    /// [`fastembed_variant`](Self::fastembed_variant). Used by the on-disk cache
+    /// check ([`crate::system_check::fastembed_weights_cached`]) to derive the
+    /// per-model hf-hub subdirectory `models--{org}--{model}` under
+    /// `{data_dir}/models/fastembed/`. Recorded here (not read from fastembed's
+    /// private tables) so the registry stays the single source of truth.
+    pub hf_repo: &'static str,
 }
 
 impl EmbeddingModelSpec {
@@ -130,6 +138,22 @@ impl EmbeddingModelSpec {
     pub fn prefix_convention(&self) -> String {
         let label = |p: &str| if p.is_empty() { "none" } else { p.trim() }.to_string();
         format!("{}/{}", label(self.prefix_doc), label(self.prefix_query))
+    }
+
+    /// The per-model hf-hub cache subdirectory name fastembed writes under
+    /// `{data_dir}/models/fastembed/` — the OBSERVED shape `models--{org}--{model}`
+    /// (every `/` in [`hf_repo`](Self::hf_repo) becomes `--`).
+    ///
+    /// OBSERVED EMPIRICALLY (M4 Phase 4b-B Step 5, R6 protocol): constructing a
+    /// real `FastembedEmbedder::new_with_spec` for `all-minilm` into a temp
+    /// data_dir produced `{data_dir}/models/fastembed/models--Qdrant--all-MiniLM-L6-v2-onnx/`
+    /// (the standard `hf-hub` repo cache layout, with `snapshots/`, `blobs/`,
+    /// `refs/` underneath). `all-minilm`'s [`hf_repo`](Self::hf_repo) is
+    /// `Qdrant/all-MiniLM-L6-v2-onnx`, so the subdir is exactly
+    /// `models--Qdrant--all-MiniLM-L6-v2-onnx` — confirming the
+    /// `models--{repo-with-slashes-as-dashes}` rule used here for every model.
+    pub fn fastembed_cache_subdir(&self) -> String {
+        format!("models--{}", self.hf_repo.replace('/', "--"))
     }
 }
 
@@ -149,6 +173,7 @@ pub static REGISTRY: &[EmbeddingModelSpec] = &[
         fastembed_variant: EmbeddingModel::NomicEmbedTextV15,
         prefix_doc: "search_document: ",
         prefix_query: "search_query: ",
+        hf_repo: "nomic-ai/nomic-embed-text-v1.5",
     },
     EmbeddingModelSpec {
         id: "mxbai-embed-large",
@@ -156,6 +181,7 @@ pub static REGISTRY: &[EmbeddingModelSpec] = &[
         fastembed_variant: EmbeddingModel::MxbaiEmbedLargeV1,
         prefix_doc: "",
         prefix_query: "Represent this sentence for searching relevant passages: ",
+        hf_repo: "mixedbread-ai/mxbai-embed-large-v1",
     },
     EmbeddingModelSpec {
         id: "all-minilm",
@@ -163,6 +189,7 @@ pub static REGISTRY: &[EmbeddingModelSpec] = &[
         fastembed_variant: EmbeddingModel::AllMiniLML6V2,
         prefix_doc: "",
         prefix_query: "",
+        hf_repo: "Qdrant/all-MiniLM-L6-v2-onnx",
     },
     EmbeddingModelSpec {
         id: "bge-m3",
@@ -170,6 +197,7 @@ pub static REGISTRY: &[EmbeddingModelSpec] = &[
         fastembed_variant: EmbeddingModel::BGEM3,
         prefix_doc: "",
         prefix_query: "",
+        hf_repo: "BAAI/bge-m3",
     },
 ];
 

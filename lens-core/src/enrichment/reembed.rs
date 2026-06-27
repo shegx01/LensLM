@@ -89,7 +89,7 @@ pub(crate) async fn reembed_and_flip(
 
     // ── (3) Embed into a PRIVATE building table — LOCK-FREE (search reads only the
     // active table). The embedder `Mutex` is the only serialization point.
-    let embedder = engine.embedder_for(&embed_model).await?;
+    let embedder = engine.embedder_for(&embed_model, embed_backend).await?;
     let data_dir = engine.data_dir().await;
     let store = LanceVectorStore::new(&data_dir, pool.clone());
 
@@ -289,7 +289,7 @@ pub(crate) async fn reembed_notebook(
     // the new coordinate has a different (model, dim), so every chunk is embedded
     // fresh by the new model's embedder (the cross-coordinate analogue of the
     // same-coordinate seed in `reembed_and_flip`).
-    let embedder = engine.embedder_for(&new_model).await?;
+    let embedder = engine.embedder_for(&new_model, new_backend).await?;
     let data_dir = engine.data_dir().await;
     let store = LanceVectorStore::new(&data_dir, pool.clone());
     let building_name = store.create_building_table(&new_coord).await?;

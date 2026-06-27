@@ -633,7 +633,7 @@ async fn run_ingest(
     // Lazily get the cached embedder. Emit a `model_download` phase BEFORE the
     // first construction so a cold-cache download surfaces in the UI.
     on_progress(IngestProgress::new(ingest_phase::MODEL_DOWNLOAD, 0, None));
-    let embedder = engine.embedder_for(&embed_model).await?;
+    let embedder = engine.embedder_for(&embed_model, embed_backend).await?;
     on_progress(IngestProgress::new(
         ingest_phase::MODEL_DOWNLOAD,
         1,
@@ -783,7 +783,7 @@ fn is_blocked_ip(ip: IpAddr) -> bool {
     }
     match ip {
         IpAddr::V4(v4) => {
-            v4.is_loopback()
+            is_loopback_ip(ip)
                 || v4.is_private()
                 || v4.is_link_local()
                 || v4.is_unspecified()
@@ -796,7 +796,7 @@ fn is_blocked_ip(ip: IpAddr) -> bool {
             if let Some(mapped) = v6.to_ipv4_mapped() {
                 return is_blocked_ip(IpAddr::V4(mapped));
             }
-            v6.is_loopback()
+            is_loopback_ip(ip)
                 || v6.is_unspecified()
                 // Link-local fe80::/10.
                 || (v6.segments()[0] & 0xffc0) == 0xfe80
@@ -804,6 +804,97 @@ fn is_blocked_ip(ip: IpAddr) -> bool {
                 || (v6.segments()[0] & 0xfe00) == 0xfc00
         }
     }
+}
+
+/// Returns `true` if `ip` is a loopback address (`127.0.0.0/8`, `::1`, or an
+/// IPv4-mapped loopback `::ffff:127.0.0.0/8`).
+///
+/// Shared classifier (single source of truth for "is this loopback?") used by
+/// BOTH the SSRF guard ([`is_blocked_ip`], which *rejects* loopback for a
+/// user-supplied remote URL source) AND the Ollama embedder's loopback gate
+/// ([`require_loopback`], which *requires* loopback for the local embedding
+/// server). The two call sites apply opposite POLICIES on the same FACT, so the
+/// fact is defined once here and cannot drift between them.
+pub(crate) fn is_loopback_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return mapped.is_loopback();
+            }
+            v6.is_loopback()
+        }
+    }
+}
+
+/// Loopback-ONLY gate for a local-service base URL (the inverse of the SSRF
+/// guard): parses `base_url`, requires an `http`/`https` scheme, resolves the
+/// host, and rejects unless EVERY resolved address is loopback
+/// ([`is_loopback_ip`]).
+///
+/// This is the safety contract for the Ollama embedder: the app will only ever
+/// POST embedding inputs to a server bound to this machine's loopback
+/// interface, never to a LAN/public host (which could exfiltrate the documents
+/// being embedded or be an SSRF pivot). An IP-literal host is checked directly;
+/// a hostname is resolved and EVERY candidate must be loopback (so a host with
+/// one loopback and one non-loopback A record is rejected). A host that resolves
+/// to NO address is rejected.
+pub(crate) fn require_loopback(base_url: &str) -> Result<(), LensError> {
+    let parsed = url::Url::parse(base_url)
+        .map_err(|e| LensError::Validation(format!("invalid base URL {base_url:?}: {e}")))?;
+    let scheme = parsed.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err(LensError::Validation(format!(
+            "base URL scheme must be http or https, got {scheme:?}"
+        )));
+    }
+    let host = parsed
+        .host()
+        .ok_or_else(|| LensError::Validation(format!("base URL {base_url:?} has no host")))?;
+    let port = parsed.port_or_known_default().unwrap_or(80);
+
+    let domain = match host {
+        url::Host::Ipv4(v4) => {
+            if !is_loopback_ip(IpAddr::V4(v4)) {
+                return Err(LensError::Validation(format!(
+                    "embedding base URL host {v4} is not loopback; the Ollama embedder \
+                     accepts loopback-only addresses"
+                )));
+            }
+            return Ok(());
+        }
+        url::Host::Ipv6(v6) => {
+            if !is_loopback_ip(IpAddr::V6(v6)) {
+                return Err(LensError::Validation(format!(
+                    "embedding base URL host {v6} is not loopback; the Ollama embedder \
+                     accepts loopback-only addresses"
+                )));
+            }
+            return Ok(());
+        }
+        url::Host::Domain(d) => d.to_string(),
+    };
+
+    let addrs = (domain.as_str(), port).to_socket_addrs().map_err(|e| {
+        LensError::Network(format!("failed to resolve base URL host {domain}: {e}"))
+    })?;
+    let mut any = false;
+    for addr in addrs {
+        any = true;
+        if !is_loopback_ip(addr.ip()) {
+            return Err(LensError::Validation(format!(
+                "embedding base URL host {domain} resolves to a non-loopback address ({}); \
+                 the Ollama embedder accepts loopback-only addresses",
+                addr.ip()
+            )));
+        }
+    }
+    if !any {
+        return Err(LensError::Network(format!(
+            "embedding base URL host {domain} did not resolve to any address"
+        )));
+    }
+    Ok(())
 }
 
 /// A validated URL-source locator: the parsed [`url::Url`] plus the exact

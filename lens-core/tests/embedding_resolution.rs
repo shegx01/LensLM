@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-use lens_core::embedder::{CountingEmbedder, Embedder, resolve};
+use lens_core::embedder::{CountingEmbedder, Embedder, EmbeddingBackend, resolve};
 use lens_core::{LensEngine, NotebookId};
 
 // ---------------------------------------------------------------------------
@@ -27,15 +27,15 @@ async fn embedder_for_caches_same_model_id() {
     let in_flight = Arc::new(AtomicUsize::new(0));
     let injected: Arc<dyn Embedder> = Arc::new(CountingEmbedder::new(load, in_flight));
     engine
-        .set_embedder_for_test(injected)
+        .set_embedder_for_test(injected, EmbeddingBackend::Fastembed)
         .expect("inject default embedder");
 
     let a = engine
-        .embedder_for_test_get("nomic-embed-text-v1.5")
+        .embedder_for_test_get("nomic-embed-text-v1.5", EmbeddingBackend::Fastembed)
         .await
         .expect("embedder_for nomic");
     let b = engine
-        .embedder_for_test_get("nomic-embed-text-v1.5")
+        .embedder_for_test_get("nomic-embed-text-v1.5", EmbeddingBackend::Fastembed)
         .await
         .expect("embedder_for nomic again");
 
@@ -57,7 +57,9 @@ async fn embedder_for_distinct_models_coexist() {
         Arc::new(AtomicUsize::new(0)),
         Arc::new(AtomicUsize::new(0)),
     ));
-    engine.set_embedder_for_test(nomic).expect("inject nomic");
+    engine
+        .set_embedder_for_test(nomic, EmbeddingBackend::Fastembed)
+        .expect("inject nomic");
 
     let mxbai_spec = resolve("mxbai-embed-large");
     let mxbai: Arc<dyn Embedder> = Arc::new(CountingEmbedder::new_with_dim(
@@ -68,14 +70,16 @@ async fn embedder_for_distinct_models_coexist() {
         Arc::new(AtomicUsize::new(0)),
         Arc::new(AtomicUsize::new(0)),
     ));
-    engine.set_embedder_for_test(mxbai).expect("inject mxbai");
+    engine
+        .set_embedder_for_test(mxbai, EmbeddingBackend::Fastembed)
+        .expect("inject mxbai");
 
     let n = engine
-        .embedder_for_test_get("nomic-embed-text-v1.5")
+        .embedder_for_test_get("nomic-embed-text-v1.5", EmbeddingBackend::Fastembed)
         .await
         .expect("nomic");
     let m = engine
-        .embedder_for_test_get("mxbai-embed-large")
+        .embedder_for_test_get("mxbai-embed-large", EmbeddingBackend::Fastembed)
         .await
         .expect("mxbai");
 
@@ -86,6 +90,52 @@ async fn embedder_for_distinct_models_coexist() {
     assert!(
         !Arc::ptr_eq(&n, &m),
         "distinct model ids must be distinct embedders"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Step 4 (4b-B) — backend-keyed embedder cache (R4/M3)
+// ---------------------------------------------------------------------------
+
+/// The SAME model id under DIFFERENT backends must occupy DISTINCT cache slots:
+/// `(nomic, Fastembed)` and `(nomic, Ollama)` return DIFFERENT `Arc`s. A
+/// model-id-only key would alias the two backends and serve the wrong backend's
+/// embedder for a notebook (silent cross-backend vector pollution).
+#[tokio::test]
+async fn embedder_cache_keys_distinct_per_backend() {
+    let engine = LensEngine::for_test().await;
+
+    // Two functionally-distinct CountingEmbedders, both reporting the SAME
+    // model_id (nomic) but injected under different backends. The cache key is
+    // `(model_id, backend)`, so they must not collide.
+    let fastembed: Arc<dyn Embedder> = Arc::new(CountingEmbedder::new(
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(0)),
+    ));
+    let ollama: Arc<dyn Embedder> = Arc::new(CountingEmbedder::new(
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(0)),
+    ));
+    engine
+        .set_embedder_for_test(fastembed, EmbeddingBackend::Fastembed)
+        .expect("inject nomic/fastembed");
+    engine
+        .set_embedder_for_test(ollama, EmbeddingBackend::Ollama)
+        .expect("inject nomic/ollama");
+
+    let f = engine
+        .embedder_for_test_get("nomic-embed-text-v1.5", EmbeddingBackend::Fastembed)
+        .await
+        .expect("nomic/fastembed");
+    let o = engine
+        .embedder_for_test_get("nomic-embed-text-v1.5", EmbeddingBackend::Ollama)
+        .await
+        .expect("nomic/ollama");
+
+    assert_eq!(f.model_id(), o.model_id(), "both report the same model id");
+    assert!(
+        !Arc::ptr_eq(&f, &o),
+        "same model id under different backends must be DISTINCT cached instances"
     );
 }
 

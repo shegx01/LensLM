@@ -42,7 +42,7 @@ pub fn inject_fake_embedder(engine: &LensEngine) {
     let in_flight = Arc::new(AtomicUsize::new(0));
     let e: Arc<dyn Embedder> = Arc::new(CountingEmbedder::new(load_count, in_flight));
     engine
-        .set_embedder_for_test(e)
+        .set_embedder_for_test(e, lens_core::EmbeddingBackend::Fastembed)
         .expect("embedder not yet initialized");
 }
 

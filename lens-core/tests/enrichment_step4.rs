@@ -81,7 +81,7 @@ async fn file_engine() -> (TempDir, LensEngine) {
             std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         ));
     engine
-        .set_embedder_for_test(embedder)
+        .set_embedder_for_test(embedder, lens_core::EmbeddingBackend::Fastembed)
         .expect("inject embedder");
     (dir, engine)
 }

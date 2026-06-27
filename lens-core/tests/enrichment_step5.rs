@@ -137,7 +137,7 @@ fn install_counting_embedder(engine: &LensEngine) {
         Arc::new(AtomicUsize::new(0)),
     ));
     engine
-        .set_embedder_for_test(embedder)
+        .set_embedder_for_test(embedder, lens_core::EmbeddingBackend::Fastembed)
         .expect("inject embedder");
 }
 
@@ -581,7 +581,7 @@ async fn crash_during_building_table_populate() {
     // Inject the FAILING embedder so the re-embed populate errors before the flip.
     let failing: Arc<dyn Embedder> = Arc::new(FailingEmbedder);
     engine
-        .set_embedder_for_test(failing)
+        .set_embedder_for_test(failing, lens_core::EmbeddingBackend::Fastembed)
         .expect("inject failing embedder");
     let (nb, source_id) = seed_indexed_prose_source(&engine).await;
     let data_dir = engine.data_dir_for_test().await;

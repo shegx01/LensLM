@@ -464,43 +464,78 @@ fn is_allowlisted_embedding(installed_name: &str, configured: &str) -> bool {
         || (!configured.is_empty() && configured.eq_ignore_ascii_case(&bare))
 }
 
-/// Returns `true` when the configured embedding model's fastembed weights are
-/// already cached on disk at `{data_dir}/models/fastembed/`.
+/// Returns `true` when the SPECIFIC `model_id`'s fastembed weights are already
+/// cached on disk under `{data_dir}/models/fastembed/`.
 ///
-/// fastembed / hf-hub caches model weights under `{cache_dir}/{model_slug}/` by
-/// default; `FastembedEmbedder::new_with_spec` passes `{data_dir}/models/fastembed/`
-/// as the cache dir. We treat the directory as "cached" when it exists AND
-/// contains at least one file (a non-empty directory means the download completed
-/// or is in progress — either way the ONNX session will either succeed or fail at
-/// construction, not at probe time).
+/// R6 (M4 Phase 4b-B, verify-then-implement): the per-model hf-hub cache
+/// subdirectory shape was OBSERVED empirically by constructing a real
+/// `FastembedEmbedder::new_with_spec` for `all-minilm` into a temp data_dir and
+/// walking the tree — it produced
+/// `{data_dir}/models/fastembed/models--Qdrant--all-MiniLM-L6-v2-onnx/`
+/// (standard `hf-hub` repo cache: `models--{org}--{model}` with `snapshots/`,
+/// `blobs/`, `refs/` underneath). The per-model subdir is derived from the
+/// registry spec ([`EmbeddingModelSpec::fastembed_cache_subdir`]), so the check
+/// is PER-MODEL: a notebook on `mxbai-embed-large` does NOT pass merely because
+/// `nomic`'s weights happen to be present.
+///
+/// Treats the model as "cached" when ITS subdir exists AND contains at least one
+/// entry (a non-empty repo dir means the download completed or is in progress —
+/// either way construction, not this probe, is the final arbiter). An unknown /
+/// empty `model_id` resolves to the default via the registry.
 fn fastembed_weights_cached(data_dir: &Path, model_id: &str) -> bool {
-    // Resolve the spec so the cache-dir lookup uses the canonical id path that
-    // fastembed / hf-hub writes. fastembed 5.x derives the sub-directory name
-    // from the model slug; we just check that the fastembed cache root is
-    // non-empty, because the exact sub-directory name is an implementation detail
-    // of the fastembed crate (typically `{org}/{model}` or a flattened variant).
-    // An empty model_id falls back to the default; either way we probe the dir.
-    let _ = model_id; // model_id reserved for future per-model sub-path checks
-    let cache_root = data_dir.join("models").join("fastembed");
-    if !cache_root.is_dir() {
+    let spec = crate::embedder::resolve(model_id);
+    let model_dir = data_dir
+        .join("models")
+        .join("fastembed")
+        .join(spec.fastembed_cache_subdir());
+    if !model_dir.is_dir() {
         return false;
     }
-    // Non-empty directory → at least one file present → weights cached.
-    std::fs::read_dir(&cache_root)
+    // Non-empty repo dir → weights present (or mid-download) for THIS model.
+    std::fs::read_dir(&model_dir)
         .ok()
         .and_then(|mut d| d.next())
         .is_some()
 }
 
-/// Probe 2 — embedding-model readiness gate.
+/// Per-backend embedding-readiness gate predicate (M4 Phase 4b-B, R6 / D2).
 ///
-/// PASSES when EITHER:
-/// - The configured model's fastembed weights are cached on disk at
-///   `{data_dir}/models/fastembed/` (R6: fastembed-first path; Ollama is NOT
-///   required and is not probed when the cache is warm); OR
-/// - Ollama is up and an allowlisted model is installed via `GET /api/tags`.
+/// PASSES iff the SELECTED backend's own arm is satisfied:
+/// `(backend == Fastembed && fastembed_cached) || (backend == Ollama &&
+/// ollama_detected)`.
 ///
-/// `Fail`s only when NEITHER arm passes, with a `Choose` affordance.
+/// Pure (no I/O) so the truth table is exhaustively unit-testable. The
+/// per-backend shape is the D2 showstopper guard: it NEVER requires Ollama for a
+/// fastembed selection (a fresh fastembed-only machine with cached weights passes
+/// even when Ollama is unreachable), and NEVER passes a fastembed selection on
+/// the strength of an unrelated Ollama tag (or vice-versa). The two facts
+/// (`fastembed_cached`, `ollama_detected`) are computed by the caller and fed in.
+fn embedding_gate_passes(
+    backend: crate::embedder::EmbeddingBackend,
+    fastembed_cached: bool,
+    ollama_detected: bool,
+) -> bool {
+    match backend {
+        crate::embedder::EmbeddingBackend::Fastembed => fastembed_cached,
+        crate::embedder::EmbeddingBackend::Ollama => ollama_detected,
+    }
+}
+
+/// Probe 2 — embedding-model readiness gate (M4 Phase 4b-B: per-backend OR-gate).
+///
+/// Resolves the configured backend ([`AppConfig::embedding_backend`], empty →
+/// the `fastembed` default) and PASSES iff that backend's own readiness arm is
+/// satisfied ([`embedding_gate_passes`]):
+/// - [`Fastembed`](crate::embedder::EmbeddingBackend::Fastembed): the SELECTED
+///   model's weights are cached on disk under `{data_dir}/models/fastembed/`
+///   ([`fastembed_weights_cached`], per-model). Ollama is NOT probed for a
+///   fastembed selection — a fresh fastembed-only install passes with Ollama
+///   unreachable (D2).
+/// - [`Ollama`](crate::embedder::EmbeddingBackend::Ollama): Ollama is up and an
+///   allowlisted/selected model is installed via `GET /api/tags`.
+///
+/// `Fail`s only when the selected backend's arm is unsatisfied, with a `Choose`
+/// affordance.
 async fn probe_embedding_model(
     client: &reqwest::Client,
     runtime: &LlmRuntimeProbe,
@@ -523,28 +558,28 @@ async fn probe_embedding_model(
         action: Some(CheckAction::Choose),
     };
 
-    // R6: fastembed cache takes priority — if the weights are already on disk, the
-    // gate passes WITHOUT contacting Ollama. This lets users who chose the fastembed
-    // path (the default for new installs) pass the onboarding gate even when Ollama
-    // is not installed.
-    if fastembed_weights_cached(data_dir, &config.embedding_model) {
-        return pass();
-    }
+    let backend = crate::embedder::EmbeddingBackend::from_opt_str(Some(&config.embedding_backend));
 
-    // Fallback: Ollama-installed model (legacy / Ollama-first path).
-    if !runtime.ollama_up {
-        return fail();
-    }
+    let fastembed_cached = fastembed_weights_cached(data_dir, &config.embedding_model);
 
-    let url = format!("{}/api/tags", runtime.ollama_base_url);
-    let found = get_json_capped::<OllamaTags>(client, &url)
-        .await
-        .map(|tags| {
-            tags.models
-                .iter()
-                .any(|m| is_allowlisted_embedding(&m.name, &config.embedding_model))
-        })
-        .unwrap_or(false);
+    // Only probe Ollama when the selected backend is Ollama AND the runtime is up
+    // — a fastembed selection must NEVER depend on (or wait on) Ollama (D2).
+    let ollama_detected =
+        if matches!(backend, crate::embedder::EmbeddingBackend::Ollama) && runtime.ollama_up {
+            let url = format!("{}/api/tags", runtime.ollama_base_url);
+            get_json_capped::<OllamaTags>(client, &url)
+                .await
+                .map(|tags| {
+                    tags.models
+                        .iter()
+                        .any(|m| is_allowlisted_embedding(&m.name, &config.embedding_model))
+                })
+                .unwrap_or(false)
+        } else {
+            false
+        };
+
+    let found = embedding_gate_passes(backend, fastembed_cached, ollama_detected);
 
     if found { pass() } else { fail() }
 }
@@ -897,9 +932,12 @@ mod tests {
             ollama_up: true,
             ollama_base_url: server.uri(),
         };
-        // No fastembed cache → falls through to Ollama probe.
-        let result =
-            probe_embedding_model(&client, &runtime, &AppConfig::default(), dir.path()).await;
+        // Ollama-backend selection + an allowlisted Ollama model present → Pass.
+        let config = AppConfig {
+            embedding_backend: "ollama".to_string(),
+            ..AppConfig::default()
+        };
+        let result = probe_embedding_model(&client, &runtime, &config, dir.path()).await;
 
         assert_eq!(result.status, CheckStatus::Pass);
         assert_eq!(result.action, Some(CheckAction::Choose));
@@ -926,9 +964,12 @@ mod tests {
             ollama_up: true,
             ollama_base_url: server.uri(),
         };
-        // No fastembed cache → falls through to Ollama probe.
-        let result =
-            probe_embedding_model(&client, &runtime, &AppConfig::default(), dir.path()).await;
+        // Ollama-backend selection but only a non-allowlisted (chat) model → Fail.
+        let config = AppConfig {
+            embedding_backend: "ollama".to_string(),
+            ..AppConfig::default()
+        };
+        let result = probe_embedding_model(&client, &runtime, &config, dir.path()).await;
 
         assert_eq!(result.status, CheckStatus::Fail);
         assert_eq!(result.action, Some(CheckAction::Choose));
@@ -951,14 +992,21 @@ mod tests {
         assert_eq!(result.status, CheckStatus::Fail);
     }
 
+    /// Creates a non-empty per-model fastembed cache subdir for `model_id`
+    /// (OBSERVED hf-hub shape `models/fastembed/models--{org}--{model}/…`).
+    fn seed_fastembed_cache(data_dir: &Path, model_id: &str) {
+        let subdir = crate::embedder::resolve(model_id).fastembed_cache_subdir();
+        let model_dir = data_dir.join("models").join("fastembed").join(subdir);
+        std::fs::create_dir_all(model_dir.join("snapshots")).unwrap();
+        std::fs::write(model_dir.join("snapshots").join("model.onnx"), b"fake").unwrap();
+    }
+
     #[tokio::test]
     async fn embedding_pass_when_fastembed_weights_cached_ollama_down() {
-        // R6: fastembed cache present + Ollama unreachable → PASS.
+        // R6: the SELECTED model's fastembed weights present + Ollama unreachable
+        // → PASS (fastembed-backend default).
         let dir = tempfile::tempdir().unwrap();
-        // Create a non-empty fastembed cache dir (simulate downloaded weights).
-        let cache_dir = dir.path().join("models").join("fastembed");
-        std::fs::create_dir_all(&cache_dir).unwrap();
-        std::fs::write(cache_dir.join("model.onnx"), b"fake-weights").unwrap();
+        seed_fastembed_cache(dir.path(), "nomic-embed-text-v1.5");
 
         let client = probe_client();
         let runtime = LlmRuntimeProbe {
@@ -987,6 +1035,110 @@ mod tests {
             probe_embedding_model(&client, &runtime, &AppConfig::default(), dir.path()).await;
 
         assert_eq!(result.status, CheckStatus::Fail);
+    }
+
+    // --- Step 5 (4b-B): per-model fastembed cache check (R6) ---
+
+    /// `fastembed_weights_cached` is PER-MODEL: caching nomic's weights does NOT
+    /// make the mxbai model report cached, and vice-versa.
+    #[test]
+    fn fastembed_weights_cached_is_per_model() {
+        let dir = tempfile::tempdir().unwrap();
+        // Only the nomic subdir is present.
+        seed_fastembed_cache(dir.path(), "nomic-embed-text-v1.5");
+
+        // The SAME model that was seeded → cached.
+        assert!(fastembed_weights_cached(
+            dir.path(),
+            "nomic-embed-text-v1.5"
+        ));
+        // A DIFFERENT model whose subdir is absent → NOT cached.
+        assert!(!fastembed_weights_cached(dir.path(), "mxbai-embed-large"));
+
+        // Now seed mxbai too → both report cached.
+        seed_fastembed_cache(dir.path(), "mxbai-embed-large");
+        assert!(fastembed_weights_cached(dir.path(), "mxbai-embed-large"));
+        assert!(fastembed_weights_cached(
+            dir.path(),
+            "nomic-embed-text-v1.5"
+        ));
+    }
+
+    /// An empty model subdir (created but no files) is NOT cached.
+    #[test]
+    fn fastembed_weights_cached_false_for_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let subdir = crate::embedder::resolve("nomic-embed-text-v1.5").fastembed_cache_subdir();
+        std::fs::create_dir_all(dir.path().join("models").join("fastembed").join(subdir)).unwrap();
+        assert!(!fastembed_weights_cached(
+            dir.path(),
+            "nomic-embed-text-v1.5"
+        ));
+    }
+
+    /// The OBSERVED hf-hub subdir literal is the `models--{org}--{model}` form,
+    /// pinning the empirically-observed shape (Step 5 R6 protocol).
+    #[test]
+    fn fastembed_cache_subdir_matches_observed_shape() {
+        assert_eq!(
+            crate::embedder::resolve("all-minilm").fastembed_cache_subdir(),
+            "models--Qdrant--all-MiniLM-L6-v2-onnx"
+        );
+        assert_eq!(
+            crate::embedder::resolve("nomic-embed-text-v1.5").fastembed_cache_subdir(),
+            "models--nomic-ai--nomic-embed-text-v1.5"
+        );
+    }
+
+    // --- Step 5 (4b-B): per-backend OR-gate predicate truth table ---
+
+    #[test]
+    fn gate_predicate_truth_table() {
+        use crate::embedder::EmbeddingBackend::{Fastembed, Ollama};
+        // Fastembed selection: passes IFF fastembed weights are cached; the
+        // ollama_detected flag is irrelevant (never required for fastembed).
+        assert!(embedding_gate_passes(Fastembed, true, false));
+        assert!(embedding_gate_passes(Fastembed, true, true));
+        assert!(!embedding_gate_passes(Fastembed, false, false));
+        assert!(
+            !embedding_gate_passes(Fastembed, false, true),
+            "a fastembed selection must NEVER pass on the strength of an Ollama tag"
+        );
+        // Ollama selection: passes IFF an Ollama tag is detected; fastembed cache
+        // is irrelevant.
+        assert!(embedding_gate_passes(Ollama, false, true));
+        assert!(embedding_gate_passes(Ollama, true, true));
+        assert!(!embedding_gate_passes(Ollama, false, false));
+        assert!(
+            !embedding_gate_passes(Ollama, true, false),
+            "an ollama selection must NEVER pass on the strength of a fastembed cache"
+        );
+    }
+
+    /// THE D2 showstopper guard: a fresh fastembed-only install — fastembed
+    /// selected (default config), the selected model's weights cached, Ollama
+    /// UNREACHABLE — PASSES the gate. A wrong fix that ANDs Ollama or probes it
+    /// for a fastembed selection would dead-end onboarding here.
+    #[tokio::test]
+    async fn fresh_install_fastembed_only_passes_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_fastembed_cache(dir.path(), "nomic-embed-text-v1.5");
+
+        let client = probe_client();
+        // Ollama is DOWN and points at a dead loopback port.
+        let runtime = LlmRuntimeProbe {
+            result: llm_runtime_placeholder(),
+            ollama_up: false,
+            ollama_base_url: "http://127.0.0.1:1".to_string(),
+        };
+        // Default config: empty embedding_backend → resolves to Fastembed.
+        let result =
+            probe_embedding_model(&client, &runtime, &AppConfig::default(), dir.path()).await;
+        assert_eq!(
+            result.status,
+            CheckStatus::Pass,
+            "a fresh fastembed-only install with cached weights must pass with Ollama unreachable"
+        );
     }
 
     #[test]

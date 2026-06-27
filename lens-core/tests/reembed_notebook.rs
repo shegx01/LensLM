@@ -36,7 +36,9 @@ fn inject_embedder(engine: &LensEngine, model_id: &str) {
         Arc::new(AtomicUsize::new(0)),
         Arc::new(AtomicUsize::new(0)),
     ));
-    engine.set_embedder_for_test(e).expect("inject embedder");
+    engine
+        .set_embedder_for_test(e, lens_core::EmbeddingBackend::Fastembed)
+        .expect("inject embedder");
 }
 
 /// A raw active vector for a chunk (axis-aligned, default nomic dim).

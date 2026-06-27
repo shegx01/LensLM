@@ -22,7 +22,9 @@
 //! are deterministic unit vectors (no fastembed weights required).
 
 use lens_core::vector_store::{Coordinate, LanceVectorStore, VectorRow, VectorStore};
-use lens_core::{DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, EmbeddingBackend, LensEngine};
+use lens_core::{
+    DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, EmbeddingBackend, LensEngine, NotebookId,
+};
 
 /// A deterministic unit vector of length `dim`, seeded so two seeds differ.
 fn unit_vector(seed: usize, dim: usize) -> Vec<f32> {
@@ -235,6 +237,80 @@ async fn same_model_dim_distinct_backends_never_collide() {
         ol_hits.iter().all(|h| h.chunk_id.starts_with("ol-")),
         "ollama search must return ONLY ollama vectors; got {:?}",
         ol_hits.iter().map(|h| &h.chunk_id).collect::<Vec<_>>()
+    );
+}
+
+/// R4/R7a — the `get_notebook_embedding_info` status query is BACKEND-SCOPED.
+/// After a same-dim cross-backend switch (the notebook is configured to ollama
+/// while a fastembed active row still lingers from before the switch), the status
+/// query must report the OLLAMA coordinate's status (the configured one), NOT the
+/// fastembed row's — a backend-blind `(model, dim)`-only query would wrongly read
+/// the fastembed active row and report `active` for the wrong backend.
+#[tokio::test]
+async fn get_notebook_embedding_info_is_backend_scoped() {
+    let (dir, engine, pool, nb) = engine_and_notebook().await;
+    let store = LanceVectorStore::new(dir.path(), pool.clone());
+
+    // A lingering FASTEMBED active coordinate (the pre-switch state).
+    let fe = Coordinate::new(
+        nb.clone(),
+        EmbeddingBackend::Fastembed,
+        DEFAULT_EMBED_MODEL_ID,
+        DEFAULT_EMBED_DIM,
+    );
+    store
+        .add(&fe, make_rows(&nb, "fe", 3, DEFAULT_EMBED_DIM))
+        .await
+        .unwrap();
+
+    // Configure the notebook to OLLAMA (same model + dim), but DO NOT yet build
+    // the ollama coordinate — so only the fastembed row is active.
+    sqlx::query("UPDATE notebooks SET embedding_backend = 'ollama' WHERE id = ?")
+        .bind(&nb)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let nb_id = NotebookId::from(nb.clone());
+    let (model, dim, backend, status) = engine
+        .get_notebook_embedding_info(&nb_id)
+        .await
+        .expect("status info");
+    assert_eq!(model, DEFAULT_EMBED_MODEL_ID);
+    assert_eq!(dim, DEFAULT_EMBED_DIM);
+    assert_eq!(
+        backend,
+        EmbeddingBackend::Ollama,
+        "resolves configured backend"
+    );
+    // The OLLAMA coordinate has NO active row yet, so status is "none" — even
+    // though a fastembed active row for the SAME (model, dim) exists. A
+    // backend-blind query would wrongly read "active" from the fastembed row.
+    assert_eq!(
+        status, "none",
+        "status must reflect the OLLAMA coordinate, not the lingering fastembed row"
+    );
+
+    // Now build the ollama coordinate → status flips to active for ollama.
+    let ol = Coordinate::new(
+        nb.clone(),
+        EmbeddingBackend::Ollama,
+        DEFAULT_EMBED_MODEL_ID,
+        DEFAULT_EMBED_DIM,
+    );
+    store
+        .add(&ol, make_rows(&nb, "ol", 3, DEFAULT_EMBED_DIM))
+        .await
+        .unwrap();
+
+    let (_m, _d, backend2, status2) = engine
+        .get_notebook_embedding_info(&nb_id)
+        .await
+        .expect("status info 2");
+    assert_eq!(backend2, EmbeddingBackend::Ollama);
+    assert_eq!(
+        status2, "active",
+        "the ollama coordinate is now active for the configured backend"
     );
 }
 

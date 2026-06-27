@@ -366,7 +366,10 @@ pub async fn get_notebook_embedding_model(
     engine: tauri::State<'_, LensEngine>,
 ) -> Result<EmbeddingModelInfo, LensError> {
     let nb_id = NotebookId::from(notebook_id);
-    let (model_id, dim, status) = engine.get_notebook_embedding_info(&nb_id).await?;
+    // NOTE (Step 6): `backend` is resolved here but not yet surfaced on
+    // `EmbeddingModelInfo` — the struct + TS mirror gain the `backend` field when
+    // the backend-aware `set_notebook_embedding_model` command lands.
+    let (model_id, dim, _backend, status) = engine.get_notebook_embedding_info(&nb_id).await?;
     Ok(EmbeddingModelInfo {
         model_id,
         dim,
