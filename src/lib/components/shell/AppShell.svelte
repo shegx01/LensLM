@@ -29,6 +29,12 @@
 
   const activeNotebook = $derived(notebookStore.activeNotebook);
 
+  // When the global Preferences view is open it renders IN-PLACE: the left
+  // notebook sidebar stays, but the center workspace + right sources rail are
+  // replaced by the Preferences view (it spans those two grid columns). It is a
+  // route/view swap, NOT a floating overlay.
+  const settingsOpen = $derived(notebookStore.settingsOpen);
+
   // Left grid column width is driven by the persisted collapse state: expanded =
   // 256px, collapsed icon rail = 104px. The collapsed width must comfortably fit
   // the native macOS traffic-light cluster (~62px wide): 104px column − 2×8px
@@ -115,30 +121,42 @@
        animates. Native traffic lights overlay the panel's top drag row. -->
   <SidebarRail onnewnotebook={() => (createOpen = true)} {userName} />
 
-  <!-- CENTER: workspace on the canvas — top drag bar, then state-driven content.
-       The floating pill header (NotebookTopBar) sits within the top area; Trash
-       is a centered modal (mounted at shell root), not a center-pane view. -->
-  <main class="flex flex-col overflow-hidden">
-    <!-- Floating pill header — always present (its full-width outer row is the
-         window drag region); the pill shows the title + Chat/Notes only when a
-         notebook is active, and always exposes share + settings. -->
-    <NotebookTopBar />
-    {#if activeNotebook}
-      <!-- Empty content region — chat/notes fill this in M5/M6. -->
-      <div class="flex flex-1 flex-col overflow-hidden"></div>
-    {:else}
-      <div class="flex flex-1 flex-col items-center justify-center gap-2">
-        <Aperture class="size-8 text-muted-foreground/40" />
-        <p class="text-sm text-muted-foreground">Your workspace</p>
-        <p class="text-xs text-muted-foreground/60">Select or create a notebook to begin</p>
-      </div>
-    {/if}
-  </main>
+  {#if settingsOpen}
+    <!-- IN-PLACE Preferences view — occupies the center + right grid columns
+         (col-span-2) right of the left notebook sidebar, replacing the
+         workspace + sources rail. No backdrop / no floating card. "← Back"
+         inside it sets settingsOpen=false to return to the notebook view. -->
+    <div class="col-span-2 flex min-w-0 overflow-hidden">
+      <PreferencesShell />
+    </div>
+  {:else}
+    <!-- CENTER: workspace on the canvas — top drag bar, then state-driven content.
+         The floating pill header (NotebookTopBar) sits within the top area; Trash
+         is a centered modal (mounted at shell root), not a center-pane view. -->
+    <main class="flex flex-col overflow-hidden">
+      <!-- Floating pill header — always present (its full-width outer row is the
+           window drag region); the pill shows the title + Chat/Notes only when a
+           notebook is active, and always exposes share + settings. -->
+      <NotebookTopBar />
+      {#if activeNotebook}
+        <!-- Empty content region — chat/notes fill this in M5/M6. -->
+        <div class="flex flex-1 flex-col overflow-hidden"></div>
+      {:else}
+        <div class="flex flex-1 flex-col items-center justify-center gap-2">
+          <Aperture class="size-8 text-muted-foreground/40" />
+          <p class="text-sm text-muted-foreground">Your workspace</p>
+          <p class="text-xs text-muted-foreground/60">Select or create a notebook to begin</p>
+        </div>
+      {/if}
+    </main>
 
-  <!-- RIGHT: sources rail — flush panel with a hairline divider; filled by M4 SourcesRail -->
-  <aside class="flex flex-col overflow-hidden border-l border-border bg-card text-card-foreground">
-    <SourcesRail />
-  </aside>
+    <!-- RIGHT: sources rail — flush panel with a hairline divider; filled by M4 SourcesRail -->
+    <aside
+      class="flex flex-col overflow-hidden border-l border-border bg-card text-card-foreground"
+    >
+      <SourcesRail />
+    </aside>
+  {/if}
 </div>
 
 <!-- Overlays mounted at shell root -->
@@ -146,8 +164,8 @@
 <TrashView />
 <NotebookCreateDialog open={createOpen} onOpenChange={(v) => (createOpen = v)} />
 
-<!-- Settings surfaces (M4 4b-B): global Preferences shell + per-notebook sheet. -->
-<PreferencesShell />
+<!-- Per-notebook settings sheet (M4 4b-B) — stays a sheet. The global
+     Preferences view is rendered in-place above, not here. -->
 <NotebookSettingsSheet />
 
 <!-- Dev/QA Embeddings Inspector — DEV-gated dynamic import so the component is
