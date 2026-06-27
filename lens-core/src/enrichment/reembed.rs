@@ -74,9 +74,18 @@ pub(crate) async fn reembed_and_flip(
     // (model + dim) rather than the global default. The cross-model switch (a new
     // coordinate) lands in Step 9; here the source's notebook always re-embeds
     // under whatever model it is currently configured with.
-    let (embed_model, embed_dim) = engine
+    let (embed_model, embed_dim, embed_backend) = engine
         .resolve_notebook_embedding(&crate::NotebookId::from(notebook.to_string()))
         .await?;
+    // Full backend-aware coordinate (M4 Phase 4b-B): every build/seed/flip below
+    // threads the notebook's OWN backend (Step 6 widens the cross-backend switch
+    // logic; here the source re-embeds under whatever backend it is configured).
+    let coord = crate::vector_store::Coordinate::new(
+        notebook.to_string(),
+        embed_backend,
+        embed_model.clone(),
+        embed_dim,
+    );
 
     // ── (3) Embed into a PRIVATE building table — LOCK-FREE (search reads only the
     // active table). The embedder `Mutex` is the only serialization point.
@@ -84,9 +93,7 @@ pub(crate) async fn reembed_and_flip(
     let data_dir = engine.data_dir().await;
     let store = LanceVectorStore::new(&data_dir, pool.clone());
 
-    let building_name = store
-        .create_building_table(notebook, &embed_model, embed_dim)
-        .await?;
+    let building_name = store.create_building_table(&coord).await?;
 
     // Seed the building table with every OTHER source's current vectors so this
     // per-source flip PRESERVES them. The flip promotes the building table to be
@@ -104,7 +111,7 @@ pub(crate) async fn reembed_and_flip(
     // reworks this orchestration — kept out of this hotfix to preserve the
     // sub-second lock window (the seed copy is unbounded in size).
     store
-        .seed_building_from_active(notebook, &embed_model, embed_dim, &building_name, source_id)
+        .seed_building_from_active(&coord, &building_name, source_id)
         .await?;
 
     for batch in chunks.chunks(REEMBED_BATCH) {
@@ -171,9 +178,7 @@ pub(crate) async fn reembed_and_flip(
             return Ok(());
         }
 
-        store
-            .flip_active(notebook, &embed_model, embed_dim, &building_name)
-            .await?;
+        store.flip_active(&coord, &building_name).await?;
     }
 
     // ── (5) Terminal: enriched. (If a crash hit between the flip commit and here,
@@ -232,7 +237,14 @@ pub(crate) async fn reembed_notebook(
     let nb = notebook_id.to_string();
 
     // The NEW configured coordinate (notebooks.embedding_model → registry, R1).
-    let (new_model, new_dim) = engine.resolve_notebook_embedding(notebook_id).await?;
+    // NOTE (Step 6): the backend axis is resolved here but the OLD-coordinate
+    // discovery + NoOp filter below remain (model, dim)-only; Step 6 widens them to
+    // the full `(model, dim, backend)` triple (R2 same-dim cross-backend switch).
+    // For Steps 1-2 the workspace must compile and existing (same-backend) tests
+    // must not regress — retirement therefore stamps the resolved `new_backend`.
+    let (new_model, new_dim, new_backend) = engine.resolve_notebook_embedding(notebook_id).await?;
+    let new_coord =
+        crate::vector_store::Coordinate::new(nb.clone(), new_backend, new_model.clone(), new_dim);
 
     // The OLD active coordinate(s) currently backing the notebook's search, minus
     // any that already equal the configured coordinate (the user re-picked the same
@@ -280,9 +292,7 @@ pub(crate) async fn reembed_notebook(
     let embedder = engine.embedder_for(&new_model).await?;
     let data_dir = engine.data_dir().await;
     let store = LanceVectorStore::new(&data_dir, pool.clone());
-    let building_name = store
-        .create_building_table(&nb, &new_model, new_dim)
-        .await?;
+    let building_name = store.create_building_table(&new_coord).await?;
 
     let mut done = 0usize;
     for batch in items.chunks(REEMBED_BATCH) {
@@ -337,7 +347,9 @@ pub(crate) async fn reembed_notebook(
         // what we built, SKIP the flip and leave the building table for the
         // startup-GC — the newer switch's own re-embed wins. Mirrors the purge-vs-flip
         // guard in `reembed_and_flip`.
-        let (configured_model, configured_dim) =
+        // (Step 6 extends this guard to compare `backend` too; for now it stays
+        // model/dim-scoped — `_configured_backend` is intentionally unused here.)
+        let (configured_model, configured_dim, _configured_backend) =
             engine.resolve_notebook_embedding(notebook_id).await?;
         if configured_model != new_model || configured_dim != new_dim {
             tracing::debug!(
@@ -350,16 +362,23 @@ pub(crate) async fn reembed_notebook(
             return Ok(ReembedOutcome::RaceAborted);
         }
 
-        store
-            .flip_active(&nb, &new_model, new_dim, &building_name)
-            .await?;
+        store.flip_active(&new_coord, &building_name).await?;
     }
 
     // Retire each OLD coordinate now that the NEW one is active. Each call is
     // idempotent + crash-recoverable (R3): a crash mid-retire leaves a `stale` row
     // the startup-GC reclaims, and the new coordinate already serves search.
     for (old_model, old_dim) in &old_coords {
-        store.retire_coordinate(&nb, old_model, *old_dim).await?;
+        // Step 6 sources `backend` from the OLD-coordinate discovery; for now the
+        // retirement stamps the resolved `new_backend` (correct for all
+        // same-backend switches, which is every existing 4b-A case + test).
+        let old_coord = crate::vector_store::Coordinate::new(
+            nb.clone(),
+            new_backend,
+            old_model.clone(),
+            *old_dim,
+        );
+        store.retire_coordinate(&old_coord).await?;
     }
 
     Ok(ReembedOutcome::Switched {

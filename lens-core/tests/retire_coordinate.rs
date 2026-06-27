@@ -11,9 +11,14 @@
 use std::sync::atomic::Ordering;
 
 use lens_core::vector_store::{
-    CRASH_AFTER_RETIRE_STALE_BEFORE_LANCE_DROP, LanceVectorStore, VectorRow, VectorStore,
+    CRASH_AFTER_RETIRE_STALE_BEFORE_LANCE_DROP, Coordinate, LanceVectorStore, VectorRow,
+    VectorStore,
 };
-use lens_core::{DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, LensEngine};
+use lens_core::{DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, EmbeddingBackend, LensEngine};
+
+fn coord(nb: &str, model: &str, dim: usize) -> Coordinate {
+    Coordinate::new(nb, EmbeddingBackend::Fastembed, model, dim)
+}
 
 /// A deterministic unit vector of length `dim`.
 fn unit_vector(seed: usize, dim: usize) -> Vec<f32> {
@@ -114,25 +119,23 @@ async fn retire_drops_active_and_leaves_other_coordinate() {
     // Two active coordinates coexist (different model/dim → partial-unique OK).
     store
         .add(
-            &nb,
-            DEFAULT_EMBED_MODEL_ID,
-            DEFAULT_EMBED_DIM,
+            &coord(&nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM),
             make_rows(&nb, 4, DEFAULT_EMBED_DIM),
         )
         .await
         .unwrap();
     store
-        .add(&nb, BGE, BGE_DIM, make_rows(&nb, 4, BGE_DIM))
+        .add(&coord(&nb, BGE, BGE_DIM), make_rows(&nb, 4, BGE_DIM))
         .await
         .unwrap();
 
-    let nomic_table = format!("vec__{nb}__nomic_v15__d{DEFAULT_EMBED_DIM}");
-    let bge_table = format!("vec__{nb}__{BGE_TABLE}__d{BGE_DIM}");
+    let nomic_table = format!("vec__{nb}__fastembed__nomic_v15__d{DEFAULT_EMBED_DIM}");
+    let bge_table = format!("vec__{nb}__fastembed__{BGE_TABLE}__d{BGE_DIM}");
     assert!(table_exists(dir.path(), &nomic_table).await);
     assert!(table_exists(dir.path(), &bge_table).await);
 
     store
-        .retire_coordinate(&nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM)
+        .retire_coordinate(&coord(&nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM))
         .await
         .unwrap();
 
@@ -147,7 +150,7 @@ async fn retire_drops_active_and_leaves_other_coordinate() {
     assert_eq!(row_count(&pool, &nb, BGE, BGE_DIM, Some("active")).await, 1);
     assert!(table_exists(dir.path(), &bge_table).await);
     let hits = store
-        .search(&nb, BGE, BGE_DIM, &unit_vector(0, BGE_DIM), 4)
+        .search(&coord(&nb, BGE, BGE_DIM), &unit_vector(0, BGE_DIM), 4)
         .await
         .unwrap();
     assert!(!hits.is_empty(), "bge-m3 coordinate still serves search");
@@ -163,20 +166,18 @@ async fn retire_leaves_building_row_untouched() {
 
     store
         .add(
-            &nb,
-            DEFAULT_EMBED_MODEL_ID,
-            DEFAULT_EMBED_DIM,
+            &coord(&nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM),
             make_rows(&nb, 4, DEFAULT_EMBED_DIM),
         )
         .await
         .unwrap();
     let building = store
-        .create_building_table(&nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM)
+        .create_building_table(&coord(&nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM))
         .await
         .unwrap();
 
     store
-        .retire_coordinate(&nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM)
+        .retire_coordinate(&coord(&nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM))
         .await
         .unwrap();
 
@@ -215,7 +216,7 @@ async fn retire_idempotent_when_no_active() {
 
     // Never added → no active row.
     store
-        .retire_coordinate(&nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM)
+        .retire_coordinate(&coord(&nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM))
         .await
         .expect("no-op, not an error");
     assert_eq!(
@@ -233,19 +234,17 @@ async fn retire_crash_before_drop_recovered_by_gc() {
 
     store
         .add(
-            &nb,
-            DEFAULT_EMBED_MODEL_ID,
-            DEFAULT_EMBED_DIM,
+            &coord(&nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM),
             make_rows(&nb, 4, DEFAULT_EMBED_DIM),
         )
         .await
         .unwrap();
-    let nomic_table = format!("vec__{nb}__nomic_v15__d{DEFAULT_EMBED_DIM}");
+    let nomic_table = format!("vec__{nb}__fastembed__nomic_v15__d{DEFAULT_EMBED_DIM}");
 
     // Arm the crash seam: demote commits, then retire returns early.
     CRASH_AFTER_RETIRE_STALE_BEFORE_LANCE_DROP.store(true, Ordering::SeqCst);
     store
-        .retire_coordinate(&nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM)
+        .retire_coordinate(&coord(&nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM))
         .await
         .unwrap();
 

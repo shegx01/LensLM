@@ -35,8 +35,14 @@ use lens_core::chunk::{
 };
 use lens_core::embedder::{CountingEmbedder, Embedder, FastembedEmbedder};
 use lens_core::parse::{Block, SourceKind, parse_blocks};
-use lens_core::vector_store::{LanceVectorStore, VectorRow, VectorStore};
-use lens_core::{DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, IngestProgress, LensEngine};
+use lens_core::vector_store::{Coordinate, LanceVectorStore, VectorRow, VectorStore};
+use lens_core::{
+    DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, EmbeddingBackend, IngestProgress, LensEngine,
+};
+
+fn coord(nb: &str, model: &str, dim: usize) -> Coordinate {
+    Coordinate::new(nb, EmbeddingBackend::Fastembed, model, dim)
+}
 use sqlx::Row;
 
 mod support;
@@ -279,9 +285,7 @@ async fn vector_store_notebook_isolation() {
     // Notebook 1: two chunks on axes 0 and 1.
     store
         .add(
-            &nb1,
-            DEFAULT_EMBED_MODEL_ID,
-            DEFAULT_EMBED_DIM,
+            &coord(&nb1, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM),
             vec![
                 VectorRow {
                     chunk_id: "nb1-a".into(),
@@ -306,9 +310,7 @@ async fn vector_store_notebook_isolation() {
     // would surface it).
     store
         .add(
-            &nb2,
-            DEFAULT_EMBED_MODEL_ID,
-            DEFAULT_EMBED_DIM,
+            &coord(&nb2, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM),
             vec![VectorRow {
                 chunk_id: "nb2-a".into(),
                 source_id: "s2".into(),
@@ -322,9 +324,7 @@ async fn vector_store_notebook_isolation() {
 
     let hits = store
         .search(
-            &nb1,
-            DEFAULT_EMBED_MODEL_ID,
-            DEFAULT_EMBED_DIM,
+            &coord(&nb1, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM),
             &unit_vector(0),
             5,
         )
@@ -362,9 +362,7 @@ async fn vector_store_search_orders_by_ascending_cosine() {
 
     store
         .add(
-            &nbx,
-            DEFAULT_EMBED_MODEL_ID,
-            DEFAULT_EMBED_DIM,
+            &coord(&nbx, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM),
             vec![
                 VectorRow {
                     chunk_id: "near".into(),
@@ -387,9 +385,7 @@ async fn vector_store_search_orders_by_ascending_cosine() {
 
     let hits = store
         .search(
-            &nbx,
-            DEFAULT_EMBED_MODEL_ID,
-            DEFAULT_EMBED_DIM,
+            &coord(&nbx, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM),
             &unit_vector(0),
             2,
         )
@@ -423,9 +419,7 @@ async fn embedding_index_registers_once_per_notebook() {
     // First source into nb1.
     store
         .add(
-            &nb1,
-            DEFAULT_EMBED_MODEL_ID,
-            DEFAULT_EMBED_DIM,
+            &coord(&nb1, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM),
             vec![VectorRow {
                 chunk_id: "c1".into(),
                 source_id: "s1".into(),
@@ -440,9 +434,7 @@ async fn embedding_index_registers_once_per_notebook() {
     // Second source into the SAME notebook (idempotent register).
     store
         .add(
-            &nb1,
-            DEFAULT_EMBED_MODEL_ID,
-            DEFAULT_EMBED_DIM,
+            &coord(&nb1, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM),
             vec![VectorRow {
                 chunk_id: "c2".into(),
                 source_id: "s2".into(),
@@ -479,7 +471,7 @@ async fn embedding_index_registers_once_per_notebook() {
     );
     assert_eq!(
         r.get::<String, _>("lance_table_name"),
-        format!("vec__{nb1}__nomic_v15__d{DEFAULT_EMBED_DIM}")
+        format!("vec__{nb1}__fastembed__nomic_v15__d{DEFAULT_EMBED_DIM}")
     );
     assert_eq!(r.get::<String, _>("status"), "active");
 }
@@ -1352,9 +1344,11 @@ async fn real_model_end_to_end_ingest_and_search() {
         .unwrap();
     let hits = store
         .search(
-            &nb.id.to_string(),
-            DEFAULT_EMBED_MODEL_ID,
-            DEFAULT_EMBED_DIM,
+            &coord(
+                &nb.id.to_string(),
+                DEFAULT_EMBED_MODEL_ID,
+                DEFAULT_EMBED_DIM,
+            ),
             &qvec,
             5,
         )

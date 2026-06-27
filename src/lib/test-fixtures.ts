@@ -23,6 +23,7 @@ export function baseAppConfig(overrides?: Partial<AppConfig>): AppConfig {
     tier_thresholds: { tier1_token_cap: 4000, tier2_token_cap: 16000 },
     onboarding_complete: false,
     embedding_model: '',
+    embedding_backend: '',
     ...overrides
   };
 }

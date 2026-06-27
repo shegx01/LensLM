@@ -28,8 +28,8 @@ pub mod vector_store;
 
 pub use config::{AppConfig, EnrichmentConfig, TaskModel};
 pub use embedder::{
-    CountingEmbedder, DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, Embedder, EmbeddingModelSpec,
-    FastembedEmbedder, resolve, resolve_opt,
+    CountingEmbedder, DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, Embedder, EmbeddingBackend,
+    EmbeddingModelSpec, FastembedEmbedder, resolve, resolve_opt,
 };
 pub use embedding::{InstallProgress, pull_embedding_model};
 pub use enrichment::{ENRICHMENT_QUEUE_CAPACITY, EnrichmentJob};
@@ -663,11 +663,13 @@ impl LensEngine {
         // Resolve the OWNING notebook's embedding coordinate (R1) so the drop
         // targets the right per-notebook table instead of the global default.
         let notebook_id = NotebookId::from(source.notebook_id.clone());
-        let (model, dim) = self.resolve_notebook_embedding(&notebook_id).await?;
+        let (model, dim, backend) = self.resolve_notebook_embedding(&notebook_id).await?;
         let store = crate::vector_store::LanceVectorStore::new(&data_dir, pool.clone());
-        store
-            .drop_source(&source.notebook_id, &model, dim, source_id)
-            .await?;
+        // NOTE (Steps 7): for now this drops from the single resolved coordinate;
+        // the ALL-active-coordinates enumeration (R7b) lands in Step 7.
+        let coord =
+            crate::vector_store::Coordinate::new(source.notebook_id.clone(), backend, model, dim);
+        store.drop_source(&coord, source_id).await?;
         NotebookRepo::new(&pool).purge_source(source_id).await?;
         // Best-effort: remove the managed source file AND its `.extracted.txt`
         // sibling so "Delete forever" does not leak either on disk. A missing
@@ -1112,8 +1114,8 @@ impl LensEngine {
         Ok(embedder)
     }
 
-    /// Resolves a notebook's configured embedding model to its `(model_id, dim)`
-    /// coordinate components (R1).
+    /// Resolves a notebook's configured embedding coordinate components
+    /// `(model_id, dim, backend)` (R1, M4 Phase 4b-B widened from `(model, dim)`).
     ///
     /// This is the SINGLE read-path entry point every query / ingest / re-embed
     /// caller resolves through before touching the vector store: it reads the
@@ -1125,25 +1127,31 @@ impl LensEngine {
     /// thread straight into [`embedder_for`](Self::embedder_for) and the
     /// `VectorStore` coordinate APIs.
     ///
-    /// The backend is implicitly `fastembed` in Phase 4b-A (it is NOT part of the
-    /// coordinate); a backend dimension lands with the selector UI in 4b-B.
+    /// The backend (M4 Phase 4b-B) is the THIRD coordinate axis: a NULL/empty/
+    /// unknown `embedding_backend` column resolves to the global default backend
+    /// via [`crate::embedder::EmbeddingBackend::from_opt_str`] (which, with an
+    /// unset config, is `fastembed`). The returned `(model, dim, backend)` triple
+    /// is everything a caller needs to construct a `VectorStore` `Coordinate`.
     pub async fn resolve_notebook_embedding(
         &self,
         notebook_id: &NotebookId,
-    ) -> Result<(String, usize), LensError> {
+    ) -> Result<(String, usize, crate::embedder::EmbeddingBackend), LensError> {
         let pool = self.pool().await;
-        // `fetch_optional` → None means NO such notebook row (fail fast); `Some(None)`
-        // means the row exists with a NULL `embedding_model` (resolve to the default).
-        let stored: Option<String> =
-            sqlx::query_scalar("SELECT embedding_model FROM notebooks WHERE id = ?")
+        // `fetch_optional` → None means NO such notebook row (fail fast); `Some(row)`
+        // with NULL columns means the row exists with a NULL model/backend (resolve
+        // each to the default).
+        let row: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT embedding_model, embedding_backend FROM notebooks WHERE id = ?")
                 .bind(notebook_id.as_str())
                 .fetch_optional(&pool)
                 .await?
                 .ok_or_else(|| {
                     LensError::Validation(format!("no notebook with id {notebook_id}"))
                 })?;
-        let spec = crate::embedder::resolve(stored.as_deref().unwrap_or(""));
-        Ok((spec.id.to_string(), spec.dim))
+        let (stored_model, stored_backend) = row;
+        let spec = crate::embedder::resolve(stored_model.as_deref().unwrap_or(""));
+        let backend = crate::embedder::EmbeddingBackend::from_opt_str(stored_backend.as_deref());
+        Ok((spec.id.to_string(), spec.dim, backend))
     }
 
     /// Persists a new embedding model choice for a notebook.
@@ -1198,7 +1206,9 @@ impl LensEngine {
         &self,
         notebook_id: &NotebookId,
     ) -> Result<(String, usize, String), LensError> {
-        let (model_id, dim) = self.resolve_notebook_embedding(notebook_id).await?;
+        // The `backend` axis is resolved here but the status query stays
+        // backend-blind until Step 4 (R4/R7a adds `AND backend = ?`).
+        let (model_id, dim, _backend) = self.resolve_notebook_embedding(notebook_id).await?;
         let pool = self.pool().await;
         let active: Option<i64> = sqlx::query_scalar(
             "SELECT 1 FROM embedding_index \

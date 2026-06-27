@@ -109,7 +109,7 @@ async fn resolve_notebook_embedding_mxbai() {
         .await
         .expect("set mxbai");
 
-    let (model, dim) = engine
+    let (model, dim, _backend) = engine
         .resolve_notebook_embedding(&nb.id)
         .await
         .expect("resolve");
@@ -132,7 +132,7 @@ async fn resolve_notebook_embedding_null_is_default() {
         .await
         .expect("null model");
 
-    let (model, dim) = engine
+    let (model, dim, _backend) = engine
         .resolve_notebook_embedding(&nb.id)
         .await
         .expect("resolve");
@@ -156,7 +156,7 @@ async fn resolve_notebook_embedding_unknown_is_default() {
         .await
         .expect("set unknown");
 
-    let (model, dim) = engine
+    let (model, dim, _backend) = engine
         .resolve_notebook_embedding(&nb.id)
         .await
         .expect("resolve");

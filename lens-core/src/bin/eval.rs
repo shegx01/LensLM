@@ -557,6 +557,13 @@ async fn measure(
         .create_notebook(EVAL_NOTEBOOK_TITLE, None, None)
         .await?;
     let notebook_id = notebook.id.as_str();
+    // The eval harness is fastembed-only until Step 8 adds a `--backend` flag.
+    let coord = lens_core::vector_store::Coordinate::new(
+        notebook_id.to_string(),
+        lens_core::EmbeddingBackend::Fastembed,
+        spec.id.to_string(),
+        spec.dim,
+    );
 
     // chunk_id -> snippet for the printed result table.
     let mut chunk_text: HashMap<String, String> = HashMap::new();
@@ -628,7 +635,7 @@ async fn measure(
             });
         }
         let n = rows.len();
-        store.add(notebook_id, spec.id, spec.dim, rows).await?;
+        store.add(&coord, rows).await?;
         println!("ingested {} ({n} rows)", doc.name);
     }
 
@@ -636,9 +643,7 @@ async fn measure(
     println!("=== Retrieval (k = {K}) ===");
     for q in queries {
         let qvec = embedder.embed_query(&q.query)?;
-        let results = store
-            .search(notebook_id, spec.id, spec.dim, &qvec, K)
-            .await?;
+        let results = store.search(&coord, &qvec, K).await?;
         let top_ids: Vec<&str> = results.iter().map(|h| h.chunk_id.as_str()).collect();
         let hit = q
             .gold_chunk_ids

@@ -149,7 +149,7 @@ pub async fn vector_chunk_ids(
         Err(_) => return std::collections::HashSet::new(),
     };
     let table_name = format!(
-        "vec__{notebook}__nomic_v15__d{}",
+        "vec__{notebook}__fastembed__nomic_v15__d{}",
         lens_core::DEFAULT_EMBED_DIM
     );
     let names = conn.table_names().execute().await.unwrap_or_default();

@@ -12,8 +12,14 @@ use std::time::Duration;
 
 use lens_core::embedder::{CountingEmbedder, Embedder, resolve};
 use lens_core::enrichment::reembed::ReembedOutcome;
-use lens_core::vector_store::{LanceVectorStore, VectorRow, VectorStore};
-use lens_core::{DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, LensEngine, NotebookId};
+use lens_core::vector_store::{Coordinate, LanceVectorStore, VectorRow, VectorStore};
+use lens_core::{
+    DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, EmbeddingBackend, LensEngine, NotebookId,
+};
+
+fn coord(nb: &str, model: &str, dim: usize) -> Coordinate {
+    Coordinate::new(nb, EmbeddingBackend::Fastembed, model, dim)
+}
 
 const BGE: &str = "bge-m3";
 const BGE_DIM: usize = 1024;
@@ -112,9 +118,7 @@ async fn seed_nomic_notebook(engine: &LensEngine) -> (String, String) {
     let store = LanceVectorStore::new(&data_dir, pool.clone());
     store
         .add(
-            &nb,
-            DEFAULT_EMBED_MODEL_ID,
-            DEFAULT_EMBED_DIM,
+            &coord(&nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM),
             vec![
                 row(&parent_id, &source_id, &nb, 0),
                 row(&child_id, &source_id, &nb, 1),
@@ -211,7 +215,10 @@ async fn model_change_reembeds_into_new_coordinate_and_retires_old() {
     // Search on the NEW coordinate returns hits (the new table serves).
     let store = LanceVectorStore::new(&engine.data_dir_for_test().await, engine.pool().await);
     let q = vec![0.1_f32; BGE_DIM];
-    let hits = store.search(&nb, BGE, BGE_DIM, &q, 4).await.unwrap();
+    let hits = store
+        .search(&coord(&nb, BGE, BGE_DIM), &q, 4)
+        .await
+        .unwrap();
     assert_eq!(hits.len(), 2, "both chunks searchable under the new model");
 }
 

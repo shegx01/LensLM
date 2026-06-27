@@ -51,6 +51,7 @@ use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use crate::LensError;
+use crate::embedder::EmbeddingBackend;
 
 /// The default embedding dimension (nomic-embed-text-v1.5 = 768). NOT a global
 /// constraint since M4 Phase 4b: each coordinate carries its own `dim` (384/768/
@@ -97,6 +98,49 @@ pub static CRASH_AFTER_FLIP_TXN_BEFORE_LANCE_DROP: std::sync::atomic::AtomicBool
 pub static CRASH_AFTER_RETIRE_STALE_BEFORE_LANCE_DROP: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// The complete logical embedding *coordinate* of a notebook's vector set
+/// (M4 Phase 4b-B): `(notebook, backend, model, dim)`.
+///
+/// This is the parameter type for every backend-aware [`VectorStore`]/registry
+/// method. Materializing the four axes as a struct (rather than threading four
+/// scalars) makes the catastrophic wrong-coordinate class — transposing
+/// `backend`/`model`, or forgetting `backend` entirely — a COMPILE error rather
+/// than a silent cross-backend vector-pollution bug (Decision A / ADR). A
+/// fastembed-768 and an ollama-768 set for the SAME model id are different
+/// numerical embeddings and MUST live in physically distinct LanceDB tables and
+/// `embedding_index` rows; the `backend` axis is what keeps them apart in both
+/// the physical table name (slug A1) and the 4-col partial-unique active index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Coordinate {
+    /// Owning notebook id.
+    pub notebook: String,
+    /// The embedding backend (`fastembed` | `ollama`).
+    pub backend: EmbeddingBackend,
+    /// Canonical registry model id (e.g. `nomic-embed-text-v1.5`).
+    pub model: String,
+    /// Output vector dimension.
+    pub dim: usize,
+}
+
+impl Coordinate {
+    /// Constructs a coordinate from its four axes. Callers resolve
+    /// `(model, dim, backend)` (e.g. via `resolve_notebook_embedding`) and build
+    /// the coordinate at the call boundary.
+    pub fn new(
+        notebook: impl Into<String>,
+        backend: EmbeddingBackend,
+        model: impl Into<String>,
+        dim: usize,
+    ) -> Self {
+        Self {
+            notebook: notebook.into(),
+            backend,
+            model: model.into(),
+            dim,
+        }
+    }
+}
+
 /// A single vector row to insert, addressed by its owning logical coordinates.
 ///
 /// `chunk_id` is the SQLite `chunks.id` — the LanceDB→SQLite link is keyed by
@@ -128,37 +172,24 @@ pub struct Hit {
 /// physical store internally; callers never pass a physical table name.
 #[async_trait::async_trait]
 pub trait VectorStore: Send + Sync {
-    /// Adds `rows` to the logical store for `(notebook, model, dim)`, creating
-    /// it (and registering it) on first use.
-    async fn add(
-        &self,
-        notebook: &str,
-        model: &str,
-        dim: usize,
-        rows: Vec<VectorRow>,
-    ) -> Result<(), LensError>;
+    /// Adds `rows` to the logical store for `coord`, creating it (and registering
+    /// it) on first use.
+    async fn add(&self, coord: &Coordinate, rows: Vec<VectorRow>) -> Result<(), LensError>;
 
-    /// Returns the `k` nearest chunk ids for `query` within `notebook`, ordered
-    /// by ascending cosine distance. Pins `DistanceType::Cosine` explicitly.
+    /// Returns the `k` nearest chunk ids for `query` within `coord`, ordered by
+    /// ascending cosine distance. Pins `DistanceType::Cosine` explicitly.
     async fn search(
         &self,
-        notebook: &str,
-        model: &str,
-        dim: usize,
+        coord: &Coordinate,
         query: &[f32],
         k: usize,
     ) -> Result<Vec<Hit>, LensError>;
 
-    /// Drops every vector belonging to `source_id` (the re-ingest wipe). Per the
-    /// cross-store ordering guarantee, this runs BEFORE the SQLite `chunks`
-    /// delete so a completed wipe leaves no orphan Lance rows.
-    async fn drop_source(
-        &self,
-        notebook: &str,
-        model: &str,
-        dim: usize,
-        source_id: &str,
-    ) -> Result<(), LensError>;
+    /// Drops every vector belonging to `source_id` (the re-ingest wipe) from the
+    /// active table of `coord`. Per the cross-store ordering guarantee, this runs
+    /// BEFORE the SQLite `chunks` delete so a completed wipe leaves no orphan
+    /// Lance rows.
+    async fn drop_source(&self, coord: &Coordinate, source_id: &str) -> Result<(), LensError>;
 
     /// Drops the physical Lance tables named in `table_names`, ignoring any that
     /// do not exist (idempotent — a re-purge re-drops nothing).
@@ -180,12 +211,7 @@ pub trait VectorStore: Send + Sync {
     /// [`flip_active`](VectorStore::flip_active). The building table is invisible
     /// to [`search`](VectorStore::search) (which resolves `status='active'` only),
     /// so populating it needs NO `ingest_lock`.
-    async fn create_building_table(
-        &self,
-        notebook: &str,
-        model: &str,
-        dim: usize,
-    ) -> Result<String, LensError>;
+    async fn create_building_table(&self, coord: &Coordinate) -> Result<String, LensError>;
 
     /// Appends `rows` to the physical table named `table_name` (M4 Phase 3,
     /// Step 5). Used to populate a `building` table created by
@@ -212,13 +238,7 @@ pub trait VectorStore: Send + Sync {
     /// physical Lance table is dropped and its registry row deleted. A crash
     /// between the commit and the Lance-drop leaves a `stale` row + orphan table
     /// that the startup-GC reclaims (idempotently — a missing table is a no-op).
-    async fn flip_active(
-        &self,
-        notebook: &str,
-        model: &str,
-        dim: usize,
-        building_name: &str,
-    ) -> Result<(), LensError>;
+    async fn flip_active(&self, coord: &Coordinate, building_name: &str) -> Result<(), LensError>;
 
     /// Retires an OLD-model coordinate after a model/dim-change re-embed has
     /// flipped the NEW coordinate `active` (M4 Phase 4b, Step 9 / R3).
@@ -231,12 +251,7 @@ pub trait VectorStore: Send + Sync {
     /// A crash between any two leaves a `stale` row + (possibly already-dropped)
     /// table that the startup-GC `gc_orphan_embedding_tables` reclaims. A no-op
     /// when the coordinate has no `active` row (already retired).
-    async fn retire_coordinate(
-        &self,
-        notebook: &str,
-        model: &str,
-        dim: usize,
-    ) -> Result<(), LensError>;
+    async fn retire_coordinate(&self, coord: &Coordinate) -> Result<(), LensError>;
 }
 
 /// Slugifies a model id into a filesystem/table-safe token.
@@ -265,36 +280,51 @@ fn model_slug(model: &str) -> String {
 }
 
 /// Resolves the physical LanceDB table name for a logical coordinate
-/// `(notebook, model, dim)`.
+/// `(notebook, backend, model, dim)`.
 ///
-/// The `dim` is encoded as a `__d{dim}` segment so two coordinates that share a
-/// `(notebook, model)` but differ in `dim` (M4 Phase 4b: the same notebook may be
-/// re-embedded with a different model/dim) never collide on one physical table:
-/// `vec__{notebook}__{model_slug}__d{dim}`.
+/// `backend` is injected as its OWN segment (slug A1, M4 Phase 4b-B):
+/// `vec__{notebook}__{backend}__{model_slug}__d{dim}`. This makes a fastembed and
+/// an ollama set for the same `(notebook, model, dim)` resolve to byte-DISTINCT
+/// physical tables, so a cross-backend collision is structurally impossible at
+/// the physical-table level. The `dim` `__d{dim}` segment still keeps two dims of
+/// the same `(notebook, backend, model)` apart.
 ///
 /// CRITICAL: this generator names NEW coordinates only. EXISTING tables keep their
 /// stored physical name — every read/write path resolves a coordinate to a table
 /// via the registry's `lance_table_name` column, never by re-deriving it here. A
-/// nomic-768 table created before this segment existed (`vec__{nb}__nomic_v15`)
-/// stays valid because its name lives in the registry; only freshly-created
-/// coordinates flow through this function.
-fn table_name(notebook: &str, model: &str, dim: usize) -> String {
-    format!("vec__{notebook}__{}__d{dim}", model_slug(model))
+/// 4b-A nomic-768 table created before the backend segment existed
+/// (`vec__{nb}__nomic_v15__d768`) stays valid because its name lives in the
+/// registry; only freshly-created coordinates flow through this function.
+fn table_name(notebook: &str, backend: EmbeddingBackend, model: &str, dim: usize) -> String {
+    format!(
+        "vec__{notebook}__{}__{}__d{dim}",
+        backend.as_str(),
+        model_slug(model)
+    )
 }
 
 /// Resolves the gen-suffixed physical table name for a coordinate + generation
 /// (Decision A: the re-embed new-table-flip).
 ///
 /// **gen-0 == [`table_name`] (byte-identical).** A non-zero generation appends
-/// `__{gen}` AFTER the dim segment (`vec__{nb}__{slug}__d{dim}__{gen}`, R7
-/// ordering: dim before gen) so a freshly-built `building` table co-exists beside
-/// the live `active` table for the SAME coordinate (the partial-unique registry
-/// from migration `0005` allows it).
-fn gen_table_name(notebook: &str, model: &str, dim: usize, generation: u32) -> String {
+/// `__{gen}` AFTER the dim segment (`vec__{nb}__{backend}__{slug}__d{dim}__{gen}`,
+/// R7 ordering: dim before gen) so a freshly-built `building` table co-exists
+/// beside the live `active` table for the SAME coordinate (the partial-unique
+/// registry from migration `0005`/`0007` allows it).
+fn gen_table_name(
+    notebook: &str,
+    backend: EmbeddingBackend,
+    model: &str,
+    dim: usize,
+    generation: u32,
+) -> String {
     if generation == 0 {
-        table_name(notebook, model, dim)
+        table_name(notebook, backend, model, dim)
     } else {
-        format!("{}__{generation}", table_name(notebook, model, dim))
+        format!(
+            "{}__{generation}",
+            table_name(notebook, backend, model, dim)
+        )
     }
 }
 
@@ -380,10 +410,10 @@ impl EmbeddingIndexRepo {
         Self { pool }
     }
 
-    /// Registers a `(notebook, model, dim)` mapping if absent.
+    /// Registers a `(notebook, backend, model, dim)` mapping if absent.
     ///
-    /// Uses `ON CONFLICT(notebook_id, model, dim) WHERE status='active' DO
-    /// NOTHING` so re-registering an existing logical coordinate (e.g. on table
+    /// Uses `ON CONFLICT(notebook_id, backend, model, dim) WHERE status='active'
+    /// DO NOTHING` so re-registering an existing logical coordinate (e.g. on table
     /// re-open) keeps the existing row untouched and is a no-op. The conflict
     /// target carries the `WHERE status='active'` predicate because the registry
     /// constraint was relaxed in migration `0005` from a table-level
@@ -398,9 +428,7 @@ impl EmbeddingIndexRepo {
     /// freely co-exist with the live `active` row for the same coordinate.
     async fn register(
         &self,
-        notebook: &str,
-        model: &str,
-        dim: usize,
+        coord: &Coordinate,
         prefix: &str,
         table: &str,
         status: &str,
@@ -409,14 +437,15 @@ impl EmbeddingIndexRepo {
         let now = chrono::Utc::now().to_rfc3339();
         sqlx::query(
             "INSERT INTO embedding_index \
-                 (id, notebook_id, model, dim, prefix_convention, lance_table_name, status, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(notebook_id, model, dim) WHERE status='active' DO NOTHING",
+                 (id, notebook_id, backend, model, dim, prefix_convention, lance_table_name, status, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(notebook_id, backend, model, dim) WHERE status='active' DO NOTHING",
         )
         .bind(&id)
-        .bind(notebook)
-        .bind(model)
-        .bind(dim as i64)
+        .bind(&coord.notebook)
+        .bind(coord.backend.as_str())
+        .bind(&coord.model)
+        .bind(coord.dim as i64)
         .bind(prefix)
         .bind(table)
         .bind(status)
@@ -506,17 +535,16 @@ impl EmbeddingIndexRepo {
     /// status (used to compute the next free generation for a building table).
     async fn lance_table_names_for_coordinate(
         &self,
-        notebook: &str,
-        model: &str,
-        dim: usize,
+        coord: &Coordinate,
     ) -> Result<Vec<String>, LensError> {
         let names = sqlx::query_scalar::<_, String>(
             "SELECT lance_table_name FROM embedding_index \
-             WHERE notebook_id = ? AND model = ? AND dim = ?",
+             WHERE notebook_id = ? AND backend = ? AND model = ? AND dim = ?",
         )
-        .bind(notebook)
-        .bind(model)
-        .bind(dim as i64)
+        .bind(&coord.notebook)
+        .bind(coord.backend.as_str())
+        .bind(&coord.model)
+        .bind(coord.dim as i64)
         .fetch_all(&self.pool)
         .await?;
         Ok(names)
@@ -526,17 +554,16 @@ impl EmbeddingIndexRepo {
     /// for a coordinate, or `None` when none is registered (AC8 search read-path).
     async fn active_lance_table_name(
         &self,
-        notebook: &str,
-        model: &str,
-        dim: usize,
+        coord: &Coordinate,
     ) -> Result<Option<String>, LensError> {
         let name = sqlx::query_scalar::<_, String>(
             "SELECT lance_table_name FROM embedding_index \
-             WHERE notebook_id = ? AND model = ? AND dim = ? AND status = 'active'",
+             WHERE notebook_id = ? AND backend = ? AND model = ? AND dim = ? AND status = 'active'",
         )
-        .bind(notebook)
-        .bind(model)
-        .bind(dim as i64)
+        .bind(&coord.notebook)
+        .bind(coord.backend.as_str())
+        .bind(&coord.model)
+        .bind(coord.dim as i64)
         .fetch_optional(&self.pool)
         .await?;
         Ok(name)
@@ -554,9 +581,7 @@ impl EmbeddingIndexRepo {
     /// serialized), so search never observes zero or two active tables.
     async fn flip_active_txn(
         &self,
-        notebook: &str,
-        model: &str,
-        dim: usize,
+        coord: &Coordinate,
         building_name: &str,
     ) -> Result<Option<String>, LensError> {
         let mut tx = self.pool.begin().await?;
@@ -565,11 +590,12 @@ impl EmbeddingIndexRepo {
         // inside the txn so it is consistent with the UPDATEs below.
         let stale_name = sqlx::query_scalar::<_, String>(
             "SELECT lance_table_name FROM embedding_index \
-             WHERE notebook_id = ? AND model = ? AND dim = ? AND status = 'active'",
+             WHERE notebook_id = ? AND backend = ? AND model = ? AND dim = ? AND status = 'active'",
         )
-        .bind(notebook)
-        .bind(model)
-        .bind(dim as i64)
+        .bind(&coord.notebook)
+        .bind(coord.backend.as_str())
+        .bind(&coord.model)
+        .bind(coord.dim as i64)
         .fetch_optional(&mut *tx)
         .await?;
 
@@ -577,23 +603,25 @@ impl EmbeddingIndexRepo {
         // permits the promote below (at most one `active` per coordinate).
         sqlx::query(
             "UPDATE embedding_index SET status = 'stale' \
-             WHERE notebook_id = ? AND model = ? AND dim = ? AND status = 'active'",
+             WHERE notebook_id = ? AND backend = ? AND model = ? AND dim = ? AND status = 'active'",
         )
-        .bind(notebook)
-        .bind(model)
-        .bind(dim as i64)
+        .bind(&coord.notebook)
+        .bind(coord.backend.as_str())
+        .bind(&coord.model)
+        .bind(coord.dim as i64)
         .execute(&mut *tx)
         .await?;
 
         // Promote the building row (matched by its physical table name) to active.
         let promoted = sqlx::query(
             "UPDATE embedding_index SET status = 'active' \
-             WHERE notebook_id = ? AND model = ? AND dim = ? \
+             WHERE notebook_id = ? AND backend = ? AND model = ? AND dim = ? \
                AND lance_table_name = ? AND status = 'building'",
         )
-        .bind(notebook)
-        .bind(model)
-        .bind(dim as i64)
+        .bind(&coord.notebook)
+        .bind(coord.backend.as_str())
+        .bind(&coord.model)
+        .bind(coord.dim as i64)
         .bind(building_name)
         .execute(&mut *tx)
         .await?;
@@ -603,7 +631,11 @@ impl EmbeddingIndexRepo {
             tx.rollback().await?;
             return Err(LensError::Validation(format!(
                 "no building embedding_index row named {building_name} for \
-                 ({notebook}, {model}, {dim}) to promote"
+                 ({}, {}, {}, {}) to promote",
+                coord.notebook,
+                coord.backend.as_str(),
+                coord.model,
+                coord.dim
             )));
         }
 
@@ -623,28 +655,28 @@ impl EmbeddingIndexRepo {
     /// row that may coexist for the same coordinate during a concurrent flip (R3).
     async fn demote_active_to_stale(
         &self,
-        notebook: &str,
-        model: &str,
-        dim: usize,
+        coord: &Coordinate,
     ) -> Result<Option<String>, LensError> {
         let mut tx = self.pool.begin().await?;
         let active = sqlx::query_scalar::<_, String>(
             "SELECT lance_table_name FROM embedding_index \
-             WHERE notebook_id = ? AND model = ? AND dim = ? AND status = 'active'",
+             WHERE notebook_id = ? AND backend = ? AND model = ? AND dim = ? AND status = 'active'",
         )
-        .bind(notebook)
-        .bind(model)
-        .bind(dim as i64)
+        .bind(&coord.notebook)
+        .bind(coord.backend.as_str())
+        .bind(&coord.model)
+        .bind(coord.dim as i64)
         .fetch_optional(&mut *tx)
         .await?;
         if active.is_some() {
             sqlx::query(
                 "UPDATE embedding_index SET status = 'stale' \
-                 WHERE notebook_id = ? AND model = ? AND dim = ? AND status = 'active'",
+                 WHERE notebook_id = ? AND backend = ? AND model = ? AND dim = ? AND status = 'active'",
             )
-            .bind(notebook)
-            .bind(model)
-            .bind(dim as i64)
+            .bind(&coord.notebook)
+            .bind(coord.backend.as_str())
+            .bind(&coord.model)
+            .bind(coord.dim as i64)
             .execute(&mut *tx)
             .await?;
         }
@@ -655,20 +687,15 @@ impl EmbeddingIndexRepo {
     /// Deletes the registry row naming `table` for a coordinate (the stale row
     /// removed after its Lance table is dropped post-flip). Idempotent: a missing
     /// row is not an error (the startup-GC may have already reclaimed it).
-    async fn delete_row_by_table(
-        &self,
-        notebook: &str,
-        model: &str,
-        dim: usize,
-        table: &str,
-    ) -> Result<(), LensError> {
+    async fn delete_row_by_table(&self, coord: &Coordinate, table: &str) -> Result<(), LensError> {
         sqlx::query(
             "DELETE FROM embedding_index \
-             WHERE notebook_id = ? AND model = ? AND dim = ? AND lance_table_name = ?",
+             WHERE notebook_id = ? AND backend = ? AND model = ? AND dim = ? AND lance_table_name = ?",
         )
-        .bind(notebook)
-        .bind(model)
-        .bind(dim as i64)
+        .bind(&coord.notebook)
+        .bind(coord.backend.as_str())
+        .bind(&coord.model)
+        .bind(coord.dim as i64)
         .bind(table)
         .execute(&self.pool)
         .await?;
@@ -804,17 +831,8 @@ impl LanceVectorStore {
     /// name, a pre-flip coordinate (whose only registered row was written by
     /// `ensure_table` as `active`) resolves to the identical physical table the
     /// old formula-based path opened.
-    async fn open_active_table(
-        &self,
-        notebook: &str,
-        model: &str,
-        dim: usize,
-    ) -> Result<Option<Table>, LensError> {
-        let name = match self
-            .registry
-            .active_lance_table_name(notebook, model, dim)
-            .await?
-        {
+    async fn open_active_table(&self, coord: &Coordinate) -> Result<Option<Table>, LensError> {
+        let name = match self.registry.active_lance_table_name(coord).await? {
             Some(n) => n,
             None => return Ok(None),
         };
@@ -830,13 +848,9 @@ impl LanceVectorStore {
     /// name. Idempotent: opens the table if it already exists, otherwise creates
     /// it (empty, schema-only) and registers the logical coordinate in the owned
     /// `embedding_index` registry.
-    async fn ensure_table(
-        &self,
-        notebook: &str,
-        model: &str,
-        dim: usize,
-    ) -> Result<Table, LensError> {
+    async fn ensure_table(&self, coord: &Coordinate) -> Result<Table, LensError> {
         let conn = self.connect().await?;
+        let dim = coord.dim;
 
         // REGISTRY-DRIVEN resolution (mirror of `open_active_table`): if a
         // `status='active'` row already exists for this coordinate, append to THAT
@@ -845,11 +859,7 @@ impl LanceVectorStore {
         // via the formula here would create a fresh gen-0 orphan and silently lose
         // the appended vectors (search reads only the registered active table). This
         // is the write-path twin of the read-path AC8 resolution.
-        if let Some(active_name) = self
-            .registry
-            .active_lance_table_name(notebook, model, dim)
-            .await?
-        {
+        if let Some(active_name) = self.registry.active_lance_table_name(coord).await? {
             if let Some(table) = self.open_table_by_name(&active_name).await? {
                 return Ok(table);
             }
@@ -860,8 +870,9 @@ impl LanceVectorStore {
             // Warn so an operator notices if this defensive path ever fires — it
             // signals an unexpected registry/Lance divergence.
             tracing::warn!(
-                notebook,
-                model,
+                notebook = coord.notebook,
+                backend = coord.backend.as_str(),
+                model = coord.model,
                 active_table = active_name,
                 "ensure_table: active registry row present but its Lance table was \
                  absent; recreating it (unexpected — investigate registry/Lance drift)"
@@ -877,7 +888,7 @@ impl LanceVectorStore {
         // name. Open a pre-existing (unregistered, e.g. crash-orphaned) table or
         // create a fresh one, then register the mapping `active` (the register is a
         // no-op on conflict, so a concurrent create is self-healing).
-        let name = table_name(notebook, model, dim);
+        let name = table_name(&coord.notebook, coord.backend, &coord.model, dim);
         let existing = conn
             .table_names()
             .execute()
@@ -898,10 +909,8 @@ impl LanceVectorStore {
 
         self.registry
             .register(
-                notebook,
-                model,
-                dim,
-                &crate::embedder::resolve(model).prefix_convention(),
+                coord,
+                &crate::embedder::resolve(&coord.model).prefix_convention(),
                 &name,
                 REGISTRY_STATUS_ACTIVE,
             )
@@ -924,16 +933,15 @@ impl LanceVectorStore {
     /// [`vector_schema`]), so no float round-trip or re-embed of unchanged sources.
     pub(crate) async fn seed_building_from_active(
         &self,
-        notebook: &str,
-        model: &str,
-        dim: usize,
+        coord: &Coordinate,
         building_name: &str,
         exclude_source_id: &str,
     ) -> Result<(), LensError> {
-        let active = match self.open_active_table(notebook, model, dim).await? {
+        let active = match self.open_active_table(coord).await? {
             Some(t) => t,
             None => return Ok(()),
         };
+        let notebook = coord.notebook.as_str();
         let building = self
             .open_table_by_name(building_name)
             .await?
@@ -1112,17 +1120,12 @@ impl LanceVectorStore {
 
 #[async_trait::async_trait]
 impl VectorStore for LanceVectorStore {
-    async fn add(
-        &self,
-        notebook: &str,
-        model: &str,
-        dim: usize,
-        rows: Vec<VectorRow>,
-    ) -> Result<(), LensError> {
+    async fn add(&self, coord: &Coordinate, rows: Vec<VectorRow>) -> Result<(), LensError> {
         if rows.is_empty() {
             return Ok(());
         }
-        let table = self.ensure_table(notebook, model, dim).await?;
+        let dim = coord.dim;
+        let table = self.ensure_table(coord).await?;
         let batch = rows_to_batch(&rows, dim)?;
         // `Scannable` is implemented for `RecordBatch` directly in lancedb 0.30.0
         // (no `RecordBatchIterator` impl), so pass the batch as-is.
@@ -1140,12 +1143,12 @@ impl VectorStore for LanceVectorStore {
 
     async fn search(
         &self,
-        notebook: &str,
-        model: &str,
-        dim: usize,
+        coord: &Coordinate,
         query: &[f32],
         k: usize,
     ) -> Result<Vec<Hit>, LensError> {
+        let dim = coord.dim;
+        let notebook = coord.notebook.as_str();
         if query.len() != dim {
             return Err(LensError::Vector(format!(
                 "query vector length {} != expected dim {dim}",
@@ -1161,7 +1164,7 @@ impl VectorStore for LanceVectorStore {
         // A search must NEVER create a table as a side effect: a never-ingested
         // coordinate (no active row) OR a row whose Lance table is momentarily
         // gone (the flip TOCTOU window) returns an empty result, never an error.
-        let table = match self.open_active_table(notebook, model, dim).await? {
+        let table = match self.open_active_table(coord).await? {
             Some(t) => t,
             None => return Ok(Vec::new()),
         };
@@ -1228,19 +1231,13 @@ impl VectorStore for LanceVectorStore {
     /// `building` tables (mid re-embed flip) are safe to ignore: the flip acquires
     /// `ingest_lock`, serializing it against `purge_source`, so a drop never races
     /// a half-built table into an inconsistent active set.
-    async fn drop_source(
-        &self,
-        notebook: &str,
-        model: &str,
-        dim: usize,
-        source_id: &str,
-    ) -> Result<(), LensError> {
+    async fn drop_source(&self, coord: &Coordinate, source_id: &str) -> Result<(), LensError> {
         // Resolve the ACTIVE physical table from the registry (AC8/AC6): after a
         // re-embed flip the active table is gen-suffixed, and the summary RAPTOR
         // node (which carries this `source_id`) lives in it — so a drop must target
         // the active table, not the bare formula name (gen-0), to reclaim it. A
         // wipe of a never-ingested coordinate (no active row) is a no-op.
-        let table = match self.open_active_table(notebook, model, dim).await? {
+        let table = match self.open_active_table(coord).await? {
             Some(t) => t,
             None => return Ok(()),
         };
@@ -1281,28 +1278,36 @@ impl VectorStore for LanceVectorStore {
         Ok(())
     }
 
-    async fn create_building_table(
-        &self,
-        notebook: &str,
-        model: &str,
-        dim: usize,
-    ) -> Result<String, LensError> {
+    async fn create_building_table(&self, coord: &Coordinate) -> Result<String, LensError> {
+        let dim = coord.dim;
         // Compute the next free generation above every name registered for the
         // coordinate (gen-0 is the live active table; prior building/stale rows may
         // linger until the startup-GC sweeps them).
         let existing = self
             .registry
-            .lance_table_names_for_coordinate(notebook, model, dim)
+            .lance_table_names_for_coordinate(coord)
             .await?;
         let mut generation = 1u32;
         loop {
-            let candidate = gen_table_name(notebook, model, dim, generation);
+            let candidate = gen_table_name(
+                &coord.notebook,
+                coord.backend,
+                &coord.model,
+                dim,
+                generation,
+            );
             if !existing.iter().any(|n| n == &candidate) {
                 break;
             }
             generation += 1;
         }
-        let building_name = gen_table_name(notebook, model, dim, generation);
+        let building_name = gen_table_name(
+            &coord.notebook,
+            coord.backend,
+            &coord.model,
+            dim,
+            generation,
+        );
 
         // Create the empty physical table, then register the `building` row. The
         // physical table is created FIRST so a crash before the registry insert
@@ -1316,10 +1321,8 @@ impl VectorStore for LanceVectorStore {
             .map_err(|e| LensError::Vector(format!("lancedb create_empty_table failed: {e}")))?;
         self.registry
             .register(
-                notebook,
-                model,
-                dim,
-                &crate::embedder::resolve(model).prefix_convention(),
+                coord,
+                &crate::embedder::resolve(&coord.model).prefix_convention(),
                 &building_name,
                 "building",
             )
@@ -1356,19 +1359,10 @@ impl VectorStore for LanceVectorStore {
         Ok(())
     }
 
-    async fn flip_active(
-        &self,
-        notebook: &str,
-        model: &str,
-        dim: usize,
-        building_name: &str,
-    ) -> Result<(), LensError> {
+    async fn flip_active(&self, coord: &Coordinate, building_name: &str) -> Result<(), LensError> {
         // (1) The ONE atomic SQLite txn: active→stale, building→active. Returns the
         // physical name of the row demoted to stale (if any) to drop afterwards.
-        let stale_name = self
-            .registry
-            .flip_active_txn(notebook, model, dim, building_name)
-            .await?;
+        let stale_name = self.registry.flip_active_txn(coord, building_name).await?;
 
         // ── CRASH WINDOW (AC7): everything below — the stale Lance drop + the
         // stale registry-row delete — happens AFTER the flip txn has committed. A
@@ -1384,27 +1378,16 @@ impl VectorStore for LanceVectorStore {
         // dangling `stale` row whose (already-gone) table the GC drops as a no-op.
         if let Some(stale) = stale_name {
             self.drop_tables(std::slice::from_ref(&stale)).await?;
-            self.registry
-                .delete_row_by_table(notebook, model, dim, &stale)
-                .await?;
+            self.registry.delete_row_by_table(coord, &stale).await?;
         }
         Ok(())
     }
 
-    async fn retire_coordinate(
-        &self,
-        notebook: &str,
-        model: &str,
-        dim: usize,
-    ) -> Result<(), LensError> {
+    async fn retire_coordinate(&self, coord: &Coordinate) -> Result<(), LensError> {
         // (1) Demote ONLY the OLD coordinate's active row to stale (committed).
         // Returns its physical table name, or None when there is nothing to retire
         // (idempotent no-op — e.g. a retried retire after the GC already swept it).
-        let Some(stale) = self
-            .registry
-            .demote_active_to_stale(notebook, model, dim)
-            .await?
-        else {
+        let Some(stale) = self.registry.demote_active_to_stale(coord).await? else {
             return Ok(());
         };
 
@@ -1423,9 +1406,7 @@ impl VectorStore for LanceVectorStore {
         // registry row — so a crash between the two leaves only a dangling `stale`
         // row whose (already-gone) table the GC drops as a no-op.
         self.drop_tables(std::slice::from_ref(&stale)).await?;
-        self.registry
-            .delete_row_by_table(notebook, model, dim, &stale)
-            .await?;
+        self.registry.delete_row_by_table(coord, &stale).await?;
         Ok(())
     }
 }
@@ -1452,14 +1433,59 @@ mod tests {
     }
 
     #[test]
-    fn table_name_includes_dim_segment() {
+    fn table_name_includes_backend_and_dim_segments() {
+        // Slug A1 (M4 Phase 4b-B): backend is its OWN segment between notebook and
+        // model_slug, ahead of the dim segment.
         assert_eq!(
-            table_name("nb1", "nomic-embed-text-v1.5", 768),
-            "vec__nb1__nomic_v15__d768"
+            table_name(
+                "nb1",
+                EmbeddingBackend::Fastembed,
+                "nomic-embed-text-v1.5",
+                768
+            ),
+            "vec__nb1__fastembed__nomic_v15__d768"
         );
         assert_eq!(
-            table_name("nb1", "all-minilm", 384),
-            "vec__nb1__all_minilm__d384"
+            table_name("nb1", EmbeddingBackend::Ollama, "all-minilm", 384),
+            "vec__nb1__ollama__all_minilm__d384"
+        );
+    }
+
+    #[test]
+    fn same_model_dim_distinct_backends_never_collide_in_slug() {
+        // A fastembed and an ollama set for the SAME (notebook, model, dim) MUST
+        // produce byte-distinct physical table names (slug-level half of R1/P1).
+        let fe = table_name(
+            "nb1",
+            EmbeddingBackend::Fastembed,
+            "nomic-embed-text-v1.5",
+            768,
+        );
+        let ol = table_name(
+            "nb1",
+            EmbeddingBackend::Ollama,
+            "nomic-embed-text-v1.5",
+            768,
+        );
+        assert_ne!(fe, ol);
+        assert_eq!(fe, "vec__nb1__fastembed__nomic_v15__d768");
+        assert_eq!(ol, "vec__nb1__ollama__nomic_v15__d768");
+        // Holds across generations too.
+        assert_ne!(
+            gen_table_name(
+                "nb1",
+                EmbeddingBackend::Fastembed,
+                "nomic-embed-text-v1.5",
+                768,
+                1
+            ),
+            gen_table_name(
+                "nb1",
+                EmbeddingBackend::Ollama,
+                "nomic-embed-text-v1.5",
+                768,
+                1
+            )
         );
     }
 
@@ -1467,13 +1493,25 @@ mod tests {
     fn gen_table_name_dim_before_gen_ordering() {
         // gen-0 == table_name (no gen suffix).
         assert_eq!(
-            gen_table_name("nb1", "mxbai-embed-large", 1024, 0),
-            "vec__nb1__mxbai_embed_large__d1024"
+            gen_table_name(
+                "nb1",
+                EmbeddingBackend::Fastembed,
+                "mxbai-embed-large",
+                1024,
+                0
+            ),
+            "vec__nb1__fastembed__mxbai_embed_large__d1024"
         );
         // Non-zero generation appends `__{gen}` AFTER the dim segment (R7).
         assert_eq!(
-            gen_table_name("nb1", "mxbai-embed-large", 1024, 2),
-            "vec__nb1__mxbai_embed_large__d1024__2"
+            gen_table_name(
+                "nb1",
+                EmbeddingBackend::Fastembed,
+                "mxbai-embed-large",
+                1024,
+                2
+            ),
+            "vec__nb1__fastembed__mxbai_embed_large__d1024__2"
         );
     }
 
@@ -1481,13 +1519,24 @@ mod tests {
     fn different_dims_never_collide_for_same_notebook() {
         // A 384 and a 768 coordinate for the same notebook must produce distinct
         // physical names so two active coordinates never share a Lance table.
-        let n384 = table_name("nb1", "all-minilm", 384);
-        let n768 = table_name("nb1", "nomic-embed-text-v1.5", 768);
+        let n384 = table_name("nb1", EmbeddingBackend::Fastembed, "all-minilm", 384);
+        let n768 = table_name(
+            "nb1",
+            EmbeddingBackend::Fastembed,
+            "nomic-embed-text-v1.5",
+            768,
+        );
         assert_ne!(n384, n768);
         // Same property holds across generations.
         assert_ne!(
-            gen_table_name("nb1", "all-minilm", 384, 1),
-            gen_table_name("nb1", "nomic-embed-text-v1.5", 768, 1)
+            gen_table_name("nb1", EmbeddingBackend::Fastembed, "all-minilm", 384, 1),
+            gen_table_name(
+                "nb1",
+                EmbeddingBackend::Fastembed,
+                "nomic-embed-text-v1.5",
+                768,
+                1
+            )
         );
     }
 

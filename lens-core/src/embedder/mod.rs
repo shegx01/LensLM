@@ -41,7 +41,8 @@ use crate::LensError;
 pub mod registry;
 
 pub use registry::{
-    DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, EmbeddingModelSpec, resolve, resolve_opt,
+    DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, EmbeddingBackend, EmbeddingModelSpec, resolve,
+    resolve_opt,
 };
 
 // ---------------------------------------------------------------------------
