@@ -136,7 +136,7 @@ arrow-schema = "58"
 # panic that fires on arbitrary user Markdown.
 pulldown-cmark = "0.13.4"
 # HF tokenizer (the SAME impl fastembed uses internally) for 512/128 chunk sizing.
-tokenizers = "0.22"
+tokenizers = "0.23"
 # async fn in the VectorStore trait.
 async-trait = "0.1"
 # Temp dir for the `eval` binary's throwaway LanceDB corpus. (Also a dev-dep for
