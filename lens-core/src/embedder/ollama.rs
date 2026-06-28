@@ -170,9 +170,12 @@ impl OllamaEmbedder {
                 )));
             }
             // Short-circuit on a declared Content-Length over the cap (avoids
-            // streaming a body the server already admits is oversized).
-            if let Some(len) = r.content_length()
-                && len > MAX_OLLAMA_RESPONSE_BYTES as u64
+            // streaming a body the server already admits is oversized). Uses
+            // `Option::filter` (a single `if let`, not a `let`-chain) to keep the
+            // build portable while still binding `len` for the error message.
+            if let Some(len) = r
+                .content_length()
+                .filter(|&len| len > MAX_OLLAMA_RESPONSE_BYTES as u64)
             {
                 return Err(LensError::Parse(format!(
                     "ollama embed response declares {len} bytes, exceeding the \
