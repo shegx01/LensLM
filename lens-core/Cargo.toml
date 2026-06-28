@@ -75,7 +75,7 @@ genai = { version = "=0.6.5", default-features = false, features = ["rustls-tls"
 
 # SHA256 integrity verification of the downloaded Kokoro model. Pinned to the
 # version already resolved in the lock tree (transitive) so no new copy is added.
-sha2 = "=0.10.9"
+sha2 = "=0.11.0"
 
 # --- M4 Source Grounding (Phase 2, Step 7) ---
 # Rust port of trafilatura for HTML content extraction (URL sources).
