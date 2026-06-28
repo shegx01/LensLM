@@ -23,7 +23,7 @@ tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 # only (we use runtime-checked `query`/`query_as`, NOT `query!`, so no
 # DATABASE_URL / offline cache is needed). `uuid` feature deliberately omitted —
 # sqlx maps `Uuid` to BLOB for SQLite, contradicting the TEXT-key design.
-sqlx = { version = "=0.8.6", default-features = false, features = [
+sqlx = { version = "=0.9.0", default-features = false, features = [
     "runtime-tokio",
     "sqlite",
     "macros",
