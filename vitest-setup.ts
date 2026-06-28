@@ -1,13 +1,19 @@
 import '@testing-library/jest-dom/vitest';
+import { cleanup } from '@testing-library/svelte';
 import { randomFillSync } from 'node:crypto';
 import { afterEach, beforeAll, beforeEach } from 'vitest';
 
-// Drain pending macrotasks + microtasks AFTER each test so deferred callbacks
-// (component focus `setTimeout(…, 0)`, Svelte transition `onfinish` microtasks,
-// bits-ui focus/scroll-lock restore, etc.) run WHILE happy-dom's `document` still
-// exists. Otherwise they fire after the environment tears down → an unhandled
-// "ReferenceError: document is not defined" that non-deterministically fails CI.
+// Unmount any components rendered during the test, THEN drain pending macrotasks
+// + microtasks. Unmounting fires each component's `onDestroy`, which clears any
+// live timers (e.g. the embeddings install phase ticker, a 1200ms `setInterval`)
+// so they can't fire after happy-dom's `document` is torn down. The subsequent
+// drain flushes deferred 0-delay callbacks (component focus `setTimeout(…, 0)`,
+// Svelte transition `onfinish` microtasks, bits-ui focus/scroll-lock restore,
+// etc.) WHILE `document` still exists. Without this, a surviving timer/callback
+// fires after teardown → an unhandled "ReferenceError: document is not defined"
+// that non-deterministically fails CI.
 afterEach(async () => {
+  cleanup();
   await new Promise((resolve) => setTimeout(resolve, 0));
 });
 
