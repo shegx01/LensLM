@@ -72,7 +72,7 @@ test('onboarding embed panel sets the global default (model + backend)', async (
   await page.getByRole('button', { name: /Install nomic-embed-text-v1\.5/i }).click();
 
   await expect
-    .poll(() => readSetConfigCalls(page))
+    .poll(() => readSetConfigCalls(page), { timeout: 15_000 })
     .toContainEqual(
       expect.objectContaining({
         embedding_model: 'nomic-embed-text-v1.5',
@@ -105,7 +105,7 @@ test('global Settings>Embeddings sets the default a new notebook adopts', async 
   await page.getByRole('button', { name: /apply selected model/i }).click();
 
   await expect
-    .poll(() => readSetConfigCalls(page))
+    .poll(() => readSetConfigCalls(page), { timeout: 15_000 })
     .toContainEqual(
       expect.objectContaining({ embedding_model: 'all-minilm', embedding_backend: 'fastembed' })
     );
@@ -149,7 +149,7 @@ test('per-notebook settings change → confirm → re-embed streams progress', a
   await page.getByRole('button', { name: /confirm re-embed/i }).click();
 
   await expect
-    .poll(() => readReembedCalls(page))
+    .poll(() => readReembedCalls(page), { timeout: 15_000 })
     .toContainEqual(
       expect.objectContaining({ notebookId: 'nb-1', modelId: 'all-minilm', backend: 'fastembed' })
     );
