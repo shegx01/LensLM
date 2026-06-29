@@ -233,6 +233,60 @@ async fn url_fetch_http_error_flips_to_error() {
 }
 
 // ===========================================================================
+// issue #71 — URL body cap reads the configurable AppConfig.max_source_mb
+// ===========================================================================
+
+/// issue #71 Step 2: the URL body-size guard reads the configured
+/// `max_source_mb` (not the hardcoded 10 MB constant). With a 1 MB configured
+/// cap, a ~1 MB+ HTML body is rejected (the Content-Length short-circuit fires),
+/// flipping the source to `error` via the Err→error flip in `ingest_source`.
+#[tokio::test]
+async fn url_uses_configurable_cap() {
+    // A real over-1MB HTML body so the production Content-Length path fires.
+    let big = format!(
+        "<html><body>{}</body></html>",
+        "a".repeat(1024 * 1024 + 100)
+    );
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/huge"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/html")
+                .set_body_string(big),
+        )
+        .mount(&mock)
+        .await;
+
+    let (_dir, engine) = file_engine().await;
+    inject_fake_embedder(&engine);
+
+    // Configure a 1 MB cap so the ~1 MB body trips it.
+    let mut cfg = engine.config().await;
+    cfg.max_source_mb = "1".to_string();
+    engine.set_config(cfg).await;
+
+    let nb = engine
+        .create_notebook("NB-cap", None, None)
+        .await
+        .expect("notebook");
+    let source = engine
+        .add_url_source(&nb.id, "huge page", &format!("{}/huge", mock.uri()))
+        .await
+        .expect("add_url_source");
+
+    let (result, _) = ingest_collecting_progress(&engine, &source.id).await;
+    assert!(
+        matches!(result, Err(lens_core::LensError::Validation(_))),
+        "a URL body over the configured cap must be rejected, got {result:?}"
+    );
+    let pool = engine.pool().await;
+    let repo = lens_core::notebooks::NotebookRepo::new(&pool);
+    let updated = repo.get_source(&source.id).await.unwrap().unwrap();
+    assert_eq!(updated.status, "error", "over-cap URL body flips to error");
+}
+
+// ===========================================================================
 // AC9a — JS shell → needs_js
 // ===========================================================================
 

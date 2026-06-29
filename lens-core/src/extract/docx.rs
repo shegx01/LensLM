@@ -136,8 +136,9 @@ impl Extractor for DocxExtractor {
         // DOCX (a ZIP) with NO intermediate inflation limit, so a small crafted
         // archive could inflate to large transient memory here. Current mitigation
         // is bounded and accepted for Phase 2:
-        //   1. Stage-1 raw-bytes cap (MAX_SOURCE_BYTES = 10 MB) rejects the source
-        //      in `run_ingest` BEFORE this call, capping the compressed input.
+        //   1. Stage-1 raw-bytes cap (the configurable `max_source_bytes`, default
+        //      50 MB via `AppConfig.max_source_mb`) rejects the source in
+        //      `run_ingest` BEFORE this call, capping the compressed input.
         //   2. Stage-2 caps the resulting `extracted_text` length post-extraction.
         //   3. This whole extraction runs under `spawn_blocking`, so a panic
         //      (e.g. allocator abort) is isolated to the task, not the runtime.

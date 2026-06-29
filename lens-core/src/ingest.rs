@@ -131,6 +131,45 @@ pub const NEEDS_JS_MIN_TEXT_RATIO: f64 = 0.01;
 /// after the file read (any file path, against the read length).
 pub const MAX_SOURCE_BYTES: usize = 10 * 1024 * 1024;
 
+/// Default non-PDF source cap, in bytes, when [`AppConfig::max_source_mb`] is
+/// empty/unset (issue #71). 50 MB — the raised cap agreed in the deep-interview
+/// spec (web pages / work docs are "hardly 50 MB"). PDF is exempt from this cap
+/// (it streams into a building table); see [`resolve_max_source_bytes`].
+///
+/// [`AppConfig::max_source_mb`]: crate::config::AppConfig::max_source_mb
+pub const DEFAULT_MAX_SOURCE_BYTES: usize = 50 * 1024 * 1024;
+
+/// Hard pre-read ceiling, in bytes, for PDF sources (issue #71, Step 3).
+///
+/// PDF is exempt from the configurable [`AppConfig::max_source_mb`] cap because
+/// its vectors stream into a building table — but Option-B streaming still does
+/// a whole-file `tokio::fs::read` during extraction, so an absurdly large PDF
+/// would still trigger a multi-GB allocation. This 500 MB ceiling is checked via
+/// `tokio::fs::metadata` BEFORE the read, as an OOM safety net. It is
+/// intentionally far above any realistic handbook PDF; it can be raised/removed
+/// once a streaming file read (Option A follow-up) lands.
+///
+/// [`AppConfig::max_source_mb`]: crate::config::AppConfig::max_source_mb
+pub const PDF_PREREAD_HARD_CEILING_BYTES: u64 = 500 * 1024 * 1024;
+
+/// Resolves the configurable non-PDF source cap (issue #71) from the
+/// stringly-typed [`AppConfig::max_source_mb`] value to a byte count.
+///
+/// Mirrors the empty-string-resolves-to-default pattern of `embedding_backend`:
+/// an empty / whitespace-only / unparseable / non-positive value resolves to
+/// [`DEFAULT_MAX_SOURCE_BYTES`] (50 MB) rather than a 0-byte cap that would
+/// reject every source. A positive integer is interpreted as a count of
+/// **megabytes** and converted to bytes. Saturating on the MB→byte multiply
+/// keeps an enormous configured value from overflowing.
+///
+/// [`AppConfig::max_source_mb`]: crate::config::AppConfig::max_source_mb
+pub fn resolve_max_source_bytes(cfg_value: &str) -> usize {
+    match cfg_value.trim().parse::<usize>() {
+        Ok(mb) if mb > 0 => mb.saturating_mul(1024 * 1024),
+        _ => DEFAULT_MAX_SOURCE_BYTES,
+    }
+}
+
 /// Ingest progress phase labels (the [`IngestProgress::phase`] string values).
 ///
 /// Single source of truth for the phase literals streamed to the progress sink,
@@ -251,6 +290,48 @@ pub async fn ingest_source(
     result
 }
 
+/// Embeds one `EMBED_BATCH`-sized slice of chunks and builds their [`VectorRow`]s.
+///
+/// Shared by both the streaming PDF path (which inserts each batch's rows into a
+/// building table and frees them) and the non-PDF path (which accumulates them).
+/// The synchronous fastembed `embed()` runs under `spawn_blocking` so it never
+/// blocks a tokio worker (Decision M2). Returns one row per chunk, in order, or a
+/// [`LensError::Model`] when the embedder returns a mismatched vector count.
+async fn embed_batch_to_rows(
+    batch: &[Chunk],
+    embedder: &std::sync::Arc<dyn crate::embedder::Embedder>,
+    source_id: &str,
+    notebook: &str,
+) -> Result<Vec<VectorRow>, LensError> {
+    // One owned copy per chunk text; `embed_documents_owned` then prefixes in
+    // place rather than cloning a second time (micro-opt vs. the borrow path).
+    let texts: Vec<String> = batch.iter().map(|c| c.text.clone()).collect();
+    let embedder = embedder.clone();
+    let vectors = tokio::task::spawn_blocking(move || embedder.embed_documents_owned(texts))
+        .await
+        .map_err(|e| LensError::Model(format!("embed task panicked: {e}")))??;
+
+    if vectors.len() != batch.len() {
+        return Err(LensError::Model(format!(
+            "embedder returned {} vectors for {} inputs",
+            vectors.len(),
+            batch.len()
+        )));
+    }
+
+    Ok(batch
+        .iter()
+        .zip(vectors)
+        .map(|(chunk, vector)| VectorRow {
+            chunk_id: chunk.id.clone(),
+            source_id: source_id.to_string(),
+            notebook_id: notebook.to_string(),
+            level: chunk.level,
+            vector,
+        })
+        .collect())
+}
+
 /// The inner pipeline (without the error-status side effect / semaphore).
 async fn run_ingest(
     engine: &LensEngine,
@@ -291,6 +372,16 @@ async fn run_ingest(
     // An unknown (test-injected) kind is treated as DERIVED — `is_text_like` is
     // the single point of truth, with `None` defaulting to derived.
     let text_like = kind.is_some_and(|k| k.is_text_like());
+    // PDF gets the streaming-ingest + cap-exemption treatment (issue #71): its
+    // vectors stream into a building table, so the raw-bytes / extracted-text caps
+    // do not apply. Every other kind is bounded by `max_source_bytes`.
+    let is_pdf = kind == Some(crate::parse::SourceKind::Pdf);
+
+    // Resolve the configurable cap (issue #71) ONCE from `AppConfig.max_source_mb`
+    // (empty → 50 MB default). Threaded into the Stage-1 raw-bytes guard, the
+    // Stage-2 extracted-text guard, the pre-read metadata check, and the URL
+    // fetch's Content-Length + streaming-body guards.
+    let max_source_bytes = resolve_max_source_bytes(&engine.config().await.max_source_mb);
 
     // ── Acquire RAW BYTES ─────────────────────────────────────────────────
     // URL sources fetch their bytes over HTTP; all other kinds read a local file.
@@ -303,12 +394,35 @@ async fn run_ingest(
         on_progress(IngestProgress::new(ingest_phase::FETCHING, 0, Some(1)));
 
         let url = source.locator.clone();
-        let bytes = fetch_url_guarded(&url, URL_FETCH_TIMEOUT).await?;
+        let bytes = fetch_url_guarded(&url, URL_FETCH_TIMEOUT, max_source_bytes).await?;
 
         on_progress(IngestProgress::new(ingest_phase::FETCHING, 1, Some(1)));
         bytes
     } else {
-        // ── File-backed: read raw bytes from the locator path ─────────────
+        // ── Pre-read file-size guard (issue #71 Step 3) ───────────────────
+        // Check the on-disk size via `metadata` BEFORE `tokio::fs::read` pulls
+        // the whole file into memory, so a misconfigured cap or an absurd file
+        // never triggers a multi-GB allocation. Non-PDF: the configured cap.
+        // PDF: exempt from the configured cap (it streams), but still bounded by
+        // a hard 500 MB pre-read ceiling as an OOM safety net (Option B still
+        // does a whole-file read during extraction). URL has no local file.
+        let meta = tokio::fs::metadata(&source.locator)
+            .await
+            .map_err(|e| LensError::Io(format!("stat source {}: {e}", source.locator)))?;
+        let file_size = meta.len();
+        if is_pdf {
+            if file_size > PDF_PREREAD_HARD_CEILING_BYTES {
+                return Err(LensError::Validation(format!(
+                    "PDF source is {file_size} bytes, exceeding the \
+                     {PDF_PREREAD_HARD_CEILING_BYTES}-byte pre-read ceiling"
+                )));
+            }
+        } else if !text_like && file_size > max_source_bytes as u64 {
+            return Err(LensError::Validation(format!(
+                "source is {file_size} bytes, exceeding the {max_source_bytes}-byte ingest limit"
+            )));
+        }
+
         // Async read so a large local file never blocks the tokio worker for the
         // duration of the disk read (the pipeline holds the single ingest permit).
         tokio::fs::read(&source.locator)
@@ -316,14 +430,15 @@ async fn run_ingest(
             .map_err(|e| LensError::Io(format!("read source {}: {e}", source.locator)))?
     };
 
-    // ── Stage-1 size guard (DERIVED kinds only) ───────────────────────────
+    // ── Stage-1 size guard (DERIVED kinds only; PDF exempt) ───────────────
     // The extractor decodes the WHOLE binary into memory, so cap the RAW bytes
     // BEFORE invoking it (front-door cap). Text/MD skip Stage 1 (raw ==
-    // canonical) and rely on the single Stage-2 check, preserving Phase-1
-    // behaviour exactly.
-    if !text_like && raw.len() > MAX_SOURCE_BYTES {
+    // canonical) and rely on the single Stage-2 check. PDF is EXEMPT (issue #71):
+    // it streams its vectors into a building table, so its raw bytes are not
+    // capped here (the 500 MB pre-read ceiling above is its only size guard).
+    if !text_like && !is_pdf && raw.len() > max_source_bytes {
         return Err(LensError::Validation(format!(
-            "source is {} raw bytes, exceeding the {MAX_SOURCE_BYTES}-byte ingest limit",
+            "source is {} raw bytes, exceeding the {max_source_bytes}-byte ingest limit",
             raw.len()
         )));
     }
@@ -456,11 +571,13 @@ async fn run_ingest(
         }
     }
 
-    // ── Stage-2 size guard (the Phase-1 `:215` check on the canonical buffer)
-    // For text/MD this is the single guard.
-    if out.extracted_text.len() > MAX_SOURCE_BYTES {
+    // ── Stage-2 size guard (the check on the canonical buffer; PDF exempt) ─
+    // For text/MD this is the single guard. PDF is EXEMPT (issue #71): its
+    // extracted text can legitimately be large (a 1225-page handbook), and its
+    // vectors stream into a building table rather than accumulating in one Vec.
+    if !is_pdf && out.extracted_text.len() > max_source_bytes {
         return Err(LensError::Validation(format!(
-            "source is {} bytes, exceeding the {MAX_SOURCE_BYTES}-byte ingest limit",
+            "source is {} bytes, exceeding the {max_source_bytes}-byte ingest limit",
             out.extracted_text.len()
         )));
     }
@@ -644,48 +761,133 @@ async fn run_ingest(
     let total = chunks.len() as u64;
     on_progress(IngestProgress::new(ingest_phase::EMBEDDING, 0, Some(total)));
 
-    let mut rows: Vec<VectorRow> = Vec::with_capacity(chunks.len());
-    let mut embedded: u64 = 0;
-    for batch in chunks.chunks(EMBED_BATCH) {
-        // One owned copy per chunk text; `embed_documents_owned` then prefixes in
-        // place rather than cloning a second time (micro-opt vs. the borrow path).
-        let texts: Vec<String> = batch.iter().map(|c| c.text.clone()).collect();
-        let embedder = embedder.clone();
-        // MANDATORY: the synchronous fastembed embed() runs under spawn_blocking
-        // so it never blocks a tokio worker (Decision M2).
-        let vectors = tokio::task::spawn_blocking(move || embedder.embed_documents_owned(texts))
-            .await
-            .map_err(|e| LensError::Model(format!("embed task panicked: {e}")))??;
+    if is_pdf {
+        // ── PDF: bounded-memory building-table streaming (issue #71) ───────
+        //
+        // The vector accumulation is the largest memory sink (~150-460 MB for a
+        // dense handbook PDF). Instead of accumulating ALL `VectorRow`s in one
+        // `Vec` and writing them in a single `store.add`, stream each EMBED_BATCH's
+        // rows into a gen-suffixed BUILDING table and free them, then flip the
+        // building table to active on completion. This reuses the re-embed
+        // building-table lifecycle and preserves atomicity (the source is never
+        // half-visible to search — `search` resolves `status='active'` only).
+        //
+        // ORDERING (pre-mortem scenario 3): the cross-store wipe at the top of this
+        // function (`store.drop_source` above) already removed this source's OLD
+        // vectors from the ACTIVE table. The sequence below is wipe → SWEEP → CREATE
+        // → SEED → POPULATE → FLIP and MUST be preserved: the seed copies from the
+        // (already-wiped) active table, so it never re-introduces this source's old
+        // vectors, and the streaming loop then adds the fresh ones. No duplicates.
+        //
+        // LOCK SCOPE: the entire `run_ingest` runs under the single-permit
+        // `ingest_lock` (acquired by `ingest_source`), and it is held for the FULL
+        // streaming duration — the wipe-before-seed ordering requires it. The lock
+        // is NOT released during the loop (lock-free ingest populate is a tracked
+        // follow-up). For a large PDF this can hold the permit for 1-2 minutes;
+        // acceptable per spec.
+        let lock_start = std::time::Instant::now();
 
-        if vectors.len() != batch.len() {
-            return Err(LensError::Model(format!(
-                "embedder returned {} vectors for {} inputs",
-                vectors.len(),
-                batch.len()
-            )));
+        // (1) Sweep any orphan building tables from a prior crashed ingest of this
+        //     coordinate (bounds orphan accumulation to one per coordinate).
+        store.sweep_orphan_building_tables(&coord).await?;
+
+        // (2) Create a fresh gen-suffixed building table. For a notebook whose FIRST
+        //     source is a PDF this creates a gen-1 building table (not gen-0 active);
+        //     the flip below promotes it. For a later source it co-exists beside the
+        //     live active table. Both converge on registry-driven resolution.
+        let building_name = store.create_building_table(&coord).await?;
+        tracing::info!(
+            source_id,
+            notebook = %notebook,
+            building = %building_name,
+            "streaming PDF ingest: created building table"
+        );
+
+        // (3) Seed the building table with every OTHER source's vectors copied from
+        //     the active table, so the flip (which promotes the building table to be
+        //     the notebook's WHOLE active table) preserves them. A NO-OP when there
+        //     is no active table yet (first-source-is-PDF) — `seed_building_from_active`
+        //     returns `Ok(())` early in that case.
+        store
+            .seed_building_from_active(&coord, &building_name, source_id)
+            .await?;
+
+        // (4) Stream: embed each EMBED_BATCH, insert its rows into the building table
+        //     WITHOUT building the index per batch, then drop the rows (memory freed).
+        let mut embedded: u64 = 0;
+        for batch in chunks.chunks(EMBED_BATCH) {
+            let rows = embed_batch_to_rows(batch, &embedder, source_id, &notebook).await?;
+            let inserted = rows.len();
+            store
+                .add_to_table_no_index(&building_name, rows, embed_dim)
+                .await?;
+            // `rows` was moved into `add_to_table_no_index` and dropped there — the
+            // batch's vectors are freed before the next batch is embedded.
+            tracing::info!(
+                source_id,
+                building = %building_name,
+                inserted,
+                "streaming PDF ingest: inserted batch into building table"
+            );
+
+            // Crash seam (issue #71, Step 5): after at least one batch has landed in
+            // the building table but BEFORE the flip, simulate a process crash.
+            #[cfg(feature = "test-util")]
+            if crate::vector_store::CRASH_AFTER_STREAMING_ADD_BEFORE_FLIP
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(LensError::Internal(
+                    "CRASH_AFTER_STREAMING_ADD_BEFORE_FLIP (test-only crash injection)".to_string(),
+                ));
+            }
+
+            embedded += batch.len() as u64;
+            on_progress(IngestProgress::new(
+                ingest_phase::EMBEDDING,
+                embedded,
+                Some(total),
+            ));
         }
 
-        for (chunk, vector) in batch.iter().zip(vectors.into_iter()) {
-            rows.push(VectorRow {
-                chunk_id: chunk.id.clone(),
-                source_id: source_id.to_string(),
-                notebook_id: notebook.clone(),
-                level: chunk.level,
-                vector,
-            });
+        // ── INDEX ─────────────────────────────────────────────────────────
+        // (5) Build the ANN index ONCE over the complete building table, then
+        //     (6) atomically flip building → active.
+        on_progress(IngestProgress::new(ingest_phase::INDEXING, 0, Some(1)));
+        store
+            .build_index_on_table(&building_name, embed_dim)
+            .await?;
+        store.flip_active(&coord, &building_name).await?;
+        tracing::info!(
+            source_id,
+            notebook = %notebook,
+            building = %building_name,
+            lock_hold_ms = lock_start.elapsed().as_millis() as u64,
+            "streaming PDF ingest: built index + flipped building → active"
+        );
+        on_progress(IngestProgress::new(ingest_phase::INDEXING, 1, Some(1)));
+    } else {
+        // ── Non-PDF: existing single-shot accumulate + `store.add` path ────
+        // Non-PDF sources are realistically small (the configurable cap bounds
+        // them), so the whole-document `Vec<VectorRow>` accumulation is unchanged.
+        let mut rows: Vec<VectorRow> = Vec::with_capacity(chunks.len());
+        let mut embedded: u64 = 0;
+        for batch in chunks.chunks(EMBED_BATCH) {
+            let mut batch_rows =
+                embed_batch_to_rows(batch, &embedder, source_id, &notebook).await?;
+            rows.append(&mut batch_rows);
+            embedded += batch.len() as u64;
+            on_progress(IngestProgress::new(
+                ingest_phase::EMBEDDING,
+                embedded,
+                Some(total),
+            ));
         }
-        embedded += batch.len() as u64;
-        on_progress(IngestProgress::new(
-            ingest_phase::EMBEDDING,
-            embedded,
-            Some(total),
-        ));
+
+        // ── INDEX ───────────────────────────────────────────────────────────
+        on_progress(IngestProgress::new(ingest_phase::INDEXING, 0, Some(1)));
+        store.add(&coord, rows).await?;
+        on_progress(IngestProgress::new(ingest_phase::INDEXING, 1, Some(1)));
     }
-
-    // ── INDEX ─────────────────────────────────────────────────────────────
-    on_progress(IngestProgress::new(ingest_phase::INDEXING, 0, Some(1)));
-    store.add(&coord, rows).await?;
-    on_progress(IngestProgress::new(ingest_phase::INDEXING, 1, Some(1)));
 
     // ── Finalize: metadata + indexed status ──────────────────────────────
     repo.update_source_metadata(source_id, total_tokens, &content_hash)
@@ -1081,13 +1283,15 @@ fn validate_fetch_url(locator: &str, allow_local: bool) -> Result<ValidatedFetch
 ///   internal host. (The strictest correct choice; matches `system_check.rs`.)
 /// * **Content-Type allowlist** — only HTML/XHTML/`text/*` bodies are read.
 /// * **Bounded body size** — the body is streamed and aborted the moment the
-///   running total exceeds [`MAX_SOURCE_BYTES`], and a `Content-Length` over the
-///   cap short-circuits before any body is read (no whole-body buffering / OOM).
+///   running total exceeds the configured `max_source_bytes`, and a
+///   `Content-Length` over the cap short-circuits before any body is read
+///   (no whole-body buffering / OOM).
 async fn fetch_url_guarded(
     locator: &str,
     timeout: std::time::Duration,
+    max_source_bytes: usize,
 ) -> Result<Vec<u8>, LensError> {
-    fetch_url_guarded_inner(locator, timeout, allow_local_url_fetch()).await
+    fetch_url_guarded_inner(locator, timeout, allow_local_url_fetch(), max_source_bytes).await
 }
 
 /// Whether the IP guard should permit loopback/local hosts.
@@ -1116,6 +1320,7 @@ async fn fetch_url_guarded_inner(
     locator: &str,
     timeout: std::time::Duration,
     allow_local: bool,
+    max_source_bytes: usize,
 ) -> Result<Vec<u8>, LensError> {
     let ValidatedFetchUrl {
         url,
@@ -1186,15 +1391,15 @@ async fn fetch_url_guarded_inner(
 
     // Short-circuit on a declared Content-Length over the cap (avoids streaming).
     if let Some(len) = resp.content_length()
-        && len > MAX_SOURCE_BYTES as u64
+        && len > max_source_bytes as u64
     {
         return Err(LensError::Validation(format!(
             "URL source {locator} declares {len} bytes, exceeding the \
-             {MAX_SOURCE_BYTES}-byte ingest limit"
+             {max_source_bytes}-byte ingest limit"
         )));
     }
 
-    // Stream the body, enforcing MAX_SOURCE_BYTES as bytes arrive so a server
+    // Stream the body, enforcing `max_source_bytes` as bytes arrive so a server
     // that lies about (or omits) Content-Length cannot OOM the pipeline.
     let mut buf: Vec<u8> = Vec::new();
     let mut stream = resp.bytes_stream();
@@ -1202,9 +1407,9 @@ async fn fetch_url_guarded_inner(
         let chunk = chunk.map_err(|e| {
             LensError::Network(format!("URL fetch body read failed for {locator}: {e}"))
         })?;
-        if buf.len() + chunk.len() > MAX_SOURCE_BYTES {
+        if buf.len() + chunk.len() > max_source_bytes {
             return Err(LensError::Validation(format!(
-                "URL source {locator} body exceeds the {MAX_SOURCE_BYTES}-byte ingest limit"
+                "URL source {locator} body exceeds the {max_source_bytes}-byte ingest limit"
             )));
         }
         buf.extend_from_slice(&chunk);
@@ -1617,6 +1822,26 @@ mod tests {
         }
     }
 
+    // ── max_source_mb resolver (issue #71) ────────────────────────────────
+
+    #[test]
+    fn test_max_source_mb_resolver() {
+        // Empty value → the 50 MB default (the empty-resolves-to-default pattern).
+        assert_eq!(resolve_max_source_bytes(""), 50 * 1024 * 1024);
+        // Whitespace-only is treated as empty.
+        assert_eq!(resolve_max_source_bytes("  "), 50 * 1024 * 1024);
+        // An explicit positive integer (MB) resolves to that many bytes.
+        assert_eq!(resolve_max_source_bytes("100"), 100 * 1024 * 1024);
+        assert_eq!(resolve_max_source_bytes("1"), 1024 * 1024);
+        // Surrounding whitespace is trimmed before parsing.
+        assert_eq!(resolve_max_source_bytes(" 25 "), 25 * 1024 * 1024);
+        // Zero and unparseable values fall back to the default rather than
+        // producing a 0-byte cap that would reject every source.
+        assert_eq!(resolve_max_source_bytes("0"), 50 * 1024 * 1024);
+        assert_eq!(resolve_max_source_bytes("garbage"), 50 * 1024 * 1024);
+        assert_eq!(resolve_max_source_bytes("-5"), 50 * 1024 * 1024);
+    }
+
     // ── SSRF IP guard (item 1) ────────────────────────────────────────────
 
     #[test]
@@ -1761,7 +1986,12 @@ mod tests {
         url: &str,
         timeout: std::time::Duration,
     ) -> Result<Vec<u8>, LensError> {
-        fetch_url_guarded_inner(url, timeout, true).await
+        // The body-cap tests assert against the legacy 10 MB `MAX_SOURCE_BYTES`
+        // boundary (a real over-cap body is sent once), so the helper pins that
+        // value as the cap. The configurable-cap path is covered separately by
+        // the `url_ingest.rs` integration test that drives `run_ingest` with a
+        // small `AppConfig.max_source_mb`.
+        fetch_url_guarded_inner(url, timeout, true, MAX_SOURCE_BYTES).await
     }
 
     /// Item 1: a 302 redirect (to a blocked loopback host) is NOT followed — the

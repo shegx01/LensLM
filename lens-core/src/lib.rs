@@ -614,8 +614,12 @@ impl LensEngine {
     ) -> Result<Source, LensError> {
         let data_dir = self.data_dir().await;
         let pool = self.pool().await;
+        // Resolve the configurable cap (issue #71) from `AppConfig.max_source_mb`
+        // (empty → 50 MB default) and enforce it at the paste boundary.
+        let max_source_bytes =
+            crate::ingest::resolve_max_source_bytes(&self.config().await.max_source_mb);
         NotebookRepo::new(&pool)
-            .add_text_source(&data_dir, notebook_id, title, text, kind)
+            .add_text_source(&data_dir, notebook_id, title, text, kind, max_source_bytes)
             .await
     }
 

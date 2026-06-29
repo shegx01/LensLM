@@ -339,6 +339,19 @@ pub struct AppConfig {
     /// here, NOT in SQL.
     #[serde(default)]
     pub embedding_backend: String,
+    /// Maximum accepted source size, in **megabytes**, for non-PDF formats
+    /// (issue #71). Empty when the user has not configured it; an absent field in
+    /// an older `config.json` reads back as `""` via `#[serde(default)]`. An empty
+    /// (or unparseable / non-positive) value resolves to the 50 MB default via
+    /// [`crate::ingest::resolve_max_source_bytes`] — the SAME
+    /// empty-string-resolves-to-default pattern as `embedding_backend`. PDF sources
+    /// are EXEMPT from this cap (they stream into a building table); only paste,
+    /// raw-bytes, extracted-text, and URL enforcement sites read it. Stored as a
+    /// `String` (not a number) to match the config's stringly-typed user-editable
+    /// fields and keep an absent/empty value forward-compatible. Config-file-only;
+    /// no settings UI (deferred).
+    #[serde(default)]
+    pub max_source_mb: String,
     /// Configured chat/inference models keyed by role.
     pub models: Vec<ModelConfig>,
     /// Arbitrary named endpoints (label -> URL).
@@ -371,6 +384,7 @@ impl Default for AppConfig {
             user_name: String::default(),
             embedding_model: String::default(),
             embedding_backend: String::default(),
+            max_source_mb: String::default(),
             models: Vec::default(),
             endpoints: BTreeMap::default(),
             voices: VoiceConfig::default(),
@@ -627,6 +641,50 @@ mod tests {
         config.save(dir.path()).unwrap();
         let loaded = AppConfig::load(dir.path()).unwrap();
         assert_eq!(loaded.embedding_backend, "ollama");
+    }
+
+    // ── max_source_mb (issue #71: configurable ingest cap) ────────────────
+
+    #[test]
+    fn test_max_source_mb_default() {
+        // Empty by default — the resolver (`ingest::resolve_max_source_bytes`)
+        // maps an empty value to the 50 MB default, mirroring the
+        // empty-string-resolves-to-default pattern of `embedding_backend`.
+        assert_eq!(AppConfig::default().max_source_mb, "");
+    }
+
+    #[test]
+    fn test_max_source_mb_missing_deserializes_to_empty() {
+        // A config.json written before the `max_source_mb` field existed has no
+        // `max_source_mb` key; it must read back as the empty string (the serde
+        // default) rather than failing to deserialize (backward compatibility —
+        // the SAME pattern as `embedding_backend`).
+        let json = r#"{
+            "theme": "dark",
+            "accent": "purple",
+            "embedding_model": "",
+            "embedding_backend": "",
+            "models": [],
+            "endpoints": {},
+            "voices": { "host": "", "guest": "" },
+            "paths": { "data_dir": "" },
+            "tier_thresholds": { "tier1_token_cap": 4000, "tier2_token_cap": 16000 },
+            "onboarding_complete": true
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.max_source_mb, "");
+    }
+
+    #[test]
+    fn test_max_source_mb_explicit_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = AppConfig {
+            max_source_mb: "100".to_string(),
+            ..AppConfig::default()
+        };
+        config.save(dir.path()).unwrap();
+        let loaded = AppConfig::load(dir.path()).unwrap();
+        assert_eq!(loaded.max_source_mb, "100");
     }
 
     #[test]
