@@ -1,3 +1,6 @@
+// issue #71: raise the limit so deep `Send` auto-trait evaluation on the
+// streamed-ingest future doesn't overflow (E0275) under stricter toolchains.
+#![recursion_limit = "256"]
 //! issue #71 Step 5 — crash-injection tests for the bounded-memory streaming PDF
 //! ingest (building-table lifecycle).
 //!

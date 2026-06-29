@@ -1,3 +1,6 @@
+// issue #71: raise the limit so deep `Send` auto-trait evaluation on the
+// ingest future doesn't overflow (E0275) under stricter toolchains.
+#![recursion_limit = "256"]
 //! Integration tests for URL source ingestion (M4 Phase 2, Step 7).
 //!
 //! # Coverage

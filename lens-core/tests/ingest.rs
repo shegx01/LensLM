@@ -1,3 +1,8 @@
+// issue #71: the streamed-ingest future grew deep enough that some toolchains
+// overflow the default 128-frame `Send` auto-trait evaluation (E0275) when
+// compiling this integration-test crate. Integration tests are their own crate
+// and don't inherit the bin's limit, so raise it here too. Compile-time only.
+#![recursion_limit = "256"]
 //! M4 Phase 1, Group g.1 — integration & snapshot tests for the text/Markdown
 //! ingestion slice: parser fidelity, chunk hierarchy, vector-store notebook
 //! isolation, the `embedding_index` registry, the embedder cached-once +

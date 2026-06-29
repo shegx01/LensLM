@@ -1,3 +1,7 @@
+// issue #71: the streamed-ingest future deepened `Send` auto-trait evaluation
+// enough to overflow the default 128-frame limit (E0275) on some toolchains.
+// Compile-time only; no runtime cost.
+#![recursion_limit = "256"]
 //! `lens-core` — the headless engine for LensLM.
 //!
 //! Pure Rust. Contains no Tauri, windowing, or UI dependencies. All localized
