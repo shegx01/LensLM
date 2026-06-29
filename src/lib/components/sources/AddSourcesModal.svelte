@@ -106,7 +106,10 @@
         multiple: false,
         filters: [
           // Kinds the backend `add_file_source` resolves from the extension.
-          { name: 'Documents', extensions: ['md', 'markdown', 'mdx', 'txt', 'pdf', 'docx'] },
+          {
+            name: 'Documents',
+            extensions: ['md', 'markdown', 'mdx', 'txt', 'pdf', 'docx', 'rtf', 'odt', 'epub']
+          },
           { name: 'Structured', extensions: ['json', 'jsonl', 'ndjson', 'yaml', 'yml', 'xml'] }
         ]
       });
@@ -350,11 +353,11 @@
                 Audio &amp; video transcribed locally via Whisper.
               </p>
               <p class="mt-1 italic text-muted-foreground/40">
-                Supported: .md · .markdown · .mdx · .txt · .pdf · .docx · .json · .jsonl · .ndjson ·
-                .yaml · .yml · .xml
+                Supported: .md · .markdown · .mdx · .txt · .pdf · .docx · .rtf · .odt · .epub ·
+                .json · .jsonl · .ndjson · .yaml · .yml · .xml
               </p>
               <p class="mt-1 italic text-muted-foreground/40">
-                Audio/video &amp; ebook (.mobi/.epub) formats coming soon.
+                Audio/video &amp; ebook (.mobi) formats coming soon.
               </p>
             </div>
 

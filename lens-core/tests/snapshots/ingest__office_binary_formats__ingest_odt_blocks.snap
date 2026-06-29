@@ -1,0 +1,21 @@
+---
+source: lens-core/tests/ingest.rs
+expression: block_shape(&out)
+---
+[
+    (
+        "heading",
+        "Sample Heading",
+        "Sample Heading",
+    ),
+    (
+        "paragraph",
+        "Sample Heading",
+        "An ODT paragraph under the heading.",
+    ),
+    (
+        "paragraph",
+        "Sample Heading",
+        "A second paragraph with multibyte 日本語 text.",
+    ),
+]

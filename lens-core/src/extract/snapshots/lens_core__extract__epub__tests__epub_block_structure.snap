@@ -1,0 +1,36 @@
+---
+source: lens-core/src/extract/epub.rs
+expression: snaps
+---
+[
+  {
+    "block_type": "heading",
+    "section_path": "Chapter One",
+    "text": "Chapter One"
+  },
+  {
+    "block_type": "paragraph",
+    "section_path": "Chapter One",
+    "text": "First para & more."
+  },
+  {
+    "block_type": "heading",
+    "section_path": "Chapter One > Sub A",
+    "text": "Sub A"
+  },
+  {
+    "block_type": "paragraph",
+    "section_path": "Chapter One > Sub A",
+    "text": "Under sub A."
+  },
+  {
+    "block_type": "heading",
+    "section_path": "Chapter Two",
+    "text": "Chapter Two"
+  },
+  {
+    "block_type": "paragraph",
+    "section_path": "Chapter Two",
+    "text": "Second emphasised para."
+  }
+]

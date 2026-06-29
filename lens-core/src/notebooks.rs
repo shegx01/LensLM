@@ -882,11 +882,17 @@ impl<'a> NotebookRepo<'a> {
             Some("yaml") => (SourceKind::Yaml.as_str(), "yaml"),
             Some("yml") => (SourceKind::Yaml.as_str(), "yml"),
             Some("xml") => (SourceKind::Xml.as_str(), "xml"),
+            // Office/binary formats (M4 issue #77). The canonical managed-file
+            // extension preserves the original so the on-disk locator round-trips.
+            Some("rtf") => (SourceKind::Rtf.as_str(), "rtf"),
+            Some("odt") => (SourceKind::Odt.as_str(), "odt"),
+            Some("epub") => (SourceKind::Epub.as_str(), "epub"),
             other => {
                 return Err(LensError::Validation(format!(
                     "unsupported file extension {other:?} for {}; expected one of \
                      \".pdf\", \".docx\", \".txt\", \".md\", \".markdown\", \".mdx\", \".json\", \
-                     \".jsonl\", \".ndjson\", \".yaml\", \".yml\", \".xml\"",
+                     \".jsonl\", \".ndjson\", \".yaml\", \".yml\", \".xml\", \".rtf\", \".odt\", \
+                     \".epub\"",
                     src_path.display()
                 )));
             }
@@ -2052,6 +2058,21 @@ mod tests {
             kind_for_extension("mdx").await,
             SourceKind::Markdown.as_str()
         );
+    }
+
+    #[tokio::test]
+    async fn add_file_source_rtf_extension() {
+        assert_eq!(kind_for_extension("rtf").await, SourceKind::Rtf.as_str());
+    }
+
+    #[tokio::test]
+    async fn add_file_source_odt_extension() {
+        assert_eq!(kind_for_extension("odt").await, SourceKind::Odt.as_str());
+    }
+
+    #[tokio::test]
+    async fn add_file_source_epub_extension() {
+        assert_eq!(kind_for_extension("epub").await, SourceKind::Epub.as_str());
     }
 
     // -----------------------------------------------------------------------

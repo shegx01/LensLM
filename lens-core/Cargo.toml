@@ -97,6 +97,25 @@ serde-saphyr = "=0.0.28"
 # deny.toml allowlist. Pinned exactly per repo convention.
 roxmltree = "=0.21.1"
 
+# --- M4 issue #77: RTF / ODT / EPUB office-binary extractors ---
+# RTF paragraph extraction. `default-features = false` drops the optional
+# `jsbindings` (WASM JSValue) feature not needed for native extraction.
+# MIT — deny.toml allowlist. Pinned exactly per repo convention.
+rtf-parser = { version = "=0.4.3", default-features = false }
+# ODF/EPUB ZIP container reader (ODT `content.xml`, EPUB structure). zip 0.6.6 is
+# ALREADY resolved transitively via docx-rs, so pinning to that version pulls NO
+# new copy. MIT — deny.toml allowlist.
+zip = { version = "=0.6.6", default-features = false, features = ["deflate"] }
+# XHTML/XML streaming parser for ODT `content.xml` and EPUB XHTML spine entries.
+# A NEW direct dep (existing transitive versions resolve independently). MIT —
+# deny.toml allowlist. Pinned exactly per repo convention.
+quick-xml = { version = "=0.41.0", default-features = false }
+# EPUB2/3 reader for the EPUB extractor. `default-features = false` drops the
+# optional `write`/`prelude` features not needed for read-only extraction;
+# `threadsafe` is REQUIRED so the parsed Epub is Send + Sync (the extractor lives
+# behind `Box<dyn Extractor>`). Apache-2.0 — deny.toml allowlist. Pinned exactly.
+rbook = { version = "=0.7.9", default-features = false, features = ["threadsafe"] }
+
 # --- M4 Source Grounding (Phase 2, Step 6) ---
 # DOCX paragraph/heading/table extraction. MIT licence — in deny.toml allowlist.
 # Pinned exactly to avoid future breaking changes in a crate still at 0.x.
