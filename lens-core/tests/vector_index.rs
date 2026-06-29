@@ -18,8 +18,14 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use lens_core::vector_store::{VectorRow, VectorStore};
-use lens_core::{DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, LanceVectorStore, LensEngine};
+use lens_core::vector_store::{Coordinate, VectorRow, VectorStore};
+use lens_core::{
+    DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, EmbeddingBackend, LanceVectorStore, LensEngine,
+};
+
+fn coord(nb: &str, model: &str, dim: usize) -> Coordinate {
+    Coordinate::new(nb, EmbeddingBackend::Fastembed, model, dim)
+}
 
 /// A deterministic, well-spread unit vector of length [`DEFAULT_EMBED_DIM`]. Each
 /// component is a sine of `(seed, dim)` so PQ/IVF k-means training sees real
@@ -51,9 +57,9 @@ fn make_rows(notebook: &str, n: usize) -> Vec<VectorRow> {
 }
 
 /// The physical table name the store resolves for the default nomic coordinate.
-/// Step 4 generalizes the scheme to embed the dim: `vec__{nb}__{slug}__d{dim}`.
+/// Step 4b adds the backend segment: `vec__{nb}__{backend}__{slug}__d{dim}`.
 fn nomic_table(notebook: &str) -> String {
-    format!("vec__{notebook}__nomic_v15__d{DEFAULT_EMBED_DIM}")
+    format!("vec__{notebook}__fastembed__nomic_v15__d{DEFAULT_EMBED_DIM}")
 }
 
 /// Connects to the physical Lance table and returns its index configs (public
@@ -123,9 +129,7 @@ async fn below_threshold_creates_no_index() {
 
     store
         .add(
-            &nb,
-            DEFAULT_EMBED_MODEL_ID,
-            DEFAULT_EMBED_DIM,
+            &coord(&nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM),
             make_rows(&nb, 100),
         )
         .await
@@ -146,9 +150,7 @@ async fn crossing_threshold_builds_one_ivfpq_index() {
 
     store
         .add(
-            &nb,
-            DEFAULT_EMBED_MODEL_ID,
-            DEFAULT_EMBED_DIM,
+            &coord(&nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM),
             make_rows(&nb, 400),
         )
         .await
@@ -175,9 +177,7 @@ async fn second_add_past_threshold_does_not_duplicate_index() {
 
     store
         .add(
-            &nb,
-            DEFAULT_EMBED_MODEL_ID,
-            DEFAULT_EMBED_DIM,
+            &coord(&nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM),
             make_rows(&nb, 400),
         )
         .await
@@ -195,7 +195,7 @@ async fn second_add_past_threshold_does_not_duplicate_index() {
         })
         .collect();
     store
-        .add(&nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM, more)
+        .add(&coord(&nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM), more)
         .await
         .unwrap();
 
@@ -219,9 +219,7 @@ async fn second_add_past_threshold_does_not_duplicate_index() {
     // Rows stay searchable (the index serves without error).
     let hits = store
         .search(
-            &nb,
-            DEFAULT_EMBED_MODEL_ID,
-            DEFAULT_EMBED_DIM,
+            &coord(&nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM),
             &unit_vector(450),
             5,
         )
@@ -261,7 +259,7 @@ async fn recall_canary_ann_returns_exact_matches_in_top_k() {
         });
     }
     store
-        .add(&nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM, rows)
+        .add(&coord(&nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM), rows)
         .await
         .unwrap();
 
@@ -275,7 +273,11 @@ async fn recall_canary_ann_returns_exact_matches_in_top_k() {
     let mut found = 0usize;
     for (id, qvec) in planted_ids.iter().zip(&planted_vecs) {
         let hits = store
-            .search(&nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM, qvec, 10)
+            .search(
+                &coord(&nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM),
+                qvec,
+                10,
+            )
             .await
             .unwrap();
         if hits.iter().any(|h| &h.chunk_id == id) {
@@ -297,7 +299,7 @@ async fn building_table_indexed_then_serves_after_flip() {
 
     // Populate a building table past threshold through the public flip APIs.
     let building = store
-        .create_building_table(&nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM)
+        .create_building_table(&coord(&nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM))
         .await
         .unwrap();
     let mut rows = make_rows(&nb, 400);
@@ -323,12 +325,19 @@ async fn building_table_indexed_then_serves_after_flip() {
     );
 
     store
-        .flip_active(&nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM, &building)
+        .flip_active(
+            &coord(&nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM),
+            &building,
+        )
         .await
         .unwrap();
 
     let hits = store
-        .search(&nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM, &planted, 10)
+        .search(
+            &coord(&nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM),
+            &planted,
+            10,
+        )
         .await
         .unwrap();
     let ids: HashSet<String> = hits.into_iter().map(|h| h.chunk_id).collect();
@@ -362,7 +371,10 @@ async fn add_to_table_accepts_1024_dim_rows() {
 
     let model = "mxbai-embed-large";
     let dim = 1024usize;
-    let building = store.create_building_table(&nb, model, dim).await.unwrap();
+    let building = store
+        .create_building_table(&coord(&nb, model, dim))
+        .await
+        .unwrap();
 
     let rows: Vec<VectorRow> = (0..5)
         .map(|i| VectorRow {
@@ -379,9 +391,12 @@ async fn add_to_table_accepts_1024_dim_rows() {
         .await
         .expect("1024-dim rows append without an assertion failure");
 
-    store.flip_active(&nb, model, dim, &building).await.unwrap();
+    store
+        .flip_active(&coord(&nb, model, dim), &building)
+        .await
+        .unwrap();
     let hits = store
-        .search(&nb, model, dim, &unit_vector_dim(0, dim), 5)
+        .search(&coord(&nb, model, dim), &unit_vector_dim(0, dim), 5)
         .await
         .unwrap();
     assert!(
@@ -472,9 +487,7 @@ async fn existing_gen0_table_resolved_by_stored_name_not_regenerated() {
     // Resolution must open the STORED legacy table — the planted hit proves it.
     let hits = store
         .search(
-            &nb,
-            DEFAULT_EMBED_MODEL_ID,
-            DEFAULT_EMBED_DIM,
+            &coord(&nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM),
             &unit_vector(7),
             5,
         )

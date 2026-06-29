@@ -63,7 +63,7 @@ async fn migration_is_idempotent_second_run_is_noop() {
         .unwrap();
 
     assert_eq!(count_before, count_after);
-    assert_eq!(count_after, 6, "all migration files applied");
+    assert_eq!(count_after, 7, "all migration files applied (0001..0007)");
 }
 
 #[tokio::test]
@@ -539,11 +539,15 @@ async fn purge_notebook_drops_lance_table() {
     // registry row, mirroring an ingest).
     let pool = engine.pool().await;
     let store = lens_core::LanceVectorStore::new(data_dir, pool.clone());
+    let coord = lens_core::vector_store::Coordinate::new(
+        nb.id.as_str(),
+        lens_core::EmbeddingBackend::Fastembed,
+        lens_core::DEFAULT_EMBED_MODEL_ID,
+        lens_core::DEFAULT_EMBED_DIM,
+    );
     store
         .add(
-            nb.id.as_str(),
-            lens_core::DEFAULT_EMBED_MODEL_ID,
-            lens_core::DEFAULT_EMBED_DIM,
+            &coord,
             vec![VectorRow {
                 chunk_id: Uuid::now_v7().to_string(),
                 source_id: Uuid::now_v7().to_string(),
@@ -597,7 +601,7 @@ async fn cold_init_under_budget_on_empty_temp_db() {
     let engine = LensEngine::init(dir.path()).await.unwrap();
     let elapsed = start.elapsed();
     // Sanity: the engine works.
-    assert_eq!(engine.migration_count().await.unwrap(), 6);
+    assert_eq!(engine.migration_count().await.unwrap(), 7);
     // Generous smoke guard against accidentally-expensive migrations (e.g. a
     // future migration that scans/rewrites large tables on cold start). This is
     // NOT a tight perf benchmark — the wide 2s budget keeps it non-flaky on

@@ -42,7 +42,7 @@ pub fn inject_fake_embedder(engine: &LensEngine) {
     let in_flight = Arc::new(AtomicUsize::new(0));
     let e: Arc<dyn Embedder> = Arc::new(CountingEmbedder::new(load_count, in_flight));
     engine
-        .set_embedder_for_test(e)
+        .set_embedder_for_test(e, lens_core::EmbeddingBackend::Fastembed)
         .expect("embedder not yet initialized");
 }
 
@@ -149,7 +149,7 @@ pub async fn vector_chunk_ids(
         Err(_) => return std::collections::HashSet::new(),
     };
     let table_name = format!(
-        "vec__{notebook}__nomic_v15__d{}",
+        "vec__{notebook}__fastembed__nomic_v15__d{}",
         lens_core::DEFAULT_EMBED_DIM
     );
     let names = conn.table_names().execute().await.unwrap_or_default();

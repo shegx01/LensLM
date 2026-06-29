@@ -108,6 +108,7 @@
         disabled={!available}
         title={available ? undefined : 'Available in Settings'}
         aria-expanded={isExpandable ? expanded : undefined}
+        aria-label={`${ACTION_LABEL[action]} ${result.label}`}
         onclick={() => {
           if (!available) return;
           if (isExpandable) {

@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-use lens_core::embedder::{CountingEmbedder, Embedder, resolve};
+use lens_core::embedder::{CountingEmbedder, Embedder, EmbeddingBackend, resolve};
 use lens_core::{LensEngine, NotebookId};
 
 // ---------------------------------------------------------------------------
@@ -27,15 +27,15 @@ async fn embedder_for_caches_same_model_id() {
     let in_flight = Arc::new(AtomicUsize::new(0));
     let injected: Arc<dyn Embedder> = Arc::new(CountingEmbedder::new(load, in_flight));
     engine
-        .set_embedder_for_test(injected)
+        .set_embedder_for_test(injected, EmbeddingBackend::Fastembed)
         .expect("inject default embedder");
 
     let a = engine
-        .embedder_for_test_get("nomic-embed-text-v1.5")
+        .embedder_for_test_get("nomic-embed-text-v1.5", EmbeddingBackend::Fastembed)
         .await
         .expect("embedder_for nomic");
     let b = engine
-        .embedder_for_test_get("nomic-embed-text-v1.5")
+        .embedder_for_test_get("nomic-embed-text-v1.5", EmbeddingBackend::Fastembed)
         .await
         .expect("embedder_for nomic again");
 
@@ -57,7 +57,9 @@ async fn embedder_for_distinct_models_coexist() {
         Arc::new(AtomicUsize::new(0)),
         Arc::new(AtomicUsize::new(0)),
     ));
-    engine.set_embedder_for_test(nomic).expect("inject nomic");
+    engine
+        .set_embedder_for_test(nomic, EmbeddingBackend::Fastembed)
+        .expect("inject nomic");
 
     let mxbai_spec = resolve("mxbai-embed-large");
     let mxbai: Arc<dyn Embedder> = Arc::new(CountingEmbedder::new_with_dim(
@@ -68,14 +70,16 @@ async fn embedder_for_distinct_models_coexist() {
         Arc::new(AtomicUsize::new(0)),
         Arc::new(AtomicUsize::new(0)),
     ));
-    engine.set_embedder_for_test(mxbai).expect("inject mxbai");
+    engine
+        .set_embedder_for_test(mxbai, EmbeddingBackend::Fastembed)
+        .expect("inject mxbai");
 
     let n = engine
-        .embedder_for_test_get("nomic-embed-text-v1.5")
+        .embedder_for_test_get("nomic-embed-text-v1.5", EmbeddingBackend::Fastembed)
         .await
         .expect("nomic");
     let m = engine
-        .embedder_for_test_get("mxbai-embed-large")
+        .embedder_for_test_get("mxbai-embed-large", EmbeddingBackend::Fastembed)
         .await
         .expect("mxbai");
 
@@ -86,6 +90,52 @@ async fn embedder_for_distinct_models_coexist() {
     assert!(
         !Arc::ptr_eq(&n, &m),
         "distinct model ids must be distinct embedders"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Step 4 (4b-B) — backend-keyed embedder cache (R4/M3)
+// ---------------------------------------------------------------------------
+
+/// The SAME model id under DIFFERENT backends must occupy DISTINCT cache slots:
+/// `(nomic, Fastembed)` and `(nomic, Ollama)` return DIFFERENT `Arc`s. A
+/// model-id-only key would alias the two backends and serve the wrong backend's
+/// embedder for a notebook (silent cross-backend vector pollution).
+#[tokio::test]
+async fn embedder_cache_keys_distinct_per_backend() {
+    let engine = LensEngine::for_test().await;
+
+    // Two functionally-distinct CountingEmbedders, both reporting the SAME
+    // model_id (nomic) but injected under different backends. The cache key is
+    // `(model_id, backend)`, so they must not collide.
+    let fastembed: Arc<dyn Embedder> = Arc::new(CountingEmbedder::new(
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(0)),
+    ));
+    let ollama: Arc<dyn Embedder> = Arc::new(CountingEmbedder::new(
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(0)),
+    ));
+    engine
+        .set_embedder_for_test(fastembed, EmbeddingBackend::Fastembed)
+        .expect("inject nomic/fastembed");
+    engine
+        .set_embedder_for_test(ollama, EmbeddingBackend::Ollama)
+        .expect("inject nomic/ollama");
+
+    let f = engine
+        .embedder_for_test_get("nomic-embed-text-v1.5", EmbeddingBackend::Fastembed)
+        .await
+        .expect("nomic/fastembed");
+    let o = engine
+        .embedder_for_test_get("nomic-embed-text-v1.5", EmbeddingBackend::Ollama)
+        .await
+        .expect("nomic/ollama");
+
+    assert_eq!(f.model_id(), o.model_id(), "both report the same model id");
+    assert!(
+        !Arc::ptr_eq(&f, &o),
+        "same model id under different backends must be DISTINCT cached instances"
     );
 }
 
@@ -109,7 +159,7 @@ async fn resolve_notebook_embedding_mxbai() {
         .await
         .expect("set mxbai");
 
-    let (model, dim) = engine
+    let (model, dim, _backend) = engine
         .resolve_notebook_embedding(&nb.id)
         .await
         .expect("resolve");
@@ -132,7 +182,7 @@ async fn resolve_notebook_embedding_null_is_default() {
         .await
         .expect("null model");
 
-    let (model, dim) = engine
+    let (model, dim, _backend) = engine
         .resolve_notebook_embedding(&nb.id)
         .await
         .expect("resolve");
@@ -156,7 +206,7 @@ async fn resolve_notebook_embedding_unknown_is_default() {
         .await
         .expect("set unknown");
 
-    let (model, dim) = engine
+    let (model, dim, _backend) = engine
         .resolve_notebook_embedding(&nb.id)
         .await
         .expect("resolve");
@@ -177,7 +227,7 @@ async fn set_embedding_model_accepts_legacy_alias_and_persists_canonical() {
         .expect("create notebook");
 
     engine
-        .set_notebook_embedding_model(&nb.id, "nomic-embed-text")
+        .set_notebook_embedding_model(&nb.id, "nomic-embed-text", EmbeddingBackend::Fastembed)
         .await
         .expect("legacy alias accepted");
 
@@ -201,10 +251,67 @@ async fn set_embedding_model_rejects_unknown_id() {
         .expect("create notebook");
 
     let err = engine
-        .set_notebook_embedding_model(&nb.id, "totally-made-up-model")
+        .set_notebook_embedding_model(&nb.id, "totally-made-up-model", EmbeddingBackend::Fastembed)
         .await
         .expect_err("unknown id rejected");
     assert!(format!("{err}").contains("unknown embedding model id"));
+}
+
+/// AC7 — a NEW notebook adopts the app-wide GLOBAL default coordinate set in
+/// Settings (`AppConfig::embedding_model` + `embedding_backend`), NOT the
+/// compile-time `nomic`/`fastembed` consts. Setting the global default to a
+/// non-default model+backend and then creating a notebook must stamp that pair,
+/// so `get_notebook_embedding_info` reports it.
+#[tokio::test]
+async fn new_notebook_adopts_global_default_model_and_backend() {
+    let engine = LensEngine::for_test().await;
+
+    // Set the global default to a NON-default model + backend.
+    let mut cfg = engine.config().await;
+    cfg.embedding_model = "mxbai-embed-large".to_string();
+    cfg.embedding_backend = "ollama".to_string();
+    engine.set_config(cfg).await;
+
+    let nb = engine
+        .create_notebook("Adopts Default NB", None, None)
+        .await
+        .expect("create notebook");
+
+    let (model, dim, backend, _status) = engine
+        .get_notebook_embedding_info(&nb.id)
+        .await
+        .expect("embedding info");
+    assert_eq!(
+        model, "mxbai-embed-large",
+        "adopts configured default model"
+    );
+    assert_eq!(dim, 1024);
+    assert_eq!(
+        backend,
+        EmbeddingBackend::Ollama,
+        "adopts configured default backend"
+    );
+}
+
+/// AC7 (negative) — with an UNSET global default (the fresh-install state), a new
+/// notebook still gets the registry/enum default (`nomic-embed-text-v1.5` /
+/// `fastembed`), preserving the prior compile-time-const behavior.
+#[tokio::test]
+async fn new_notebook_with_unset_global_default_uses_registry_default() {
+    let engine = LensEngine::for_test().await;
+    // `for_test` config has empty embedding_model/backend (fresh-install state).
+    let nb = engine
+        .create_notebook("Default NB", None, None)
+        .await
+        .expect("create notebook");
+
+    let (model, dim, backend, _status) = engine
+        .get_notebook_embedding_info(&nb.id)
+        .await
+        .expect("embedding info");
+    assert_eq!(model, "nomic-embed-text-v1.5");
+    assert_eq!(dim, 768);
+    assert_eq!(backend, EmbeddingBackend::Fastembed);
 }
 
 /// `resolve_notebook_embedding` fails fast for a non-existent notebook (rather

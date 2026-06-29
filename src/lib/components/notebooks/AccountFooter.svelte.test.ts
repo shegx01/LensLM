@@ -60,17 +60,19 @@ describe('AccountFooter', () => {
     await waitFor(() => expect(screen.getByRole('menu')).toBeInTheDocument());
   });
 
-  it('Settings menu item is disabled/aria-disabled', async () => {
+  it('Settings menu item is enabled and opens the global Preferences shell', async () => {
+    const { notebookStore } = await import('$lib/notebooks/index.js');
+    notebookStore.settingsOpen = false;
     render(AccountFooter, { props: { userName: 'Jamie' } });
     await fireEvent.click(screen.getByRole('button', { name: /account menu/i }));
     await waitFor(() => screen.getByRole('menu'));
-    const settingsItem = screen.queryByText(/settings/i);
+    const settingsItem = screen.getByRole('menuitem', { name: /settings/i });
     expect(settingsItem).toBeInTheDocument();
-    // The settings item wraps in a TooltipTrigger with disabled; check aria-disabled
-    const disabledEl =
-      screen.getByText(/settings/i).closest('[aria-disabled="true"]') ??
-      screen.getByText(/settings/i).closest('[disabled]');
-    expect(disabledEl).toBeTruthy();
+    // No longer disabled — clicking opens the Preferences shell.
+    expect(settingsItem.closest('[aria-disabled="true"]')).toBeNull();
+    await fireEvent.click(settingsItem);
+    expect(notebookStore.settingsOpen).toBe(true);
+    notebookStore.settingsOpen = false;
   });
 
   it('does NOT render a "Sign out" menu item', async () => {

@@ -115,21 +115,40 @@
         <TooltipContent side="bottom">Available soon</TooltipContent>
       </Tooltip>
 
-      <!-- Settings gear — circular icon button, disabled, "Available soon" -->
-      <Tooltip>
-        <TooltipTrigger>
-          <Button
-            variant="ghost"
-            size="icon"
-            disabled
-            class="size-[30px] rounded-full bg-muted text-muted-foreground hover:bg-muted/70"
-            aria-label="Notebook settings (available soon)"
-          >
-            <Settings class="size-[13px]" />
-          </Button>
-        </TooltipTrigger>
-        <TooltipContent side="bottom">Available soon</TooltipContent>
-      </Tooltip>
+      <!-- Settings gear — opens the per-notebook "{notebook} settings" sheet.
+           Only interactive when a notebook is active (it edits THAT notebook's
+           embedding coordinate); honestly disabled otherwise. -->
+      {#if activeNotebook}
+        <Tooltip>
+          <TooltipTrigger>
+            <Button
+              variant="ghost"
+              size="icon"
+              class="size-[30px] rounded-full bg-muted text-muted-foreground hover:bg-muted/70 hover:text-foreground"
+              aria-label="Notebook settings"
+              onclick={() => (notebookStore.notebookSettingsOpen = true)}
+            >
+              <Settings class="size-[13px]" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom">Notebook settings</TooltipContent>
+        </Tooltip>
+      {:else}
+        <Tooltip>
+          <TooltipTrigger>
+            <Button
+              variant="ghost"
+              size="icon"
+              disabled
+              class="size-[30px] rounded-full bg-muted text-muted-foreground hover:bg-muted/70"
+              aria-label="Notebook settings (no active notebook)"
+            >
+              <Settings class="size-[13px]" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom">Select a notebook</TooltipContent>
+        </Tooltip>
+      {/if}
     </TooltipProvider>
   </div>
 </div>

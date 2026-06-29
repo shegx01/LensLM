@@ -1,8 +1,7 @@
 //! System / diagnostic commands.
 
 use lens_core::{
-    ALLOWED_EMBEDDING_MODELS, CheckResult, DownloadProgress, InstallProgress, LensEngine,
-    LensError, LlmDetection, TtsVoice,
+    CheckResult, DownloadProgress, InstallProgress, LensEngine, LensError, LlmDetection, TtsVoice,
 };
 use serde::Serialize;
 use tauri::Manager;
@@ -68,7 +67,9 @@ pub async fn run_system_check(
 /// `base_url`: a user could paste a URL embedding `user:password@` userinfo, and
 /// `%base_url` would leak those credentials into the trace/log stream.
 #[tracing::instrument(skip_all, fields(target = %sanitize_url_for_log(&base_url)))]
-#[tauri::command]
+// `rename_all = "snake_case"` so the snake_case JS arg key `base_url` binds
+// (Tauri v2 defaults to camelCase; without this, auto-detect silently no-ops).
+#[tauri::command(rename_all = "snake_case")]
 pub async fn detect_llm(base_url: String) -> Result<LlmDetection, LensError> {
     Ok(lens_core::detect_llm(&base_url).await)
 }
@@ -103,8 +104,16 @@ pub async fn list_tts_voices() -> Result<Vec<TtsVoice>, LensError> {
 /// configured Ollama base URL (same resolution as the system-check probe). If
 /// Ollama is unreachable the command returns an `Err` for the UI to surface.
 ///
-/// `model` is validated against [`ALLOWED_EMBEDDING_MODELS`]; anything else is
+/// `model` is validated via [`lens_core::is_allowlisted_embedding_id`] (the
+/// registry-derived allowlist plus the Ollama alias bridge); anything else is
 /// rejected with a [`LensError::Validation`] before any network call.
+///
+/// RESERVED FOR FUTURE USE (M5+): this command is REGISTERED (`main.rs`) but
+/// currently has no frontend caller — the onboarding/Settings embedding UX moved
+/// to the fastembed warm path + Ollama detect-only flow (4b-B), which never pulls
+/// from Ollama. It is kept (not removed) as the intended consumer is the planned
+/// "pull an Ollama embedding model from the UI" affordance; removing a registered
+/// Tauri command is higher-risk churn than documenting its dormant status.
 ///
 /// Invoked as `invoke("install_embedding_model", { model, onProgress })` where
 /// `onProgress` is a `Channel<InstallProgress>`.
@@ -115,7 +124,7 @@ pub async fn install_embedding_model(
     on_progress: Channel<InstallProgress>,
     engine: tauri::State<'_, LensEngine>,
 ) -> Result<(), LensError> {
-    if !ALLOWED_EMBEDDING_MODELS.contains(&model.as_str()) {
+    if !lens_core::is_allowlisted_embedding_id(&model) {
         return Err(LensError::Validation(format!(
             "unsupported embedding model: {model}"
         )));
@@ -171,6 +180,56 @@ pub async fn kokoro_downloaded(app: tauri::AppHandle) -> Result<bool, LensError>
         .app_data_dir()
         .map_err(|e| LensError::Io(e.to_string()))?;
     Ok(data_dir.join(lens_core::KOKORO_MODEL_RELPATH).is_file())
+}
+
+/// Returns the set of registry embedding-model ids whose fastembed weights are
+/// already cached on disk under `{app_data_dir}/models/fastembed/`.
+///
+/// This is the per-model, fastembed-side counterpart to `list_ollama_models`
+/// (the Ollama-side `/api/tags` probe): the onboarding + Settings Embeddings
+/// surfaces use it to light up a fastembed model card as "Ready" without forcing
+/// a re-download. Reuses the SAME per-model cache predicate the readiness gate
+/// uses ([`lens_core::fastembed_weights_cached`]) so the card state and the gate
+/// can never disagree. Best-effort: an unresolvable data dir yields an empty list.
+///
+/// Invoked as `invoke("fastembed_models_cached")`.
+#[tracing::instrument(skip_all)]
+#[tauri::command]
+pub async fn fastembed_models_cached(app: tauri::AppHandle) -> Result<Vec<String>, LensError> {
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| LensError::Io(e.to_string()))?;
+    let cached = lens_core::REGISTRY
+        .iter()
+        .filter(|spec| lens_core::fastembed_weights_cached(&data_dir, spec.id))
+        .map(|spec| spec.id.to_string())
+        .collect();
+    Ok(cached)
+}
+
+/// Warms (downloads + caches) a fastembed model's weights so a fastembed
+/// selection can pass the onboarding readiness gate without a first ingest.
+///
+/// `model` is validated against the registry (unknown ids are rejected). On a
+/// warm cache this returns immediately; on a cold cache it blocks while fastembed
+/// fetches the weights from HuggingFace (the `tokio::spawn_blocking` lives inside
+/// `LensEngine::warm_fastembed_model`). There is no byte-level progress (fastembed
+/// init is synchronous + opaque), so the UI shows an indeterminate phase spinner.
+///
+/// Invoked as `invoke("warm_fastembed_model", { model })`.
+#[tracing::instrument(skip(engine), fields(model = %model))]
+#[tauri::command]
+pub async fn warm_fastembed_model(
+    model: String,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<(), LensError> {
+    if lens_core::resolve_opt(&model).is_none() {
+        return Err(LensError::Validation(format!(
+            "unsupported embedding model: {model}"
+        )));
+    }
+    engine.warm_fastembed_model(&model).await
 }
 
 /// Allowed document extensions (lowercased, no dot) for recent-doc suggestions.
@@ -357,8 +416,9 @@ mod tests {
         assert!(status.db_ok);
         // All migrations are recorded: 0001_init, 0002_notebook_personalize,
         // 0003_source_soft_delete, 0004_source_anchor, 0005_enrichment,
-        // 0006_notebook_embedding_model.
-        assert_eq!(status.migration_count, 6);
+        // 0006_notebook_embedding_model, 0007_notebook_embedding_backend (M4
+        // Phase 4b-B).
+        assert_eq!(status.migration_count, 7);
     }
 
     #[tokio::test]

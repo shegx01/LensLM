@@ -62,6 +62,8 @@ fn main() {
             commands::system::install_embedding_model,
             commands::system::download_tts_engine,
             commands::system::kokoro_downloaded,
+            commands::system::fastembed_models_cached,
+            commands::system::warm_fastembed_model,
             commands::models::list_models,
             commands::models::list_provider_models,
             commands::models::list_ollama_models,

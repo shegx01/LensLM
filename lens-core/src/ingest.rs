@@ -515,9 +515,17 @@ async fn run_ingest(
     // boundary: every drop/add/embed below threads this per-notebook model+dim
     // instead of the global default, so a notebook configured with a non-nomic
     // model is indexed under its own coordinate.
-    let (embed_model, embed_dim) = engine
+    let (embed_model, embed_dim, embed_backend) = engine
         .resolve_notebook_embedding(&crate::NotebookId::from(notebook.clone()))
         .await?;
+    // The full backend-aware coordinate (M4 Phase 4b-B) threaded into every
+    // drop/add below so the source is indexed under its notebook's own backend.
+    let coord = crate::vector_store::Coordinate::new(
+        notebook.clone(),
+        embed_backend,
+        embed_model.clone(),
+        embed_dim,
+    );
 
     // ── PARSE ─────────────────────────────────────────────────────────────
     {
@@ -578,9 +586,7 @@ async fn run_ingest(
     // SQLite chunk delete + insert then run inside ONE transaction so a crash
     // mid-insert can never leave a half-written set of chunk rows: the tx either
     // commits the full fresh set or rolls back to the prior state.
-    store
-        .drop_source(&notebook, &embed_model, embed_dim, source_id)
-        .await?;
+    store.drop_source(&coord, source_id).await?;
 
     let mut tx = pool.begin().await?;
     delete_chunks_for_source(&mut tx, source_id).await?;
@@ -627,7 +633,7 @@ async fn run_ingest(
     // Lazily get the cached embedder. Emit a `model_download` phase BEFORE the
     // first construction so a cold-cache download surfaces in the UI.
     on_progress(IngestProgress::new(ingest_phase::MODEL_DOWNLOAD, 0, None));
-    let embedder = engine.embedder_for(&embed_model).await?;
+    let embedder = engine.embedder_for(&embed_model, embed_backend).await?;
     on_progress(IngestProgress::new(
         ingest_phase::MODEL_DOWNLOAD,
         1,
@@ -678,7 +684,7 @@ async fn run_ingest(
 
     // ── INDEX ─────────────────────────────────────────────────────────────
     on_progress(IngestProgress::new(ingest_phase::INDEXING, 0, Some(1)));
-    store.add(&notebook, &embed_model, embed_dim, rows).await?;
+    store.add(&coord, rows).await?;
     on_progress(IngestProgress::new(ingest_phase::INDEXING, 1, Some(1)));
 
     // ── Finalize: metadata + indexed status ──────────────────────────────
@@ -777,7 +783,7 @@ fn is_blocked_ip(ip: IpAddr) -> bool {
     }
     match ip {
         IpAddr::V4(v4) => {
-            v4.is_loopback()
+            is_loopback_ip(ip)
                 || v4.is_private()
                 || v4.is_link_local()
                 || v4.is_unspecified()
@@ -790,7 +796,7 @@ fn is_blocked_ip(ip: IpAddr) -> bool {
             if let Some(mapped) = v6.to_ipv4_mapped() {
                 return is_blocked_ip(IpAddr::V4(mapped));
             }
-            v6.is_loopback()
+            is_loopback_ip(ip)
                 || v6.is_unspecified()
                 // Link-local fe80::/10.
                 || (v6.segments()[0] & 0xffc0) == 0xfe80
@@ -798,6 +804,130 @@ fn is_blocked_ip(ip: IpAddr) -> bool {
                 || (v6.segments()[0] & 0xfe00) == 0xfc00
         }
     }
+}
+
+/// Returns `true` if `ip` is a loopback address (`127.0.0.0/8`, `::1`, or an
+/// IPv4-mapped loopback `::ffff:127.0.0.0/8`).
+///
+/// Shared classifier (single source of truth for "is this loopback?") used by
+/// BOTH the SSRF guard ([`is_blocked_ip`], which *rejects* loopback for a
+/// user-supplied remote URL source) AND the Ollama embedder's loopback gate
+/// ([`require_loopback`], which *requires* loopback for the local embedding
+/// server). The two call sites apply opposite POLICIES on the same FACT, so the
+/// fact is defined once here and cannot drift between them.
+pub(crate) fn is_loopback_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return mapped.is_loopback();
+            }
+            v6.is_loopback()
+        }
+    }
+}
+
+/// A validated loopback base URL: the lowercased host string plus the resolved,
+/// guard-approved loopback [`SocketAddr`]s to pin reqwest to (the inverse of
+/// [`ValidatedFetchUrl`] for the local-service direction).
+///
+/// `pinned_addrs` carries the addresses a HOSTNAME resolved to so the caller can
+/// pin reqwest's connection via `resolve_to_addrs` — closing the same DNS-rebinding
+/// TOCTOU the URL-fetch guard defends against (resolve here, then reqwest
+/// re-resolves at connect time). It is EMPTY for an IP-literal host, where reqwest
+/// performs no DNS lookup and there is nothing to rebind.
+#[derive(Debug)]
+pub(crate) struct LoopbackTarget {
+    /// The lowercased host string used as the `resolve_to_addrs` DNS-override key.
+    pub host: String,
+    /// Guard-approved resolved loopback addresses to pin reqwest to (empty ⇒
+    /// IP-literal host, no DNS step to pin).
+    pub pinned_addrs: Vec<std::net::SocketAddr>,
+}
+
+/// Loopback-ONLY gate for a local-service base URL (the inverse of the SSRF
+/// guard): parses `base_url`, requires an `http`/`https` scheme, resolves the
+/// host, and rejects unless EVERY resolved address is loopback
+/// ([`is_loopback_ip`]).
+///
+/// On success returns the [`LoopbackTarget`] (host + resolved loopback addrs) so
+/// the caller can pin reqwest to exactly those addresses and avoid a second,
+/// unchecked DNS resolution at connect time (DNS-rebinding TOCTOU).
+///
+/// This is the safety contract for the Ollama embedder: the app will only ever
+/// POST embedding inputs to a server bound to this machine's loopback
+/// interface, never to a LAN/public host (which could exfiltrate the documents
+/// being embedded or be an SSRF pivot). An IP-literal host is checked directly;
+/// a hostname is resolved and EVERY candidate must be loopback (so a host with
+/// one loopback and one non-loopback A record is rejected). A host that resolves
+/// to NO address is rejected.
+pub(crate) fn require_loopback(base_url: &str) -> Result<LoopbackTarget, LensError> {
+    let parsed = url::Url::parse(base_url)
+        .map_err(|e| LensError::Validation(format!("invalid base URL {base_url:?}: {e}")))?;
+    let scheme = parsed.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err(LensError::Validation(format!(
+            "base URL scheme must be http or https, got {scheme:?}"
+        )));
+    }
+    let host = parsed
+        .host()
+        .ok_or_else(|| LensError::Validation(format!("base URL {base_url:?} has no host")))?;
+    let port = parsed.port_or_known_default().unwrap_or(80);
+
+    let domain = match host {
+        url::Host::Ipv4(v4) => {
+            if !is_loopback_ip(IpAddr::V4(v4)) {
+                return Err(LensError::Validation(format!(
+                    "embedding base URL host {v4} is not loopback; the Ollama embedder \
+                     accepts loopback-only addresses"
+                )));
+            }
+            // IP-literal: reqwest connects to the literal directly (no DNS), so
+            // there is nothing to pin.
+            return Ok(LoopbackTarget {
+                host: v4.to_string(),
+                pinned_addrs: Vec::new(),
+            });
+        }
+        url::Host::Ipv6(v6) => {
+            if !is_loopback_ip(IpAddr::V6(v6)) {
+                return Err(LensError::Validation(format!(
+                    "embedding base URL host {v6} is not loopback; the Ollama embedder \
+                     accepts loopback-only addresses"
+                )));
+            }
+            return Ok(LoopbackTarget {
+                host: v6.to_string(),
+                pinned_addrs: Vec::new(),
+            });
+        }
+        url::Host::Domain(d) => d.to_string(),
+    };
+
+    let addrs = (domain.as_str(), port).to_socket_addrs().map_err(|e| {
+        LensError::Network(format!("failed to resolve base URL host {domain}: {e}"))
+    })?;
+    let mut pinned_addrs = Vec::new();
+    for addr in addrs {
+        if !is_loopback_ip(addr.ip()) {
+            return Err(LensError::Validation(format!(
+                "embedding base URL host {domain} resolves to a non-loopback address ({}); \
+                 the Ollama embedder accepts loopback-only addresses",
+                addr.ip()
+            )));
+        }
+        pinned_addrs.push(addr);
+    }
+    if pinned_addrs.is_empty() {
+        return Err(LensError::Network(format!(
+            "embedding base URL host {domain} did not resolve to any address"
+        )));
+    }
+    Ok(LoopbackTarget {
+        host: domain.to_ascii_lowercase(),
+        pinned_addrs,
+    })
 }
 
 /// A validated URL-source locator: the parsed [`url::Url`] plus the exact
@@ -1123,37 +1253,45 @@ async fn wipe_source_content(
     // the right per-notebook table. This helper has only the pool (no engine
     // handle), so resolve straight off the notebook row through the registry —
     // identical semantics to `LensEngine::resolve_notebook_embedding`.
-    let (embed_model, embed_dim) = resolve_notebook_embedding_from_pool(pool, notebook_id).await?;
-    store
-        .drop_source(notebook_id, &embed_model, embed_dim, source_id)
-        .await?;
+    let (embed_model, embed_dim, embed_backend) =
+        resolve_notebook_embedding_from_pool(pool, notebook_id).await?;
+    let coord = crate::vector_store::Coordinate::new(
+        notebook_id.to_string(),
+        embed_backend,
+        embed_model,
+        embed_dim,
+    );
+    store.drop_source(&coord, source_id).await?;
     let mut tx = pool.begin().await?;
     delete_chunks_for_source(&mut tx, source_id).await?;
     tx.commit().await?;
     Ok(())
 }
 
-/// Resolves a notebook's `(model_id, dim)` embedding coordinate directly from the
-/// pool (the pool-only twin of [`crate::LensEngine::resolve_notebook_embedding`]).
+/// Resolves a notebook's `(model_id, dim, backend)` embedding coordinate directly
+/// from the pool (the pool-only twin of
+/// [`crate::LensEngine::resolve_notebook_embedding`]).
 ///
 /// Used by the ingest helpers that hold a `&SqlitePool` but no engine handle. A
-/// NULL `embedding_model` (the column exists but is unset) or an unknown value
-/// falls back to the registry default; a MISSING notebook row fails fast, matching
-/// [`crate::LensEngine::resolve_notebook_embedding`].
+/// NULL `embedding_model`/`embedding_backend` (the column exists but is unset) or
+/// an unknown value falls back to the registry/backend default; a MISSING notebook
+/// row fails fast, matching [`crate::LensEngine::resolve_notebook_embedding`].
 async fn resolve_notebook_embedding_from_pool(
     pool: &sqlx::SqlitePool,
     notebook_id: &str,
-) -> Result<(String, usize), LensError> {
-    // `fetch_optional` → None means NO such notebook (fail fast); `Some(None)` means
-    // the row exists with a NULL `embedding_model` (resolve to the default).
-    let stored: Option<String> =
-        sqlx::query_scalar("SELECT embedding_model FROM notebooks WHERE id = ?")
+) -> Result<(String, usize, crate::embedder::EmbeddingBackend), LensError> {
+    // `fetch_optional` → None means NO such notebook (fail fast); NULL columns mean
+    // the row exists with an unset model/backend (resolve each to the default).
+    let row: (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT embedding_model, embedding_backend FROM notebooks WHERE id = ?")
             .bind(notebook_id)
             .fetch_optional(pool)
             .await?
             .ok_or_else(|| LensError::Validation(format!("no notebook with id {notebook_id}")))?;
-    let spec = crate::embedder::resolve(stored.as_deref().unwrap_or(""));
-    Ok((spec.id.to_string(), spec.dim))
+    let (stored_model, stored_backend) = row;
+    let spec = crate::embedder::resolve(stored_model.as_deref().unwrap_or(""));
+    let backend = crate::embedder::EmbeddingBackend::from_opt_str(stored_backend.as_deref());
+    Ok((spec.id.to_string(), spec.dim, backend))
 }
 
 /// Deletes every `chunks` row for `source_id`.

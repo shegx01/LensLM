@@ -28,8 +28,8 @@ pub mod vector_store;
 
 pub use config::{AppConfig, EnrichmentConfig, TaskModel};
 pub use embedder::{
-    CountingEmbedder, DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, Embedder, EmbeddingModelSpec,
-    FastembedEmbedder, resolve, resolve_opt,
+    CountingEmbedder, DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, Embedder, EmbeddingBackend,
+    EmbeddingModelSpec, FastembedEmbedder, OllamaEmbedder, REGISTRY, resolve, resolve_opt,
 };
 pub use embedding::{InstallProgress, pull_embedding_model};
 pub use enrichment::{ENRICHMENT_QUEUE_CAPACITY, EnrichmentJob};
@@ -53,7 +53,8 @@ pub use notebooks::{
 };
 pub use system_check::{
     ALLOWED_EMBEDDING_MODELS, CheckAction, CheckId, CheckResult, CheckStatus, LlmDetection,
-    detect_llm, list_ollama_models, ollama_base_url,
+    detect_llm, fastembed_weights_cached, is_allowlisted_embedding_id, list_ollama_models,
+    ollama_base_url,
 };
 pub use tts::{
     DownloadProgress, Gender, KOKORO_MODEL_FILENAME, KOKORO_MODEL_RELPATH, KOKORO_MODEL_URL,
@@ -517,9 +518,24 @@ impl LensEngine {
         description: Option<&str>,
         focus_mode: Option<&str>,
     ) -> Result<Notebook, LensError> {
+        // Resolve the app-wide global default coordinate so a NEW notebook adopts
+        // whatever default was set in Settings (M4 Phase 4b-B, AC7). Both fields
+        // collapse an empty / unset config value to the registry/enum default, so
+        // an unconfigured app stamps the same `nomic-embed-text-v1.5`/`fastembed`
+        // pair the previous compile-time consts produced.
+        let cfg = self.config().await;
+        let embedding_model = crate::embedder::registry::resolve(&cfg.embedding_model).id;
+        let embedding_backend =
+            crate::embedder::EmbeddingBackend::from_opt_str(Some(&cfg.embedding_backend)).as_str();
         let pool = self.pool().await;
         NotebookRepo::new(&pool)
-            .create(title, description, focus_mode)
+            .create(
+                title,
+                description,
+                focus_mode,
+                embedding_model,
+                embedding_backend,
+            )
             .await
     }
 
@@ -660,14 +676,32 @@ impl LensEngine {
             .get_source(source_id)
             .await?
             .ok_or_else(|| LensError::Validation(format!("no source with id {source_id}")))?;
-        // Resolve the OWNING notebook's embedding coordinate (R1) so the drop
-        // targets the right per-notebook table instead of the global default.
-        let notebook_id = NotebookId::from(source.notebook_id.clone());
-        let (model, dim) = self.resolve_notebook_embedding(&notebook_id).await?;
         let store = crate::vector_store::LanceVectorStore::new(&data_dir, pool.clone());
-        store
-            .drop_source(&source.notebook_id, &model, dim, source_id)
-            .await?;
+        // R7b: drop the source from EVERY active coordinate the notebook holds, not
+        // just the currently-configured one. A same-(model, dim) cross-backend
+        // switch (or a re-embed mid-flight) can leave MULTIPLE active coordinates
+        // for one notebook (e.g. a lingering fastembed row alongside a new ollama
+        // one); resolving only the configured coordinate would leave the other
+        // backend's vectors dangling (search would return hits no source backs).
+        // Enumerate the active registry rows — each yields its own backend — and
+        // drop from each. A coordinate with no active row is a no-op inside
+        // `drop_source`.
+        let active_coords: Vec<(String, i64, String)> = sqlx::query_as(
+            "SELECT DISTINCT model, dim, backend FROM embedding_index \
+             WHERE notebook_id = ? AND status = 'active'",
+        )
+        .bind(&source.notebook_id)
+        .fetch_all(&pool)
+        .await?;
+        for (model, dim, backend) in active_coords {
+            let coord = crate::vector_store::Coordinate::new(
+                source.notebook_id.clone(),
+                crate::embedder::EmbeddingBackend::from_opt_str(Some(&backend)),
+                model,
+                dim as usize,
+            );
+            store.drop_source(&coord, source_id).await?;
+        }
         NotebookRepo::new(&pool).purge_source(source_id).await?;
         // Best-effort: remove the managed source file AND its `.extracted.txt`
         // sibling so "Delete forever" does not leak either on disk. A missing
@@ -1028,11 +1062,12 @@ impl LensEngine {
     /// [`Embedder`] so integration tests can inject a `CountingEmbedder` (and so
     /// avoid the ~130 MB `FastembedEmbedder` model download).
     ///
-    /// The embedder is registered under its own [`Embedder::model_id`], so a
-    /// later [`embedder_for`](Self::embedder_for) for that id returns this
-    /// injected instance instead of building a real model. Inject one per model a
-    /// test exercises (e.g. a default-nomic embedder AND a 1024-dim mxbai
-    /// embedder, each under its own key).
+    /// The embedder is registered under `(model_id, backend)` (its own
+    /// [`Embedder::model_id`] plus the caller-supplied `backend`), so a later
+    /// [`embedder_for`](Self::embedder_for) for that `(id, backend)` returns this
+    /// injected instance instead of building a real model. Inject one per
+    /// `(model, backend)` a test exercises (e.g. a default-nomic Fastembed
+    /// embedder AND the same nomic id under Ollama, each under its own key).
     ///
     /// Gated behind the `test-util` feature so it is NEVER present in a
     /// production build. Returns `Err` if an embedder is already cached for that
@@ -1043,8 +1078,12 @@ impl LensEngine {
     /// concurrency AC (`in_flight` never exceeds `1`) are both observable through
     /// the same `Arc` the pipeline reuses.
     #[cfg(feature = "test-util")]
-    pub fn set_embedder_for_test(&self, embedder: Arc<dyn Embedder>) -> Result<(), LensError> {
-        let key = embedder.model_id().to_string();
+    pub fn set_embedder_for_test(
+        &self,
+        embedder: Arc<dyn Embedder>,
+        backend: crate::embedder::EmbeddingBackend,
+    ) -> Result<(), LensError> {
+        let key = Self::embedder_cache_key(embedder.model_id(), backend);
         // `try_lock` (not `blocking_lock`) keeps this a sync fn that is safe to
         // call from inside a `#[tokio::test]` async context: the cache is
         // uncontended at injection time, so the lock is always immediately
@@ -1069,51 +1108,96 @@ impl LensEngine {
     pub async fn embedder_for_test_get(
         &self,
         model_id: &str,
+        backend: crate::embedder::EmbeddingBackend,
     ) -> Result<Arc<dyn Embedder>, LensError> {
-        self.embedder_for(model_id).await
+        self.embedder_for(model_id, backend).await
     }
 
-    /// Lazily constructs (once per model id) and returns the shared embedder for
-    /// `model_id`, caching it in the keyed embedder cache (R8).
+    /// The embedder-cache key for a `(resolved-model-id, backend)` pair.
+    ///
+    /// The backend is part of the key (M4 Phase 4b-B): the SAME registry model
+    /// served by `fastembed` vs `ollama` is two physically-distinct embedders
+    /// (different numerical vectors), so they MUST occupy separate cache slots —
+    /// a model-id-only key would alias them and return the wrong backend's
+    /// embedder for a notebook. Format: `"{backend}:{model_id}"`.
+    fn embedder_cache_key(model_id: &str, backend: crate::embedder::EmbeddingBackend) -> String {
+        format!("{}:{model_id}", backend.as_str())
+    }
+
+    /// Lazily constructs (once per `(model_id, backend)`) and returns the shared
+    /// embedder for that coordinate, caching it in the keyed embedder cache (R8).
     ///
     /// On a cache hit the cached `Arc` is cloned and returned. On a miss the
     /// model id is resolved through the registry ([`crate::embedder::resolve`],
-    /// which falls back to the default for an unknown/empty id) and a
-    /// [`FastembedEmbedder`] is built for that spec over `{data_dir}/models/
-    /// fastembed/` (a ~130 MB–1.3 GB ONNX session, with a one-time HuggingFace
-    /// download on a cold cache). Construction runs under
-    /// [`tokio::task::spawn_blocking`] because fastembed init is synchronous and
-    /// CPU/IO-heavy.
+    /// which falls back to the default for an unknown/empty id) and an embedder is
+    /// built for that spec PER BACKEND:
     ///
-    /// The cache is keyed by the *resolved* spec id so the legacy alias and an
-    /// unknown id both collapse onto the canonical entry rather than building
-    /// duplicate sessions. The whole construct-and-insert runs while holding the
-    /// cache `Mutex`, so concurrent callers for the same key serialize: the
-    /// expensive init runs exactly once (see the field's R8 doc).
+    /// - [`EmbeddingBackend::Fastembed`](crate::embedder::EmbeddingBackend::Fastembed):
+    ///   a [`FastembedEmbedder`] over `{data_dir}/models/fastembed/` (a
+    ///   ~130 MB–1.3 GB ONNX session, with a one-time HuggingFace download on a
+    ///   cold cache). Construction runs under [`tokio::task::spawn_blocking`]
+    ///   because fastembed init is synchronous and CPU/IO-heavy.
+    /// - [`EmbeddingBackend::Ollama`](crate::embedder::EmbeddingBackend::Ollama):
+    ///   an [`OllamaEmbedder`](crate::embedder::OllamaEmbedder) targeting the
+    ///   configured (loopback-only) Ollama base URL.
+    ///
+    /// The cache is keyed by `(resolved-spec-id, backend)`
+    /// ([`embedder_cache_key`](Self::embedder_cache_key)) so the legacy alias and
+    /// an unknown id both collapse onto the canonical entry, while the two
+    /// backends for the same model NEVER alias. The whole construct-and-insert
+    /// runs while holding the cache `Mutex`, so concurrent callers for the same
+    /// key serialize: the expensive init runs exactly once (see the field's R8
+    /// doc).
     pub(crate) async fn embedder_for(
         &self,
         model_id: &str,
+        backend: crate::embedder::EmbeddingBackend,
     ) -> Result<Arc<dyn Embedder>, LensError> {
         let spec = crate::embedder::resolve(model_id);
-        let key = spec.id.to_string();
+        let key = Self::embedder_cache_key(spec.id, backend);
         let mut cache = self.embedders.lock().await;
         if let Some(existing) = cache.get(&key) {
             return Ok(Arc::clone(existing));
         }
-        let data_dir = self.data_dir().await;
-        // `spec` is a `&'static EmbeddingModelSpec` (Copy), so the closure can
-        // capture it directly without a clone or move of `key`.
-        let embedder =
-            tokio::task::spawn_blocking(move || FastembedEmbedder::new_with_spec(&data_dir, spec))
+        let embedder: Arc<dyn Embedder> = match backend {
+            crate::embedder::EmbeddingBackend::Fastembed => {
+                let data_dir = self.data_dir().await;
+                // `spec` is a `&'static EmbeddingModelSpec` (Copy), so the closure
+                // can capture it directly without a clone or move of `key`.
+                let e = tokio::task::spawn_blocking(move || {
+                    FastembedEmbedder::new_with_spec(&data_dir, spec)
+                })
                 .await
                 .map_err(|e| LensError::Model(format!("embedder init task panicked: {e}")))??;
-        let embedder: Arc<dyn Embedder> = Arc::new(embedder);
+                Arc::new(e)
+            }
+            crate::embedder::EmbeddingBackend::Ollama => {
+                let base_url = ollama_base_url(&self.config().await);
+                Arc::new(crate::embedder::OllamaEmbedder::new(&base_url, spec)?)
+            }
+        };
         cache.insert(key, Arc::clone(&embedder));
         Ok(embedder)
     }
 
-    /// Resolves a notebook's configured embedding model to its `(model_id, dim)`
-    /// coordinate components (R1).
+    /// Warms (constructs + caches) the fastembed embedder for `model_id`,
+    /// downloading its HuggingFace weights to `{data_dir}/models/fastembed/` on a
+    /// cold cache. Idempotent: a warm cache hit returns immediately.
+    ///
+    /// This is the onboarding/Settings "Install [fastembed model]" path: fastembed
+    /// has no separate download step (weights land lazily on first embedder
+    /// construction), so warming up-front lets onboarding pass the per-backend
+    /// readiness gate ([`crate::fastembed_weights_cached`]) for a fastembed
+    /// selection on a fresh, Ollama-less machine. Always `Fastembed` (Ollama is
+    /// detect-only — the app never pulls).
+    pub async fn warm_fastembed_model(&self, model_id: &str) -> Result<(), LensError> {
+        self.embedder_for(model_id, crate::embedder::EmbeddingBackend::Fastembed)
+            .await
+            .map(|_| ())
+    }
+
+    /// Resolves a notebook's configured embedding coordinate components
+    /// `(model_id, dim, backend)` (R1, M4 Phase 4b-B widened from `(model, dim)`).
     ///
     /// This is the SINGLE read-path entry point every query / ingest / re-embed
     /// caller resolves through before touching the vector store: it reads the
@@ -1125,25 +1209,31 @@ impl LensEngine {
     /// thread straight into [`embedder_for`](Self::embedder_for) and the
     /// `VectorStore` coordinate APIs.
     ///
-    /// The backend is implicitly `fastembed` in Phase 4b-A (it is NOT part of the
-    /// coordinate); a backend dimension lands with the selector UI in 4b-B.
+    /// The backend (M4 Phase 4b-B) is the THIRD coordinate axis: a NULL/empty/
+    /// unknown `embedding_backend` column resolves to the global default backend
+    /// via [`crate::embedder::EmbeddingBackend::from_opt_str`] (which, with an
+    /// unset config, is `fastembed`). The returned `(model, dim, backend)` triple
+    /// is everything a caller needs to construct a `VectorStore` `Coordinate`.
     pub async fn resolve_notebook_embedding(
         &self,
         notebook_id: &NotebookId,
-    ) -> Result<(String, usize), LensError> {
+    ) -> Result<(String, usize, crate::embedder::EmbeddingBackend), LensError> {
         let pool = self.pool().await;
-        // `fetch_optional` → None means NO such notebook row (fail fast); `Some(None)`
-        // means the row exists with a NULL `embedding_model` (resolve to the default).
-        let stored: Option<String> =
-            sqlx::query_scalar("SELECT embedding_model FROM notebooks WHERE id = ?")
+        // `fetch_optional` → None means NO such notebook row (fail fast); `Some(row)`
+        // with NULL columns means the row exists with a NULL model/backend (resolve
+        // each to the default).
+        let row: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT embedding_model, embedding_backend FROM notebooks WHERE id = ?")
                 .bind(notebook_id.as_str())
                 .fetch_optional(&pool)
                 .await?
                 .ok_or_else(|| {
                     LensError::Validation(format!("no notebook with id {notebook_id}"))
                 })?;
-        let spec = crate::embedder::resolve(stored.as_deref().unwrap_or(""));
-        Ok((spec.id.to_string(), spec.dim))
+        let (stored_model, stored_backend) = row;
+        let spec = crate::embedder::resolve(stored_model.as_deref().unwrap_or(""));
+        let backend = crate::embedder::EmbeddingBackend::from_opt_str(stored_backend.as_deref());
+        Ok((spec.id.to_string(), spec.dim, backend))
     }
 
     /// Persists a new embedding model choice for a notebook.
@@ -1156,10 +1246,16 @@ impl LensEngine {
     ///
     /// This does NOT kick off re-embedding — the Tauri command layer calls
     /// [`reembed_notebook`](Self::reembed_notebook) after persisting.
+    ///
+    /// `backend` (M4 Phase 4b-B) is the THIRD coordinate axis: it is persisted to
+    /// `notebooks.embedding_backend` alongside the model so a same-(model, dim)
+    /// backend switch is a genuine coordinate change that
+    /// [`reembed_notebook`](Self::reembed_notebook) re-embeds + retires (R2).
     pub async fn set_notebook_embedding_model(
         &self,
         notebook_id: &NotebookId,
         model_id: &str,
+        backend: crate::embedder::EmbeddingBackend,
     ) -> Result<(), LensError> {
         // Reject genuinely-unknown ids via the registry's strict lookup (which
         // accepts the legacy alias `nomic-embed-text` → nomic). Persist the
@@ -1173,10 +1269,11 @@ impl LensEngine {
         })?;
         let pool = self.pool().await;
         let result = sqlx::query(
-            "UPDATE notebooks SET embedding_model = ?, updated_at = ? \
+            "UPDATE notebooks SET embedding_model = ?, embedding_backend = ?, updated_at = ? \
              WHERE id = ? AND trashed_at IS NULL",
         )
         .bind(spec.id)
+        .bind(backend.as_str())
         .bind(chrono::Utc::now().to_rfc3339())
         .bind(notebook_id.as_str())
         .execute(&pool)
@@ -1189,28 +1286,37 @@ impl LensEngine {
         Ok(())
     }
 
-    /// Returns `(model_id, dim, status)` for a notebook's current embedding
-    /// coordinate, where `status` is `"active"` when a live `embedding_index` row
-    /// exists for `(model, dim)`, or `"none"` otherwise.
+    /// Returns `(model_id, dim, backend, status)` for a notebook's current
+    /// embedding coordinate, where `status` is `"active"` when a live
+    /// `embedding_index` row exists for the FULL `(notebook, backend, model, dim)`
+    /// coordinate, or `"none"` otherwise.
+    ///
+    /// R4/R7a (M4 Phase 4b-B): the status query is backend-scoped (`AND backend =
+    /// ?`). After a same-dim cross-backend switch — e.g. fastembed-nomic-768 →
+    /// ollama-nomic-768 — the OLD backend's row may still be `stale`/being retired
+    /// while the NEW backend's row is `active`. A backend-blind query (matching
+    /// only `(model, dim)`) would report the WRONG backend's status; binding the
+    /// resolved backend returns the configured coordinate's true status.
     ///
     /// Used by [`get_notebook_embedding_model`] in the Tauri command layer.
     pub async fn get_notebook_embedding_info(
         &self,
         notebook_id: &NotebookId,
-    ) -> Result<(String, usize, String), LensError> {
-        let (model_id, dim) = self.resolve_notebook_embedding(notebook_id).await?;
+    ) -> Result<(String, usize, crate::embedder::EmbeddingBackend, String), LensError> {
+        let (model_id, dim, backend) = self.resolve_notebook_embedding(notebook_id).await?;
         let pool = self.pool().await;
         let active: Option<i64> = sqlx::query_scalar(
             "SELECT 1 FROM embedding_index \
-             WHERE notebook_id = ? AND model = ? AND dim = ? AND status = 'active'",
+             WHERE notebook_id = ? AND model = ? AND dim = ? AND backend = ? AND status = 'active'",
         )
         .bind(notebook_id.as_str())
         .bind(&model_id)
         .bind(dim as i64)
+        .bind(backend.as_str())
         .fetch_optional(&pool)
         .await?;
         let status = if active.is_some() { "active" } else { "none" }.to_string();
-        Ok((model_id, dim, status))
+        Ok((model_id, dim, backend, status))
     }
 
     /// Re-embeds every chunk of `notebook_id` into the notebook's currently

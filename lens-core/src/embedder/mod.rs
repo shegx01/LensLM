@@ -38,10 +38,13 @@ use fastembed::{InitOptions, TextEmbedding};
 
 use crate::LensError;
 
+pub mod ollama;
 pub mod registry;
 
+pub use ollama::OllamaEmbedder;
 pub use registry::{
-    DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, EmbeddingModelSpec, resolve, resolve_opt,
+    DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, EmbeddingBackend, EmbeddingModelSpec, REGISTRY,
+    resolve, resolve_opt,
 };
 
 // ---------------------------------------------------------------------------
@@ -741,6 +744,32 @@ mod tests {
         assert_eq!(e.model_id(), "all-minilm");
         let v = e.embed_query("hello").unwrap();
         assert_eq!(v.len(), 384);
+    }
+
+    // R6 OBSERVE probe (M4 Phase 4b-B Step 5): downloads the smallest model
+    // (all-minilm ~90 MB) and walks the cache dir so we can record the LITERAL
+    // per-model subdir shape fastembed/hf-hub writes. #[ignore]d (network +
+    // download); run explicitly with `cargo test -- --ignored observe_`.
+    #[test]
+    #[ignore = "downloads ~90 MB all-minilm weights to OBSERVE the on-disk cache layout"]
+    fn observe_fastembed_cache_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let _e = FastembedEmbedder::new_with_spec(dir.path(), resolve("all-minilm")).unwrap();
+        let root = dir.path().join("models").join("fastembed");
+        fn walk(p: &std::path::Path, depth: usize) {
+            if let Ok(rd) = std::fs::read_dir(p) {
+                for e in rd.flatten() {
+                    let path = e.path();
+                    let ty = if path.is_dir() { "DIR " } else { "FILE" };
+                    eprintln!("{}{ty} {}", "  ".repeat(depth), path.display());
+                    if path.is_dir() {
+                        walk(&path, depth + 1);
+                    }
+                }
+            }
+        }
+        eprintln!("=== OBSERVED fastembed cache root: {} ===", root.display());
+        walk(&root, 0);
     }
 
     // -----------------------------------------------------------------------

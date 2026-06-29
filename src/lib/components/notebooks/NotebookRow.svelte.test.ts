@@ -46,6 +46,7 @@ function makeNotebook(overrides?: Partial<NotebookSummary>): NotebookSummary {
     updated_at: '2026-06-01T00:00:00Z',
     trashed_at: null,
     embedding_model: null,
+    embedding_backend: null,
     source_count: 3,
     ...overrides
   };
