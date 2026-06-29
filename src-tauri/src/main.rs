@@ -1,5 +1,11 @@
 // Prevents an additional console window on Windows in release builds.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// The ingest pipeline future (`LensEngine::ingest_source`) grew with the
+// bounded-memory streaming PDF path (issue #71), pushing the compiler's
+// auto-trait (`Send`) evaluation for the Tauri command futures past the default
+// 128-frame recursion limit. Raising it to 256 is the compiler-recommended,
+// zero-runtime-cost fix (it only affects type-checking depth).
+#![recursion_limit = "256"]
 
 mod commands;
 mod stream;

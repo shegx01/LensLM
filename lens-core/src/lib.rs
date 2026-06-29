@@ -1,3 +1,7 @@
+// issue #71: the streamed-ingest future deepened `Send` auto-trait evaluation
+// enough to overflow the default 128-frame limit (E0275) on some toolchains.
+// Compile-time only; no runtime cost.
+#![recursion_limit = "256"]
 //! `lens-core` — the headless engine for LensLM.
 //!
 //! Pure Rust. Contains no Tauri, windowing, or UI dependencies. All localized
@@ -614,8 +618,12 @@ impl LensEngine {
     ) -> Result<Source, LensError> {
         let data_dir = self.data_dir().await;
         let pool = self.pool().await;
+        // Resolve the configurable cap (issue #71) from `AppConfig.max_source_mb`
+        // (empty → 50 MB default) and enforce it at the paste boundary.
+        let max_source_bytes =
+            crate::ingest::resolve_max_source_bytes(&self.config().await.max_source_mb);
         NotebookRepo::new(&pool)
-            .add_text_source(&data_dir, notebook_id, title, text, kind)
+            .add_text_source(&data_dir, notebook_id, title, text, kind, max_source_bytes)
             .await
     }
 

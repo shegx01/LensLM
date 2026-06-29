@@ -25,7 +25,7 @@ use super::{ExtractOutput, Extractor, SourceAnchor};
 /// scan BEFORE `roxmltree` parses (and recursively builds) the DOM. roxmltree
 /// 0.21.1 has no element-nesting limit of its own (its `LoopDetector` only
 /// bounds entity expansion), so an adversarial deeply-nested document — well
-/// under [`MAX_SOURCE_BYTES`](crate::ingest) — would overflow the stack during
+/// under the configurable raw-bytes cap (`max_source_bytes`) — would overflow the stack during
 /// the parser's own recursive descent. This ceiling is comfortably above any
 /// real document yet far below the stack-overflow threshold; the pre-scan is
 /// intentionally conservative (it may over-count slightly) since its only job

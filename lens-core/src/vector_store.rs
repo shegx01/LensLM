@@ -98,6 +98,22 @@ pub static CRASH_AFTER_FLIP_TXN_BEFORE_LANCE_DROP: std::sync::atomic::AtomicBool
 pub static CRASH_AFTER_RETIRE_STALE_BEFORE_LANCE_DROP: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Test-only crash-injection point for the streaming PDF ingest (issue #71).
+///
+/// When set to `true`, the streaming-ingest populate loop in `ingest::run_ingest`
+/// returns an `Internal` error AFTER at least one EMBED_BATCH has been written to
+/// the building table but BEFORE [`VectorStore::flip_active`] — simulating a
+/// process crash mid-stream. The error flips the source to `error` and leaves the
+/// building table as an orphan that the startup-GC must reclaim, with NO rows in
+/// the active table for the source. The flag is consumed (reset to `false`) on use
+/// so a single test can arm it once. Compiled out of production builds.
+///
+/// Lives in its OWN dedicated test binary (`tests/ingest_streaming_crash.rs`) so
+/// this process-global flag never races the parallel ingest tests.
+#[cfg(feature = "test-util")]
+pub static CRASH_AFTER_STREAMING_ADD_BEFORE_FLIP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// The complete logical embedding *coordinate* of a notebook's vector set
 /// (M4 Phase 4b-B): `(notebook, backend, model, dim)`.
 ///
@@ -226,6 +242,37 @@ pub trait VectorStore: Send + Sync {
         rows: Vec<VectorRow>,
         dim: usize,
     ) -> Result<(), LensError>;
+
+    /// Appends `rows` to the physical table named `table_name` WITHOUT building or
+    /// refreshing the ANN index (issue #71: bounded-memory streaming PDF ingest).
+    ///
+    /// Identical to [`add_to_table`](VectorStore::add_to_table) except it SKIPS the
+    /// per-insert [`maybe_build_or_refresh_index`] call. Used by the streaming PDF
+    /// ingest populate loop, which inserts one EMBED_BATCH's rows at a time: running
+    /// the index maintenance after every batch would, once the building table
+    /// crosses `ANN_INDEX_MIN_ROWS`, rebuild the IVF_PQ index on every subsequent
+    /// batch (an O(n²) rebuild storm). The caller instead builds the index ONCE
+    /// after the full populate via [`build_index_on_table`](VectorStore::build_index_on_table),
+    /// before the flip. An empty `rows` is a no-op. `dim` is the coordinate's vector
+    /// dimension (used to build the Arrow batch — must match every row).
+    ///
+    /// [`maybe_build_or_refresh_index`]: LanceVectorStore::maybe_build_or_refresh_index
+    async fn add_to_table_no_index(
+        &self,
+        table_name: &str,
+        rows: Vec<VectorRow>,
+        dim: usize,
+    ) -> Result<(), LensError>;
+
+    /// Builds (or refreshes) the ANN index ONCE on the physical table named
+    /// `table_name` (issue #71). The post-populate counterpart to
+    /// [`add_to_table_no_index`](VectorStore::add_to_table_no_index): after the
+    /// streaming loop has written every batch index-free, this runs the single
+    /// IVF_PQ build over the COMPLETE row set, so the building table is fully
+    /// indexed before the flip promotes it to active. Non-fatal — a build failure
+    /// is logged and swallowed (search degrades to exact kNN), exactly like the
+    /// per-`add` path. A missing table is a no-op.
+    async fn build_index_on_table(&self, table_name: &str, dim: usize) -> Result<(), LensError>;
 
     /// Atomically flips the `building` table to `active` for a coordinate, then
     /// drops the now-`stale` Lance table (M4 Phase 3, Step 5 / AC7).
@@ -570,6 +617,45 @@ impl EmbeddingIndexRepo {
         .fetch_optional(&self.pool)
         .await?;
         Ok(name)
+    }
+
+    /// Returns the physical `lance_table_name`s of every `status='building'` row
+    /// for a coordinate (issue #71). Used by the streaming-ingest in-process orphan
+    /// sweep to find lingering building tables from a prior crashed ingest of the
+    /// SAME coordinate, so they can be dropped before a fresh building table is
+    /// created (bounds orphan accumulation to one table per coordinate per retry).
+    async fn building_lance_table_names(
+        &self,
+        coord: &Coordinate,
+    ) -> Result<Vec<String>, LensError> {
+        let names = sqlx::query_scalar::<_, String>(
+            "SELECT lance_table_name FROM embedding_index \
+             WHERE notebook_id = ? AND backend = ? AND model = ? AND dim = ? AND status = 'building'",
+        )
+        .bind(&coord.notebook)
+        .bind(coord.backend.as_str())
+        .bind(&coord.model)
+        .bind(coord.dim as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(names)
+    }
+
+    /// Deletes every `status='building'` registry row for a coordinate (issue #71).
+    /// The orphan-sweep counterpart: after the physical building tables are dropped,
+    /// their registry rows are removed so a fresh build starts from a clean slate.
+    async fn delete_building_rows(&self, coord: &Coordinate) -> Result<(), LensError> {
+        sqlx::query(
+            "DELETE FROM embedding_index \
+             WHERE notebook_id = ? AND backend = ? AND model = ? AND dim = ? AND status = 'building'",
+        )
+        .bind(&coord.notebook)
+        .bind(coord.backend.as_str())
+        .bind(&coord.model)
+        .bind(coord.dim as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// The ONE SQLite transaction of the re-embed flip (AC7): demote the current
@@ -936,6 +1022,38 @@ impl LanceVectorStore {
     /// source) — the caller then populates the building table with that source
     /// alone. Vectors are copied as Arrow batches directly (both tables share
     /// [`vector_schema`]), so no float round-trip or re-embed of unchanged sources.
+    /// Drops every lingering `status='building'` table + registry row for a
+    /// coordinate (issue #71 — in-process orphan sweep / pre-mortem scenario 2).
+    ///
+    /// Called by the streaming PDF ingest BEFORE `create_building_table`: a prior
+    /// ingest that crashed mid-stream leaves an orphan building table that the
+    /// startup-GC only reclaims on the next process launch. Without this sweep, a
+    /// crash-retry loop within a single process run would accumulate one orphan
+    /// building table per retry (each ~hundreds of MB for a large PDF). Sweeping
+    /// here bounds accumulation to a single in-flight building table per coordinate.
+    /// Drop the physical tables FIRST (idempotent — a missing table is a no-op),
+    /// THEN delete the registry rows, mirroring the startup-GC ordering. A no-op
+    /// when no building rows exist (the common case).
+    pub(crate) async fn sweep_orphan_building_tables(
+        &self,
+        coord: &Coordinate,
+    ) -> Result<(), LensError> {
+        let names = self.registry.building_lance_table_names(coord).await?;
+        if names.is_empty() {
+            return Ok(());
+        }
+        tracing::warn!(
+            notebook = coord.notebook,
+            backend = coord.backend.as_str(),
+            model = coord.model,
+            count = names.len(),
+            "streaming ingest: sweeping orphan building table(s) from a prior crashed ingest"
+        );
+        self.drop_tables(&names).await?;
+        self.registry.delete_building_rows(coord).await?;
+        Ok(())
+    }
+
     pub(crate) async fn seed_building_from_active(
         &self,
         coord: &Coordinate,
@@ -1354,6 +1472,44 @@ impl VectorStore for LanceVectorStore {
         // table handle (not this path), so the index is built once the per-source
         // populate begins — over the complete row set, not the half-seeded one.
         self.maybe_build_or_refresh_index(&table, dim).await;
+        Ok(())
+    }
+
+    async fn add_to_table_no_index(
+        &self,
+        table_name: &str,
+        rows: Vec<VectorRow>,
+        dim: usize,
+    ) -> Result<(), LensError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let table = self
+            .open_table_by_name(table_name)
+            .await?
+            .ok_or_else(|| LensError::Vector(format!("no table named {table_name} to add to")))?;
+        let batch = rows_to_batch(&rows, dim)?;
+        table
+            .add(batch)
+            .execute()
+            .await
+            .map_err(|e| LensError::Vector(format!("lancedb add failed: {e}")))?;
+        // DELIBERATELY no `maybe_build_or_refresh_index` here (issue #71): the
+        // streaming PDF populate loop calls this per EMBED_BATCH and builds the
+        // index ONCE after the full populate via `build_index_on_table`, avoiding
+        // the per-batch IVF_PQ rebuild storm once the table crosses the threshold.
+        Ok(())
+    }
+
+    async fn build_index_on_table(&self, table_name: &str, dim: usize) -> Result<(), LensError> {
+        // Open by exact name (the building table); a missing table is a no-op (the
+        // streaming loop may have inserted nothing, e.g. an empty source). Delegate
+        // to the SAME private index-maintenance routine `add`/`add_to_table` use, so
+        // the post-populate single build over the complete row set is byte-identical
+        // to the per-add path — just amortized into one call.
+        if let Some(table) = self.open_table_by_name(table_name).await? {
+            self.maybe_build_or_refresh_index(&table, dim).await;
+        }
         Ok(())
     }
 
