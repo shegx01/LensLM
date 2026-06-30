@@ -1,0 +1,31 @@
+---
+source: lens-core/tests/ingest.rs
+expression: block_shape(&out)
+---
+[
+    (
+        "paragraph",
+        "",
+        "Introduction to the sample document.",
+    ),
+    (
+        "paragraph",
+        "",
+        "This RTF fixture exercises the flat-paragraph extractor.",
+    ),
+    (
+        "paragraph",
+        "",
+        "RTF has no semantic heading tags, so every block is a paragraph.",
+    ),
+    (
+        "paragraph",
+        "",
+        "Each paragraph is separated by a paragraph-break control word.",
+    ),
+    (
+        "paragraph",
+        "",
+        "The byte-identity invariant must hold for every emitted block.",
+    ),
+]

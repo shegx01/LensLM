@@ -1,0 +1,26 @@
+---
+source: lens-core/src/extract/odt.rs
+expression: snaps
+---
+[
+  {
+    "block_type": "heading",
+    "section_path": "Chapter One",
+    "text": "Chapter One"
+  },
+  {
+    "block_type": "paragraph",
+    "section_path": "Chapter One",
+    "text": "An introductory paragraph."
+  },
+  {
+    "block_type": "heading",
+    "section_path": "Chapter One > Section A",
+    "text": "Section A"
+  },
+  {
+    "block_type": "paragraph",
+    "section_path": "Chapter One > Section A",
+    "text": "Body under section A."
+  }
+]

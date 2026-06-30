@@ -2234,6 +2234,56 @@ async fn seam_derived_reingest_noop_without_reextract_and_sibling_lifecycle() {
     );
 }
 
+/// Full-pipeline end-to-end for a DERIVED office format (issue #77) via the REAL
+/// `RtfExtractor` (no fake factory): real `.rtf` bytes flow extract → chunk →
+/// embed → index, reaching `indexed` with chunks produced and the
+/// `.extracted.txt` sibling persisted, every chunk slicing it byte-for-byte.
+/// The unit tests cover extraction in isolation; this proves the new kinds wire
+/// through the whole ingest pipeline (not just `extract()`).
+#[tokio::test]
+async fn ingest_rtf_end_to_end_real_extractor() {
+    if !tokenizer_available().await {
+        eprintln!("skipping ingest_rtf_end_to_end_real_extractor: no tokenizer (offline)");
+        return;
+    }
+    let (_dir, engine) = inject_counting_engine().await;
+    let data_dir = engine.data_dir_for_test().await;
+    let nb = engine.create_notebook("rtf-e2e", None, None).await.unwrap();
+
+    // Minimal real RTF (two `\par` paragraphs) parsed by the production extractor.
+    let rtf = b"{\\rtf1\\ansi\\deff0 Hello world from a real RTF document.\\par \
+                A second paragraph with enough words to exercise the chunker end to end.\\par}";
+    let id = uuid::Uuid::now_v7().to_string();
+    let locator = write_raw_source_file(&data_dir, &id, rtf);
+    insert_raw_source_locator(&engine, &nb.id.to_string(), "rtf", &locator, &id).await;
+
+    engine
+        .ingest_source(&id, |_p| {})
+        .await
+        .expect("ingest rtf");
+
+    // Reaches `indexed` (status only flips after the indexing phase) with chunks.
+    assert_eq!(engine_source_status(&engine, &id).await, "indexed");
+    assert!(
+        count_chunks(&engine, &id).await > 0,
+        "RTF ingest must produce chunks end-to-end"
+    );
+
+    // Derived-kind canonical buffer is the `.extracted.txt` sibling; chunks slice
+    // it byte-for-byte.
+    let sibling = data_dir.join("sources").join(format!("{id}.extracted.txt"));
+    assert!(
+        sibling.exists(),
+        "RTF (derived kind) must persist the .extracted.txt sibling"
+    );
+    let canonical = std::fs::read_to_string(&sibling).unwrap();
+    assert!(
+        canonical.contains("Hello world from a real RTF document."),
+        "extracted canonical text present: {canonical:?}"
+    );
+    assert_chunk_byte_identity(&engine, &id, &canonical).await;
+}
+
 // ===========================================================================
 // Step 4 — SourceAnchor persisted in a dedicated column (AC5)
 // ===========================================================================
@@ -3184,4 +3234,187 @@ async fn test_pdf_reingest_changed_content() {
     assert_eq!(embidx_count(&engine, &nb_id, "active").await, 1);
     assert_eq!(embidx_count(&engine, &nb_id, "building").await, 0);
     assert_eq!(embidx_count(&engine, &nb_id, "stale").await, 0);
+}
+
+// ===========================================================================
+// M4 issue #77 — RTF / ODT / EPUB extractor integration & snapshot tests
+// ===========================================================================
+
+mod office_binary_formats {
+    use std::io::{Cursor, Write};
+
+    use lens_core::extract::{ExtractOutput, SourceAnchor, extractor_for};
+
+    const SAMPLE_RTF: &str = include_str!("fixtures/sample.rtf");
+
+    /// Byte-identity over an `ExtractOutput`: every block slices `extracted_text`
+    /// exactly (bytes).
+    fn assert_extract_byte_identity(out: &ExtractOutput, label: &str) {
+        assert!(!out.blocks.is_empty(), "{label}: must produce blocks");
+        assert_eq!(
+            out.anchors.len(),
+            out.blocks.len(),
+            "{label}: anchors index-aligned with blocks"
+        );
+        for (i, b) in out.blocks.iter().enumerate() {
+            assert!(
+                b.char_end <= out.extracted_text.len(),
+                "{label}: block[{i}] OOB"
+            );
+            assert_eq!(
+                &out.extracted_text[b.char_start..b.char_end],
+                b.text,
+                "{label}: byte-identity violated for block[{i}]"
+            );
+        }
+    }
+
+    /// Builds a minimal ODT (ZIP + content.xml) in memory.
+    fn build_sample_odt() -> Vec<u8> {
+        let content = r#"<?xml version="1.0" encoding="UTF-8"?>
+<office:document-content xmlns:office="urn:office" xmlns:text="urn:text">
+  <office:body><office:text>
+    <text:h text:outline-level="1">Sample Heading</text:h>
+    <text:p>An ODT paragraph under the heading.</text:p>
+    <text:p>A second paragraph with multibyte 日本語 text.</text:p>
+  </office:text></office:body>
+</office:document-content>"#;
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let opts: zip::write::FileOptions = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            zip.start_file("content.xml", opts).unwrap();
+            zip.write_all(content.as_bytes()).unwrap();
+            zip.finish().unwrap();
+        }
+        buf
+    }
+
+    /// Builds a minimal, valid EPUB 3 (2 chapters with headings + paragraphs).
+    fn build_sample_epub() -> Vec<u8> {
+        fn xhtml(body: &str) -> String {
+            format!(
+                r#"<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>t</title></head>
+<body>{body}</body></html>"#
+            )
+        }
+        let opf = r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="id">x</dc:identifier><dc:title>T</dc:title><dc:language>en</dc:language></metadata>
+  <manifest>
+    <item id="c1" href="chapter1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="c2" href="chapter2.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine><itemref idref="c1"/><itemref idref="c2"/></spine>
+</package>"#;
+        let mut buf = Vec::new();
+        {
+            let mut z = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let stored: zip::write::FileOptions = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            let defl: zip::write::FileOptions = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            z.start_file("mimetype", stored).unwrap();
+            z.write_all(b"application/epub+zip").unwrap();
+            z.start_file("META-INF/container.xml", defl).unwrap();
+            z.write_all(
+                br#"<?xml version="1.0"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
+</container>"#,
+            )
+            .unwrap();
+            z.start_file("OEBPS/content.opf", defl).unwrap();
+            z.write_all(opf.as_bytes()).unwrap();
+            z.start_file("OEBPS/chapter1.xhtml", defl).unwrap();
+            z.write_all(xhtml("<h1>Chapter One</h1><p>First chapter body.</p>").as_bytes())
+                .unwrap();
+            z.start_file("OEBPS/chapter2.xhtml", defl).unwrap();
+            z.write_all(xhtml("<h1>Chapter Two</h1><p>Second chapter body.</p>").as_bytes())
+                .unwrap();
+            z.finish().unwrap();
+        }
+        buf
+    }
+
+    fn block_shape(out: &ExtractOutput) -> Vec<(String, String, String)> {
+        out.blocks
+            .iter()
+            .map(|b| (b.block_type.clone(), b.section_path.clone(), b.text.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn rtf_extractor_byte_identity() {
+        let out = extractor_for("rtf")
+            .unwrap()
+            .extract(SAMPLE_RTF.as_bytes())
+            .expect("rtf extract");
+        assert_extract_byte_identity(&out, "rtf");
+        assert!(
+            out.anchors
+                .iter()
+                .all(|a| matches!(a, SourceAnchor::Rtf { .. }))
+        );
+    }
+
+    #[test]
+    fn odt_extractor_byte_identity() {
+        let bytes = build_sample_odt();
+        let out = extractor_for("odt")
+            .unwrap()
+            .extract(&bytes)
+            .expect("odt extract");
+        assert_extract_byte_identity(&out, "odt");
+        assert!(
+            out.anchors
+                .iter()
+                .all(|a| matches!(a, SourceAnchor::Odt { .. }))
+        );
+    }
+
+    #[test]
+    fn epub_extractor_byte_identity() {
+        let bytes = build_sample_epub();
+        let out = extractor_for("epub")
+            .unwrap()
+            .extract(&bytes)
+            .expect("epub extract");
+        assert_extract_byte_identity(&out, "epub");
+        assert!(
+            out.anchors
+                .iter()
+                .all(|a| matches!(a, SourceAnchor::Epub { .. }))
+        );
+    }
+
+    #[test]
+    fn rtf_extractor_snapshot() {
+        let out = extractor_for("rtf")
+            .unwrap()
+            .extract(SAMPLE_RTF.as_bytes())
+            .expect("rtf extract");
+        insta::assert_debug_snapshot!("ingest_rtf_blocks", block_shape(&out));
+    }
+
+    #[test]
+    fn odt_extractor_snapshot() {
+        let out = extractor_for("odt")
+            .unwrap()
+            .extract(&build_sample_odt())
+            .expect("odt extract");
+        insta::assert_debug_snapshot!("ingest_odt_blocks", block_shape(&out));
+    }
+
+    #[test]
+    fn epub_extractor_snapshot() {
+        let out = extractor_for("epub")
+            .unwrap()
+            .extract(&build_sample_epub())
+            .expect("epub extract");
+        insta::assert_debug_snapshot!("ingest_epub_blocks", block_shape(&out));
+    }
 }

@@ -21,11 +21,15 @@
 //! [`LensError`] for kinds not yet implemented.
 
 pub mod docx;
+pub mod epub;
 pub mod json;
 pub mod jsonl;
+pub mod odt;
 pub mod pdf;
+pub mod rtf;
 pub mod url;
 pub mod xml;
+pub mod xml_blocks;
 pub mod yaml;
 
 use serde::{Deserialize, Serialize};
@@ -61,6 +65,21 @@ pub enum SourceAnchor {
     /// independently under its own `kind` tag, so adding `Structured` cannot
     /// change the wire shape of `Text`/`Pdf`/`Docx`/`Url`.
     Structured { path: String },
+    /// An RTF block: its byte offset in the canonical extracted-text buffer.
+    ///
+    /// Additive under its own `kind` tag (issue #77); cannot change the wire
+    /// shape of any pre-existing variant. `u64` (not `usize`) so the persisted
+    /// JSON wire shape is identical on 32- and 64-bit targets.
+    Rtf { text_offset: u64 },
+    /// An ODT block: the node path in `content.xml` (e.g. `"body/text:h[0]"`).
+    ///
+    /// Additive under its own `kind` tag (issue #77).
+    Odt { node_path: String },
+    /// An EPUB block: the spine index and the href of the content document.
+    ///
+    /// Additive under its own `kind` tag (issue #77). `spine_index` is `u64`
+    /// (not `usize`) for a target-independent JSON wire shape.
+    Epub { spine_index: u64, href: String },
 }
 
 /// The canonical extraction result for a single source.
@@ -157,6 +176,11 @@ pub fn extractor_for(kind: &str) -> Result<Box<dyn Extractor>, LensError> {
         SourceKind::Jsonl => Ok(Box::new(jsonl::JsonlExtractor)),
         SourceKind::Yaml => Ok(Box::new(yaml::YamlExtractor)),
         SourceKind::Xml => Ok(Box::new(xml::XmlExtractor)),
+        // Office/binary-format extractors (M4 issue #77): RTF flat paragraphs,
+        // ODT/EPUB structural blocks with byte-identity offsets.
+        SourceKind::Rtf => Ok(Box::new(rtf::RtfExtractor)),
+        SourceKind::Odt => Ok(Box::new(odt::OdtExtractor)),
+        SourceKind::Epub => Ok(Box::new(epub::EpubExtractor)),
     }
 }
 
@@ -436,6 +460,92 @@ mod tests {
             .unwrap(),
             r#"{"kind":"Url","text_offset":"42"}"#
         );
+    }
+
+    #[test]
+    fn source_anchor_office_binary_roundtrips_through_serde_json() {
+        let anchors = vec![
+            SourceAnchor::Rtf { text_offset: 42 },
+            SourceAnchor::Odt {
+                node_path: "body/text:h[0]".to_string(),
+            },
+            SourceAnchor::Epub {
+                spine_index: 2,
+                href: "OEBPS/chapter1.xhtml".to_string(),
+            },
+        ];
+        for a in anchors {
+            let json = serde_json::to_string(&a).expect("serialize office-binary anchor");
+            let back: SourceAnchor =
+                serde_json::from_str(&json).expect("deserialize office-binary anchor");
+            assert_eq!(a, back, "anchor must round-trip through serde_json");
+        }
+    }
+
+    #[test]
+    fn source_anchor_office_binary_does_not_change_existing_wire_shape() {
+        // Regression guard: adding `Rtf`/`Odt`/`Epub` must NOT change the
+        // serialized JSON of any pre-existing variant (locked literals).
+        assert_eq!(
+            serde_json::to_string(&SourceAnchor::Text).unwrap(),
+            r#"{"kind":"Text"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&SourceAnchor::Docx {
+                node_path: "body/p[4]".to_string(),
+            })
+            .unwrap(),
+            r#"{"kind":"Docx","node_path":"body/p[4]"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&SourceAnchor::Url {
+                text_offset: "42".to_string(),
+            })
+            .unwrap(),
+            r#"{"kind":"Url","text_offset":"42"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&SourceAnchor::Structured {
+                path: "/a/b".to_string(),
+            })
+            .unwrap(),
+            r#"{"kind":"Structured","path":"/a/b"}"#
+        );
+        // And lock the new variants' own wire shapes.
+        assert_eq!(
+            serde_json::to_string(&SourceAnchor::Rtf { text_offset: 42 }).unwrap(),
+            r#"{"kind":"Rtf","text_offset":42}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&SourceAnchor::Odt {
+                node_path: "body/text:h[0]".to_string(),
+            })
+            .unwrap(),
+            r#"{"kind":"Odt","node_path":"body/text:h[0]"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&SourceAnchor::Epub {
+                spine_index: 2,
+                href: "OEBPS/chapter1.xhtml".to_string(),
+            })
+            .unwrap(),
+            r#"{"kind":"Epub","spine_index":2,"href":"OEBPS/chapter1.xhtml"}"#
+        );
+    }
+
+    #[test]
+    fn rtf_kind_resolves_to_extractor() {
+        assert!(extractor_for("rtf").is_ok());
+    }
+
+    #[test]
+    fn odt_kind_resolves_to_extractor() {
+        assert!(extractor_for("odt").is_ok());
+    }
+
+    #[test]
+    fn epub_kind_resolves_to_extractor() {
+        assert!(extractor_for("epub").is_ok());
     }
 
     #[test]

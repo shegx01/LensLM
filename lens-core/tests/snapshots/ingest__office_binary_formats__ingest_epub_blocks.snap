@@ -1,0 +1,26 @@
+---
+source: lens-core/tests/ingest.rs
+expression: block_shape(&out)
+---
+[
+    (
+        "heading",
+        "Chapter One",
+        "Chapter One",
+    ),
+    (
+        "paragraph",
+        "Chapter One",
+        "First chapter body.",
+    ),
+    (
+        "heading",
+        "Chapter Two",
+        "Chapter Two",
+    ),
+    (
+        "paragraph",
+        "Chapter Two",
+        "Second chapter body.",
+    ),
+]

@@ -1,0 +1,21 @@
+---
+source: lens-core/src/extract/rtf.rs
+expression: snaps
+---
+[
+  {
+    "block_type": "paragraph",
+    "section_path": "",
+    "text": "First paragraph."
+  },
+  {
+    "block_type": "paragraph",
+    "section_path": "",
+    "text": "Second paragraph."
+  },
+  {
+    "block_type": "paragraph",
+    "section_path": "",
+    "text": "Third paragraph."
+  }
+]

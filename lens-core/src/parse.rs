@@ -46,6 +46,12 @@ pub enum SourceKind {
     Yaml,
     /// An XML document (roxmltree DOM walk).
     Xml,
+    /// An RTF document (rtf-parser flat-paragraph walk).
+    Rtf,
+    /// An ODT document (ODF ZIP `content.xml` quick-xml walk).
+    Odt,
+    /// An EPUB document (rbook spine + quick-xml XHTML walk).
+    Epub,
 }
 
 impl SourceKind {
@@ -64,6 +70,9 @@ impl SourceKind {
             Self::Jsonl => "jsonl",
             Self::Yaml => "yaml",
             Self::Xml => "xml",
+            Self::Rtf => "rtf",
+            Self::Odt => "odt",
+            Self::Epub => "epub",
         }
     }
 
@@ -80,8 +89,11 @@ impl SourceKind {
             "jsonl" => Ok(Self::Jsonl),
             "yaml" => Ok(Self::Yaml),
             "xml" => Ok(Self::Xml),
+            "rtf" => Ok(Self::Rtf),
+            "odt" => Ok(Self::Odt),
+            "epub" => Ok(Self::Epub),
             other => Err(LensError::Validation(format!(
-                "unknown source kind: {other:?}; expected one of \"text\", \"markdown\", \"pdf\", \"docx\", \"url\", \"json\", \"jsonl\", \"yaml\", \"xml\""
+                "unknown source kind: {other:?}; expected one of \"text\", \"markdown\", \"pdf\", \"docx\", \"url\", \"json\", \"jsonl\", \"yaml\", \"xml\", \"rtf\", \"odt\", \"epub\""
             ))),
         }
     }
@@ -98,6 +110,9 @@ impl SourceKind {
             // canonical buffer is a verbalization produced by a dedicated
             // Extractor, persisted as the `.extracted.txt` sibling.
             Self::Json | Self::Jsonl | Self::Yaml | Self::Xml => false,
+            // Office/binary formats (RTF/ODT/EPUB) are DERIVED: their canonical
+            // buffer is produced by a dedicated Extractor (issue #77).
+            Self::Rtf | Self::Odt | Self::Epub => false,
         }
     }
 }
@@ -277,7 +292,10 @@ pub fn parse_blocks(src: &str, kind: SourceKind) -> Vec<Block> {
         | SourceKind::Json
         | SourceKind::Jsonl
         | SourceKind::Yaml
-        | SourceKind::Xml => {
+        | SourceKind::Xml
+        | SourceKind::Rtf
+        | SourceKind::Odt
+        | SourceKind::Epub => {
             debug_assert!(
                 false,
                 "parse_blocks called with derived kind {kind:?} — use an Extractor"
@@ -1050,6 +1068,32 @@ mod tests {
         assert!(!SourceKind::Jsonl.is_text_like());
         assert!(!SourceKind::Yaml.is_text_like());
         assert!(!SourceKind::Xml.is_text_like());
+    }
+
+    #[test]
+    fn source_kind_rtf_roundtrip() {
+        assert_eq!(SourceKind::from_kind_str("rtf").unwrap(), SourceKind::Rtf);
+        assert_eq!(SourceKind::Rtf.as_str(), "rtf");
+    }
+
+    #[test]
+    fn source_kind_odt_roundtrip() {
+        assert_eq!(SourceKind::from_kind_str("odt").unwrap(), SourceKind::Odt);
+        assert_eq!(SourceKind::Odt.as_str(), "odt");
+    }
+
+    #[test]
+    fn source_kind_epub_roundtrip() {
+        assert_eq!(SourceKind::from_kind_str("epub").unwrap(), SourceKind::Epub);
+        assert_eq!(SourceKind::Epub.as_str(), "epub");
+    }
+
+    #[test]
+    fn source_kind_office_binary_not_text_like() {
+        // RTF/ODT/EPUB are DERIVED (not text-like) — issue #77.
+        assert!(!SourceKind::Rtf.is_text_like());
+        assert!(!SourceKind::Odt.is_text_like());
+        assert!(!SourceKind::Epub.is_text_like());
     }
 
     #[test]
