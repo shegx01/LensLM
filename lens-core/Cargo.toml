@@ -187,7 +187,7 @@ lancedb = "0.30.0"
 # Pure-Rust PDF writer — generates the tiny text-layer PDF fixture IN-TEST (Step 5
 # TDD) so no binary fixture is committed. Dev-only; never in production builds.
 # MIT-licensed (deny.toml allowlist).
-printpdf = "=0.7.0"
+printpdf = "=0.9.1"
 arrow-array = "58"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # Tokenizer download fallback for tokenizer-dependent tests when offline cache
