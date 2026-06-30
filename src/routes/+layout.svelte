@@ -11,6 +11,7 @@
   import CreateNotebook from '$lib/components/onboarding/CreateNotebook.svelte';
   import AddSources from '$lib/components/onboarding/AddSources.svelte';
   import { draft, resetDraft } from '$lib/components/onboarding/onboarding-state.svelte.js';
+  import ToastContainer from '$lib/components/ui/ToastContainer.svelte';
 
   let { children } = $props();
 
@@ -93,6 +94,11 @@
      are needed; draggability is provided by per-region drag bars: the AppShell rails
      and, during first-run, each onboarding screen's <main data-tauri-drag-region>
      (the empty canvas around the card), mirroring the SourcesRail pattern. -->
+
+<!-- ToastContainer is mounted OUTSIDE the booting/onboarding conditional so toasts
+     are always visible regardless of which surface is active. z-[100] places it
+     above the modal overlay (z-50). -->
+<ToastContainer />
 
 {#if booting}
   <!-- Hold render until the single config read resolves so the app never

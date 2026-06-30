@@ -3,18 +3,104 @@ import { cleanup } from '@testing-library/svelte';
 import { randomFillSync } from 'node:crypto';
 import { afterEach, beforeAll, beforeEach } from 'vitest';
 
+// ── Pending-timer tracking ────────────────────────────────────────────────────
+//
+// Root fix for the intermittent "ReferenceError: document is not defined" CI
+// flake: bits-ui Dialog (focus-restore / scroll-lock cleanup) schedules a
+// `setTimeout(fn, >0)` during component teardown. Under parallel Vitest with
+// happy-dom, that callback can fire AFTER happy-dom has already torn down the
+// *next* file's `document`, throwing at the process level and failing the run.
+//
+// Strategy: wrap globalThis.{setTimeout,setInterval} to register every pending
+// id in a Set; wrap clearTimeout/clearInterval to deregister; auto-deregister
+// a setTimeout id when its callback fires (so the Set only holds genuinely
+// pending timers). In afterEach, after cleanup() + the 0-delay drain, forcibly
+// clear any remaining ids so no callback can outlive the file boundary.
+//
+// The internal drain uses the REAL setTimeout (captured before wrapping) so it
+// is never tracked and never self-cleared.
+//
+// vi.useFakeTimers() — tests that invoke this replace globalThis.setTimeout
+// temporarily and restore it afterwards. Our wrapper is the baseline real impl
+// and is NOT affected: if fake timers are active during afterEach our Set only
+// holds real-timer ids from before/after the fake-timer window; clearing them
+// is safe. Fake-timer ids managed by Vitest are outside our Set entirely.
+
+const _realSetTimeout = globalThis.setTimeout;
+const _realSetInterval = globalThis.setInterval;
+const _realClearTimeout = globalThis.clearTimeout;
+const _realClearInterval = globalThis.clearInterval;
+
+const _pendingTimeouts = new Set<ReturnType<typeof _realSetTimeout>>();
+const _pendingIntervals = new Set<ReturnType<typeof _realSetInterval>>();
+
+globalThis.setTimeout = (<TArgs extends unknown[]>(
+  handler: (...args: TArgs) => void,
+  delay?: number,
+  ...args: TArgs
+): ReturnType<typeof _realSetTimeout> => {
+  let id: ReturnType<typeof _realSetTimeout>;
+  id = _realSetTimeout(
+    (...a: TArgs) => {
+      _pendingTimeouts.delete(id);
+      handler(...a);
+    },
+    delay,
+    ...args
+  );
+  _pendingTimeouts.add(id);
+  return id;
+}) as typeof globalThis.setTimeout;
+
+globalThis.setInterval = (<TArgs extends unknown[]>(
+  handler: (...args: TArgs) => void,
+  delay?: number,
+  ...args: TArgs
+): ReturnType<typeof _realSetInterval> => {
+  const id = _realSetInterval(handler, delay, ...args);
+  _pendingIntervals.add(id);
+  return id;
+}) as typeof globalThis.setInterval;
+
+globalThis.clearTimeout = (id?: ReturnType<typeof _realSetTimeout>): void => {
+  if (id !== undefined) _pendingTimeouts.delete(id);
+  _realClearTimeout(id);
+};
+
+globalThis.clearInterval = (id?: ReturnType<typeof _realSetInterval>): void => {
+  if (id !== undefined) _pendingIntervals.delete(id);
+  _realClearInterval(id);
+};
+
+// ── afterEach: cleanup → 0-delay drain → clear all surviving timers ───────────
+//
 // Unmount any components rendered during the test, THEN drain pending macrotasks
 // + microtasks. Unmounting fires each component's `onDestroy`, which clears any
 // live timers (e.g. the embeddings install phase ticker, a 1200ms `setInterval`)
 // so they can't fire after happy-dom's `document` is torn down. The subsequent
 // drain flushes deferred 0-delay callbacks (component focus `setTimeout(…, 0)`,
 // Svelte transition `onfinish` microtasks, bits-ui focus/scroll-lock restore,
-// etc.) WHILE `document` still exists. Without this, a surviving timer/callback
-// fires after teardown → an unhandled "ReferenceError: document is not defined"
-// that non-deterministically fails CI.
+// etc.) WHILE `document` still exists.
+//
+// Finally, forcibly clear every timer id still in the tracking Sets: any timer
+// that survives both cleanup() and the drain is a leaked >0-delay callback (e.g.
+// bits-ui Dialog focus-restore) that must not be allowed to fire after teardown.
+// The drain uses _realSetTimeout so it is never entered into the tracking Sets.
 afterEach(async () => {
   cleanup();
-  await new Promise((resolve) => setTimeout(resolve, 0));
+  await new Promise<void>((resolve) => _realSetTimeout(resolve, 0));
+
+  // Clear all surviving tracked timeouts.
+  for (const id of _pendingTimeouts) {
+    _realClearTimeout(id);
+  }
+  _pendingTimeouts.clear();
+
+  // Clear all surviving tracked intervals.
+  for (const id of _pendingIntervals) {
+    _realClearInterval(id);
+  }
+  _pendingIntervals.clear();
 });
 
 // happy-dom v20 exposes `localStorage` but its `getItem`/`setItem` are not
