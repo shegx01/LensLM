@@ -1,14 +1,22 @@
 // App-level Tauri v2 native drag-and-drop manager.
 //
 // Owns exactly ONE ref-counted `getCurrentWebview().onDragDropEvent` listener.
-// Drop zones register `{ getRect, onDrop, setHover }`; on a native drop the
-// manager DPR-corrects the physical position, hit-tests live rects, and
-// dispatches to the last-registered (LIFO/topmost) containing target.
+// Drop zones register `{ onDrop, setHover }`; a drop is routed to the currently
+// ACTIVE drop zone (the last-registered target).
 //
-// Pure helpers (`partitionPaths`, `physicalToLogical`, `hitTest`) carry zero
-// Svelte/Tauri dependencies and are unit-testable in isolation. The Tauri
-// webview API is imported DYNAMICALLY behind `isTauri()` so `vite dev` without
-// a Tauri runtime never evaluates it.
+// We deliberately do NOT coordinate-hit-test the drop position against an
+// element rect. Tauri's reported drop `position` is unreliable — it is
+// documented as inaccurate while the devtools panel is open, and has a known
+// per-platform cursor offset (e.g. ~28px on macOS, tauri-apps/tauri#10744).
+// Gating acceptance on a position-vs-rect check silently drops valid files.
+// The canonical Tauri pattern accepts the drop window-wide and uses enter/over/
+// leave only to drive the visual hover state. Because only one drop zone is ever
+// mounted at a time in this app (onboarding and the modal are mutually exclusive),
+// "active = last-registered target" routes correctly without any hit-test.
+//
+// Pure helper `partitionPaths` carries zero Svelte/Tauri dependencies and is
+// unit-testable in isolation. The Tauri webview API is imported DYNAMICALLY
+// behind `isTauri()` so `vite dev` without a Tauri runtime never evaluates it.
 //
 // See `.omc/plans/issue95-drag-drop-ingest.md` for the full design.
 
@@ -91,18 +99,21 @@ export function partitionPaths(paths: string[]): {
 // ---------------------------------------------------------------------------
 
 export interface DropTarget {
-  /** Return the element's current bounding rect (CSS px). Called at event time. */
-  getRect: () => DOMRect;
   /** Called with the accepted file paths on a successful drop.
    *  Only called when accepted.length > 0. */
   onDrop: (paths: string[]) => void;
-  /** Drive visual hover state. true = drag is over this zone; false = left/dropped. */
+  /** Drive visual hover state. true = drag is over the window; false = left/dropped. */
   setHover: (hovering: boolean) => void;
 }
 
 // Module-level registry — push on register, splice on unregister.
-// LIFO resolution = iterate from end to start, return first containing target.
+// The ACTIVE target is the last-registered one (top of the stack).
 const targets: DropTarget[] = [];
+
+/** The currently active drop zone — the last-registered target, or null. */
+function activeTarget(): DropTarget | null {
+  return targets.length > 0 ? targets[targets.length - 1] : null;
+}
 
 // Async listener state: `onDragDropEvent` returns Promise<UnlistenFn>. We track
 // both the pending promise and the resolved unlisten fn so teardown can handle
@@ -114,55 +125,50 @@ let unlistenFn: UnlistenFn | null = null;
  *  receives `Event<DragDropEvent>` — the data lives at `event.payload`. */
 interface DragDropPayload {
   type: 'enter' | 'over' | 'drop' | 'leave';
-  position?: { x: number; y: number };
   paths?: string[];
 }
 
-/** Apply hover state across all targets: the matched target (if any) gets
- *  `setHover(true)`, every other target gets `setHover(false)`. */
-function applyHover(matched: DropTarget | null): void {
+/** Drive hover state: the active target gets `setHover(hovering)`, every other
+ *  registered target is forced to `setHover(false)`. */
+function setActiveHover(hovering: boolean): void {
+  const active = activeTarget();
   for (const target of targets) {
-    target.setHover(target === matched);
+    target.setHover(hovering && target === active);
   }
 }
 
 /** The single global drag-drop handler. Receives `Event<DragDropEvent>`;
- *  all field access goes through `event.payload`. */
+ *  all field access goes through `event.payload`. No coordinate hit-test —
+ *  the active (last-registered) drop zone receives the drop. */
 function handleDragDropEvent(event: { payload: DragDropPayload }): void {
   const payload = event.payload;
 
-  if (payload.type === 'leave') {
-    // No `position`, no `paths` — clear hover on every target.
-    applyHover(null);
-    return;
-  }
-
-  // `enter`, `over`, `drop` all carry `position` (physical pixels).
-  const position = payload.position;
-  if (!position) return;
-  const { x, y } = physicalToLogical(position.x, position.y, window.devicePixelRatio);
-  const matched = hitTest(targets, x, y);
-
-  if (payload.type === 'enter' || payload.type === 'over') {
-    // `over` has no `paths`; `enter` carries `paths` but they are not needed
-    // (filtering happens on `drop`). Just drive hover state.
-    applyHover(matched);
-    return;
-  }
-
-  // payload.type === 'drop' — has `position` and `paths`.
-  if (!matched) {
-    // Drop outside any registered zone — ignore entirely.
-    return;
-  }
-  applyHover(null);
-  const { accepted, rejected } = partitionPaths(payload.paths ?? []);
-  if (accepted.length > 0) {
-    matched.onDrop(accepted);
-  }
-  if (rejected.length > 0) {
-    const exts = rejected.map((r) => `.${r.ext}`).join(', ');
-    showToast(`${rejected.length} file(s) skipped: ${exts} not supported`);
+  switch (payload.type) {
+    case 'enter':
+    case 'over':
+      // Drive the hover highlight on the active zone. (`over` has no `paths`;
+      // we never read paths here — filtering happens on `drop`.)
+      setActiveHover(true);
+      return;
+    case 'leave':
+      // Drag cancelled / left the window — clear hover everywhere.
+      setActiveHover(false);
+      return;
+    case 'drop': {
+      const active = activeTarget();
+      setActiveHover(false);
+      // No active drop zone (e.g. modal closed) — ignore the drop entirely.
+      if (!active) return;
+      const { accepted, rejected } = partitionPaths(payload.paths ?? []);
+      if (accepted.length > 0) {
+        active.onDrop(accepted);
+      }
+      if (rejected.length > 0) {
+        const exts = rejected.map((r) => `.${r.ext}`).join(', ');
+        showToast(`${rejected.length} file(s) skipped: ${exts} not supported`);
+      }
+      return;
+    }
   }
 }
 
@@ -210,42 +216,4 @@ export function registerDropTarget(target: DropTarget): () => void {
     if (idx !== -1) targets.splice(idx, 1);
     if (targets.length === 0) teardownListener();
   };
-}
-
-// ---------------------------------------------------------------------------
-// Hit-test (exported for unit testing)
-// ---------------------------------------------------------------------------
-
-/** Convert physical pixel position to CSS px by dividing by devicePixelRatio.
- *  Exported for unit testing; not intended for external use. */
-export function physicalToLogical(
-  physX: number,
-  physY: number,
-  dpr: number
-): { x: number; y: number } {
-  // Guard against a 0 / NaN devicePixelRatio (theoretical in headless envs);
-  // dividing by it would yield Infinity and silently break hit-testing.
-  const safeDpr = dpr || 1;
-  return { x: physX / safeDpr, y: physY / safeDpr };
-}
-
-/** Find the topmost (LIFO) registered target whose rect contains the point.
- *  Returns null if no target matches. Exported for unit testing. */
-export function hitTest(
-  targets: DropTarget[],
-  logicalX: number,
-  logicalY: number
-): DropTarget | null {
-  for (let i = targets.length - 1; i >= 0; i--) {
-    const rect = targets[i].getRect();
-    if (
-      logicalX >= rect.left &&
-      logicalX <= rect.right &&
-      logicalY >= rect.top &&
-      logicalY <= rect.bottom
-    ) {
-      return targets[i];
-    }
-  }
-  return null;
 }

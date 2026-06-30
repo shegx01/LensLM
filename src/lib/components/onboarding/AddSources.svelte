@@ -65,7 +65,6 @@
 
     if (!dropZoneEl) return;
     unregisterDrop = registerDropTarget({
-      getRect: () => dropZoneEl!.getBoundingClientRect(),
       onDrop: (paths: string[]) => {
         for (const p of paths) {
           if (selectedPaths.has(p)) continue;

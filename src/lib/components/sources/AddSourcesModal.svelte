@@ -6,7 +6,6 @@
      Drag region: modal and ALL its controls are data-tauri-drag-region=none (no-drag).
      Tokens only — no hardcoded hex. -->
 <script lang="ts">
-  import { onMount, onDestroy } from 'svelte';
   import { open as openFilePicker } from '@tauri-apps/plugin-dialog';
   import { isTauri } from '@tauri-apps/api/core';
   import X from '@lucide/svelte/icons/x';
@@ -138,14 +137,19 @@
 
   // ---------------------------------------------------------------------------
   // Native drag-drop (Tauri v2) — registered via the app-level drop manager.
+  // The drop zone only exists while the modal is open AND the Upload tab is
+  // active (it lives behind `{#if open}` + `{#if activeTab === 'upload'}`), so a
+  // one-shot onMount registration would miss it. Instead, (re)register whenever
+  // the bound element mounts and clean up when it unmounts — an $effect keyed on
+  // `dropZoneEl` handles open/close and tab switches in both directions.
   // ---------------------------------------------------------------------------
 
-  let unregisterDrop: (() => void) | null = null;
-
-  onMount(() => {
+  $effect(() => {
+    // Registering only while the drop-zone element is mounted (modal open +
+    // Upload tab active) scopes the drop to this surface — the manager routes
+    // drops to the active (last-registered) target. No coordinate hit-test.
     if (!dropZoneEl) return;
-    unregisterDrop = registerDropTarget({
-      getRect: () => dropZoneEl!.getBoundingClientRect(),
+    return registerDropTarget({
       setHover: (h) => {
         dragOver = h;
       },
@@ -153,6 +157,7 @@
         if (!activeNotebookId || uploadSubmitting) return;
         uploadError = null;
         uploadSubmitting = true;
+        let addedAny = false;
         try {
           for (const path of paths) {
             // Skip files already added to this notebook (dedup by locator).
@@ -162,6 +167,7 @@
               const source = await addFileSource(activeNotebookId, name, path);
               addSourceLocal(source);
               void ingest(source.id);
+              addedAny = true;
             } catch (err) {
               uploadError = 'Could not add file. Please try again.';
               console.error('AddSourcesModal: drop ingest failed for', path, err);
@@ -171,13 +177,12 @@
           uploadSubmitting = false;
           void loadSources(activeNotebookId);
         }
+        // Dismiss the modal after a successful drop so the new sources are
+        // visible in the rail (mirrors the browse flow). Stay open when nothing
+        // was added (all duplicates / all failed) so the error remains visible.
+        if (addedAny) onclose?.();
       }
     });
-  });
-
-  onDestroy(() => {
-    unregisterDrop?.();
-    unregisterDrop = null;
   });
 
   // ---------------------------------------------------------------------------
