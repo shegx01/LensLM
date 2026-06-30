@@ -8,7 +8,8 @@
 //!   (block offsets are global byte offsets into this buffer).
 //! - `blocks` carries `block_type = "heading"` for `<h1>`..`<h6>` (level taken
 //!   from the tag) and `block_type = "paragraph"` for `<p>`. Other block-level
-//!   elements (lists, tables) are treated as paragraphs for v1.
+//!   elements (lists, tables) are NOT recognised as their own blocks for v1;
+//!   any `<p>` nested inside them is still captured as a paragraph.
 //! - `anchors` carries one [`SourceAnchor::Epub { spine_index, href }`] per block.
 //!
 //! ## Inter-spine separator protocol
@@ -69,9 +70,22 @@ impl Extractor for EpubExtractor {
         for item in epub.reader() {
             let content =
                 item.map_err(|e| LensError::Parse(format!("EPUB spine entry read failed: {e}")))?;
-            let spine_index = content.position();
+            let spine_index = content.position() as u64;
             let href = content.manifest_entry().href().as_str().to_string();
             let xhtml = content.content();
+
+            // Decompression-bomb guard (pre-walk): rbook fully inflates the spine
+            // entry into `xhtml` before we get here, so reject an oversized single
+            // entry BEFORE parsing it — this bounds peak memory more tightly than
+            // the cumulative post-walk check below. (rbook owns decompression, so
+            // a detect-after-inflate guard is the best available without its
+            // lower-level zip API.)
+            if xhtml.len() > MAX_DECOMPRESSED_BYTES {
+                return Err(LensError::Validation(format!(
+                    "EPUB spine entry decompresses to more than the \
+                     {MAX_DECOMPRESSED_BYTES}-byte limit (possible decompression bomb)"
+                )));
+            }
 
             // Each spine entry is its own XHTML document with its own heading
             // hierarchy: reset the section-path stack per entry.
@@ -80,15 +94,20 @@ impl Extractor for EpubExtractor {
             walk_xml_blocks(
                 xhtml,
                 "EPUB XHTML",
-                // classify: <h1>..<h6> are headings, <p> a paragraph.
-                |e: &BytesStart<'_>| match heading_level(e.name().as_ref()) {
-                    Some(lvl) => Some(BlockKind::Heading(lvl)),
-                    None if e.name().as_ref() == b"p" => Some(BlockKind::Paragraph),
-                    None => None,
+                // classify: <h1>..<h6> are headings, <p> a paragraph. Match on the
+                // LOCAL name so namespace-prefixed XHTML (e.g. `<html:p>`) is still
+                // recognised rather than silently dropping the whole chapter.
+                |e: &BytesStart<'_>| {
+                    let local = e.local_name();
+                    match heading_level(local.as_ref()) {
+                        Some(lvl) => Some(BlockKind::Heading(lvl)),
+                        None if local.as_ref() == b"p" => Some(BlockKind::Paragraph),
+                        None => None,
+                    }
                 },
                 // inline_whitespace: XHTML `<br/>` is a hard line break.
                 |e: &BytesStart<'_>| {
-                    if e.name().as_ref() == b"br" {
+                    if e.local_name().as_ref() == b"br" {
                         Some("\n")
                     } else {
                         None
@@ -363,6 +382,25 @@ mod tests {
         assert_byte_identity(&out);
         assert_eq!(out.blocks.len(), 1);
         assert!(out.blocks[0].text.len() >= 1_900_000, "full body extracted");
+    }
+
+    #[test]
+    fn epub_namespaced_block_elements_extracted() {
+        // XHTML that prefixes its block elements (valid XML: `<x:h1>`, `<x:p>`
+        // bound to the XHTML namespace) must still be recognised via local-name
+        // matching — otherwise an entire chapter would be silently dropped.
+        let body = r#"<x:h1 xmlns:x="http://www.w3.org/1999/xhtml">Prefixed Heading</x:h1><x:p xmlns:x="http://www.w3.org/1999/xhtml">Prefixed paragraph.</x:p>"#;
+        let out = extract(&[("c.xhtml", body)]);
+        assert_byte_identity(&out);
+        assert!(
+            out.blocks.iter().any(|b| b.text == "Prefixed Heading"),
+            "namespaced <x:h1> must be extracted; blocks: {:?}",
+            out.blocks.iter().map(|b| &b.text).collect::<Vec<_>>()
+        );
+        assert!(
+            out.blocks.iter().any(|b| b.text == "Prefixed paragraph."),
+            "namespaced <x:p> must be extracted"
+        );
     }
 
     #[test]

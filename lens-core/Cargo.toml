@@ -114,6 +114,13 @@ quick-xml = { version = "=0.41.0", default-features = false }
 # optional `write`/`prelude` features not needed for read-only extraction;
 # `threadsafe` is REQUIRED so the parsed Epub is Send + Sync (the extractor lives
 # behind `Box<dyn Extractor>`). Apache-2.0 — deny.toml allowlist. Pinned exactly.
+#
+# KNOWN TRANSITIVE SIDE EFFECT: rbook pulls its own `zip 8.6.0`, which enables
+# `flate2`'s `zlib-rs` backend. Via Cargo feature unification this switches the
+# DEFLATE backend (miniz_oxide → zlib-rs) for ALL flate2 consumers in the
+# workspace (lance, reqwest, docx-rs). zlib-rs is a production-grade pure-Rust
+# backend and the full test suite passes; documented here so a future maintainer
+# isn't surprised by the Cargo.lock backend change.
 rbook = { version = "=0.7.9", default-features = false, features = ["threadsafe"] }
 
 # --- M4 Source Grounding (Phase 2, Step 6) ---

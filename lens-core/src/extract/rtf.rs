@@ -115,7 +115,7 @@ impl Extractor for RtfExtractor {
                 char_end,
             });
             anchors.push(SourceAnchor::Rtf {
-                text_offset: char_start,
+                text_offset: char_start as u64,
             });
         }
 
@@ -193,7 +193,10 @@ mod tests {
             let SourceAnchor::Rtf { text_offset } = a else {
                 panic!("anchor[{i}] must be SourceAnchor::Rtf");
             };
-            assert_eq!(*text_offset, b.char_start, "anchor offset == block start");
+            assert_eq!(
+                *text_offset, b.char_start as u64,
+                "anchor offset == block start"
+            );
         }
     }
 

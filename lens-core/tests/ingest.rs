@@ -2234,6 +2234,56 @@ async fn seam_derived_reingest_noop_without_reextract_and_sibling_lifecycle() {
     );
 }
 
+/// Full-pipeline end-to-end for a DERIVED office format (issue #77) via the REAL
+/// `RtfExtractor` (no fake factory): real `.rtf` bytes flow extract → chunk →
+/// embed → index, reaching `indexed` with chunks produced and the
+/// `.extracted.txt` sibling persisted, every chunk slicing it byte-for-byte.
+/// The unit tests cover extraction in isolation; this proves the new kinds wire
+/// through the whole ingest pipeline (not just `extract()`).
+#[tokio::test]
+async fn ingest_rtf_end_to_end_real_extractor() {
+    if !tokenizer_available().await {
+        eprintln!("skipping ingest_rtf_end_to_end_real_extractor: no tokenizer (offline)");
+        return;
+    }
+    let (_dir, engine) = inject_counting_engine().await;
+    let data_dir = engine.data_dir_for_test().await;
+    let nb = engine.create_notebook("rtf-e2e", None, None).await.unwrap();
+
+    // Minimal real RTF (two `\par` paragraphs) parsed by the production extractor.
+    let rtf = b"{\\rtf1\\ansi\\deff0 Hello world from a real RTF document.\\par \
+                A second paragraph with enough words to exercise the chunker end to end.\\par}";
+    let id = uuid::Uuid::now_v7().to_string();
+    let locator = write_raw_source_file(&data_dir, &id, rtf);
+    insert_raw_source_locator(&engine, &nb.id.to_string(), "rtf", &locator, &id).await;
+
+    engine
+        .ingest_source(&id, |_p| {})
+        .await
+        .expect("ingest rtf");
+
+    // Reaches `indexed` (status only flips after the indexing phase) with chunks.
+    assert_eq!(engine_source_status(&engine, &id).await, "indexed");
+    assert!(
+        count_chunks(&engine, &id).await > 0,
+        "RTF ingest must produce chunks end-to-end"
+    );
+
+    // Derived-kind canonical buffer is the `.extracted.txt` sibling; chunks slice
+    // it byte-for-byte.
+    let sibling = data_dir.join("sources").join(format!("{id}.extracted.txt"));
+    assert!(
+        sibling.exists(),
+        "RTF (derived kind) must persist the .extracted.txt sibling"
+    );
+    let canonical = std::fs::read_to_string(&sibling).unwrap();
+    assert!(
+        canonical.contains("Hello world from a real RTF document."),
+        "extracted canonical text present: {canonical:?}"
+    );
+    assert_chunk_byte_identity(&engine, &id, &canonical).await;
+}
+
 // ===========================================================================
 // Step 4 — SourceAnchor persisted in a dedicated column (AC5)
 // ===========================================================================

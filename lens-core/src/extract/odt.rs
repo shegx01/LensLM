@@ -134,26 +134,29 @@ fn read_capped<R: Read>(reader: R, max: u64) -> Result<String, LensError> {
     Ok(content)
 }
 
-/// Maps a `<text:s text:c="n"/>` empty element to `n` spaces (default 1 when the
-/// attribute is absent or unparseable, per ODF 1.3 §6.1.3). Capped at a small
-/// number of static `&str` slices; falls back to a single space for large `n`
-/// (the in-flight text is built from `&'static str`, so we never allocate here —
-/// callers expecting huge runs are pathological and a single space is safe).
+/// Maps a `<text:s text:c="n"/>` empty element to `n` spaces, per ODF 1.3
+/// §6.1.3. A MISSING `text:c` attribute defaults to 1 space; an explicit
+/// `text:c="0"` yields ZERO spaces (the spec permits it); an unparseable value
+/// falls back to 1. Large counts are clamped to 32 (`SPACES.len()`) — the
+/// in-flight text borrows from a `&'static str`, so we never allocate here and a
+/// pathological run cannot blow up memory.
 fn text_s_spaces(e: &BytesStart<'_>) -> &'static str {
     const SPACES: &str = "                                "; // 32 spaces
-    let n = e
+    let n = match e
         .attributes()
         .flatten()
         .find(|a| a.key.as_ref() == b"text:c")
-        .and_then(|a| {
-            std::str::from_utf8(a.value.as_ref())
-                .ok()?
-                .trim()
-                .parse::<usize>()
-                .ok()
-        })
-        .unwrap_or(1)
-        .clamp(1, SPACES.len());
+    {
+        // No text:c → ODF default of a single space.
+        None => 1,
+        // text:c present: honour its value (0 = zero spaces is valid); an
+        // unparseable value falls back to 1.
+        Some(a) => std::str::from_utf8(a.value.as_ref())
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(1),
+    }
+    .min(SPACES.len());
     &SPACES[..n]
 }
 
@@ -424,6 +427,72 @@ mod tests {
         assert_byte_identity(&out);
         assert_eq!(out.blocks.len(), 1);
         assert!(out.blocks[0].text.len() >= 4_000_000, "full body extracted");
+    }
+
+    #[test]
+    fn odt_text_s_zero_emits_no_space_and_large_clamps() {
+        // `text:c="0"` is valid ODF and means ZERO spaces (must NOT become 1);
+        // a huge `text:c` clamps to 32 rather than the literal count.
+        let content = r#"<?xml version="1.0"?>
+<office:document-content xmlns:office="urn:o" xmlns:text="urn:t">
+  <office:body><office:text>
+    <text:p>A<text:s text:c="0"/>B</text:p>
+    <text:p>C<text:s text:c="99999"/>D</text:p>
+  </office:text></office:body>
+</office:document-content>"#;
+        let out = extract(content);
+        assert_byte_identity(&out);
+        assert_eq!(out.blocks[0].text, "AB", "text:c=0 must emit zero spaces");
+        // 32 spaces (clamped) between C and D.
+        assert_eq!(out.blocks[1].text, format!("C{}D", " ".repeat(32)));
+    }
+
+    #[test]
+    fn odt_self_closing_block_advances_node_path() {
+        // A self-closing `<text:p/>` emits no block but MUST advance the p counter
+        // so the following paragraph keeps a stable node_path (parity with the
+        // paired-empty `<text:p></text:p>` case).
+        let content = r#"<?xml version="1.0"?>
+<office:document-content xmlns:office="urn:o" xmlns:text="urn:t">
+  <office:body><office:text>
+    <text:p>First</text:p>
+    <text:p/>
+    <text:p>Third</text:p>
+  </office:text></office:body>
+</office:document-content>"#;
+        let out = extract(content);
+        assert_byte_identity(&out);
+        // Two emitted blocks (the self-closing middle one is empty).
+        assert_eq!(out.blocks.len(), 2);
+        let third = out
+            .blocks
+            .iter()
+            .position(|b| b.text == "Third")
+            .expect("third paragraph");
+        let SourceAnchor::Odt { node_path } = &out.anchors[third] else {
+            panic!("odt anchor");
+        };
+        assert_eq!(
+            node_path, "body/text:p[2]",
+            "self-closing <text:p/> must advance the counter (Third == p[2], not p[1])"
+        );
+    }
+
+    #[test]
+    fn odt_multibyte_byte_identity_through_walker() {
+        // CJK + emoji passing through the shared XML walker must preserve
+        // byte-identity (offsets are byte offsets, never mid-codepoint).
+        let content = r#"<?xml version="1.0"?>
+<office:document-content xmlns:office="urn:o" xmlns:text="urn:t">
+  <office:body><office:text>
+    <text:h text:outline-level="1">日本語の見出し</text:h>
+    <text:p>café — naïve — 🚀 résumé</text:p>
+  </office:text></office:body>
+</office:document-content>"#;
+        let out = extract(content);
+        assert_byte_identity(&out);
+        assert_eq!(out.blocks[0].text, "日本語の見出し");
+        assert_eq!(out.blocks[1].text, "café — naïve — 🚀 résumé");
     }
 
     #[test]

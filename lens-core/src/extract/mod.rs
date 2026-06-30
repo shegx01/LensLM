@@ -68,16 +68,18 @@ pub enum SourceAnchor {
     /// An RTF block: its byte offset in the canonical extracted-text buffer.
     ///
     /// Additive under its own `kind` tag (issue #77); cannot change the wire
-    /// shape of any pre-existing variant.
-    Rtf { text_offset: usize },
+    /// shape of any pre-existing variant. `u64` (not `usize`) so the persisted
+    /// JSON wire shape is identical on 32- and 64-bit targets.
+    Rtf { text_offset: u64 },
     /// An ODT block: the node path in `content.xml` (e.g. `"body/text:h[0]"`).
     ///
     /// Additive under its own `kind` tag (issue #77).
     Odt { node_path: String },
     /// An EPUB block: the spine index and the href of the content document.
     ///
-    /// Additive under its own `kind` tag (issue #77).
-    Epub { spine_index: usize, href: String },
+    /// Additive under its own `kind` tag (issue #77). `spine_index` is `u64`
+    /// (not `usize`) for a target-independent JSON wire shape.
+    Epub { spine_index: u64, href: String },
 }
 
 /// The canonical extraction result for a single source.

@@ -119,12 +119,21 @@ where
                 }
             }
             Ok(Event::Empty(e)) => {
-                // Empty element (e.g. `<text:s/>`, `<text:tab/>`, `<br/>`):
-                // contributes whitespace but no open/close depth change.
-                if let Some(cur) = current.as_mut()
-                    && let Some(ws) = inline_whitespace(&e)
-                {
-                    cur.text.push_str(ws);
+                if let Some(cur) = current.as_mut() {
+                    // Inside a block: an empty element (e.g. `<text:s/>`,
+                    // `<text:tab/>`, `<br/>`) contributes whitespace but no
+                    // open/close depth change.
+                    if let Some(ws) = inline_whitespace(&e) {
+                        cur.text.push_str(ws);
+                    }
+                } else if let Some(kind) = classify(&e) {
+                    // A self-closing BLOCK element (e.g. `<text:p/>`): it is
+                    // definitionally empty so emits no block, but the per-element
+                    // counter must still advance so node_path positions stay
+                    // stable regardless of `<text:p/>` vs `<text:p></text:p>`
+                    // serialization (parity with the paired-empty case below).
+                    let is_heading = matches!(kind, BlockKind::Heading(_));
+                    let _ = make_anchor(is_heading);
                 }
             }
             Ok(Event::Text(t)) => {
