@@ -25,7 +25,23 @@ export type SourceStatus =
  * variant on the Rust side but is a real persisted value, so it is included
  * here for the rows the backend can return. */
 // SYNC-CHECK: must match lens-core/src/parse.rs SourceKind enum
-export type SourceKind = 'text' | 'markdown' | 'pdf' | 'docx' | 'url' | 'file';
+export type SourceKind =
+  | 'text'
+  | 'markdown'
+  | 'pdf'
+  | 'docx'
+  | 'url'
+  | 'json'
+  | 'jsonl'
+  | 'yaml'
+  | 'xml'
+  | 'rtf'
+  | 'odt'
+  | 'epub'
+  | 'xlsx'
+  | 'xls'
+  | 'csv'
+  | 'file';
 
 // SYNC-CHECK: must match lens-core/src/notebooks.rs Source struct (around line 82)
 export interface Source {

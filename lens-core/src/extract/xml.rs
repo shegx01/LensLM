@@ -346,6 +346,7 @@ impl Extractor for XmlExtractor {
             extracted_text: buf,
             blocks,
             anchors,
+            table_markdown: None,
         })
     }
 }

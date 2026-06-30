@@ -48,6 +48,7 @@ impl Extractor for UrlExtractor {
                 extracted_text,
                 blocks: vec![],
                 anchors: vec![],
+                table_markdown: None,
             });
         }
 
@@ -117,6 +118,7 @@ impl Extractor for UrlExtractor {
             extracted_text,
             blocks,
             anchors,
+            table_markdown: None,
         })
     }
 }

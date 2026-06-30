@@ -110,6 +110,7 @@ impl Extractor for OdtExtractor {
             extracted_text,
             blocks,
             anchors,
+            table_markdown: None,
         })
     }
 }

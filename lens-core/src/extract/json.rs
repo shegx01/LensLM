@@ -102,6 +102,7 @@ impl Sink {
             extracted_text: self.buf,
             blocks: self.blocks,
             anchors: self.anchors,
+            table_markdown: None,
         }
     }
 

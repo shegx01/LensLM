@@ -29,9 +29,9 @@ import { showToast } from './toast.svelte.js';
 // ---------------------------------------------------------------------------
 
 /** Backend-accepted extensions, lowercase, no leading dot.
- *  Mirrors lens-core/src/notebooks.rs:872-899 exactly.
- *  Count: 15 (pdf, docx, txt, md, markdown, mdx, json, jsonl, ndjson,
- *  yaml, yml, xml, rtf, odt, epub). */
+ *  Mirrors lens-core/src/notebooks.rs add_file_source exactly.
+ *  Count: 18 (pdf, docx, txt, md, markdown, mdx, json, jsonl, ndjson,
+ *  yaml, yml, xml, rtf, odt, epub, xlsx, xls, csv). */
 export const ACCEPTED_EXTENSIONS: ReadonlySet<string> = new Set([
   'pdf',
   'docx',
@@ -47,16 +47,20 @@ export const ACCEPTED_EXTENSIONS: ReadonlySet<string> = new Set([
   'xml',
   'rtf',
   'odt',
-  'epub'
+  'epub',
+  'xlsx',
+  'xls',
+  'csv'
 ]);
 
 /** Picker filter groups for @tauri-apps/plugin-dialog `open()`.
- *  Derived from ACCEPTED_EXTENSIONS — two groups: Documents + Structured. */
+ *  Derived from ACCEPTED_EXTENSIONS — three groups: Documents + Tabular + Structured. */
 export const PICKER_FILTERS: Array<{ name: string; extensions: string[] }> = [
   {
     name: 'Documents',
     extensions: ['pdf', 'docx', 'txt', 'md', 'markdown', 'mdx', 'rtf', 'odt', 'epub']
   },
+  { name: 'Tabular', extensions: ['xlsx', 'xls', 'csv'] },
   { name: 'Structured', extensions: ['json', 'jsonl', 'ndjson', 'yaml', 'yml', 'xml'] }
 ];
 

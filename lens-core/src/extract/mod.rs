@@ -20,6 +20,7 @@
 //! are added in later steps. The dispatcher [`extractor_for`] returns a clear
 //! [`LensError`] for kinds not yet implemented.
 
+pub mod csv;
 pub mod docx;
 pub mod epub;
 pub mod json;
@@ -27,6 +28,8 @@ pub mod jsonl;
 pub mod odt;
 pub mod pdf;
 pub mod rtf;
+pub mod spreadsheet;
+pub mod tabular_utils;
 pub mod url;
 pub mod xml;
 pub mod xml_blocks;
@@ -95,6 +98,12 @@ pub struct ExtractOutput {
     pub blocks: Vec<Block>,
     /// One anchor per block, index-aligned with `blocks`.
     pub anchors: Vec<SourceAnchor>,
+    /// Pipe-delimited markdown table rendering for tabular sources (XLSX/XLS/CSV,
+    /// issue #76). `Some(md)` for tabular extractors; `None` for all others.
+    /// Rendered DURING extraction (no second parse) and persisted by ingest as the
+    /// `{id}.tables.md` sibling, but NEVER embedded and NEVER included in
+    /// `extracted_text`.
+    pub table_markdown: Option<String>,
 }
 
 /// The single new seam: turns raw source bytes into a canonical [`ExtractOutput`].
@@ -137,6 +146,7 @@ impl Extractor for TextExtractor {
             extracted_text: s.to_string(),
             blocks,
             anchors,
+            table_markdown: None,
         })
     }
 }
@@ -181,6 +191,11 @@ pub fn extractor_for(kind: &str) -> Result<Box<dyn Extractor>, LensError> {
         SourceKind::Rtf => Ok(Box::new(rtf::RtfExtractor)),
         SourceKind::Odt => Ok(Box::new(odt::OdtExtractor)),
         SourceKind::Epub => Ok(Box::new(epub::EpubExtractor)),
+        // Tabular-format extractors (M4 issue #76): TableRAG row-verbalization
+        // with byte-identity offsets and `SourceAnchor::Structured` anchors. XLSX
+        // and XLS share the calamine-based `SpreadsheetExtractor`.
+        SourceKind::Xlsx | SourceKind::Xls => Ok(Box::new(spreadsheet::SpreadsheetExtractor)),
+        SourceKind::Csv => Ok(Box::new(csv::CsvExtractor)),
     }
 }
 
@@ -267,6 +282,7 @@ pub mod test_seam {
                     page: 1,
                     bbox: [0.0, 0.0, 0.0, 0.0],
                 }],
+                table_markdown: None,
             })
         }
     }
@@ -566,5 +582,20 @@ mod tests {
     #[test]
     fn xml_kind_resolves_to_extractor() {
         assert!(extractor_for("xml").is_ok());
+    }
+
+    #[test]
+    fn xlsx_kind_resolves_to_extractor() {
+        assert!(extractor_for("xlsx").is_ok());
+    }
+
+    #[test]
+    fn xls_kind_resolves_to_extractor() {
+        assert!(extractor_for("xls").is_ok());
+    }
+
+    #[test]
+    fn csv_kind_resolves_to_extractor() {
+        assert!(extractor_for("csv").is_ok());
     }
 }

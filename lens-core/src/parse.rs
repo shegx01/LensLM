@@ -52,6 +52,12 @@ pub enum SourceKind {
     Odt,
     /// An EPUB document (rbook spine + quick-xml XHTML walk).
     Epub,
+    /// An XLSX workbook (calamine extraction, row-verbalization — issue #76).
+    Xlsx,
+    /// An XLS workbook (calamine extraction, row-verbalization — issue #76).
+    Xls,
+    /// A CSV file (csv crate, comma-delimited, RFC-4180 — issue #76).
+    Csv,
 }
 
 impl SourceKind {
@@ -73,6 +79,9 @@ impl SourceKind {
             Self::Rtf => "rtf",
             Self::Odt => "odt",
             Self::Epub => "epub",
+            Self::Xlsx => "xlsx",
+            Self::Xls => "xls",
+            Self::Csv => "csv",
         }
     }
 
@@ -92,8 +101,11 @@ impl SourceKind {
             "rtf" => Ok(Self::Rtf),
             "odt" => Ok(Self::Odt),
             "epub" => Ok(Self::Epub),
+            "xlsx" => Ok(Self::Xlsx),
+            "xls" => Ok(Self::Xls),
+            "csv" => Ok(Self::Csv),
             other => Err(LensError::Validation(format!(
-                "unknown source kind: {other:?}; expected one of \"text\", \"markdown\", \"pdf\", \"docx\", \"url\", \"json\", \"jsonl\", \"yaml\", \"xml\", \"rtf\", \"odt\", \"epub\""
+                "unknown source kind: {other:?}; expected one of \"text\", \"markdown\", \"pdf\", \"docx\", \"url\", \"json\", \"jsonl\", \"yaml\", \"xml\", \"rtf\", \"odt\", \"epub\", \"xlsx\", \"xls\", \"csv\""
             ))),
         }
     }
@@ -113,6 +125,9 @@ impl SourceKind {
             // Office/binary formats (RTF/ODT/EPUB) are DERIVED: their canonical
             // buffer is produced by a dedicated Extractor (issue #77).
             Self::Rtf | Self::Odt | Self::Epub => false,
+            // Tabular formats (XLSX/XLS/CSV) are DERIVED: their canonical buffer
+            // is a row-verbalization produced by a dedicated Extractor (issue #76).
+            Self::Xlsx | Self::Xls | Self::Csv => false,
         }
     }
 }
@@ -295,7 +310,10 @@ pub fn parse_blocks(src: &str, kind: SourceKind) -> Vec<Block> {
         | SourceKind::Xml
         | SourceKind::Rtf
         | SourceKind::Odt
-        | SourceKind::Epub => {
+        | SourceKind::Epub
+        | SourceKind::Xlsx
+        | SourceKind::Xls
+        | SourceKind::Csv => {
             debug_assert!(
                 false,
                 "parse_blocks called with derived kind {kind:?} — use an Extractor"
@@ -1086,6 +1104,32 @@ mod tests {
     fn source_kind_epub_roundtrip() {
         assert_eq!(SourceKind::from_kind_str("epub").unwrap(), SourceKind::Epub);
         assert_eq!(SourceKind::Epub.as_str(), "epub");
+    }
+
+    #[test]
+    fn source_kind_xlsx_roundtrip() {
+        assert_eq!(SourceKind::from_kind_str("xlsx").unwrap(), SourceKind::Xlsx);
+        assert_eq!(SourceKind::Xlsx.as_str(), "xlsx");
+    }
+
+    #[test]
+    fn source_kind_xls_roundtrip() {
+        assert_eq!(SourceKind::from_kind_str("xls").unwrap(), SourceKind::Xls);
+        assert_eq!(SourceKind::Xls.as_str(), "xls");
+    }
+
+    #[test]
+    fn source_kind_csv_roundtrip() {
+        assert_eq!(SourceKind::from_kind_str("csv").unwrap(), SourceKind::Csv);
+        assert_eq!(SourceKind::Csv.as_str(), "csv");
+    }
+
+    #[test]
+    fn source_kind_tabular_not_text_like() {
+        // XLSX/XLS/CSV are DERIVED (not text-like) — issue #76.
+        assert!(!SourceKind::Xlsx.is_text_like());
+        assert!(!SourceKind::Xls.is_text_like());
+        assert!(!SourceKind::Csv.is_text_like());
     }
 
     #[test]

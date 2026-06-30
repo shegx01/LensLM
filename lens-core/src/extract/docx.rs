@@ -260,6 +260,7 @@ impl Extractor for DocxExtractor {
             extracted_text,
             blocks,
             anchors,
+            table_markdown: None,
         })
     }
 }

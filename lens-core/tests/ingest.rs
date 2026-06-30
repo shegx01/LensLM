@@ -2417,6 +2417,7 @@ async fn source_anchor_pdf_maps_page_to_chunk_page_column() {
                     page: 3,
                     bbox: [10.0, 20.0, 500.0, 700.0],
                 }],
+                table_markdown: None,
             })
         }
     }

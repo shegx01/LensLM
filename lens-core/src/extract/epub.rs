@@ -142,6 +142,7 @@ impl Extractor for EpubExtractor {
             extracted_text,
             blocks,
             anchors,
+            table_markdown: None,
         })
     }
 }

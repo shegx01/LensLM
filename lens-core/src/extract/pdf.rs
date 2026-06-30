@@ -256,6 +256,7 @@ impl Extractor for PdfExtractor {
                 extracted_text: String::new(),
                 blocks: Vec::new(),
                 anchors: Vec::new(),
+                table_markdown: None,
             });
         }
 
@@ -263,6 +264,7 @@ impl Extractor for PdfExtractor {
             extracted_text,
             blocks,
             anchors,
+            table_markdown: None,
         })
     }
 }
