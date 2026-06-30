@@ -33,7 +33,7 @@ sqlx = { version = "=0.8.6", default-features = false, features = [
 # UUIDv7 generation only; values are stored as TEXT via `.to_string()`.
 # Bumped from =1.18.1 → =1.23.3 for M4: lancedb 0.30 → datafusion 53 requires
 # uuid ^1.21. uuid 1.x is API-stable (v7 + serde present throughout 1.x).
-uuid = { version = "=1.23.3", features = ["v7", "serde"] }
+uuid = { version = "=1.23.4", features = ["v7", "serde"] }
 chrono = { version = "=0.4.45", features = ["serde"] }
 serde_json = "1.0"
 tracing = "0.1"
