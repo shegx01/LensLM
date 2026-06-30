@@ -4,7 +4,7 @@
      Reads/writes the shared draft via $lib/components/onboarding/onboarding-state.svelte.ts
      (draft.selectedSources, draft.notebookId). -->
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, onDestroy } from 'svelte';
   import { invoke, isTauri } from '@tauri-apps/api/core';
   import { open as openDialog } from '@tauri-apps/plugin-dialog';
   import Upload from '@lucide/svelte/icons/upload';
@@ -23,6 +23,7 @@
   import ProgressDots from '$lib/components/onboarding/ProgressDots.svelte';
   import OnboardingBackButton from '$lib/components/onboarding/OnboardingBackButton.svelte';
   import { completeOnboarding } from '$lib/onboarding/completeOnboarding.js';
+  import { registerDropTarget, PICKER_FILTERS } from '$lib/sources/dragDrop.js';
 
   let { oncomplete, onback }: { oncomplete: () => void; onback: () => void } = $props();
 
@@ -31,6 +32,9 @@
   let dropHover = $state(false);
   let finishing = $state(false);
   let completeError = $state<string | null>(null);
+
+  let dropZoneEl: HTMLElement | undefined;
+  let unregisterDrop: (() => void) | undefined;
 
   // Paths that `add_source` has already accepted. Persists across retries (it is
   // NOT reset on each click) so a failure partway through the loop can be retried
@@ -55,9 +59,31 @@
   const visibleAddedFiles = $derived(draft.selectedSources.slice(0, 4));
   const hiddenAddedCount = $derived(Math.max(0, draft.selectedSources.length - 4));
 
-  // ── Mount: load recent documents ──────────────────────────────────────────
+  // ── Mount: load recent documents + register native drop target ───────────
   onMount(() => {
     void loadSuggestions();
+
+    if (!dropZoneEl) return;
+    unregisterDrop = registerDropTarget({
+      getRect: () => dropZoneEl!.getBoundingClientRect(),
+      onDrop: (paths: string[]) => {
+        for (const p of paths) {
+          if (selectedPaths.has(p)) continue;
+          const name = p.split(/[\\/]/).pop() ?? p;
+          const extMatch = name.match(/\.([^.]+)$/);
+          const ext = extMatch ? extMatch[1].toLowerCase() : '';
+          const src: DraftSource = { path: p, name, ext, size: 0, mtime: 0 };
+          draft.selectedSources = [...draft.selectedSources, src];
+        }
+      },
+      setHover: (h: boolean) => {
+        dropHover = h;
+      }
+    });
+  });
+
+  onDestroy(() => {
+    unregisterDrop?.();
   });
 
   async function loadSuggestions(): Promise<void> {
@@ -94,14 +120,12 @@
     try {
       const selected = await openDialog({
         multiple: true,
-        filters: [{ name: 'Documents', extensions: ['pdf', 'docx', 'txt', 'md'] }]
+        filters: PICKER_FILTERS
       });
       if (!selected) return;
       const paths = Array.isArray(selected) ? selected : [selected];
       for (const p of paths) {
-        // NOTE: Unix/macOS path assumptions (HOME-based dirs / '/' separator);
-        // revisit for Windows.
-        const name = p.split('/').pop() ?? p;
+        const name = p.split(/[\\/]/).pop() ?? p;
         const extMatch = name.match(/\.([^.]+)$/);
         const ext = extMatch ? extMatch[1].toLowerCase() : '';
         const src: DraftSource = { path: p, name, ext, size: 0, mtime: 0 };
@@ -186,20 +210,13 @@
       </p>
 
       <!-- Drop zone -->
-      <!-- NOTE: Tauri v2 file-drop via window drag events requires additional
-           plugin wiring non-trivial in SvelteKit's SSR context. The clickable
-           browse picker is the primary interaction; native drag-drop is
-           NICE-TO-HAVE left for a follow-up milestone. -->
       <button
+        bind:this={dropZoneEl}
         class={cn(
           'mb-[18px] w-full cursor-pointer rounded-xl border-[1.5px] border-dashed px-6 py-6 text-center transition-colors duration-150',
           dropHover ? 'border-primary' : 'border-border'
         )}
         onclick={browse}
-        onmouseenter={() => (dropHover = true)}
-        onmouseleave={() => (dropHover = false)}
-        onfocus={() => (dropHover = true)}
-        onblur={() => (dropHover = false)}
         aria-label="Drop files here or click to browse"
         type="button"
       >
@@ -210,7 +227,7 @@
         </div>
         <div class="text-foreground mb-1 text-[13px] font-semibold">Drop files here</div>
         <div class="text-muted-foreground text-[11px]">
-          PDF, DOCX, TXT, MD — or
+          PDF, DOCX, RTF, EPUB & more — or
           <!-- svelte-ignore a11y_interactive_supports_focus -->
           <span
             class="text-primary cursor-pointer underline"

@@ -574,16 +574,19 @@ describe('AddSourcesModal', () => {
     expect(screen.getByText('browse your computer')).toBeInTheDocument();
   });
 
-  it('Upload tab shows the format categories', () => {
+  it('Upload tab shows only backend-supported format categories', () => {
     render(AddSourcesModal, { open: true });
+    // Trimmed to the backend-accepted set (issue #95): DOCUMENTS + JSON only.
     expect(screen.getByText(/DOCUMENTS/)).toBeInTheDocument();
-    expect(screen.getByText(/AUDIO/)).toBeInTheDocument();
-    expect(screen.getByText(/VIDEO/)).toBeInTheDocument();
+    expect(screen.getAllByText(/JSON/).length).toBeGreaterThan(0);
   });
 
-  it('Upload tab shows Whisper note', () => {
+  it('Upload tab no longer advertises unsupported formats', () => {
     render(AddSourcesModal, { open: true });
-    expect(screen.getByText(/whisper/i)).toBeInTheDocument();
+    // Regression guard (AC-7): no audio/video/Whisper/spreadsheet/presentation copy.
+    expect(screen.queryByText(/AUDIO/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/VIDEO/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/whisper/i)).not.toBeInTheDocument();
   });
 
   it('clicking URL tab switches to URL panel', async () => {

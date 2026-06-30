@@ -39,6 +39,19 @@ vi.mock('@tauri-apps/plugin-dialog', () => ({
   open: vi.fn().mockResolvedValue(null)
 }));
 
+// ── Mock @tauri-apps/api/webview ──────────────────────────────────────────────
+// The component now registers a native drag-drop target on mount (issue #95).
+// Because these tests activate the Tauri path (globalThis.isTauri = true), the
+// drag-drop manager dynamically imports this module and calls
+// getCurrentWebview().onDragDropEvent. Stub it with a no-op listener that
+// resolves to a no-op unlisten fn so registration/teardown are inert in tests.
+
+vi.mock('@tauri-apps/api/webview', () => ({
+  getCurrentWebview: () => ({
+    onDragDropEvent: vi.fn().mockResolvedValue(() => {})
+  })
+}));
+
 // ── Setup / teardown ─────────────────────────────────────────────────────────
 
 beforeEach(() => {

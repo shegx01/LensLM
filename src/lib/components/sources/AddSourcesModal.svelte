@@ -6,6 +6,7 @@
      Drag region: modal and ALL its controls are data-tauri-drag-region=none (no-drag).
      Tokens only — no hardcoded hex. -->
 <script lang="ts">
+  import { onMount, onDestroy } from 'svelte';
   import { open as openFilePicker } from '@tauri-apps/plugin-dialog';
   import { isTauri } from '@tauri-apps/api/core';
   import X from '@lucide/svelte/icons/x';
@@ -14,8 +15,14 @@
   import { cn } from '$lib/utils.js';
   import { Button } from '$lib/components/ui/button/index.js';
   import { addFileSource, addTextSource } from '$lib/sources/ipc.js';
-  import { addSourceLocal, loadSources, ingest } from '$lib/sources/sources-state.svelte.js';
+  import {
+    addSourceLocal,
+    loadSources,
+    ingest,
+    sourcesStore
+  } from '$lib/sources/sources-state.svelte.js';
   import { notebookStore } from '$lib/notebooks/index.js';
+  import { registerDropTarget, PICKER_FILTERS } from '$lib/sources/dragDrop.js';
 
   // ---------------------------------------------------------------------------
   // Props
@@ -54,6 +61,9 @@
   /** Upload submitting + error */
   let uploadSubmitting = $state(false);
   let uploadError = $state<string | null>(null);
+
+  /** Drop zone element ref — used by the native drag-drop manager. */
+  let dropZoneEl = $state<HTMLDivElement | undefined>(undefined);
 
   // ---------------------------------------------------------------------------
   // Derived
@@ -104,14 +114,7 @@
     try {
       const selected = await openFilePicker({
         multiple: false,
-        filters: [
-          // Kinds the backend `add_file_source` resolves from the extension.
-          {
-            name: 'Documents',
-            extensions: ['md', 'markdown', 'mdx', 'txt', 'pdf', 'docx', 'rtf', 'odt', 'epub']
-          },
-          { name: 'Structured', extensions: ['json', 'jsonl', 'ndjson', 'yaml', 'yml', 'xml'] }
-        ]
+        filters: PICKER_FILTERS
       });
       if (!selected) return;
       const path = Array.isArray(selected) ? selected[0] : selected;
@@ -133,22 +136,49 @@
     }
   }
 
-  function handleDragOver(e: DragEvent): void {
-    e.preventDefault();
-    dragOver = true;
-  }
+  // ---------------------------------------------------------------------------
+  // Native drag-drop (Tauri v2) — registered via the app-level drop manager.
+  // ---------------------------------------------------------------------------
 
-  function handleDragLeave(): void {
-    dragOver = false;
-  }
+  let unregisterDrop: (() => void) | null = null;
 
-  async function handleDrop(e: DragEvent): Promise<void> {
-    e.preventDefault();
-    dragOver = false;
-    // Delegate to the browse flow: Tauri needs the native file path, not a
-    // DataTransfer File object. The picker filter defines the accepted kinds.
-    await handleBrowse();
-  }
+  onMount(() => {
+    if (!dropZoneEl) return;
+    unregisterDrop = registerDropTarget({
+      getRect: () => dropZoneEl!.getBoundingClientRect(),
+      setHover: (h) => {
+        dragOver = h;
+      },
+      onDrop: async (paths) => {
+        if (!activeNotebookId || uploadSubmitting) return;
+        uploadError = null;
+        uploadSubmitting = true;
+        try {
+          for (const path of paths) {
+            // Skip files already added to this notebook (dedup by locator).
+            if (sourcesStore.sources.some((s) => s.locator === path)) continue;
+            const name = path.split(/[\\/]/).pop() ?? path;
+            try {
+              const source = await addFileSource(activeNotebookId, name, path);
+              addSourceLocal(source);
+              void ingest(source.id);
+            } catch (err) {
+              uploadError = 'Could not add file. Please try again.';
+              console.error('AddSourcesModal: drop ingest failed for', path, err);
+            }
+          }
+        } finally {
+          uploadSubmitting = false;
+          void loadSources(activeNotebookId);
+        }
+      }
+    });
+  });
+
+  onDestroy(() => {
+    unregisterDrop?.();
+    unregisterDrop = null;
+  });
 
   // ---------------------------------------------------------------------------
   // Paste tab handler
@@ -281,15 +311,13 @@
           >
             <!-- Drop zone -->
             <div
+              bind:this={dropZoneEl}
               class={cn(
                 'flex flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed px-6 py-8 text-center transition-colors duration-100',
                 dragOver
                   ? 'border-primary bg-primary/5'
                   : 'border-border bg-muted/30 hover:border-primary/40 hover:bg-muted/50'
               )}
-              ondragover={handleDragOver}
-              ondragleave={handleDragLeave}
-              ondrop={handleDrop}
               role="region"
               aria-label="File drop zone"
             >
@@ -317,47 +345,17 @@
                 <span class="font-semibold uppercase tracking-wide text-muted-foreground/50"
                   >DOCUMENTS</span
                 >
-                &nbsp;PDF · DOCX · DOC · RTF · ODT · TXT · MD · EPUB
-              </p>
-              <p>
-                <span class="font-semibold uppercase tracking-wide text-muted-foreground/50"
-                  >DATA</span
-                >
-                &nbsp;XLSX · XLS · CSV
+                &nbsp;PDF · DOCX · RTF · ODT · TXT · MD · EPUB
               </p>
               <p>
                 <span class="font-semibold uppercase tracking-wide text-muted-foreground/50"
                   >JSON</span
                 >
-                &nbsp;JSON · JSONL · YAML · XML
-              </p>
-              <p>
-                <span class="font-semibold uppercase tracking-wide text-muted-foreground/50"
-                  >OTHER</span
-                >
-                &nbsp;PPTX · KEY · PAGES
-              </p>
-              <p>
-                <span class="font-semibold uppercase tracking-wide text-muted-foreground/50"
-                  >AUDIO</span
-                >
-                &nbsp;MP3 · WAV · M4A · FLAC · OGG · AAC · OPUS
-              </p>
-              <p>
-                <span class="font-semibold uppercase tracking-wide text-muted-foreground/50"
-                  >VIDEO</span
-                >
-                &nbsp;MP4 · MOV · WEBM
-              </p>
-              <p class="mt-2 text-muted-foreground/50">
-                Audio &amp; video transcribed locally via Whisper.
+                &nbsp;JSON · JSONL · NDJSON · YAML · YML · XML
               </p>
               <p class="mt-1 italic text-muted-foreground/40">
                 Supported: .md · .markdown · .mdx · .txt · .pdf · .docx · .rtf · .odt · .epub ·
                 .json · .jsonl · .ndjson · .yaml · .yml · .xml
-              </p>
-              <p class="mt-1 italic text-muted-foreground/40">
-                Audio/video &amp; ebook (.mobi) formats coming soon.
               </p>
             </div>
 
