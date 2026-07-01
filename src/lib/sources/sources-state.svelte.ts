@@ -11,7 +11,7 @@
 
 import { listSources, ingestSource, setSourceSelected, trashSource, restoreSource } from './ipc.js';
 import type { Source, SourceStatus, StreamEvent, IngestProgress } from './types.js';
-import { notebookStore } from '$lib/notebooks/notebooks-state.svelte.js';
+import { notebookStore, refreshTrashedSources } from '$lib/notebooks/notebooks-state.svelte.js';
 
 // ---------------------------------------------------------------------------
 // Module-level reactive state
@@ -245,6 +245,8 @@ export async function removeSource(sourceId: string): Promise<void> {
       trashQueue = trashQueue.filter((e) => e.source.id !== sourceId);
     }, TRASH_UNDO_TTL_MS);
     trashQueue = [...trashQueue, { source: snapshot, prevSiblingId, timeoutId }];
+    // Refresh sidebar trash badge without blocking or hijacking the trash flow.
+    void refreshTrashedSources().catch(() => {});
   } catch (err) {
     // Revert on failure — re-insert at original position.
     if (idx >= sources.length) {
@@ -298,6 +300,8 @@ export async function undoRemove(notebookId?: string): Promise<void> {
     if (notebookId) {
       await loadSources(notebookId);
     }
+    // Refresh sidebar trash badge without blocking or hijacking the restore flow.
+    void refreshTrashedSources().catch(() => {});
   } catch (err) {
     // Revert the optimistic re-insert.
     sources = sources.filter((s) => s.id !== source.id);

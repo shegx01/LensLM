@@ -542,6 +542,42 @@ describe('notebookStore.trashCount', () => {
   it('is 0 initially', () => {
     expect(notebookStore.trashCount).toBe(0);
   });
+
+  it('includes trashed sources in the count', async () => {
+    vi.mocked(listTrashedSources).mockResolvedValue([
+      makeTrashedSource({ id: 'src-001' }),
+      makeTrashedSource({ id: 'src-002' })
+    ]);
+    await loadTrashedSources();
+    expect(notebookStore.trashCount).toBe(2);
+  });
+
+  it('sums trashed notebooks AND trashed sources', async () => {
+    vi.mocked(listTrashed).mockResolvedValue([
+      makeNotebookSummary({ id: 'nb-001', trashed_at: new Date().toISOString() })
+    ]);
+    vi.mocked(listTrashedSources).mockResolvedValue([
+      makeTrashedSource({ id: 'src-001' }),
+      makeTrashedSource({ id: 'src-002' })
+    ]);
+    await loadTrashed();
+    await loadTrashedSources();
+    expect(notebookStore.trashCount).toBe(3);
+  });
+
+  it('resets to 0 after resetNotebookStore()', async () => {
+    vi.mocked(listTrashed).mockResolvedValue([
+      makeNotebookSummary({ id: 'nb-001', trashed_at: new Date().toISOString() })
+    ]);
+    vi.mocked(listTrashedSources).mockResolvedValue([makeTrashedSource({ id: 'src-001' })]);
+    await loadTrashed();
+    await loadTrashedSources();
+    expect(notebookStore.trashCount).toBe(2);
+
+    resetNotebookStore();
+
+    expect(notebookStore.trashCount).toBe(0);
+  });
 });
 
 // ---------------------------------------------------------------------------

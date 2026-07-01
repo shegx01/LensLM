@@ -66,7 +66,7 @@ const paletteResults = $derived(
 
 const activeNotebook = $derived(notebooks.find((n) => n.id === activeNotebookId) ?? null);
 
-const trashCount = $derived(trashedNotebooks.length);
+const trashCount = $derived(trashedNotebooks.length + trashedSources.length);
 
 // Rank-based decorative color assignment.
 //
@@ -196,7 +196,7 @@ async function refreshTrashed(): Promise<void> {
   trashedNotebooks = await listTrashed();
 }
 
-async function refreshTrashedSources(): Promise<void> {
+export async function refreshTrashedSources(): Promise<void> {
   trashedSources = await listTrashedSources();
 }
 
