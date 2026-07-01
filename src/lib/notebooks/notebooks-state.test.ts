@@ -10,11 +10,14 @@ import {
   resetNotebookStore,
   loadNotebooks,
   loadTrashed,
+  loadTrashedSources,
   createNotebookAction,
   renameNotebookAction,
   trashNotebookAction,
   restoreNotebookAction,
   purgeNotebookAction,
+  restoreSourceFromTrash,
+  purgeSourceAction,
   selectNotebook,
   openTrash,
   notebookColorClass
@@ -35,6 +38,19 @@ vi.mock('./ipc.js', () => ({
   purgeNotebook: vi.fn()
 }));
 
+// Mock the sources IPC layer (used by notebooks-state for trashed sources).
+vi.mock('$lib/sources/ipc.js', () => ({
+  listTrashedSources: vi.fn(),
+  purgeSource: vi.fn(),
+  restoreSource: vi.fn()
+}));
+
+// Mock the sources store (used for loadSources + drainTrashQueueEntry).
+vi.mock('$lib/sources/sources-state.svelte.js', () => ({
+  loadSources: vi.fn(),
+  drainTrashQueueEntry: vi.fn()
+}));
+
 // Import the mocked functions so we can configure return values per test.
 import {
   listNotebooks,
@@ -45,12 +61,36 @@ import {
   listTrashed,
   purgeNotebook
 } from './ipc.js';
+import { listTrashedSources, purgeSource, restoreSource } from '$lib/sources/ipc.js';
+import { loadSources, drainTrashQueueEntry } from '$lib/sources/sources-state.svelte.js';
 
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
 
 import type { NotebookSummary, Notebook } from './types.js';
+import type { TrashedSource } from '$lib/sources/types.js';
+
+function makeTrashedSource(overrides?: Partial<TrashedSource>): TrashedSource {
+  return {
+    id: 'src-001',
+    notebook_id: 'nb-001',
+    kind: 'pdf',
+    title: 'My Report.pdf',
+    status: 'indexed',
+    locator: '/path/to/my-report.pdf',
+    selected: 1,
+    created_at: new Date(Date.now() - 7200_000).toISOString(),
+    token_count: 1024,
+    content_hash: 'abc123',
+    file_hash: null,
+    trashed_at: new Date(Date.now() - 3600_000).toISOString(),
+    enrichment_status: null,
+    enrichment_meta: null,
+    notebook_title: 'My Notebook',
+    ...overrides
+  };
+}
 
 function makeNotebookSummary(overrides?: Partial<NotebookSummary>): NotebookSummary {
   return {
@@ -90,6 +130,12 @@ function makeNotebook(overrides?: Partial<Notebook>): Notebook {
 beforeEach(() => {
   vi.clearAllMocks();
   resetNotebookStore();
+  // Default mocks for sources dependencies
+  vi.mocked(listTrashedSources).mockResolvedValue([]);
+  vi.mocked(loadSources).mockResolvedValue(undefined);
+  vi.mocked(drainTrashQueueEntry).mockReturnValue(undefined);
+  vi.mocked(purgeSource).mockResolvedValue(undefined);
+  vi.mocked(restoreSource).mockResolvedValue(undefined);
 });
 
 afterEach(() => {
@@ -318,11 +364,50 @@ describe('openTrash', () => {
   it('opens the Trash modal and loads trashed notebooks', async () => {
     const trashed = makeNotebookSummary({ id: 'nb-trashed', trashed_at: new Date().toISOString() });
     vi.mocked(listTrashed).mockResolvedValue([trashed]);
+    vi.mocked(listTrashedSources).mockResolvedValue([]);
 
     await openTrash();
 
     expect(notebookStore.trashOpen).toBe(true);
     expect(notebookStore.trashedNotebooks).toHaveLength(1);
+  });
+
+  it('also loads trashed sources when opening', async () => {
+    vi.mocked(listTrashed).mockResolvedValue([]);
+    vi.mocked(listTrashedSources).mockResolvedValue([makeTrashedSource()]);
+
+    await openTrash();
+
+    expect(notebookStore.trashOpen).toBe(true);
+    expect(notebookStore.trashedSources).toHaveLength(1);
+  });
+
+  it('still renders trashed notebooks when trashed-sources fetch rejects (Promise.allSettled)', async () => {
+    const trashed = makeNotebookSummary({ id: 'nb-trashed', trashed_at: new Date().toISOString() });
+    vi.mocked(listTrashed).mockResolvedValue([trashed]);
+    vi.mocked(listTrashedSources).mockRejectedValue(new Error('sources fetch failed'));
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await openTrash();
+
+    // Notebooks still rendered despite sources error
+    expect(notebookStore.trashedNotebooks).toHaveLength(1);
+    // Error is set from the rejection
+    expect(notebookStore.error).toBeTruthy();
+    consoleSpy.mockRestore();
+  });
+
+  it('still renders trashed sources when trashed-notebooks fetch rejects (Promise.allSettled)', async () => {
+    vi.mocked(listTrashed).mockRejectedValue(new Error('notebooks fetch failed'));
+    vi.mocked(listTrashedSources).mockResolvedValue([makeTrashedSource()]);
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await openTrash();
+
+    // Sources still rendered despite notebooks error
+    expect(notebookStore.trashedSources).toHaveLength(1);
+    expect(notebookStore.error).toBeTruthy();
+    consoleSpy.mockRestore();
   });
 });
 
@@ -456,5 +541,194 @@ describe('notebookStore.trashCount', () => {
 
   it('is 0 initially', () => {
     expect(notebookStore.trashCount).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// loadTrashedSources
+// ---------------------------------------------------------------------------
+
+describe('loadTrashedSources', () => {
+  it('populates trashedSources from listTrashedSources()', async () => {
+    const data = [makeTrashedSource({ id: 'src-001' }), makeTrashedSource({ id: 'src-002' })];
+    vi.mocked(listTrashedSources).mockResolvedValue(data);
+
+    await loadTrashedSources();
+
+    expect(notebookStore.trashedSources).toEqual(data);
+  });
+
+  it('sets loading to false after success', async () => {
+    vi.mocked(listTrashedSources).mockResolvedValue([]);
+    await loadTrashedSources();
+    expect(notebookStore.loading).toBe(false);
+  });
+
+  it('sets loading to false and sets error on failure', async () => {
+    vi.mocked(listTrashedSources).mockRejectedValue(new Error('DB error'));
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await loadTrashedSources();
+
+    expect(notebookStore.loading).toBe(false);
+    expect(notebookStore.error).toBeTruthy();
+    consoleSpy.mockRestore();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// restoreSourceFromTrash
+// ---------------------------------------------------------------------------
+
+describe('restoreSourceFromTrash', () => {
+  it('calls restoreSource IPC and refreshes trashedSources', async () => {
+    const src = makeTrashedSource({ id: 'src-001', notebook_id: 'nb-999' });
+    vi.mocked(listTrashedSources).mockResolvedValue([src]);
+    await loadTrashedSources();
+
+    vi.mocked(restoreSource).mockResolvedValue(undefined);
+    vi.mocked(listTrashedSources).mockResolvedValue([]);
+
+    await restoreSourceFromTrash('src-001');
+
+    expect(restoreSource).toHaveBeenCalledWith('src-001');
+    expect(notebookStore.trashedSources).toHaveLength(0);
+  });
+
+  it('drains the trashQueue entry for the source before restoring', async () => {
+    const src = makeTrashedSource({ id: 'src-001', notebook_id: 'nb-999' });
+    vi.mocked(listTrashedSources).mockResolvedValue([src]);
+    await loadTrashedSources();
+    vi.mocked(restoreSource).mockResolvedValue(undefined);
+    vi.mocked(listTrashedSources).mockResolvedValue([]);
+
+    await restoreSourceFromTrash('src-001');
+
+    expect(drainTrashQueueEntry).toHaveBeenCalledWith('src-001');
+  });
+
+  it('refreshes active source list when the source belongs to the active notebook', async () => {
+    notebookStore.activeNotebookId = 'nb-active';
+    const src = makeTrashedSource({ id: 'src-001', notebook_id: 'nb-active' });
+    vi.mocked(listTrashedSources).mockResolvedValue([src]);
+    await loadTrashedSources();
+    vi.mocked(restoreSource).mockResolvedValue(undefined);
+    vi.mocked(listTrashedSources).mockResolvedValue([]);
+
+    await restoreSourceFromTrash('src-001');
+
+    expect(loadSources).toHaveBeenCalledWith('nb-active');
+  });
+
+  it('does NOT refresh active source list when source belongs to a different notebook', async () => {
+    notebookStore.activeNotebookId = 'nb-active';
+    const src = makeTrashedSource({ id: 'src-001', notebook_id: 'nb-other' });
+    vi.mocked(listTrashedSources).mockResolvedValue([src]);
+    await loadTrashedSources();
+    vi.mocked(restoreSource).mockResolvedValue(undefined);
+    vi.mocked(listTrashedSources).mockResolvedValue([]);
+
+    await restoreSourceFromTrash('src-001');
+
+    expect(loadSources).not.toHaveBeenCalled();
+  });
+
+  it('does NOT refresh active source list when no notebook is active', async () => {
+    notebookStore.activeNotebookId = null;
+    const src = makeTrashedSource({ id: 'src-001', notebook_id: 'nb-001' });
+    vi.mocked(listTrashedSources).mockResolvedValue([src]);
+    await loadTrashedSources();
+    vi.mocked(restoreSource).mockResolvedValue(undefined);
+    vi.mocked(listTrashedSources).mockResolvedValue([]);
+
+    await restoreSourceFromTrash('src-001');
+
+    expect(loadSources).not.toHaveBeenCalled();
+  });
+
+  it('sets error on failure and loading stays false', async () => {
+    const src = makeTrashedSource({ id: 'src-001' });
+    vi.mocked(listTrashedSources).mockResolvedValue([src]);
+    await loadTrashedSources();
+    vi.mocked(restoreSource).mockRejectedValue(new Error('restore failed'));
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await restoreSourceFromTrash('src-001');
+
+    expect(notebookStore.loading).toBe(false);
+    expect(notebookStore.error).toBeTruthy();
+    consoleSpy.mockRestore();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// purgeSourceAction
+// ---------------------------------------------------------------------------
+
+describe('purgeSourceAction', () => {
+  it('calls purgeSource IPC and refreshes trashedSources', async () => {
+    const src = makeTrashedSource({ id: 'src-001', notebook_id: 'nb-999' });
+    vi.mocked(listTrashedSources).mockResolvedValue([src]);
+    await loadTrashedSources();
+
+    vi.mocked(purgeSource).mockResolvedValue(undefined);
+    vi.mocked(listTrashedSources).mockResolvedValue([]);
+
+    await purgeSourceAction('src-001');
+
+    expect(purgeSource).toHaveBeenCalledWith('src-001');
+    expect(notebookStore.trashedSources).toHaveLength(0);
+  });
+
+  it('drains the trashQueue entry for the source before purging', async () => {
+    const src = makeTrashedSource({ id: 'src-001', notebook_id: 'nb-999' });
+    vi.mocked(listTrashedSources).mockResolvedValue([src]);
+    await loadTrashedSources();
+    vi.mocked(purgeSource).mockResolvedValue(undefined);
+    vi.mocked(listTrashedSources).mockResolvedValue([]);
+
+    await purgeSourceAction('src-001');
+
+    expect(drainTrashQueueEntry).toHaveBeenCalledWith('src-001');
+  });
+
+  it('refreshes active source list when the source belongs to the active notebook', async () => {
+    notebookStore.activeNotebookId = 'nb-active';
+    const src = makeTrashedSource({ id: 'src-001', notebook_id: 'nb-active' });
+    vi.mocked(listTrashedSources).mockResolvedValue([src]);
+    await loadTrashedSources();
+    vi.mocked(purgeSource).mockResolvedValue(undefined);
+    vi.mocked(listTrashedSources).mockResolvedValue([]);
+
+    await purgeSourceAction('src-001');
+
+    expect(loadSources).toHaveBeenCalledWith('nb-active');
+  });
+
+  it('does NOT refresh active source list when source belongs to a different notebook', async () => {
+    notebookStore.activeNotebookId = 'nb-active';
+    const src = makeTrashedSource({ id: 'src-001', notebook_id: 'nb-other' });
+    vi.mocked(listTrashedSources).mockResolvedValue([src]);
+    await loadTrashedSources();
+    vi.mocked(purgeSource).mockResolvedValue(undefined);
+    vi.mocked(listTrashedSources).mockResolvedValue([]);
+
+    await purgeSourceAction('src-001');
+
+    expect(loadSources).not.toHaveBeenCalled();
+  });
+
+  it('sets error on failure and loading stays false', async () => {
+    const src = makeTrashedSource({ id: 'src-001' });
+    vi.mocked(listTrashedSources).mockResolvedValue([src]);
+    await loadTrashedSources();
+    vi.mocked(purgeSource).mockRejectedValue(new Error('purge failed'));
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await purgeSourceAction('src-001');
+
+    expect(notebookStore.loading).toBe(false);
+    expect(notebookStore.error).toBeTruthy();
+    consoleSpy.mockRestore();
   });
 });

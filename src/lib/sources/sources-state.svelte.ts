@@ -85,6 +85,20 @@ export function disposeTrashTimers(): void {
   trashQueue = [];
 }
 
+/**
+ * Drain (remove) the undo-bar queue entry for a specific source id if present.
+ * Clears its timeout so it cannot fire after the source is already restored
+ * via the Trash modal. Call before restoring via the modal to avoid a stale
+ * undo entry calling `restore_source` on an already-live source.
+ */
+export function drainTrashQueueEntry(sourceId: string): void {
+  const entry = trashQueue.find((e) => e.source.id === sourceId);
+  if (entry) {
+    clearTimeout(entry.timeoutId);
+    trashQueue = trashQueue.filter((e) => e.source.id !== sourceId);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Actions (exported top-level functions)
 // ---------------------------------------------------------------------------

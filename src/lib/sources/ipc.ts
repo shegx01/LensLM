@@ -9,7 +9,7 @@
 // and Tauri deserialises them into snake_case Rust params.
 
 import { Channel, invoke, isTauri } from '@tauri-apps/api/core';
-import type { Source, IngestProgress, StreamEvent } from './types.js';
+import type { Source, TrashedSource, IngestProgress, StreamEvent } from './types.js';
 
 /**
  * List all sources for a notebook.
@@ -102,4 +102,22 @@ export async function trashSource(sourceId: string): Promise<void> {
 export async function restoreSource(sourceId: string): Promise<void> {
   if (!isTauri()) return;
   return invoke<void>('restore_source', { sourceId });
+}
+
+/**
+ * List all individually-trashed sources (whose parent notebook is live).
+ * Returns `[]` outside a Tauri host (test isolation).
+ */
+export async function listTrashedSources(): Promise<TrashedSource[]> {
+  if (!isTauri()) return [];
+  return invoke<TrashedSource[]>('list_trashed_sources');
+}
+
+/**
+ * Permanently delete a trashed source and its Lance vectors.
+ * Returns outside a Tauri host (test isolation).
+ */
+export async function purgeSource(sourceId: string): Promise<void> {
+  if (!isTauri()) return;
+  return invoke<void>('purge_source', { sourceId });
 }

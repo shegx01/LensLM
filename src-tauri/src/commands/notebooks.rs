@@ -2,7 +2,7 @@
 
 use lens_core::{
     AddFileOutcome, IngestProgress, LensEngine, LensError, Notebook, NotebookId, NotebookSummary,
-    Source,
+    Source, TrashedSource,
 };
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
@@ -285,6 +285,16 @@ pub async fn list_trashed(
     engine: tauri::State<'_, LensEngine>,
 ) -> Result<Vec<NotebookSummary>, LensError> {
     engine.list_trashed_with_counts().await
+}
+
+/// Lists individually-trashed sources whose parent notebook is still live,
+/// newest-trashed first. Used by the Trash modal Sources section (issue #94).
+#[tracing::instrument(skip_all)]
+#[tauri::command]
+pub async fn list_trashed_sources(
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<Vec<TrashedSource>, LensError> {
+    engine.list_trashed_sources().await
 }
 
 /// Permanently deletes a notebook (child rows cascade). Used by "Delete forever".
@@ -629,5 +639,83 @@ mod tests {
             msg.contains("unknown embedding model id"),
             "expected validation error, got: {msg}"
         );
+    }
+
+    /// Lifecycle: trash source → appears in list_trashed_sources; restore → gone
+    /// from trashed + back in list_sources; purge → gone from both.
+    #[tokio::test]
+    async fn trash_restore_purge_source_lifecycle() {
+        let app = tauri::test::mock_app();
+        app.manage(LensEngine::for_test().await);
+        let engine = app.state::<LensEngine>();
+
+        let nb = create_notebook("NB".into(), None, None, engine.clone())
+            .await
+            .unwrap();
+        let src = add_source(
+            nb.id.to_string(),
+            "report.pdf".into(),
+            "/abs/report.pdf".into(),
+            engine.clone(),
+        )
+        .await
+        .unwrap();
+
+        // Initially: live, not in trashed list.
+        assert_eq!(
+            list_sources(nb.id.to_string(), engine.clone())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            list_trashed_sources(engine.clone())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Trash: leaves live list, enters trashed-sources list.
+        trash_source(src.id.clone(), engine.clone()).await.unwrap();
+        assert!(
+            list_sources(nb.id.to_string(), engine.clone())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let trashed = list_trashed_sources(engine.clone()).await.unwrap();
+        assert_eq!(trashed.len(), 1);
+        assert_eq!(trashed[0].source.id, src.id);
+        assert_eq!(trashed[0].notebook_title, "NB");
+
+        // Restore: returns to live list, gone from trashed list.
+        restore_source(src.id.clone(), engine.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            list_sources(nb.id.to_string(), engine.clone())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            list_trashed_sources(engine.clone())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Trash again, then purge: gone from both lists.
+        trash_source(src.id.clone(), engine.clone()).await.unwrap();
+        purge_source(src.id.clone(), engine.clone()).await.unwrap();
+        assert!(
+            list_sources(nb.id.to_string(), engine.clone())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(list_trashed_sources(engine).await.unwrap().is_empty());
     }
 }
