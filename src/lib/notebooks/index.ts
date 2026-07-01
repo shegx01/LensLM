@@ -14,6 +14,8 @@ export {
   loadNotebooks,
   loadTrashed,
   loadTrashedSources,
+  refreshTrashed,
+  refreshTrashedSources,
   createNotebookAction,
   renameNotebookAction,
   trashNotebookAction,

@@ -192,12 +192,33 @@ async function refreshNotebooks(): Promise<void> {
   notebooks = await listNotebooks();
 }
 
-async function refreshTrashed(): Promise<void> {
+export async function refreshTrashed(): Promise<void> {
   trashedNotebooks = await listTrashed();
 }
 
+// Coalescing serial refresh for trashed sources. Concurrent callers coalesce
+// onto the in-flight promise; a queued flag ensures a final fetch always runs
+// AFTER the last trigger, so stale earlier responses can never overwrite newer
+// ones (fixes multi-delete race / badge undercount).
+let _trashSourcesRefreshInFlight: Promise<void> | null = null;
+let _trashSourcesRefreshQueued = false;
+
 export async function refreshTrashedSources(): Promise<void> {
-  trashedSources = await listTrashedSources();
+  if (_trashSourcesRefreshInFlight) {
+    _trashSourcesRefreshQueued = true;
+    return _trashSourcesRefreshInFlight;
+  }
+  _trashSourcesRefreshInFlight = (async () => {
+    try {
+      do {
+        _trashSourcesRefreshQueued = false;
+        trashedSources = await listTrashedSources();
+      } while (_trashSourcesRefreshQueued);
+    } finally {
+      _trashSourcesRefreshInFlight = null;
+    }
+  })();
+  return _trashSourcesRefreshInFlight;
 }
 
 /** Fetch all non-trashed notebooks and populate the store. */
@@ -281,7 +302,7 @@ export async function trashNotebookAction(id: string): Promise<void> {
     if (activeNotebookId === id) {
       activeNotebookId = null;
     }
-    await Promise.all([refreshNotebooks(), refreshTrashed()]);
+    await Promise.all([refreshNotebooks(), refreshTrashed(), refreshTrashedSources()]);
   } catch (err) {
     console.error('trashNotebookAction: failed', err);
     error = String(err);
@@ -296,7 +317,7 @@ export async function restoreNotebookAction(id: string): Promise<void> {
   loading = true;
   try {
     await restoreNotebook(id);
-    await Promise.all([refreshNotebooks(), refreshTrashed()]);
+    await Promise.all([refreshNotebooks(), refreshTrashed(), refreshTrashedSources()]);
   } catch (err) {
     console.error('restoreNotebookAction: failed', err);
     error = String(err);
@@ -311,7 +332,7 @@ export async function purgeNotebookAction(id: string): Promise<void> {
   loading = true;
   try {
     await purgeNotebook(id);
-    await Promise.all([refreshNotebooks(), refreshTrashed()]);
+    await Promise.all([refreshNotebooks(), refreshTrashed(), refreshTrashedSources()]);
   } catch (err) {
     console.error('purgeNotebookAction: failed', err);
     error = String(err);
@@ -468,4 +489,6 @@ export function resetNotebookStore(): void {
   paletteQuery = '';
   loading = false;
   error = null;
+  _trashSourcesRefreshInFlight = null;
+  _trashSourcesRefreshQueued = false;
 }

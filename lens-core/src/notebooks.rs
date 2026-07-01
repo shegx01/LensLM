@@ -580,16 +580,18 @@ impl<'a> NotebookRepo<'a> {
     /// Lists all trashed notebooks with their source counts, newest
     /// `trashed_at` first.
     ///
-    /// As in [`list_with_counts`](Self::list_with_counts), the
-    /// `s.trashed_at IS NULL` predicate lives in the `ON` clause so
-    /// individually-trashed sources do not inflate the count.
+    /// Unlike [`list_with_counts`](Self::list_with_counts), the JOIN has **no**
+    /// `s.trashed_at IS NULL` predicate — a trashed notebook's count intentionally
+    /// includes individually-trashed sources because they all purge or restore
+    /// together with the notebook. Excluding them would make a notebook whose only
+    /// sources were individually-trashed appear as "0 files" in the Trash modal.
     pub async fn list_trashed_with_counts(&self) -> Result<Vec<NotebookSummary>, LensError> {
         self.list_summaries(
             "SELECT n.id, n.title, n.description, n.focus_mode, n.embedding_model, \
                     n.embedding_backend, n.created_at, n.updated_at, n.trashed_at, \
                     COALESCE(COUNT(s.id), 0) AS source_count \
              FROM notebooks n \
-             LEFT JOIN sources s ON s.notebook_id = n.id AND s.trashed_at IS NULL \
+             LEFT JOIN sources s ON s.notebook_id = n.id \
              WHERE n.trashed_at IS NOT NULL \
              GROUP BY n.id \
              ORDER BY n.trashed_at DESC",
@@ -2018,7 +2020,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn source_count_excludes_individually_trashed_sources() {
+    async fn source_count_excludes_individually_trashed_sources_from_live_listing() {
         let pool = test_pool().await;
         let repo = NotebookRepo::new(&pool);
         let nb = repo
@@ -2049,13 +2051,55 @@ mod tests {
             "individually-trashed source must not inflate the live count"
         );
 
-        // Same invariant once the notebook itself is trashed.
+        // Trashed-notebook listing counts ALL sources (live + individually-trashed)
+        // because they all purge/restore with the notebook.
         repo.trash(&nb.id).await.unwrap();
         let trashed = repo.list_trashed_with_counts().await.unwrap();
         assert_eq!(trashed.len(), 1);
         assert_eq!(
+            trashed[0].source_count, 2,
+            "trashed notebook must count both live and individually-trashed sources"
+        );
+    }
+
+    /// Regression guard for the "Showing 0 file" bug (commit 85471b8):
+    /// a notebook whose ONLY source was individually-trashed must show source_count 1
+    /// in the trashed listing, not 0.
+    #[tokio::test]
+    async fn list_trashed_with_counts_counts_notebook_with_only_trashed_sources() {
+        let pool = test_pool().await;
+        let repo = NotebookRepo::new(&pool);
+        let nb = repo
+            .create(
+                "AllTrashed",
+                None,
+                None,
+                crate::embedder::registry::DEFAULT_EMBED_MODEL_ID,
+                "fastembed",
+            )
+            .await
+            .unwrap();
+        // Add one source then individually-trash it — notebook now has zero live sources.
+        let src = repo
+            .add_source(&nb.id, "only.pdf", "/abs/only.pdf")
+            .await
+            .unwrap();
+        repo.trash_source(&src.id).await.unwrap();
+
+        // Live listing must show source_count 0 (individually-trashed excluded).
+        let live = repo.list_with_counts().await.unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].source_count, 0);
+
+        // Now trash the notebook itself.
+        repo.trash(&nb.id).await.unwrap();
+
+        // Trashed listing must show source_count 1, not 0.
+        let trashed = repo.list_trashed_with_counts().await.unwrap();
+        assert_eq!(trashed.len(), 1);
+        assert_eq!(
             trashed[0].source_count, 1,
-            "individually-trashed source must not inflate the trashed count"
+            "notebook with only individually-trashed sources must not show 0 files in trash"
         );
     }
 

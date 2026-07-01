@@ -11,6 +11,8 @@ import {
   loadNotebooks,
   loadTrashed,
   loadTrashedSources,
+  refreshTrashed,
+  refreshTrashedSources,
   createNotebookAction,
   renameNotebookAction,
   trashNotebookAction,
@@ -766,5 +768,144 @@ describe('purgeSourceAction', () => {
     expect(notebookStore.loading).toBe(false);
     expect(notebookStore.error).toBeTruthy();
     consoleSpy.mockRestore();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FIX A — refreshTrashedSources coalescing serial pattern
+// ---------------------------------------------------------------------------
+
+describe('refreshTrashedSources (coalescing race guard)', () => {
+  it('concurrent calls coalesce: final state reflects the LATEST fetch, not an earlier stale one', async () => {
+    // Deferred promise helpers so we control resolution order.
+    let resolveFirst!: (v: ReturnType<typeof makeTrashedSource>[]) => void;
+    let resolveSecond!: (v: ReturnType<typeof makeTrashedSource>[]) => void;
+    const firstResult = [makeTrashedSource({ id: 'src-STALE' })];
+    const secondResult = [
+      makeTrashedSource({ id: 'src-LATEST-1' }),
+      makeTrashedSource({ id: 'src-LATEST-2' })
+    ];
+
+    const firstFetch = new Promise<ReturnType<typeof makeTrashedSource>[]>((res) => {
+      resolveFirst = res;
+    });
+    const secondFetch = new Promise<ReturnType<typeof makeTrashedSource>[]>((res) => {
+      resolveSecond = res;
+    });
+
+    vi.mocked(listTrashedSources)
+      .mockReturnValueOnce(firstFetch as unknown as Promise<TrashedSource[]>)
+      .mockReturnValueOnce(secondFetch as unknown as Promise<TrashedSource[]>);
+
+    // Fire both calls concurrently. The second call should queue and NOT start
+    // a second fetch until the first fetch settles.
+    const p1 = refreshTrashedSources();
+    const p2 = refreshTrashedSources();
+
+    // listTrashedSources should have been called only once so far (the second
+    // call is coalesced onto the in-flight promise).
+    expect(vi.mocked(listTrashedSources)).toHaveBeenCalledTimes(1);
+
+    // Now resolve the first (stale) fetch — the loop should notice the queued
+    // flag and immediately run a second fetch.
+    resolveFirst(firstResult);
+    // Let microtasks settle so the do-while loop can check _trashSourcesRefreshQueued.
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // A second fetch should now be in-flight.
+    expect(vi.mocked(listTrashedSources)).toHaveBeenCalledTimes(2);
+
+    // Resolve the second (latest) fetch.
+    resolveSecond(secondResult);
+    await Promise.all([p1, p2]);
+
+    // Final state must reflect the second (latest) result.
+    expect(notebookStore.trashedSources).toHaveLength(2);
+    expect(notebookStore.trashedSources.map((s) => s.id)).toContain('src-LATEST-1');
+    expect(notebookStore.trashedSources.map((s) => s.id)).toContain('src-LATEST-2');
+  });
+
+  it('resets guard flags via resetNotebookStore so subsequent calls start fresh', async () => {
+    // Start a refresh, let it complete, then reset.
+    vi.mocked(listTrashedSources).mockResolvedValueOnce([
+      makeTrashedSource({ id: 'before-reset' })
+    ]);
+    await refreshTrashedSources();
+    expect(notebookStore.trashedSources).toHaveLength(1);
+
+    // After reset, guards are cleared and state is zeroed.
+    resetNotebookStore();
+    expect(notebookStore.trashedSources).toHaveLength(0);
+
+    // A fresh call after reset should trigger a new independent fetch (no coalescing bleed).
+    vi.mocked(listTrashedSources).mockResolvedValueOnce([
+      makeTrashedSource({ id: 'after-reset-1' }),
+      makeTrashedSource({ id: 'after-reset-2' })
+    ]);
+    await refreshTrashedSources();
+    expect(notebookStore.trashedSources).toHaveLength(2);
+    expect(notebookStore.trashedSources[0].id).toBe('after-reset-1');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FIX B — notebook actions must refresh trashed sources
+// ---------------------------------------------------------------------------
+
+describe('trashNotebookAction — refreshes trashed sources', () => {
+  it('calls listTrashedSources after trashing a notebook', async () => {
+    vi.mocked(trashNotebook).mockResolvedValue(undefined);
+    vi.mocked(listNotebooks).mockResolvedValue([]);
+    vi.mocked(listTrashed).mockResolvedValue([]);
+    vi.mocked(listTrashedSources).mockResolvedValue([]);
+
+    await trashNotebookAction('nb-001');
+
+    expect(vi.mocked(listTrashedSources)).toHaveBeenCalled();
+  });
+});
+
+describe('restoreNotebookAction — refreshes trashed sources', () => {
+  it('calls listTrashedSources after restoring a notebook', async () => {
+    vi.mocked(restoreNotebook).mockResolvedValue(undefined);
+    vi.mocked(listNotebooks).mockResolvedValue([]);
+    vi.mocked(listTrashed).mockResolvedValue([]);
+    vi.mocked(listTrashedSources).mockResolvedValue([]);
+
+    await restoreNotebookAction('nb-001');
+
+    expect(vi.mocked(listTrashedSources)).toHaveBeenCalled();
+  });
+});
+
+describe('purgeNotebookAction — refreshes trashed sources', () => {
+  it('calls listTrashedSources after purging a notebook', async () => {
+    vi.mocked(purgeNotebook).mockResolvedValue(undefined);
+    vi.mocked(listNotebooks).mockResolvedValue([]);
+    vi.mocked(listTrashed).mockResolvedValue([]);
+    vi.mocked(listTrashedSources).mockResolvedValue([]);
+
+    await purgeNotebookAction('nb-001');
+
+    expect(vi.mocked(listTrashedSources)).toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FIX C — refreshTrashed is exported and populates trashedNotebooks
+// ---------------------------------------------------------------------------
+
+describe('refreshTrashed (exported)', () => {
+  it('is exported from notebooks-state and populates trashedNotebooks', async () => {
+    const nb = makeNotebookSummary({ id: 'nb-trashed', trashed_at: new Date().toISOString() });
+    vi.mocked(listTrashed).mockResolvedValue([nb]);
+
+    await refreshTrashed();
+
+    expect(notebookStore.trashedNotebooks).toHaveLength(1);
+    expect(notebookStore.trashedNotebooks[0].id).toBe('nb-trashed');
+    // Crucially, it must NOT toggle the shared loading flag (no UI flash).
+    expect(notebookStore.loading).toBe(false);
   });
 });

@@ -8,7 +8,12 @@
   import TrashView from '$lib/components/notebooks/TrashView.svelte';
   import CommandPalette from '$lib/components/notebooks/CommandPalette.svelte';
   import NotebookCreateDialog from '$lib/components/notebooks/NotebookCreateDialog.svelte';
-  import { notebookStore, loadNotebooks } from '$lib/notebooks/index.js';
+  import {
+    notebookStore,
+    loadNotebooks,
+    refreshTrashed,
+    refreshTrashedSources
+  } from '$lib/notebooks/index.js';
   import SourcesRail from '$lib/components/sources/SourcesRail.svelte';
   import PreferencesShell from '$lib/components/embeddings/PreferencesShell.svelte';
   import NotebookSettingsSheet from '$lib/components/embeddings/NotebookSettingsSheet.svelte';
@@ -87,6 +92,11 @@
 
     // Load notebooks + user name on mount (guarded for non-Tauri test/SSR env).
     void loadNotebooks();
+    // Pre-load trash counts so the badge is correct from startup without a
+    // loading flash. Uses raw refresh helpers (not loadTrashed/loadTrashedSources)
+    // to avoid toggling the shared `loading` flag and flashing the UI.
+    void refreshTrashed().catch(() => {});
+    void refreshTrashedSources().catch(() => {});
     if (isTauri()) {
       invoke<AppConfig>('get_config')
         .then((cfg) => {
