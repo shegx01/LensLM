@@ -85,7 +85,9 @@ pub async fn list_sources(
 
 /// Inserts a managed text/markdown source (paste-text or `.md`/`.txt` content),
 /// writing the text to a managed file and inserting a `queued` row. `kind` must
-/// be `"text"` or `"markdown"`. Returns the inserted source.
+/// be `"text"` or `"markdown"`. Returns an [`AddSourceOutcome`]
+/// (`{ source, wasExisting }` on the wire) — on a content-dedup hit (issue #100)
+/// the existing live source is returned with `wasExisting = true`.
 #[tracing::instrument(skip(text, engine))]
 #[tauri::command]
 pub async fn add_text_source(
@@ -94,7 +96,7 @@ pub async fn add_text_source(
     text: String,
     kind: String,
     engine: tauri::State<'_, LensEngine>,
-) -> Result<Source, LensError> {
+) -> Result<AddSourceOutcome, LensError> {
     engine
         .add_text_source(&NotebookId::from(notebook_id), &title, &text, &kind)
         .await

@@ -530,7 +530,8 @@ async fn embedder_cached_once_and_ingest_serialized() {
             "markdown",
         )
         .await
-        .unwrap();
+        .unwrap()
+        .source;
     let s2 = engine
         .add_text_source(
             &nb.id,
@@ -539,7 +540,8 @@ async fn embedder_cached_once_and_ingest_serialized() {
             "markdown",
         )
         .await
-        .unwrap();
+        .unwrap()
+        .source;
 
     // Drive two ingests CONCURRENTLY. The single-permit semaphore must serialize
     // them so the embedder's in_flight never exceeds 1.
@@ -661,7 +663,8 @@ async fn ingest_streaming_phases_and_indexed_status() {
             "markdown",
         )
         .await
-        .unwrap();
+        .unwrap()
+        .source;
 
     let mut phases: Vec<String> = Vec::new();
     engine
@@ -747,7 +750,8 @@ async fn ingest_uses_per_notebook_model_mxbai() {
             "markdown",
         )
         .await
-        .unwrap();
+        .unwrap()
+        .source;
     engine
         .ingest_source(&src.id, |_p| {})
         .await
@@ -797,7 +801,8 @@ async fn purge_resolves_per_notebook_model() {
     let src = engine
         .add_text_source(&nb.id, "doc", "# T\n\nBody.\n", "markdown")
         .await
-        .unwrap();
+        .unwrap()
+        .source;
     engine
         .ingest_source(&src.id, |_p| {})
         .await
@@ -829,7 +834,8 @@ async fn ingest_failure_sets_error_status() {
     let src = engine
         .add_text_source(&nb.id, "doc", "body", "text")
         .await
-        .unwrap();
+        .unwrap()
+        .source;
 
     // Remove the backing file so the pipeline's read_to_string fails.
     std::fs::remove_file(&src.locator).unwrap();
@@ -877,7 +883,8 @@ async fn reingest_idempotency_and_wipe() {
             "markdown",
         )
         .await
-        .unwrap();
+        .unwrap()
+        .source;
 
     // First ingest → indexed.
     engine.ingest_source(&src.id, |_p| {}).await.unwrap();
@@ -1173,7 +1180,8 @@ async fn purge_source_removes_rows_and_vectors() {
             "markdown",
         )
         .await
-        .unwrap();
+        .unwrap()
+        .source;
 
     // 2. Ingest so Lance vectors exist.
     engine.ingest_source(&src.id, |_p| {}).await.unwrap();
@@ -1425,7 +1433,8 @@ async fn trash_source_hides_from_list_keeps_data() {
             "markdown",
         )
         .await
-        .unwrap();
+        .unwrap()
+        .source;
 
     // Ingest so chunks + vectors exist.
     engine.ingest_source(&src.id, |_p| {}).await.unwrap();
@@ -1490,7 +1499,8 @@ async fn restore_source_reappears_in_list() {
     let src = engine
         .add_text_source(&nb.id, "to-restore", "Just some text.", "text")
         .await
-        .unwrap();
+        .unwrap()
+        .source;
 
     // Trash then restore.
     engine.trash_source(&src.id).await.unwrap();
@@ -1520,7 +1530,8 @@ async fn trash_and_restore_idempotency_errors() {
     let src = engine
         .add_text_source(&nb.id, "idem", "Idempotency test.", "text")
         .await
-        .unwrap();
+        .unwrap()
+        .source;
 
     // Restoring a live source must fail.
     let err = engine.restore_source(&src.id).await;
@@ -1550,7 +1561,8 @@ async fn purge_source_without_vectors_is_clean() {
     let src = engine
         .add_text_source(&nb.id, "no-vectors", "No ingest yet.", "text")
         .await
-        .unwrap();
+        .unwrap()
+        .source;
 
     // Purge without any prior ingest — must succeed (vector store handles missing
     // table gracefully). Purge requires a trashed source, so trash it first.
@@ -1587,7 +1599,8 @@ async fn purge_source_removes_managed_file() {
     let src = engine
         .add_text_source(&nb.id, "doc", "Some managed body text.", "text")
         .await
-        .unwrap();
+        .unwrap()
+        .source;
 
     // The managed file exists right after add_text_source.
     let path = std::path::PathBuf::from(&src.locator);
@@ -1622,11 +1635,13 @@ async fn purge_notebook_removes_managed_source_files() {
     let live = engine
         .add_text_source(&nb.id, "live", "Live source body.", "text")
         .await
-        .unwrap();
+        .unwrap()
+        .source;
     let trashed = engine
         .add_text_source(&nb.id, "trashed", "Trashed source body.", "markdown")
         .await
-        .unwrap();
+        .unwrap()
+        .source;
     // Trash one source so the notebook holds both a live and a trashed source.
     engine.trash_source(&trashed.id).await.unwrap();
 
@@ -1668,7 +1683,8 @@ async fn real_model_end_to_end_ingest_and_search() {
             "markdown",
         )
         .await
-        .unwrap();
+        .unwrap()
+        .source;
     engine.ingest_source(&src.id, |_p| {}).await.unwrap();
     assert_eq!(engine_source_status(&engine, &src.id).await, "indexed");
 
@@ -1761,7 +1777,8 @@ async fn empty_doc_indexes_without_loading_embedder() {
     let src = engine
         .add_text_source(&nb.id, "empty", "   \n\t\n  \n", "text")
         .await
-        .unwrap();
+        .unwrap()
+        .source;
 
     let mut phases: Vec<String> = Vec::new();
     engine
@@ -1823,7 +1840,8 @@ async fn ingest_spans_chunk_insert_batch_seam() {
     let src = engine
         .add_text_source(&nb.id, "big", &doc, "markdown")
         .await
-        .unwrap();
+        .unwrap()
+        .source;
     engine.ingest_source(&src.id, |_p| {}).await.unwrap();
     assert_eq!(engine_source_status(&engine, &src.id).await, "indexed");
 
@@ -1894,7 +1912,8 @@ async fn ingest_preserves_gfm_table_block() {
     let src = engine
         .add_text_source(&nb.id, "t", &doc, "markdown")
         .await
-        .unwrap();
+        .unwrap()
+        .source;
     engine.ingest_source(&src.id, |_p| {}).await.unwrap();
     assert_eq!(engine_source_status(&engine, &src.id).await, "indexed");
 
@@ -1994,7 +2013,8 @@ async fn seam_text_md_byte_identity_against_canonical() {
         let src = engine
             .add_text_source(&nb.id, title, body, kind)
             .await
-            .unwrap();
+            .unwrap()
+            .source;
         engine.ingest_source(&src.id, |_p| {}).await.unwrap();
         assert_eq!(engine_source_status(&engine, &src.id).await, "indexed");
         // The canonical buffer for text/MD is the original locator content.
@@ -2022,7 +2042,8 @@ async fn seam_single_buffer_drives_chunk_and_hash() {
     let src = engine
         .add_text_source(&nb.id, "buf", body, "markdown")
         .await
-        .unwrap();
+        .unwrap()
+        .source;
     engine.ingest_source(&src.id, |_p| {}).await.unwrap();
 
     let canonical = std::fs::read_to_string(&src.locator).unwrap();
@@ -2491,7 +2512,8 @@ async fn source_anchor_roundtrip_and_enrichment_null_for_text_source() {
     let src = engine
         .add_text_source(&nb.id, "doc", body, "markdown")
         .await
-        .unwrap();
+        .unwrap()
+        .source;
     engine.ingest_source(&src.id, |_p| {}).await.unwrap();
     assert_eq!(engine_source_status(&engine, &src.id).await, "indexed");
 
@@ -3393,6 +3415,48 @@ async fn test_pdf_reingest_changed_content() {
     assert_eq!(embidx_count(&engine, &nb_id, "active").await, 1);
     assert_eq!(embidx_count(&engine, &nb_id, "building").await, 0);
     assert_eq!(embidx_count(&engine, &nb_id, "stale").await, 0);
+}
+
+// ===========================================================================
+// M4 issue #100 — content-hash dedup for text / URL / onboarding + restore guard
+// ===========================================================================
+
+/// AC-3 / AC-8: pasting identical text twice deduplicates. The second add
+/// returns the existing source (`was_existing = true`) with the same id, and
+/// only one row exists; different text creates a distinct source.
+#[tokio::test]
+async fn add_text_source_dedup_returns_existing() {
+    let (_dir, engine) = file_engine().await;
+    let nb = engine
+        .create_notebook("text-dedup-nb", None, None)
+        .await
+        .unwrap();
+
+    let first = engine
+        .add_text_source(&nb.id, "doc", "hello world", "text")
+        .await
+        .unwrap();
+    assert!(!first.was_existing, "first add is a fresh insert");
+
+    let second = engine
+        .add_text_source(&nb.id, "doc-again", "hello world", "text")
+        .await
+        .unwrap();
+    assert!(second.was_existing, "second identical add is a dedup hit");
+    assert_eq!(
+        second.source.id, first.source.id,
+        "dedup hit returns the same source row"
+    );
+
+    let third = engine
+        .add_text_source(&nb.id, "other", "different text", "text")
+        .await
+        .unwrap();
+    assert!(!third.was_existing, "different text is a fresh insert");
+    assert_ne!(third.source.id, first.source.id);
+
+    let live = engine.list_sources(&nb.id).await.unwrap();
+    assert_eq!(live.len(), 2, "only two distinct rows exist");
 }
 
 // ===========================================================================

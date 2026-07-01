@@ -96,7 +96,9 @@ vi.mock('$lib/sources/sources-state.svelte.js', () => ({
 
 vi.mock('$lib/sources/ipc.js', () => ({
   listSources: vi.fn().mockResolvedValue([]),
-  addTextSource: vi.fn().mockResolvedValue({ id: 'src-new', status: 'pending' }),
+  addTextSource: vi
+    .fn()
+    .mockResolvedValue({ source: { id: 'src-new', status: 'pending' }, wasExisting: false }),
   addFileSource: vi
     .fn()
     .mockResolvedValue({ source: { id: 'src-new', status: 'pending' }, wasExisting: false }),

@@ -22,16 +22,24 @@ export async function listSources(notebookId: string): Promise<Source[]> {
 
 /**
  * Add a pasted-text or Markdown source to a notebook.
- * Returns the created `Source` row.
+ *
+ * Returns an `AddSourceOutcome` (`{ source, wasExisting }`): on a content-dedup
+ * hit (#100) the existing live source is returned with `wasExisting = true` and
+ * no new row is written. Mirrors the Rust `AddSourceOutcome` (serde camelCase).
  */
 export async function addTextSource(
   notebookId: string,
   title: string,
   text: string,
   kind: string
-): Promise<Source> {
+): Promise<{ source: Source; wasExisting: boolean }> {
   if (!isTauri()) throw new Error('addTextSource: not running under Tauri');
-  return invoke<Source>('add_text_source', { notebookId, title, text, kind });
+  return invoke<{ source: Source; wasExisting: boolean }>('add_text_source', {
+    notebookId,
+    title,
+    text,
+    kind
+  });
 }
 
 /**

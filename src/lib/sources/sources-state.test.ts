@@ -23,7 +23,9 @@ import {
 
 vi.mock('./ipc.js', () => ({
   listSources: vi.fn(),
-  addTextSource: vi.fn(),
+  addTextSource: vi
+    .fn()
+    .mockResolvedValue({ source: { id: 'src-new', status: 'pending' }, wasExisting: false }),
   addFileSource: vi.fn(),
   ingestSource: vi.fn(),
   setSourceSelected: vi.fn(),

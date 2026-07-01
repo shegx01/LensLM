@@ -229,7 +229,8 @@ async fn url_fetch_http_error_flips_to_error() {
             "text",
         )
         .await
-        .expect("add_text_source");
+        .expect("add_text_source")
+        .source;
     // We don't run the full ingest (tokenizer not available offline) — just prove
     // add_text_source returns without deadlocking. The lock is already released.
     assert_eq!(src2.status, "queued");

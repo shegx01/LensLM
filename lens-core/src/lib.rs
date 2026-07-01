@@ -607,7 +607,9 @@ impl LensEngine {
 
     /// Inserts a managed text/markdown source: writes `text` to a managed file
     /// under `{data_dir}/sources/` and inserts a `queued` `sources` row.
-    /// `kind` must be `"text"` or `"markdown"`. Returns the inserted source.
+    /// `kind` must be `"text"` or `"markdown"`. Returns an [`AddSourceOutcome`]:
+    /// on a content-dedup hit (issue #100) the existing live source is returned
+    /// (`was_existing = true`) without writing the managed file or inserting a row.
     #[tracing::instrument(skip(self, text))]
     pub async fn add_text_source(
         &self,
@@ -615,7 +617,7 @@ impl LensEngine {
         title: &str,
         text: &str,
         kind: &str,
-    ) -> Result<Source, LensError> {
+    ) -> Result<AddSourceOutcome, LensError> {
         let data_dir = self.data_dir().await;
         let pool = self.pool().await;
         // Resolve the configurable cap (issue #71) from `AppConfig.max_source_mb`

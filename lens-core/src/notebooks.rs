@@ -488,6 +488,18 @@ fn sha256_file(path: &Path) -> std::io::Result<String> {
     Ok(crate::hex_encode(&hasher.finalize()))
 }
 
+/// SHA-256 of an in-memory byte slice. Returns the lowercase hex digest.
+///
+/// The in-memory counterpart to [`sha256_file`] (issue #100): used by the
+/// text/URL/onboarding add paths whose content is already resident in memory
+/// (pasted text bytes, a normalized URL string, or a file-path string) so no
+/// file I/O is needed to compute the dedup key.
+fn sha256_bytes(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    crate::hex_encode(&hasher.finalize())
+}
+
 /// Validates and normalizes a user-supplied notebook title.
 ///
 /// Trims surrounding whitespace, rejects empty/whitespace-only input, and caps
@@ -807,8 +819,18 @@ impl<'a> NotebookRepo<'a> {
     /// `{data_dir}/sources/{id}.{ext}` (ext from `kind`: `text` → `txt`,
     /// `markdown` → `md`), then inserts a `sources` row with `kind ∈
     /// {"text","markdown"}`, `status = "queued"`, `selected = 1`, and `locator`
-    /// = that managed file path. Returns the inserted [`Source`] (`token_count`
+    /// = that managed file path. Returns an [`AddSourceOutcome`] (`token_count`
     /// and `content_hash` are `NULL` until ingestion populates them).
+    ///
+    /// **Content dedup (issue #100):** the raw text bytes are hashed (SHA-256)
+    /// and stored as `raw_content_hash`. If a live (non-trashed) source in the
+    /// same notebook already carries that `raw_content_hash`, this returns the
+    /// existing row (`was_existing = true`) WITHOUT writing the managed file or
+    /// inserting a new row. The partial unique index on `(notebook_id,
+    /// raw_content_hash) WHERE trashed_at IS NULL AND raw_content_hash IS NOT
+    /// NULL` is the authoritative guard: the upfront `SELECT` is a fast-path
+    /// optimisation and an `INSERT … ON CONFLICT DO NOTHING` resolves any race
+    /// (the loser reclaims its managed file and re-queries the winner).
     pub async fn add_text_source(
         &self,
         data_dir: &Path,
@@ -817,7 +839,7 @@ impl<'a> NotebookRepo<'a> {
         text: &str,
         kind: &str,
         max_source_bytes: usize,
-    ) -> Result<Source, LensError> {
+    ) -> Result<AddSourceOutcome, LensError> {
         // OOM guard: reject an oversized paste before writing it to disk and
         // queueing it for ingest (the ingest pipeline enforces the same cap after
         // reading any file path). `max_source_bytes` is the configured cap
@@ -842,6 +864,36 @@ impl<'a> NotebookRepo<'a> {
                 )));
             }
         };
+        // Hash the raw text bytes as the dedup key (issue #100). A dedup hit
+        // returns immediately (no managed file written); a miss writes the file.
+        let raw_content_hash = sha256_bytes(text.as_bytes());
+
+        // SELECT projection reused by the fast-path check and the race re-query.
+        const SOURCE_SELECT: &str = "SELECT id, notebook_id, kind, title, status, locator, \
+             selected, token_count, content_hash, raw_content_hash, created_at, trashed_at, \
+             enrichment_status, enrichment_meta \
+             FROM sources WHERE notebook_id = ? AND raw_content_hash = ? AND trashed_at IS NULL LIMIT 1";
+
+        // Fast-path: a live source with identical raw content already exists.
+        // Return it WITHOUT writing the managed file or inserting a row.
+        if let Some(dup) = sqlx::query_as::<_, Source>(SOURCE_SELECT)
+            .bind(notebook_id)
+            .bind(&raw_content_hash)
+            .fetch_optional(self.pool)
+            .await?
+        {
+            tracing::info!(
+                notebook_id = %notebook_id,
+                raw_content_hash = %raw_content_hash,
+                source_id = %dup.id,
+                "duplicate text detected at add time — returning existing source"
+            );
+            return Ok(AddSourceOutcome {
+                source: dup,
+                was_existing: true,
+            });
+        }
+
         let id = Uuid::now_v7().to_string();
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -855,9 +907,14 @@ impl<'a> NotebookRepo<'a> {
             .map_err(|e| LensError::Io(format!("{}: {e}", path.display())))?;
         let locator = path.display().to_string();
 
-        sqlx::query(
-            "INSERT INTO sources (id, notebook_id, kind, title, status, locator, selected, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
+        // Authoritative dedup: the partial unique index makes a racing duplicate
+        // insert a no-op. `ON CONFLICT DO NOTHING` (untargeted) lets SQLite pick
+        // the matching partial index, so no index-target ambiguity arises.
+        let result = sqlx::query(
+            "INSERT INTO sources (id, notebook_id, kind, title, status, locator, selected, \
+             created_at, raw_content_hash) \
+             VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?) \
+             ON CONFLICT DO NOTHING",
         )
         .bind(&id)
         .bind(notebook_id)
@@ -866,24 +923,49 @@ impl<'a> NotebookRepo<'a> {
         .bind(SourceStatus::Queued.as_str())
         .bind(&locator)
         .bind(&now)
+        .bind(&raw_content_hash)
         .execute(self.pool)
         .await?;
 
-        Ok(Source {
-            id,
-            notebook_id: notebook_id.to_string(),
-            kind: kind.to_string(),
-            title: title.to_string(),
-            status: SourceStatus::Queued.as_str().to_string(),
-            locator,
-            selected: 1,
-            token_count: None,
-            content_hash: None,
-            raw_content_hash: None,
-            created_at: now,
-            trashed_at: None,
-            enrichment_status: None,
-            enrichment_meta: None,
+        if result.rows_affected() == 0 {
+            // Lost the race: another add inserted the winning row first. Reclaim
+            // the managed file we just wrote and return the winner as existing.
+            let _ = std::fs::remove_file(&path);
+            let winner = sqlx::query_as::<_, Source>(SOURCE_SELECT)
+                .bind(notebook_id)
+                .bind(&raw_content_hash)
+                .fetch_one(self.pool)
+                .await?;
+            tracing::info!(
+                notebook_id = %notebook_id,
+                raw_content_hash = %raw_content_hash,
+                source_id = %winner.id,
+                "duplicate text detected via ON CONFLICT race — returning existing source"
+            );
+            return Ok(AddSourceOutcome {
+                source: winner,
+                was_existing: true,
+            });
+        }
+
+        Ok(AddSourceOutcome {
+            source: Source {
+                id,
+                notebook_id: notebook_id.to_string(),
+                kind: kind.to_string(),
+                title: title.to_string(),
+                status: SourceStatus::Queued.as_str().to_string(),
+                locator,
+                selected: 1,
+                token_count: None,
+                content_hash: None,
+                raw_content_hash: Some(raw_content_hash),
+                created_at: now,
+                trashed_at: None,
+                enrichment_status: None,
+                enrichment_meta: None,
+            },
+            was_existing: false,
         })
     }
 
