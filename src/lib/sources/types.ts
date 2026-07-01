@@ -68,6 +68,15 @@ export interface Source {
   enrichment_meta: string | null;
 }
 
+/** Return type of all add-source IPC calls (add_file_source, add_source,
+ * add_text_source, add_url_source — issues #96 + #100). Mirrors the Rust
+ * `AddSourceOutcome` struct (serde camelCase). `wasExisting = true` means a
+ * dedup hit: no new row was written and the existing source is returned. */
+export interface AddSourceOutcome {
+  source: Source;
+  wasExisting: boolean;
+}
+
 // SYNC-CHECK: must match lens-core/src/ingest.rs IngestProgress struct
 export interface IngestProgress {
   phase: string;

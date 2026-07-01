@@ -25,7 +25,7 @@
   import { completeOnboarding } from '$lib/onboarding/completeOnboarding.js';
   import { registerDropTarget, PICKER_FILTERS } from '$lib/sources/dragDrop.js';
   import { showToast } from '$lib/sources/toast.svelte.js';
-  import type { Source } from '$lib/sources/types.js';
+  import type { Source, AddSourceOutcome } from '$lib/sources/types.js';
 
   let { oncomplete, onback }: { oncomplete: () => void; onback: () => void } = $props();
 
@@ -155,14 +155,11 @@
           // a prior (partially-failed) attempt to avoid redundant IPC round-trips.
           // The backend `raw_content_hash` dedup (#100) is the authority.
           if (addedPaths.has(src.path)) continue;
-          const { wasExisting } = await invoke<{ source: Source; wasExisting: boolean }>(
-            'add_source',
-            {
-              notebookId: draft.notebookId,
-              title: src.name,
-              locator: src.path
-            }
-          );
+          const { wasExisting } = await invoke<AddSourceOutcome>('add_source', {
+            notebookId: draft.notebookId,
+            title: src.name,
+            locator: src.path
+          });
           if (wasExisting) skipped++;
           addedPaths.add(src.path);
         }

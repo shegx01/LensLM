@@ -278,12 +278,20 @@ pub struct Source {
     /// Used to short-circuit re-ingest when the content is unchanged. `None`
     /// until the source has been ingested.
     pub content_hash: Option<String>,
-    /// SHA-256 of the RAW file bytes, computed at *add* time (issue #96), used as
-    /// the add-time dedup key. SEPARATE from `content_hash` (extracted-text hash,
-    /// set at ingest time). `None` for text/paste/url sources and pre-migration
-    /// rows. A partial unique index on `(notebook_id, raw_content_hash) WHERE
+    /// SHA-256 dedup key computed at *add* time for ALL add paths (issues #96 +
+    /// #100): file bytes (`add_file_source`), text-paste bytes
+    /// (`add_text_source`), normalized URL bytes (`add_url_source`), and
+    /// onboarding locator path bytes (`add_source`). SEPARATE from
+    /// `content_hash` (extracted-text hash set at *ingest* time). `None` ONLY
+    /// for pre-migration rows (never `None` for rows inserted by any current add
+    /// path). A partial unique index on `(notebook_id, raw_content_hash) WHERE
     /// trashed_at IS NULL AND raw_content_hash IS NOT NULL` enforces
     /// at-most-one live source per (notebook, raw-content) pair.
+    ///
+    /// Note: dedup is content-level, not kind-scoped — the same bytes added as
+    /// different kinds intentionally dedup; hash inputs are categorically
+    /// distinct per add path, so real cross-kind collisions require a SHA-256
+    /// preimage.
     pub raw_content_hash: Option<String>,
     /// RFC3339 creation timestamp.
     pub created_at: String,
@@ -298,13 +306,15 @@ pub struct Source {
     pub enrichment_meta: Option<String>,
 }
 
-/// The result of [`NotebookRepo::add_file_source`] (issue #96).
+/// The return type of all add-source paths (issues #96 + #100):
+/// [`NotebookRepo::add_file_source`], [`NotebookRepo::add_source`],
+/// [`NotebookRepo::add_text_source`], and [`NotebookRepo::add_url_source`].
 ///
 /// Carries the [`Source`] row plus a `was_existing` flag distinguishing a
 /// freshly-inserted source (`false`) from a dedup hit — an already-present live
-/// source in the same notebook with identical raw-file content (`true`). Serde
+/// source in the same notebook with identical raw content (`true`). Serde
 /// `camelCase` renaming yields the wire shape `{ source, wasExisting }` for the
-/// Tauri command and the frontend `addFileSource` IPC wrapper.
+/// Tauri commands and all the `add*` IPC wrappers on the frontend.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AddSourceOutcome {
@@ -519,6 +529,14 @@ fn validate_title(title: &str) -> Result<String, LensError> {
     }
     Ok(trimmed.to_string())
 }
+
+/// SELECT projection shared by the fast-path dedup check and the race re-query
+/// in every `add_*` path. Keyed on `(notebook_id, raw_content_hash)` over live
+/// rows only; returns at most one row (LIMIT 1 matches the partial unique index).
+const SOURCE_DEDUP_SELECT: &str = "SELECT id, notebook_id, kind, title, status, locator, \
+     selected, token_count, content_hash, raw_content_hash, created_at, trashed_at, \
+     enrichment_status, enrichment_meta \
+     FROM sources WHERE notebook_id = ? AND raw_content_hash = ? AND trashed_at IS NULL LIMIT 1";
 
 /// Repository over the `notebooks` table. Borrows a pool; holds no state.
 ///
@@ -797,14 +815,8 @@ impl<'a> NotebookRepo<'a> {
         // dedup key is the SHA-256 of the locator string (see doc comment above).
         let raw_content_hash = sha256_bytes(locator.as_bytes());
 
-        // SELECT projection reused by the fast-path check and the race re-query.
-        const SOURCE_SELECT: &str = "SELECT id, notebook_id, kind, title, status, locator, \
-             selected, token_count, content_hash, raw_content_hash, created_at, trashed_at, \
-             enrichment_status, enrichment_meta \
-             FROM sources WHERE notebook_id = ? AND raw_content_hash = ? AND trashed_at IS NULL LIMIT 1";
-
         // Fast-path: a live source with the same locator already exists.
-        if let Some(dup) = sqlx::query_as::<_, Source>(SOURCE_SELECT)
+        if let Some(dup) = sqlx::query_as::<_, Source>(SOURCE_DEDUP_SELECT)
             .bind(notebook_id)
             .bind(&raw_content_hash)
             .fetch_optional(self.pool)
@@ -842,7 +854,7 @@ impl<'a> NotebookRepo<'a> {
 
         if result.rows_affected() == 0 {
             // Lost the race: return the winner as an existing source.
-            let winner = sqlx::query_as::<_, Source>(SOURCE_SELECT)
+            let winner = sqlx::query_as::<_, Source>(SOURCE_DEDUP_SELECT)
                 .bind(notebook_id)
                 .bind(&raw_content_hash)
                 .fetch_one(self.pool)
@@ -935,15 +947,9 @@ impl<'a> NotebookRepo<'a> {
         // returns immediately (no managed file written); a miss writes the file.
         let raw_content_hash = sha256_bytes(text.as_bytes());
 
-        // SELECT projection reused by the fast-path check and the race re-query.
-        const SOURCE_SELECT: &str = "SELECT id, notebook_id, kind, title, status, locator, \
-             selected, token_count, content_hash, raw_content_hash, created_at, trashed_at, \
-             enrichment_status, enrichment_meta \
-             FROM sources WHERE notebook_id = ? AND raw_content_hash = ? AND trashed_at IS NULL LIMIT 1";
-
         // Fast-path: a live source with identical raw content already exists.
         // Return it WITHOUT writing the managed file or inserting a row.
-        if let Some(dup) = sqlx::query_as::<_, Source>(SOURCE_SELECT)
+        if let Some(dup) = sqlx::query_as::<_, Source>(SOURCE_DEDUP_SELECT)
             .bind(notebook_id)
             .bind(&raw_content_hash)
             .fetch_optional(self.pool)
@@ -998,7 +1004,7 @@ impl<'a> NotebookRepo<'a> {
             // Lost the race: another add inserted the winning row first. Reclaim
             // the managed file we just wrote and return the winner as existing.
             let _ = std::fs::remove_file(&path);
-            let winner = sqlx::query_as::<_, Source>(SOURCE_SELECT)
+            let winner = sqlx::query_as::<_, Source>(SOURCE_DEDUP_SELECT)
                 .bind(notebook_id)
                 .bind(&raw_content_hash)
                 .fetch_one(self.pool)
@@ -1124,26 +1130,20 @@ impl<'a> NotebookRepo<'a> {
         // Hash the raw file bytes by streaming 64 KiB chunks — the entire file
         // is never held in memory. A dedup hit returns immediately (no copy);
         // a miss copies via std::fs::copy (kernel-streamed, no user-space buffer).
-        let file_hash = sha256_file(src_path)
+        let raw_content_hash = sha256_file(src_path)
             .map_err(|e| LensError::Io(format!("hash {}: {e}", src_path.display())))?;
-
-        // SELECT projection reused by the fast-path check and the race re-query.
-        const SOURCE_SELECT: &str = "SELECT id, notebook_id, kind, title, status, locator, \
-             selected, token_count, content_hash, raw_content_hash, created_at, trashed_at, \
-             enrichment_status, enrichment_meta \
-             FROM sources WHERE notebook_id = ? AND raw_content_hash = ? AND trashed_at IS NULL LIMIT 1";
 
         // Fast-path: a live source with identical raw content already exists.
         // Return it WITHOUT copying the file or inserting a row.
-        if let Some(dup) = sqlx::query_as::<_, Source>(SOURCE_SELECT)
+        if let Some(dup) = sqlx::query_as::<_, Source>(SOURCE_DEDUP_SELECT)
             .bind(notebook_id)
-            .bind(&file_hash)
+            .bind(&raw_content_hash)
             .fetch_optional(self.pool)
             .await?
         {
             tracing::info!(
                 notebook_id = %notebook_id,
-                raw_content_hash = %file_hash,
+                raw_content_hash = %raw_content_hash,
                 source_id = %dup.id,
                 "duplicate file detected at add time — returning existing source"
             );
@@ -1183,7 +1183,7 @@ impl<'a> NotebookRepo<'a> {
         .bind(SourceStatus::Queued.as_str())
         .bind(&locator)
         .bind(&now)
-        .bind(&file_hash)
+        .bind(&raw_content_hash)
         .execute(self.pool)
         .await?;
 
@@ -1191,14 +1191,14 @@ impl<'a> NotebookRepo<'a> {
             // Lost the race: another add inserted the winning row first. Reclaim
             // the copy we just wrote and return the winner as an existing source.
             let _ = std::fs::remove_file(&dest);
-            let winner = sqlx::query_as::<_, Source>(SOURCE_SELECT)
+            let winner = sqlx::query_as::<_, Source>(SOURCE_DEDUP_SELECT)
                 .bind(notebook_id)
-                .bind(&file_hash)
+                .bind(&raw_content_hash)
                 .fetch_one(self.pool)
                 .await?;
             tracing::info!(
                 notebook_id = %notebook_id,
-                raw_content_hash = %file_hash,
+                raw_content_hash = %raw_content_hash,
                 source_id = %winner.id,
                 "duplicate file detected via ON CONFLICT race — returning existing source"
             );
@@ -1219,7 +1219,7 @@ impl<'a> NotebookRepo<'a> {
                 selected: 1,
                 token_count: None,
                 content_hash: None,
-                raw_content_hash: Some(file_hash),
+                raw_content_hash: Some(raw_content_hash),
                 created_at: now,
                 trashed_at: None,
                 enrichment_status: None,
@@ -1256,14 +1256,8 @@ impl<'a> NotebookRepo<'a> {
         // case/port/fragment/trailing-slash variants of the same URL collide.
         let raw_content_hash = sha256_bytes(normalize_url(url)?.as_bytes());
 
-        // SELECT projection reused by the fast-path check and the race re-query.
-        const SOURCE_SELECT: &str = "SELECT id, notebook_id, kind, title, status, locator, \
-             selected, token_count, content_hash, raw_content_hash, created_at, trashed_at, \
-             enrichment_status, enrichment_meta \
-             FROM sources WHERE notebook_id = ? AND raw_content_hash = ? AND trashed_at IS NULL LIMIT 1";
-
         // Fast-path: a live source with an equivalent URL already exists.
-        if let Some(dup) = sqlx::query_as::<_, Source>(SOURCE_SELECT)
+        if let Some(dup) = sqlx::query_as::<_, Source>(SOURCE_DEDUP_SELECT)
             .bind(notebook_id)
             .bind(&raw_content_hash)
             .fetch_optional(self.pool)
@@ -1303,7 +1297,7 @@ impl<'a> NotebookRepo<'a> {
 
         if result.rows_affected() == 0 {
             // Lost the race: return the winner as an existing source.
-            let winner = sqlx::query_as::<_, Source>(SOURCE_SELECT)
+            let winner = sqlx::query_as::<_, Source>(SOURCE_DEDUP_SELECT)
                 .bind(notebook_id)
                 .bind(&raw_content_hash)
                 .fetch_one(self.pool)

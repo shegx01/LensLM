@@ -9,7 +9,7 @@
 // and Tauri deserialises them into snake_case Rust params.
 
 import { Channel, invoke, isTauri } from '@tauri-apps/api/core';
-import type { Source, IngestProgress, StreamEvent } from './types.js';
+import type { Source, IngestProgress, StreamEvent, AddSourceOutcome } from './types.js';
 
 /**
  * List all sources for a notebook.
@@ -32,9 +32,9 @@ export async function addTextSource(
   title: string,
   text: string,
   kind: string
-): Promise<{ source: Source; wasExisting: boolean }> {
+): Promise<AddSourceOutcome> {
   if (!isTauri()) throw new Error('addTextSource: not running under Tauri');
-  return invoke<{ source: Source; wasExisting: boolean }>('add_text_source', {
+  return invoke<AddSourceOutcome>('add_text_source', {
     notebookId,
     title,
     text,
@@ -58,9 +58,9 @@ export async function addFileSource(
   notebookId: string,
   title: string,
   path: string
-): Promise<{ source: Source; wasExisting: boolean }> {
+): Promise<AddSourceOutcome> {
   if (!isTauri()) throw new Error('addFileSource: not running under Tauri');
-  return invoke<{ source: Source; wasExisting: boolean }>('add_file_source', {
+  return invoke<AddSourceOutcome>('add_file_source', {
     notebookId,
     path,
     title
@@ -82,9 +82,9 @@ export async function addUrlSource(
   notebookId: string,
   title: string,
   url: string
-): Promise<{ source: Source; wasExisting: boolean }> {
+): Promise<AddSourceOutcome> {
   if (!isTauri()) throw new Error('addUrlSource: not running under Tauri');
-  return invoke<{ source: Source; wasExisting: boolean }>('add_url_source', {
+  return invoke<AddSourceOutcome>('add_url_source', {
     notebookId,
     title,
     url
