@@ -50,9 +50,9 @@ export async function addTextSource(
  * jsonl/yaml/xml); an unsupported extension is rejected. (The older `add_source`
  * command recorded a generic `kind="file"` that the ingest pipeline rejects.)
  *
- * Returns an `AddFileOutcome` (`{ source, wasExisting }`): on a content-dedup
+ * Returns an `AddSourceOutcome` (`{ source, wasExisting }`): on a content-dedup
  * hit (#96) the existing live source is returned with `wasExisting = true` and
- * no new row is written. Mirrors the Rust `AddFileOutcome` (serde camelCase).
+ * no new row is written. Mirrors the Rust `AddSourceOutcome` (serde camelCase).
  */
 export async function addFileSource(
   notebookId: string,
