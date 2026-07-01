@@ -559,13 +559,17 @@ impl<'a> NotebookRepo<'a> {
     /// appear (with `source_count = 0`). Maps each row manually because
     /// `NotebookSummary::source_count` is a `COUNT(...)` aggregate with no
     /// backing column, so `query_as::<_, Notebook>` cannot populate it.
+    ///
+    /// The `s.trashed_at IS NULL` predicate lives in the JOIN's `ON` clause
+    /// (not `WHERE`) so individually-trashed sources are excluded from the
+    /// count while notebooks with zero live sources are still returned.
     pub async fn list_with_counts(&self) -> Result<Vec<NotebookSummary>, LensError> {
         self.list_summaries(
             "SELECT n.id, n.title, n.description, n.focus_mode, n.embedding_model, \
                     n.embedding_backend, n.created_at, n.updated_at, n.trashed_at, \
                     COALESCE(COUNT(s.id), 0) AS source_count \
              FROM notebooks n \
-             LEFT JOIN sources s ON s.notebook_id = n.id \
+             LEFT JOIN sources s ON s.notebook_id = n.id AND s.trashed_at IS NULL \
              WHERE n.trashed_at IS NULL \
              GROUP BY n.id \
              ORDER BY n.created_at DESC",
@@ -575,13 +579,17 @@ impl<'a> NotebookRepo<'a> {
 
     /// Lists all trashed notebooks with their source counts, newest
     /// `trashed_at` first.
+    ///
+    /// As in [`list_with_counts`](Self::list_with_counts), the
+    /// `s.trashed_at IS NULL` predicate lives in the `ON` clause so
+    /// individually-trashed sources do not inflate the count.
     pub async fn list_trashed_with_counts(&self) -> Result<Vec<NotebookSummary>, LensError> {
         self.list_summaries(
             "SELECT n.id, n.title, n.description, n.focus_mode, n.embedding_model, \
                     n.embedding_backend, n.created_at, n.updated_at, n.trashed_at, \
                     COALESCE(COUNT(s.id), 0) AS source_count \
              FROM notebooks n \
-             LEFT JOIN sources s ON s.notebook_id = n.id \
+             LEFT JOIN sources s ON s.notebook_id = n.id AND s.trashed_at IS NULL \
              WHERE n.trashed_at IS NOT NULL \
              GROUP BY n.id \
              ORDER BY n.trashed_at DESC",
@@ -2007,6 +2015,75 @@ mod tests {
         let trashed = repo.list_trashed_with_counts().await.unwrap();
         assert_eq!(trashed.len(), 1);
         assert_eq!(trashed[0].source_count, 2);
+    }
+
+    #[tokio::test]
+    async fn source_count_excludes_individually_trashed_sources() {
+        let pool = test_pool().await;
+        let repo = NotebookRepo::new(&pool);
+        let nb = repo
+            .create(
+                "Notebook",
+                None,
+                None,
+                crate::embedder::registry::DEFAULT_EMBED_MODEL_ID,
+                "fastembed",
+            )
+            .await
+            .unwrap();
+        // One live source, one individually-trashed source.
+        repo.add_source(&nb.id, "live.pdf", "/abs/live.pdf")
+            .await
+            .unwrap();
+        let trashed_src = repo
+            .add_source(&nb.id, "gone.pdf", "/abs/gone.pdf")
+            .await
+            .unwrap();
+        repo.trash_source(&trashed_src.id).await.unwrap();
+
+        // Live-notebook listing counts only the live source, not the trashed one.
+        let live = repo.list_with_counts().await.unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(
+            live[0].source_count, 1,
+            "individually-trashed source must not inflate the live count"
+        );
+
+        // Same invariant once the notebook itself is trashed.
+        repo.trash(&nb.id).await.unwrap();
+        let trashed = repo.list_trashed_with_counts().await.unwrap();
+        assert_eq!(trashed.len(), 1);
+        assert_eq!(
+            trashed[0].source_count, 1,
+            "individually-trashed source must not inflate the trashed count"
+        );
+    }
+
+    #[tokio::test]
+    async fn source_count_includes_notebooks_with_zero_live_sources() {
+        let pool = test_pool().await;
+        let repo = NotebookRepo::new(&pool);
+        let nb = repo
+            .create(
+                "Empty",
+                None,
+                None,
+                crate::embedder::registry::DEFAULT_EMBED_MODEL_ID,
+                "fastembed",
+            )
+            .await
+            .unwrap();
+        // Only source is individually trashed → notebook has zero live sources
+        // but must still appear with source_count = 0 (ON-clause filter, not WHERE).
+        let src = repo
+            .add_source(&nb.id, "gone.pdf", "/abs/gone.pdf")
+            .await
+            .unwrap();
+        repo.trash_source(&src.id).await.unwrap();
+
+        let live = repo.list_with_counts().await.unwrap();
+        assert_eq!(live.len(), 1, "notebook must not vanish from the list");
+        assert_eq!(live[0].source_count, 0);
     }
 
     #[tokio::test]
