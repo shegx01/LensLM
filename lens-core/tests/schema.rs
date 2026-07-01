@@ -63,7 +63,7 @@ async fn migration_is_idempotent_second_run_is_noop() {
         .unwrap();
 
     assert_eq!(count_before, count_after);
-    assert_eq!(count_after, 8, "all migration files applied (0001..0008)");
+    assert_eq!(count_after, 9, "all migration files applied (0001..0009)");
 }
 
 #[tokio::test]
@@ -601,7 +601,7 @@ async fn cold_init_under_budget_on_empty_temp_db() {
     let engine = LensEngine::init(dir.path()).await.unwrap();
     let elapsed = start.elapsed();
     // Sanity: the engine works.
-    assert_eq!(engine.migration_count().await.unwrap(), 8);
+    assert_eq!(engine.migration_count().await.unwrap(), 9);
     // Generous smoke guard against accidentally-expensive migrations (e.g. a
     // future migration that scans/rewrites large tables on cold start). This is
     // NOT a tight perf benchmark — the wide 2s budget keeps it non-flaky on
@@ -706,4 +706,48 @@ async fn add_source_inserts_pending_file_record_and_lists_scoped() {
 
     // list_sources is scoped to its notebook.
     assert!(engine.list_sources(&other.id).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn migration_0009_renames_file_hash_to_raw_content_hash() {
+    let engine = LensEngine::for_test().await;
+    let pool = engine.pool().await;
+
+    // Column rename: raw_content_hash present, file_hash gone.
+    let source_cols: HashSet<String> = sqlx::query("PRAGMA table_info(sources)")
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.get::<String, _>("name"))
+        .collect();
+    assert!(
+        source_cols.contains("raw_content_hash"),
+        "sources.raw_content_hash must exist after 0009"
+    );
+    assert!(
+        !source_cols.contains("file_hash"),
+        "sources.file_hash must be gone after 0009"
+    );
+
+    // Index recreated under the new name; old index dropped.
+    let indexes: HashSet<String> =
+        sqlx::query("SELECT name FROM sqlite_master WHERE type = 'index'")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.get::<String, _>("name"))
+            .collect();
+    assert!(
+        indexes.contains("idx_sources_notebook_raw_content_hash"),
+        "idx_sources_notebook_raw_content_hash must exist after 0009"
+    );
+    assert!(
+        !indexes.contains("idx_sources_notebook_file_hash"),
+        "old idx_sources_notebook_file_hash must be gone after 0009"
+    );
+
+    // Migration count reflects all nine migrations.
+    assert_eq!(engine.migration_count().await.unwrap(), 9);
 }

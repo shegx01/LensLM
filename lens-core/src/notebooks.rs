@@ -280,10 +280,10 @@ pub struct Source {
     /// SHA-256 of the RAW file bytes, computed at *add* time (issue #96), used as
     /// the add-time dedup key. SEPARATE from `content_hash` (extracted-text hash,
     /// set at ingest time). `None` for text/paste/url sources and pre-migration
-    /// rows. A partial unique index on `(notebook_id, file_hash) WHERE trashed_at
-    /// IS NULL AND file_hash IS NOT NULL` enforces at-most-one live source per
-    /// (notebook, raw-content) pair.
-    pub file_hash: Option<String>,
+    /// rows. A partial unique index on `(notebook_id, raw_content_hash) WHERE
+    /// trashed_at IS NULL AND raw_content_hash IS NOT NULL` enforces
+    /// at-most-one live source per (notebook, raw-content) pair.
+    pub raw_content_hash: Option<String>,
     /// RFC3339 creation timestamp.
     pub created_at: String,
     /// RFC3339 soft-delete timestamp, or `None` if live.
@@ -793,7 +793,7 @@ impl<'a> NotebookRepo<'a> {
             selected: 1,
             token_count: None,
             content_hash: None,
-            file_hash: None,
+            raw_content_hash: None,
             created_at: now,
             trashed_at: None,
             enrichment_status: None,
@@ -879,7 +879,7 @@ impl<'a> NotebookRepo<'a> {
             selected: 1,
             token_count: None,
             content_hash: None,
-            file_hash: None,
+            raw_content_hash: None,
             created_at: now,
             trashed_at: None,
             enrichment_status: None,
@@ -904,11 +904,12 @@ impl<'a> NotebookRepo<'a> {
     ///
     /// **Content dedup (issue #96):** the file is hashed (SHA-256) by streaming
     /// 64 KiB chunks — the entire file is never buffered in memory — and the
-    /// digest stored as `file_hash`. If a live (non-trashed) source in the same
-    /// notebook already carries that `file_hash`, this returns the existing row
-    /// (`was_existing = true`) WITHOUT copying the file or inserting a new row. A
-    /// partial unique index on `(notebook_id, file_hash) WHERE trashed_at IS NULL
-    /// AND file_hash IS NOT NULL` is the authoritative guard: the upfront `SELECT`
+    /// digest stored as `raw_content_hash`. If a live (non-trashed) source in
+    /// the same notebook already carries that `raw_content_hash`, this returns
+    /// the existing row (`was_existing = true`) WITHOUT copying the file or
+    /// inserting a new row. A partial unique index on `(notebook_id,
+    /// raw_content_hash) WHERE trashed_at IS NULL AND raw_content_hash IS NOT
+    /// NULL` is the authoritative guard: the upfront `SELECT`
     /// is a fast-path optimisation, and an `INSERT … ON CONFLICT DO NOTHING`
     /// resolves any race (the loser cleans up its copy and re-queries the winner).
     /// `content_hash` stays `NULL` at add time (populated later by ingestion) so
@@ -979,9 +980,9 @@ impl<'a> NotebookRepo<'a> {
 
         // SELECT projection reused by the fast-path check and the race re-query.
         const SOURCE_SELECT: &str = "SELECT id, notebook_id, kind, title, status, locator, \
-             selected, token_count, content_hash, file_hash, created_at, trashed_at, \
+             selected, token_count, content_hash, raw_content_hash, created_at, trashed_at, \
              enrichment_status, enrichment_meta \
-             FROM sources WHERE notebook_id = ? AND file_hash = ? AND trashed_at IS NULL LIMIT 1";
+             FROM sources WHERE notebook_id = ? AND raw_content_hash = ? AND trashed_at IS NULL LIMIT 1";
 
         // Fast-path: a live source with identical raw content already exists.
         // Return it WITHOUT copying the file or inserting a row.
@@ -993,7 +994,7 @@ impl<'a> NotebookRepo<'a> {
         {
             tracing::info!(
                 notebook_id = %notebook_id,
-                file_hash = %file_hash,
+                raw_content_hash = %file_hash,
                 source_id = %dup.id,
                 "duplicate file detected at add time — returning existing source"
             );
@@ -1022,7 +1023,7 @@ impl<'a> NotebookRepo<'a> {
         // the matching partial index, so no index-target ambiguity arises.
         let result = sqlx::query(
             "INSERT INTO sources (id, notebook_id, kind, title, status, locator, selected, \
-             created_at, file_hash) \
+             created_at, raw_content_hash) \
              VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?) \
              ON CONFLICT DO NOTHING",
         )
@@ -1048,7 +1049,7 @@ impl<'a> NotebookRepo<'a> {
                 .await?;
             tracing::info!(
                 notebook_id = %notebook_id,
-                file_hash = %file_hash,
+                raw_content_hash = %file_hash,
                 source_id = %winner.id,
                 "duplicate file detected via ON CONFLICT race — returning existing source"
             );
@@ -1069,7 +1070,7 @@ impl<'a> NotebookRepo<'a> {
                 selected: 1,
                 token_count: None,
                 content_hash: None,
-                file_hash: Some(file_hash),
+                raw_content_hash: Some(file_hash),
                 created_at: now,
                 trashed_at: None,
                 enrichment_status: None,
@@ -1116,7 +1117,7 @@ impl<'a> NotebookRepo<'a> {
             selected: 1,
             token_count: None,
             content_hash: None,
-            file_hash: None,
+            raw_content_hash: None,
             created_at: now,
             trashed_at: None,
             enrichment_status: None,
@@ -1399,7 +1400,7 @@ impl<'a> NotebookRepo<'a> {
     pub async fn get_source(&self, id: &str) -> Result<Option<Source>, LensError> {
         let row = sqlx::query_as::<_, Source>(
             "SELECT id, notebook_id, kind, title, status, locator, selected, token_count, \
-             content_hash, file_hash, created_at, trashed_at, enrichment_status, enrichment_meta \
+             content_hash, raw_content_hash, created_at, trashed_at, enrichment_status, enrichment_meta \
              FROM sources WHERE id = ?",
         )
         .bind(id)
@@ -1412,7 +1413,7 @@ impl<'a> NotebookRepo<'a> {
     pub async fn list_sources(&self, notebook_id: &NotebookId) -> Result<Vec<Source>, LensError> {
         let rows = sqlx::query_as::<_, Source>(
             "SELECT id, notebook_id, kind, title, status, locator, selected, token_count, \
-             content_hash, file_hash, created_at, trashed_at, enrichment_status, enrichment_meta \
+             content_hash, raw_content_hash, created_at, trashed_at, enrichment_status, enrichment_meta \
              FROM sources WHERE notebook_id = ? AND trashed_at IS NULL ORDER BY created_at DESC",
         )
         .bind(notebook_id)
@@ -2425,7 +2426,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // #96 — add_file_source content-hash dedup (file_hash column)
+    // #96 — add_file_source content-hash dedup (raw_content_hash column)
     // -----------------------------------------------------------------------
 
     /// Creates a fresh notebook in `repo` and returns it.
@@ -2449,7 +2450,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn add_file_source_computes_file_hash() {
+    async fn add_file_source_computes_raw_content_hash() {
         let pool = test_pool().await;
         let repo = NotebookRepo::new(&pool);
         let nb = make_notebook(&repo, "Notebook").await;
@@ -2466,9 +2467,9 @@ mod tests {
 
         assert!(!outcome.was_existing, "a fresh add is not an existing dup");
         assert_eq!(
-            outcome.source.file_hash,
+            outcome.source.raw_content_hash,
             Some(crate::ingest::sha256_hex(bytes)),
-            "file_hash must be the SHA-256 of the raw file bytes"
+            "raw_content_hash must be the SHA-256 of the raw file bytes"
         );
         // content_hash stays NULL at add time (ingest populates it later).
         assert_eq!(outcome.source.content_hash, None);

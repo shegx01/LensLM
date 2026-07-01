@@ -98,7 +98,7 @@ vi.mock('$lib/sources/ipc.js', () => ({
       created_at: new Date().toISOString(),
       token_count: null,
       content_hash: null,
-      file_hash: null,
+      raw_content_hash: null,
       trashed_at: null,
       enrichment_status: null,
       enrichment_meta: null
@@ -190,7 +190,7 @@ function outcome(id: string, wasExisting: boolean) {
       created_at: new Date().toISOString(),
       token_count: null,
       content_hash: null,
-      file_hash: null,
+      raw_content_hash: null,
       trashed_at: null,
       enrichment_status: null,
       enrichment_meta: null

@@ -55,9 +55,10 @@ export interface Source {
   created_at: string;
   token_count: number | null;
   content_hash: string | null;
-  /** Raw-file-bytes SHA-256 computed at add time for content dedup (#96);
-   * `null` for text/paste/URL sources and pre-migration rows. */
-  file_hash: string | null;
+  /** Raw-content SHA-256 computed at add time for content dedup (#96/#100);
+   * hashes file bytes, text-paste bytes, or the normalized URL. `null` for
+   * pre-migration rows. */
+  raw_content_hash: string | null;
   trashed_at: string | null;
   /** Enrichment lifecycle (none|pending|enriching|enriched|failed|skipped),
    * SEPARATE from `status`. `null` ≡ `none` for pre-Phase-3 rows. */

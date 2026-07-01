@@ -968,7 +968,10 @@ async fn file_hash_does_not_break_reingest_noop() {
         .unwrap();
     assert!(!outcome.was_existing);
     let src = outcome.source;
-    let file_hash = src.file_hash.clone().expect("file source has file_hash");
+    let file_hash = src
+        .raw_content_hash
+        .clone()
+        .expect("file source has raw_content_hash");
     assert_eq!(src.content_hash, None, "content_hash is NULL until ingest");
 
     // First ingest → indexed, content_hash populated over the extracted text.
@@ -990,9 +993,9 @@ async fn file_hash_does_not_break_reingest_noop() {
         "for a DERIVED (non-text_like) kind, content_hash hashes the raw file bytes — same as file_hash"
     );
 
-    // The stored file_hash is unchanged by ingestion.
+    // The stored raw_content_hash is unchanged by ingestion.
     let stored_file_hash: Option<String> =
-        sqlx::query_scalar("SELECT file_hash FROM sources WHERE id = ?")
+        sqlx::query_scalar("SELECT raw_content_hash FROM sources WHERE id = ?")
             .bind(&src.id)
             .fetch_one(&pool)
             .await
@@ -1000,7 +1003,7 @@ async fn file_hash_does_not_break_reingest_noop() {
     assert_eq!(
         stored_file_hash,
         Some(file_hash),
-        "ingestion must not touch file_hash"
+        "ingestion must not touch raw_content_hash"
     );
 
     // Re-ingest with UNCHANGED content → no-op driven by content_hash.
@@ -1053,7 +1056,10 @@ async fn file_hash_differs_from_content_hash_for_text() {
         .unwrap();
     assert!(!outcome.was_existing);
     let src = outcome.source;
-    let file_hash = src.file_hash.clone().expect("file source has file_hash");
+    let file_hash = src
+        .raw_content_hash
+        .clone()
+        .expect("file source has raw_content_hash");
     assert_eq!(src.content_hash, None, "content_hash is NULL until ingest");
 
     // Ingest → indexed, content_hash populated.
