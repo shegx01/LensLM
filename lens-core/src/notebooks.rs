@@ -306,7 +306,7 @@ pub struct Source {
 /// Tauri command and the frontend `addFileSource` IPC wrapper.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct AddFileOutcome {
+pub struct AddSourceOutcome {
     /// The inserted (or pre-existing, on a dedup hit) source row.
     pub source: Source,
     /// `true` when the content already existed in the notebook (dedup hit — no
@@ -913,14 +913,14 @@ impl<'a> NotebookRepo<'a> {
     /// is a fast-path optimisation, and an `INSERT … ON CONFLICT DO NOTHING`
     /// resolves any race (the loser cleans up its copy and re-queries the winner).
     /// `content_hash` stays `NULL` at add time (populated later by ingestion) so
-    /// the re-ingest no-op is unaffected. Returns an [`AddFileOutcome`].
+    /// the re-ingest no-op is unaffected. Returns an [`AddSourceOutcome`].
     pub async fn add_file_source(
         &self,
         data_dir: &Path,
         notebook_id: &NotebookId,
         src_path: &Path,
         title: Option<&str>,
-    ) -> Result<AddFileOutcome, LensError> {
+    ) -> Result<AddSourceOutcome, LensError> {
         // Detect kind + canonical extension from the source file extension
         // (case-insensitive). An unknown / missing extension is a clear
         // validation error rather than a silently-mis-ingested source.
@@ -998,7 +998,7 @@ impl<'a> NotebookRepo<'a> {
                 source_id = %dup.id,
                 "duplicate file detected at add time — returning existing source"
             );
-            return Ok(AddFileOutcome {
+            return Ok(AddSourceOutcome {
                 source: dup,
                 was_existing: true,
             });
@@ -1053,13 +1053,13 @@ impl<'a> NotebookRepo<'a> {
                 source_id = %winner.id,
                 "duplicate file detected via ON CONFLICT race — returning existing source"
             );
-            return Ok(AddFileOutcome {
+            return Ok(AddSourceOutcome {
                 source: winner,
                 was_existing: true,
             });
         }
 
-        Ok(AddFileOutcome {
+        Ok(AddSourceOutcome {
             source: Source {
                 id,
                 notebook_id: notebook_id.to_string(),

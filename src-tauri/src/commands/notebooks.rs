@@ -1,7 +1,7 @@
 //! Notebook commands. Thin pass-throughs to `lens-core`; full CRUD UI is M3.
 
 use lens_core::{
-    AddFileOutcome, IngestProgress, LensEngine, LensError, Notebook, NotebookId, NotebookSummary,
+    AddSourceOutcome, IngestProgress, LensEngine, LensError, Notebook, NotebookId, NotebookSummary,
     Source,
 };
 use serde::{Deserialize, Serialize};
@@ -119,7 +119,7 @@ pub async fn add_url_source(
 /// Inserts a managed local-file source (PDF/DOCX/text/markdown): copies the file
 /// into managed storage and inserts a `queued` row. `kind` is detected from the
 /// file extension; an unsupported extension is rejected. `title` defaults to the
-/// file name when omitted. Returns an [`AddFileOutcome`] (`{ source, wasExisting }`
+/// file name when omitted. Returns an [`AddSourceOutcome`] (`{ source, wasExisting }`
 /// on the wire) — on a content-dedup hit (issue #96) the existing live source is
 /// returned with `wasExisting = true` and no new row/file is written. No ingestion
 /// happens here; call `ingest_source` separately to extract + index it.
@@ -130,7 +130,7 @@ pub async fn add_file_source(
     path: String,
     title: Option<String>,
     engine: tauri::State<'_, LensEngine>,
-) -> Result<AddFileOutcome, LensError> {
+) -> Result<AddSourceOutcome, LensError> {
     engine
         .add_file_source(
             &NotebookId::from(notebook_id),

@@ -53,7 +53,7 @@ pub use model_catalog::{
     load_catalog, refresh_if_stale,
 };
 pub use notebooks::{
-    AddFileOutcome, EmbeddingStats, InspectorChunk, Notebook, NotebookId, NotebookSummary, Source,
+    AddSourceOutcome, EmbeddingStats, InspectorChunk, Notebook, NotebookId, NotebookSummary, Source,
 };
 pub use system_check::{
     ALLOWED_EMBEDDING_MODELS, CheckAction, CheckId, CheckResult, CheckStatus, LlmDetection,
@@ -630,7 +630,7 @@ impl LensEngine {
     /// Inserts a managed local-file source (PDF/DOCX/text/markdown): copies the
     /// file into managed storage under `{data_dir}/sources/` and inserts a
     /// `queued` `sources` row. `kind` is detected from the file EXTENSION. `title`
-    /// defaults to the file name when not supplied. Returns an [`AddFileOutcome`]
+    /// defaults to the file name when not supplied. Returns an [`AddSourceOutcome`]
     /// carrying the source plus a `was_existing` flag: on a content-dedup hit
     /// (issue #96) the existing live source is returned (`was_existing = true`)
     /// without copying the file or inserting a new row.
@@ -641,7 +641,7 @@ impl LensEngine {
         notebook_id: &NotebookId,
         src_path: &Path,
         title: Option<&str>,
-    ) -> Result<AddFileOutcome, LensError> {
+    ) -> Result<AddSourceOutcome, LensError> {
         let data_dir = self.data_dir().await;
         let pool = self.pool().await;
         NotebookRepo::new(&pool)
