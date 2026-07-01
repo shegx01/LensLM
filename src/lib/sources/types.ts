@@ -67,6 +67,14 @@ export interface Source {
   enrichment_meta: string | null;
 }
 
+// SYNC-CHECK: must match lens-core/src/notebooks.rs TrashedSource struct
+/** A trashed source enriched with its parent notebook's title.
+ * Mirrors the Rust `TrashedSource` struct (`notebooks.rs`) which flattens
+ * `Source` via `#[serde(flatten)]` and adds `notebook_title`. */
+export interface TrashedSource extends Source {
+  notebook_title: string;
+}
+
 // SYNC-CHECK: must match lens-core/src/ingest.rs IngestProgress struct
 export interface IngestProgress {
   phase: string;

@@ -54,6 +54,7 @@ pub use model_catalog::{
 };
 pub use notebooks::{
     AddFileOutcome, EmbeddingStats, InspectorChunk, Notebook, NotebookId, NotebookSummary, Source,
+    TrashedSource,
 };
 pub use system_check::{
     ALLOWED_EMBEDDING_MODELS, CheckAction, CheckId, CheckResult, CheckStatus, LlmDetection,
@@ -511,6 +512,15 @@ impl LensEngine {
     pub async fn list_trashed_with_counts(&self) -> Result<Vec<NotebookSummary>, LensError> {
         let pool = self.pool().await;
         NotebookRepo::new(&pool).list_trashed_with_counts().await
+    }
+
+    /// Lists individually-trashed sources whose parent notebook is still live,
+    /// newest `trashed_at` first. Used by the Trash modal Sources section (issue
+    /// #94). Sources under a trashed notebook are excluded.
+    #[tracing::instrument(skip_all)]
+    pub async fn list_trashed_sources(&self) -> Result<Vec<TrashedSource>, LensError> {
+        let pool = self.pool().await;
+        NotebookRepo::new(&pool).list_trashed_sources().await
     }
 
     /// Creates a notebook with the given (validated) title and optional
