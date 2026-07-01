@@ -69,7 +69,8 @@ mod tests {
                 "/abs/doc.md",
             )
             .await
-            .unwrap();
+            .unwrap()
+            .source;
 
         let now = chrono::Utc::now().to_rfc3339();
         sqlx::query(

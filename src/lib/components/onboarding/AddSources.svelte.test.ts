@@ -344,7 +344,7 @@ describe('AddSources', () => {
       }
       if (cmd === 'add_source') {
         addSourceCalled = true;
-        return undefined;
+        return { source: { id: 'src-1' }, wasExisting: false };
       }
     });
 
@@ -388,7 +388,7 @@ describe('AddSources', () => {
       }
       if (cmd === 'add_source') {
         addSourceCalls.push(args);
-        return undefined;
+        return { source: { id: 'src-1' }, wasExisting: false };
       }
     });
 
@@ -427,7 +427,7 @@ describe('AddSources', () => {
           if (notesAttempts === 1) throw new Error('add_source failed');
         }
         addSourceLocators.push(locator);
-        return undefined;
+        return { source: { id: 'src-1' }, wasExisting: false };
       }
     });
 
@@ -460,7 +460,7 @@ describe('AddSources', () => {
       if (cmd === 'set_config') return undefined;
       if (cmd === 'add_source') {
         addSourceCalled = true;
-        return undefined;
+        return { source: { id: 'src-1' }, wasExisting: false };
       }
     });
 

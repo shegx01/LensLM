@@ -774,19 +774,61 @@ impl<'a> NotebookRepo<'a> {
     ///
     /// The row is inert: `kind = "file"`, `status = "pending"`, `selected = 1`,
     /// `locator` = the absolute file path. NO parsing/embedding/chunking happens
-    /// here — M4 ingestion picks up the `pending` row later. Returns the inserted
-    /// [`Source`].
+    /// here — M4 ingestion picks up the `pending` row later. Returns an
+    /// [`AddSourceOutcome`].
+    ///
+    /// **Dedup is PATH-based here (issue #100), deliberately distinct from the
+    /// content-based dedup of [`add_file_source`](Self::add_file_source).** This
+    /// M1 metadata-only path NEVER reads the file's bytes — it only receives a
+    /// `locator` string. So its dedup key is `sha256(locator path bytes)`, not the
+    /// file content. Consequence: two files at *different* paths with *identical*
+    /// content will NOT dedup via this path (that is acceptable — no bytes are
+    /// read here). Adding the *same path* twice DOES dedup. A live source in the
+    /// same notebook with a matching `raw_content_hash` short-circuits to a dedup
+    /// hit (`was_existing = true`); the partial unique index is the authoritative
+    /// guard and `INSERT … ON CONFLICT DO NOTHING` resolves any race.
     pub async fn add_source(
         &self,
         notebook_id: &NotebookId,
         title: &str,
         locator: &str,
-    ) -> Result<Source, LensError> {
+    ) -> Result<AddSourceOutcome, LensError> {
+        // PATH-based hash: this onboarding path never reads file bytes, so the
+        // dedup key is the SHA-256 of the locator string (see doc comment above).
+        let raw_content_hash = sha256_bytes(locator.as_bytes());
+
+        // SELECT projection reused by the fast-path check and the race re-query.
+        const SOURCE_SELECT: &str = "SELECT id, notebook_id, kind, title, status, locator, \
+             selected, token_count, content_hash, raw_content_hash, created_at, trashed_at, \
+             enrichment_status, enrichment_meta \
+             FROM sources WHERE notebook_id = ? AND raw_content_hash = ? AND trashed_at IS NULL LIMIT 1";
+
+        // Fast-path: a live source with the same locator already exists.
+        if let Some(dup) = sqlx::query_as::<_, Source>(SOURCE_SELECT)
+            .bind(notebook_id)
+            .bind(&raw_content_hash)
+            .fetch_optional(self.pool)
+            .await?
+        {
+            tracing::info!(
+                notebook_id = %notebook_id,
+                raw_content_hash = %raw_content_hash,
+                source_id = %dup.id,
+                "duplicate onboarding source (path) detected at add time — returning existing source"
+            );
+            return Ok(AddSourceOutcome {
+                source: dup,
+                was_existing: true,
+            });
+        }
+
         let id = Uuid::now_v7().to_string();
         let now = chrono::Utc::now().to_rfc3339();
-        sqlx::query(
-            "INSERT INTO sources (id, notebook_id, kind, title, status, locator, selected, created_at) \
-             VALUES (?, ?, 'file', ?, ?, ?, 1, ?)",
+        let result = sqlx::query(
+            "INSERT INTO sources (id, notebook_id, kind, title, status, locator, selected, \
+             created_at, raw_content_hash) \
+             VALUES (?, ?, 'file', ?, ?, ?, 1, ?, ?) \
+             ON CONFLICT DO NOTHING",
         )
         .bind(&id)
         .bind(notebook_id)
@@ -794,23 +836,47 @@ impl<'a> NotebookRepo<'a> {
         .bind(SourceStatus::Pending.as_str())
         .bind(locator)
         .bind(&now)
+        .bind(&raw_content_hash)
         .execute(self.pool)
         .await?;
-        Ok(Source {
-            id,
-            notebook_id: notebook_id.to_string(),
-            kind: "file".to_string(),
-            title: title.to_string(),
-            status: SourceStatus::Pending.as_str().to_string(),
-            locator: locator.to_string(),
-            selected: 1,
-            token_count: None,
-            content_hash: None,
-            raw_content_hash: None,
-            created_at: now,
-            trashed_at: None,
-            enrichment_status: None,
-            enrichment_meta: None,
+
+        if result.rows_affected() == 0 {
+            // Lost the race: return the winner as an existing source.
+            let winner = sqlx::query_as::<_, Source>(SOURCE_SELECT)
+                .bind(notebook_id)
+                .bind(&raw_content_hash)
+                .fetch_one(self.pool)
+                .await?;
+            tracing::info!(
+                notebook_id = %notebook_id,
+                raw_content_hash = %raw_content_hash,
+                source_id = %winner.id,
+                "duplicate onboarding source (path) detected via ON CONFLICT race — returning existing source"
+            );
+            return Ok(AddSourceOutcome {
+                source: winner,
+                was_existing: true,
+            });
+        }
+
+        Ok(AddSourceOutcome {
+            source: Source {
+                id,
+                notebook_id: notebook_id.to_string(),
+                kind: "file".to_string(),
+                title: title.to_string(),
+                status: SourceStatus::Pending.as_str().to_string(),
+                locator: locator.to_string(),
+                selected: 1,
+                token_count: None,
+                content_hash: None,
+                raw_content_hash: Some(raw_content_hash),
+                created_at: now,
+                trashed_at: None,
+                enrichment_status: None,
+                enrichment_meta: None,
+            },
+            was_existing: false,
         })
     }
 
@@ -1299,7 +1365,55 @@ impl<'a> NotebookRepo<'a> {
     ///
     /// Only affects trashed sources (`trashed_at IS NOT NULL`); restoring a live
     /// or unknown source affects 0 rows and returns a validation error.
+    ///
+    /// **Collision guard (issue #100):** before clearing `trashed_at`, if the
+    /// source being restored carries a `raw_content_hash` and another LIVE source
+    /// in the same notebook already has that same hash, the restore is rejected
+    /// with [`LensError::Validation`] rather than letting the partial unique index
+    /// surface a raw UNIQUE-constraint error. This turns "restoring would create a
+    /// duplicate" into a clear, user-facing message. The DB index remains the
+    /// authoritative guard against the check-then-update race.
     pub async fn restore_source(&self, id: &str) -> Result<(), LensError> {
+        // Fetch the raw_content_hash + notebook of the trashed row being restored.
+        // (Only trashed rows are restorable; a live/unknown id yields None here and
+        // the UPDATE below produces the same "no trashed source" error as before.)
+        if let Some(row) = sqlx::query_as::<_, (Option<String>, String)>(
+            "SELECT raw_content_hash, notebook_id FROM sources \
+             WHERE id = ? AND trashed_at IS NOT NULL",
+        )
+        .bind(id)
+        .fetch_optional(self.pool)
+        .await?
+        {
+            let (raw_content_hash, notebook_id) = row;
+            if let Some(hash) = raw_content_hash {
+                // Any OTHER live source in the same notebook with this hash blocks
+                // the restore (exclude the row being restored itself).
+                let collision = sqlx::query_scalar::<_, String>(
+                    "SELECT id FROM sources \
+                     WHERE notebook_id = ? AND raw_content_hash = ? \
+                       AND trashed_at IS NULL AND id != ? LIMIT 1",
+                )
+                .bind(&notebook_id)
+                .bind(&hash)
+                .bind(id)
+                .fetch_optional(self.pool)
+                .await?;
+                if let Some(existing_id) = collision {
+                    tracing::warn!(
+                        notebook_id = %notebook_id,
+                        raw_content_hash = %hash,
+                        restoring_id = %id,
+                        existing_id = %existing_id,
+                        "restore blocked — a live source with identical content already exists"
+                    );
+                    return Err(LensError::Validation(
+                        "a source with this content already exists in the notebook".into(),
+                    ));
+                }
+            }
+        }
+
         let result = sqlx::query(
             "UPDATE sources SET trashed_at = NULL WHERE id = ? AND trashed_at IS NOT NULL",
         )
@@ -1925,7 +2039,8 @@ mod tests {
         let src = repo
             .add_source(&nb.id, "file.pdf", "/abs/file.pdf")
             .await
-            .unwrap();
+            .unwrap()
+            .source;
 
         repo.update_enrichment_status(&src.id, EnrichmentStatus::Skipped)
             .await
@@ -2189,7 +2304,8 @@ mod tests {
         let src = repo
             .add_source(&nb.id, "a.pdf", "/abs/a.pdf")
             .await
-            .unwrap();
+            .unwrap()
+            .source;
 
         // A LIVE (non-trashed) source must not be hard-purgeable.
         assert!(matches!(
@@ -2447,7 +2563,8 @@ mod tests {
         let src = repo
             .add_source(&nb.id, "doc.md", "/abs/doc.md")
             .await
-            .unwrap();
+            .unwrap()
+            .source;
 
         // Insert ≥3 chunks across levels with varied token_start, deliberately
         // out of final order so ORDER BY (level ASC, token_start ASC) is exercised.

@@ -692,7 +692,8 @@ async fn add_source_inserts_pending_file_record_and_lists_scoped() {
     let src = engine
         .add_source(&nb.id, "report.pdf", "/abs/report.pdf")
         .await
-        .unwrap();
+        .unwrap()
+        .source;
     assert_eq!(src.kind, "file");
     assert_eq!(src.status, "pending");
     assert_eq!(src.title, "report.pdf");

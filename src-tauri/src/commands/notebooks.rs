@@ -59,7 +59,9 @@ pub async fn create_notebook(
 }
 
 /// Inserts a file source record for a notebook (M1 onboarding "Add sources").
-/// Records only — no ingestion. Returns the inserted source.
+/// Records only — no ingestion. Returns an [`AddSourceOutcome`]
+/// (`{ source, wasExisting }` on the wire) — on a PATH-based dedup hit (issue
+/// #100) the existing live source is returned with `wasExisting = true`.
 #[tracing::instrument(skip_all)]
 #[tauri::command]
 pub async fn add_source(
@@ -67,7 +69,7 @@ pub async fn add_source(
     title: String,
     locator: String,
     engine: tauri::State<'_, LensEngine>,
-) -> Result<Source, LensError> {
+) -> Result<AddSourceOutcome, LensError> {
     engine
         .add_source(&NotebookId::from(notebook_id), &title, &locator)
         .await
@@ -455,7 +457,8 @@ mod tests {
             engine.clone(),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .source;
         assert_eq!(src.kind, "file");
         assert_eq!(src.status, "pending");
         assert_eq!(src.locator, "/abs/path/report.pdf");

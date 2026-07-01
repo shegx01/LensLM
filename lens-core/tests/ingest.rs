@@ -3459,6 +3459,87 @@ async fn add_text_source_dedup_returns_existing() {
     assert_eq!(live.len(), 2, "only two distinct rows exist");
 }
 
+/// AC-7 / AC-8: the M1 onboarding `add_source` path deduplicates on the LOCATOR
+/// (path bytes, NOT file content). Adding the same path twice returns the
+/// existing source (`was_existing = true`); a different path is a fresh insert.
+#[tokio::test]
+async fn add_source_onboarding_dedup() {
+    let (_dir, engine) = file_engine().await;
+    let nb = engine
+        .create_notebook("onboarding-dedup-nb", None, None)
+        .await
+        .unwrap();
+
+    let first = engine
+        .add_source(&nb.id, "notes", "/path/to/file.pdf")
+        .await
+        .unwrap();
+    assert!(!first.was_existing, "first add is a fresh insert");
+
+    let second = engine
+        .add_source(&nb.id, "notes-again", "/path/to/file.pdf")
+        .await
+        .unwrap();
+    assert!(second.was_existing, "same path is a dedup hit");
+    assert_eq!(second.source.id, first.source.id);
+
+    let third = engine
+        .add_source(&nb.id, "other", "/path/to/other.pdf")
+        .await
+        .unwrap();
+    assert!(!third.was_existing, "a different path is a fresh insert");
+
+    let live = engine.list_sources(&nb.id).await.unwrap();
+    assert_eq!(live.len(), 2, "only two distinct path rows exist");
+}
+
+/// AC-5: restoring a trashed source whose `raw_content_hash` matches a LIVE
+/// source in the same notebook is rejected with a clear `LensError::Validation`
+/// instead of a raw UNIQUE-constraint error.
+#[tokio::test]
+async fn restore_source_rejects_hash_collision() {
+    let (_dir, engine) = file_engine().await;
+    let nb = engine
+        .create_notebook("restore-collision-nb", None, None)
+        .await
+        .unwrap();
+
+    // Add file source A (populates raw_content_hash = H).
+    let src_dir = tempfile::tempdir().unwrap();
+    let path_a = src_dir.path().join("a.txt");
+    std::fs::write(&path_a, "identical content bytes").unwrap();
+    let a = engine.add_file_source(&nb.id, &path_a, None).await.unwrap();
+    assert!(!a.was_existing);
+    let a = a.source;
+
+    // Trash A so the partial unique index frees the (notebook, H) slot.
+    engine.trash_source(&a.id).await.unwrap();
+
+    // Add file source B with the SAME content (same hash H, new id — allowed
+    // because A is trashed).
+    let path_b = src_dir.path().join("b.txt");
+    std::fs::write(&path_b, "identical content bytes").unwrap();
+    let b = engine.add_file_source(&nb.id, &path_b, None).await.unwrap();
+    assert!(!b.was_existing, "B is a fresh insert while A is trashed");
+    assert_ne!(b.source.id, a.id);
+    assert_eq!(
+        b.source.raw_content_hash, a.raw_content_hash,
+        "A and B share the same content hash"
+    );
+
+    // Restoring A must now be rejected — B is a live collision.
+    let err = engine.restore_source(&a.id).await;
+    match err {
+        Err(lens_core::LensError::Validation(msg)) => {
+            assert!(
+                msg.contains("already exists"),
+                "collision message should mention the duplicate, got {msg:?}"
+            );
+        }
+        other => panic!("expected Validation collision error, got {other:?}"),
+    }
+}
+
 // ===========================================================================
 // M4 issue #77 — RTF / ODT / EPUB extractor integration & snapshot tests
 // ===========================================================================

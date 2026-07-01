@@ -544,14 +544,17 @@ impl LensEngine {
             .await
     }
 
-    /// Inserts a file source record for a notebook (M1 onboarding). Returns it.
+    /// Inserts a file source record for a notebook (M1 onboarding). Returns an
+    /// [`AddSourceOutcome`]: on a PATH-based dedup hit (issue #100 — this path
+    /// hashes the locator, not file content) the existing live source is returned
+    /// (`was_existing = true`).
     #[tracing::instrument(skip_all)]
     pub async fn add_source(
         &self,
         notebook_id: &NotebookId,
         title: &str,
         locator: &str,
-    ) -> Result<Source, LensError> {
+    ) -> Result<AddSourceOutcome, LensError> {
         let pool = self.pool().await;
         NotebookRepo::new(&pool)
             .add_source(notebook_id, title, locator)
