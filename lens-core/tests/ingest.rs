@@ -3540,6 +3540,71 @@ async fn restore_source_rejects_hash_collision() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// issue #100 Step 6 — LensEngine-level end-to-end dedup coverage
+// ---------------------------------------------------------------------------
+
+/// LensEngine-level: adding identical text through the full engine wrapper
+/// stack deduplicates and leaves exactly one row.
+#[tokio::test]
+async fn engine_add_text_source_dedup_end_to_end() {
+    let (_dir, engine) = file_engine().await;
+    let nb = engine
+        .create_notebook("engine-text-dedup", None, None)
+        .await
+        .unwrap();
+
+    let first = engine
+        .add_text_source(&nb.id, "note", "hello", "text")
+        .await
+        .unwrap();
+    assert!(!first.was_existing);
+
+    let second = engine
+        .add_text_source(&nb.id, "note", "hello", "text")
+        .await
+        .unwrap();
+    assert!(second.was_existing, "identical text dedups end-to-end");
+    assert_eq!(second.source.id, first.source.id);
+
+    assert_eq!(
+        engine.list_sources(&nb.id).await.unwrap().len(),
+        1,
+        "exactly one source row after a dedup hit"
+    );
+}
+
+/// LensEngine-level: the restore-collision guard produces a clear
+/// `LensError::Validation` when restoring into a live content collision.
+#[tokio::test]
+async fn restore_source_collision_guard_end_to_end() {
+    let (_dir, engine) = file_engine().await;
+    let nb = engine
+        .create_notebook("engine-restore-collision", None, None)
+        .await
+        .unwrap();
+
+    let src_dir = tempfile::tempdir().unwrap();
+    let path_a = src_dir.path().join("a.txt");
+    std::fs::write(&path_a, "same content").unwrap();
+    let a = engine
+        .add_file_source(&nb.id, &path_a, None)
+        .await
+        .unwrap()
+        .source;
+    engine.trash_source(&a.id).await.unwrap();
+
+    let path_b = src_dir.path().join("b.txt");
+    std::fs::write(&path_b, "same content").unwrap();
+    engine.add_file_source(&nb.id, &path_b, None).await.unwrap();
+
+    let err = engine.restore_source(&a.id).await;
+    assert!(
+        matches!(err, Err(lens_core::LensError::Validation(ref m)) if m.contains("already exists")),
+        "restore into a live collision must be a clear Validation error, got {err:?}"
+    );
+}
+
 // ===========================================================================
 // M4 issue #77 — RTF / ODT / EPUB extractor integration & snapshot tests
 // ===========================================================================

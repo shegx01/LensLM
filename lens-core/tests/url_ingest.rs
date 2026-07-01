@@ -652,6 +652,36 @@ async fn add_url_source_dedup_returns_existing() {
     assert_eq!(live.len(), 2, "only two distinct URL rows exist");
 }
 
+/// issue #100 Step 6 — LensEngine-level: adding an equivalent URL (host case)
+/// through the full engine wrapper stack deduplicates and leaves one row.
+#[tokio::test]
+async fn engine_add_url_source_dedup_end_to_end() {
+    let (_dir, engine) = file_engine().await;
+    let nb = engine
+        .create_notebook("engine-url-dedup", None, None)
+        .await
+        .expect("notebook");
+
+    let first = engine
+        .add_url_source(&nb.id, "page", "https://Example.COM/page")
+        .await
+        .expect("add_url_source");
+    assert!(!first.was_existing);
+
+    let second = engine
+        .add_url_source(&nb.id, "page", "https://example.com/page")
+        .await
+        .expect("add_url_source");
+    assert!(second.was_existing, "case-differing host dedups end-to-end");
+    assert_eq!(second.source.id, first.source.id);
+
+    assert_eq!(
+        engine.list_sources(&nb.id).await.unwrap().len(),
+        1,
+        "exactly one URL row after a dedup hit"
+    );
+}
+
 // ===========================================================================
 // Item 5 — URL `.extracted.txt` sibling is removed on purge (no leak)
 // ===========================================================================
