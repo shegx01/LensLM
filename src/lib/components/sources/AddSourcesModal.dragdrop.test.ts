@@ -87,20 +87,24 @@ vi.mock('$lib/sources/ipc.js', () => ({
   listSources: vi.fn().mockResolvedValue([]),
   addTextSource: vi.fn().mockResolvedValue({ id: 'src-new', status: 'pending' }),
   addFileSource: vi.fn().mockResolvedValue({
-    id: 'src-new',
-    notebook_id: 'nb-001',
-    kind: 'file',
-    title: 'a.pdf',
-    status: 'pending',
-    locator: '/tmp/a.pdf',
-    selected: 1,
-    created_at: new Date().toISOString(),
-    token_count: null,
-    content_hash: null,
-    trashed_at: null,
-    enrichment_status: null,
-    enrichment_meta: null
-  } satisfies Source),
+    source: {
+      id: 'src-new',
+      notebook_id: 'nb-001',
+      kind: 'file',
+      title: 'a.pdf',
+      status: 'pending',
+      locator: '/tmp/a.pdf',
+      selected: 1,
+      created_at: new Date().toISOString(),
+      token_count: null,
+      content_hash: null,
+      file_hash: null,
+      trashed_at: null,
+      enrichment_status: null,
+      enrichment_meta: null
+    } satisfies Source,
+    wasExisting: false
+  }),
   ingestSource: vi.fn().mockResolvedValue(undefined),
   setSourceSelected: vi.fn().mockResolvedValue(undefined),
   trashSource: vi.fn().mockResolvedValue(undefined),
@@ -161,6 +165,39 @@ vi.mock('@tauri-apps/api/webview', () => ({
 
 import AddSourcesModal from './AddSourcesModal.svelte';
 import { addFileSource } from '$lib/sources/ipc.js';
+import { open as openFilePicker } from '@tauri-apps/plugin-dialog';
+import { addSourceLocal, ingest } from '$lib/sources/sources-state.svelte.js';
+import { showToast } from '$lib/sources/toast.svelte.js';
+
+// Typed handles onto the mocked functions (each is a vi.fn()).
+const mockAddFileSource = vi.mocked(addFileSource);
+const mockOpenFilePicker = vi.mocked(openFilePicker);
+const mockAddSourceLocal = vi.mocked(addSourceLocal);
+const mockIngest = vi.mocked(ingest);
+const mockShowToast = vi.mocked(showToast);
+
+/** Build the `{ source, wasExisting }` outcome the backend returns. */
+function outcome(id: string, wasExisting: boolean) {
+  return {
+    source: {
+      id,
+      notebook_id: 'nb-001',
+      kind: 'file',
+      title: `${id}.pdf`,
+      status: 'pending',
+      locator: `/tmp/${id}.pdf`,
+      selected: 1,
+      created_at: new Date().toISOString(),
+      token_count: null,
+      content_hash: null,
+      file_hash: null,
+      trashed_at: null,
+      enrichment_status: null,
+      enrichment_meta: null
+    } satisfies Source,
+    wasExisting
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -319,5 +356,168 @@ describe('AddSourcesModal — native drag-drop registration ($effect fix)', () =
 
     expect(addFileSource).not.toHaveBeenCalled();
     expect(onclose).not.toHaveBeenCalled();
+  });
+});
+
+// ===========================================================================
+// #96 — shared ingestPaths dispatch (exercised via the drop handler) + the
+// multi-select browse picker. ingestPaths is an internal helper; it is tested
+// through its two real entry points (drop + browse) — the same surface the app
+// uses — asserting on addFileSource / addSourceLocal / ingest / showToast /
+// onclose, which fully pins its behavior.
+// ===========================================================================
+
+/** Render an open modal and wait until the native drop handler is registered. */
+async function renderOpenWithDrop(onclose = vi.fn()) {
+  render(AddSourcesModal, { open: true, onclose });
+  await flushEffects(10);
+  await waitFor(() => expect(capturedHandler).not.toBeNull(), { timeout: 500 });
+  return { onclose };
+}
+
+/** Fire a native drop of the given (already-supported) paths. */
+function fireDrop(paths: string[]): void {
+  capturedHandler!({ payload: { type: 'drop', paths } });
+}
+
+describe('AddSourcesModal — ingestPaths batch dispatch (#96, via drop)', () => {
+  it('all-success: adds every path, ingests each, closes the modal, no toast', async () => {
+    mockAddFileSource
+      .mockResolvedValueOnce(outcome('s1', false))
+      .mockResolvedValueOnce(outcome('s2', false))
+      .mockResolvedValueOnce(outcome('s3', false));
+    const { onclose } = await renderOpenWithDrop();
+
+    fireDrop(['/tmp/a.pdf', '/tmp/b.txt', '/tmp/c.md']);
+
+    await waitFor(() => expect(mockAddFileSource).toHaveBeenCalledTimes(3), { timeout: 1000 });
+    await waitFor(() => expect(onclose).toHaveBeenCalledOnce(), { timeout: 1000 });
+    expect(mockAddSourceLocal).toHaveBeenCalledTimes(3);
+    expect(mockIngest).toHaveBeenCalledTimes(3);
+    // Clean batch (all added) → no summary toast.
+    expect(mockShowToast).not.toHaveBeenCalled();
+  });
+
+  it('partial-failure: batch continues, closes (added>0), toast reports the failure', async () => {
+    mockAddFileSource
+      .mockResolvedValueOnce(outcome('s1', false))
+      .mockRejectedValueOnce(new Error('boom'))
+      .mockResolvedValueOnce(outcome('s3', false));
+    const { onclose } = await renderOpenWithDrop();
+
+    fireDrop(['/tmp/a.pdf', '/tmp/b.txt', '/tmp/c.md']);
+
+    await waitFor(() => expect(mockAddFileSource).toHaveBeenCalledTimes(3), { timeout: 1000 });
+    await waitFor(() => expect(onclose).toHaveBeenCalledOnce(), { timeout: 1000 });
+    // Only the two successes were inserted + ingested.
+    expect(mockAddSourceLocal).toHaveBeenCalledTimes(2);
+    expect(mockIngest).toHaveBeenCalledTimes(2);
+    await waitFor(() => expect(mockShowToast).toHaveBeenCalledWith('2 added, 1 failed'), {
+      timeout: 1000
+    });
+  });
+
+  it('all-fail: nothing added, modal stays open, toast reports failures', async () => {
+    mockAddFileSource
+      .mockRejectedValueOnce(new Error('boom'))
+      .mockRejectedValueOnce(new Error('boom'))
+      .mockRejectedValueOnce(new Error('boom'));
+    const { onclose } = await renderOpenWithDrop();
+
+    fireDrop(['/tmp/a.pdf', '/tmp/b.txt', '/tmp/c.md']);
+
+    await waitFor(() => expect(mockAddFileSource).toHaveBeenCalledTimes(3), { timeout: 1000 });
+    await waitFor(() => expect(mockShowToast).toHaveBeenCalledWith('3 failed'), { timeout: 1000 });
+    expect(mockAddSourceLocal).not.toHaveBeenCalled();
+    expect(mockIngest).not.toHaveBeenCalled();
+    expect(onclose).not.toHaveBeenCalled();
+  });
+
+  it('duplicate-skip: wasExisting path is skipped (no addSourceLocal/ingest)', async () => {
+    mockAddFileSource
+      .mockResolvedValueOnce(outcome('s1', false))
+      .mockResolvedValueOnce(outcome('s2', true));
+    const { onclose } = await renderOpenWithDrop();
+
+    fireDrop(['/tmp/a.pdf', '/tmp/b.txt']);
+
+    await waitFor(() => expect(mockAddFileSource).toHaveBeenCalledTimes(2), { timeout: 1000 });
+    await waitFor(() => expect(onclose).toHaveBeenCalledOnce(), { timeout: 1000 });
+    // Only the non-duplicate was inserted + ingested.
+    expect(mockAddSourceLocal).toHaveBeenCalledTimes(1);
+    expect(mockIngest).toHaveBeenCalledTimes(1);
+    await waitFor(
+      () => expect(mockShowToast).toHaveBeenCalledWith('1 added, 1 already in notebook'),
+      {
+        timeout: 1000
+      }
+    );
+  });
+
+  it('all-skipped: modal stays open (added=0), toast shows "already in notebook"', async () => {
+    mockAddFileSource
+      .mockResolvedValueOnce(outcome('s1', true))
+      .mockResolvedValueOnce(outcome('s2', true))
+      .mockResolvedValueOnce(outcome('s3', true));
+    const { onclose } = await renderOpenWithDrop();
+
+    fireDrop(['/tmp/a.pdf', '/tmp/b.txt', '/tmp/c.md']);
+
+    await waitFor(() => expect(mockAddFileSource).toHaveBeenCalledTimes(3), { timeout: 1000 });
+    await waitFor(() => expect(mockShowToast).toHaveBeenCalledWith('3 already in notebook'), {
+      timeout: 1000
+    });
+    expect(mockAddSourceLocal).not.toHaveBeenCalled();
+    expect(mockIngest).not.toHaveBeenCalled();
+    expect(onclose).not.toHaveBeenCalled();
+  });
+
+  it('batch summary toast: mixed added + skipped', async () => {
+    mockAddFileSource
+      .mockResolvedValueOnce(outcome('s1', false))
+      .mockResolvedValueOnce(outcome('s2', false))
+      .mockResolvedValueOnce(outcome('s3', true));
+    await renderOpenWithDrop();
+
+    fireDrop(['/tmp/a.pdf', '/tmp/b.txt', '/tmp/c.md']);
+
+    await waitFor(
+      () => expect(mockShowToast).toHaveBeenCalledWith('2 added, 1 already in notebook'),
+      { timeout: 1000 }
+    );
+  });
+});
+
+describe('AddSourcesModal — multi-select browse picker (#96)', () => {
+  it('multi-select: picker returns 3 paths → addFileSource called 3x with multiple:true', async () => {
+    mockOpenFilePicker.mockResolvedValueOnce(['/tmp/a.pdf', '/tmp/b.txt', '/tmp/c.md']);
+    mockAddFileSource
+      .mockResolvedValueOnce(outcome('s1', false))
+      .mockResolvedValueOnce(outcome('s2', false))
+      .mockResolvedValueOnce(outcome('s3', false));
+    render(AddSourcesModal, { open: true });
+    await flushEffects(10);
+
+    const browseBtn = await screen.findByRole('button', { name: /browse your computer/i });
+    browseBtn.click();
+
+    await waitFor(() => expect(mockAddFileSource).toHaveBeenCalledTimes(3), { timeout: 1000 });
+    // The picker must be opened in multi-select mode.
+    expect(mockOpenFilePicker).toHaveBeenCalledWith(expect.objectContaining({ multiple: true }));
+    expect(mockAddFileSource).toHaveBeenNthCalledWith(1, 'nb-001', 'a.pdf', '/tmp/a.pdf');
+    expect(mockAddFileSource).toHaveBeenNthCalledWith(3, 'nb-001', 'c.md', '/tmp/c.md');
+  });
+
+  it('single-select compat: picker returns a bare string → normalized to one path', async () => {
+    mockOpenFilePicker.mockResolvedValueOnce('/tmp/only.pdf');
+    mockAddFileSource.mockResolvedValueOnce(outcome('s1', false));
+    render(AddSourcesModal, { open: true });
+    await flushEffects(10);
+
+    const browseBtn = await screen.findByRole('button', { name: /browse your computer/i });
+    browseBtn.click();
+
+    await waitFor(() => expect(mockAddFileSource).toHaveBeenCalledTimes(1), { timeout: 1000 });
+    expect(mockAddFileSource).toHaveBeenCalledWith('nb-001', 'only.pdf', '/tmp/only.pdf');
   });
 });

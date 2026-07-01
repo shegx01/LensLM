@@ -41,15 +41,22 @@ export async function addTextSource(
  * detects the source `kind` from the file EXTENSION (.md/.txt/.pdf/.docx/json/
  * jsonl/yaml/xml); an unsupported extension is rejected. (The older `add_source`
  * command recorded a generic `kind="file"` that the ingest pipeline rejects.)
- * Returns the created `Source` row.
+ *
+ * Returns an `AddFileOutcome` (`{ source, wasExisting }`): on a content-dedup
+ * hit (#96) the existing live source is returned with `wasExisting = true` and
+ * no new row is written. Mirrors the Rust `AddFileOutcome` (serde camelCase).
  */
 export async function addFileSource(
   notebookId: string,
   title: string,
   path: string
-): Promise<Source> {
+): Promise<{ source: Source; wasExisting: boolean }> {
   if (!isTauri()) throw new Error('addFileSource: not running under Tauri');
-  return invoke<Source>('add_file_source', { notebookId, path, title });
+  return invoke<{ source: Source; wasExisting: boolean }>('add_file_source', {
+    notebookId,
+    path,
+    title
+  });
 }
 
 /**

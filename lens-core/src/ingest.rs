@@ -913,7 +913,7 @@ async fn run_ingest(
 }
 
 /// SHA-256 of `bytes`, lowercase hex.
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     crate::hex_encode(&Sha256::digest(bytes))
 }
 

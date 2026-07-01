@@ -60,7 +60,8 @@ async fn ingest_xlsx_end_to_end() {
     let src = engine
         .add_file_source(&nb.id, &path, Some("People & Cities"))
         .await
-        .expect("add xlsx source");
+        .expect("add xlsx source")
+        .source;
 
     engine
         .ingest_source(&src.id, |_p| {})
@@ -105,7 +106,8 @@ async fn ingest_csv_end_to_end() {
     let src = engine
         .add_file_source(&nb.id, &path, Some("People CSV"))
         .await
-        .expect("add csv source");
+        .expect("add csv source")
+        .source;
 
     engine
         .ingest_source(&src.id, |_p| {})
@@ -149,7 +151,8 @@ async fn embed_never_tables_md() {
     let src = engine
         .add_file_source(&nb.id, &path, None)
         .await
-        .expect("add csv source");
+        .expect("add csv source")
+        .source;
     engine
         .ingest_source(&src.id, |_p| {})
         .await
@@ -198,7 +201,8 @@ async fn purge_tabular_source() {
     let src = engine
         .add_file_source(&nb.id, &path, None)
         .await
-        .expect("add csv source");
+        .expect("add csv source")
+        .source;
     engine
         .ingest_source(&src.id, |_p| {})
         .await
@@ -246,7 +250,8 @@ async fn purge_notebook_removes_tables_md() {
     let src = engine
         .add_file_source(&nb.id, &path, None)
         .await
-        .expect("add csv source");
+        .expect("add csv source")
+        .source;
     engine
         .ingest_source(&src.id, |_p| {})
         .await

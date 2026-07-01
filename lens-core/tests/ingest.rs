@@ -929,6 +929,156 @@ async fn reingest_idempotency_and_wipe() {
     );
 }
 
+/// #96 regression: the add-time `file_hash` (raw-bytes SHA-256) must NOT break
+/// the ingest-time `content_hash` re-ingest no-op. A `.docx` source is used as
+/// a derived (non-text_like) kind: its `content_hash` hashes the raw file bytes,
+/// the same input as `file_hash`, so the two are EQUAL by design. The
+/// load-bearing assertion here is the re-ingest no-op (unchanged `content_hash`
+/// / chunk count), not hash inequality. See `file_hash_differs_from_content_hash_for_text`
+/// for the text-source case where they diverge.
+#[tokio::test]
+async fn file_hash_does_not_break_reingest_noop() {
+    if !tokenizer_available().await {
+        eprintln!("skipping file_hash_does_not_break_reingest_noop: no tokenizer (offline)");
+        return;
+    }
+    let (_dir, engine) = inject_counting_engine().await;
+
+    let nb = engine
+        .create_notebook("file-hash-noop-nb", None, None)
+        .await
+        .unwrap();
+
+    // Add a real FILE source (not paste) so `file_hash` is populated at add time.
+    // `.docx` is a DERIVED (non-text_like) kind, so at ingest time content_hash
+    // hashes the RAW file bytes (ingest.rs:625) — the SAME bytes file_hash hashes
+    // at add time. They are therefore EQUAL by design; the load-bearing guard is
+    // the re-ingest no-op (unchanged chunk count) asserted below, not hash
+    // inequality.
+    let src_dir = tempfile::tempdir().unwrap();
+    let src_path = src_dir.path().join("doc.docx");
+    std::fs::write(
+        &src_path,
+        build_e2e_docx_bytes("Body text for the file_hash re-ingest no-op regression."),
+    )
+    .unwrap();
+    let outcome = engine
+        .add_file_source(&nb.id, &src_path, None)
+        .await
+        .unwrap();
+    assert!(!outcome.was_existing);
+    let src = outcome.source;
+    let file_hash = src.file_hash.clone().expect("file source has file_hash");
+    assert_eq!(src.content_hash, None, "content_hash is NULL until ingest");
+
+    // First ingest → indexed, content_hash populated over the extracted text.
+    engine.ingest_source(&src.id, |_p| {}).await.unwrap();
+    assert_eq!(engine_source_status(&engine, &src.id).await, "indexed");
+    let chunks_after_first = count_chunks(&engine, &src.id).await;
+    assert!(chunks_after_first > 0);
+
+    let pool = engine.pool().await;
+    let content_hash: Option<String> =
+        sqlx::query_scalar("SELECT content_hash FROM sources WHERE id = ?")
+            .bind(&src.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let content_hash = content_hash.expect("content_hash set after ingest");
+    assert_eq!(
+        content_hash, file_hash,
+        "for a DERIVED (non-text_like) kind, content_hash hashes the raw file bytes — same as file_hash"
+    );
+
+    // The stored file_hash is unchanged by ingestion.
+    let stored_file_hash: Option<String> =
+        sqlx::query_scalar("SELECT file_hash FROM sources WHERE id = ?")
+            .bind(&src.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        stored_file_hash,
+        Some(file_hash),
+        "ingestion must not touch file_hash"
+    );
+
+    // Re-ingest with UNCHANGED content → no-op driven by content_hash.
+    engine.ingest_source(&src.id, |_p| {}).await.unwrap();
+    assert_eq!(engine_source_status(&engine, &src.id).await, "indexed");
+    assert_eq!(
+        count_chunks(&engine, &src.id).await,
+        chunks_after_first,
+        "unchanged re-ingest must remain a no-op after file_hash exists"
+    );
+}
+
+/// For a TEXT source (`.txt` or `.md`) the `TextExtractor` returns the raw file
+/// bytes re-interpreted as UTF-8 verbatim: `extracted_text = s.to_string()` where
+/// `s = std::str::from_utf8(raw)`. The ingest pipeline then computes
+/// `content_hash = sha256_hex(canonical.as_bytes())` with `canonical = &extracted_text`,
+/// which is byte-identical to `raw`. Meanwhile `add_file_source` hashes the
+/// same raw bytes via `sha256_file`. Therefore `content_hash == file_hash` for
+/// all valid UTF-8 text sources — the two hashes are NOT independent for this kind.
+///
+/// This test documents and asserts that equality. For the DERIVED (non-text_like)
+/// case (`.docx`) see `file_hash_does_not_break_reingest_noop`, which carries the
+/// same assertion and the load-bearing re-ingest no-op guard.
+#[tokio::test]
+async fn file_hash_differs_from_content_hash_for_text() {
+    // NOTE: Despite the name required by the spec, the canonicalization evidence
+    // above shows they are EQUAL for text sources. This test asserts the true
+    // invariant: content_hash == file_hash for UTF-8 text-like sources.
+    if !tokenizer_available().await {
+        eprintln!("skipping file_hash_differs_from_content_hash_for_text: no tokenizer (offline)");
+        return;
+    }
+    let (_dir, engine) = inject_counting_engine().await;
+
+    let nb = engine
+        .create_notebook("file-hash-text-nb", None, None)
+        .await
+        .unwrap();
+
+    // Write a plain-text file. Any valid UTF-8 content will do — the TextExtractor
+    // returns it byte-for-byte, so content_hash and file_hash hash the same bytes.
+    let src_dir = tempfile::tempdir().unwrap();
+    let src_path = src_dir.path().join("note.txt");
+    let content = "Hello, world!\n\nThis is a plain-text source.\n";
+    std::fs::write(&src_path, content.as_bytes()).unwrap();
+
+    let outcome = engine
+        .add_file_source(&nb.id, &src_path, None)
+        .await
+        .unwrap();
+    assert!(!outcome.was_existing);
+    let src = outcome.source;
+    let file_hash = src.file_hash.clone().expect("file source has file_hash");
+    assert_eq!(src.content_hash, None, "content_hash is NULL until ingest");
+
+    // Ingest → indexed, content_hash populated.
+    engine.ingest_source(&src.id, |_p| {}).await.unwrap();
+    assert_eq!(engine_source_status(&engine, &src.id).await, "indexed");
+
+    let pool = engine.pool().await;
+    let content_hash: Option<String> =
+        sqlx::query_scalar("SELECT content_hash FROM sources WHERE id = ?")
+            .bind(&src.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let content_hash = content_hash.expect("content_hash set after ingest");
+
+    // For text-like sources: TextExtractor returns raw bytes as extracted_text
+    // (no normalization). content_hash = sha256(extracted_text.as_bytes())
+    // = sha256(raw bytes) = file_hash. They are EQUAL by design.
+    assert_eq!(
+        content_hash, file_hash,
+        "for a text-like source, content_hash hashes the raw UTF-8 bytes — \
+         same input as file_hash — so they are EQUAL"
+    );
+}
+
 async fn live_chunk_ids(engine: &LensEngine, source_id: &str) -> std::collections::HashSet<String> {
     let pool = engine.pool().await;
     let rows: Vec<String> = sqlx::query_scalar("SELECT id FROM chunks WHERE source_id = ?")
@@ -2736,7 +2886,8 @@ async fn docx_file_source_indexed_with_anchors_end_to_end() {
     let source = engine
         .add_file_source(&nb.id, &src_path, None)
         .await
-        .expect("add_file_source for a .docx must succeed");
+        .expect("add_file_source for a .docx must succeed")
+        .source;
     assert_eq!(source.kind, "docx", "extension .docx → kind docx");
     assert_eq!(source.status, "queued", "new file source is queued");
     assert_eq!(
@@ -2861,7 +3012,8 @@ async fn pdf_file_source_indexed_with_anchors_end_to_end() {
     let source = engine
         .add_file_source(&nb.id, &src_path, Some("Custom Title"))
         .await
-        .expect("add_file_source for a .pdf must succeed");
+        .expect("add_file_source for a .pdf must succeed")
+        .source;
     assert_eq!(source.kind, "pdf", "extension .pdf → kind pdf");
     assert_eq!(source.status, "queued");
     assert_eq!(source.title, "Custom Title", "supplied title is honored");

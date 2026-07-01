@@ -7,9 +7,12 @@
 //! takes a `&SqlitePool`. `LensEngine` exposes a `pool()` accessor and delegates.
 
 use std::fmt;
+use std::io::Read as _;
 use std::ops::Deref;
 use std::path::Path;
 use std::str::FromStr;
+
+use sha2::{Digest, Sha256};
 
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -274,6 +277,13 @@ pub struct Source {
     /// Used to short-circuit re-ingest when the content is unchanged. `None`
     /// until the source has been ingested.
     pub content_hash: Option<String>,
+    /// SHA-256 of the RAW file bytes, computed at *add* time (issue #96), used as
+    /// the add-time dedup key. SEPARATE from `content_hash` (extracted-text hash,
+    /// set at ingest time). `None` for text/paste/url sources and pre-migration
+    /// rows. A partial unique index on `(notebook_id, file_hash) WHERE trashed_at
+    /// IS NULL AND file_hash IS NOT NULL` enforces at-most-one live source per
+    /// (notebook, raw-content) pair.
+    pub file_hash: Option<String>,
     /// RFC3339 creation timestamp.
     pub created_at: String,
     /// RFC3339 soft-delete timestamp, or `None` if live.
@@ -285,6 +295,24 @@ pub struct Source {
     /// JSON enrichment metadata (composite cache key + budget/skip reason),
     /// written by the enrichment worker. `None` until the source is enriched.
     pub enrichment_meta: Option<String>,
+}
+
+/// The result of [`NotebookRepo::add_file_source`] (issue #96).
+///
+/// Carries the [`Source`] row plus a `was_existing` flag distinguishing a
+/// freshly-inserted source (`false`) from a dedup hit — an already-present live
+/// source in the same notebook with identical raw-file content (`true`). Serde
+/// `camelCase` renaming yields the wire shape `{ source, wasExisting }` for the
+/// Tauri command and the frontend `addFileSource` IPC wrapper.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddFileOutcome {
+    /// The inserted (or pre-existing, on a dedup hit) source row.
+    pub source: Source,
+    /// `true` when the content already existed in the notebook (dedup hit — no
+    /// new row was written and the file was NOT copied to managed storage);
+    /// `false` when a new source row was inserted.
+    pub was_existing: bool,
 }
 
 /// A chunk row projected for the enrichment pass (M4 Phase-3 Step 4).
@@ -441,6 +469,23 @@ pub struct NotebookSummary {
     pub notebook: Notebook,
     /// Number of sources belonging to this notebook (`COUNT` of `sources`).
     pub source_count: i64,
+}
+
+/// SHA-256 of the file at `path`, computed by streaming 64 KiB chunks so the
+/// entire file is never held in memory at once. Returns the lowercase hex digest.
+fn sha256_file(path: &Path) -> std::io::Result<String> {
+    const CHUNK: usize = 64 * 1024;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; CHUNK];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(crate::hex_encode(&hasher.finalize()))
 }
 
 /// Validates and normalizes a user-supplied notebook title.
@@ -748,6 +793,7 @@ impl<'a> NotebookRepo<'a> {
             selected: 1,
             token_count: None,
             content_hash: None,
+            file_hash: None,
             created_at: now,
             trashed_at: None,
             enrichment_status: None,
@@ -833,6 +879,7 @@ impl<'a> NotebookRepo<'a> {
             selected: 1,
             token_count: None,
             content_hash: None,
+            file_hash: None,
             created_at: now,
             trashed_at: None,
             enrichment_status: None,
@@ -853,15 +900,26 @@ impl<'a> NotebookRepo<'a> {
     /// [`add_text_source`](Self::add_text_source) — and a purge of the source
     /// reclaims the copy via `remove_managed_source_file`). Inserts a `sources`
     /// row with `status = "queued"`, `selected = 1`. `title` defaults to the
-    /// source file's name when not supplied. Returns the inserted [`Source`]
-    /// (`token_count`/`content_hash` are `NULL` until ingestion populates them).
+    /// source file's name when not supplied.
+    ///
+    /// **Content dedup (issue #96):** the file is hashed (SHA-256) by streaming
+    /// 64 KiB chunks — the entire file is never buffered in memory — and the
+    /// digest stored as `file_hash`. If a live (non-trashed) source in the same
+    /// notebook already carries that `file_hash`, this returns the existing row
+    /// (`was_existing = true`) WITHOUT copying the file or inserting a new row. A
+    /// partial unique index on `(notebook_id, file_hash) WHERE trashed_at IS NULL
+    /// AND file_hash IS NOT NULL` is the authoritative guard: the upfront `SELECT`
+    /// is a fast-path optimisation, and an `INSERT … ON CONFLICT DO NOTHING`
+    /// resolves any race (the loser cleans up its copy and re-queries the winner).
+    /// `content_hash` stays `NULL` at add time (populated later by ingestion) so
+    /// the re-ingest no-op is unaffected. Returns an [`AddFileOutcome`].
     pub async fn add_file_source(
         &self,
         data_dir: &Path,
         notebook_id: &NotebookId,
         src_path: &Path,
         title: Option<&str>,
-    ) -> Result<Source, LensError> {
+    ) -> Result<AddFileOutcome, LensError> {
         // Detect kind + canonical extension from the source file extension
         // (case-insensitive). An unknown / missing extension is a clear
         // validation error rather than a silently-mis-ingested source.
@@ -913,28 +971,60 @@ impl<'a> NotebookRepo<'a> {
                 .to_string(),
         };
 
+        // Hash the raw file bytes by streaming 64 KiB chunks — the entire file
+        // is never held in memory. A dedup hit returns immediately (no copy);
+        // a miss copies via std::fs::copy (kernel-streamed, no user-space buffer).
+        let file_hash = sha256_file(src_path)
+            .map_err(|e| LensError::Io(format!("hash {}: {e}", src_path.display())))?;
+
+        // SELECT projection reused by the fast-path check and the race re-query.
+        const SOURCE_SELECT: &str = "SELECT id, notebook_id, kind, title, status, locator, \
+             selected, token_count, content_hash, file_hash, created_at, trashed_at, \
+             enrichment_status, enrichment_meta \
+             FROM sources WHERE notebook_id = ? AND file_hash = ? AND trashed_at IS NULL LIMIT 1";
+
+        // Fast-path: a live source with identical raw content already exists.
+        // Return it WITHOUT copying the file or inserting a row.
+        if let Some(dup) = sqlx::query_as::<_, Source>(SOURCE_SELECT)
+            .bind(notebook_id)
+            .bind(&file_hash)
+            .fetch_optional(self.pool)
+            .await?
+        {
+            tracing::info!(
+                notebook_id = %notebook_id,
+                file_hash = %file_hash,
+                source_id = %dup.id,
+                "duplicate file detected at add time — returning existing source"
+            );
+            return Ok(AddFileOutcome {
+                source: dup,
+                was_existing: true,
+            });
+        }
+
         let id = Uuid::now_v7().to_string();
         let now = chrono::Utc::now().to_rfc3339();
 
-        // Copy the original file into the managed sources dir so `locator` is a
-        // managed path (so purge reclaims it and the ingest read path is the
-        // same as the paste/text path).
+        // Copy the source file into managed storage so `locator` is a managed
+        // path (purge reclaims it; the ingest read path matches the paste/text
+        // path). std::fs::copy uses kernel-level transfer — no user-space buffer.
         let sources_dir = data_dir.join("sources");
         std::fs::create_dir_all(&sources_dir)
             .map_err(|e| LensError::Io(format!("{}: {e}", sources_dir.display())))?;
         let dest = sources_dir.join(format!("{id}.{ext}"));
-        std::fs::copy(src_path, &dest).map_err(|e| {
-            LensError::Io(format!(
-                "copy {} -> {}: {e}",
-                src_path.display(),
-                dest.display()
-            ))
-        })?;
+        std::fs::copy(src_path, &dest)
+            .map_err(|e| LensError::Io(format!("copy {}: {e}", dest.display())))?;
         let locator = dest.display().to_string();
 
-        sqlx::query(
-            "INSERT INTO sources (id, notebook_id, kind, title, status, locator, selected, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
+        // Authoritative dedup: the partial unique index makes a racing duplicate
+        // insert a no-op. `ON CONFLICT DO NOTHING` (untargeted) lets SQLite pick
+        // the matching partial index, so no index-target ambiguity arises.
+        let result = sqlx::query(
+            "INSERT INTO sources (id, notebook_id, kind, title, status, locator, selected, \
+             created_at, file_hash) \
+             VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?) \
+             ON CONFLICT DO NOTHING",
         )
         .bind(&id)
         .bind(notebook_id)
@@ -943,23 +1033,49 @@ impl<'a> NotebookRepo<'a> {
         .bind(SourceStatus::Queued.as_str())
         .bind(&locator)
         .bind(&now)
+        .bind(&file_hash)
         .execute(self.pool)
         .await?;
 
-        Ok(Source {
-            id,
-            notebook_id: notebook_id.to_string(),
-            kind: kind.to_string(),
-            title,
-            status: SourceStatus::Queued.as_str().to_string(),
-            locator,
-            selected: 1,
-            token_count: None,
-            content_hash: None,
-            created_at: now,
-            trashed_at: None,
-            enrichment_status: None,
-            enrichment_meta: None,
+        if result.rows_affected() == 0 {
+            // Lost the race: another add inserted the winning row first. Reclaim
+            // the copy we just wrote and return the winner as an existing source.
+            let _ = std::fs::remove_file(&dest);
+            let winner = sqlx::query_as::<_, Source>(SOURCE_SELECT)
+                .bind(notebook_id)
+                .bind(&file_hash)
+                .fetch_one(self.pool)
+                .await?;
+            tracing::info!(
+                notebook_id = %notebook_id,
+                file_hash = %file_hash,
+                source_id = %winner.id,
+                "duplicate file detected via ON CONFLICT race — returning existing source"
+            );
+            return Ok(AddFileOutcome {
+                source: winner,
+                was_existing: true,
+            });
+        }
+
+        Ok(AddFileOutcome {
+            source: Source {
+                id,
+                notebook_id: notebook_id.to_string(),
+                kind: kind.to_string(),
+                title,
+                status: SourceStatus::Queued.as_str().to_string(),
+                locator,
+                selected: 1,
+                token_count: None,
+                content_hash: None,
+                file_hash: Some(file_hash),
+                created_at: now,
+                trashed_at: None,
+                enrichment_status: None,
+                enrichment_meta: None,
+            },
+            was_existing: false,
         })
     }
 
@@ -1000,6 +1116,7 @@ impl<'a> NotebookRepo<'a> {
             selected: 1,
             token_count: None,
             content_hash: None,
+            file_hash: None,
             created_at: now,
             trashed_at: None,
             enrichment_status: None,
@@ -1282,7 +1399,7 @@ impl<'a> NotebookRepo<'a> {
     pub async fn get_source(&self, id: &str) -> Result<Option<Source>, LensError> {
         let row = sqlx::query_as::<_, Source>(
             "SELECT id, notebook_id, kind, title, status, locator, selected, token_count, \
-             content_hash, created_at, trashed_at, enrichment_status, enrichment_meta \
+             content_hash, file_hash, created_at, trashed_at, enrichment_status, enrichment_meta \
              FROM sources WHERE id = ?",
         )
         .bind(id)
@@ -1295,7 +1412,7 @@ impl<'a> NotebookRepo<'a> {
     pub async fn list_sources(&self, notebook_id: &NotebookId) -> Result<Vec<Source>, LensError> {
         let rows = sqlx::query_as::<_, Source>(
             "SELECT id, notebook_id, kind, title, status, locator, selected, token_count, \
-             content_hash, created_at, trashed_at, enrichment_status, enrichment_meta \
+             content_hash, file_hash, created_at, trashed_at, enrichment_status, enrichment_meta \
              FROM sources WHERE notebook_id = ? AND trashed_at IS NULL ORDER BY created_at DESC",
         )
         .bind(notebook_id)
@@ -2016,7 +2133,8 @@ mod tests {
         let source = repo
             .add_file_source(data_dir, &nb.id, &src_path, None)
             .await
-            .expect("add_file_source must accept the extension");
+            .expect("add_file_source must accept the extension")
+            .source;
         source.kind
     }
 
@@ -2304,5 +2422,184 @@ mod tests {
         assert_eq!(stats[0].status, "active");
         assert_eq!(stats[1].model, "model-z");
         assert_eq!(stats[1].dim, 768);
+    }
+
+    // -----------------------------------------------------------------------
+    // #96 — add_file_source content-hash dedup (file_hash column)
+    // -----------------------------------------------------------------------
+
+    /// Creates a fresh notebook in `repo` and returns it.
+    async fn make_notebook(repo: &NotebookRepo<'_>, title: &str) -> Notebook {
+        repo.create(
+            title,
+            None,
+            None,
+            crate::embedder::registry::DEFAULT_EMBED_MODEL_ID,
+            "fastembed",
+        )
+        .await
+        .expect("create notebook")
+    }
+
+    /// Writes `bytes` to `dir/<name>` and returns the path.
+    fn write_source_file(dir: &Path, name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).expect("write source file");
+        path
+    }
+
+    #[tokio::test]
+    async fn add_file_source_computes_file_hash() {
+        let pool = test_pool().await;
+        let repo = NotebookRepo::new(&pool);
+        let nb = make_notebook(&repo, "Notebook").await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let data_dir = tmp.path();
+
+        let bytes = b"hello world content #96";
+        let src = write_source_file(data_dir, "a.txt", bytes);
+
+        let outcome = repo
+            .add_file_source(data_dir, &nb.id, &src, None)
+            .await
+            .expect("add_file_source");
+
+        assert!(!outcome.was_existing, "a fresh add is not an existing dup");
+        assert_eq!(
+            outcome.source.file_hash,
+            Some(crate::ingest::sha256_hex(bytes)),
+            "file_hash must be the SHA-256 of the raw file bytes"
+        );
+        // content_hash stays NULL at add time (ingest populates it later).
+        assert_eq!(outcome.source.content_hash, None);
+    }
+
+    #[tokio::test]
+    async fn add_file_source_dedup_returns_existing() {
+        let pool = test_pool().await;
+        let repo = NotebookRepo::new(&pool);
+        let nb = make_notebook(&repo, "Notebook").await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let data_dir = tmp.path();
+
+        let bytes = b"duplicate content bytes";
+        let first_path = write_source_file(data_dir, "first.txt", bytes);
+        let first = repo
+            .add_file_source(data_dir, &nb.id, &first_path, None)
+            .await
+            .expect("first add");
+        assert!(!first.was_existing);
+
+        // A DIFFERENT file path but IDENTICAL content → dedup hit, same id.
+        let second_path = write_source_file(data_dir, "second.txt", bytes);
+        let second = repo
+            .add_file_source(data_dir, &nb.id, &second_path, None)
+            .await
+            .expect("second add (dup)");
+        assert!(second.was_existing, "identical content is a dedup hit");
+        assert_eq!(
+            second.source.id, first.source.id,
+            "dedup returns the pre-existing source row"
+        );
+
+        // Exactly one live source row exists.
+        assert_eq!(
+            repo.list_sources(&nb.id).await.unwrap().len(),
+            1,
+            "no duplicate row inserted for identical content"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_file_source_dedup_different_content() {
+        let pool = test_pool().await;
+        let repo = NotebookRepo::new(&pool);
+        let nb = make_notebook(&repo, "Notebook").await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let data_dir = tmp.path();
+
+        let a = write_source_file(data_dir, "a.txt", b"content A");
+        let b = write_source_file(data_dir, "b.txt", b"content B - different");
+        let first = repo
+            .add_file_source(data_dir, &nb.id, &a, None)
+            .await
+            .unwrap();
+        let second = repo
+            .add_file_source(data_dir, &nb.id, &b, None)
+            .await
+            .unwrap();
+
+        assert!(!first.was_existing);
+        assert!(!second.was_existing, "different content is a new row");
+        assert_ne!(first.source.id, second.source.id);
+        assert_eq!(
+            repo.list_sources(&nb.id).await.unwrap().len(),
+            2,
+            "distinct content yields two rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_file_source_dedup_allows_trashed() {
+        let pool = test_pool().await;
+        let repo = NotebookRepo::new(&pool);
+        let nb = make_notebook(&repo, "Notebook").await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let data_dir = tmp.path();
+
+        let bytes = b"content that gets trashed then re-added";
+        let path = write_source_file(data_dir, "doc.txt", bytes);
+        let first = repo
+            .add_file_source(data_dir, &nb.id, &path, None)
+            .await
+            .unwrap();
+
+        // Trash it — the partial unique index excludes trashed rows.
+        repo.trash_source(&first.source.id).await.unwrap();
+
+        // Re-adding the same content now creates a NEW live row (dedup does not
+        // consider trashed sources).
+        let second = repo
+            .add_file_source(data_dir, &nb.id, &path, None)
+            .await
+            .unwrap();
+        assert!(
+            !second.was_existing,
+            "a trashed source must not block re-adding the same content"
+        );
+        assert_ne!(second.source.id, first.source.id);
+        // One live source (the trashed one is excluded).
+        assert_eq!(repo.list_sources(&nb.id).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn add_file_source_dedup_cross_notebook() {
+        let pool = test_pool().await;
+        let repo = NotebookRepo::new(&pool);
+        let nb_a = make_notebook(&repo, "Notebook A").await;
+        let nb_b = make_notebook(&repo, "Notebook B").await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let data_dir = tmp.path();
+
+        let bytes = b"shared content across notebooks";
+        let path = write_source_file(data_dir, "shared.txt", bytes);
+
+        let in_a = repo
+            .add_file_source(data_dir, &nb_a.id, &path, None)
+            .await
+            .unwrap();
+        let in_b = repo
+            .add_file_source(data_dir, &nb_b.id, &path, None)
+            .await
+            .unwrap();
+
+        assert!(!in_a.was_existing);
+        assert!(
+            !in_b.was_existing,
+            "dedup is scoped per-notebook — same content in a different notebook is a new row"
+        );
+        assert_ne!(in_a.source.id, in_b.source.id);
+        assert_eq!(repo.list_sources(&nb_a.id).await.unwrap().len(), 1);
+        assert_eq!(repo.list_sources(&nb_b.id).await.unwrap().len(), 1);
     }
 }
