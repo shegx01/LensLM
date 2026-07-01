@@ -195,7 +195,8 @@ async fn url_fetch_http_error_flips_to_error() {
     let source = engine
         .add_url_source(&nb.id, "bad page", &format!("{}/page", mock.uri()))
         .await
-        .expect("add_url_source");
+        .expect("add_url_source")
+        .source;
     assert_eq!(source.status, "queued");
     assert_eq!(source.kind, "url");
 
@@ -277,7 +278,8 @@ async fn url_uses_configurable_cap() {
     let source = engine
         .add_url_source(&nb.id, "huge page", &format!("{}/huge", mock.uri()))
         .await
-        .expect("add_url_source");
+        .expect("add_url_source")
+        .source;
 
     let (result, _) = ingest_collecting_progress(&engine, &source.id).await;
     assert!(
@@ -320,7 +322,8 @@ async fn url_needs_js_on_js_shell() {
     let source = engine
         .add_url_source(&nb.id, "spa page", &format!("{}/spa", mock.uri()))
         .await
-        .expect("add_url_source");
+        .expect("add_url_source")
+        .source;
 
     let (result, _events) = ingest_collecting_progress(&engine, &source.id).await;
     assert!(
@@ -388,7 +391,8 @@ async fn url_indexes_real_article() {
     let source = engine
         .add_url_source(&nb.id, "real article", &format!("{}/article", mock.uri()))
         .await
-        .expect("add_url_source");
+        .expect("add_url_source")
+        .source;
 
     let (result, _events) = ingest_collecting_progress(&engine, &source.id).await;
 
@@ -451,11 +455,13 @@ async fn crash_recovery_skips_needs_js_and_needs_ocr() {
     let src_js = repo
         .add_url_source(&nb.id, "spa", "https://example.com/spa")
         .await
-        .expect("add_url_source");
+        .expect("add_url_source")
+        .source;
     let src_ocr = repo
         .add_url_source(&nb.id, "scanned", "https://example.com/pdf")
         .await
-        .expect("add_url_source for ocr");
+        .expect("add_url_source for ocr")
+        .source;
 
     // Manually set their statuses to the terminal-pending values.
     repo.update_source_status(
@@ -534,7 +540,8 @@ async fn needs_js_not_set_via_err_path() {
     let source = engine
         .add_url_source(&nb.id, "spa", &format!("{}/spa", mock.uri()))
         .await
-        .expect("add_url_source");
+        .expect("add_url_source")
+        .source;
 
     let (result, _events) = ingest_collecting_progress(&engine, &source.id).await;
 
@@ -577,7 +584,8 @@ async fn add_url_source_returns_queued_without_fetch() {
     let source: Source = engine
         .add_url_source(&nb.id, "page title", url)
         .await
-        .expect("add_url_source must not attempt a network connection");
+        .expect("add_url_source must not attempt a network connection")
+        .source;
 
     assert_eq!(source.status, "queued");
     assert_eq!(source.kind, "url");
@@ -585,6 +593,63 @@ async fn add_url_source_returns_queued_without_fetch() {
     assert_eq!(source.title, "page title");
     assert!(source.token_count.is_none());
     assert!(source.content_hash.is_none());
+}
+
+// ===========================================================================
+// issue #100 — content-hash dedup for URL sources (moderate normalization)
+// ===========================================================================
+
+/// AC-2 / AC-8: adding equivalent URLs (case-differing host, fragment-only diff)
+/// deduplicates via the normalized-URL hash; a genuinely different URL does not.
+/// The verbatim `locator` of the first add is preserved.
+#[tokio::test]
+async fn add_url_source_dedup_returns_existing() {
+    let (_dir, engine) = file_engine().await;
+    let nb = engine
+        .create_notebook("url-dedup-nb", None, None)
+        .await
+        .expect("notebook");
+
+    // First add — fresh insert. Locator keeps the verbatim (mixed-case) URL.
+    let first = engine
+        .add_url_source(&nb.id, "article", "https://Example.COM/article")
+        .await
+        .expect("add_url_source");
+    assert!(!first.was_existing, "first add is a fresh insert");
+    assert_eq!(
+        first.source.locator, "https://Example.COM/article",
+        "locator preserves the verbatim first-added URL"
+    );
+
+    // Host-case-only difference — dedup hit.
+    let second = engine
+        .add_url_source(&nb.id, "again", "https://example.com/article")
+        .await
+        .expect("add_url_source");
+    assert!(second.was_existing, "case-differing host is a dedup hit");
+    assert_eq!(second.source.id, first.source.id);
+
+    // Fragment-only difference — dedup hit.
+    let third = engine
+        .add_url_source(&nb.id, "frag", "https://example.com/article#section2")
+        .await
+        .expect("add_url_source");
+    assert!(
+        third.was_existing,
+        "fragment-only difference is a dedup hit"
+    );
+    assert_eq!(third.source.id, first.source.id);
+
+    // Genuinely different path — fresh insert.
+    let fourth = engine
+        .add_url_source(&nb.id, "other", "https://example.com/different")
+        .await
+        .expect("add_url_source");
+    assert!(!fourth.was_existing, "different URL is a fresh insert");
+    assert_ne!(fourth.source.id, first.source.id);
+
+    let live = engine.list_sources(&nb.id).await.unwrap();
+    assert_eq!(live.len(), 2, "only two distinct URL rows exist");
 }
 
 // ===========================================================================
@@ -620,7 +685,8 @@ async fn url_extracted_sibling_removed_on_purge() {
     let source = engine
         .add_url_source(&nb.id, "article", &format!("{}/article", mock.uri()))
         .await
-        .expect("add_url_source");
+        .expect("add_url_source")
+        .source;
 
     let (result, _events) = ingest_collecting_progress(&engine, &source.id).await;
     // Tokenizer may be unavailable offline; the sibling is written BEFORE chunking
@@ -680,7 +746,8 @@ async fn url_extracted_sibling_removed_on_purge_notebook() {
     let source = engine
         .add_url_source(&nb.id, "article", &format!("{}/article", mock.uri()))
         .await
-        .expect("add_url_source");
+        .expect("add_url_source")
+        .source;
 
     let (result, _events) = ingest_collecting_progress(&engine, &source.id).await;
     let sibling = data_dir
@@ -752,7 +819,8 @@ async fn reingest_into_needs_js_wipes_stale_chunks_and_vectors() {
     let source = engine
         .add_url_source(&nb.id, "page", &format!("{}/page", mock.uri()))
         .await
-        .expect("add_url_source");
+        .expect("add_url_source")
+        .source;
 
     // First ingest: real article → indexed (needs the tokenizer).
     let (result, _events) = ingest_collecting_progress(&engine, &source.id).await;

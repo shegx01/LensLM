@@ -103,7 +103,9 @@ pub async fn add_text_source(
 }
 
 /// Inserts a URL source: inserts a `queued` row whose `locator` is the URL.
-/// Returns immediately — no HTTP fetch happens here.
+/// Returns immediately — no HTTP fetch happens here. Returns an [`AddSourceOutcome`]
+/// (`{ source, wasExisting }` on the wire) — on a content-dedup hit (issue #100,
+/// keyed on the normalized URL) the existing live source is returned.
 /// Call `ingest_source` separately to fetch + extract the page in the background.
 #[tracing::instrument(skip(engine))]
 #[tauri::command]
@@ -112,7 +114,7 @@ pub async fn add_url_source(
     title: String,
     url: String,
     engine: tauri::State<'_, LensEngine>,
-) -> Result<Source, LensError> {
+) -> Result<AddSourceOutcome, LensError> {
     engine
         .add_url_source(&NotebookId::from(notebook_id), &title, &url)
         .await

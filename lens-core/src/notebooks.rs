@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 use crate::LensError;
 use crate::parse::SourceKind;
+use crate::url_normalize::normalize_url;
 
 /// Maximum accepted notebook title length, in characters. Titles longer than
 /// this are rejected with [`LensError::Validation`] rather than silently stored.
@@ -1167,19 +1168,62 @@ impl<'a> NotebookRepo<'a> {
     /// Inserts a `sources` row with `kind = "url"`, `status = "queued"`,
     /// `selected = 1`, and `locator` = the verbatim URL string. No file is written
     /// to disk — the locator IS the URL, and the ingest pipeline fetches the HTML
-    /// at ingest time. Returns the inserted [`Source`] (`token_count` and
+    /// at ingest time. Returns an [`AddSourceOutcome`] (`token_count` and
     /// `content_hash` are `NULL` until ingestion populates them).
+    ///
+    /// **Content dedup (issue #100):** the URL is moderately normalized via
+    /// [`normalize_url`] (lowercase scheme+host, strip default ports, drop
+    /// fragment, strip one trailing slash — query order/content preserved) and
+    /// the SHA-256 of that normalized form stored as `raw_content_hash`. The
+    /// `locator` keeps the verbatim first-added URL for display; the hash catches
+    /// equivalent URLs. A live source in the same notebook with a matching
+    /// `raw_content_hash` short-circuits to a dedup hit (`was_existing = true`).
+    /// The partial unique index is the authoritative guard; `SELECT` is the
+    /// fast path and `INSERT … ON CONFLICT DO NOTHING` resolves any race.
     pub async fn add_url_source(
         &self,
         notebook_id: &NotebookId,
         title: &str,
         url: &str,
-    ) -> Result<Source, LensError> {
+    ) -> Result<AddSourceOutcome, LensError> {
+        // Hash the NORMALIZED URL (not the verbatim string) as the dedup key so
+        // case/port/fragment/trailing-slash variants of the same URL collide.
+        let raw_content_hash = sha256_bytes(normalize_url(url)?.as_bytes());
+
+        // SELECT projection reused by the fast-path check and the race re-query.
+        const SOURCE_SELECT: &str = "SELECT id, notebook_id, kind, title, status, locator, \
+             selected, token_count, content_hash, raw_content_hash, created_at, trashed_at, \
+             enrichment_status, enrichment_meta \
+             FROM sources WHERE notebook_id = ? AND raw_content_hash = ? AND trashed_at IS NULL LIMIT 1";
+
+        // Fast-path: a live source with an equivalent URL already exists.
+        if let Some(dup) = sqlx::query_as::<_, Source>(SOURCE_SELECT)
+            .bind(notebook_id)
+            .bind(&raw_content_hash)
+            .fetch_optional(self.pool)
+            .await?
+        {
+            tracing::info!(
+                notebook_id = %notebook_id,
+                raw_content_hash = %raw_content_hash,
+                source_id = %dup.id,
+                "duplicate URL detected at add time — returning existing source"
+            );
+            return Ok(AddSourceOutcome {
+                source: dup,
+                was_existing: true,
+            });
+        }
+
         let id = Uuid::now_v7().to_string();
         let now = chrono::Utc::now().to_rfc3339();
-        sqlx::query(
-            "INSERT INTO sources (id, notebook_id, kind, title, status, locator, selected, created_at) \
-             VALUES (?, ?, 'url', ?, ?, ?, 1, ?)",
+        // Authoritative dedup: the partial unique index makes a racing duplicate
+        // insert a no-op via `ON CONFLICT DO NOTHING`.
+        let result = sqlx::query(
+            "INSERT INTO sources (id, notebook_id, kind, title, status, locator, selected, \
+             created_at, raw_content_hash) \
+             VALUES (?, ?, 'url', ?, ?, ?, 1, ?, ?) \
+             ON CONFLICT DO NOTHING",
         )
         .bind(&id)
         .bind(notebook_id)
@@ -1187,23 +1231,47 @@ impl<'a> NotebookRepo<'a> {
         .bind(SourceStatus::Queued.as_str())
         .bind(url)
         .bind(&now)
+        .bind(&raw_content_hash)
         .execute(self.pool)
         .await?;
-        Ok(Source {
-            id,
-            notebook_id: notebook_id.to_string(),
-            kind: SourceKind::Url.as_str().to_string(),
-            title: title.to_string(),
-            status: SourceStatus::Queued.as_str().to_string(),
-            locator: url.to_string(),
-            selected: 1,
-            token_count: None,
-            content_hash: None,
-            raw_content_hash: None,
-            created_at: now,
-            trashed_at: None,
-            enrichment_status: None,
-            enrichment_meta: None,
+
+        if result.rows_affected() == 0 {
+            // Lost the race: return the winner as an existing source.
+            let winner = sqlx::query_as::<_, Source>(SOURCE_SELECT)
+                .bind(notebook_id)
+                .bind(&raw_content_hash)
+                .fetch_one(self.pool)
+                .await?;
+            tracing::info!(
+                notebook_id = %notebook_id,
+                raw_content_hash = %raw_content_hash,
+                source_id = %winner.id,
+                "duplicate URL detected via ON CONFLICT race — returning existing source"
+            );
+            return Ok(AddSourceOutcome {
+                source: winner,
+                was_existing: true,
+            });
+        }
+
+        Ok(AddSourceOutcome {
+            source: Source {
+                id,
+                notebook_id: notebook_id.to_string(),
+                kind: SourceKind::Url.as_str().to_string(),
+                title: title.to_string(),
+                status: SourceStatus::Queued.as_str().to_string(),
+                locator: url.to_string(),
+                selected: 1,
+                token_count: None,
+                content_hash: None,
+                raw_content_hash: Some(raw_content_hash),
+                created_at: now,
+                trashed_at: None,
+                enrichment_status: None,
+                enrichment_meta: None,
+            },
+            was_existing: false,
         })
     }
 

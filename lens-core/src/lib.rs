@@ -28,6 +28,7 @@ pub mod notebooks;
 pub mod parse;
 pub mod system_check;
 pub mod tts;
+pub mod url_normalize;
 pub mod vector_store;
 
 pub use config::{AppConfig, EnrichmentConfig, TaskModel};
@@ -591,14 +592,16 @@ impl LensEngine {
     /// Inserts a URL source: inserts a `queued` `sources` row whose `locator` is
     /// the verbatim URL string. Returns immediately — no fetch happens here.
     /// The caller should invoke [`ingest_source`](Self::ingest_source) separately
-    /// to fetch and extract the page in the background.
+    /// to fetch and extract the page in the background. Returns an
+    /// [`AddSourceOutcome`]: on a content-dedup hit (issue #100, keyed on the
+    /// normalized URL) the existing live source is returned (`was_existing = true`).
     #[tracing::instrument(skip(self))]
     pub async fn add_url_source(
         &self,
         notebook_id: &NotebookId,
         title: &str,
         url: &str,
-    ) -> Result<Source, LensError> {
+    ) -> Result<AddSourceOutcome, LensError> {
         let pool = self.pool().await;
         NotebookRepo::new(&pool)
             .add_url_source(notebook_id, title, url)

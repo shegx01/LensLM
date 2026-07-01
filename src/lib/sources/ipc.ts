@@ -68,6 +68,30 @@ export async function addFileSource(
 }
 
 /**
+ * Add a URL-backed source to a notebook.
+ *
+ * Routes to `add_url_source`, which inserts a `queued` row whose `locator` is
+ * the verbatim URL (no fetch happens here — `ingestSource` does that later).
+ *
+ * Returns an `AddSourceOutcome` (`{ source, wasExisting }`): on a content-dedup
+ * hit (#100, keyed on the moderately-normalized URL) the existing live source is
+ * returned with `wasExisting = true` and no new row is written. Mirrors the Rust
+ * `AddSourceOutcome` (serde camelCase).
+ */
+export async function addUrlSource(
+  notebookId: string,
+  title: string,
+  url: string
+): Promise<{ source: Source; wasExisting: boolean }> {
+  if (!isTauri()) throw new Error('addUrlSource: not running under Tauri');
+  return invoke<{ source: Source; wasExisting: boolean }>('add_url_source', {
+    notebookId,
+    title,
+    url
+  });
+}
+
+/**
  * Ingest a source, streaming progress events via a Channel.
  * `onProgress` receives each `StreamEvent<IngestProgress>` as it arrives.
  *
