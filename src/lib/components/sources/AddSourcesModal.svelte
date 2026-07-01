@@ -14,14 +14,10 @@
   import { cn } from '$lib/utils.js';
   import { Button } from '$lib/components/ui/button/index.js';
   import { addFileSource, addTextSource } from '$lib/sources/ipc.js';
-  import {
-    addSourceLocal,
-    loadSources,
-    ingest,
-    sourcesStore
-  } from '$lib/sources/sources-state.svelte.js';
+  import { addSourceLocal, loadSources, ingest } from '$lib/sources/sources-state.svelte.js';
   import { notebookStore } from '$lib/notebooks/index.js';
   import { registerDropTarget, PICKER_FILTERS } from '$lib/sources/dragDrop.js';
+  import { showToast } from '$lib/sources/toast.svelte.js';
 
   // ---------------------------------------------------------------------------
   // Props
@@ -106,32 +102,85 @@
   // Upload tab handlers
   // ---------------------------------------------------------------------------
 
+  /**
+   * Shared multi-path ingest dispatch used by BOTH the browse picker and the
+   * native drop handler (DRY — one place to unit-test the batch behavior).
+   *
+   * Per path: adds the file source via the backend (which enforces content-hash
+   * dedup, #96). The backend's `wasExisting` flag is the single source of truth:
+   * an existing (duplicate) source is counted as `skipped` and is NOT inserted
+   * into the store or re-ingested. A per-file failure is caught and counted as
+   * `failed` — one file's failure never aborts the rest of the batch.
+   */
+  async function ingestPaths(
+    notebookId: string,
+    paths: string[]
+  ): Promise<{ added: number; failed: number; skipped: number }> {
+    let added = 0;
+    let failed = 0;
+    let skipped = 0;
+    for (const path of paths) {
+      // Use both / and \ to extract the filename (Tauri returns OS-native paths).
+      const name = path.split(/[\\/]/).pop() ?? path;
+      try {
+        const { source, wasExisting } = await addFileSource(notebookId, name, path);
+        if (wasExisting) {
+          // Backend detected a content-dedup hit — do NOT addSourceLocal/ingest.
+          skipped++;
+        } else {
+          // Optimistically insert the row BEFORE starting ingest so progress
+          // events find the entry in the store immediately (avoids silent drops).
+          addSourceLocal(source);
+          void ingest(source.id);
+          added++;
+        }
+      } catch (err) {
+        failed++;
+        uploadError = 'Could not add file. Please try again.';
+        console.error('ingestPaths: failed for', path, err);
+      }
+    }
+    return { added, failed, skipped };
+  }
+
+  /**
+   * Surfaces a batch summary toast when anything was skipped or failed. A clean
+   * batch (all added, nothing skipped/failed) shows no toast — the modal simply
+   * closes.
+   */
+  function showBatchSummary(result: { added: number; failed: number; skipped: number }): void {
+    if (result.skipped === 0 && result.failed === 0) return;
+    const parts: string[] = [];
+    if (result.added > 0) parts.push(`${result.added} added`);
+    if (result.skipped > 0) parts.push(`${result.skipped} already in notebook`);
+    if (result.failed > 0) parts.push(`${result.failed} failed`);
+    showToast(parts.join(', '));
+  }
+
   async function handleBrowse(): Promise<void> {
     if (!isTauri() || !activeNotebookId || uploadSubmitting) return;
     uploadError = null;
     uploadSubmitting = true;
     try {
       const selected = await openFilePicker({
-        multiple: false,
+        multiple: true,
         filters: PICKER_FILTERS
       });
       if (!selected) return;
-      const path = Array.isArray(selected) ? selected[0] : selected;
-      // Use both / and \ to extract the filename (Tauri returns OS-native paths).
-      const name = path.split(/[\\/]/).pop() ?? path;
-      const source = await addFileSource(activeNotebookId, name, path);
-      // Optimistically insert the row BEFORE starting ingest so progress events
-      // find the entry in the store immediately (avoids silent drops).
-      addSourceLocal(source);
-      void ingest(source.id);
-      onclose?.();
-      // Reconcile with backend ordering after the modal closes.
-      void loadSources(activeNotebookId);
+      const paths = Array.isArray(selected) ? selected : [selected];
+      if (paths.length === 0) return;
+
+      const result = await ingestPaths(activeNotebookId, paths);
+      showBatchSummary(result);
+      // Close only if at least one source was added (mirrors the drop flow).
+      if (result.added > 0) onclose?.();
     } catch (err) {
       uploadError = 'Could not add file. Please try again.';
       console.error('AddSourcesModal: handleBrowse failed', err);
     } finally {
       uploadSubmitting = false;
+      // Reconcile with backend ordering.
+      void loadSources(activeNotebookId);
     }
   }
 
@@ -157,30 +206,19 @@
         if (!activeNotebookId || uploadSubmitting) return;
         uploadError = null;
         uploadSubmitting = true;
-        let addedAny = false;
         try {
-          for (const path of paths) {
-            // Skip files already added to this notebook (dedup by locator).
-            if (sourcesStore.sources.some((s) => s.locator === path)) continue;
-            const name = path.split(/[\\/]/).pop() ?? path;
-            try {
-              const source = await addFileSource(activeNotebookId, name, path);
-              addSourceLocal(source);
-              void ingest(source.id);
-              addedAny = true;
-            } catch (err) {
-              uploadError = 'Could not add file. Please try again.';
-              console.error('AddSourcesModal: drop ingest failed for', path, err);
-            }
-          }
+          // Backend content-hash dedup (#96) is authoritative — no frontend
+          // locator-based dedup guessing. Shared with the browse flow.
+          const result = await ingestPaths(activeNotebookId, paths);
+          showBatchSummary(result);
+          // Dismiss the modal after a successful drop so the new sources are
+          // visible in the rail (mirrors the browse flow). Stay open when nothing
+          // was added (all duplicates / all failed) so the toast/error remains.
+          if (result.added > 0) onclose?.();
         } finally {
           uploadSubmitting = false;
           void loadSources(activeNotebookId);
         }
-        // Dismiss the modal after a successful drop so the new sources are
-        // visible in the rail (mirrors the browse flow). Stay open when nothing
-        // was added (all duplicates / all failed) so the error remains visible.
-        if (addedAny) onclose?.();
       }
     });
   });

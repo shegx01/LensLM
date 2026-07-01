@@ -101,6 +101,7 @@ function makeSource(overrides?: Partial<Source>): Source {
     created_at: new Date().toISOString(),
     token_count: 2048,
     content_hash: 'abc123',
+    file_hash: null,
     trashed_at: null,
     enrichment_status: null,
     enrichment_meta: null,
