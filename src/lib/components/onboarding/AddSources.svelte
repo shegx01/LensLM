@@ -24,6 +24,8 @@
   import OnboardingBackButton from '$lib/components/onboarding/OnboardingBackButton.svelte';
   import { completeOnboarding } from '$lib/onboarding/completeOnboarding.js';
   import { registerDropTarget, PICKER_FILTERS } from '$lib/sources/dragDrop.js';
+  import { showToast } from '$lib/sources/toast.svelte.js';
+  import type { Source, AddSourceOutcome } from '$lib/sources/types.js';
 
   let { oncomplete, onback }: { oncomplete: () => void; onback: () => void } = $props();
 
@@ -146,16 +148,24 @@
     finishing = true;
     completeError = null;
     try {
+      let skipped = 0;
       if (persistSources && isTauri() && draft.notebookId) {
         for (const src of draft.selectedSources) {
+          // Client-side belt-and-suspenders guard: skip paths already accepted on
+          // a prior (partially-failed) attempt to avoid redundant IPC round-trips.
+          // The backend `raw_content_hash` dedup (#100) is the authority.
           if (addedPaths.has(src.path)) continue;
-          await invoke<void>('add_source', {
+          const { wasExisting } = await invoke<AddSourceOutcome>('add_source', {
             notebookId: draft.notebookId,
             title: src.name,
             locator: src.path
           });
+          if (wasExisting) skipped++;
           addedPaths.add(src.path);
         }
+      }
+      if (skipped > 0) {
+        showToast(skipped === 1 ? 'Already in notebook' : `${skipped} already in notebook`);
       }
       await completeOnboarding();
       oncomplete();

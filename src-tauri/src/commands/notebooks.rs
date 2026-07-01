@@ -1,7 +1,7 @@
 //! Notebook commands. Thin pass-throughs to `lens-core`; full CRUD UI is M3.
 
 use lens_core::{
-    AddFileOutcome, IngestProgress, LensEngine, LensError, Notebook, NotebookId, NotebookSummary,
+    AddSourceOutcome, IngestProgress, LensEngine, LensError, Notebook, NotebookId, NotebookSummary,
     Source, TrashedSource,
 };
 use serde::{Deserialize, Serialize};
@@ -59,7 +59,9 @@ pub async fn create_notebook(
 }
 
 /// Inserts a file source record for a notebook (M1 onboarding "Add sources").
-/// Records only — no ingestion. Returns the inserted source.
+/// Records only — no ingestion. Returns an [`AddSourceOutcome`]
+/// (`{ source, wasExisting }` on the wire) — on a PATH-based dedup hit (issue
+/// #100) the existing live source is returned with `wasExisting = true`.
 #[tracing::instrument(skip_all)]
 #[tauri::command]
 pub async fn add_source(
@@ -67,7 +69,7 @@ pub async fn add_source(
     title: String,
     locator: String,
     engine: tauri::State<'_, LensEngine>,
-) -> Result<Source, LensError> {
+) -> Result<AddSourceOutcome, LensError> {
     engine
         .add_source(&NotebookId::from(notebook_id), &title, &locator)
         .await
@@ -85,7 +87,9 @@ pub async fn list_sources(
 
 /// Inserts a managed text/markdown source (paste-text or `.md`/`.txt` content),
 /// writing the text to a managed file and inserting a `queued` row. `kind` must
-/// be `"text"` or `"markdown"`. Returns the inserted source.
+/// be `"text"` or `"markdown"`. Returns an [`AddSourceOutcome`]
+/// (`{ source, wasExisting }` on the wire) — on a content-dedup hit (issue #100)
+/// the existing live source is returned with `wasExisting = true`.
 #[tracing::instrument(skip(text, engine))]
 #[tauri::command]
 pub async fn add_text_source(
@@ -94,14 +98,16 @@ pub async fn add_text_source(
     text: String,
     kind: String,
     engine: tauri::State<'_, LensEngine>,
-) -> Result<Source, LensError> {
+) -> Result<AddSourceOutcome, LensError> {
     engine
         .add_text_source(&NotebookId::from(notebook_id), &title, &text, &kind)
         .await
 }
 
 /// Inserts a URL source: inserts a `queued` row whose `locator` is the URL.
-/// Returns immediately — no HTTP fetch happens here.
+/// Returns immediately — no HTTP fetch happens here. Returns an [`AddSourceOutcome`]
+/// (`{ source, wasExisting }` on the wire) — on a content-dedup hit (issue #100,
+/// keyed on the normalized URL) the existing live source is returned.
 /// Call `ingest_source` separately to fetch + extract the page in the background.
 #[tracing::instrument(skip(engine))]
 #[tauri::command]
@@ -110,7 +116,7 @@ pub async fn add_url_source(
     title: String,
     url: String,
     engine: tauri::State<'_, LensEngine>,
-) -> Result<Source, LensError> {
+) -> Result<AddSourceOutcome, LensError> {
     engine
         .add_url_source(&NotebookId::from(notebook_id), &title, &url)
         .await
@@ -119,7 +125,7 @@ pub async fn add_url_source(
 /// Inserts a managed local-file source (PDF/DOCX/text/markdown): copies the file
 /// into managed storage and inserts a `queued` row. `kind` is detected from the
 /// file extension; an unsupported extension is rejected. `title` defaults to the
-/// file name when omitted. Returns an [`AddFileOutcome`] (`{ source, wasExisting }`
+/// file name when omitted. Returns an [`AddSourceOutcome`] (`{ source, wasExisting }`
 /// on the wire) — on a content-dedup hit (issue #96) the existing live source is
 /// returned with `wasExisting = true` and no new row/file is written. No ingestion
 /// happens here; call `ingest_source` separately to extract + index it.
@@ -130,7 +136,7 @@ pub async fn add_file_source(
     path: String,
     title: Option<String>,
     engine: tauri::State<'_, LensEngine>,
-) -> Result<AddFileOutcome, LensError> {
+) -> Result<AddSourceOutcome, LensError> {
     engine
         .add_file_source(
             &NotebookId::from(notebook_id),
@@ -461,7 +467,8 @@ mod tests {
             engine.clone(),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .source;
         assert_eq!(src.kind, "file");
         assert_eq!(src.status, "pending");
         assert_eq!(src.locator, "/abs/path/report.pdf");
@@ -677,7 +684,9 @@ mod tests {
         );
 
         // Trash: leaves live list, enters trashed-sources list.
-        trash_source(src.id.clone(), engine.clone()).await.unwrap();
+        trash_source(src.source.id.clone(), engine.clone())
+            .await
+            .unwrap();
         assert!(
             list_sources(nb.id.to_string(), engine.clone())
                 .await
@@ -686,11 +695,11 @@ mod tests {
         );
         let trashed = list_trashed_sources(engine.clone()).await.unwrap();
         assert_eq!(trashed.len(), 1);
-        assert_eq!(trashed[0].source.id, src.id);
+        assert_eq!(trashed[0].source.id, src.source.id);
         assert_eq!(trashed[0].notebook_title, "NB");
 
         // Restore: returns to live list, gone from trashed list.
-        restore_source(src.id.clone(), engine.clone())
+        restore_source(src.source.id.clone(), engine.clone())
             .await
             .unwrap();
         assert_eq!(
@@ -708,8 +717,12 @@ mod tests {
         );
 
         // Trash again, then purge: gone from both lists.
-        trash_source(src.id.clone(), engine.clone()).await.unwrap();
-        purge_source(src.id.clone(), engine.clone()).await.unwrap();
+        trash_source(src.source.id.clone(), engine.clone())
+            .await
+            .unwrap();
+        purge_source(src.source.id.clone(), engine.clone())
+            .await
+            .unwrap();
         assert!(
             list_sources(nb.id.to_string(), engine.clone())
                 .await

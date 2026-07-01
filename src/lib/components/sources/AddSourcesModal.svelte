@@ -233,11 +233,21 @@
     pasteSubmitting = true;
     try {
       const title = pasteTitle.trim() || 'Untitled text';
-      const source = await addTextSource(activeNotebookId, title, pasteContent.trim(), 'text');
-      // Optimistically insert the row BEFORE starting ingest so progress events
-      // find the entry in the store immediately (avoids silent drops).
-      addSourceLocal(source);
-      void ingest(source.id);
+      const { source, wasExisting } = await addTextSource(
+        activeNotebookId,
+        title,
+        pasteContent.trim(),
+        'text'
+      );
+      if (wasExisting) {
+        // Backend detected a content-dedup hit (#100) — do NOT insert or ingest.
+        showToast('Already in notebook');
+      } else {
+        // Optimistically insert the row BEFORE starting ingest so progress events
+        // find the entry in the store immediately (avoids silent drops).
+        addSourceLocal(source);
+        void ingest(source.id);
+      }
       onclose?.();
       // Reconcile with backend ordering after the modal closes.
       void loadSources(activeNotebookId);

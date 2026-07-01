@@ -9,7 +9,13 @@
 // and Tauri deserialises them into snake_case Rust params.
 
 import { Channel, invoke, isTauri } from '@tauri-apps/api/core';
-import type { Source, TrashedSource, IngestProgress, StreamEvent } from './types.js';
+import type {
+  Source,
+  TrashedSource,
+  IngestProgress,
+  StreamEvent,
+  AddSourceOutcome
+} from './types.js';
 
 /**
  * List all sources for a notebook.
@@ -22,16 +28,24 @@ export async function listSources(notebookId: string): Promise<Source[]> {
 
 /**
  * Add a pasted-text or Markdown source to a notebook.
- * Returns the created `Source` row.
+ *
+ * Returns an `AddSourceOutcome` (`{ source, wasExisting }`): on a content-dedup
+ * hit (#100) the existing live source is returned with `wasExisting = true` and
+ * no new row is written. Mirrors the Rust `AddSourceOutcome` (serde camelCase).
  */
 export async function addTextSource(
   notebookId: string,
   title: string,
   text: string,
   kind: string
-): Promise<Source> {
+): Promise<AddSourceOutcome> {
   if (!isTauri()) throw new Error('addTextSource: not running under Tauri');
-  return invoke<Source>('add_text_source', { notebookId, title, text, kind });
+  return invoke<AddSourceOutcome>('add_text_source', {
+    notebookId,
+    title,
+    text,
+    kind
+  });
 }
 
 /**
@@ -42,20 +56,44 @@ export async function addTextSource(
  * jsonl/yaml/xml); an unsupported extension is rejected. (The older `add_source`
  * command recorded a generic `kind="file"` that the ingest pipeline rejects.)
  *
- * Returns an `AddFileOutcome` (`{ source, wasExisting }`): on a content-dedup
+ * Returns an `AddSourceOutcome` (`{ source, wasExisting }`): on a content-dedup
  * hit (#96) the existing live source is returned with `wasExisting = true` and
- * no new row is written. Mirrors the Rust `AddFileOutcome` (serde camelCase).
+ * no new row is written. Mirrors the Rust `AddSourceOutcome` (serde camelCase).
  */
 export async function addFileSource(
   notebookId: string,
   title: string,
   path: string
-): Promise<{ source: Source; wasExisting: boolean }> {
+): Promise<AddSourceOutcome> {
   if (!isTauri()) throw new Error('addFileSource: not running under Tauri');
-  return invoke<{ source: Source; wasExisting: boolean }>('add_file_source', {
+  return invoke<AddSourceOutcome>('add_file_source', {
     notebookId,
     path,
     title
+  });
+}
+
+/**
+ * Add a URL-backed source to a notebook.
+ *
+ * Routes to `add_url_source`, which inserts a `queued` row whose `locator` is
+ * the verbatim URL (no fetch happens here — `ingestSource` does that later).
+ *
+ * Returns an `AddSourceOutcome` (`{ source, wasExisting }`): on a content-dedup
+ * hit (#100, keyed on the moderately-normalized URL) the existing live source is
+ * returned with `wasExisting = true` and no new row is written. Mirrors the Rust
+ * `AddSourceOutcome` (serde camelCase).
+ */
+export async function addUrlSource(
+  notebookId: string,
+  title: string,
+  url: string
+): Promise<AddSourceOutcome> {
+  if (!isTauri()) throw new Error('addUrlSource: not running under Tauri');
+  return invoke<AddSourceOutcome>('add_url_source', {
+    notebookId,
+    title,
+    url
   });
 }
 

@@ -85,7 +85,7 @@ function makeTrashedSource(overrides?: Partial<TrashedSource>): TrashedSource {
     created_at: new Date(Date.now() - 7200_000).toISOString(),
     token_count: 1024,
     content_hash: 'abc123',
-    file_hash: null,
+    raw_content_hash: null,
     trashed_at: new Date(Date.now() - 3600_000).toISOString(),
     enrichment_status: null,
     enrichment_meta: null,

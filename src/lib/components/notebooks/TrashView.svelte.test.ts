@@ -108,7 +108,7 @@ function makeTrashedSource(overrides?: Partial<TrashedSource>): TrashedSource {
     created_at: '2026-01-01T00:00:00Z',
     token_count: 1024,
     content_hash: 'abc123',
-    file_hash: null,
+    raw_content_hash: null,
     trashed_at: '2026-06-01T00:00:00Z',
     enrichment_status: null,
     enrichment_meta: null,

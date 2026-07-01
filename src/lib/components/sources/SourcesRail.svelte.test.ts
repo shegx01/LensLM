@@ -96,7 +96,9 @@ vi.mock('$lib/sources/sources-state.svelte.js', () => ({
 
 vi.mock('$lib/sources/ipc.js', () => ({
   listSources: vi.fn().mockResolvedValue([]),
-  addTextSource: vi.fn().mockResolvedValue({ id: 'src-new', status: 'pending' }),
+  addTextSource: vi
+    .fn()
+    .mockResolvedValue({ source: { id: 'src-new', status: 'pending' }, wasExisting: false }),
   addFileSource: vi
     .fn()
     .mockResolvedValue({ source: { id: 'src-new', status: 'pending' }, wasExisting: false }),
@@ -140,7 +142,7 @@ function makeSource(overrides?: Partial<Source>): Source {
     created_at: new Date().toISOString(),
     token_count: 2048,
     content_hash: 'abc123',
-    file_hash: null,
+    raw_content_hash: null,
     trashed_at: null,
     enrichment_status: null,
     enrichment_meta: null,

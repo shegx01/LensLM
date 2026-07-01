@@ -28,6 +28,7 @@ pub mod notebooks;
 pub mod parse;
 pub mod system_check;
 pub mod tts;
+pub mod url_normalize;
 pub mod vector_store;
 
 pub use config::{AppConfig, EnrichmentConfig, TaskModel};
@@ -53,8 +54,8 @@ pub use model_catalog::{
     load_catalog, refresh_if_stale,
 };
 pub use notebooks::{
-    AddFileOutcome, EmbeddingStats, InspectorChunk, Notebook, NotebookId, NotebookSummary, Source,
-    TrashedSource,
+    AddSourceOutcome, EmbeddingStats, InspectorChunk, Notebook, NotebookId, NotebookSummary,
+    Source, TrashedSource,
 };
 pub use system_check::{
     ALLOWED_EMBEDDING_MODELS, CheckAction, CheckId, CheckResult, CheckStatus, LlmDetection,
@@ -553,14 +554,17 @@ impl LensEngine {
             .await
     }
 
-    /// Inserts a file source record for a notebook (M1 onboarding). Returns it.
+    /// Inserts a file source record for a notebook (M1 onboarding). Returns an
+    /// [`AddSourceOutcome`]: on a PATH-based dedup hit (issue #100 — this path
+    /// hashes the locator, not file content) the existing live source is returned
+    /// (`was_existing = true`).
     #[tracing::instrument(skip_all)]
     pub async fn add_source(
         &self,
         notebook_id: &NotebookId,
         title: &str,
         locator: &str,
-    ) -> Result<Source, LensError> {
+    ) -> Result<AddSourceOutcome, LensError> {
         let pool = self.pool().await;
         NotebookRepo::new(&pool)
             .add_source(notebook_id, title, locator)
@@ -601,14 +605,16 @@ impl LensEngine {
     /// Inserts a URL source: inserts a `queued` `sources` row whose `locator` is
     /// the verbatim URL string. Returns immediately — no fetch happens here.
     /// The caller should invoke [`ingest_source`](Self::ingest_source) separately
-    /// to fetch and extract the page in the background.
+    /// to fetch and extract the page in the background. Returns an
+    /// [`AddSourceOutcome`]: on a content-dedup hit (issue #100, keyed on the
+    /// normalized URL) the existing live source is returned (`was_existing = true`).
     #[tracing::instrument(skip(self))]
     pub async fn add_url_source(
         &self,
         notebook_id: &NotebookId,
         title: &str,
         url: &str,
-    ) -> Result<Source, LensError> {
+    ) -> Result<AddSourceOutcome, LensError> {
         let pool = self.pool().await;
         NotebookRepo::new(&pool)
             .add_url_source(notebook_id, title, url)
@@ -617,7 +623,9 @@ impl LensEngine {
 
     /// Inserts a managed text/markdown source: writes `text` to a managed file
     /// under `{data_dir}/sources/` and inserts a `queued` `sources` row.
-    /// `kind` must be `"text"` or `"markdown"`. Returns the inserted source.
+    /// `kind` must be `"text"` or `"markdown"`. Returns an [`AddSourceOutcome`]:
+    /// on a content-dedup hit (issue #100) the existing live source is returned
+    /// (`was_existing = true`) without writing the managed file or inserting a row.
     #[tracing::instrument(skip(self, text))]
     pub async fn add_text_source(
         &self,
@@ -625,7 +633,7 @@ impl LensEngine {
         title: &str,
         text: &str,
         kind: &str,
-    ) -> Result<Source, LensError> {
+    ) -> Result<AddSourceOutcome, LensError> {
         let data_dir = self.data_dir().await;
         let pool = self.pool().await;
         // Resolve the configurable cap (issue #71) from `AppConfig.max_source_mb`
@@ -640,7 +648,7 @@ impl LensEngine {
     /// Inserts a managed local-file source (PDF/DOCX/text/markdown): copies the
     /// file into managed storage under `{data_dir}/sources/` and inserts a
     /// `queued` `sources` row. `kind` is detected from the file EXTENSION. `title`
-    /// defaults to the file name when not supplied. Returns an [`AddFileOutcome`]
+    /// defaults to the file name when not supplied. Returns an [`AddSourceOutcome`]
     /// carrying the source plus a `was_existing` flag: on a content-dedup hit
     /// (issue #96) the existing live source is returned (`was_existing = true`)
     /// without copying the file or inserting a new row.
@@ -651,7 +659,7 @@ impl LensEngine {
         notebook_id: &NotebookId,
         src_path: &Path,
         title: Option<&str>,
-    ) -> Result<AddFileOutcome, LensError> {
+    ) -> Result<AddSourceOutcome, LensError> {
         let data_dir = self.data_dir().await;
         let pool = self.pool().await;
         NotebookRepo::new(&pool)

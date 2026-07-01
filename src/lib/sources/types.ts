@@ -55,9 +55,10 @@ export interface Source {
   created_at: string;
   token_count: number | null;
   content_hash: string | null;
-  /** Raw-file-bytes SHA-256 computed at add time for content dedup (#96);
-   * `null` for text/paste/URL sources and pre-migration rows. */
-  file_hash: string | null;
+  /** Raw-content SHA-256 computed at add time for content dedup (#96/#100);
+   * hashes file bytes, text-paste bytes, or the normalized URL. `null` for
+   * pre-migration rows. */
+  raw_content_hash: string | null;
   trashed_at: string | null;
   /** Enrichment lifecycle (none|pending|enriching|enriched|failed|skipped),
    * SEPARATE from `status`. `null` ≡ `none` for pre-Phase-3 rows. */
@@ -65,6 +66,15 @@ export interface Source {
   /** JSON enrichment metadata (composite cache key + budget/skip reason);
    * `null` until the source is enriched. */
   enrichment_meta: string | null;
+}
+
+/** Return type of all add-source IPC calls (add_file_source, add_source,
+ * add_text_source, add_url_source — issues #96 + #100). Mirrors the Rust
+ * `AddSourceOutcome` struct (serde camelCase). `wasExisting = true` means a
+ * dedup hit: no new row was written and the existing source is returned. */
+export interface AddSourceOutcome {
+  source: Source;
+  wasExisting: boolean;
 }
 
 // SYNC-CHECK: must match lens-core/src/notebooks.rs TrashedSource struct

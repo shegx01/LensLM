@@ -530,7 +530,8 @@ async fn embedder_cached_once_and_ingest_serialized() {
             "markdown",
         )
         .await
-        .unwrap();
+        .unwrap()
+        .source;
     let s2 = engine
         .add_text_source(
             &nb.id,
@@ -539,7 +540,8 @@ async fn embedder_cached_once_and_ingest_serialized() {
             "markdown",
         )
         .await
-        .unwrap();
+        .unwrap()
+        .source;
 
     // Drive two ingests CONCURRENTLY. The single-permit semaphore must serialize
     // them so the embedder's in_flight never exceeds 1.
@@ -661,7 +663,8 @@ async fn ingest_streaming_phases_and_indexed_status() {
             "markdown",
         )
         .await
-        .unwrap();
+        .unwrap()
+        .source;
 
     let mut phases: Vec<String> = Vec::new();
     engine
@@ -747,7 +750,8 @@ async fn ingest_uses_per_notebook_model_mxbai() {
             "markdown",
         )
         .await
-        .unwrap();
+        .unwrap()
+        .source;
     engine
         .ingest_source(&src.id, |_p| {})
         .await
@@ -797,7 +801,8 @@ async fn purge_resolves_per_notebook_model() {
     let src = engine
         .add_text_source(&nb.id, "doc", "# T\n\nBody.\n", "markdown")
         .await
-        .unwrap();
+        .unwrap()
+        .source;
     engine
         .ingest_source(&src.id, |_p| {})
         .await
@@ -829,7 +834,8 @@ async fn ingest_failure_sets_error_status() {
     let src = engine
         .add_text_source(&nb.id, "doc", "body", "text")
         .await
-        .unwrap();
+        .unwrap()
+        .source;
 
     // Remove the backing file so the pipeline's read_to_string fails.
     std::fs::remove_file(&src.locator).unwrap();
@@ -877,7 +883,8 @@ async fn reingest_idempotency_and_wipe() {
             "markdown",
         )
         .await
-        .unwrap();
+        .unwrap()
+        .source;
 
     // First ingest → indexed.
     engine.ingest_source(&src.id, |_p| {}).await.unwrap();
@@ -968,7 +975,10 @@ async fn file_hash_does_not_break_reingest_noop() {
         .unwrap();
     assert!(!outcome.was_existing);
     let src = outcome.source;
-    let file_hash = src.file_hash.clone().expect("file source has file_hash");
+    let file_hash = src
+        .raw_content_hash
+        .clone()
+        .expect("file source has raw_content_hash");
     assert_eq!(src.content_hash, None, "content_hash is NULL until ingest");
 
     // First ingest → indexed, content_hash populated over the extracted text.
@@ -990,9 +1000,9 @@ async fn file_hash_does_not_break_reingest_noop() {
         "for a DERIVED (non-text_like) kind, content_hash hashes the raw file bytes — same as file_hash"
     );
 
-    // The stored file_hash is unchanged by ingestion.
+    // The stored raw_content_hash is unchanged by ingestion.
     let stored_file_hash: Option<String> =
-        sqlx::query_scalar("SELECT file_hash FROM sources WHERE id = ?")
+        sqlx::query_scalar("SELECT raw_content_hash FROM sources WHERE id = ?")
             .bind(&src.id)
             .fetch_one(&pool)
             .await
@@ -1000,7 +1010,7 @@ async fn file_hash_does_not_break_reingest_noop() {
     assert_eq!(
         stored_file_hash,
         Some(file_hash),
-        "ingestion must not touch file_hash"
+        "ingestion must not touch raw_content_hash"
     );
 
     // Re-ingest with UNCHANGED content → no-op driven by content_hash.
@@ -1053,7 +1063,10 @@ async fn file_hash_differs_from_content_hash_for_text() {
         .unwrap();
     assert!(!outcome.was_existing);
     let src = outcome.source;
-    let file_hash = src.file_hash.clone().expect("file source has file_hash");
+    let file_hash = src
+        .raw_content_hash
+        .clone()
+        .expect("file source has raw_content_hash");
     assert_eq!(src.content_hash, None, "content_hash is NULL until ingest");
 
     // Ingest → indexed, content_hash populated.
@@ -1167,7 +1180,8 @@ async fn purge_source_removes_rows_and_vectors() {
             "markdown",
         )
         .await
-        .unwrap();
+        .unwrap()
+        .source;
 
     // 2. Ingest so Lance vectors exist.
     engine.ingest_source(&src.id, |_p| {}).await.unwrap();
@@ -1419,7 +1433,8 @@ async fn trash_source_hides_from_list_keeps_data() {
             "markdown",
         )
         .await
-        .unwrap();
+        .unwrap()
+        .source;
 
     // Ingest so chunks + vectors exist.
     engine.ingest_source(&src.id, |_p| {}).await.unwrap();
@@ -1484,7 +1499,8 @@ async fn restore_source_reappears_in_list() {
     let src = engine
         .add_text_source(&nb.id, "to-restore", "Just some text.", "text")
         .await
-        .unwrap();
+        .unwrap()
+        .source;
 
     // Trash then restore.
     engine.trash_source(&src.id).await.unwrap();
@@ -1514,7 +1530,8 @@ async fn trash_and_restore_idempotency_errors() {
     let src = engine
         .add_text_source(&nb.id, "idem", "Idempotency test.", "text")
         .await
-        .unwrap();
+        .unwrap()
+        .source;
 
     // Restoring a live source must fail.
     let err = engine.restore_source(&src.id).await;
@@ -1544,7 +1561,8 @@ async fn purge_source_without_vectors_is_clean() {
     let src = engine
         .add_text_source(&nb.id, "no-vectors", "No ingest yet.", "text")
         .await
-        .unwrap();
+        .unwrap()
+        .source;
 
     // Purge without any prior ingest — must succeed (vector store handles missing
     // table gracefully). Purge requires a trashed source, so trash it first.
@@ -1581,7 +1599,8 @@ async fn purge_source_removes_managed_file() {
     let src = engine
         .add_text_source(&nb.id, "doc", "Some managed body text.", "text")
         .await
-        .unwrap();
+        .unwrap()
+        .source;
 
     // The managed file exists right after add_text_source.
     let path = std::path::PathBuf::from(&src.locator);
@@ -1616,11 +1635,13 @@ async fn purge_notebook_removes_managed_source_files() {
     let live = engine
         .add_text_source(&nb.id, "live", "Live source body.", "text")
         .await
-        .unwrap();
+        .unwrap()
+        .source;
     let trashed = engine
         .add_text_source(&nb.id, "trashed", "Trashed source body.", "markdown")
         .await
-        .unwrap();
+        .unwrap()
+        .source;
     // Trash one source so the notebook holds both a live and a trashed source.
     engine.trash_source(&trashed.id).await.unwrap();
 
@@ -1662,7 +1683,8 @@ async fn real_model_end_to_end_ingest_and_search() {
             "markdown",
         )
         .await
-        .unwrap();
+        .unwrap()
+        .source;
     engine.ingest_source(&src.id, |_p| {}).await.unwrap();
     assert_eq!(engine_source_status(&engine, &src.id).await, "indexed");
 
@@ -1755,7 +1777,8 @@ async fn empty_doc_indexes_without_loading_embedder() {
     let src = engine
         .add_text_source(&nb.id, "empty", "   \n\t\n  \n", "text")
         .await
-        .unwrap();
+        .unwrap()
+        .source;
 
     let mut phases: Vec<String> = Vec::new();
     engine
@@ -1817,7 +1840,8 @@ async fn ingest_spans_chunk_insert_batch_seam() {
     let src = engine
         .add_text_source(&nb.id, "big", &doc, "markdown")
         .await
-        .unwrap();
+        .unwrap()
+        .source;
     engine.ingest_source(&src.id, |_p| {}).await.unwrap();
     assert_eq!(engine_source_status(&engine, &src.id).await, "indexed");
 
@@ -1888,7 +1912,8 @@ async fn ingest_preserves_gfm_table_block() {
     let src = engine
         .add_text_source(&nb.id, "t", &doc, "markdown")
         .await
-        .unwrap();
+        .unwrap()
+        .source;
     engine.ingest_source(&src.id, |_p| {}).await.unwrap();
     assert_eq!(engine_source_status(&engine, &src.id).await, "indexed");
 
@@ -1988,7 +2013,8 @@ async fn seam_text_md_byte_identity_against_canonical() {
         let src = engine
             .add_text_source(&nb.id, title, body, kind)
             .await
-            .unwrap();
+            .unwrap()
+            .source;
         engine.ingest_source(&src.id, |_p| {}).await.unwrap();
         assert_eq!(engine_source_status(&engine, &src.id).await, "indexed");
         // The canonical buffer for text/MD is the original locator content.
@@ -2016,7 +2042,8 @@ async fn seam_single_buffer_drives_chunk_and_hash() {
     let src = engine
         .add_text_source(&nb.id, "buf", body, "markdown")
         .await
-        .unwrap();
+        .unwrap()
+        .source;
     engine.ingest_source(&src.id, |_p| {}).await.unwrap();
 
     let canonical = std::fs::read_to_string(&src.locator).unwrap();
@@ -2485,7 +2512,8 @@ async fn source_anchor_roundtrip_and_enrichment_null_for_text_source() {
     let src = engine
         .add_text_source(&nb.id, "doc", body, "markdown")
         .await
-        .unwrap();
+        .unwrap()
+        .source;
     engine.ingest_source(&src.id, |_p| {}).await.unwrap();
     assert_eq!(engine_source_status(&engine, &src.id).await, "indexed");
 
@@ -3387,6 +3415,194 @@ async fn test_pdf_reingest_changed_content() {
     assert_eq!(embidx_count(&engine, &nb_id, "active").await, 1);
     assert_eq!(embidx_count(&engine, &nb_id, "building").await, 0);
     assert_eq!(embidx_count(&engine, &nb_id, "stale").await, 0);
+}
+
+// ===========================================================================
+// M4 issue #100 — content-hash dedup for text / URL / onboarding + restore guard
+// ===========================================================================
+
+/// AC-3 / AC-8: pasting identical text twice deduplicates. The second add
+/// returns the existing source (`was_existing = true`) with the same id, and
+/// only one row exists; different text creates a distinct source.
+#[tokio::test]
+async fn add_text_source_dedup_returns_existing() {
+    let (_dir, engine) = file_engine().await;
+    let nb = engine
+        .create_notebook("text-dedup-nb", None, None)
+        .await
+        .unwrap();
+
+    let first = engine
+        .add_text_source(&nb.id, "doc", "hello world", "text")
+        .await
+        .unwrap();
+    assert!(!first.was_existing, "first add is a fresh insert");
+
+    let second = engine
+        .add_text_source(&nb.id, "doc-again", "hello world", "text")
+        .await
+        .unwrap();
+    assert!(second.was_existing, "second identical add is a dedup hit");
+    assert_eq!(
+        second.source.id, first.source.id,
+        "dedup hit returns the same source row"
+    );
+
+    let third = engine
+        .add_text_source(&nb.id, "other", "different text", "text")
+        .await
+        .unwrap();
+    assert!(!third.was_existing, "different text is a fresh insert");
+    assert_ne!(third.source.id, first.source.id);
+
+    let live = engine.list_sources(&nb.id).await.unwrap();
+    assert_eq!(live.len(), 2, "only two distinct rows exist");
+}
+
+/// AC-7 / AC-8: the M1 onboarding `add_source` path deduplicates on the LOCATOR
+/// (path bytes, NOT file content). Adding the same path twice returns the
+/// existing source (`was_existing = true`); a different path is a fresh insert.
+#[tokio::test]
+async fn add_source_onboarding_dedup() {
+    let (_dir, engine) = file_engine().await;
+    let nb = engine
+        .create_notebook("onboarding-dedup-nb", None, None)
+        .await
+        .unwrap();
+
+    let first = engine
+        .add_source(&nb.id, "notes", "/path/to/file.pdf")
+        .await
+        .unwrap();
+    assert!(!first.was_existing, "first add is a fresh insert");
+
+    let second = engine
+        .add_source(&nb.id, "notes-again", "/path/to/file.pdf")
+        .await
+        .unwrap();
+    assert!(second.was_existing, "same path is a dedup hit");
+    assert_eq!(second.source.id, first.source.id);
+
+    let third = engine
+        .add_source(&nb.id, "other", "/path/to/other.pdf")
+        .await
+        .unwrap();
+    assert!(!third.was_existing, "a different path is a fresh insert");
+
+    let live = engine.list_sources(&nb.id).await.unwrap();
+    assert_eq!(live.len(), 2, "only two distinct path rows exist");
+}
+
+/// AC-5: restoring a trashed source whose `raw_content_hash` matches a LIVE
+/// source in the same notebook is rejected with a clear `LensError::Validation`
+/// instead of a raw UNIQUE-constraint error.
+#[tokio::test]
+async fn restore_source_rejects_hash_collision() {
+    let (_dir, engine) = file_engine().await;
+    let nb = engine
+        .create_notebook("restore-collision-nb", None, None)
+        .await
+        .unwrap();
+
+    // Add file source A (populates raw_content_hash = H).
+    let src_dir = tempfile::tempdir().unwrap();
+    let path_a = src_dir.path().join("a.txt");
+    std::fs::write(&path_a, "identical content bytes").unwrap();
+    let a = engine.add_file_source(&nb.id, &path_a, None).await.unwrap();
+    assert!(!a.was_existing);
+    let a = a.source;
+
+    // Trash A so the partial unique index frees the (notebook, H) slot.
+    engine.trash_source(&a.id).await.unwrap();
+
+    // Add file source B with the SAME content (same hash H, new id — allowed
+    // because A is trashed).
+    let path_b = src_dir.path().join("b.txt");
+    std::fs::write(&path_b, "identical content bytes").unwrap();
+    let b = engine.add_file_source(&nb.id, &path_b, None).await.unwrap();
+    assert!(!b.was_existing, "B is a fresh insert while A is trashed");
+    assert_ne!(b.source.id, a.id);
+    assert_eq!(
+        b.source.raw_content_hash, a.raw_content_hash,
+        "A and B share the same content hash"
+    );
+
+    // Restoring A must now be rejected — B is a live collision.
+    let err = engine.restore_source(&a.id).await;
+    match err {
+        Err(lens_core::LensError::Validation(msg)) => {
+            assert!(
+                msg.contains("already exists"),
+                "collision message should mention the duplicate, got {msg:?}"
+            );
+        }
+        other => panic!("expected Validation collision error, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// issue #100 Step 6 — LensEngine-level end-to-end dedup coverage
+// ---------------------------------------------------------------------------
+
+/// LensEngine-level: adding identical text through the full engine wrapper
+/// stack deduplicates and leaves exactly one row.
+#[tokio::test]
+async fn engine_add_text_source_dedup_end_to_end() {
+    let (_dir, engine) = file_engine().await;
+    let nb = engine
+        .create_notebook("engine-text-dedup", None, None)
+        .await
+        .unwrap();
+
+    let first = engine
+        .add_text_source(&nb.id, "note", "hello", "text")
+        .await
+        .unwrap();
+    assert!(!first.was_existing);
+
+    let second = engine
+        .add_text_source(&nb.id, "note", "hello", "text")
+        .await
+        .unwrap();
+    assert!(second.was_existing, "identical text dedups end-to-end");
+    assert_eq!(second.source.id, first.source.id);
+
+    assert_eq!(
+        engine.list_sources(&nb.id).await.unwrap().len(),
+        1,
+        "exactly one source row after a dedup hit"
+    );
+}
+
+/// LensEngine-level: the restore-collision guard produces a clear
+/// `LensError::Validation` when restoring into a live content collision.
+#[tokio::test]
+async fn restore_source_collision_guard_end_to_end() {
+    let (_dir, engine) = file_engine().await;
+    let nb = engine
+        .create_notebook("engine-restore-collision", None, None)
+        .await
+        .unwrap();
+
+    let src_dir = tempfile::tempdir().unwrap();
+    let path_a = src_dir.path().join("a.txt");
+    std::fs::write(&path_a, "same content").unwrap();
+    let a = engine
+        .add_file_source(&nb.id, &path_a, None)
+        .await
+        .unwrap()
+        .source;
+    engine.trash_source(&a.id).await.unwrap();
+
+    let path_b = src_dir.path().join("b.txt");
+    std::fs::write(&path_b, "same content").unwrap();
+    engine.add_file_source(&nb.id, &path_b, None).await.unwrap();
+
+    let err = engine.restore_source(&a.id).await;
+    assert!(
+        matches!(err, Err(lens_core::LensError::Validation(ref m)) if m.contains("already exists")),
+        "restore into a live collision must be a clear Validation error, got {err:?}"
+    );
 }
 
 // ===========================================================================
