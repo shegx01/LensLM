@@ -229,6 +229,8 @@ export async function installTauriStub(
               );
             case 'list_trashed':
               return Promise.resolve([]);
+            case 'list_trashed_sources':
+              return Promise.resolve([]);
             case 'fastembed_models_cached':
               // Per-model fastembed on-disk cache probe (M4 4b-B).
               return Promise.resolve(fastembedCached);

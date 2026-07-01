@@ -110,7 +110,9 @@ export async function restoreSource(sourceId: string): Promise<void> {
  */
 export async function listTrashedSources(): Promise<TrashedSource[]> {
   if (!isTauri()) return [];
-  return invoke<TrashedSource[]>('list_trashed_sources');
+  // Coerce a null/undefined response to [] so a misbehaving host can never
+  // poison `trashedSources` (a null there makes `trashCount`'s `.length` throw).
+  return (await invoke<TrashedSource[] | null>('list_trashed_sources')) ?? [];
 }
 
 /**
