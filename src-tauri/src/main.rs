@@ -47,6 +47,7 @@ fn main() {
             commands::notebooks::trash_notebook,
             commands::notebooks::restore_notebook,
             commands::notebooks::list_trashed,
+            commands::notebooks::list_trashed_sources,
             commands::notebooks::purge_notebook,
             commands::notebooks::add_source,
             commands::notebooks::list_sources,

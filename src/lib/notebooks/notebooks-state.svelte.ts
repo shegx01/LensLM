@@ -22,6 +22,13 @@ import {
   listTrashed,
   purgeNotebook
 } from './ipc.js';
+import { listTrashedSources, restoreSource, purgeSource } from '$lib/sources/ipc.js';
+import type { TrashedSource } from '$lib/sources/types.js';
+// NOTE: loadSources + drainTrashQueueEntry are imported lazily inside actions
+// to break the circular dependency:
+//   notebooks-state → sources-state → notebooks-state (for activeNotebookId)
+// Static import would initialise sources-state before notebookStore is ready,
+// causing the $effect.root auto-refresh to read an undefined notebookStore.
 import type { Notebook, NotebookSummary } from './types.js';
 import { NOTEBOOK_PALETTE, notebookAccentClass } from './notebook-color.js';
 
@@ -31,6 +38,7 @@ import { NOTEBOOK_PALETTE, notebookAccentClass } from './notebook-color.js';
 
 let notebooks = $state<NotebookSummary[]>([]);
 let trashedNotebooks = $state<NotebookSummary[]>([]);
+let trashedSources = $state<TrashedSource[]>([]);
 let activeNotebookId = $state<string | null>(null); // session-only
 let activeTab = $state<'chat' | 'notes'>('chat'); // session-only
 let trashOpen = $state(false); // Trash modal visibility (centered dialog)
@@ -58,7 +66,7 @@ const paletteResults = $derived(
 
 const activeNotebook = $derived(notebooks.find((n) => n.id === activeNotebookId) ?? null);
 
-const trashCount = $derived(trashedNotebooks.length);
+const trashCount = $derived(trashedNotebooks.length + trashedSources.length);
 
 // Rank-based decorative color assignment.
 //
@@ -87,6 +95,9 @@ export const notebookStore = {
   },
   get trashedNotebooks() {
     return trashedNotebooks;
+  },
+  get trashedSources() {
+    return trashedSources;
   },
   get trashCount() {
     return trashCount;
@@ -181,8 +192,33 @@ async function refreshNotebooks(): Promise<void> {
   notebooks = await listNotebooks();
 }
 
-async function refreshTrashed(): Promise<void> {
+export async function refreshTrashed(): Promise<void> {
   trashedNotebooks = await listTrashed();
+}
+
+// Coalescing serial refresh for trashed sources. Concurrent callers coalesce
+// onto the in-flight promise; a queued flag ensures a final fetch always runs
+// AFTER the last trigger, so stale earlier responses can never overwrite newer
+// ones (fixes multi-delete race / badge undercount).
+let _trashSourcesRefreshInFlight: Promise<void> | null = null;
+let _trashSourcesRefreshQueued = false;
+
+export async function refreshTrashedSources(): Promise<void> {
+  if (_trashSourcesRefreshInFlight) {
+    _trashSourcesRefreshQueued = true;
+    return _trashSourcesRefreshInFlight;
+  }
+  _trashSourcesRefreshInFlight = (async () => {
+    try {
+      do {
+        _trashSourcesRefreshQueued = false;
+        trashedSources = await listTrashedSources();
+      } while (_trashSourcesRefreshQueued);
+    } finally {
+      _trashSourcesRefreshInFlight = null;
+    }
+  })();
+  return _trashSourcesRefreshInFlight;
 }
 
 /** Fetch all non-trashed notebooks and populate the store. */
@@ -266,7 +302,7 @@ export async function trashNotebookAction(id: string): Promise<void> {
     if (activeNotebookId === id) {
       activeNotebookId = null;
     }
-    await Promise.all([refreshNotebooks(), refreshTrashed()]);
+    await Promise.all([refreshNotebooks(), refreshTrashed(), refreshTrashedSources()]);
   } catch (err) {
     console.error('trashNotebookAction: failed', err);
     error = String(err);
@@ -281,7 +317,7 @@ export async function restoreNotebookAction(id: string): Promise<void> {
   loading = true;
   try {
     await restoreNotebook(id);
-    await Promise.all([refreshNotebooks(), refreshTrashed()]);
+    await Promise.all([refreshNotebooks(), refreshTrashed(), refreshTrashedSources()]);
   } catch (err) {
     console.error('restoreNotebookAction: failed', err);
     error = String(err);
@@ -296,7 +332,7 @@ export async function purgeNotebookAction(id: string): Promise<void> {
   loading = true;
   try {
     await purgeNotebook(id);
-    await Promise.all([refreshNotebooks(), refreshTrashed()]);
+    await Promise.all([refreshNotebooks(), refreshTrashed(), refreshTrashedSources()]);
   } catch (err) {
     console.error('purgeNotebookAction: failed', err);
     error = String(err);
@@ -330,12 +366,108 @@ export function notebookColorClass(id: string): string {
   return notebookColorMap.get(id) ?? notebookAccentClass(id);
 }
 
+/** Fetch all individually-trashed sources and populate the store. */
+export async function loadTrashedSources(): Promise<void> {
+  error = null;
+  loading = true;
+  try {
+    await refreshTrashedSources();
+  } catch (err) {
+    console.error('loadTrashedSources: failed', err);
+    error = String(err);
+  } finally {
+    loading = false;
+  }
+}
+
 /**
- * Open the Trash modal and load the trashed list.
+ * Restore a trashed source from the Trash modal. Drains any matching undo-bar
+ * entry for that source so the stale undo cannot call `restore_source` on an
+ * already-live source. Refreshes the trashed-sources list, and if the source
+ * belonged to the active notebook, also refreshes the active source list.
+ */
+export async function restoreSourceFromTrash(sourceId: string): Promise<void> {
+  // Look up notebook_id BEFORE the IPC call (row is removed after).
+  const source = trashedSources.find((s) => s.id === sourceId);
+  const notebookId = source?.notebook_id ?? null;
+
+  // Drain any pending undo-bar entry for this source.
+  // Dynamic import to avoid circular dependency: sources-state ↔ notebooks-state.
+  const { drainTrashQueueEntry } = await import('$lib/sources/sources-state.svelte.js');
+  drainTrashQueueEntry(sourceId);
+
+  error = null;
+  loading = true;
+  try {
+    await restoreSource(sourceId);
+    await refreshTrashedSources();
+    // Only reload the active source list if this source belonged to it.
+    if (notebookId && notebookId === activeNotebookId) {
+      const { loadSources } = await import('$lib/sources/sources-state.svelte.js');
+      await loadSources(notebookId);
+    }
+  } catch (err) {
+    console.error('restoreSourceFromTrash: failed', err);
+    error = String(err);
+  } finally {
+    loading = false;
+  }
+}
+
+/**
+ * Permanently delete a trashed source. Refreshes the trashed-sources list, and
+ * if the source belonged to the active notebook, also refreshes the active
+ * source list (in case it was temporarily visible via optimistic state).
+ */
+export async function purgeSourceAction(sourceId: string): Promise<void> {
+  // Look up notebook_id BEFORE the IPC call (row is removed after).
+  const source = trashedSources.find((s) => s.id === sourceId);
+  const notebookId = source?.notebook_id ?? null;
+
+  // Drain any pending undo-bar entry so a stale undo cannot try to restore a
+  // source we just permanently purged.
+  // Dynamic import to avoid circular dependency: sources-state ↔ notebooks-state.
+  const { drainTrashQueueEntry } = await import('$lib/sources/sources-state.svelte.js');
+  drainTrashQueueEntry(sourceId);
+
+  error = null;
+  loading = true;
+  try {
+    await purgeSource(sourceId);
+    await refreshTrashedSources();
+    // Only reload the active source list if this source belonged to it.
+    if (notebookId && notebookId === activeNotebookId) {
+      // Dynamic import to avoid circular dependency: sources-state ↔ notebooks-state.
+      const { loadSources } = await import('$lib/sources/sources-state.svelte.js');
+      await loadSources(notebookId);
+    }
+  } catch (err) {
+    console.error('purgeSourceAction: failed', err);
+    error = String(err);
+  } finally {
+    loading = false;
+  }
+}
+
+/**
+ * Open the Trash modal and load both trashed notebooks and trashed sources.
+ * Uses Promise.allSettled so a failure in one fetch still renders the other.
  */
 export async function openTrash(): Promise<void> {
   trashOpen = true;
-  await loadTrashed();
+  error = null;
+  loading = true;
+  try {
+    const results = await Promise.allSettled([refreshTrashed(), refreshTrashedSources()]);
+    for (const result of results) {
+      if (result.status === 'rejected') {
+        console.error('openTrash: a fetch failed', result.reason);
+        error = String(result.reason);
+      }
+    }
+  } finally {
+    loading = false;
+  }
 }
 
 /**
@@ -346,6 +478,7 @@ export async function openTrash(): Promise<void> {
 export function resetNotebookStore(): void {
   notebooks = [];
   trashedNotebooks = [];
+  trashedSources = [];
   activeNotebookId = null;
   activeTab = 'chat';
   trashOpen = false;
@@ -356,4 +489,6 @@ export function resetNotebookStore(): void {
   paletteQuery = '';
   loading = false;
   error = null;
+  _trashSourcesRefreshInFlight = null;
+  _trashSourcesRefreshQueued = false;
 }

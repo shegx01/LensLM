@@ -306,6 +306,26 @@ pub struct Source {
     pub enrichment_meta: Option<String>,
 }
 
+/// A trashed source with its parent notebook's title, used by the Trash modal.
+///
+/// Mirrors [`NotebookSummary`]'s design: `notebook_title` is a JOIN alias (not a
+/// `sources` column), so this must NOT derive `sqlx::FromRow`. The inner [`Source`]
+/// fields are flattened to the top level via `#[serde(flatten)]`, giving the wire
+/// shape `{id, notebook_id, kind, title, ..., notebook_title}`.
+///
+/// Returned by [`NotebookRepo::list_trashed_sources`]; covers individually-trashed
+/// sources whose parent notebook is still live (`s.trashed_at IS NOT NULL AND
+/// n.trashed_at IS NULL`). Sources under a trashed notebook are excluded — they
+/// recover/purge with the notebook.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrashedSource {
+    /// The underlying source row (its fields are flattened into the response).
+    #[serde(flatten)]
+    pub source: Source,
+    /// Display title of the parent notebook.
+    pub notebook_title: String,
+}
+
 /// The return type of all add-source paths (issues #96 + #100):
 /// [`NotebookRepo::add_file_source`], [`NotebookRepo::add_source`],
 /// [`NotebookRepo::add_text_source`], and [`NotebookRepo::add_url_source`].
@@ -570,13 +590,17 @@ impl<'a> NotebookRepo<'a> {
     /// appear (with `source_count = 0`). Maps each row manually because
     /// `NotebookSummary::source_count` is a `COUNT(...)` aggregate with no
     /// backing column, so `query_as::<_, Notebook>` cannot populate it.
+    ///
+    /// The `s.trashed_at IS NULL` predicate lives in the JOIN's `ON` clause
+    /// (not `WHERE`) so individually-trashed sources are excluded from the
+    /// count while notebooks with zero live sources are still returned.
     pub async fn list_with_counts(&self) -> Result<Vec<NotebookSummary>, LensError> {
         self.list_summaries(
             "SELECT n.id, n.title, n.description, n.focus_mode, n.embedding_model, \
                     n.embedding_backend, n.created_at, n.updated_at, n.trashed_at, \
                     COALESCE(COUNT(s.id), 0) AS source_count \
              FROM notebooks n \
-             LEFT JOIN sources s ON s.notebook_id = n.id \
+             LEFT JOIN sources s ON s.notebook_id = n.id AND s.trashed_at IS NULL \
              WHERE n.trashed_at IS NULL \
              GROUP BY n.id \
              ORDER BY n.created_at DESC",
@@ -586,6 +610,12 @@ impl<'a> NotebookRepo<'a> {
 
     /// Lists all trashed notebooks with their source counts, newest
     /// `trashed_at` first.
+    ///
+    /// Unlike [`list_with_counts`](Self::list_with_counts), the JOIN has **no**
+    /// `s.trashed_at IS NULL` predicate — a trashed notebook's count intentionally
+    /// includes individually-trashed sources because they all purge or restore
+    /// together with the notebook. Excluding them would make a notebook whose only
+    /// sources were individually-trashed appear as "0 files" in the Trash modal.
     pub async fn list_trashed_with_counts(&self) -> Result<Vec<NotebookSummary>, LensError> {
         self.list_summaries(
             "SELECT n.id, n.title, n.description, n.focus_mode, n.embedding_model, \
@@ -598,6 +628,57 @@ impl<'a> NotebookRepo<'a> {
              ORDER BY n.trashed_at DESC",
         )
         .await
+    }
+
+    /// Lists individually-trashed sources whose parent notebook is still live,
+    /// ordered by `s.trashed_at DESC` (most-recently-trashed first).
+    ///
+    /// Sources under a trashed notebook are excluded — they recover/purge with the
+    /// notebook and must not appear as loose rows in the Trash modal. Each row
+    /// carries the parent notebook's title so the UI can label it without a second
+    /// query.
+    ///
+    /// Uses manual [`sqlx::Row`] mapping (mirrors [`list_summaries`](Self::list_summaries))
+    /// because `TrashedSource::notebook_title` is a JOIN alias with no backing
+    /// column on `sources`, so `query_as::<_, TrashedSource>` would fail.
+    pub async fn list_trashed_sources(&self) -> Result<Vec<TrashedSource>, LensError> {
+        use sqlx::Row;
+        let rows = sqlx::query(
+            "SELECT s.id, s.notebook_id, s.kind, s.title, s.status, s.locator, s.selected, \
+                    s.token_count, s.content_hash, s.raw_content_hash, s.created_at, s.trashed_at, \
+                    s.enrichment_status, s.enrichment_meta, n.title AS notebook_title \
+             FROM sources s \
+             JOIN notebooks n ON n.id = s.notebook_id \
+             WHERE s.trashed_at IS NOT NULL AND n.trashed_at IS NULL \
+             ORDER BY s.trashed_at DESC",
+        )
+        .fetch_all(self.pool)
+        .await?;
+        let trashed = rows
+            .into_iter()
+            .map(|row| {
+                Ok(TrashedSource {
+                    source: Source {
+                        id: row.try_get("id")?,
+                        notebook_id: row.try_get("notebook_id")?,
+                        kind: row.try_get("kind")?,
+                        title: row.try_get("title")?,
+                        status: row.try_get("status")?,
+                        locator: row.try_get("locator")?,
+                        selected: row.try_get("selected")?,
+                        token_count: row.try_get("token_count")?,
+                        content_hash: row.try_get("content_hash")?,
+                        raw_content_hash: row.try_get("raw_content_hash")?,
+                        created_at: row.try_get("created_at")?,
+                        trashed_at: row.try_get("trashed_at")?,
+                        enrichment_status: row.try_get("enrichment_status")?,
+                        enrichment_meta: row.try_get("enrichment_meta")?,
+                    },
+                    notebook_title: row.try_get("notebook_title")?,
+                })
+            })
+            .collect::<Result<Vec<_>, LensError>>()?;
+        Ok(trashed)
     }
 
     /// Runs a `NotebookSummary` list query and maps each row by column name.
@@ -2199,6 +2280,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn source_count_excludes_individually_trashed_sources_from_live_listing() {
+        let pool = test_pool().await;
+        let repo = NotebookRepo::new(&pool);
+        let nb = repo
+            .create(
+                "Notebook",
+                None,
+                None,
+                crate::embedder::registry::DEFAULT_EMBED_MODEL_ID,
+                "fastembed",
+            )
+            .await
+            .unwrap();
+        // One live source, one individually-trashed source.
+        repo.add_source(&nb.id, "live.pdf", "/abs/live.pdf")
+            .await
+            .unwrap();
+        let trashed_src = repo
+            .add_source(&nb.id, "gone.pdf", "/abs/gone.pdf")
+            .await
+            .unwrap();
+        repo.trash_source(&trashed_src.source.id).await.unwrap();
+
+        // Live-notebook listing counts only the live source, not the trashed one.
+        let live = repo.list_with_counts().await.unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(
+            live[0].source_count, 1,
+            "individually-trashed source must not inflate the live count"
+        );
+
+        // Trashed-notebook listing counts ALL sources (live + individually-trashed)
+        // because they all purge/restore with the notebook.
+        repo.trash(&nb.id).await.unwrap();
+        let trashed = repo.list_trashed_with_counts().await.unwrap();
+        assert_eq!(trashed.len(), 1);
+        assert_eq!(
+            trashed[0].source_count, 2,
+            "trashed notebook must count both live and individually-trashed sources"
+        );
+    }
+
+    /// Regression guard for the "Showing 0 file" bug (commit 85471b8):
+    /// a notebook whose ONLY source was individually-trashed must show source_count 1
+    /// in the trashed listing, not 0.
+    #[tokio::test]
+    async fn list_trashed_with_counts_counts_notebook_with_only_trashed_sources() {
+        let pool = test_pool().await;
+        let repo = NotebookRepo::new(&pool);
+        let nb = repo
+            .create(
+                "AllTrashed",
+                None,
+                None,
+                crate::embedder::registry::DEFAULT_EMBED_MODEL_ID,
+                "fastembed",
+            )
+            .await
+            .unwrap();
+        // Add one source then individually-trash it — notebook now has zero live sources.
+        let src = repo
+            .add_source(&nb.id, "only.pdf", "/abs/only.pdf")
+            .await
+            .unwrap();
+        repo.trash_source(&src.source.id).await.unwrap();
+
+        // Live listing must show source_count 0 (individually-trashed excluded).
+        let live = repo.list_with_counts().await.unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].source_count, 0);
+
+        // Now trash the notebook itself.
+        repo.trash(&nb.id).await.unwrap();
+
+        // Trashed listing must show source_count 1, not 0.
+        let trashed = repo.list_trashed_with_counts().await.unwrap();
+        assert_eq!(trashed.len(), 1);
+        assert_eq!(
+            trashed[0].source_count, 1,
+            "notebook with only individually-trashed sources must not show 0 files in trash"
+        );
+    }
+
+    #[tokio::test]
+    async fn source_count_includes_notebooks_with_zero_live_sources() {
+        let pool = test_pool().await;
+        let repo = NotebookRepo::new(&pool);
+        let nb = repo
+            .create(
+                "Empty",
+                None,
+                None,
+                crate::embedder::registry::DEFAULT_EMBED_MODEL_ID,
+                "fastembed",
+            )
+            .await
+            .unwrap();
+        // Only source is individually trashed → notebook has zero live sources
+        // but must still appear with source_count = 0 (ON-clause filter, not WHERE).
+        let src = repo
+            .add_source(&nb.id, "gone.pdf", "/abs/gone.pdf")
+            .await
+            .unwrap();
+        repo.trash_source(&src.source.id).await.unwrap();
+
+        let live = repo.list_with_counts().await.unwrap();
+        assert_eq!(live.len(), 1, "notebook must not vanish from the list");
+        assert_eq!(live[0].source_count, 0);
+    }
+
+    #[tokio::test]
     async fn purge_removes_permanently() {
         let pool = test_pool().await;
         let repo = NotebookRepo::new(&pool);
@@ -2863,5 +3055,101 @@ mod tests {
         assert_ne!(in_a.source.id, in_b.source.id);
         assert_eq!(repo.list_sources(&nb_a.id).await.unwrap().len(), 1);
         assert_eq!(repo.list_sources(&nb_b.id).await.unwrap().len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #94 — list_trashed_sources
+    // -----------------------------------------------------------------------
+
+    /// `list_trashed_sources` returns individually-trashed sources whose parent
+    /// notebook is live, carries the correct `notebook_title`, excludes live sources,
+    /// and excludes sources under a trashed notebook.
+    #[tokio::test]
+    async fn list_trashed_sources_returns_trashed_under_live_notebook() {
+        let pool = test_pool().await;
+        let repo = NotebookRepo::new(&pool);
+        let nb = make_notebook(&repo, "My Notebook").await;
+
+        let src = repo
+            .add_source(&nb.id, "report.pdf", "/abs/report.pdf")
+            .await
+            .unwrap();
+
+        // Before trashing, nothing appears in the trashed-sources list.
+        assert!(repo.list_trashed_sources().await.unwrap().is_empty());
+
+        repo.trash_source(&src.source.id).await.unwrap();
+
+        let trashed = repo.list_trashed_sources().await.unwrap();
+        assert_eq!(trashed.len(), 1);
+        assert_eq!(trashed[0].source.id, src.source.id);
+        // notebook_title is propagated from the JOIN.
+        assert_eq!(trashed[0].notebook_title, "My Notebook");
+        // trashed_at is set.
+        assert!(trashed[0].source.trashed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn list_trashed_sources_excludes_live_sources() {
+        let pool = test_pool().await;
+        let repo = NotebookRepo::new(&pool);
+        let nb = make_notebook(&repo, "Notebook").await;
+
+        // Add a source but do NOT trash it — must not appear.
+        repo.add_source(&nb.id, "live.pdf", "/abs/live.pdf")
+            .await
+            .unwrap();
+
+        assert!(repo.list_trashed_sources().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_trashed_sources_excludes_sources_under_trashed_notebook() {
+        let pool = test_pool().await;
+        let repo = NotebookRepo::new(&pool);
+        let nb = make_notebook(&repo, "Notebook").await;
+
+        let src = repo
+            .add_source(&nb.id, "report.pdf", "/abs/report.pdf")
+            .await
+            .unwrap();
+
+        // Trash the source individually, then also trash the parent notebook.
+        repo.trash_source(&src.source.id).await.unwrap();
+        repo.trash(&nb.id).await.unwrap();
+
+        // The source's parent notebook is now trashed — it must NOT appear in the
+        // flat trashed-sources list (it recovers/purges with the notebook).
+        assert!(repo.list_trashed_sources().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_trashed_sources_ordered_by_trashed_at_desc() {
+        let pool = test_pool().await;
+        let repo = NotebookRepo::new(&pool);
+        let nb = make_notebook(&repo, "Notebook").await;
+
+        let src_a = repo
+            .add_source(&nb.id, "a.pdf", "/abs/a.pdf")
+            .await
+            .unwrap();
+        let src_b = repo
+            .add_source(&nb.id, "b.pdf", "/abs/b.pdf")
+            .await
+            .unwrap();
+
+        // Trash in order a then b; b should appear first (most recent trash).
+        repo.trash_source(&src_a.source.id).await.unwrap();
+        // Tiny sleep to ensure distinct trashed_at timestamps on fast machines.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        repo.trash_source(&src_b.source.id).await.unwrap();
+
+        let trashed = repo.list_trashed_sources().await.unwrap();
+        assert_eq!(trashed.len(), 2);
+        assert_eq!(
+            trashed[0].source.id, src_b.source.id,
+            "most recently trashed first"
+        );
+        assert_eq!(trashed[1].source.id, src_a.source.id);
     }
 }

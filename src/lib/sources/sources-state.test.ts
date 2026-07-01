@@ -46,11 +46,13 @@ vi.mock('$lib/notebooks/notebooks-state.svelte.js', () => ({
     get activeNotebookId() {
       return null;
     }
-  }
+  },
+  refreshTrashedSources: vi.fn()
 }));
 
 // Import the mocked functions so we can configure return values per test.
 import { listSources, ingestSource, setSourceSelected, trashSource, restoreSource } from './ipc.js';
+import { refreshTrashedSources } from '$lib/notebooks/notebooks-state.svelte.js';
 import type { Source } from './types.js';
 
 // ---------------------------------------------------------------------------
@@ -84,6 +86,7 @@ function makeSource(overrides?: Partial<Source>): Source {
 beforeEach(() => {
   vi.clearAllMocks();
   resetSourcesStore();
+  vi.mocked(refreshTrashedSources).mockResolvedValue(undefined);
 });
 
 afterEach(() => {
@@ -886,5 +889,65 @@ describe('disposeTrashTimers + TTL auto-expiry', () => {
     disposeTrashTimers();
 
     expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Badge refresh — refreshTrashedSources called after trash / undo
+// ---------------------------------------------------------------------------
+
+describe('removeSource calls refreshTrashedSources to update the sidebar badge', () => {
+  it('calls refreshTrashedSources after a successful trash', async () => {
+    vi.mocked(listSources).mockResolvedValue([makeSource({ id: 'src-001' })]);
+    await loadSources('nb-001');
+    vi.mocked(trashSource).mockResolvedValue(undefined);
+
+    await removeSource('src-001');
+
+    expect(refreshTrashedSources).toHaveBeenCalledTimes(1);
+  });
+
+  it('does NOT call refreshTrashedSources when trashSource fails', async () => {
+    vi.mocked(listSources).mockResolvedValue([makeSource({ id: 'src-001' })]);
+    await loadSources('nb-001');
+    vi.mocked(trashSource).mockRejectedValue(new Error('DB error'));
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await removeSource('src-001');
+
+    expect(refreshTrashedSources).not.toHaveBeenCalled();
+    consoleSpy.mockRestore();
+  });
+});
+
+describe('undoRemove calls refreshTrashedSources to update the sidebar badge', () => {
+  it('calls refreshTrashedSources after a successful restore', async () => {
+    vi.mocked(listSources).mockResolvedValue([makeSource({ id: 'src-001' })]);
+    await loadSources('nb-001');
+    vi.mocked(trashSource).mockResolvedValue(undefined);
+    vi.mocked(restoreSource).mockResolvedValue(undefined);
+
+    await removeSource('src-001');
+    vi.mocked(refreshTrashedSources).mockClear();
+
+    await undoRemove();
+
+    expect(refreshTrashedSources).toHaveBeenCalledTimes(1);
+  });
+
+  it('does NOT call refreshTrashedSources when restoreSource fails', async () => {
+    vi.mocked(listSources).mockResolvedValue([makeSource({ id: 'src-001' })]);
+    await loadSources('nb-001');
+    vi.mocked(trashSource).mockResolvedValue(undefined);
+    vi.mocked(restoreSource).mockRejectedValue(new Error('restore failed'));
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await removeSource('src-001');
+    vi.mocked(refreshTrashedSources).mockClear();
+
+    await undoRemove();
+
+    expect(refreshTrashedSources).not.toHaveBeenCalled();
+    consoleSpy.mockRestore();
   });
 });
