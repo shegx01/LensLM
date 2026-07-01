@@ -602,6 +602,20 @@ async fn run_ingest(
             .await
             .map_err(|e| LensError::Io(format!("{}: {e}", sibling.display())))?;
     }
+
+    // For TABULAR kinds (xlsx/xls/csv), persist the `table_markdown` sibling
+    // (rendered DURING extraction — no second parse). It is NEVER embedded and
+    // NEVER part of the canonical buffer; it exists only for future display. The
+    // sources dir was created above for the derived-kind `.extracted.txt` write
+    // (tabular kinds are derived), so it already exists. Same shared path builder
+    // the purge site uses, so write and cleanup can never diverge (issue #76).
+    if let Some(ref md) = out.table_markdown {
+        let tables_path = tables_sibling_path(&data_dir, source_id);
+        tokio::fs::write(&tables_path, md)
+            .await
+            .map_err(|e| LensError::Io(format!("{}: {e}", tables_path.display())))?;
+    }
+
     let canonical: &str = &out.extracted_text;
 
     // ── Content hash (hash split) + text/MD no-op short-circuit ───────────
@@ -953,6 +967,21 @@ pub(crate) fn extracted_sibling_path(data_dir: &Path, source_id: &str) -> PathBu
     data_dir
         .join("sources")
         .join(format!("{source_id}.extracted.txt"))
+}
+
+/// The `.tables.md` sibling path for a TABULAR (xlsx/xls/csv) source:
+/// `{data_dir}/sources/{source_id}.tables.md` (issue #76).
+///
+/// SINGLE source of truth shared by the ingest WRITE site ([`run_ingest`]) and
+/// the purge CLEANUP site (`remove_managed_source_file` in `lib.rs`), mirroring
+/// the [`extracted_sibling_path`] invariant so the two can never diverge. The
+/// markdown rendering is produced during extraction (carried on
+/// [`ExtractOutput::table_markdown`](crate::extract::ExtractOutput::table_markdown))
+/// and persisted for future display; it is NEVER embedded.
+pub(crate) fn tables_sibling_path(data_dir: &Path, source_id: &str) -> PathBuf {
+    data_dir
+        .join("sources")
+        .join(format!("{source_id}.tables.md"))
 }
 
 /// Accepted `Content-Type` prefixes for a URL source body.
@@ -1820,6 +1849,22 @@ mod tests {
         ] {
             assert!(!k.is_text_like(), "{k:?} must be a derived (non-text) kind");
         }
+    }
+
+    #[test]
+    fn tabular_kinds_follow_derived_path() {
+        // XLSX/XLS/CSV are DERIVED (issue #76): raw-bytes-hash + `.extracted.txt`.
+        use crate::parse::SourceKind;
+        for k in [SourceKind::Xlsx, SourceKind::Xls, SourceKind::Csv] {
+            assert!(!k.is_text_like(), "{k:?} must be a derived (non-text) kind");
+        }
+    }
+
+    #[test]
+    fn tables_sibling_path_builder() {
+        let data_dir = Path::new("/data");
+        let p = tables_sibling_path(data_dir, "abc-123");
+        assert_eq!(p, Path::new("/data/sources/abc-123.tables.md"));
     }
 
     // ── max_source_mb resolver (issue #71) ────────────────────────────────

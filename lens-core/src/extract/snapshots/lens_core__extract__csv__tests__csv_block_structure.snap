@@ -1,0 +1,16 @@
+---
+source: lens-core/src/extract/csv.rs
+expression: snaps
+---
+[
+  {
+    "block_type": "table",
+    "section_path": "",
+    "text": "Name: Alice; Age: 30; City: NYC"
+  },
+  {
+    "block_type": "table",
+    "section_path": "",
+    "text": "Name: Bob; Age: 25; City: LA"
+  }
+]

@@ -123,6 +123,18 @@ quick-xml = { version = "=0.41.0", default-features = false }
 # isn't surprised by the Cargo.lock backend change.
 rbook = { version = "=0.7.9", default-features = false, features = ["threadsafe"] }
 
+# --- M4 issue #76: tabular-format extractors (XLSX/XLS/CSV) ---
+# Excel/OpenDocument spreadsheet reader (XLSX + XLS) via the shared
+# `spreadsheet.rs` extractor. Read-only; opened from in-memory bytes via
+# `open_workbook_auto_from_rs(Cursor::new(raw))`. The cell enum is `Data`
+# (variants Int/Float/String/Bool/DateTime(ExcelDateTime)/DateTimeIso(String)/
+# DurationIso(String)/Error/Empty). MIT — deny.toml allowlist. Pinned exactly.
+calamine = "=0.35.0"
+# CSV reader (comma-delimited, RFC-4180 quoting) for the `csv.rs` extractor.
+# `ReaderBuilder::default()` does NOT strip a leading UTF-8 BOM; the extractor
+# strips it manually. MIT OR Unlicense — MIT in deny.toml allowlist. Pinned.
+csv = "=1.4.0"
+
 # --- M4 Source Grounding (Phase 2, Step 6) ---
 # DOCX paragraph/heading/table extraction. MIT licence — in deny.toml allowlist.
 # Pinned exactly to avoid future breaking changes in a crate still at 0.x.
@@ -188,6 +200,10 @@ lancedb = "0.30.0"
 # TDD) so no binary fixture is committed. Dev-only; never in production builds.
 # MIT-licensed (deny.toml allowlist).
 printpdf = "=0.7.0"
+# Pure-Rust XLSX writer — generates the `sample.xlsx` test fixture in a #[test]
+# (see `extract::spreadsheet` tests). calamine is READ-ONLY so it cannot write
+# fixtures. Dev-only; never in production builds. MIT OR Apache-2.0.
+rust_xlsxwriter = "=0.92.0"
 arrow-array = "58"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # Tokenizer download fallback for tokenizer-dependent tests when offline cache

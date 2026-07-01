@@ -1,0 +1,21 @@
+---
+source: lens-core/src/extract/spreadsheet.rs
+expression: snaps
+---
+[
+  {
+    "block_type": "table",
+    "section_path": "People",
+    "text": "Name: Alice; Age: 30"
+  },
+  {
+    "block_type": "table",
+    "section_path": "People",
+    "text": "Name: Bob; Age: 25"
+  },
+  {
+    "block_type": "table",
+    "section_path": "Cities",
+    "text": "City: NYC; Pop: 8000000"
+  }
+]

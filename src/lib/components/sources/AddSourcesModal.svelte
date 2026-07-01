@@ -360,7 +360,7 @@
               </p>
               <p class="mt-1 italic text-muted-foreground/40">
                 Supported: .md · .markdown · .mdx · .txt · .pdf · .docx · .rtf · .odt · .epub ·
-                .json · .jsonl · .ndjson · .yaml · .yml · .xml
+                .xlsx · .xls · .csv · .json · .jsonl · .ndjson · .yaml · .yml · .xml
               </p>
             </div>
 

@@ -712,8 +712,8 @@ impl LensEngine {
         }
         NotebookRepo::new(&pool).purge_source(source_id).await?;
         // Best-effort: remove the managed source file AND its `.extracted.txt`
-        // sibling so "Delete forever" does not leak either on disk. A missing
-        // file (already gone) is not an error.
+        // and `.tables.md` siblings so "Delete forever" does not leak any of them
+        // on disk. A missing file (already gone) is not an error.
         remove_managed_source_file(&data_dir, source_id, &source.locator);
         Ok(())
     }
@@ -1429,8 +1429,9 @@ impl LensEngine {
         let data_dir = self.data_dir().await;
         // Capture every source (id, locator) pair (live AND trashed) BEFORE the
         // cascade deletes the `sources` rows, so the managed source files AND
-        // their `.extracted.txt` siblings can be removed afterwards rather than
-        // leaked on disk forever. The id is needed to derive the sibling path.
+        // their `.extracted.txt` / `.tables.md` siblings can be removed afterwards
+        // rather than leaked on disk forever. The id is needed to derive the
+        // sibling paths.
         let sources: Vec<(String, String)> =
             sqlx::query_as("SELECT id, locator FROM sources WHERE notebook_id = ?")
                 .bind(id.as_str())
@@ -1452,7 +1453,7 @@ impl LensEngine {
 }
 
 /// Best-effort removal of a managed source file AND its canonical
-/// `.extracted.txt` sibling, ignoring a missing file.
+/// `.extracted.txt` and `.tables.md` siblings, ignoring a missing file.
 ///
 /// Used by the purge paths to reclaim `{data_dir}/sources/{id}.{ext}` files
 /// written by `add_text_source`, PLUS the canonical
@@ -1473,6 +1474,11 @@ fn remove_managed_source_file(data_dir: &Path, source_id: &str, locator: &str) {
     // regardless of the locator (a URL locator is not a filesystem path).
     let sibling = crate::ingest::extracted_sibling_path(data_dir, source_id);
     remove_file_best_effort(&sibling);
+    // The `.tables.md` sibling for TABULAR kinds (XLSX/XLS/CSV — issue #76). Same
+    // shared builder the ingest write site uses. Unconditional + best-effort: for
+    // non-tabular kinds the file does not exist, so `NotFound` is silently ignored.
+    let tables_sibling = crate::ingest::tables_sibling_path(data_dir, source_id);
+    remove_file_best_effort(&tables_sibling);
 }
 
 /// Removes a single file, ignoring `NotFound` and logging any other error.

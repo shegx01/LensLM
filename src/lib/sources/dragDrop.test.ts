@@ -100,24 +100,13 @@ describe('partitionPaths — rejected extensions', () => {
       '/a/song.mp3',
       '/a/clip.mp4',
       '/a/deck.pptx',
-      '/a/sheet.xlsx',
-      '/a/data.csv',
       '/a/note.key',
       '/a/doc.pages',
       '/a/blob.unknown'
     ];
     const { accepted, rejected } = partitionPaths(paths);
     expect(accepted).toHaveLength(0);
-    expect(rejected.map((r) => r.ext)).toEqual([
-      'mp3',
-      'mp4',
-      'pptx',
-      'xlsx',
-      'csv',
-      'key',
-      'pages',
-      'unknown'
-    ]);
+    expect(rejected.map((r) => r.ext)).toEqual(['mp3', 'mp4', 'pptx', 'key', 'pages', 'unknown']);
   });
 });
 
@@ -156,8 +145,8 @@ describe('partitionPaths — no-extension file', () => {
 // ---------------------------------------------------------------------------
 
 describe('ACCEPTED_EXTENSIONS', () => {
-  it('contains exactly the 15 backend-accepted extensions', () => {
-    expect(ACCEPTED_EXTENSIONS.size).toBe(15);
+  it('contains exactly the 18 backend-accepted extensions', () => {
+    expect(ACCEPTED_EXTENSIONS.size).toBe(18);
     const expected = [
       'pdf',
       'docx',
@@ -173,7 +162,10 @@ describe('ACCEPTED_EXTENSIONS', () => {
       'xml',
       'rtf',
       'odt',
-      'epub'
+      'epub',
+      'xlsx',
+      'xls',
+      'csv'
     ];
     for (const ext of expected) {
       expect(ACCEPTED_EXTENSIONS.has(ext)).toBe(true);
@@ -186,10 +178,10 @@ describe('ACCEPTED_EXTENSIONS', () => {
 // ---------------------------------------------------------------------------
 
 describe('PICKER_FILTERS', () => {
-  it('has two groups (Documents + Structured) covering all accepted extensions', () => {
-    expect(PICKER_FILTERS).toHaveLength(2);
+  it('has three groups (Documents + Tabular + Structured) covering all accepted extensions', () => {
+    expect(PICKER_FILTERS).toHaveLength(3);
     const names = PICKER_FILTERS.map((g) => g.name);
-    expect(names).toEqual(['Documents', 'Structured']);
+    expect(names).toEqual(['Documents', 'Tabular', 'Structured']);
     const all = new Set(PICKER_FILTERS.flatMap((g) => g.extensions));
     expect(all).toEqual(new Set([...ACCEPTED_EXTENSIONS]));
   });

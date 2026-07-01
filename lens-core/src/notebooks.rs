@@ -887,12 +887,17 @@ impl<'a> NotebookRepo<'a> {
             Some("rtf") => (SourceKind::Rtf.as_str(), "rtf"),
             Some("odt") => (SourceKind::Odt.as_str(), "odt"),
             Some("epub") => (SourceKind::Epub.as_str(), "epub"),
+            // Tabular formats (M4 issue #76). The canonical managed-file extension
+            // preserves the original so the on-disk locator round-trips.
+            Some("xlsx") => (SourceKind::Xlsx.as_str(), "xlsx"),
+            Some("xls") => (SourceKind::Xls.as_str(), "xls"),
+            Some("csv") => (SourceKind::Csv.as_str(), "csv"),
             other => {
                 return Err(LensError::Validation(format!(
                     "unsupported file extension {other:?} for {}; expected one of \
                      \".pdf\", \".docx\", \".txt\", \".md\", \".markdown\", \".mdx\", \".json\", \
                      \".jsonl\", \".ndjson\", \".yaml\", \".yml\", \".xml\", \".rtf\", \".odt\", \
-                     \".epub\"",
+                     \".epub\", \".xlsx\", \".xls\", \".csv\"",
                     src_path.display()
                 )));
             }
