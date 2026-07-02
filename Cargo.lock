@@ -4845,7 +4845,9 @@ dependencies = [
 name = "lenslm"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
+ "futures",
  "lens-core",
  "serde",
  "serde_json",

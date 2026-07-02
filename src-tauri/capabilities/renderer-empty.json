@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "renderer-empty",
+  "description": "Defense-in-depth: the offscreen SPA-render windows (label `lens-render-*`) execute UNTRUSTED page JS and must have ZERO IPC/command access. This capability grants an EMPTY permission set to those labels. The primary guarantee is already structural — the `lens-render-*` label matches no capability with real permissions (the `default` capability is scoped to `windows: [\"main\"]`), and Tauri's ACL denies all IPC to a webview matching no capability. This file makes the intent explicit and pins it against future capability drift.",
+  "windows": ["lens-render-*"],
+  "permissions": []
+}

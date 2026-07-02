@@ -6,7 +6,8 @@
 /** Constrained set of source ingestion states — mirrors the Rust
  * `SourceStatus` enum (lens-core/src/notebooks.rs). 'pending' is used by the
  * add_source (file) path before ingest begins; 'needs_ocr'/'needs_js' are the
- * terminal-pending states from the PDF/URL ingest gates. */
+ * terminal-pending states from the PDF/URL ingest gates; 'render_failed' is
+ * the terminal state for a URL whose JS render attempt failed. */
 export type SourceStatus =
   | 'pending'
   | 'queued'
@@ -15,7 +16,8 @@ export type SourceStatus =
   | 'indexed'
   | 'error'
   | 'needs_ocr'
-  | 'needs_js';
+  | 'needs_js'
+  | 'render_failed';
 
 /** Constrained set of source kinds — the exact `sources.kind` column values
  * returned across IPC. 'text'|'markdown'|'pdf'|'docx'|'url' mirror the Rust

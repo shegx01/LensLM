@@ -304,6 +304,12 @@ fn default_accent() -> String {
     DEFAULT_ACCENT.to_string()
 }
 
+/// Serde default fn: `js_render_enabled` is `true` when absent from
+/// `config.json` (issue #78 — on by default, user may opt out).
+fn default_js_render_enabled() -> bool {
+    true
+}
+
 /// Top-level application configuration.
 ///
 /// Loaded from / saved to `{data_dir}/config.json`. A missing file yields
@@ -368,6 +374,13 @@ pub struct AppConfig {
     /// `#[serde(default)]` (backward compatibility, mirroring `tts`).
     #[serde(default)]
     pub enrichment: EnrichmentConfig,
+    /// Whether to use the JS-render path for web pages that return near-empty
+    /// text via the static extractor (issue #78 SPA fallback). Defaults to
+    /// `true` (on); an absent field in an older `config.json` reads back as
+    /// `true` via [`default_js_render_enabled`] (backward compatibility —
+    /// the SAME additive pattern as `tts`/`enrichment`).
+    #[serde(default = "default_js_render_enabled")]
+    pub js_render_enabled: bool,
     /// Filesystem paths.
     pub paths: PathConfig,
     /// Tier token thresholds.
@@ -390,6 +403,7 @@ impl Default for AppConfig {
             voices: VoiceConfig::default(),
             tts: TtsConfig::default(),
             enrichment: EnrichmentConfig::default(),
+            js_render_enabled: default_js_render_enabled(),
             paths: PathConfig::default(),
             tier_thresholds: TierThresholds::default(),
             onboarding_complete: false,
@@ -1041,5 +1055,42 @@ mod tests {
         assert!(catalog.validate("anthropic", "totally-made-up").is_err());
         // Local Ollama is exempt (user-pulled): any non-empty id is valid.
         assert!(catalog.is_valid("ollama", "qwen2.5-coder"));
+    }
+
+    // ── js_render_enabled (issue #78: JS-render toggle) ──────────────────────
+
+    #[test]
+    fn default_js_render_enabled_is_true() {
+        assert!(
+            AppConfig::default().js_render_enabled,
+            "js_render_enabled must default ON"
+        );
+    }
+
+    #[test]
+    fn missing_js_render_enabled_deserializes_to_true() {
+        // A config.json written before the `js_render_enabled` field existed has no
+        // such key; it must read back as `true` (default ON) rather than failing to
+        // deserialize (backward compatibility — the SAME additive pattern as
+        // `tts`/`enrichment`).
+        let json = r#"{
+            "theme": "dark",
+            "accent": "purple",
+            "user_name": "",
+            "embedding_model": "",
+            "embedding_backend": "",
+            "models": [],
+            "endpoints": {},
+            "voices": { "host": "", "guest": "" },
+            "tts": { "provider": "", "api_key": "" },
+            "paths": { "data_dir": "" },
+            "tier_thresholds": { "tier1_token_cap": 4000, "tier2_token_cap": 16000 },
+            "onboarding_complete": true
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert!(
+            config.js_render_enabled,
+            "absent js_render_enabled key must read back as true"
+        );
     }
 }

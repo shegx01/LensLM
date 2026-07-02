@@ -123,6 +123,10 @@ pub enum SourceStatus {
     /// Terminal-pending: URL source returned near-empty text — likely a JS-rendered
     /// SPA. Must NOT be reset to `error` on crash recovery (it is not transient).
     NeedsJs,
+    /// Terminal: URL source was attempted via JS renderer but the render failed
+    /// (timeout, blocked host, or empty DOM). Must NOT be reset to `error` on
+    /// crash recovery (it is not transient).
+    RenderFailed,
 }
 
 impl SourceStatus {
@@ -139,6 +143,7 @@ impl SourceStatus {
             Self::Error => "error",
             Self::NeedsOcr => "needs_ocr",
             Self::NeedsJs => "needs_js",
+            Self::RenderFailed => "render_failed",
         }
     }
 
@@ -159,7 +164,8 @@ impl SourceStatus {
             | Self::Indexed
             | Self::Error
             | Self::NeedsOcr
-            | Self::NeedsJs => false,
+            | Self::NeedsJs
+            | Self::RenderFailed => false,
         }
     }
 }
@@ -177,9 +183,11 @@ impl FromStr for SourceStatus {
             "error" => Ok(Self::Error),
             "needs_ocr" => Ok(Self::NeedsOcr),
             "needs_js" => Ok(Self::NeedsJs),
+            "render_failed" => Ok(Self::RenderFailed),
             other => Err(LensError::Validation(format!(
                 "unknown source status: {other:?}; expected one of \"pending\", \"queued\", \
-                 \"parsing\", \"embedding\", \"indexed\", \"error\", \"needs_ocr\", \"needs_js\""
+                 \"parsing\", \"embedding\", \"indexed\", \"error\", \"needs_ocr\", \"needs_js\", \
+                 \"render_failed\""
             ))),
         }
     }
@@ -1854,6 +1862,7 @@ mod tests {
             (SourceStatus::Error, "error"),
             (SourceStatus::NeedsOcr, "needs_ocr"),
             (SourceStatus::NeedsJs, "needs_js"),
+            (SourceStatus::RenderFailed, "render_failed"),
         ];
         for (status, s) in cases {
             assert_eq!(status.as_str(), s, "as_str must equal legacy wire string");
@@ -1879,6 +1888,7 @@ mod tests {
             (SourceStatus::Error, false),
             (SourceStatus::NeedsOcr, false),
             (SourceStatus::NeedsJs, false),
+            (SourceStatus::RenderFailed, false),
         ];
         for (status, transient) in cases {
             assert_eq!(

@@ -59,8 +59,10 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokenizers::Tokenizer;
+use tracing::Instrument;
 
 use crate::chunk::{Chunk, chunk_blocks};
+use crate::extract::Extractor;
 use crate::vector_store::{LanceVectorStore, VectorRow, VectorStore};
 use crate::{LensEngine, LensError};
 
@@ -555,7 +557,179 @@ async fn run_ingest(
                 text_len,
                 raw_len,
                 ratio,
-                "URL source has near-empty extraction — likely JS-rendered; setting needs_js"
+                "URL source has near-empty extraction — likely JS-rendered; attempting JS-render fallback"
+            );
+
+            // ── JS-render auto-fallback (Layer d) ─────────────────────────
+            // Before committing the terminal `needs_js`, try to render the page
+            // in the injected offscreen webview and re-extract. The fallback is
+            // gated by the `js_render_enabled` opt-out (Layer e) and requires an
+            // injected renderer; both false-arms preserve the existing needs_js
+            // behavior EXACTLY (graceful — production always injects, but a
+            // headless lens-core test may not, and the user may opt out).
+            let js_render_enabled = engine.config().await.js_render_enabled;
+            let renderer = if js_render_enabled {
+                engine.js_renderer().await
+            } else {
+                None
+            };
+
+            if let Some(renderer) = renderer {
+                let span = tracing::info_span!("js_render", source_id, url = %source.locator);
+                let started = std::time::Instant::now();
+                // The render call is the ONE outcome-bearing await; run it inside
+                // the span so the elapsed ms + outcome land on one trace event.
+                //
+                // CONTRACT (FIX 2): a render *failure* is TERMINAL `render_failed`,
+                // NOT the transient `error` state. An `Err` from `render_html`
+                // (webview/SSRF/etc.) or from the render-branch `extract` must NOT
+                // propagate up via `?` — that would flip the source to `error`,
+                // which crash-recovery RESETS and retries. Both errors are caught
+                // here and mapped to the `render_failed` terminal path below (same
+                // Ok(())-contract as needs_js/needs_ocr). The STATIC path's extract
+                // error handling is unchanged.
+                let rendered = match renderer
+                    .render_html(&source.locator)
+                    .instrument(span.clone())
+                    .await
+                {
+                    Ok(rendered) => rendered,
+                    Err(e) => {
+                        let _guard = span.enter();
+                        tracing::warn!(
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            outcome = "render_failed",
+                            error = %e,
+                            "js_render fallback errored; setting render_failed"
+                        );
+                        drop(_guard);
+                        set_terminal_pending(
+                            &repo,
+                            &pool,
+                            &data_dir,
+                            &source.notebook_id,
+                            source_id,
+                            crate::notebooks::SourceStatus::RenderFailed.as_str(),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                };
+
+                // Feed the rendered HTML through the SAME extractor the static
+                // path uses (M3: one pipeline, no parallel path). The content
+                // oracle applies ONLY the char floor (`NEEDS_JS_MIN_CHARS`), on
+                // the extracted-text BYTE length (`out.extracted_text.len()`),
+                // matching the static gate's `text_len`. The static ratio arm is
+                // intentionally NOT reused: its denominator is the fetched raw
+                // HTML bytes, which have no faithful analogue for a JS-rendered
+                // SPA whose `outerHTML` is dominated by framework markup — reusing
+                // it would re-introduce an `innerText` capture M3 deliberately
+                // dropped, for marginal value (the char floor already rejects
+                // blank/spinner pages). See plan Layer (d) step 11 (M2 oracle).
+                let indexed = if let Some(html) = rendered {
+                    // A render-branch extract failure is ALSO a render failure
+                    // (FIX 2): catch it and map to render_failed rather than
+                    // letting `?` flip the source to `error`.
+                    let rendered_out =
+                        match crate::extract::url::UrlExtractor.extract(html.as_bytes()) {
+                            Ok(o) => o,
+                            Err(e) => {
+                                let _guard = span.enter();
+                                tracing::warn!(
+                                    elapsed_ms = started.elapsed().as_millis() as u64,
+                                    outcome = "render_failed",
+                                    error = %e,
+                                    "render-branch extract errored; setting render_failed"
+                                );
+                                drop(_guard);
+                                set_terminal_pending(
+                                    &repo,
+                                    &pool,
+                                    &data_dir,
+                                    &source.notebook_id,
+                                    source_id,
+                                    crate::notebooks::SourceStatus::RenderFailed.as_str(),
+                                )
+                                .await?;
+                                return Ok(());
+                            }
+                        };
+                    if rendered_out.extracted_text.len() >= NEEDS_JS_MIN_CHARS {
+                        let _guard = span.enter();
+                        tracing::info!(
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            outcome = "indexed",
+                            "js_render fallback cleared the content oracle; indexing rendered DOM"
+                        );
+                        drop(_guard);
+                        // Rendered content clears the oracle → run the SAME
+                        // downstream tail as the static branch. The ORIGINAL
+                        // fetched `raw` (JS-shell bytes) remains the derived
+                        // content-hash identity (what the source fetched), so
+                        // re-ingest determinism is unchanged.
+                        index_extract_output(
+                            engine,
+                            &repo,
+                            &pool,
+                            &data_dir,
+                            source_id,
+                            &source,
+                            status,
+                            is_pdf,
+                            text_like,
+                            max_source_bytes,
+                            &raw,
+                            rendered_out,
+                            &mut on_progress,
+                        )
+                        .await?;
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                if indexed {
+                    // The shared tail already flipped the source to `Indexed`.
+                    return Ok(());
+                }
+
+                // Fails oracle / None / (provenance already discarded in the
+                // renderer, which returns None for a blocked final host) ⇒
+                // terminal `render_failed`. Return Ok so the Err→error flip in
+                // `ingest_source` never fires (same contract as needs_js/needs_ocr).
+                let _guard = span.enter();
+                tracing::info!(
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    outcome = "render_failed",
+                    "js_render fallback did not produce indexable content; setting render_failed"
+                );
+                drop(_guard);
+                set_terminal_pending(
+                    &repo,
+                    &pool,
+                    &data_dir,
+                    &source.notebook_id,
+                    source_id,
+                    crate::notebooks::SourceStatus::RenderFailed.as_str(),
+                )
+                .await?;
+                return Ok(());
+            }
+
+            // Opt-out (js_render_enabled=false) or no renderer injected ⇒
+            // graceful, unchanged needs_js path.
+            tracing::info!(
+                source_id,
+                outcome = if js_render_enabled {
+                    "needs_js"
+                } else {
+                    "opt_out"
+                },
+                "no JS-render fallback available; setting needs_js"
             );
             set_terminal_pending(
                 &repo,
@@ -571,6 +745,54 @@ async fn run_ingest(
         }
     }
 
+    // ── ExtractOutput → chunk → embed → index (shared tail) ───────────────
+    // Both the static path (here) and the JS-render fallback (above) converge
+    // on ONE downstream pipeline (Principle 1 — no parallel path). The helper
+    // owns the Stage-2 guard, canonical-buffer persist, content hash, chunk,
+    // embed, index and the terminal `Indexed` flip.
+    index_extract_output(
+        engine,
+        &repo,
+        &pool,
+        &data_dir,
+        source_id,
+        &source,
+        status,
+        is_pdf,
+        text_like,
+        max_source_bytes,
+        &raw,
+        out,
+        &mut on_progress,
+    )
+    .await
+}
+
+/// Shared downstream tail: takes a computed [`ExtractOutput`] all the way to a
+/// terminal `Indexed` source (Stage-2 guard → canonical-buffer persist →
+/// content hash → chunk → embed → index).
+///
+/// SINGLE code path for both the static extraction branch and the JS-render
+/// fallback branch of [`run_ingest`] (Principle 1 — no parallel pipeline). The
+/// render fallback passes the ORIGINAL fetched `raw` (the JS-shell bytes) as the
+/// derived-kind content-hash identity — the source's identity is what it fetched,
+/// not the rendered DOM — so re-ingest determinism is preserved unchanged.
+#[allow(clippy::too_many_arguments)]
+async fn index_extract_output(
+    engine: &LensEngine,
+    repo: &crate::notebooks::NotebookRepo<'_>,
+    pool: &sqlx::SqlitePool,
+    data_dir: &Path,
+    source_id: &str,
+    source: &crate::notebooks::Source,
+    status: crate::notebooks::SourceStatus,
+    is_pdf: bool,
+    text_like: bool,
+    max_source_bytes: usize,
+    raw: &[u8],
+    out: crate::extract::ExtractOutput,
+    on_progress: &mut impl FnMut(IngestProgress),
+) -> Result<(), LensError> {
     // ── Stage-2 size guard (the check on the canonical buffer; PDF exempt) ─
     // For text/MD this is the single guard. PDF is EXEMPT (issue #71): its
     // extracted text can legitimately be large (a 1225-page handbook), and its
@@ -597,7 +819,7 @@ async fn run_ingest(
         // SAME path builder the purge path uses (`extracted_sibling_path`), so
         // the write site and the cleanup site can never diverge. Async write so
         // persisting a large extracted buffer never blocks the tokio worker.
-        let sibling = extracted_sibling_path(&data_dir, source_id);
+        let sibling = extracted_sibling_path(data_dir, source_id);
         tokio::fs::write(&sibling, &out.extracted_text)
             .await
             .map_err(|e| LensError::Io(format!("{}: {e}", sibling.display())))?;
@@ -610,7 +832,7 @@ async fn run_ingest(
     // (tabular kinds are derived), so it already exists. Same shared path builder
     // the purge site uses, so write and cleanup can never diverge (issue #76).
     if let Some(ref md) = out.table_markdown {
-        let tables_path = tables_sibling_path(&data_dir, source_id);
+        let tables_path = tables_sibling_path(data_dir, source_id);
         tokio::fs::write(&tables_path, md)
             .await
             .map_err(|e| LensError::Io(format!("{}: {e}", tables_path.display())))?;
@@ -636,11 +858,11 @@ async fn run_ingest(
         }
         h
     } else {
-        sha256_hex(&raw)
+        sha256_hex(raw)
     };
 
     // ── Construct the vector store (per-ingest; cheap embedded connection) ─
-    let store = LanceVectorStore::new(&data_dir, pool.clone());
+    let store = LanceVectorStore::new(data_dir, pool.clone());
     let notebook = source.notebook_id.clone();
     // Resolve the OWNING notebook's embedding coordinate (R1) ONCE, here at the
     // boundary: every drop/add/embed below threads this per-notebook model+dim
@@ -680,7 +902,7 @@ async fn run_ingest(
     // Emit a `model_download` event up front only when the tokenizer is not yet
     // cached on disk (a cold-cache fetch is about to happen); the engine then
     // resolves + caches the multi-MB tokenizer once and reuses it across ingests.
-    maybe_emit_tokenizer_download(&data_dir, &mut on_progress);
+    maybe_emit_tokenizer_download(data_dir, on_progress);
     let tokenizer = engine.tokenizer().await?;
     let mut chunks = chunk_blocks(canonical, blocks, &tokenizer)?;
     let total_tokens: i64 = chunks
@@ -1295,6 +1517,79 @@ fn validate_fetch_url(locator: &str, allow_local: bool) -> Result<ValidatedFetch
         host: host_key,
         pinned_addrs,
     })
+}
+
+/// BLOCKING SSRF allow/deny gate exposing the EXACT static-path policy (scheme
+/// allowlist + the ONE DNS resolve + [`is_blocked_ip`]) for reuse by the JS
+/// renderer (issue #78, Layer c).
+///
+/// This wraps [`validate_fetch_url`] `(url, false)` and discards its result, so
+/// it applies the identical accept/reject decision as the static fetch —
+/// including resolving a hostname host and rejecting it if ANY resolved IP is
+/// blocked. It runs the single blocking DNS lookup, so it MUST be called off the
+/// UI/event-loop thread (the renderer calls it at pre-flight and, again on the
+/// async task, at the final-committed-URL readback re-check).
+///
+/// **Honesty note (Principle 2 / C1):** this returns only the boolean decision.
+/// The DNS-pinned `pinned_addrs` [`validate_fetch_url`] computes are NOT exposed
+/// here — the OS webview does its OWN DNS at navigation and has no
+/// `resolve_to_addrs` hook to consume them (research §7). So the webview path
+/// deliberately drops the pins; it is protected by host allow/deny + the
+/// readback provenance re-check, NOT by connect-time DNS pinning. The static
+/// fetch's pinning ([`fetch_url_guarded`]) is untouched.
+pub fn ssrf_check_url(url: &str) -> Result<(), LensError> {
+    validate_fetch_url(url, false).map(|_| ())
+}
+
+/// NON-BLOCKING host-string SSRF gate for the `on_navigation` closure, which
+/// runs on the UI/event-loop thread (issue #78, Layer c, m6).
+///
+/// Reuses the same [`is_blocked_ip`] policy for a host that is already an IP
+/// LITERAL, but performs **NO DNS** (no `to_socket_addrs`/`getaddrinfo`) so it
+/// cannot stall the event loop. A hostname is ALLOWED as a string — the
+/// blocking resolve+approve happened once at pre-flight ([`ssrf_check_url`]),
+/// and a hostname that resolves to a blocked IP only at connect time
+/// (DNS-rebind) is caught later by the readback provenance re-check, NOT by
+/// re-resolving here.
+///
+/// A missing host fails closed. An IP-literal host (`IpAddr::from_str` parses)
+/// is checked with [`is_blocked_ip`]; anything else (a real hostname) is
+/// allowed.
+pub fn ssrf_check_host(host: Option<&str>) -> Result<(), LensError> {
+    let host =
+        host.ok_or_else(|| LensError::Validation("navigation URL has no host".to_string()))?;
+    // Strip the brackets `url::Url::host_str` puts around an IPv6 literal so it
+    // parses as an `IpAddr` (`"[::1]"` → `"::1"`).
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    // If — and ONLY if — the host is an IP literal do we run the IP guard. No
+    // name resolution is performed for a hostname (that is the whole point of
+    // this non-blocking gate).
+    if let Ok(ip) = bare.parse::<IpAddr>()
+        && is_blocked_ip(ip)
+    {
+        return Err(LensError::Validation(format!(
+            "navigation host {host} is a blocked address; refusing to navigate"
+        )));
+    }
+    Ok(())
+}
+
+/// Pure, webview-free readback provenance decision (issue #78, Layer b step 7 /
+/// C1): given the final-committed URL the render webview reports
+/// (`webview.url()`), returns `true` iff its host passes the shared SSRF policy
+/// ([`ssrf_check_url`]).
+///
+/// Fail-closed: a malformed or host-less URL, or a host that resolves to a
+/// blocked address, returns `false` so the rendered output is discarded before
+/// it can reach chunk→embed→index. Extracted here so the discard logic is
+/// unit-testable under normal CI without a live webview. Because it may resolve
+/// DNS (via `ssrf_check_url`), the renderer calls it on the async task, NOT on
+/// the event-loop thread.
+pub fn readback_host_allowed(final_url: &str) -> bool {
+    ssrf_check_url(final_url).is_ok()
 }
 
 /// Fetches `locator` as an SSRF-guarded, size-bounded, no-redirect HTTP GET.
@@ -2013,6 +2308,136 @@ mod tests {
             "allow_local must not pin (reqwest resolves loopback itself)"
         );
         assert_eq!(local.host, "localhost");
+    }
+
+    // ── SSRF reuse gates (issue #78, Layer c) ─────────────────────────────
+
+    /// The BLOCKING `ssrf_check_url` gate (the renderer's pre-flight + readback
+    /// provenance re-check) reuses the EXACT static-path policy: scheme allowlist
+    /// + `is_blocked_ip`. It must reject metadata/loopback/link-local/private
+    ///   literals and non-http schemes, and accept a public literal.
+    #[test]
+    fn ssrf_check_url_rejects_blocked_and_scheme() {
+        for bad in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://127.0.0.1/secret",
+            "http://[::1]/",
+            "http://10.0.0.1/",
+            "http://192.168.1.1/admin",
+            "http://[fe80::1]/",
+            "file:///etc/passwd",
+            "gopher://example.com/",
+            "data:text/plain,hi",
+        ] {
+            let err = ssrf_check_url(bad).expect_err("blocked/non-http URL must be rejected");
+            assert!(
+                matches!(err, LensError::Validation(_) | LensError::Network(_)),
+                "expected Validation/Network for {bad:?}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ssrf_check_url_accepts_public_literal() {
+        // A public IP literal passes (no DNS needed): mirrors the static path's
+        // acceptance, just without exposing the pins.
+        ssrf_check_url("http://8.8.8.8/").expect("public literal must pass the SSRF gate");
+    }
+
+    /// The NON-BLOCKING `ssrf_check_host` gate runs inside the `on_navigation`
+    /// closure on the UI/event-loop thread: it gates on the HOST STRING only —
+    /// IP-literal hosts go through `is_blocked_ip`, hostnames are ALLOWED without
+    /// any name resolution (no `to_socket_addrs`/`getaddrinfo`). The blocking
+    /// resolve happens once at pre-flight; connect-time rebind is caught at
+    /// readback.
+    #[test]
+    fn ssrf_check_host_rejects_blocked_ip_literals() {
+        for bad in [
+            "169.254.169.254",
+            "127.0.0.1",
+            "::1",
+            "10.0.0.1",
+            "192.168.1.1",
+            "fe80::1",
+            "0.0.0.0",
+        ] {
+            let err =
+                ssrf_check_host(Some(bad)).expect_err("a blocked IP-literal host must be rejected");
+            assert!(
+                matches!(err, LensError::Validation(_)),
+                "expected Validation for host {bad:?}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ssrf_check_host_allows_public_host_string_without_dns() {
+        // A hostname (and a public IP literal) is allowed. The DECISIVE property
+        // — that this performs NO DNS — is guaranteed BY CONSTRUCTION: the impl
+        // only calls `IpAddr::from_str` + `is_blocked_ip`, never
+        // `to_socket_addrs`. `localhost` (which resolves to loopback) is used to
+        // prove that: if the gate resolved, it would reject `localhost`; because
+        // it does NOT resolve, the literal-parse fails and the host string is
+        // allowed.
+        ssrf_check_host(Some("example.com")).expect("a public hostname must be allowed");
+        ssrf_check_host(Some("localhost"))
+            .expect("a hostname is allowed WITHOUT resolving (proving no DNS is performed)");
+    }
+
+    #[test]
+    fn ssrf_check_host_rejects_missing_host() {
+        let err = ssrf_check_host(None).expect_err("a missing host must fail closed");
+        assert!(matches!(err, LensError::Validation(_)), "got {err:?}");
+    }
+
+    /// C1 (Layer b step 7): the readback provenance decision extracted to a pure,
+    /// webview-free helper. A blocked final-committed host ⇒ discard (`false`); a
+    /// public final host ⇒ keep (`true`); a malformed/host-less URL ⇒ discard
+    /// (fail-closed).
+    #[test]
+    fn readback_host_allowed_discards_blocked_and_malformed() {
+        for blocked in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://127.0.0.1/x",
+            "http://[::1]/",
+            "http://10.0.0.5/",
+            "not a url",
+            "http:///no-host",
+            "file:///etc/passwd",
+        ] {
+            assert!(
+                !readback_host_allowed(blocked),
+                "expected {blocked:?} to be discarded (false)"
+            );
+        }
+    }
+
+    #[test]
+    fn readback_host_allowed_keeps_public() {
+        assert!(
+            readback_host_allowed("http://8.8.8.8/page"),
+            "a public final host must be kept"
+        );
+    }
+
+    /// C1 honesty: exposing the reuse gates must NOT weaken the static path — a
+    /// hostname host still RESOLVES and RETURNS pinned addrs via
+    /// `validate_fetch_url` (the DNS-pinning TOCTOU guard is untouched). We assert
+    /// the escape-hatch domain path still yields the (empty, by design) pin shape
+    /// and, for a literal, the no-pin contract holds — proving `ssrf_check_url`
+    /// added no changes to `validate_fetch_url`'s pinning machinery.
+    #[test]
+    fn validate_fetch_url_pinning_untouched_by_ssrf_gates() {
+        // The static path's pin-returning contract is intact (literal ⇒ no pin,
+        // populated for a resolvable domain). Covered end-to-end by
+        // `validate_fetch_url_pins_resolved_addrs_for_hostname`; here we assert
+        // the function still hands back a `ValidatedFetchUrl` with the pin field.
+        let ok = validate_fetch_url("http://8.8.8.8/", false).expect("public literal passes");
+        assert!(
+            ok.pinned_addrs.is_empty(),
+            "IP-literal must still produce no pins (pinning machinery untouched)"
+        );
+        assert_eq!(ok.host, "8.8.8.8");
     }
 
     // ── Streaming body cap + Content-Type + redirect + timeout (items 2–4) ─

@@ -8,10 +8,17 @@
 #![recursion_limit = "256"]
 
 mod commands;
+// The offscreen SPA-render impl (issue #78). Its `TauriJsRenderer` is injected
+// into the engine in the `.setup` block below (Layer f), so its items are live.
+mod render;
 mod stream;
+
+use std::sync::Arc;
 
 use lens_core::LensEngine;
 use tauri::Manager;
+
+use crate::render::TauriJsRenderer;
 
 fn main() {
     // Initialize a tracing subscriber so engine/command spans are visible.
@@ -31,6 +38,17 @@ fn main() {
             let data_dir = app.path().app_data_dir()?;
             let engine = tauri::async_runtime::block_on(LensEngine::init(&data_dir))?;
             app.manage(engine);
+
+            // Inject the offscreen-webview JS renderer (issue #78, Layer f) so
+            // the URL-ingest needs_js fallback can render SPA pages. Mirrors the
+            // engine init's async setup pattern (`block_on`). The renderer holds
+            // an `AppHandle` to build/destroy the isolated offscreen webview; the
+            // engine dispatches against the `JsRenderer` trait object without ever
+            // seeing `tauri`. The `lens-render-*` label matches NO capability, and
+            // `capabilities/renderer-empty.json` is auto-loaded as defense-in-depth.
+            let renderer = TauriJsRenderer::new(app.handle().clone());
+            let engine_state = app.state::<LensEngine>();
+            tauri::async_runtime::block_on(engine_state.set_js_renderer(Some(Arc::new(renderer))));
             Ok(())
         })
         // Register typed per-feature commands; the deprecated shim is kept so

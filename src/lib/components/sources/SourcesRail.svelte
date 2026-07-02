@@ -169,6 +169,12 @@
         return 'Queued';
       case 'pending':
         return 'Pending';
+      case 'needs_ocr':
+        return 'Needs OCR';
+      case 'needs_js':
+        return 'Needs JS';
+      case 'render_failed':
+        return 'Render failed';
       default:
         return status;
     }

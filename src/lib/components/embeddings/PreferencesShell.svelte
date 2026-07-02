@@ -24,10 +24,12 @@
   import { notebookStore } from '$lib/notebooks/index.js';
   import { cn } from '$lib/utils.js';
   import EmbeddingsSection from './EmbeddingsSection.svelte';
+  import IngestionSection from './IngestionSection.svelte';
   import ArrowLeft from '@lucide/svelte/icons/arrow-left';
   import Settings2 from '@lucide/svelte/icons/settings-2';
   import Cpu from '@lucide/svelte/icons/cpu';
   import Share2 from '@lucide/svelte/icons/share-2';
+  import Download from '@lucide/svelte/icons/download';
   import HardDrive from '@lucide/svelte/icons/hard-drive';
   import Shield from '@lucide/svelte/icons/shield';
   import Keyboard from '@lucide/svelte/icons/keyboard';
@@ -35,15 +37,24 @@
 
   const open = $derived(notebookStore.settingsOpen);
 
-  type SectionId = 'general' | 'ai' | 'embeddings' | 'storage' | 'privacy' | 'shortcuts' | 'about';
+  type SectionId =
+    | 'general'
+    | 'ai'
+    | 'embeddings'
+    | 'ingestion'
+    | 'storage'
+    | 'privacy'
+    | 'shortcuts'
+    | 'about';
 
-  // Left-nav order matches the design (Lens.dc.html Preferences nav). Only
-  // `embeddings` is live (`stub: false`); the rest are coming-soon stubs.
+  // Left-nav order matches the design (Lens.dc.html Preferences nav). `embeddings`
+  // and `ingestion` are live (`stub: false`); the rest are coming-soon stubs.
   // `About` sits at the bottom in the design (pushed down by a spacer).
   const NAV: { id: SectionId; label: string; icon: typeof Settings2; stub: boolean }[] = [
     { id: 'general', label: 'General', icon: Settings2, stub: true },
     { id: 'ai', label: 'AI Model', icon: Cpu, stub: true },
     { id: 'embeddings', label: 'Embeddings', icon: Share2, stub: false },
+    { id: 'ingestion', label: 'Ingestion', icon: Download, stub: false },
     { id: 'storage', label: 'Storage', icon: HardDrive, stub: true },
     { id: 'privacy', label: 'Privacy', icon: Shield, stub: true },
     { id: 'shortcuts', label: 'Shortcuts', icon: Keyboard, stub: true },
@@ -124,6 +135,8 @@
     <div class="flex-1 overflow-y-auto px-10 py-8">
       {#if active === 'embeddings'}
         <EmbeddingsSection mode="global" />
+      {:else if active === 'ingestion'}
+        <IngestionSection />
       {/if}
     </div>
   </section>

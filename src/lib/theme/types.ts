@@ -110,4 +110,7 @@ export interface AppConfig {
   // SYNC-CHECK: must match lens-core/src/config.rs AppConfig.embedding_backend (default "").
   // Empty resolves to the default backend ("fastembed") at the resolver boundary.
   embedding_backend: string;
+  // SYNC-CHECK: must match lens-core/src/config.rs AppConfig.js_render_enabled (default true).
+  // On by default; user may opt out via the Settings > Ingestion toggle.
+  js_render_enabled: boolean;
 }
