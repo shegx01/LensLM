@@ -360,6 +360,14 @@
 
   // Test connection (LOCAL): validate BEFORE persist. Enrichment blocks on invalid;
   // studio/chat is informational only.
+  //
+  // Signal strategy (Fix 1 — no double-signal):
+  // • When enrichmentEnabled: the inline per-role validationStatus cue is the SOLE
+  //   model-validation signal. testMessage stays null on both success and enrichment
+  //   failure (the cue conveys it). testMessage only appears for the opt-out
+  //   reachability path or an unexpected thrown error.
+  // • When enrichment opted out (enrichmentEnabled === false): detectLlm drives
+  //   testStatus + testMessage ("Connected — <version>" / "Could not reach…").
   async function handleTestConnection(): Promise<void> {
     testStatus = 'testing';
     testMessage = null;
@@ -370,7 +378,7 @@
     try {
       // ENRICHMENT (blocking) — only when enrichment is enabled (opt-out skips it).
       if (enrichmentEnabled) {
-        const { ok, reason } = await runModelValidation(
+        const { ok } = await runModelValidation(
           'enrichment',
           'ollama',
           enrichmentLocalModel,
@@ -378,8 +386,9 @@
           ''
         );
         if (!ok) {
+          // Inline cue (enrichmentValidation='invalid') conveys the reason.
+          // DO NOT set testMessage — that would duplicate the inline signal.
           testStatus = 'fail';
-          testMessage = reason ?? 'Enrichment model validation failed.';
           return; // DO NOT persist, DO NOT oncheck.
         }
       }
@@ -403,14 +412,22 @@
         coref_model: buildCorefModel(),
         chat_model: buildChatModel()
       });
-      const result = await detectLlm(localEndpoint);
-      if (result.reachable) {
+      if (enrichmentEnabled) {
+        // Enrichment on + validation passed: inline "Available" cue is the confirmation.
+        // No separate testMessage needed.
         testStatus = 'success';
-        testMessage = result.version ? `Connected — ${result.version}` : 'Connected';
         await oncheck();
       } else {
-        testStatus = 'fail';
-        testMessage = 'Could not reach the local server. Is it running?';
+        // Enrichment opted out: reachability check drives the testMessage signal.
+        const result = await detectLlm(localEndpoint);
+        if (result.reachable) {
+          testStatus = 'success';
+          testMessage = result.version ? `Connected — ${result.version}` : 'Connected';
+          await oncheck();
+        } else {
+          testStatus = 'fail';
+          testMessage = 'Could not reach the local server. Is it running?';
+        }
       }
     } catch (err) {
       testStatus = 'fail';
@@ -430,8 +447,10 @@
     try {
       const enrichmentActive = enrichmentEnabled && cloudConsent;
       // ENRICHMENT (blocking) — only when enrichment is actually active for cloud.
+      // Inline cue (enrichmentValidation='invalid') conveys the reason; DO NOT
+      // duplicate into saveError (that would create a double signal).
       if (enrichmentActive) {
-        const { ok, reason } = await runModelValidation(
+        const { ok } = await runModelValidation(
           'enrichment',
           cloudProvider,
           enrichmentCloudModel,
@@ -439,8 +458,7 @@
           cloudApiKey
         );
         if (!ok) {
-          saveError = reason ?? 'Enrichment model validation failed.';
-          return; // DO NOT persist, DO NOT oncheck.
+          return; // Inline cue shows reason. DO NOT persist, DO NOT oncheck.
         }
       }
       // STUDIO & CHAT (non-blocking) — informational when a model is set.
@@ -805,56 +823,63 @@
             Used for chat and Studio generation. Configured now; used when chat/Studio ships.
           </p>
           {@render validationStatus(studioChatValidation, studioChatValidationMessage)}
+
+          <!-- ── Context window — sub-setting of Studio & Chat model ──────────
+               Context size is a chat/generation concern. Persisted via
+               saveLlmProvider({ context: contextWindow }) as before.
+               TODO(M5): attach contextWindow directly to the studio/chat
+               TaskModel once the backend supports per-model context overrides. -->
+          <div class="border-border mt-1 flex flex-col gap-1.5 border-t pt-3">
+            <div class="flex items-baseline gap-1.5">
+              <span class="text-muted-foreground text-[0.8rem] font-medium">Context window</span>
+              <span class="text-muted-foreground text-[0.68rem]">— affects source bloat</span>
+            </div>
+            <div
+              id="llm-context-window"
+              class="flex gap-1"
+              role="group"
+              aria-label="Context window size"
+            >
+              {#each CONTEXT_OPTIONS as opt (opt.value)}
+                <button
+                  type="button"
+                  onclick={() => (contextWindow = opt.value)}
+                  aria-pressed={contextWindow === opt.value}
+                  class={cn(
+                    'flex-1 rounded-md border px-2 py-1.5 text-[0.75rem] font-medium transition-colors',
+                    contextWindow === opt.value
+                      ? 'bg-primary text-primary-foreground border-primary'
+                      : 'border-border bg-transparent text-muted-foreground hover:bg-muted hover:text-foreground'
+                  )}
+                >
+                  {opt.label}
+                </button>
+              {/each}
+            </div>
+            <!-- Custom override: presets are shortcuts, but many models use sizes
+                 outside the list (e.g. 2K, 64K). A value typed here takes priority. -->
+            <div class="mt-1 flex items-center gap-2">
+              <input
+                id="llm-context-custom"
+                type="number"
+                min="256"
+                step="256"
+                value={contextWindow}
+                oninput={(e) => {
+                  const v = parseInt(e.currentTarget.value, 10);
+                  if (Number.isFinite(v) && v >= 256) contextWindow = v;
+                }}
+                aria-label="Custom context window in tokens"
+                class="border-input focus-visible:border-ring focus-visible:ring-ring/50 dark:bg-input/30 placeholder:text-muted-foreground h-8 w-full min-w-0 rounded-lg border bg-transparent px-2.5 py-1 text-base transition-colors outline-none focus-visible:ring-3 md:text-sm"
+              />
+              <span class="text-muted-foreground shrink-0 text-[0.72rem]">tokens (custom)</span>
+            </div>
+            {#if contextHelper}
+              <p class="text-muted-foreground text-[0.72rem] leading-relaxed">{contextHelper}</p>
+            {/if}
+          </div>
         </div>
       </div>
-    </div>
-
-    <!-- ── Group 3: Context window ─────────────────────────────────────── -->
-    <div class="border-border flex flex-col gap-1.5 border-t pt-4">
-      <div class="flex items-baseline gap-1.5">
-        <p class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase">
-          Context Window
-        </p>
-        <span class="text-muted-foreground text-[0.68rem]">— affects source bloat</span>
-      </div>
-      <div id="llm-context-window" class="flex gap-1" role="group" aria-label="Context window size">
-        {#each CONTEXT_OPTIONS as opt (opt.value)}
-          <button
-            type="button"
-            onclick={() => (contextWindow = opt.value)}
-            aria-pressed={contextWindow === opt.value}
-            class={cn(
-              'flex-1 rounded-md border px-2 py-1.5 text-[0.75rem] font-medium transition-colors',
-              contextWindow === opt.value
-                ? 'bg-primary text-primary-foreground border-primary'
-                : 'border-border bg-transparent text-muted-foreground hover:bg-muted hover:text-foreground'
-            )}
-          >
-            {opt.label}
-          </button>
-        {/each}
-      </div>
-      <!-- Custom override: presets are shortcuts, but many models use sizes
-           outside the list (e.g. 2K, 64K). A value typed here takes priority. -->
-      <div class="mt-2 flex items-center gap-2">
-        <input
-          id="llm-context-custom"
-          type="number"
-          min="256"
-          step="256"
-          value={contextWindow}
-          oninput={(e) => {
-            const v = parseInt(e.currentTarget.value, 10);
-            if (Number.isFinite(v) && v >= 256) contextWindow = v;
-          }}
-          aria-label="Custom context window in tokens"
-          class="border-input focus-visible:border-ring focus-visible:ring-ring/50 dark:bg-input/30 placeholder:text-muted-foreground h-8 w-full min-w-0 rounded-lg border bg-transparent px-2.5 py-1 text-base transition-colors outline-none focus-visible:ring-3 md:text-sm"
-        />
-        <span class="text-muted-foreground shrink-0 text-[0.72rem]">tokens (custom)</span>
-      </div>
-      {#if contextHelper}
-        <p class="text-muted-foreground text-[0.72rem] leading-relaxed">{contextHelper}</p>
-      {/if}
     </div>
 
     <!-- Test connection status -->
