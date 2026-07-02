@@ -87,15 +87,27 @@ pub const URL_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 
 /// `User-Agent` sent on the URL-fetch HTTP GET.
 ///
-/// A UA-less client is routinely served `403`/`429` by real sites (bot-blocking
-/// CDNs, WAFs), which surfaces here as a silent fetch failure. A named,
-/// honest UA (app name + version + contact URL) avoids those rejections without
-/// impersonating a browser. The version tracks the workspace crate version.
-pub const URL_FETCH_USER_AGENT: &str = concat!(
-    "LensLM/",
-    env!("CARGO_PKG_VERSION"),
-    " (+https://github.com/shegx01/LensLM)"
-);
+/// Real sites routinely serve a `403`/`429`, a bot wall, or a degraded/near-empty
+/// shell to a non-browser UA (bot-blocking CDNs/WAFs, SPA landing pages that gate
+/// content on a recognized browser). A bot-identifying UA therefore both fails
+/// outright on some hosts and needlessly pushes many pages down the `needs_js`
+/// render fallback. We mimic a current desktop Chrome so the static path receives
+/// the same HTML a browser would — the offscreen render path already presents the
+/// OS webview's native browser UA, so this keeps the two paths consistent.
+///
+/// The string is matched to the build's OS (`macos`/`windows`/otherwise Linux) so
+/// the platform token in the UA is not internally inconsistent with the host.
+/// Chrome's major version moves ~monthly; a slightly-behind value is harmless
+/// (sites do not hard-gate on the exact build), but bump it periodically.
+#[cfg(target_os = "macos")]
+pub const URL_FETCH_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+     AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36";
+#[cfg(target_os = "windows")]
+pub const URL_FETCH_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
+     AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36";
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub const URL_FETCH_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) \
+     AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36";
 
 /// Embed batch size — documents are embedded in batches of this many texts to
 /// bound peak memory while keeping the ONNX session warm.
@@ -2442,7 +2454,7 @@ mod tests {
 
     // ── Streaming body cap + Content-Type + redirect + timeout (items 2–4) ─
 
-    use wiremock::matchers::{header, method, path as wm_path};
+    use wiremock::matchers::{method, path as wm_path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// Drives the REAL `fetch_url_guarded_inner` against a wiremock server.
@@ -2536,18 +2548,28 @@ mod tests {
         assert!(!body.is_empty());
     }
 
-    /// Item 1: the fetch client sends our named `User-Agent` so bot-blocking
-    /// CDNs/WAFs don't `403`/`429` a UA-less request. The mock ONLY matches when
-    /// the `User-Agent` header equals [`URL_FETCH_USER_AGENT`]; a missing/wrong UA
-    /// would yield no matched mock and a fetch error.
+    /// Item 1: the fetch client sends a browser-mimicking (Chrome) `User-Agent` so
+    /// bot-blocking CDNs/WAFs and browser-gated SPA shells don't `403`/`429` or serve
+    /// a degraded page.
+    ///
+    /// We inspect the ACTUAL header the server received (via `received_requests`)
+    /// rather than gating on wiremock's `header(...)` matcher: the Chrome UA
+    /// contains a comma (`(KHTML, like Gecko)`) and that matcher compares against
+    /// comma-split header values, so it would spuriously miss a legitimate,
+    /// correctly-sent single-value UA. Real servers receive the whole value.
     #[tokio::test]
     async fn fetch_sends_user_agent_header() {
         // Guard against an empty/misconfigured const before relying on it.
         assert!(!URL_FETCH_USER_AGENT.is_empty());
+        // Intent lock: the UA must mimic a browser (Chrome), not identify as a bot.
+        assert!(
+            URL_FETCH_USER_AGENT.contains("Chrome/")
+                && URL_FETCH_USER_AGENT.starts_with("Mozilla/5.0"),
+            "URL_FETCH_USER_AGENT must be a browser-mimicking Chrome UA, got: {URL_FETCH_USER_AGENT}"
+        );
         let mock = MockServer::start().await;
         Mock::given(method("GET"))
             .and(wm_path("/ua"))
-            .and(header("user-agent", URL_FETCH_USER_AGENT))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("content-type", "text/html; charset=utf-8")
@@ -2560,8 +2582,23 @@ mod tests {
             std::time::Duration::from_secs(5),
         )
         .await
-        .expect("request carrying the expected User-Agent must be served");
+        .expect("fetch must succeed");
         assert!(!body.is_empty());
+
+        // Assert the exact User-Agent the server received equals the const, whole.
+        let reqs = mock
+            .received_requests()
+            .await
+            .expect("mock records requests");
+        let sent_ua = reqs
+            .iter()
+            .find_map(|r| r.headers.get("user-agent"))
+            .expect("a User-Agent header was sent");
+        assert_eq!(
+            sent_ua.to_str().unwrap(),
+            URL_FETCH_USER_AGENT,
+            "the full browser UA must be sent as a single header value"
+        );
     }
 
     /// Item 2: a body LARGER than `MAX_SOURCE_BYTES` is rejected. wiremock sets a
