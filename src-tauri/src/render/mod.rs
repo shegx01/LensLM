@@ -328,7 +328,13 @@ async fn poll_once(app: &tauri::AppHandle, label: &str) -> Option<Readback> {
     // on one poll. This distinguishes "JS suspended" (repeated timeouts here) from
     // "eval dispatch failed" (the warn above) from "window gone" (the warn above).
     match tokio::time::timeout(EVAL_CALLBACK_TIMEOUT, rx).await {
-        Ok(Ok(json)) => Some(parse_readback(&json)),
+        Ok(Ok(json)) => {
+            // TEMPORARY (issue #78 debug): log the RAW eval result shape so we can
+            // confirm single- vs double-encoding and whether outerHTML comes back.
+            let head: String = json.chars().take(180).collect();
+            tracing::info!(target: "lens::js_render", label = %label, json_len = json.len(), json_head = %head, "poll readback raw");
+            Some(parse_readback(&json))
+        }
         // Sender dropped (window gone before the callback fired) ⇒ stop polling.
         Ok(Err(_)) => None,
         Err(_) => {
@@ -386,6 +392,18 @@ impl Readback {
 fn parse_readback(json: &str) -> Readback {
     match serde_json::from_str::<serde_json::Value>(json) {
         Ok(v) => {
+            // Some eval bridges (incl. Tauri/wry `eval_with_callback`) return the
+            // script's completion value ALREADY `JSON.stringify`-d. Our POLL_JS also
+            // returns a JSON string, so the result arrives DOUBLE-encoded: a JSON
+            // string primitive whose contents are our JSON object. Detect that and
+            // parse the inner payload once more. (Single-encoding still works — a
+            // top-level object is not a `String`.)
+            let v = match &v {
+                serde_json::Value::String(inner) => {
+                    serde_json::from_str::<serde_json::Value>(inner).unwrap_or(v)
+                }
+                _ => v,
+            };
             if let Some(err) = v.get("err").and_then(|e| e.as_str()) {
                 return Readback::Err(err.to_string());
             }
@@ -840,6 +858,35 @@ mod tests {
         // Malformed / unrecognized ⇒ Err (fail closed).
         assert!(matches!(parse_readback("not json"), Readback::Err(_)));
         assert!(matches!(parse_readback(r#"{"other":1}"#), Readback::Err(_)));
+    }
+
+    /// DOUBLE-ENCODED payload: some eval bridges (Tauri/wry `eval_with_callback`)
+    /// `JSON.stringify` the script's completion value, and POLL_JS already returns
+    /// a JSON string — so the result arrives as a JSON *string primitive* wrapping
+    /// our object. `parse_readback` must unwrap it, not treat it as unrecognized.
+    #[test]
+    fn parse_readback_unwraps_double_encoded() {
+        // The inner object our POLL_JS returns:
+        let inner = r#"{"quiescent":true,"best":"","live":"<html><body>hi there</body></html>","textLen":8}"#;
+        // Double-encoded: a JSON string whose content IS that object.
+        let double = serde_json::to_string(inner).unwrap();
+        match parse_readback(&double) {
+            Readback::Poll {
+                quiescent,
+                live,
+                text_len,
+                ..
+            } => {
+                assert!(quiescent);
+                assert_eq!(live, "<html><body>hi there</body></html>");
+                assert_eq!(text_len, 8);
+            }
+            Readback::Err(e) => panic!("double-encoded payload must parse, got Err({e})"),
+        }
+        assert_eq!(
+            parse_readback(&double).best_html(),
+            "<html><body>hi there</body></html>"
+        );
     }
 
     /// C1 provenance decision (delegates to the lens-core helper). Blocked final
