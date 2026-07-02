@@ -644,21 +644,26 @@
   {/if}
 {/snippet}
 
-<!-- ── Per-role validation status line ───────────────────────────────────────
-     Consistent text size for BOTH roles (text-[0.75rem]). -->
+<!-- ── Per-role validation status cue ─────────────────────────────────────────
+     Compact inline cue: icon + short text, sits close to the field (gap-1.5).
+     Kept lightweight so two cues inside the Models card don't dominate.
+     role="alert" on invalid is preserved — tests assert it. -->
 {#snippet validationStatus(
   status: 'idle' | 'checking' | 'valid' | 'invalid',
   message: string | null
 )}
   {#if status === 'checking'}
-    <p class="text-muted-foreground flex items-center gap-1.5 text-[0.75rem]" aria-live="polite">
-      <LoaderCircle class="size-3.5 animate-spin" />
+    <p class="text-muted-foreground mt-1 flex items-center gap-1 text-[0.72rem]" aria-live="polite">
+      <LoaderCircle class="size-3 animate-spin" />
       Checking…
     </p>
   {:else if status === 'valid'}
-    <p class="text-primary text-[0.75rem]">Model available.</p>
+    <p class="text-primary mt-1 flex items-center gap-1 text-[0.72rem]">
+      <Check class="size-3" aria-hidden="true" />
+      Available
+    </p>
   {:else if status === 'invalid' && message}
-    <p class="text-destructive text-[0.75rem]" role="alert">{message}</p>
+    <p class="text-destructive mt-1 text-[0.72rem]" role="alert">{message}</p>
   {/if}
 {/snippet}
 
@@ -707,21 +712,18 @@
     role="tabpanel"
     aria-labelledby="llm-tab-local"
     tabindex={activeTab === 'local' ? 0 : -1}
-    class={cn('mt-3 flex flex-col gap-3', activeTab !== 'local' && 'hidden')}
+    class={cn('mt-3 flex flex-col gap-5', activeTab !== 'local' && 'hidden')}
   >
     <!-- Helper text -->
     <p class="text-muted-foreground text-[0.78rem] leading-relaxed">
       Works with Ollama, LM Studio, vLLM, Jan, llama.cpp — any OpenAI-compatible local server.
     </p>
 
-    <!-- API ENDPOINT field -->
+    <!-- ── Group 1: Connection ──────────────────────────────────────────── -->
     <div class="flex flex-col gap-1.5">
-      <label
-        for="llm-endpoint"
-        class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase"
-      >
-        API Endpoint
-      </label>
+      <p class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase">
+        Connection
+      </p>
       <div class="flex gap-2">
         <Input
           id="llm-endpoint"
@@ -731,6 +733,7 @@
           class="flex-1"
           autocomplete="off"
           spellcheck={false}
+          aria-label="API Endpoint"
         />
         <Button
           variant="outline"
@@ -753,57 +756,65 @@
       {/if}
     </div>
 
-    <!-- ENRICHMENT MODEL (local) — BLOCKING -->
-    <div class="flex flex-col gap-1.5">
-      <label
-        for="llm-model-local"
-        class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase"
-      >
-        Enrichment model
-      </label>
-      {@render localModelSelector(
-        'llm-model-local',
-        'enrichment',
-        enrichmentLocalModel,
-        (v) => (enrichmentLocalModel = v),
-        false
-      )}
-      <p class="text-muted-foreground text-[0.72rem] leading-relaxed">
-        Used to enrich sources (coreference + structural mapping).
+    <!-- ── Group 2: Models ─────────────────────────────────────────────── -->
+    <div class="border-border flex flex-col gap-3 border-t pt-4">
+      <p class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase">
+        Models
       </p>
-      {@render validationStatus(enrichmentValidation, enrichmentValidationMessage)}
+      <div class="border-border bg-muted/40 flex flex-col gap-4 rounded-lg border p-3">
+        <!-- ENRICHMENT MODEL (local) — BLOCKING -->
+        <div class="flex flex-col gap-1.5">
+          <div class="flex items-baseline gap-2">
+            <label for="llm-model-local" class="text-foreground text-[0.8rem] font-medium">
+              Enrichment model
+            </label>
+            <span class="text-primary text-[0.68rem] font-medium">Required</span>
+          </div>
+          {@render localModelSelector(
+            'llm-model-local',
+            'enrichment',
+            enrichmentLocalModel,
+            (v) => (enrichmentLocalModel = v),
+            false
+          )}
+          <p class="text-muted-foreground text-[0.72rem] leading-relaxed">
+            Used to enrich sources (coreference + structural mapping).
+          </p>
+          {@render validationStatus(enrichmentValidation, enrichmentValidationMessage)}
+        </div>
+
+        <!-- divider -->
+        <div class="border-border border-t"></div>
+
+        <!-- STUDIO & CHAT MODEL (local) — NON-blocking -->
+        <div class="flex flex-col gap-1.5">
+          <div class="flex items-baseline gap-2">
+            <label for="studio-chat-model-local" class="text-foreground text-[0.8rem] font-medium">
+              Studio &amp; Chat model
+            </label>
+            <span class="text-muted-foreground text-[0.68rem]">Optional</span>
+          </div>
+          {@render localModelSelector(
+            'studio-chat-model-local',
+            'studioChat',
+            studioChatLocalModel,
+            (v) => (studioChatLocalModel = v),
+            true
+          )}
+          <p class="text-muted-foreground text-[0.72rem] leading-relaxed">
+            Used for chat and Studio generation. Configured now; used when chat/Studio ships.
+          </p>
+          {@render validationStatus(studioChatValidation, studioChatValidationMessage)}
+        </div>
+      </div>
     </div>
 
-    <!-- STUDIO & CHAT MODEL (local) — NON-blocking -->
-    <div class="flex flex-col gap-1.5">
-      <label
-        for="studio-chat-model-local"
-        class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase"
-      >
-        Studio &amp; Chat model
-      </label>
-      {@render localModelSelector(
-        'studio-chat-model-local',
-        'studioChat',
-        studioChatLocalModel,
-        (v) => (studioChatLocalModel = v),
-        true
-      )}
-      <p class="text-muted-foreground text-[0.72rem] leading-relaxed">
-        Used for chat and Studio generation. Configured now; used when chat/Studio ships.
-      </p>
-      {@render validationStatus(studioChatValidation, studioChatValidationMessage)}
-    </div>
-
-    <!-- CONTEXT WINDOW field -->
-    <div class="flex flex-col gap-1.5">
-      <div class="flex items-baseline gap-1">
-        <label
-          for="llm-context-custom"
-          class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase"
-        >
+    <!-- ── Group 3: Context window ─────────────────────────────────────── -->
+    <div class="border-border flex flex-col gap-1.5 border-t pt-4">
+      <div class="flex items-baseline gap-1.5">
+        <p class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase">
           Context Window
-        </label>
+        </p>
         <span class="text-muted-foreground text-[0.68rem]">— affects source bloat</span>
       </div>
       <div id="llm-context-window" class="flex gap-1" role="group" aria-label="Context window size">
@@ -870,175 +881,186 @@
     role="tabpanel"
     aria-labelledby="llm-tab-cloud"
     tabindex={activeTab === 'cloud' ? 0 : -1}
-    class={cn('mt-3 flex flex-col gap-3', activeTab !== 'cloud' && 'hidden')}
+    class={cn('mt-3 flex flex-col gap-5', activeTab !== 'cloud' && 'hidden')}
   >
-    <!-- Cloud provider — searchable combobox (type-to-filter, grouped). -->
-    <div class="flex flex-col gap-1.5">
-      <label
-        for="llm-cloud-provider"
-        class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase"
-      >
-        Cloud provider
-      </label>
-      <Combobox.Root
-        type="single"
-        value={cloudProvider}
-        onValueChange={(v) => {
-          if (v) void selectProvider(v);
-        }}
-        onOpenChange={(open) => {
-          if (!open) providerQuery = '';
-        }}
-      >
-        <div class="relative">
-          <Combobox.Input
-            id="llm-cloud-provider"
-            aria-label="Cloud provider"
-            defaultValue={selectedProvider.name}
-            oninput={(e) => (providerQuery = e.currentTarget.value)}
-            placeholder="Search providers…"
-            class="border-input bg-transparent dark:bg-input/30 focus-visible:border-ring focus-visible:ring-ring/50 text-foreground placeholder:text-muted-foreground h-9 w-full min-w-0 rounded-lg border px-2.5 py-1 pr-8 text-sm outline-none transition-colors focus-visible:ring-3"
-          />
-          <Combobox.Trigger
-            aria-label="Show providers"
-            class="text-muted-foreground absolute inset-y-0 right-0 flex items-center pr-2.5 outline-none"
-          >
-            <ChevronsUpDown class="size-4" aria-hidden="true" />
-          </Combobox.Trigger>
-        </div>
-        <Combobox.Portal>
-          <Combobox.Content
-            class="border-border bg-popover text-popover-foreground z-[70] max-h-64 w-[var(--bits-combobox-anchor-width)] overflow-y-auto rounded-lg border p-1 shadow-lg"
-            sideOffset={4}
-          >
-            {#each filteredProviders as group (group.key)}
-              <Combobox.Group>
-                <Combobox.GroupHeading
-                  class="text-muted-foreground px-2 pt-1.5 pb-1 text-[0.62rem] font-semibold tracking-widest uppercase"
-                >
-                  {group.label}
-                </Combobox.GroupHeading>
-                {#each group.items as provider (provider.id)}
-                  <Combobox.Item
-                    value={provider.id}
-                    label={provider.name}
-                    class="data-highlighted:bg-primary/10 data-highlighted:text-foreground text-foreground flex cursor-pointer items-center justify-between rounded-md px-2 py-1.5 text-sm outline-none"
+    <!-- ── Group 1: Connection ──────────────────────────────────────────── -->
+    <div class="flex flex-col gap-3">
+      <p class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase">
+        Connection
+      </p>
+
+      <!-- Cloud provider — searchable combobox (type-to-filter, grouped). -->
+      <div class="flex flex-col gap-1.5">
+        <Combobox.Root
+          type="single"
+          value={cloudProvider}
+          onValueChange={(v) => {
+            if (v) void selectProvider(v);
+          }}
+          onOpenChange={(open) => {
+            if (!open) providerQuery = '';
+          }}
+        >
+          <div class="relative">
+            <Combobox.Input
+              id="llm-cloud-provider"
+              aria-label="Cloud provider"
+              defaultValue={selectedProvider.name}
+              oninput={(e) => (providerQuery = e.currentTarget.value)}
+              placeholder="Search providers…"
+              class="border-input bg-transparent dark:bg-input/30 focus-visible:border-ring focus-visible:ring-ring/50 text-foreground placeholder:text-muted-foreground h-9 w-full min-w-0 rounded-lg border px-2.5 py-1 pr-8 text-sm outline-none transition-colors focus-visible:ring-3"
+            />
+            <Combobox.Trigger
+              aria-label="Show providers"
+              class="text-muted-foreground absolute inset-y-0 right-0 flex items-center pr-2.5 outline-none"
+            >
+              <ChevronsUpDown class="size-4" aria-hidden="true" />
+            </Combobox.Trigger>
+          </div>
+          <Combobox.Portal>
+            <Combobox.Content
+              class="border-border bg-popover text-popover-foreground z-[70] max-h-64 w-[var(--bits-combobox-anchor-width)] overflow-y-auto rounded-lg border p-1 shadow-lg"
+              sideOffset={4}
+            >
+              {#each filteredProviders as group (group.key)}
+                <Combobox.Group>
+                  <Combobox.GroupHeading
+                    class="text-muted-foreground px-2 pt-1.5 pb-1 text-[0.62rem] font-semibold tracking-widest uppercase"
                   >
-                    {#snippet children({ selected })}
-                      <span>{provider.name}</span>
-                      {#if selected}
-                        <Check class="text-primary size-4" aria-hidden="true" />
-                      {/if}
-                    {/snippet}
-                  </Combobox.Item>
-                {/each}
-              </Combobox.Group>
-            {/each}
-            {#if filteredProviders.length === 0}
-              <div class="text-muted-foreground px-2 py-3 text-center text-[0.78rem]">
-                No providers found
-              </div>
-            {/if}
-          </Combobox.Content>
-        </Combobox.Portal>
-      </Combobox.Root>
+                    {group.label}
+                  </Combobox.GroupHeading>
+                  {#each group.items as provider (provider.id)}
+                    <Combobox.Item
+                      value={provider.id}
+                      label={provider.name}
+                      class="data-highlighted:bg-primary/10 data-highlighted:text-foreground text-foreground flex cursor-pointer items-center justify-between rounded-md px-2 py-1.5 text-sm outline-none"
+                    >
+                      {#snippet children({ selected })}
+                        <span>{provider.name}</span>
+                        {#if selected}
+                          <Check class="text-primary size-4" aria-hidden="true" />
+                        {/if}
+                      {/snippet}
+                    </Combobox.Item>
+                  {/each}
+                </Combobox.Group>
+              {/each}
+              {#if filteredProviders.length === 0}
+                <div class="text-muted-foreground px-2 py-3 text-center text-[0.78rem]">
+                  No providers found
+                </div>
+              {/if}
+            </Combobox.Content>
+          </Combobox.Portal>
+        </Combobox.Root>
+      </div>
+
+      <!-- API KEY -->
+      <div class="flex flex-col gap-1.5">
+        <label for="llm-cloud-key" class="text-muted-foreground text-[0.68rem] font-medium">
+          API Key
+        </label>
+        <Input
+          id="llm-cloud-key"
+          type="password"
+          bind:value={cloudApiKey}
+          placeholder={hasSavedKey && !editingKey
+            ? '•••••••••• saved — click to replace'
+            : 'Paste API key…'}
+          autocomplete="new-password"
+          onfocus={startEditingKey}
+          oninput={startEditingKey}
+        />
+        {#if hasSavedKey && !editingKey}
+          <p class="text-muted-foreground text-[0.72rem] leading-relaxed">
+            A key is already saved. Click the field to replace it.
+          </p>
+        {/if}
+      </div>
+
+      <!-- BASE URL — only for the custom OpenAI-compatible endpoint. -->
+      {#if isCustomProvider}
+        <div class="flex flex-col gap-1.5">
+          <label for="llm-cloud-url" class="text-muted-foreground text-[0.68rem] font-medium">
+            Base URL
+          </label>
+          <Input
+            id="llm-cloud-url"
+            type="url"
+            bind:value={cloudBaseUrl}
+            placeholder="https://api.openai.com/v1"
+            autocomplete="off"
+            spellcheck={false}
+          />
+          <p class="text-muted-foreground text-[0.72rem] leading-relaxed">
+            The OpenAI-compatible endpoint to call — for LM Studio, vLLM, a proxy, or any other
+            self-hosted/compatible server.
+          </p>
+        </div>
+      {/if}
     </div>
 
-    <!-- ENRICHMENT MODEL (cloud) — BLOCKING -->
-    <div class="flex flex-col gap-1.5">
-      <div class="flex items-baseline gap-1.5">
-        <label
-          for="llm-cloud-model"
-          class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase"
-        >
-          Enrichment model
-        </label>
+    <!-- ── Group 2: Models ─────────────────────────────────────────────── -->
+    <div class="border-border flex flex-col gap-3 border-t pt-4">
+      <div class="flex items-baseline gap-2">
+        <p class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase">
+          Models
+        </p>
         {#if catalogUpdating}
           <span class="text-muted-foreground text-[0.68rem]" aria-live="polite">updating…</span>
         {/if}
       </div>
-      {@render cloudModelSelector('llm-cloud-model', 'enrichment', enrichmentCloudModel, (v) => {
-        enrichmentCloudModel = v;
-        cloudModelPicked = true;
-      })}
-      <p class="text-muted-foreground text-[0.72rem] leading-relaxed">
-        Used to enrich sources (coreference + structural mapping).
-      </p>
-      {#if modelHint}
-        <p class="text-muted-foreground text-[0.72rem] leading-relaxed">{modelHint}</p>
-      {/if}
-      {@render validationStatus(enrichmentValidation, enrichmentValidationMessage)}
-    </div>
+      <div class="border-border bg-muted/40 flex flex-col gap-4 rounded-lg border p-3">
+        <!-- ENRICHMENT MODEL (cloud) — BLOCKING -->
+        <div class="flex flex-col gap-1.5">
+          <div class="flex items-baseline gap-2">
+            <label for="llm-cloud-model" class="text-foreground text-[0.8rem] font-medium">
+              Enrichment model
+            </label>
+            <span class="text-primary text-[0.68rem] font-medium">Required</span>
+          </div>
+          {@render cloudModelSelector(
+            'llm-cloud-model',
+            'enrichment',
+            enrichmentCloudModel,
+            (v) => {
+              enrichmentCloudModel = v;
+              cloudModelPicked = true;
+            }
+          )}
+          <p class="text-muted-foreground text-[0.72rem] leading-relaxed">
+            Used to enrich sources (coreference + structural mapping).
+          </p>
+          {#if modelHint}
+            <p class="text-muted-foreground text-[0.72rem] leading-relaxed">{modelHint}</p>
+          {/if}
+          {@render validationStatus(enrichmentValidation, enrichmentValidationMessage)}
+        </div>
 
-    <!-- STUDIO & CHAT MODEL (cloud) — NON-blocking -->
-    <div class="flex flex-col gap-1.5">
-      <label
-        for="studio-chat-model-cloud"
-        class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase"
-      >
-        Studio &amp; Chat model
-      </label>
-      {@render cloudModelSelector(
-        'studio-chat-model-cloud',
-        'studioChat',
-        studioChatCloudModel,
-        (v) => (studioChatCloudModel = v)
-      )}
-      <p class="text-muted-foreground text-[0.72rem] leading-relaxed">
-        Used for chat and Studio generation. Configured now; used when chat/Studio ships.
-      </p>
-      {@render validationStatus(studioChatValidation, studioChatValidationMessage)}
-    </div>
+        <!-- divider -->
+        <div class="border-border border-t"></div>
 
-    <!-- API KEY -->
-    <div class="flex flex-col gap-1.5">
-      <label
-        for="llm-cloud-key"
-        class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase"
-      >
-        API Key
-      </label>
-      <Input
-        id="llm-cloud-key"
-        type="password"
-        bind:value={cloudApiKey}
-        placeholder={hasSavedKey && !editingKey
-          ? '•••••••••• saved — click to replace'
-          : 'Paste API key…'}
-        autocomplete="new-password"
-        onfocus={startEditingKey}
-        oninput={startEditingKey}
-      />
-      {#if hasSavedKey && !editingKey}
-        <p class="text-muted-foreground text-[0.72rem] leading-relaxed">
-          A key is already saved. Click the field to replace it.
-        </p>
-      {/if}
-    </div>
-
-    <!-- BASE URL — only for the custom OpenAI-compatible endpoint. -->
-    {#if isCustomProvider}
-      <div class="flex flex-col gap-1.5">
-        <label
-          for="llm-cloud-url"
-          class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase"
-        >
-          Base URL
-        </label>
-        <Input
-          id="llm-cloud-url"
-          type="url"
-          bind:value={cloudBaseUrl}
-          placeholder="https://api.openai.com/v1"
-          autocomplete="off"
-          spellcheck={false}
-        />
-        <p class="text-muted-foreground text-[0.72rem] leading-relaxed">
-          The OpenAI-compatible endpoint to call — for LM Studio, vLLM, a proxy, or any other
-          self-hosted/compatible server.
-        </p>
+        <!-- STUDIO & CHAT MODEL (cloud) — NON-blocking -->
+        <div class="flex flex-col gap-1.5">
+          <div class="flex items-baseline gap-2">
+            <label for="studio-chat-model-cloud" class="text-foreground text-[0.8rem] font-medium">
+              Studio &amp; Chat model
+            </label>
+            <span class="text-muted-foreground text-[0.68rem]">Optional</span>
+          </div>
+          {@render cloudModelSelector(
+            'studio-chat-model-cloud',
+            'studioChat',
+            studioChatCloudModel,
+            (v) => (studioChatCloudModel = v)
+          )}
+          <p class="text-muted-foreground text-[0.72rem] leading-relaxed">
+            Used for chat and Studio generation. Configured now; used when chat/Studio ships.
+          </p>
+          {@render validationStatus(studioChatValidation, studioChatValidationMessage)}
+        </div>
       </div>
-    {/if}
+    </div>
 
     <!-- Save error -->
     {#if saveError}
