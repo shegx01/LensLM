@@ -24,6 +24,8 @@ export interface Notebook {
   created_at: string;
   updated_at: string;
   trashed_at: string | null;
+  // SYNC-CHECK: must match lens-core/src/notebooks.rs Notebook.last_activity_at (nullable TEXT).
+  last_activity_at: string | null;
 }
 
 // SYNC-CHECK: must match lens-core/src/notebooks.rs NotebookSummary struct.
@@ -44,5 +46,7 @@ export interface NotebookSummary {
   created_at: string;
   updated_at: string;
   trashed_at: string | null;
+  // SYNC-CHECK: must match lens-core/src/notebooks.rs Notebook.last_activity_at (nullable TEXT).
+  last_activity_at: string | null;
   source_count: number;
 }

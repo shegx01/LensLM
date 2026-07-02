@@ -80,3 +80,13 @@ export async function purgeNotebook(id: string): Promise<void> {
   if (!isTauri()) throw new Error('purgeNotebook: not running under Tauri');
   return invoke<void>('purge_notebook', { id });
 }
+
+/**
+ * Record that the user opened/interacted with a notebook. Fire-and-forget: a
+ * failed DB write must not block the selection. Returns silently outside a
+ * Tauri host (test isolation).
+ */
+export async function touchNotebookActivity(notebookId: string): Promise<void> {
+  if (!isTauri()) return;
+  return invoke<void>('touch_notebook_activity', { notebook_id: notebookId });
+}
