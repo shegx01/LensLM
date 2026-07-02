@@ -428,7 +428,12 @@ async fn url_indexes_real_article() {
         .await
         .expect("notebook");
     let source = engine
-        .add_url_source(&nb.id, "real article", &format!("{}/article", mock.uri()), false)
+        .add_url_source(
+            &nb.id,
+            "real article",
+            &format!("{}/article", mock.uri()),
+            false,
+        )
         .await
         .expect("add_url_source")
         .source;
@@ -816,7 +821,12 @@ async fn add_url_source_dedup_returns_existing() {
 
     // Fragment-only difference — dedup hit.
     let third = engine
-        .add_url_source(&nb.id, "frag", "https://example.com/article#section2", false)
+        .add_url_source(
+            &nb.id,
+            "frag",
+            "https://example.com/article#section2",
+            false,
+        )
         .await
         .expect("add_url_source");
     assert!(

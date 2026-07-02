@@ -26,12 +26,18 @@
 //!   the settle window.
 //!
 //! The Rust side then **polls** (every [`POLL_INTERVAL`], via `eval_with_callback`
-//! dispatched on the main thread) reading `{quiescent, best, live}`, keeping the
-//! largest capture across polls. Polling STOPS and resolves as soon as
-//! `quiescent` is `true`, OR when [`JS_RENDER_MAX_TIMEOUT`] elapses — in which
-//! case the best capture seen so far is returned (only `None` if we truly never
-//! captured anything). `PageLoadEvent::Finished` is used as a convenience trigger
-//! to kick the first poll but is NOT depended upon.
+//! dispatched on the main thread) reading `{quiescent, best, live, textLen}`,
+//! keeping the largest capture across polls. Crucially, a `quiescent` signal is
+//! accepted ONLY once BOTH (a) at least [`MIN_RENDER_WAIT`] has elapsed and (b)
+//! visible body-text has grown past the first poll's shell baseline by
+//! [`CONTENT_GROWTH_MIN`] chars — i.e. real content actually rendered. Real SPAs
+//! sit idle for 2–5s after load before fetching, and their shell already contains
+//! sidebar/nav text, so accepting the first "no activity" quiescence (or an
+//! absolute text threshold) would capture the empty shell. If content never grows
+//! (throttled/blocked/genuinely-thin page), polling runs to
+//! [`JS_RENDER_MAX_TIMEOUT`] and returns the best capture seen (only `None` if
+//! nothing was ever captured). `PageLoadEvent::Finished` kicks the first poll but
+//! is NOT depended upon.
 //!
 //! ## Security model (executes UNTRUSTED page JS)
 //! - **No IPC bridge:** the render window's label (`lens-render-*`) matches NO
@@ -68,12 +74,31 @@ use tauri::{Manager, Url, WebviewUrl};
 /// signal, so a hostile/broken page cannot exceed it. On timeout the best
 /// capture seen so far is returned (then the caller's content oracle decides);
 /// `None` only if nothing was ever captured.
-const JS_RENDER_MAX_TIMEOUT: Duration = Duration::from_secs(15);
+///
+/// Sized for real SPAs: many idle 2–3s (some up to ~5s) after load BEFORE they
+/// even begin fetching data, then need time to fetch + render. 20s leaves headroom
+/// for a ~5s-to-start SPA plus fetch/render, while still bounding the held ingest
+/// permit.
+const JS_RENDER_MAX_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// How often the Rust side polls the webview for `{quiescent, best, live}`
-/// (via `eval_with_callback`). Matched to the in-page `SETTLE_MS` settle window
-/// so a page that quiesces is observed within roughly one interval.
+/// How often the Rust side polls the webview (via `eval_with_callback`). Matched
+/// to the in-page `SETTLE_MS` settle window so a page that quiesces is observed
+/// within roughly one interval.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Minimum growth in visible body-text length (chars) over the FIRST poll's
+/// reading before a `quiescent` signal is accepted. The initial shell of a
+/// client-rendered SPA already contains sidebar/nav text, so an absolute text
+/// threshold would fire on the shell; requiring GROWTH means we only accept once
+/// real content has rendered ON TOP of the nav. If text never grows this much
+/// (throttled/blocked page, or a genuinely thin page), the loop runs to the hard
+/// timeout and returns the best capture — never a premature empty-shell capture.
+const CONTENT_GROWTH_MIN: usize = 800;
+
+/// Minimum time to keep polling before ANY `quiescent` accept, so the idle gap
+/// right after load (before the SPA starts fetching) can never be mistaken for a
+/// settled render.
+const MIN_RENDER_WAIT: Duration = Duration::from_secs(3);
 
 /// Offscreen position (logical px) — far outside any real display so the webview
 /// renders (avoiding occlusion/timer throttling that `.visible(false)` incurs)
@@ -199,7 +224,14 @@ const POLL_JS: &str = r#"
     var live = el ? (el.outerHTML || "") : "";
     var best = (typeof window.__lensBest === "string") ? window.__lensBest : "";
     var q = (window.__lensQuiescent === true);
-    return JSON.stringify({ quiescent: q, best: best, live: live });
+    // Visible text length — the "has the content actually rendered?" signal. A
+    // client-rendered SPA shell has little body text until its JS populates the
+    // DOM, so the Rust poll loop refuses to accept quiescence until this crosses
+    // a threshold (otherwise it would capture the empty shell during the idle gap
+    // right after load, before hydration begins).
+    var textLen = 0;
+    try { textLen = (document.body && document.body.innerText) ? document.body.innerText.length : 0; } catch (e) {}
+    return JSON.stringify({ quiescent: q, best: best, live: live, textLen: textLen });
   } catch (e) {
     return JSON.stringify({ err: String(e) });
   }
@@ -296,6 +328,9 @@ enum Readback {
         best: String,
         /// The current live `document.documentElement.outerHTML`.
         live: String,
+        /// Current `document.body.innerText.length` — the "content rendered yet?"
+        /// signal used to reject a premature quiescence on the bare shell.
+        text_len: usize,
     },
     /// The in-page readback reported an error (or the payload was unparseable).
     Err(String),
@@ -342,10 +377,12 @@ fn parse_readback(json: &str) -> Readback {
                     .and_then(|l| l.as_str())
                     .unwrap_or("")
                     .to_string();
+                let text_len = v.get("textLen").and_then(|t| t.as_u64()).unwrap_or(0) as usize;
                 Readback::Poll {
                     quiescent,
                     best,
                     live,
+                    text_len,
                 }
             } else {
                 Readback::Err(format!("unrecognized readback payload: {json}"))
@@ -497,18 +534,39 @@ async fn render_inner(
     // lets a client-rendered SPA whose content arrives AFTER load be captured.
     let candidate = tokio::time::timeout(JS_RENDER_MAX_TIMEOUT, async {
         let mut best_seen = String::new();
+        // Body-text length from the FIRST poll (the shell, incl. nav text). We
+        // accept a `quiescent` signal only once text has grown past this baseline
+        // by `CONTENT_GROWTH_MIN` — i.e. real content rendered on top of the nav.
+        let mut baseline_text: Option<usize> = None;
+        let mut polls: u32 = 0;
         loop {
             match poll_once(app, label).await {
-                Some(rb @ Readback::Poll { .. }) => {
-                    let quiescent = matches!(rb, Readback::Poll { quiescent: true, .. });
+                Some(Readback::Poll {
+                    quiescent,
+                    best,
+                    live,
+                    text_len,
+                }) => {
+                    polls += 1;
+                    let baseline = *baseline_text.get_or_insert(text_len);
                     // Keep the largest capture across ALL polls (the page may
                     // shrink transiently between renders).
-                    let this = rb.best_html();
+                    let this = if live.len() >= best.len() { live } else { best };
                     if this.len() > best_seen.len() {
                         best_seen = this;
                     }
-                    if quiescent {
-                        // Settled: return the best capture now.
+                    // Accept the settled signal ONLY once: (a) we've polled past
+                    // MIN_RENDER_WAIT (so the post-load idle gap can't be mistaken
+                    // for "settled"), AND (b) visible text grew past the shell
+                    // baseline by CONTENT_GROWTH_MIN (content actually rendered).
+                    let waited = polls as u64 * POLL_INTERVAL.as_millis() as u64
+                        >= MIN_RENDER_WAIT.as_millis() as u64;
+                    let content_grew = text_len >= baseline.saturating_add(CONTENT_GROWTH_MIN);
+                    if quiescent && waited && content_grew {
+                        tracing::debug!(
+                            target: "lens::js_render", label, polls, text_len, baseline,
+                            "render settled with content; accepting capture"
+                        );
                         break;
                     }
                 }
@@ -533,8 +591,9 @@ async fn render_inner(
         // `best_seen`, so signal the timeout with an empty string and let the
         // trailing final read below recover the init script's best capture. We
         // return the best capture seen so far, NOT None (unless nothing was ever
-        // captured) — this is what the timeout arm MUST do (FIX 1).
-        tracing::warn!(target: "lens::js_render", label, timeout_s = JS_RENDER_MAX_TIMEOUT.as_secs(), "render timed out; using best capture seen");
+        // captured). A timeout here means the page never rendered enough text to
+        // clear the growth gate (slow/throttled/blocked, or a genuinely thin page).
+        tracing::warn!(target: "lens::js_render", label, timeout_s = JS_RENDER_MAX_TIMEOUT.as_secs(), "render timed out before content growth; using best capture seen");
         String::new()
     });
 
@@ -556,6 +615,13 @@ async fn render_inner(
         }
         if best.is_empty() { None } else { Some(best) }
     };
+
+    tracing::info!(
+        target: "lens::js_render",
+        label,
+        captured_html_len = candidate.as_ref().map(|s| s.len()).unwrap_or(0),
+        "render capture complete"
+    );
 
     // ── Final-committed-URL provenance re-check (C1). Read `webview.url()` and
     // run its host through the shared SSRF policy (off the event-loop thread).
@@ -604,6 +670,7 @@ mod tests {
                 quiescent,
                 best,
                 live,
+                ..
             } => {
                 assert!(quiescent);
                 assert_eq!(best, "<html>a</html>");
@@ -625,17 +692,25 @@ mod tests {
             "<html>abcd</html>"
         );
 
-        // Missing scalars default safely (not quiescent, empty html).
+        // Missing scalars default safely (not quiescent, empty html, zero text).
         match parse_readback(r#"{"best":"x"}"#) {
             Readback::Poll {
                 quiescent,
                 best,
                 live,
+                text_len,
             } => {
                 assert!(!quiescent);
                 assert_eq!(best, "x");
                 assert_eq!(live, "");
+                assert_eq!(text_len, 0);
             }
+            Readback::Err(e) => panic!("expected Poll, got Err({e})"),
+        }
+
+        // textLen is parsed when present.
+        match parse_readback(r#"{"quiescent":true,"best":"","live":"<p>hi</p>","textLen":1234}"#) {
+            Readback::Poll { text_len, .. } => assert_eq!(text_len, 1234),
             Readback::Err(e) => panic!("expected Poll, got Err({e})"),
         }
 
