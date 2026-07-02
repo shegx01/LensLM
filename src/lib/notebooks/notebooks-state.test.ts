@@ -37,7 +37,8 @@ vi.mock('./ipc.js', () => ({
   trashNotebook: vi.fn(),
   restoreNotebook: vi.fn(),
   listTrashed: vi.fn(),
-  purgeNotebook: vi.fn()
+  purgeNotebook: vi.fn(),
+  touchNotebookActivity: vi.fn().mockResolvedValue(undefined)
 }));
 
 // Mock the sources IPC layer (used by notebooks-state for trashed sources).
@@ -104,6 +105,7 @@ function makeNotebookSummary(overrides?: Partial<NotebookSummary>): NotebookSumm
     created_at: new Date(Date.now() - 3600_000).toISOString(),
     updated_at: new Date(Date.now() - 3600_000).toISOString(),
     trashed_at: null,
+    last_activity_at: null,
     embedding_model: null,
     embedding_backend: null,
     source_count: 0,
@@ -120,6 +122,7 @@ function makeNotebook(overrides?: Partial<Notebook>): Notebook {
     created_at: new Date(Date.now() - 3600_000).toISOString(),
     updated_at: new Date(Date.now() - 3600_000).toISOString(),
     trashed_at: null,
+    last_activity_at: null,
     embedding_model: null,
     embedding_backend: null,
     ...overrides

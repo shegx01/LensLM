@@ -18,6 +18,7 @@ function makeNotebook(id: string, title: string): NotebookSummary {
     created_at: '2026-01-01T00:00:00Z',
     updated_at: '2026-01-01T00:00:00Z',
     trashed_at: null,
+    last_activity_at: null,
     source_count: 2
   };
 }
@@ -63,10 +64,10 @@ describe('PreferencesShell', () => {
     ]) {
       expect(screen.getByRole('button', { name: new RegExp(label, 'i') })).toBeInTheDocument();
     }
-    // Only Embeddings is live; the rest carry a "Soon" marker + aria-disabled.
+    // General and Embeddings are live (stub: false); the rest carry "Soon" + aria-disabled.
     const general = screen.getByRole('button', { name: /general/i });
-    expect(general).toHaveAttribute('aria-disabled', 'true');
-    // The live Embeddings section renders by default.
+    expect(general).not.toHaveAttribute('aria-disabled', 'true');
+    // The live Embeddings section renders by default (default active = 'embeddings').
     expect(screen.getByRole('heading', { name: 'Embeddings' })).toBeInTheDocument();
   });
 

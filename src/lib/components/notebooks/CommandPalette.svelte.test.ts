@@ -30,7 +30,8 @@ vi.mock('$lib/notebooks/ipc.js', () => ({
   trashNotebook: vi.fn(),
   restoreNotebook: vi.fn(),
   listTrashed: vi.fn(),
-  purgeNotebook: vi.fn()
+  purgeNotebook: vi.fn(),
+  touchNotebookActivity: vi.fn().mockResolvedValue(undefined)
 }));
 
 import { listNotebooks } from '$lib/notebooks/ipc.js';
@@ -50,6 +51,7 @@ function makeNotebook(overrides?: Partial<NotebookSummary>): NotebookSummary {
     created_at: new Date(Date.now() - 7_200_000).toISOString(),
     updated_at: new Date(Date.now() - 7_200_000).toISOString(),
     trashed_at: null,
+    last_activity_at: null,
     embedding_model: null,
     embedding_backend: null,
     source_count: 3,
