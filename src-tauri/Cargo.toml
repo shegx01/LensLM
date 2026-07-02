@@ -37,6 +37,14 @@ futures = "0.3"
 # Unique offscreen render-window labels (`lens-render-<uuid>`); v7 for time-order.
 uuid = { workspace = true }
 
+# macOS: set the render window's native NSWindow alphaValue to 0 (#78). WKWebView
+# suspends JS for an off-screen/occluded window, so the render window must be
+# genuinely on-screen — we hide it by making the native window fully transparent
+# (a public AppKit API; no `macos-private-api` needed). Version tracks the objc2
+# already in the tree via tauri.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+
 [dev-dependencies]
 # The `test` feature (mock runtime) is unioned in only for test builds.
 tauri = { version = "2", features = ["test"] }

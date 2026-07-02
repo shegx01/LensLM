@@ -100,9 +100,11 @@ const CONTENT_GROWTH_MIN: usize = 800;
 /// settled render.
 const MIN_RENDER_WAIT: Duration = Duration::from_secs(3);
 
-/// Offscreen position (logical px) — far outside any real display so the webview
-/// renders (avoiding occlusion/timer throttling that `.visible(false)` incurs)
-/// without ever appearing on screen.
+/// Off-screen position (logical px), used on NON-macOS only. NOTE: on macOS an
+/// off-screen window is occlusion-suspended by WebKit (JS never runs), which is
+/// why macOS positions the window on-screen and hides it via a zero native alpha
+/// instead. A native-hide equivalent for Windows/Linux is a follow-up.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 const OFFSCREEN_XY: f64 = -32000.0;
 const RENDER_WIDTH: f64 = 1280.0;
 const RENDER_HEIGHT: f64 = 800.0;
@@ -455,13 +457,30 @@ async fn render_inner(
     let label_owned = label.to_string();
 
     let dispatch = app.run_on_main_thread(move || {
+        // macOS suspends JS for an off-screen/occluded webview, so on macOS the
+        // render window must be genuinely on-screen — we position it at the origin
+        // and hide it via a zero native alpha after build. On other platforms we
+        // keep the off-screen position (best-effort; a native-alpha equivalent is a
+        // follow-up).
+        #[cfg(target_os = "macos")]
+        let (pos_x, pos_y) = (0.0_f64, 0.0_f64);
+        #[cfg(not(target_os = "macos"))]
+        let (pos_x, pos_y) = (OFFSCREEN_XY, OFFSCREEN_XY);
+
         let builder =
             WebviewWindowBuilder::new(&app_for_build, &label_owned, WebviewUrl::External(parsed))
-                // Offscreen + visible (NOT `.visible(false)`: a truly hidden webview is
-                // occlusion/timer-throttled on macOS/Windows, stalling SPA JS).
-                .position(OFFSCREEN_XY, OFFSCREEN_XY)
+                // On-screen but hidden. Build it HIDDEN, then (macOS) zero the native
+                // NSWindow alpha and `show()` it → on-screen (JS runs) + invisible, no
+                // flash. Chrome/focus/taskbar stripped; always-on-top so the main
+                // window can't occlude → suspend it.
+                .position(pos_x, pos_y)
                 .inner_size(RENDER_WIDTH, RENDER_HEIGHT)
-                .visible(true)
+                .visible(false)
+                .decorations(false)
+                .shadow(false)
+                .skip_taskbar(true)
+                .focused(false)
+                .always_on_top(true)
                 // Ephemeral session: no shared cookies/localStorage/cache to exfiltrate
                 // or bleed across renders.
                 .incognito(true)
@@ -492,7 +511,35 @@ async fn render_inner(
                 });
 
         match builder.build() {
-            Ok(_) => {
+            Ok(_window) => {
+                // macOS: make the on-screen window invisible by zeroing its native
+                // NSWindow alpha (public AppKit API — no `macos-private-api`), then
+                // reveal it. It stays composited/on-screen so WebKit runs the page's
+                // JS (and our eval), but the user sees nothing. Also make it
+                // click-through so an alpha-0 always-on-top window can't eat input.
+                #[cfg(target_os = "macos")]
+                {
+                    if let Ok(ns_ptr) = _window.ns_window() {
+                        let ns = ns_ptr as *mut objc2::runtime::AnyObject;
+                        if !ns.is_null() {
+                            // SAFETY: `ns_window()` returns this window's `NSWindow*`
+                            // and we are on the main thread; `setAlphaValue:` is a
+                            // standard main-thread NSWindow setter.
+                            unsafe {
+                                let _: () = objc2::msg_send![&*ns, setAlphaValue: 0.0_f64];
+                            }
+                        }
+                    }
+                    let _ = _window.set_ignore_cursor_events(true);
+                    // Reveal it: now on-screen (JS un-throttles) but alpha 0 (unseen).
+                    let _ = _window.show();
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    // Best-effort on other platforms (off-screen; may still be
+                    // throttled — a native-hide equivalent is a follow-up).
+                    let _ = _window.show();
+                }
                 // Diagnostic: confirm the window is findable by label immediately
                 // after build (same main-thread tick). If this logs `false`, the
                 // window is not registered in the manager and every poll_once will
