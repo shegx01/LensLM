@@ -36,7 +36,7 @@ vi.mock('$lib/sources/ipc.js', () => ({
 const mockIsTauri = vi.fn(() => false);
 
 vi.mock('@tauri-apps/api/core', () => ({
-  isTauri: (...args: unknown[]) => mockIsTauri(...args),
+  isTauri: () => mockIsTauri(),
   invoke: vi.fn()
 }));
 
