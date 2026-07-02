@@ -69,31 +69,21 @@ use lens_core::{JsRenderer, LensError, readback_host_allowed};
 use tauri::webview::{PageLoadEvent, WebviewWindowBuilder};
 use tauri::{Manager, Url, WebviewUrl};
 
-/// Hard wall-clock cap on a single render, enforced Rust-side with
-/// `tokio::time::timeout` around the poll loop — independent of any in-page
-/// signal, so a hostile/broken page cannot exceed it. On timeout the best
-/// capture seen so far is returned (then the caller's content oracle decides);
-/// `None` only if nothing was ever captured.
-///
-/// Sized for real SPAs: many idle 2–3s (some up to ~5s) after load BEFORE they
-/// even begin fetching data, then need time to fetch + render. 20s leaves headroom
-/// for a ~5s-to-start SPA plus fetch/render, while still bounding the held ingest
-/// permit.
-/// How the render window is hidden (issue #78). WKWebView needs a window it
-/// considers on-screen to run JS at full speed; the open question was whether an
-/// OFF-SCREEN window also runs — earlier off-screen tests captured nothing, but
-/// that turned out to be the double-encoded-readback bug (now fixed), NOT
-/// necessarily suspension. With that fixed + a per-poll `eval` timeout that
-/// definitively detects a suspended webview, we can test the off-screen path.
+/// How the render window is hidden (issue #78). It was initially suspected that
+/// WKWebView suspends JS for an off-screen window, but testing confirmed the
+/// off-screen webview runs its JS and captures rendered content fine once the
+/// double-encoded-readback bug was fixed — so `Offscreen` is the production path.
 #[derive(PartialEq, Eq)]
 enum RenderVisibility {
-    /// A real, VISIBLE, decorated window — for watching the render while debugging.
+    /// A real, VISIBLE, decorated window — for watching the render while
+    /// developing. Never commit this as the active `RENDER_VISIBILITY`.
     DebugVisible,
-    /// Off-screen (invisible; never covers on-screen content). The ideal, IF
-    /// WKWebView does not suspend an off-screen window.
+    /// Off-screen (invisible; never covers on-screen content). The confirmed
+    /// production path.
     Offscreen,
     /// On-screen at the origin but native-alpha 0 + click-through (invisible and
-    /// non-covering). The fallback if off-screen proves to be suspended.
+    /// non-covering). Retained as an untested fallback if some OS is ever found to
+    /// suspend off-screen webviews; not currently active.
     OnscreenAlphaZero,
 }
 
@@ -104,6 +94,16 @@ enum RenderVisibility {
 /// `DebugVisible` to watch a render during development.
 const RENDER_VISIBILITY: RenderVisibility = RenderVisibility::Offscreen;
 
+/// Hard wall-clock cap on a single render, enforced Rust-side with
+/// `tokio::time::timeout` around the poll loop — independent of any in-page
+/// signal, so a hostile/broken page cannot exceed it. On timeout the best
+/// capture seen so far is returned (then the caller's content oracle decides);
+/// `None` only if nothing was ever captured.
+///
+/// Sized for real SPAs: many idle 2–3s (some up to ~5s) after load BEFORE they
+/// even begin fetching data, then need time to fetch + render. 20s leaves headroom
+/// for a ~5s-to-start SPA plus fetch/render, while still bounding the held ingest
+/// permit.
 const JS_RENDER_MAX_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// How often the Rust side polls the webview (via `eval_with_callback`). Matched
@@ -498,6 +498,12 @@ impl JsRenderer for TauriJsRenderer {
 
 /// The render body proper. Separated so `render_html` can wrap it in
 /// `catch_unwind`. Schedules teardown on EVERY exit arm.
+///
+/// NOTE: no automated coverage — this drives a live Tauri webview, which cannot
+/// run in headless CI. The pure, testable pieces are extracted and unit-tested
+/// (`parse_readback`, `nav_url_allowed`, `readback_host_allowed`); the ingest
+/// wiring is covered via a fake `JsRenderer` in `lens-core/tests/url_ingest.rs`.
+/// Exercise this function with the env-gated real-webview smoke test / manually.
 async fn render_inner(
     app: &tauri::AppHandle,
     label: &str,
@@ -543,6 +549,7 @@ async fn render_inner(
                 .shadow(false)
                 .skip_taskbar(!debug_visible)
                 .focused(false)
+                .resizable(false)
                 .always_on_top(true)
                 .title("LensLM · rendering")
                 // Ephemeral session: no shared cookies/localStorage/cache to exfiltrate
@@ -907,6 +914,10 @@ mod tests {
         assert!(!readback_host_allowed("http://127.0.0.1/x"));
         assert!(!readback_host_allowed("http://[::1]/"));
         assert!(!readback_host_allowed("http://10.0.0.5/"));
+        // The `localhost` HOSTNAME (not just the loopback literal) must be blocked:
+        // the readback re-check resolves DNS, so a redirect that lands on localhost
+        // is discarded before its content can be indexed.
+        assert!(!readback_host_allowed("http://localhost/whatever"));
         assert!(!readback_host_allowed("not a url"));
         assert!(readback_host_allowed("http://8.8.8.8/page"));
     }

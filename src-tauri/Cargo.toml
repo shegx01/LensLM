@@ -37,11 +37,11 @@ futures = "0.3"
 # Unique offscreen render-window labels (`lens-render-<uuid>`); v7 for time-order.
 uuid = { workspace = true }
 
-# macOS: set the render window's native NSWindow alphaValue to 0 (#78). WKWebView
-# suspends JS for an off-screen/occluded window, so the render window must be
-# genuinely on-screen — we hide it by making the native window fully transparent
-# (a public AppKit API; no `macos-private-api` needed). Version tracks the objc2
-# already in the tree via tauri.
+# macOS: used ONLY by the inactive `OnscreenAlphaZero` render fallback (#78), which
+# sets the render window's native NSWindow alphaValue to 0 (a public AppKit API; no
+# `macos-private-api` needed). The production path is `Offscreen` (off-screen +
+# invisible), which needs no native calls; this dep is retained so the fallback
+# compiles if ever activated. Version tracks the objc2 already in the tree via tauri.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 
