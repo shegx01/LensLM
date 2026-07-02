@@ -11,6 +11,7 @@
   import { isTauri } from '@tauri-apps/api/core';
   import X from '@lucide/svelte/icons/x';
   import Upload from '@lucide/svelte/icons/upload';
+  import Check from '@lucide/svelte/icons/check';
   import { cn } from '$lib/utils.js';
   import { Button } from '$lib/components/ui/button/index.js';
   import { addFileSource, addTextSource, addUrlSource } from '$lib/sources/ipc.js';
@@ -48,6 +49,8 @@
   let urlValue = $state('');
   let urlError = $state<string | null>(null);
   let urlSubmitting = $state(false);
+  /** #78: mark the URL as a JS app / SPA so ingest always JS-renders it. */
+  let urlIsSpa = $state(false);
 
   /** Paste tab */
   let pasteTitle = $state('');
@@ -94,6 +97,7 @@
       urlValue = '';
       urlError = null;
       urlSubmitting = false;
+      urlIsSpa = false;
       pasteTitle = '';
       pasteContent = '';
       pasteError = null;
@@ -295,7 +299,12 @@
     urlSubmitting = true;
     try {
       const url = urlValue.trim();
-      const { source, wasExisting } = await addUrlSource(activeNotebookId, titleFromUrl(url), url);
+      const { source, wasExisting } = await addUrlSource(
+        activeNotebookId,
+        titleFromUrl(url),
+        url,
+        urlIsSpa
+      );
       if (wasExisting) {
         // Backend content-dedup hit (#100) — do NOT insert or ingest.
         showToast('Already in notebook');
@@ -499,6 +508,32 @@
                 style="-webkit-app-region: no-drag;"
               />
             </div>
+            <!-- #78: SPA / JS-render opt-in. Token-styled (appearance-none) so it
+                 follows light/dark mode AND the selected accent — a native
+                 checkbox ignores the app theme (no color-scheme is set). -->
+            <label
+              class="mb-3 flex items-start gap-2 text-[12px] text-foreground"
+              for="add-sources-url-spa"
+              style="-webkit-app-region: no-drag;"
+            >
+              <span class="relative mt-0.5 inline-flex size-4 shrink-0 items-center justify-center">
+                <input
+                  id="add-sources-url-spa"
+                  type="checkbox"
+                  class="peer size-4 shrink-0 cursor-pointer appearance-none rounded border border-input bg-background outline-none checked:border-primary checked:bg-primary focus-visible:ring-2 focus-visible:ring-ring/50"
+                  bind:checked={urlIsSpa}
+                  style="-webkit-app-region: no-drag;"
+                />
+                <Check
+                  class="pointer-events-none absolute size-3 text-primary-foreground opacity-0 peer-checked:opacity-100"
+                  strokeWidth={3}
+                />
+              </span>
+              <span class="leading-relaxed">
+                This page needs JavaScript to load
+                <span class="text-muted-foreground/70">(render it before extracting)</span>
+              </span>
+            </label>
             <p class="text-[12px] text-muted-foreground/70 leading-relaxed">
               Supports web pages, blog posts, documentation and GitHub repos. Content is fetched and
               indexed locally.

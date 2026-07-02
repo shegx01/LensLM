@@ -232,7 +232,7 @@ async fn url_fetch_http_error_flips_to_error() {
         .await
         .expect("notebook");
     let source = engine
-        .add_url_source(&nb.id, "bad page", &format!("{}/page", mock.uri()))
+        .add_url_source(&nb.id, "bad page", &format!("{}/page", mock.uri()), false)
         .await
         .expect("add_url_source")
         .source;
@@ -315,7 +315,7 @@ async fn url_uses_configurable_cap() {
         .await
         .expect("notebook");
     let source = engine
-        .add_url_source(&nb.id, "huge page", &format!("{}/huge", mock.uri()))
+        .add_url_source(&nb.id, "huge page", &format!("{}/huge", mock.uri()), false)
         .await
         .expect("add_url_source")
         .source;
@@ -359,7 +359,7 @@ async fn url_needs_js_on_js_shell() {
         .await
         .expect("notebook");
     let source = engine
-        .add_url_source(&nb.id, "spa page", &format!("{}/spa", mock.uri()))
+        .add_url_source(&nb.id, "spa page", &format!("{}/spa", mock.uri()), false)
         .await
         .expect("add_url_source")
         .source;
@@ -428,7 +428,7 @@ async fn url_indexes_real_article() {
         .await
         .expect("notebook");
     let source = engine
-        .add_url_source(&nb.id, "real article", &format!("{}/article", mock.uri()))
+        .add_url_source(&nb.id, "real article", &format!("{}/article", mock.uri()), false)
         .await
         .expect("add_url_source")
         .source;
@@ -504,7 +504,7 @@ async fn url_indexes_content_rich_page_despite_low_ratio() {
         .await
         .expect("notebook");
     let source = engine
-        .add_url_source(&nb.id, "guide", &format!("{}/guide", mock.uri()))
+        .add_url_source(&nb.id, "guide", &format!("{}/guide", mock.uri()), false)
         .await
         .expect("add_url_source")
         .source;
@@ -536,6 +536,64 @@ async fn url_indexes_content_rich_page_despite_low_ratio() {
     }
 }
 
+/// #78 SPA opt-in: a page whose STATIC extraction is content-rich (and therefore
+/// would index directly — proven by `url_indexes_content_rich_page_despite_low_ratio`)
+/// must instead be DIVERTED to the JS-render branch when `force_js_render=true`.
+/// With no renderer injected (headless test) + rendering enabled, the diverted
+/// source lands in `needs_js` — proving the flag routed it away from the static
+/// index path rather than indexing the static extraction.
+#[tokio::test]
+async fn url_force_js_render_diverts_content_rich_page_to_render() {
+    let html = content_rich_low_ratio_html();
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/guide"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(html)
+                .insert_header("content-type", "text/html; charset=utf-8"),
+        )
+        .mount(&mock)
+        .await;
+
+    let (_dir, engine) = file_engine().await;
+    inject_fake_embedder(&engine);
+    seed_tokenizer_from_env(&engine.data_dir_for_test().await);
+
+    let nb = engine
+        .create_notebook("NB", None, None)
+        .await
+        .expect("notebook");
+    let source = engine
+        // force_js_render = true (the SPA checkbox)
+        .add_url_source(&nb.id, "guide", &format!("{}/guide", mock.uri()), true)
+        .await
+        .expect("add_url_source")
+        .source;
+    // The flag must persist on the row.
+    assert_eq!(
+        source.force_js_render, 1,
+        "force_js_render must persist as 1 on the source row"
+    );
+
+    let (result, _events) = ingest_collecting_progress(&engine, &source.id).await;
+    assert!(result.is_ok(), "ingest must not error: {result:?}");
+
+    let pool = engine.pool().await;
+    let repo = lens_core::notebooks::NotebookRepo::new(&pool);
+    let updated = repo
+        .get_source(&source.id)
+        .await
+        .expect("get_source ok")
+        .expect("source exists");
+    assert_eq!(
+        updated.status, "needs_js",
+        "force_js_render must divert a content-rich page to the render branch; with no \
+         renderer injected it lands in needs_js (got {:?})",
+        updated.status
+    );
+}
+
 // ===========================================================================
 // Crash-recovery: needs_js / needs_ocr survive engine restart
 // ===========================================================================
@@ -558,17 +616,17 @@ async fn crash_recovery_skips_needs_js_and_needs_ocr() {
     let repo = lens_core::notebooks::NotebookRepo::new(&pool);
 
     let src_js = repo
-        .add_url_source(&nb.id, "spa", "https://example.com/spa")
+        .add_url_source(&nb.id, "spa", "https://example.com/spa", false)
         .await
         .expect("add_url_source")
         .source;
     let src_ocr = repo
-        .add_url_source(&nb.id, "scanned", "https://example.com/pdf")
+        .add_url_source(&nb.id, "scanned", "https://example.com/pdf", false)
         .await
         .expect("add_url_source for ocr")
         .source;
     let src_rf = repo
-        .add_url_source(&nb.id, "failed-render", "https://example.com/rf")
+        .add_url_source(&nb.id, "failed-render", "https://example.com/rf", false)
         .await
         .expect("add_url_source for render_failed")
         .source;
@@ -665,7 +723,7 @@ async fn needs_js_not_set_via_err_path() {
         .await
         .expect("notebook");
     let source = engine
-        .add_url_source(&nb.id, "spa", &format!("{}/spa", mock.uri()))
+        .add_url_source(&nb.id, "spa", &format!("{}/spa", mock.uri()), false)
         .await
         .expect("add_url_source")
         .source;
@@ -709,7 +767,7 @@ async fn add_url_source_returns_queued_without_fetch() {
 
     // This must return before any network timeout fires.
     let source: Source = engine
-        .add_url_source(&nb.id, "page title", url)
+        .add_url_source(&nb.id, "page title", url, false)
         .await
         .expect("add_url_source must not attempt a network connection")
         .source;
@@ -739,7 +797,7 @@ async fn add_url_source_dedup_returns_existing() {
 
     // First add — fresh insert. Locator keeps the verbatim (mixed-case) URL.
     let first = engine
-        .add_url_source(&nb.id, "article", "https://Example.COM/article")
+        .add_url_source(&nb.id, "article", "https://Example.COM/article", false)
         .await
         .expect("add_url_source");
     assert!(!first.was_existing, "first add is a fresh insert");
@@ -750,7 +808,7 @@ async fn add_url_source_dedup_returns_existing() {
 
     // Host-case-only difference — dedup hit.
     let second = engine
-        .add_url_source(&nb.id, "again", "https://example.com/article")
+        .add_url_source(&nb.id, "again", "https://example.com/article", false)
         .await
         .expect("add_url_source");
     assert!(second.was_existing, "case-differing host is a dedup hit");
@@ -758,7 +816,7 @@ async fn add_url_source_dedup_returns_existing() {
 
     // Fragment-only difference — dedup hit.
     let third = engine
-        .add_url_source(&nb.id, "frag", "https://example.com/article#section2")
+        .add_url_source(&nb.id, "frag", "https://example.com/article#section2", false)
         .await
         .expect("add_url_source");
     assert!(
@@ -769,7 +827,7 @@ async fn add_url_source_dedup_returns_existing() {
 
     // Genuinely different path — fresh insert.
     let fourth = engine
-        .add_url_source(&nb.id, "other", "https://example.com/different")
+        .add_url_source(&nb.id, "other", "https://example.com/different", false)
         .await
         .expect("add_url_source");
     assert!(!fourth.was_existing, "different URL is a fresh insert");
@@ -790,13 +848,13 @@ async fn engine_add_url_source_dedup_end_to_end() {
         .expect("notebook");
 
     let first = engine
-        .add_url_source(&nb.id, "page", "https://Example.COM/page")
+        .add_url_source(&nb.id, "page", "https://Example.COM/page", false)
         .await
         .expect("add_url_source");
     assert!(!first.was_existing);
 
     let second = engine
-        .add_url_source(&nb.id, "page", "https://example.com/page")
+        .add_url_source(&nb.id, "page", "https://example.com/page", false)
         .await
         .expect("add_url_source");
     assert!(second.was_existing, "case-differing host dedups end-to-end");
@@ -840,7 +898,7 @@ async fn url_extracted_sibling_removed_on_purge() {
         .await
         .expect("notebook");
     let source = engine
-        .add_url_source(&nb.id, "article", &format!("{}/article", mock.uri()))
+        .add_url_source(&nb.id, "article", &format!("{}/article", mock.uri()), false)
         .await
         .expect("add_url_source")
         .source;
@@ -901,7 +959,7 @@ async fn url_extracted_sibling_removed_on_purge_notebook() {
         .await
         .expect("notebook");
     let source = engine
-        .add_url_source(&nb.id, "article", &format!("{}/article", mock.uri()))
+        .add_url_source(&nb.id, "article", &format!("{}/article", mock.uri()), false)
         .await
         .expect("add_url_source")
         .source;
@@ -974,7 +1032,7 @@ async fn reingest_into_needs_js_wipes_stale_chunks_and_vectors() {
         .await
         .expect("notebook");
     let source = engine
-        .add_url_source(&nb.id, "page", &format!("{}/page", mock.uri()))
+        .add_url_source(&nb.id, "page", &format!("{}/page", mock.uri()), false)
         .await
         .expect("add_url_source")
         .source;
@@ -1097,7 +1155,7 @@ async fn js_render_fallback_indexes_when_renderer_populates() {
         .await
         .expect("notebook");
     let source = engine
-        .add_url_source(&nb.id, "spa", &format!("{}/spa", mock.uri()))
+        .add_url_source(&nb.id, "spa", &format!("{}/spa", mock.uri()), false)
         .await
         .expect("add_url_source")
         .source;
@@ -1154,7 +1212,7 @@ async fn js_render_fallback_render_failed_when_renderer_returns_none() {
         .await
         .expect("notebook");
     let source = engine
-        .add_url_source(&nb.id, "spa", &format!("{}/spa", mock.uri()))
+        .add_url_source(&nb.id, "spa", &format!("{}/spa", mock.uri()), false)
         .await
         .expect("add_url_source")
         .source;
@@ -1228,7 +1286,7 @@ async fn js_render_fallback_render_failed_when_renderer_errors() {
         .await
         .expect("notebook");
     let source = engine
-        .add_url_source(&nb.id, "spa", &format!("{}/spa", mock.uri()))
+        .add_url_source(&nb.id, "spa", &format!("{}/spa", mock.uri()), false)
         .await
         .expect("add_url_source")
         .source;
@@ -1287,7 +1345,7 @@ async fn js_render_fallback_opt_out_stays_needs_js() {
         .await
         .expect("notebook");
     let source = engine
-        .add_url_source(&nb.id, "spa", &format!("{}/spa", mock.uri()))
+        .add_url_source(&nb.id, "spa", &format!("{}/spa", mock.uri()), false)
         .await
         .expect("add_url_source")
         .source;
@@ -1332,7 +1390,7 @@ async fn js_render_fallback_no_renderer_stays_needs_js() {
         .await
         .expect("notebook");
     let source = engine
-        .add_url_source(&nb.id, "spa", &format!("{}/spa", mock.uri()))
+        .add_url_source(&nb.id, "spa", &format!("{}/spa", mock.uri()), false)
         .await
         .expect("add_url_source")
         .source;
@@ -1384,7 +1442,7 @@ async fn js_render_provenance_blocked_render_failed_writes_nothing() {
         .await
         .expect("notebook");
     let source = engine
-        .add_url_source(&nb.id, "spa", &format!("{}/spa", mock.uri()))
+        .add_url_source(&nb.id, "spa", &format!("{}/spa", mock.uri()), false)
         .await
         .expect("add_url_source")
         .source;

@@ -628,16 +628,21 @@ impl LensEngine {
     /// to fetch and extract the page in the background. Returns an
     /// [`AddSourceOutcome`]: on a content-dedup hit (issue #100, keyed on the
     /// normalized URL) the existing live source is returned (`was_existing = true`).
+    ///
+    /// `force_js_render` (#78) persists the per-source "SPA / render this page"
+    /// opt-in; when `true`, ingest ALWAYS routes this source through the JS-render
+    /// path rather than relying on static-extraction auto-detection.
     #[tracing::instrument(skip(self))]
     pub async fn add_url_source(
         &self,
         notebook_id: &NotebookId,
         title: &str,
         url: &str,
+        force_js_render: bool,
     ) -> Result<AddSourceOutcome, LensError> {
         let pool = self.pool().await;
         NotebookRepo::new(&pool)
-            .add_url_source(notebook_id, title, url)
+            .add_url_source(notebook_id, title, url, force_js_render)
             .await
     }
 

@@ -586,7 +586,15 @@ async fn run_ingest(
         } else {
             text_len as f64 / raw_len as f64
         };
-        let needs_js = text_len < NEEDS_JS_MIN_CHARS
+        // Per-source SPA opt-in (#78): a persisted `force_js_render` flag on the
+        // loaded source ALWAYS routes the source down the render branch, OR-ed in
+        // ahead of the static auto-detection heuristics. The global
+        // `js_render_enabled` opt-out below still wins (opt-out beats per-source
+        // force): with rendering disabled the branch keeps `needs_js` and never
+        // renders.
+        let force_js_render = source.force_js_render != 0;
+        let needs_js = force_js_render
+            || text_len < NEEDS_JS_MIN_CHARS
             || (text_len < NEEDS_JS_SUFFICIENT_CHARS && ratio < NEEDS_JS_MIN_TEXT_RATIO);
         if needs_js {
             tracing::info!(
@@ -594,7 +602,8 @@ async fn run_ingest(
                 text_len,
                 raw_len,
                 ratio,
-                "URL source has near-empty extraction — likely JS-rendered; attempting JS-render fallback"
+                force_js_render,
+                "URL source needs JS render (forced or near-empty extraction); attempting JS-render fallback"
             );
 
             // ── JS-render auto-fallback (Layer d) ─────────────────────────

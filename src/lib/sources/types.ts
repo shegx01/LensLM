@@ -68,6 +68,11 @@ export interface Source {
   /** JSON enrichment metadata (composite cache key + budget/skip reason);
    * `null` until the source is enriched. */
   enrichment_meta: string | null;
+  /** SYNC-CHECK: must match lens-core/src/notebooks.rs `Source.force_js_render`.
+   * Per-source "SPA / render this page" opt-in (#78). SQLite integer boolean
+   * (`0` = off, `1` = on), mirroring `selected`. When set, ingest ALWAYS routes
+   * the URL source through the JS-render path. Only URL sources render. */
+  force_js_render: number;
 }
 
 /** Return type of all add-source IPC calls (add_file_source, add_source,

@@ -112,6 +112,7 @@ function makeTrashedSource(overrides?: Partial<TrashedSource>): TrashedSource {
     trashed_at: '2026-06-01T00:00:00Z',
     enrichment_status: null,
     enrichment_meta: null,
+    force_js_render: 0,
     notebook_title: 'Old Research Notes',
     ...overrides
   };

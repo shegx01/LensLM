@@ -89,6 +89,7 @@ function makeTrashedSource(overrides?: Partial<TrashedSource>): TrashedSource {
     trashed_at: new Date(Date.now() - 3600_000).toISOString(),
     enrichment_status: null,
     enrichment_meta: null,
+    force_js_render: 0,
     notebook_title: 'My Notebook',
     ...overrides
   };

@@ -75,6 +75,7 @@ function makeSource(overrides?: Partial<Source>): Source {
     trashed_at: null,
     enrichment_status: null,
     enrichment_meta: null,
+    force_js_render: 0,
     ...overrides
   };
 }

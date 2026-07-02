@@ -83,17 +83,24 @@ export async function addFileSource(
  * hit (#100, keyed on the moderately-normalized URL) the existing live source is
  * returned with `wasExisting = true` and no new row is written. Mirrors the Rust
  * `AddSourceOutcome` (serde camelCase).
+ *
+ * `forceJsRender` (#78) persists the per-source "SPA / render this page" opt-in;
+ * when `true`, ingest ALWAYS routes the source through the JS-render path instead
+ * of relying on static-extraction auto-detection. Sent camelCase — Tauri maps it
+ * to the snake_case `force_js_render` command arg.
  */
 export async function addUrlSource(
   notebookId: string,
   title: string,
-  url: string
+  url: string,
+  forceJsRender: boolean = false
 ): Promise<AddSourceOutcome> {
   if (!isTauri()) throw new Error('addUrlSource: not running under Tauri');
   return invoke<AddSourceOutcome>('add_url_source', {
     notebookId,
     title,
-    url
+    url,
+    forceJsRender
   });
 }
 

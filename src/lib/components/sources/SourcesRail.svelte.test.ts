@@ -156,6 +156,7 @@ function makeSource(overrides?: Partial<Source>): Source {
     trashed_at: null,
     enrichment_status: null,
     enrichment_meta: null,
+    force_js_render: 0,
     ...overrides
   };
 }
@@ -652,7 +653,26 @@ describe('AddSourcesModal', () => {
     expect(addUrlSource).toHaveBeenCalledWith(
       'nb-001',
       expect.any(String),
-      'https://example.com/article'
+      'https://example.com/article',
+      false
+    );
+    expect(ingest).toHaveBeenCalledWith('src-url');
+    expect(onclose).toHaveBeenCalled();
+  });
+
+  it('checking the SPA checkbox then submitting calls addUrlSource with forceJsRender=true', async () => {
+    const onclose = vi.fn();
+    render(AddSourcesModal, { open: true, onclose });
+    await fireEvent.click(screen.getByRole('tab', { name: /url/i }));
+    const input = screen.getByLabelText(/web page url/i);
+    await fireEvent.input(input, { target: { value: 'https://example.com/spa' } });
+    await fireEvent.click(screen.getByLabelText(/needs javascript to load/i));
+    await fireEvent.click(screen.getByRole('button', { name: /add to notebook/i }));
+    expect(addUrlSource).toHaveBeenCalledWith(
+      'nb-001',
+      expect.any(String),
+      'https://example.com/spa',
+      true
     );
     expect(ingest).toHaveBeenCalledWith('src-url');
     expect(onclose).toHaveBeenCalled();

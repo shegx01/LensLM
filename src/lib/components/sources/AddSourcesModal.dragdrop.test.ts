@@ -103,7 +103,8 @@ vi.mock('$lib/sources/ipc.js', () => ({
       raw_content_hash: null,
       trashed_at: null,
       enrichment_status: null,
-      enrichment_meta: null
+      enrichment_meta: null,
+      force_js_render: 0
     } satisfies Source,
     wasExisting: false
   }),
@@ -195,7 +196,8 @@ function outcome(id: string, wasExisting: boolean) {
       raw_content_hash: null,
       trashed_at: null,
       enrichment_status: null,
-      enrichment_meta: null
+      enrichment_meta: null,
+      force_js_render: 0
     } satisfies Source,
     wasExisting
   };
