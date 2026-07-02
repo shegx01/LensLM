@@ -468,8 +468,9 @@ mod tests {
         // 0006_notebook_embedding_model, 0007_notebook_embedding_backend (M4
         // Phase 4b-B), 0008_source_file_hash (#96 add-time content dedup),
         // 0009_source_raw_content_hash_rename (#100 rename file_hash),
-        // 0010_source_force_js_render (#78 per-source SPA render opt-in).
-        assert_eq!(status.migration_count, 10);
+        // 0010_source_force_js_render (#78 per-source SPA render opt-in),
+        // 0011_notebook_last_activity_at (last-edited-notebook default).
+        assert_eq!(status.migration_count, 11);
     }
 
     #[tokio::test]

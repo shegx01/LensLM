@@ -262,6 +262,19 @@ pub async fn rename_notebook(
     engine.rename_notebook(&NotebookId::from(id), &title).await
 }
 
+/// Bumps a live notebook's `last_activity_at` (records an "open" for cold-launch
+/// MRU auto-open). Fire-and-forget from the frontend selection path.
+#[tracing::instrument(skip_all)]
+#[tauri::command]
+pub async fn touch_notebook_activity(
+    notebook_id: String,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<(), LensError> {
+    engine
+        .touch_notebook_activity(&NotebookId::from(notebook_id))
+        .await
+}
+
 /// Soft-deletes a notebook (backward-compat alias for `trash_notebook`).
 ///
 /// Sets `trashed_at` rather than hard-deleting; the notebook is recoverable from
