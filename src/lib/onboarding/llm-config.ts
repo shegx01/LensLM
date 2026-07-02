@@ -85,6 +85,11 @@ export interface EnrichmentPrefsInput {
   /** Per-task structural-map model override (Stage 3). Same null/undefined
    * semantics as {@link coref_model}. */
   map_model?: TaskModel | null;
+  /** Studio & Chat model (non-blocking). Persisted into `enrichment.chat_model`.
+   * `undefined` leaves the prior value untouched; `null` clears it; a
+   * {@link TaskModel} pins it. Configured during onboarding; used when chat /
+   * Studio ships. NEVER gates save. */
+  chat_model?: TaskModel | null;
 }
 
 /**
@@ -94,10 +99,11 @@ export interface EnrichmentPrefsInput {
  * overrides (`coref_model`/`map_model`/`chat_model`) co-exist with the three core
  * fields, so a partial save must never drop a field the caller didn't set.
  *
- * `routing`/`coref_model`/`map_model` are applied ONLY when the caller provides
- * them (`undefined` ⇒ keep the prior value); passing `null` for a per-task model
- * explicitly clears the override (back to the routing default). `chat_model` is
- * never touched here (M5's concern) — it is round-tripped from the prior config.
+ * `routing`/`coref_model`/`map_model`/`chat_model` are applied ONLY when the
+ * caller provides them (`undefined` ⇒ keep the prior value); passing `null` for a
+ * per-task model explicitly clears the override (back to the routing default).
+ * `chat_model` holds the Studio & Chat model configured in onboarding (used when
+ * chat / Studio ships); it merges without clobbering `coref_model`/`map_model`.
  *
  * A no-op outside Tauri (the `updateConfig` guard), so onboarding stays
  * non-blocking: a skipped step simply never calls this and the Rust-side
@@ -115,6 +121,7 @@ export async function saveEnrichmentPrefs(input: EnrichmentPrefsInput): Promise<
     if (input.routing !== undefined) enrichment.routing = input.routing;
     if (input.coref_model !== undefined) enrichment.coref_model = input.coref_model;
     if (input.map_model !== undefined) enrichment.map_model = input.map_model;
+    if (input.chat_model !== undefined) enrichment.chat_model = input.chat_model;
     return { ...cfg, enrichment };
   });
 }

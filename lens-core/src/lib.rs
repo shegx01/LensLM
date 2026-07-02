@@ -59,8 +59,8 @@ pub use notebooks::{
 };
 pub use system_check::{
     ALLOWED_EMBEDDING_MODELS, CheckAction, CheckId, CheckResult, CheckStatus, LlmDetection,
-    detect_llm, fastembed_weights_cached, is_allowlisted_embedding_id, list_ollama_models,
-    ollama_base_url,
+    ModelValidation, detect_llm, fastembed_weights_cached, is_allowlisted_embedding_id,
+    list_ollama_models, ollama_base_url, validate_model_interactive,
 };
 pub use tts::{
     DownloadProgress, Gender, KOKORO_MODEL_FILENAME, KOKORO_MODEL_RELPATH, KOKORO_MODEL_URL,

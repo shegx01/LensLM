@@ -284,6 +284,13 @@ pub struct EnrichmentMeta {
     /// Total LLM calls this job dispatched (observability).
     #[serde(default)]
     pub calls_made: u32,
+    /// Human-readable reason for an enrichment failure. `None` = no failure,
+    /// `Some(reason)` = failed with this reason (issue #90 worker preflight).
+    /// Backward-compatible via `#[serde(default)]`: existing `enrichment_meta`
+    /// rows persisted before this field existed deserialize as `None` (no DB
+    /// migration — the field lives inside the JSON blob in `sources.enrichment_meta`).
+    #[serde(default)]
+    pub failure_reason: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -627,5 +634,56 @@ mod tests {
         assert_eq!(job2.check_before_dispatch(100), BudgetCheck::Exceeded);
         assert_eq!(session.tokens_used(), 100);
         assert_eq!(session.calls_made(), 1);
+    }
+
+    // --- failure_reason (issue #90 worker preflight surfacing) --------------
+
+    #[test]
+    fn enrichment_meta_failure_reason_roundtrip() {
+        // A failure reason serializes and deserializes intact.
+        let meta = EnrichmentMeta {
+            cache_key: "k".to_string(),
+            failure_reason: Some("Model 'x' not found in Ollama".to_string()),
+            ..EnrichmentMeta::default()
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let back: EnrichmentMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.failure_reason,
+            Some("Model 'x' not found in Ollama".to_string())
+        );
+    }
+
+    #[test]
+    fn enrichment_meta_backward_compat() {
+        // Old rows persisted before `failure_reason` existed have NO such key and
+        // must deserialize with `failure_reason: None` (via `#[serde(default)]`).
+        let old_json = r#"{
+            "cache_key": "k",
+            "map_quality": "ok",
+            "budget_exceeded": false,
+            "tokens_spent": 10,
+            "calls_made": 2
+        }"#;
+        let meta: EnrichmentMeta = serde_json::from_str(old_json).unwrap();
+        assert_eq!(meta.failure_reason, None);
+        // The pre-existing fields still round-trip.
+        assert_eq!(meta.cache_key, "k");
+        assert_eq!(meta.tokens_spent, 10);
+    }
+
+    #[test]
+    fn enrichment_meta_explicit_none() {
+        // An explicit `failure_reason: null` in the JSON deserializes as `None`.
+        let json = r#"{
+            "cache_key": "k",
+            "map_quality": "ok",
+            "budget_exceeded": false,
+            "tokens_spent": 0,
+            "calls_made": 0,
+            "failure_reason": null
+        }"#;
+        let meta: EnrichmentMeta = serde_json::from_str(json).unwrap();
+        assert_eq!(meta.failure_reason, None);
     }
 }

@@ -438,6 +438,16 @@ impl GenaiProvider {
         self.client.clone()
     }
 
+    /// Whether this provider's resolved adapter is LOCAL Ollama.
+    ///
+    /// Public so the enrichment-model preflight (issue #90) can distinguish a local
+    /// Ollama provider — validated by tags-membership via `list_ollama_models` — from
+    /// a cloud provider (validated by a live probe) WITHOUT leaking the genai
+    /// [`AdapterKind`] type across the crate's public API.
+    pub fn is_ollama(&self) -> bool {
+        matches!(self.resolved.adapter, AdapterKind::Ollama)
+    }
+
     /// Maps an [`LlmRequest`] onto a genai `(ChatRequest, ChatOptions)` pair.
     ///
     /// PRESERVES the determinism contract: `temperature` is passed verbatim
@@ -930,6 +940,41 @@ fn build_provider(model: &crate::config::ModelConfig) -> Option<Arc<dyn LlmProvi
         &model.model,
         &model.base_url,
         &model.api_key,
+    )))
+}
+
+/// Builds an [`LlmProvider`] directly from RAW, not-yet-persisted params (issue
+/// #90 interactive validation). Unlike [`provider_from_config`], this bypasses the
+/// routing/consent/catalog gates and the persisted [`AppConfig`] entirely — the
+/// interactive panel validates exactly the values the user typed BEFORE they are
+/// saved. Returns `None` for an unrecognized provider id, or a local/custom
+/// endpoint with an empty `base_url` (no canonical default to fall back to).
+///
+/// The `provider` id follows the same canonical convention as `ModelConfig.provider`
+/// (`"ollama"`, `"openai"`, `"anthropic"`, the custom `"openai-compatible"`, …).
+pub fn build_provider_raw(
+    provider: &str,
+    model: &str,
+    base_url: &str,
+    api_key: &str,
+) -> Option<Arc<dyn LlmProvider>> {
+    if model.is_empty() {
+        return None;
+    }
+    if !base_url.is_empty() {
+        let scheme_ok = base_url.split_once("://").is_some_and(|(scheme, _)| {
+            scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+        });
+        if !scheme_ok {
+            return None;
+        }
+    }
+    let adapter = adapter_for(&provider.to_ascii_lowercase())?;
+    if base_url.is_empty() && native_endpoint(adapter).is_none() {
+        return None;
+    }
+    Some(Arc::new(GenaiProvider::new(
+        adapter, model, base_url, api_key,
     )))
 }
 
