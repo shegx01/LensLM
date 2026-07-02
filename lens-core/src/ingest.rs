@@ -126,12 +126,28 @@ pub const NEEDS_JS_MIN_CHARS: usize = 200;
 /// Minimum ratio of `extracted_text.len() / raw_html.len()` for a URL source
 /// to be considered successfully extracted. A very low ratio (e.g. 0.01 = 1%)
 /// indicates that nearly all page bytes are in script/style/markup rather than
-/// readable text — a strong JS-SPA signal.
+/// readable text — a JS-SPA *hint*.
 ///
-/// Applied together with [`NEEDS_JS_MIN_CHARS`]: EITHER condition triggers
-/// `needs_js` (so a short but high-ratio page from a tiny real article does not
-/// false-positive, and a long but script-dominated page also flags correctly).
+/// IMPORTANT: the ratio is only a SECONDARY signal, gated by
+/// [`NEEDS_JS_SUFFICIENT_CHARS`] — see the `needs_js` decision in `run_ingest`.
+/// On its own it false-positives badly on the modern web: a content-rich docs
+/// page or article routinely ships a multi-hundred-KB HTML payload (inlined
+/// hydration JSON, script tags, design-system CSS), so even a perfectly-extracted
+/// page can have `ratio < 0.01`. Absolute extracted content is the authoritative
+/// signal; the ratio only helps disambiguate the *marginal* band below
+/// `NEEDS_JS_SUFFICIENT_CHARS`.
 pub const NEEDS_JS_MIN_TEXT_RATIO: f64 = 0.01;
+
+/// Absolute amount of extracted text (bytes) at/above which a URL source is
+/// considered to have REAL content and is indexed directly — regardless of the
+/// [`NEEDS_JS_MIN_TEXT_RATIO`] ratio. This is what stops the ratio arm from
+/// false-flagging large-but-content-rich pages (e.g. `docs.stripe.com`, which
+/// extracts ~2.6 KB of docs prose from a ~1.2 MB SPA shell → ratio ≈ 0.002 but
+/// is genuinely full of readable content). trafilatura returns MAIN content
+/// (nav/boilerplate already stripped), so this many bytes of it is a strong
+/// positive signal, not chrome. The ratio arm therefore only applies to the
+/// marginal band `[NEEDS_JS_MIN_CHARS, NEEDS_JS_SUFFICIENT_CHARS)`.
+pub const NEEDS_JS_SUFFICIENT_CHARS: usize = 1000;
 
 /// Maximum accepted source size, in bytes (Phase-1 OOM guard).
 ///
@@ -526,10 +542,18 @@ async fn run_ingest(
     // but the status is already `needs_js`/`needs_ocr` — the Done progress event
     // is fine (the UI should read the persisted status, not the event).
     //
-    // needs_js triggers when EITHER:
-    //   - extracted text is shorter than NEEDS_JS_MIN_CHARS (absolute floor), OR
-    //   - extracted text is less than NEEDS_JS_MIN_TEXT_RATIO of the raw HTML
-    //     (ratio floor — catches script-heavy SPAs with large bundles).
+    // needs_js triggers when:
+    //   - extracted text is shorter than NEEDS_JS_MIN_CHARS (absolute floor — a
+    //     near-contentless shell), OR
+    //   - extracted text is in the MARGINAL band [NEEDS_JS_MIN_CHARS,
+    //     NEEDS_JS_SUFFICIENT_CHARS) AND its ratio to the raw HTML is below
+    //     NEEDS_JS_MIN_TEXT_RATIO (a small amount of text buried in a large,
+    //     script-dominated shell).
+    // Once extraction yields >= NEEDS_JS_SUFFICIENT_CHARS of (nav-stripped) main
+    // content, the page is indexed directly regardless of ratio — the ratio arm
+    // alone false-positives on content-rich pages with large HTML payloads
+    // (modern docs/SPAs), which previously sent e.g. docs.stripe.com (2.6 KB of
+    // real docs text, ratio ~0.002) needlessly down the render fallback.
     //
     // needs_ocr (Step 5): a `pdf` source whose extractor produced no text is an
     // image-only / scanned PDF (no text layer). The `PdfExtractor` signals this
@@ -562,7 +586,8 @@ async fn run_ingest(
         } else {
             text_len as f64 / raw_len as f64
         };
-        let needs_js = text_len < NEEDS_JS_MIN_CHARS || ratio < NEEDS_JS_MIN_TEXT_RATIO;
+        let needs_js = text_len < NEEDS_JS_MIN_CHARS
+            || (text_len < NEEDS_JS_SUFFICIENT_CHARS && ratio < NEEDS_JS_MIN_TEXT_RATIO);
         if needs_js {
             tracing::info!(
                 source_id,

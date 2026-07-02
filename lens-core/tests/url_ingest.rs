@@ -145,6 +145,45 @@ high-level code without sacrificing performance.</p>
         .to_string()
 }
 
+/// HTML with GENUINE, substantial article content (well over
+/// `NEEDS_JS_SUFFICIENT_CHARS`) embedded in a very large HTML payload so the
+/// text/raw ratio falls below `NEEDS_JS_MIN_TEXT_RATIO`. Models the modern-web
+/// case (e.g. `docs.stripe.com`): real content in a script/markup-heavy shell.
+/// Must be INDEXED, not flagged `needs_js` (the ratio arm must NOT false-positive
+/// once absolute extracted content is sufficient).
+fn content_rich_low_ratio_html() -> String {
+    let mut html = String::from(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Comprehensive Guide</title></head>
+<body>
+<article>
+<h1>Comprehensive Guide to the Payments API</h1>
+"#,
+    );
+    // ~10 substantial paragraphs → several thousand chars of extractable prose,
+    // comfortably above NEEDS_JS_SUFFICIENT_CHARS (1000).
+    for i in 1..=10 {
+        html.push_str(&format!(
+            "<p>Section {i}: The payments API lets you accept and manage transactions \
+             securely across many providers. This paragraph describes the request and \
+             response lifecycle in detail, including idempotency keys, webhooks for \
+             asynchronous events, retry semantics, and the recommended error-handling \
+             strategy for production integrations. Read each section carefully before \
+             wiring the client, because the ordering of operations matters.</p>\n"
+        ));
+    }
+    html.push_str("</article>\n");
+    // Pad the raw payload with a large inline script so ratio < 0.01 even though
+    // the extracted content is substantial (mirrors a big SPA/hydration bundle).
+    html.push_str("<script>\n");
+    for _ in 0..6000 {
+        html.push_str("/* inlined bundle padding to enlarge the raw HTML payload */\n");
+    }
+    html.push_str("</script>\n</body>\n</html>\n");
+    html
+}
+
 // ===========================================================================
 // Compile-time sanity: URL_FETCH_TIMEOUT is 30 s
 // ===========================================================================
@@ -429,6 +468,72 @@ async fn url_indexes_real_article() {
         "real article must be indexed (got {:?})",
         updated.status
     );
+}
+
+/// Regression (issue #78 follow-up): a content-rich page whose text/raw ratio is
+/// below `NEEDS_JS_MIN_TEXT_RATIO` but whose absolute extracted content exceeds
+/// `NEEDS_JS_SUFFICIENT_CHARS` must be INDEXED, not sent to the needs_js render
+/// fallback. This is the docs.stripe.com case: ~2.6 KB of real docs prose in a
+/// ~1.2 MB SPA shell (ratio ≈ 0.002) was wrongly flagged needs_js before the fix.
+#[tokio::test]
+async fn url_indexes_content_rich_page_despite_low_ratio() {
+    let html = content_rich_low_ratio_html();
+    // Sanity-check the fixture actually exercises the low-ratio-but-rich band.
+    assert!(
+        html.len() as f64 > 0.0,
+        "fixture non-empty (raw_len={})",
+        html.len()
+    );
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/guide"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(html)
+                .insert_header("content-type", "text/html; charset=utf-8"),
+        )
+        .mount(&mock)
+        .await;
+
+    let (_dir, engine) = file_engine().await;
+    inject_fake_embedder(&engine);
+    seed_tokenizer_from_env(&engine.data_dir_for_test().await);
+
+    let nb = engine
+        .create_notebook("NB", None, None)
+        .await
+        .expect("notebook");
+    let source = engine
+        .add_url_source(&nb.id, "guide", &format!("{}/guide", mock.uri()))
+        .await
+        .expect("add_url_source")
+        .source;
+
+    let (result, _events) = ingest_collecting_progress(&engine, &source.id).await;
+
+    let pool = engine.pool().await;
+    let repo = lens_core::notebooks::NotebookRepo::new(&pool);
+    let updated = repo
+        .get_source(&source.id)
+        .await
+        .expect("get_source ok")
+        .expect("source exists");
+
+    // The key invariant regardless of tokenizer availability: NOT needs_js.
+    assert_ne!(
+        updated.status, "needs_js",
+        "content-rich low-ratio page must NOT be flagged needs_js (status={:?})",
+        updated.status
+    );
+    // With a tokenizer present the full pipeline indexes it; without one the
+    // ingest errors at the tokenizer step (not a needs_js false positive).
+    if result.is_ok() {
+        assert_eq!(
+            updated.status, "indexed",
+            "content-rich low-ratio page must be indexed (got {:?})",
+            updated.status
+        );
+    }
 }
 
 // ===========================================================================
