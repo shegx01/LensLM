@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/svelte';
+import { render, screen, waitFor } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import Page from './+page.svelte';
 import { resetNotebookStore } from '$lib/notebooks/notebooks-state.svelte.js';
@@ -12,7 +12,8 @@ vi.mock('$lib/notebooks/ipc.js', () => ({
   trashNotebook: vi.fn(),
   restoreNotebook: vi.fn(),
   listTrashed: vi.fn().mockResolvedValue([]),
-  purgeNotebook: vi.fn()
+  purgeNotebook: vi.fn(),
+  touchNotebookActivity: vi.fn().mockResolvedValue(undefined)
 }));
 
 vi.mock('$lib/sources/ipc.js', () => ({
@@ -38,13 +39,16 @@ afterEach(() => {
 });
 
 describe('+page.svelte', () => {
-  it('renders the app shell (not the old Hello World placeholder)', () => {
+  it('renders the app shell (not the old Hello World placeholder)', async () => {
     render(Page);
     // The shell replaced the Hello World landing.
     expect(screen.queryByRole('heading', { name: /hello world/i })).not.toBeInTheDocument();
-    // Left rail sidebar, centre workspace, right rail are all present.
+    // Left rail sidebar and right rail are always present.
     expect(screen.getByText('Notebooks')).toBeInTheDocument();
     expect(screen.getByText('Sources')).toBeInTheDocument();
-    expect(screen.getByText('Your workspace')).toBeInTheDocument();
+    // Empty state renders after loading completes (gated on !loading to prevent flash).
+    await waitFor(() => {
+      expect(screen.getByText('Your workspace')).toBeInTheDocument();
+    });
   });
 });
