@@ -284,6 +284,7 @@ async fn poll_once(app: &tauri::AppHandle, label: &str) -> Option<Readback> {
     let dispatched = app.run_on_main_thread(move || {
         let Some(w) = app2.get_webview_window(&label_owned) else {
             // Window gone: drop the sender so the awaiting `rx` resolves to Err.
+            tracing::warn!(target: "lens::js_render", label = %label_owned, "poll: render window not found by label (get_webview_window → None)");
             return;
         };
         let tx = tx.clone();
@@ -492,6 +493,12 @@ async fn render_inner(
 
         match builder.build() {
             Ok(_) => {
+                // Diagnostic: confirm the window is findable by label immediately
+                // after build (same main-thread tick). If this logs `false`, the
+                // window is not registered in the manager and every poll_once will
+                // get None — the render captures nothing.
+                let found = app_for_build.get_webview_window(&label_owned).is_some();
+                tracing::info!(target: "lens::js_render", label = %label_owned, found_after_build = found, "webview build() returned Ok");
                 let _ = build_tx.send(Ok(()));
             }
             Err(e) => {
@@ -539,6 +546,12 @@ async fn render_inner(
         // by `CONTENT_GROWTH_MIN` — i.e. real content rendered on top of the nav.
         let mut baseline_text: Option<usize> = None;
         let mut polls: u32 = 0;
+        // Whether we've EVER gotten a readback from the webview. A freshly-built
+        // webview is not immediately eval-able (the page is still loading, so
+        // `eval_with_callback` errors and `poll_once` → None). Before the first
+        // successful readback, None means "not ready yet — retry"; only AFTER a
+        // success does None mean "the window vanished — stop with what we have".
+        let mut saw_poll = false;
         loop {
             match poll_once(app, label).await {
                 Some(Readback::Poll {
@@ -548,6 +561,7 @@ async fn render_inner(
                     text_len,
                 }) => {
                     polls += 1;
+                    saw_poll = true;
                     let baseline = *baseline_text.get_or_insert(text_len);
                     // Keep the largest capture across ALL polls (the page may
                     // shrink transiently between renders).
@@ -571,14 +585,27 @@ async fn render_inner(
                     }
                 }
                 Some(Readback::Err(e)) => {
-                    // The in-page readback erred (e.g. no documentElement yet).
-                    // Keep polling; the init script may recover on the next tick.
+                    // eval reached the webview but POLL_JS reported an error (e.g.
+                    // no documentElement yet). The webview IS reachable → keep
+                    // polling; it may recover on the next tick.
+                    saw_poll = true;
                     tracing::debug!(target: "lens::js_render", label, error = %e, "poll readback error; retrying");
                 }
                 None => {
-                    // The window vanished or the eval could not be dispatched.
-                    // Nothing more to poll; return what we have.
-                    break;
+                    // eval could not be dispatched / the window was not found.
+                    if saw_poll {
+                        // We reached the webview before, so it has now vanished
+                        // (torn down / content-process crash). Stop with what we
+                        // captured so far.
+                        tracing::debug!(target: "lens::js_render", label, "poll: webview unreachable after prior success; stopping");
+                        break;
+                    }
+                    // NOT READY YET: a just-built webview is not immediately
+                    // eval-able while the page is still loading. Keep retrying
+                    // (bounded by the outer JS_RENDER_MAX_TIMEOUT) instead of
+                    // giving up in the first few ms — this was the bug that made
+                    // SPAs capture nothing (elapsed_ms≈66, captured 0).
+                    tracing::trace!(target: "lens::js_render", label, "poll: webview not ready yet; retrying");
                 }
             }
             tokio::time::sleep(POLL_INTERVAL).await;
