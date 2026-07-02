@@ -97,10 +97,11 @@ enum RenderVisibility {
     OnscreenAlphaZero,
 }
 
-/// Active render-window visibility strategy. Currently testing `Offscreen` (the
-/// ideal, non-covering) now that the capture bug is fixed; fall back to
-/// `OnscreenAlphaZero` if the logs show a suspended webview, or `DebugVisible` to
-/// watch it.
+/// Active render-window visibility strategy. `Offscreen` is the CONFIRMED working
+/// production path (verified on macOS: the off-screen webview runs its JS and
+/// captures rendered content, and it never covers on-screen content). Switch to
+/// `OnscreenAlphaZero` only if an OS is found to suspend off-screen webviews, or
+/// `DebugVisible` to watch a render during development.
 const RENDER_VISIBILITY: RenderVisibility = RenderVisibility::Offscreen;
 
 const JS_RENDER_MAX_TIMEOUT: Duration = Duration::from_secs(20);
@@ -345,10 +346,9 @@ async fn poll_once(app: &tauri::AppHandle, label: &str) -> Option<Readback> {
     // "eval dispatch failed" (the warn above) from "window gone" (the warn above).
     match tokio::time::timeout(EVAL_CALLBACK_TIMEOUT, rx).await {
         Ok(Ok(json)) => {
-            // TEMPORARY (issue #78 debug): log the RAW eval result shape so we can
-            // confirm single- vs double-encoding and whether outerHTML comes back.
-            let head: String = json.chars().take(180).collect();
-            tracing::info!(target: "lens::js_render", label = %label, json_len = json.len(), json_head = %head, "poll readback raw");
+            // Low-volume-friendly: readback size only, at debug (the raw head log
+            // used during #78 bring-up was removed as too noisy).
+            tracing::debug!(target: "lens::js_render", label = %label, json_len = json.len(), "poll readback");
             Some(parse_readback(&json))
         }
         // Sender dropped (window gone before the callback fired) ⇒ stop polling.
@@ -544,7 +544,7 @@ async fn render_inner(
                 .skip_taskbar(!debug_visible)
                 .focused(false)
                 .always_on_top(true)
-                .title("LensLM · rendering (debug)")
+                .title("LensLM · rendering")
                 // Ephemeral session: no shared cookies/localStorage/cache to exfiltrate
                 // or bleed across renders.
                 .incognito(true)
