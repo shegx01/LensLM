@@ -533,52 +533,161 @@ async fn run_ingest(
         .and_then(|(raw, out)| out.map(|out| (raw, out)))?
     };
 
+    // Bundle the compute-once values (engine handle, shared pool/data_dir, loaded
+    // source + parsed status, derived kind flags, resolved cap) so the downstream
+    // gate + index helpers take a single `&IngestContext` instead of a dozen
+    // positional args each (issue #78 maintainability follow-up). `ctx` borrows
+    // `source`/`pool`/`data_dir` immutably; the code below only reads them.
+    let ctx = IngestContext {
+        engine,
+        pool: &pool,
+        data_dir: &data_dir,
+        source_id,
+        source: &source,
+        status,
+        is_pdf,
+        text_like,
+        max_source_bytes,
+    };
+
     // ── needs_js / needs_ocr gate (URL sources, and future OCR-required PDFs) ──
     //
     // INVARIANT (load-bearing): these statuses are returned as Ok(()) — NOT as
     // Err — so the error-flip in `ingest_source` (which sets status to `error`
-    // on any Err) never fires. `run_ingest` sets the terminal-pending status
-    // directly and returns Ok early. The caller's success path then emits Done,
-    // but the status is already `needs_js`/`needs_ocr` — the Done progress event
-    // is fine (the UI should read the persisted status, not the event).
-    //
-    // needs_js triggers when:
-    //   - extracted text is shorter than NEEDS_JS_MIN_CHARS (absolute floor — a
-    //     near-contentless shell), OR
-    //   - extracted text is in the MARGINAL band [NEEDS_JS_MIN_CHARS,
-    //     NEEDS_JS_SUFFICIENT_CHARS) AND its ratio to the raw HTML is below
-    //     NEEDS_JS_MIN_TEXT_RATIO (a small amount of text buried in a large,
-    //     script-dominated shell).
-    // Once extraction yields >= NEEDS_JS_SUFFICIENT_CHARS of (nav-stripped) main
-    // content, the page is indexed directly regardless of ratio — the ratio arm
-    // alone false-positives on content-rich pages with large HTML payloads
-    // (modern docs/SPAs), which previously sent e.g. docs.stripe.com (2.6 KB of
-    // real docs text, ratio ~0.002) needlessly down the render fallback.
+    // on any Err) never fires. The gate sets the terminal-pending status directly
+    // and `run_ingest` returns Ok early. The caller's success path then emits
+    // Done, but the status is already `needs_js`/`needs_ocr` — the Done progress
+    // event is fine (the UI should read the persisted status, not the event).
     //
     // needs_ocr (Step 5): a `pdf` source whose extractor produced no text is an
     // image-only / scanned PDF (no text layer). The `PdfExtractor` signals this
     // by returning EMPTY output (no Err) — see `extract::pdf`. We set
     // `needs_ocr` via the SAME Ok-with-status mechanism as `needs_js` (NOT Err,
-    // which would flip to `error`) and index nothing.
+    // which would flip to `error`) and index nothing. The `needs_js` decision
+    // and its JS-render fallback live in `IngestContext::try_js_render` below.
     if kind == Some(crate::parse::SourceKind::Pdf) && out.extracted_text.trim().is_empty() {
         tracing::info!(
             source_id,
             "PDF source produced no text layer — likely scanned/image-only; setting needs_ocr"
         );
-        set_terminal_pending(
-            &repo,
-            &pool,
-            &data_dir,
-            &source.notebook_id,
-            source_id,
-            crate::notebooks::SourceStatus::NeedsOcr.as_str(),
-        )
-        .await?;
+        ctx.set_terminal_pending(crate::notebooks::SourceStatus::NeedsOcr.as_str())
+            .await?;
         // Return Ok so the Err→error flip in ingest_source never fires.
         return Ok(());
     }
 
+    // ── needs_js gate + JS-render fallback (URL sources) ──────────────────
+    // The whole decision tree (render → re-extract → index, or terminal
+    // `needs_js`/`render_failed`) lives in `try_js_render`. `Handled` means the
+    // gate set a terminal status (return early); `NotNeeded` means static
+    // extraction already cleared the oracle and we fall through to the shared
+    // static index tail below.
     if kind == Some(crate::parse::SourceKind::Url) {
+        match ctx.try_js_render(&raw, &out, &mut on_progress).await? {
+            JsRenderOutcome::Handled => return Ok(()),
+            JsRenderOutcome::NotNeeded => {}
+        }
+    }
+
+    // ── ExtractOutput → chunk → embed → index (shared tail) ───────────────
+    // Both the static path (here) and the JS-render fallback (inside
+    // `try_js_render`) converge on ONE downstream pipeline (Principle 1 — no
+    // parallel path). The helper owns the Stage-2 guard, canonical-buffer
+    // persist, content hash, chunk, embed, index and the terminal `Indexed` flip.
+    ctx.index_extract_output(&raw, out, &mut on_progress).await
+}
+
+/// Outcome of the URL JS-render gate ([`IngestContext::try_js_render`]).
+///
+/// Lets the gate own its full decision tree (render → re-extract → index, or a
+/// terminal `needs_js`/`render_failed`) while telling [`run_ingest`] whether the
+/// source is already fully handled or should fall through to the shared static
+/// index tail.
+enum JsRenderOutcome {
+    /// The source was driven to a terminal status inside the gate — either
+    /// indexed via the render fallback, or set to `needs_js`/`render_failed`.
+    /// The caller must return `Ok(())` immediately.
+    Handled,
+    /// Static extraction already cleared the content oracle (not a JS-render
+    /// candidate). The caller proceeds to the shared static index tail.
+    NotNeeded,
+}
+
+/// Bundled, compute-once context for a single [`run_ingest`] invocation.
+///
+/// Groups the values resolved once at the top of `run_ingest` — the engine
+/// handle, the shared pool/`data_dir`, the loaded source row + its parsed
+/// `status`, and the derived `is_pdf`/`text_like`/`max_source_bytes` flags — so
+/// the downstream helpers take a single `&IngestContext` instead of threading a
+/// dozen positional arguments each (the `index_extract_output` follow-up from
+/// issue #78). Every field is `Copy` (references + small scalars), so a helper
+/// destructures `*self` back into the original local bindings at zero cost.
+///
+/// [`NotebookRepo`](crate::notebooks::NotebookRepo) is deliberately NOT a field:
+/// it borrows the pool, which would make this a self-referential struct. It is
+/// instead reconstructed on demand via [`IngestContext::repo`] (a cheap stateless
+/// `&pool` wrapper).
+struct IngestContext<'a> {
+    engine: &'a LensEngine,
+    pool: &'a sqlx::SqlitePool,
+    data_dir: &'a Path,
+    source_id: &'a str,
+    source: &'a crate::notebooks::Source,
+    status: crate::notebooks::SourceStatus,
+    is_pdf: bool,
+    text_like: bool,
+    max_source_bytes: usize,
+}
+
+impl IngestContext<'_> {
+    /// Reconstructs the stateless [`NotebookRepo`](crate::notebooks::NotebookRepo)
+    /// `&pool` wrapper on demand (see the struct docs for why it is not stored).
+    fn repo(&self) -> crate::notebooks::NotebookRepo<'_> {
+        crate::notebooks::NotebookRepo::new(self.pool)
+    }
+
+    /// Drives THIS source into a terminal-pending status (`needs_ocr` /
+    /// `needs_js` / `render_failed`), wiping any prior indexed content first.
+    /// Thin convenience over the free [`set_terminal_pending`] helper so the gate
+    /// call sites read as `ctx.set_terminal_pending(status)` rather than
+    /// re-threading the repo/pool/data_dir/notebook/source tuple each time.
+    async fn set_terminal_pending(&self, status: &str) -> Result<(), LensError> {
+        set_terminal_pending(
+            &self.repo(),
+            self.pool,
+            self.data_dir,
+            &self.source.notebook_id,
+            self.source_id,
+            status,
+        )
+        .await
+    }
+
+    /// The URL JS-render gate: decides whether the statically-extracted `out` is
+    /// too thin (a JS-rendered SPA shell) and, if so, renders the page in the
+    /// injected offscreen webview, re-extracts, and either indexes the rendered
+    /// DOM or records a terminal `needs_js`/`render_failed`.
+    ///
+    /// Returns [`JsRenderOutcome::NotNeeded`] when static extraction already
+    /// cleared the oracle (the caller then runs the static index tail) and
+    /// [`JsRenderOutcome::Handled`] when the gate itself set the source's
+    /// terminal status (the caller returns `Ok(())`). Only called for URL sources.
+    ///
+    /// INVARIANT (load-bearing): every terminal outcome here is `Ok(..)`, NOT
+    /// `Err` — a render *failure* is the terminal `render_failed`/`needs_js`
+    /// state, not the transient `error` state that crash-recovery resets and
+    /// retries. An `Err` from `render_html` or the render-branch `extract` is
+    /// caught and mapped to `render_failed` rather than propagated via `?`.
+    async fn try_js_render(
+        &self,
+        raw: &[u8],
+        out: &crate::extract::ExtractOutput,
+        on_progress: &mut impl FnMut(IngestProgress),
+    ) -> Result<JsRenderOutcome, LensError> {
+        let engine = self.engine;
+        let source = self.source;
+        let source_id = self.source_id;
+
         let text_len = out.extracted_text.len();
         let raw_len = raw.len();
         let ratio = if raw_len == 0 {
@@ -593,591 +702,538 @@ async fn run_ingest(
         // force): with rendering disabled the branch keeps `needs_js` and never
         // renders.
         let force_js_render = source.force_js_render != 0;
+        // Two-arm oracle (see the constant docs for the full rationale): (1) an
+        // absolute floor — fewer than NEEDS_JS_MIN_CHARS is a near-empty shell; or
+        // (2) the marginal band — below NEEDS_JS_SUFFICIENT_CHARS AND a
+        // text/raw-HTML ratio below NEEDS_JS_MIN_TEXT_RATIO (a little text buried
+        // in a large script-dominated shell). At/above NEEDS_JS_SUFFICIENT_CHARS
+        // the page is indexed directly regardless of ratio, so the ratio arm never
+        // false-positives on content-rich pages with large HTML payloads.
         let needs_js = force_js_render
             || text_len < NEEDS_JS_MIN_CHARS
             || (text_len < NEEDS_JS_SUFFICIENT_CHARS && ratio < NEEDS_JS_MIN_TEXT_RATIO);
-        if needs_js {
-            tracing::info!(
-                source_id,
-                text_len,
-                raw_len,
-                ratio,
-                force_js_render,
-                "URL source needs JS render (forced or near-empty extraction); attempting JS-render fallback"
-            );
+        if !needs_js {
+            return Ok(JsRenderOutcome::NotNeeded);
+        }
 
-            // ── JS-render auto-fallback (Layer d) ─────────────────────────
-            // Before committing the terminal `needs_js`, try to render the page
-            // in the injected offscreen webview and re-extract. The fallback is
-            // gated by the `js_render_enabled` opt-out (Layer e) and requires an
-            // injected renderer; both false-arms preserve the existing needs_js
-            // behavior EXACTLY (graceful — production always injects, but a
-            // headless lens-core test may not, and the user may opt out).
-            let js_render_enabled = engine.config().await.js_render_enabled;
-            let renderer = if js_render_enabled {
-                engine.js_renderer().await
-            } else {
-                None
+        tracing::info!(
+            source_id,
+            text_len,
+            raw_len,
+            ratio,
+            force_js_render,
+            "URL source needs JS render (forced or near-empty extraction); attempting JS-render fallback"
+        );
+
+        // ── JS-render auto-fallback (Layer d) ─────────────────────────────
+        // Before committing the terminal `needs_js`, try to render the page in the
+        // injected offscreen webview and re-extract. The fallback is gated by the
+        // `js_render_enabled` opt-out (Layer e) and requires an injected renderer;
+        // both false-arms preserve the existing needs_js behavior EXACTLY
+        // (graceful — production always injects, but a headless lens-core test may
+        // not, and the user may opt out).
+        let js_render_enabled = engine.config().await.js_render_enabled;
+        let renderer = if js_render_enabled {
+            engine.js_renderer().await
+        } else {
+            None
+        };
+
+        if let Some(renderer) = renderer {
+            let span = tracing::info_span!("js_render", source_id, url = %source.locator);
+            let started = std::time::Instant::now();
+            // The render call is the ONE outcome-bearing await; run it inside the
+            // span so the elapsed ms + outcome land on one trace event.
+            //
+            // CONTRACT (FIX 2): a render *failure* is TERMINAL `render_failed`, NOT
+            // the transient `error` state. An `Err` from `render_html`
+            // (webview/SSRF/etc.) or from the render-branch `extract` must NOT
+            // propagate up via `?` — that would flip the source to `error`, which
+            // crash-recovery RESETS and retries. Both errors are caught here and
+            // mapped to the `render_failed` terminal path below (same Ok(..)
+            // contract as needs_js/needs_ocr). The STATIC path's extract error
+            // handling is unchanged.
+            let rendered = match renderer
+                .render_html(&source.locator)
+                .instrument(span.clone())
+                .await
+            {
+                Ok(rendered) => rendered,
+                Err(e) => {
+                    let _guard = span.enter();
+                    tracing::warn!(
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        outcome = "render_failed",
+                        error = %e,
+                        "js_render fallback errored; setting render_failed"
+                    );
+                    drop(_guard);
+                    self.set_terminal_pending(
+                        crate::notebooks::SourceStatus::RenderFailed.as_str(),
+                    )
+                    .await?;
+                    return Ok(JsRenderOutcome::Handled);
+                }
             };
 
-            if let Some(renderer) = renderer {
-                let span = tracing::info_span!("js_render", source_id, url = %source.locator);
-                let started = std::time::Instant::now();
-                // The render call is the ONE outcome-bearing await; run it inside
-                // the span so the elapsed ms + outcome land on one trace event.
-                //
-                // CONTRACT (FIX 2): a render *failure* is TERMINAL `render_failed`,
-                // NOT the transient `error` state. An `Err` from `render_html`
-                // (webview/SSRF/etc.) or from the render-branch `extract` must NOT
-                // propagate up via `?` — that would flip the source to `error`,
-                // which crash-recovery RESETS and retries. Both errors are caught
-                // here and mapped to the `render_failed` terminal path below (same
-                // Ok(())-contract as needs_js/needs_ocr). The STATIC path's extract
-                // error handling is unchanged.
-                let rendered = match renderer
-                    .render_html(&source.locator)
-                    .instrument(span.clone())
-                    .await
+            // Feed the rendered HTML through the SAME extractor the static path
+            // uses (M3: one pipeline, no parallel path). The content oracle applies
+            // ONLY the char floor (`NEEDS_JS_MIN_CHARS`), on the extracted-text
+            // BYTE length (`out.extracted_text.len()`), matching the static gate's
+            // `text_len`. The static ratio arm is intentionally NOT reused: its
+            // denominator is the fetched raw HTML bytes, which have no faithful
+            // analogue for a JS-rendered SPA whose `outerHTML` is dominated by
+            // framework markup — reusing it would re-introduce an `innerText`
+            // capture M3 deliberately dropped, for marginal value (the char floor
+            // already rejects blank/spinner pages). See plan Layer (d) step 11
+            // (M2 oracle).
+            if let Some(html) = rendered {
+                // A render-branch extract failure is ALSO a render failure (FIX 2):
+                // catch it and map to render_failed rather than letting `?` flip the
+                // source to `error`.
+                let rendered_out = match crate::extract::url::UrlExtractor.extract(html.as_bytes())
                 {
-                    Ok(rendered) => rendered,
+                    Ok(o) => o,
                     Err(e) => {
                         let _guard = span.enter();
                         tracing::warn!(
                             elapsed_ms = started.elapsed().as_millis() as u64,
                             outcome = "render_failed",
                             error = %e,
-                            "js_render fallback errored; setting render_failed"
+                            "render-branch extract errored; setting render_failed"
                         );
                         drop(_guard);
-                        set_terminal_pending(
-                            &repo,
-                            &pool,
-                            &data_dir,
-                            &source.notebook_id,
-                            source_id,
+                        self.set_terminal_pending(
                             crate::notebooks::SourceStatus::RenderFailed.as_str(),
                         )
                         .await?;
-                        return Ok(());
+                        return Ok(JsRenderOutcome::Handled);
                     }
                 };
-
-                // Feed the rendered HTML through the SAME extractor the static
-                // path uses (M3: one pipeline, no parallel path). The content
-                // oracle applies ONLY the char floor (`NEEDS_JS_MIN_CHARS`), on
-                // the extracted-text BYTE length (`out.extracted_text.len()`),
-                // matching the static gate's `text_len`. The static ratio arm is
-                // intentionally NOT reused: its denominator is the fetched raw
-                // HTML bytes, which have no faithful analogue for a JS-rendered
-                // SPA whose `outerHTML` is dominated by framework markup — reusing
-                // it would re-introduce an `innerText` capture M3 deliberately
-                // dropped, for marginal value (the char floor already rejects
-                // blank/spinner pages). See plan Layer (d) step 11 (M2 oracle).
-                let indexed = if let Some(html) = rendered {
-                    // A render-branch extract failure is ALSO a render failure
-                    // (FIX 2): catch it and map to render_failed rather than
-                    // letting `?` flip the source to `error`.
-                    let rendered_out =
-                        match crate::extract::url::UrlExtractor.extract(html.as_bytes()) {
-                            Ok(o) => o,
-                            Err(e) => {
-                                let _guard = span.enter();
-                                tracing::warn!(
-                                    elapsed_ms = started.elapsed().as_millis() as u64,
-                                    outcome = "render_failed",
-                                    error = %e,
-                                    "render-branch extract errored; setting render_failed"
-                                );
-                                drop(_guard);
-                                set_terminal_pending(
-                                    &repo,
-                                    &pool,
-                                    &data_dir,
-                                    &source.notebook_id,
-                                    source_id,
-                                    crate::notebooks::SourceStatus::RenderFailed.as_str(),
-                                )
-                                .await?;
-                                return Ok(());
-                            }
-                        };
-                    if rendered_out.extracted_text.len() >= NEEDS_JS_MIN_CHARS {
-                        let _guard = span.enter();
-                        tracing::info!(
-                            elapsed_ms = started.elapsed().as_millis() as u64,
-                            outcome = "indexed",
-                            "js_render fallback cleared the content oracle; indexing rendered DOM"
-                        );
-                        drop(_guard);
-                        // Rendered content clears the oracle → run the SAME
-                        // downstream tail as the static branch. The ORIGINAL
-                        // fetched `raw` (JS-shell bytes) remains the derived
-                        // content-hash identity (what the source fetched), so
-                        // re-ingest determinism is unchanged.
-                        index_extract_output(
-                            engine,
-                            &repo,
-                            &pool,
-                            &data_dir,
-                            source_id,
-                            &source,
-                            status,
-                            is_pdf,
-                            text_like,
-                            max_source_bytes,
-                            &raw,
-                            rendered_out,
-                            &mut on_progress,
-                        )
+                if rendered_out.extracted_text.len() >= NEEDS_JS_MIN_CHARS {
+                    let _guard = span.enter();
+                    tracing::info!(
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        outcome = "indexed",
+                        "js_render fallback cleared the content oracle; indexing rendered DOM"
+                    );
+                    drop(_guard);
+                    // Rendered content clears the oracle → run the SAME downstream
+                    // tail as the static branch. The ORIGINAL fetched `raw`
+                    // (JS-shell bytes) remains the derived content-hash identity
+                    // (what the source fetched), so re-ingest determinism is
+                    // unchanged.
+                    self.index_extract_output(raw, rendered_out, on_progress)
                         .await?;
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-
-                if indexed {
-                    // The shared tail already flipped the source to `Indexed`.
-                    return Ok(());
+                    return Ok(JsRenderOutcome::Handled);
                 }
-
-                // Fails oracle / None / (provenance already discarded in the
-                // renderer, which returns None for a blocked final host) ⇒
-                // terminal `render_failed`. Return Ok so the Err→error flip in
-                // `ingest_source` never fires (same contract as needs_js/needs_ocr).
-                let _guard = span.enter();
-                tracing::info!(
-                    elapsed_ms = started.elapsed().as_millis() as u64,
-                    outcome = "render_failed",
-                    "js_render fallback did not produce indexable content; setting render_failed"
-                );
-                drop(_guard);
-                set_terminal_pending(
-                    &repo,
-                    &pool,
-                    &data_dir,
-                    &source.notebook_id,
-                    source_id,
-                    crate::notebooks::SourceStatus::RenderFailed.as_str(),
-                )
-                .await?;
-                return Ok(());
             }
 
-            // Opt-out (js_render_enabled=false) or no renderer injected ⇒
-            // graceful, unchanged needs_js path.
+            // Fails oracle / None / (provenance already discarded in the renderer,
+            // which returns None for a blocked final host) ⇒ terminal
+            // `render_failed`. Return Ok so the Err→error flip in `ingest_source`
+            // never fires (same contract as needs_js/needs_ocr).
+            let _guard = span.enter();
             tracing::info!(
-                source_id,
-                outcome = if js_render_enabled {
-                    "needs_js"
-                } else {
-                    "opt_out"
-                },
-                "no JS-render fallback available; setting needs_js"
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                outcome = "render_failed",
+                "js_render fallback did not produce indexable content; setting render_failed"
             );
-            set_terminal_pending(
-                &repo,
-                &pool,
-                &data_dir,
-                &source.notebook_id,
-                source_id,
-                crate::notebooks::SourceStatus::NeedsJs.as_str(),
-            )
-            .await?;
-            // Return Ok so the Err→error flip in ingest_source never fires.
-            return Ok(());
+            drop(_guard);
+            self.set_terminal_pending(crate::notebooks::SourceStatus::RenderFailed.as_str())
+                .await?;
+            return Ok(JsRenderOutcome::Handled);
         }
+
+        // Opt-out (js_render_enabled=false) or no renderer injected ⇒ graceful,
+        // unchanged needs_js path.
+        tracing::info!(
+            source_id,
+            outcome = if js_render_enabled {
+                "needs_js"
+            } else {
+                "opt_out"
+            },
+            "no JS-render fallback available; setting needs_js"
+        );
+        self.set_terminal_pending(crate::notebooks::SourceStatus::NeedsJs.as_str())
+            .await?;
+        Ok(JsRenderOutcome::Handled)
     }
 
-    // ── ExtractOutput → chunk → embed → index (shared tail) ───────────────
-    // Both the static path (here) and the JS-render fallback (above) converge
-    // on ONE downstream pipeline (Principle 1 — no parallel path). The helper
-    // owns the Stage-2 guard, canonical-buffer persist, content hash, chunk,
-    // embed, index and the terminal `Indexed` flip.
-    index_extract_output(
-        engine,
-        &repo,
-        &pool,
-        &data_dir,
-        source_id,
-        &source,
-        status,
-        is_pdf,
-        text_like,
-        max_source_bytes,
-        &raw,
-        out,
-        &mut on_progress,
-    )
-    .await
-}
+    /// Shared downstream tail: takes a computed [`ExtractOutput`] all the way to a
+    /// terminal `Indexed` source (Stage-2 guard → canonical-buffer persist →
+    /// content hash → chunk → embed → index).
+    ///
+    /// SINGLE code path for both the static extraction branch and the JS-render
+    /// fallback branch of [`run_ingest`] (Principle 1 — no parallel pipeline). The
+    /// render fallback passes the ORIGINAL fetched `raw` (the JS-shell bytes) as the
+    /// derived-kind content-hash identity — the source's identity is what it fetched,
+    /// not the rendered DOM — so re-ingest determinism is preserved unchanged.
+    async fn index_extract_output(
+        &self,
+        raw: &[u8],
+        out: crate::extract::ExtractOutput,
+        on_progress: &mut impl FnMut(IngestProgress),
+    ) -> Result<(), LensError> {
+        // Destructure the context back into the local bindings the body below uses,
+        // so the pipeline logic reads exactly as it did when these were positional
+        // parameters. Every field is `Copy`, so this is zero-cost.
+        let &IngestContext {
+            engine,
+            pool,
+            data_dir,
+            source_id,
+            source,
+            status,
+            is_pdf,
+            text_like,
+            max_source_bytes,
+        } = self;
+        // Owned wrapper (a stateless `&pool` handle); the body only calls methods
+        // on it, so no separate reborrow is needed.
+        let repo = self.repo();
+        // ── Stage-2 size guard (the check on the canonical buffer; PDF exempt) ─
+        // For text/MD this is the single guard. PDF is EXEMPT (issue #71): its
+        // extracted text can legitimately be large (a 1225-page handbook), and its
+        // vectors stream into a building table rather than accumulating in one Vec.
+        if !is_pdf && out.extracted_text.len() > max_source_bytes {
+            return Err(LensError::Validation(format!(
+                "source is {} bytes, exceeding the {max_source_bytes}-byte ingest limit",
+                out.extracted_text.len()
+            )));
+        }
 
-/// Shared downstream tail: takes a computed [`ExtractOutput`] all the way to a
-/// terminal `Indexed` source (Stage-2 guard → canonical-buffer persist →
-/// content hash → chunk → embed → index).
-///
-/// SINGLE code path for both the static extraction branch and the JS-render
-/// fallback branch of [`run_ingest`] (Principle 1 — no parallel pipeline). The
-/// render fallback passes the ORIGINAL fetched `raw` (the JS-shell bytes) as the
-/// derived-kind content-hash identity — the source's identity is what it fetched,
-/// not the rendered DOM — so re-ingest determinism is preserved unchanged.
-#[allow(clippy::too_many_arguments)]
-async fn index_extract_output(
-    engine: &LensEngine,
-    repo: &crate::notebooks::NotebookRepo<'_>,
-    pool: &sqlx::SqlitePool,
-    data_dir: &Path,
-    source_id: &str,
-    source: &crate::notebooks::Source,
-    status: crate::notebooks::SourceStatus,
-    is_pdf: bool,
-    text_like: bool,
-    max_source_bytes: usize,
-    raw: &[u8],
-    out: crate::extract::ExtractOutput,
-    on_progress: &mut impl FnMut(IngestProgress),
-) -> Result<(), LensError> {
-    // ── Stage-2 size guard (the check on the canonical buffer; PDF exempt) ─
-    // For text/MD this is the single guard. PDF is EXEMPT (issue #71): its
-    // extracted text can legitimately be large (a 1225-page handbook), and its
-    // vectors stream into a building table rather than accumulating in one Vec.
-    if !is_pdf && out.extracted_text.len() > max_source_bytes {
-        return Err(LensError::Validation(format!(
-            "source is {} bytes, exceeding the {max_source_bytes}-byte ingest limit",
-            out.extracted_text.len()
-        )));
-    }
+        // ── Persist the canonical buffer + bind ONE `canonical: &str` ─────────
+        // For DERIVED kinds, write `extracted_text` to the sibling
+        // `{data_dir}/sources/{source_id}.extracted.txt` (reusing the
+        // `add_text_source` write pattern) and chunk THAT persisted buffer. For
+        // text/MD the original locator content IS canonical (Decision A1) — no
+        // sibling. The SAME `canonical` binding feeds both `chunk_blocks` and the
+        // content hash, with no second disk read between them.
+        if !text_like {
+            let sources_dir = data_dir.join("sources");
+            tokio::fs::create_dir_all(&sources_dir)
+                .await
+                .map_err(|e| LensError::Io(format!("{}: {e}", sources_dir.display())))?;
+            // SAME path builder the purge path uses (`extracted_sibling_path`), so
+            // the write site and the cleanup site can never diverge. Async write so
+            // persisting a large extracted buffer never blocks the tokio worker.
+            let sibling = extracted_sibling_path(data_dir, source_id);
+            tokio::fs::write(&sibling, &out.extracted_text)
+                .await
+                .map_err(|e| LensError::Io(format!("{}: {e}", sibling.display())))?;
+        }
 
-    // ── Persist the canonical buffer + bind ONE `canonical: &str` ─────────
-    // For DERIVED kinds, write `extracted_text` to the sibling
-    // `{data_dir}/sources/{source_id}.extracted.txt` (reusing the
-    // `add_text_source` write pattern) and chunk THAT persisted buffer. For
-    // text/MD the original locator content IS canonical (Decision A1) — no
-    // sibling. The SAME `canonical` binding feeds both `chunk_blocks` and the
-    // content hash, with no second disk read between them.
-    if !text_like {
-        let sources_dir = data_dir.join("sources");
-        tokio::fs::create_dir_all(&sources_dir)
-            .await
-            .map_err(|e| LensError::Io(format!("{}: {e}", sources_dir.display())))?;
-        // SAME path builder the purge path uses (`extracted_sibling_path`), so
-        // the write site and the cleanup site can never diverge. Async write so
-        // persisting a large extracted buffer never blocks the tokio worker.
-        let sibling = extracted_sibling_path(data_dir, source_id);
-        tokio::fs::write(&sibling, &out.extracted_text)
-            .await
-            .map_err(|e| LensError::Io(format!("{}: {e}", sibling.display())))?;
-    }
+        // For TABULAR kinds (xlsx/xls/csv), persist the `table_markdown` sibling
+        // (rendered DURING extraction — no second parse). It is NEVER embedded and
+        // NEVER part of the canonical buffer; it exists only for future display. The
+        // sources dir was created above for the derived-kind `.extracted.txt` write
+        // (tabular kinds are derived), so it already exists. Same shared path builder
+        // the purge site uses, so write and cleanup can never diverge (issue #76).
+        if let Some(ref md) = out.table_markdown {
+            let tables_path = tables_sibling_path(data_dir, source_id);
+            tokio::fs::write(&tables_path, md)
+                .await
+                .map_err(|e| LensError::Io(format!("{}: {e}", tables_path.display())))?;
+        }
 
-    // For TABULAR kinds (xlsx/xls/csv), persist the `table_markdown` sibling
-    // (rendered DURING extraction — no second parse). It is NEVER embedded and
-    // NEVER part of the canonical buffer; it exists only for future display. The
-    // sources dir was created above for the derived-kind `.extracted.txt` write
-    // (tabular kinds are derived), so it already exists. Same shared path builder
-    // the purge site uses, so write and cleanup can never diverge (issue #76).
-    if let Some(ref md) = out.table_markdown {
-        let tables_path = tables_sibling_path(data_dir, source_id);
-        tokio::fs::write(&tables_path, md)
-            .await
-            .map_err(|e| LensError::Io(format!("{}: {e}", tables_path.display())))?;
-    }
+        let canonical: &str = &out.extracted_text;
 
-    let canonical: &str = &out.extracted_text;
+        // ── Content hash (hash split) + text/MD no-op short-circuit ───────────
+        // DERIVED kinds reuse the raw-bytes hash already checked above; text/MD hash
+        // the canonical text as in Phase 1. The text/MD short-circuit lives here
+        // (text/MD extraction is cheap + deterministic, so running it first is fine).
+        let content_hash = if text_like {
+            let h = sha256_hex(canonical.as_bytes());
+            if status == crate::notebooks::SourceStatus::Indexed
+                && source.content_hash.as_deref() == Some(h.as_str())
+            {
+                tracing::info!(
+                    source_id,
+                    "source already indexed with unchanged content; no-op"
+                );
+                on_progress(IngestProgress::new(ingest_phase::DONE, 1, Some(1)));
+                return Ok(());
+            }
+            h
+        } else {
+            sha256_hex(raw)
+        };
 
-    // ── Content hash (hash split) + text/MD no-op short-circuit ───────────
-    // DERIVED kinds reuse the raw-bytes hash already checked above; text/MD hash
-    // the canonical text as in Phase 1. The text/MD short-circuit lives here
-    // (text/MD extraction is cheap + deterministic, so running it first is fine).
-    let content_hash = if text_like {
-        let h = sha256_hex(canonical.as_bytes());
-        if status == crate::notebooks::SourceStatus::Indexed
-            && source.content_hash.as_deref() == Some(h.as_str())
+        // ── Construct the vector store (per-ingest; cheap embedded connection) ─
+        let store = LanceVectorStore::new(data_dir, pool.clone());
+        let notebook = source.notebook_id.clone();
+        // Resolve the OWNING notebook's embedding coordinate (R1) ONCE, here at the
+        // boundary: every drop/add/embed below threads this per-notebook model+dim
+        // instead of the global default, so a notebook configured with a non-nomic
+        // model is indexed under its own coordinate.
+        let (embed_model, embed_dim, embed_backend) = engine
+            .resolve_notebook_embedding(&crate::NotebookId::from(notebook.clone()))
+            .await?;
+        // The full backend-aware coordinate (M4 Phase 4b-B) threaded into every
+        // drop/add below so the source is indexed under its notebook's own backend.
+        let coord = crate::vector_store::Coordinate::new(
+            notebook.clone(),
+            embed_backend,
+            embed_model.clone(),
+            embed_dim,
+        );
+
+        // ── PARSE ─────────────────────────────────────────────────────────────
         {
-            tracing::info!(
-                source_id,
-                "source already indexed with unchanged content; no-op"
-            );
+            // INVARIANT (load-bearing): status MUST move to a transient state
+            // (`parsing`) BEFORE the cross-store wipe below, so that if the process
+            // crashes mid-wipe the startup crash-recovery reset (`lib.rs init`, which
+            // flips lingering `parsing`/`embedding` rows → `error`) can reclaim the
+            // half-wiped source on next launch. Wiping while still `indexed` would
+            // leave a row that looks complete but has lost its vectors.
+            repo.update_source_status(source_id, crate::notebooks::SourceStatus::Parsing.as_str())
+                .await?;
+        }
+        on_progress(IngestProgress::new(ingest_phase::PARSING, 0, Some(1)));
+        // Blocks come straight from the extractor (`out.blocks`); their
+        // `char_start/char_end` index into `canonical` (== `out.extracted_text`).
+        let blocks = &out.blocks;
+        on_progress(IngestProgress::new(ingest_phase::PARSING, 1, Some(1)));
+
+        // ── CHUNK ─────────────────────────────────────────────────────────────
+        on_progress(IngestProgress::new(ingest_phase::CHUNKING, 0, None));
+        // Emit a `model_download` event up front only when the tokenizer is not yet
+        // cached on disk (a cold-cache fetch is about to happen); the engine then
+        // resolves + caches the multi-MB tokenizer once and reuses it across ingests.
+        maybe_emit_tokenizer_download(data_dir, on_progress);
+        let tokenizer = engine.tokenizer().await?;
+        let mut chunks = chunk_blocks(canonical, blocks, &tokenizer)?;
+        let total_tokens: i64 = chunks
+            .iter()
+            .filter(|c| c.level == 0)
+            .map(|c| c.token_end - c.token_start)
+            .sum();
+
+        // ── Attach SourceAnchor JSON to each chunk (AC5) ──────────────────────
+        // After chunking, align each chunk to its source block by char offset:
+        // the block whose range contains `chunk.char_start` is the "first block"
+        // of that chunk — exactly the same dominance rule used for `block_type` and
+        // `section_path`. For parents this is the first block of the window; for
+        // children this is the block the child sub-span was split from.
+        //
+        // Mapping approach: linear scan over `out.anchors` (index-aligned with
+        // `out.blocks`). The scan is O(blocks * chunks) but blocks are usually
+        // O(tens-to-hundreds) and chunking already did O(blocks * tokens) work,
+        // so this is not on the hot path.
+        attach_anchors_to_chunks(&mut chunks, blocks, &out.anchors);
+
+        on_progress(IngestProgress::new(
+            ingest_phase::CHUNKING,
+            chunks.len() as u64,
+            Some(chunks.len() as u64),
+        ));
+
+        // ── Cross-store wipe (G5: Lance vectors FIRST, then SQLite chunks) ────
+        // This handles both a content change on an indexed source and a self-heal
+        // retry of a source left non-`indexed` by a crashed prior run.
+        //
+        // The Lance `drop_source` runs BEFORE the SQLite transaction (G5 ordering:
+        // Lance first, so a completed wipe never leaves orphan Lance rows). The
+        // SQLite chunk delete + insert then run inside ONE transaction so a crash
+        // mid-insert can never leave a half-written set of chunk rows: the tx either
+        // commits the full fresh set or rolls back to the prior state.
+        store.drop_source(&coord, source_id).await?;
+
+        let mut tx = pool.begin().await?;
+        delete_chunks_for_source(&mut tx, source_id).await?;
+        insert_chunks(&mut tx, source_id, &chunks).await?;
+        tx.commit().await?;
+        // NOTE: `&mut tx` coerces to `&mut SqliteConnection` via `Transaction`'s
+        // `DerefMut`; the helpers take `&mut SqliteConnection` so they run inside
+        // this transaction rather than against the pool directly.
+
+        // ── Reset enrichment on content change (AC12) ─────────────────────────
+        // Reaching here means the content changed (the unchanged-content paths above
+        // returned early): the chunks + vectors were just re-written, so any prior
+        // enrichment (`chunks.enrichment`, `embedding_text`, the cache key in
+        // `enrichment_meta`) is now stale. Reset `enrichment_status` to `none` so the
+        // post-`Indexed` enqueue (issued OUTSIDE the held permit by `ingest_source`)
+        // re-runs the pass. This UPDATE runs UNDER the held `ingest_lock` permit (we
+        // are inside `run_ingest`), distinct from the non-blocking enqueue.
+        repo.update_enrichment_status(source_id, crate::notebooks::EnrichmentStatus::None)
+            .await?;
+
+        // ── Empty-doc short-circuit ───────────────────────────────────────────
+        // An empty/whitespace-only source produces zero chunks. There is nothing to
+        // embed, so skip the embedder load entirely: loading it would force the
+        // ~130 MB model download/init just to embed nothing, and a download failure
+        // would flip a trivially-indexable empty source to `error`. The cross-store
+        // wipe above already cleared any prior chunks/vectors, so this finalizes the
+        // source as an empty-but-indexed row (token_count 0) and emits `done`.
+        if chunks.is_empty() {
+            repo.update_source_metadata(source_id, 0, &content_hash)
+                .await?;
+            repo.update_source_status(source_id, crate::notebooks::SourceStatus::Indexed.as_str())
+                .await?;
             on_progress(IngestProgress::new(ingest_phase::DONE, 1, Some(1)));
             return Ok(());
         }
-        h
-    } else {
-        sha256_hex(raw)
-    };
 
-    // ── Construct the vector store (per-ingest; cheap embedded connection) ─
-    let store = LanceVectorStore::new(data_dir, pool.clone());
-    let notebook = source.notebook_id.clone();
-    // Resolve the OWNING notebook's embedding coordinate (R1) ONCE, here at the
-    // boundary: every drop/add/embed below threads this per-notebook model+dim
-    // instead of the global default, so a notebook configured with a non-nomic
-    // model is indexed under its own coordinate.
-    let (embed_model, embed_dim, embed_backend) = engine
-        .resolve_notebook_embedding(&crate::NotebookId::from(notebook.clone()))
-        .await?;
-    // The full backend-aware coordinate (M4 Phase 4b-B) threaded into every
-    // drop/add below so the source is indexed under its notebook's own backend.
-    let coord = crate::vector_store::Coordinate::new(
-        notebook.clone(),
-        embed_backend,
-        embed_model.clone(),
-        embed_dim,
-    );
-
-    // ── PARSE ─────────────────────────────────────────────────────────────
-    {
-        // INVARIANT (load-bearing): status MUST move to a transient state
-        // (`parsing`) BEFORE the cross-store wipe below, so that if the process
-        // crashes mid-wipe the startup crash-recovery reset (`lib.rs init`, which
-        // flips lingering `parsing`/`embedding` rows → `error`) can reclaim the
-        // half-wiped source on next launch. Wiping while still `indexed` would
-        // leave a row that looks complete but has lost its vectors.
-        repo.update_source_status(source_id, crate::notebooks::SourceStatus::Parsing.as_str())
-            .await?;
-    }
-    on_progress(IngestProgress::new(ingest_phase::PARSING, 0, Some(1)));
-    // Blocks come straight from the extractor (`out.blocks`); their
-    // `char_start/char_end` index into `canonical` (== `out.extracted_text`).
-    let blocks = &out.blocks;
-    on_progress(IngestProgress::new(ingest_phase::PARSING, 1, Some(1)));
-
-    // ── CHUNK ─────────────────────────────────────────────────────────────
-    on_progress(IngestProgress::new(ingest_phase::CHUNKING, 0, None));
-    // Emit a `model_download` event up front only when the tokenizer is not yet
-    // cached on disk (a cold-cache fetch is about to happen); the engine then
-    // resolves + caches the multi-MB tokenizer once and reuses it across ingests.
-    maybe_emit_tokenizer_download(data_dir, on_progress);
-    let tokenizer = engine.tokenizer().await?;
-    let mut chunks = chunk_blocks(canonical, blocks, &tokenizer)?;
-    let total_tokens: i64 = chunks
-        .iter()
-        .filter(|c| c.level == 0)
-        .map(|c| c.token_end - c.token_start)
-        .sum();
-
-    // ── Attach SourceAnchor JSON to each chunk (AC5) ──────────────────────
-    // After chunking, align each chunk to its source block by char offset:
-    // the block whose range contains `chunk.char_start` is the "first block"
-    // of that chunk — exactly the same dominance rule used for `block_type` and
-    // `section_path`. For parents this is the first block of the window; for
-    // children this is the block the child sub-span was split from.
-    //
-    // Mapping approach: linear scan over `out.anchors` (index-aligned with
-    // `out.blocks`). The scan is O(blocks * chunks) but blocks are usually
-    // O(tens-to-hundreds) and chunking already did O(blocks * tokens) work,
-    // so this is not on the hot path.
-    attach_anchors_to_chunks(&mut chunks, blocks, &out.anchors);
-
-    on_progress(IngestProgress::new(
-        ingest_phase::CHUNKING,
-        chunks.len() as u64,
-        Some(chunks.len() as u64),
-    ));
-
-    // ── Cross-store wipe (G5: Lance vectors FIRST, then SQLite chunks) ────
-    // This handles both a content change on an indexed source and a self-heal
-    // retry of a source left non-`indexed` by a crashed prior run.
-    //
-    // The Lance `drop_source` runs BEFORE the SQLite transaction (G5 ordering:
-    // Lance first, so a completed wipe never leaves orphan Lance rows). The
-    // SQLite chunk delete + insert then run inside ONE transaction so a crash
-    // mid-insert can never leave a half-written set of chunk rows: the tx either
-    // commits the full fresh set or rolls back to the prior state.
-    store.drop_source(&coord, source_id).await?;
-
-    let mut tx = pool.begin().await?;
-    delete_chunks_for_source(&mut tx, source_id).await?;
-    insert_chunks(&mut tx, source_id, &chunks).await?;
-    tx.commit().await?;
-    // NOTE: `&mut tx` coerces to `&mut SqliteConnection` via `Transaction`'s
-    // `DerefMut`; the helpers take `&mut SqliteConnection` so they run inside
-    // this transaction rather than against the pool directly.
-
-    // ── Reset enrichment on content change (AC12) ─────────────────────────
-    // Reaching here means the content changed (the unchanged-content paths above
-    // returned early): the chunks + vectors were just re-written, so any prior
-    // enrichment (`chunks.enrichment`, `embedding_text`, the cache key in
-    // `enrichment_meta`) is now stale. Reset `enrichment_status` to `none` so the
-    // post-`Indexed` enqueue (issued OUTSIDE the held permit by `ingest_source`)
-    // re-runs the pass. This UPDATE runs UNDER the held `ingest_lock` permit (we
-    // are inside `run_ingest`), distinct from the non-blocking enqueue.
-    repo.update_enrichment_status(source_id, crate::notebooks::EnrichmentStatus::None)
+        // ── EMBED ─────────────────────────────────────────────────────────────
+        repo.update_source_status(
+            source_id,
+            crate::notebooks::SourceStatus::Embedding.as_str(),
+        )
         .await?;
 
-    // ── Empty-doc short-circuit ───────────────────────────────────────────
-    // An empty/whitespace-only source produces zero chunks. There is nothing to
-    // embed, so skip the embedder load entirely: loading it would force the
-    // ~130 MB model download/init just to embed nothing, and a download failure
-    // would flip a trivially-indexable empty source to `error`. The cross-store
-    // wipe above already cleared any prior chunks/vectors, so this finalizes the
-    // source as an empty-but-indexed row (token_count 0) and emits `done`.
-    if chunks.is_empty() {
-        repo.update_source_metadata(source_id, 0, &content_hash)
+        // Lazily get the cached embedder. Emit a `model_download` phase BEFORE the
+        // first construction so a cold-cache download surfaces in the UI.
+        on_progress(IngestProgress::new(ingest_phase::MODEL_DOWNLOAD, 0, None));
+        let embedder = engine.embedder_for(&embed_model, embed_backend).await?;
+        on_progress(IngestProgress::new(
+            ingest_phase::MODEL_DOWNLOAD,
+            1,
+            Some(1),
+        ));
+
+        // Embed every chunk (parents AND children) in batches under spawn_blocking.
+        let total = chunks.len() as u64;
+        on_progress(IngestProgress::new(ingest_phase::EMBEDDING, 0, Some(total)));
+
+        if is_pdf {
+            // ── PDF: bounded-memory building-table streaming (issue #71) ───────
+            //
+            // The vector accumulation is the largest memory sink (~150-460 MB for a
+            // dense handbook PDF). Instead of accumulating ALL `VectorRow`s in one
+            // `Vec` and writing them in a single `store.add`, stream each EMBED_BATCH's
+            // rows into a gen-suffixed BUILDING table and free them, then flip the
+            // building table to active on completion. This reuses the re-embed
+            // building-table lifecycle and preserves atomicity (the source is never
+            // half-visible to search — `search` resolves `status='active'` only).
+            //
+            // ORDERING (pre-mortem scenario 3): the cross-store wipe at the top of this
+            // function (`store.drop_source` above) already removed this source's OLD
+            // vectors from the ACTIVE table. The sequence below is wipe → SWEEP → CREATE
+            // → SEED → POPULATE → FLIP and MUST be preserved: the seed copies from the
+            // (already-wiped) active table, so it never re-introduces this source's old
+            // vectors, and the streaming loop then adds the fresh ones. No duplicates.
+            //
+            // LOCK SCOPE: the entire `run_ingest` runs under the single-permit
+            // `ingest_lock` (acquired by `ingest_source`), and it is held for the FULL
+            // streaming duration — the wipe-before-seed ordering requires it. The lock
+            // is NOT released during the loop (lock-free ingest populate is a tracked
+            // follow-up). For a large PDF this can hold the permit for 1-2 minutes;
+            // acceptable per spec.
+            let lock_start = std::time::Instant::now();
+
+            // (1) Sweep any orphan building tables from a prior crashed ingest of this
+            //     coordinate (bounds orphan accumulation to one per coordinate).
+            store.sweep_orphan_building_tables(&coord).await?;
+
+            // (2) Create a fresh gen-suffixed building table. For a notebook whose FIRST
+            //     source is a PDF this creates a gen-1 building table (not gen-0 active);
+            //     the flip below promotes it. For a later source it co-exists beside the
+            //     live active table. Both converge on registry-driven resolution.
+            let building_name = store.create_building_table(&coord).await?;
+            tracing::info!(
+                source_id,
+                notebook = %notebook,
+                building = %building_name,
+                "streaming PDF ingest: created building table"
+            );
+
+            // (3) Seed the building table with every OTHER source's vectors copied from
+            //     the active table, so the flip (which promotes the building table to be
+            //     the notebook's WHOLE active table) preserves them. A NO-OP when there
+            //     is no active table yet (first-source-is-PDF) — `seed_building_from_active`
+            //     returns `Ok(())` early in that case.
+            store
+                .seed_building_from_active(&coord, &building_name, source_id)
+                .await?;
+
+            // (4) Stream: embed each EMBED_BATCH, insert its rows into the building table
+            //     WITHOUT building the index per batch, then drop the rows (memory freed).
+            let mut embedded: u64 = 0;
+            for batch in chunks.chunks(EMBED_BATCH) {
+                let rows = embed_batch_to_rows(batch, &embedder, source_id, &notebook).await?;
+                let inserted = rows.len();
+                store
+                    .add_to_table_no_index(&building_name, rows, embed_dim)
+                    .await?;
+                // `rows` was moved into `add_to_table_no_index` and dropped there — the
+                // batch's vectors are freed before the next batch is embedded.
+                tracing::info!(
+                    source_id,
+                    building = %building_name,
+                    inserted,
+                    "streaming PDF ingest: inserted batch into building table"
+                );
+
+                // Crash seam (issue #71, Step 5): after at least one batch has landed in
+                // the building table but BEFORE the flip, simulate a process crash.
+                #[cfg(feature = "test-util")]
+                if crate::vector_store::CRASH_AFTER_STREAMING_ADD_BEFORE_FLIP
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err(LensError::Internal(
+                        "CRASH_AFTER_STREAMING_ADD_BEFORE_FLIP (test-only crash injection)"
+                            .to_string(),
+                    ));
+                }
+
+                embedded += batch.len() as u64;
+                on_progress(IngestProgress::new(
+                    ingest_phase::EMBEDDING,
+                    embedded,
+                    Some(total),
+                ));
+            }
+
+            // ── INDEX ─────────────────────────────────────────────────────────
+            // (5) Build the ANN index ONCE over the complete building table, then
+            //     (6) atomically flip building → active.
+            on_progress(IngestProgress::new(ingest_phase::INDEXING, 0, Some(1)));
+            store
+                .build_index_on_table(&building_name, embed_dim)
+                .await?;
+            store.flip_active(&coord, &building_name).await?;
+            tracing::info!(
+                source_id,
+                notebook = %notebook,
+                building = %building_name,
+                lock_hold_ms = lock_start.elapsed().as_millis() as u64,
+                "streaming PDF ingest: built index + flipped building → active"
+            );
+            on_progress(IngestProgress::new(ingest_phase::INDEXING, 1, Some(1)));
+        } else {
+            // ── Non-PDF: existing single-shot accumulate + `store.add` path ────
+            // Non-PDF sources are realistically small (the configurable cap bounds
+            // them), so the whole-document `Vec<VectorRow>` accumulation is unchanged.
+            let mut rows: Vec<VectorRow> = Vec::with_capacity(chunks.len());
+            let mut embedded: u64 = 0;
+            for batch in chunks.chunks(EMBED_BATCH) {
+                let mut batch_rows =
+                    embed_batch_to_rows(batch, &embedder, source_id, &notebook).await?;
+                rows.append(&mut batch_rows);
+                embedded += batch.len() as u64;
+                on_progress(IngestProgress::new(
+                    ingest_phase::EMBEDDING,
+                    embedded,
+                    Some(total),
+                ));
+            }
+
+            // ── INDEX ───────────────────────────────────────────────────────────
+            on_progress(IngestProgress::new(ingest_phase::INDEXING, 0, Some(1)));
+            store.add(&coord, rows).await?;
+            on_progress(IngestProgress::new(ingest_phase::INDEXING, 1, Some(1)));
+        }
+
+        // ── Finalize: metadata + indexed status ──────────────────────────────
+        repo.update_source_metadata(source_id, total_tokens, &content_hash)
             .await?;
         repo.update_source_status(source_id, crate::notebooks::SourceStatus::Indexed.as_str())
             .await?;
         on_progress(IngestProgress::new(ingest_phase::DONE, 1, Some(1)));
-        return Ok(());
+        Ok(())
     }
-
-    // ── EMBED ─────────────────────────────────────────────────────────────
-    repo.update_source_status(
-        source_id,
-        crate::notebooks::SourceStatus::Embedding.as_str(),
-    )
-    .await?;
-
-    // Lazily get the cached embedder. Emit a `model_download` phase BEFORE the
-    // first construction so a cold-cache download surfaces in the UI.
-    on_progress(IngestProgress::new(ingest_phase::MODEL_DOWNLOAD, 0, None));
-    let embedder = engine.embedder_for(&embed_model, embed_backend).await?;
-    on_progress(IngestProgress::new(
-        ingest_phase::MODEL_DOWNLOAD,
-        1,
-        Some(1),
-    ));
-
-    // Embed every chunk (parents AND children) in batches under spawn_blocking.
-    let total = chunks.len() as u64;
-    on_progress(IngestProgress::new(ingest_phase::EMBEDDING, 0, Some(total)));
-
-    if is_pdf {
-        // ── PDF: bounded-memory building-table streaming (issue #71) ───────
-        //
-        // The vector accumulation is the largest memory sink (~150-460 MB for a
-        // dense handbook PDF). Instead of accumulating ALL `VectorRow`s in one
-        // `Vec` and writing them in a single `store.add`, stream each EMBED_BATCH's
-        // rows into a gen-suffixed BUILDING table and free them, then flip the
-        // building table to active on completion. This reuses the re-embed
-        // building-table lifecycle and preserves atomicity (the source is never
-        // half-visible to search — `search` resolves `status='active'` only).
-        //
-        // ORDERING (pre-mortem scenario 3): the cross-store wipe at the top of this
-        // function (`store.drop_source` above) already removed this source's OLD
-        // vectors from the ACTIVE table. The sequence below is wipe → SWEEP → CREATE
-        // → SEED → POPULATE → FLIP and MUST be preserved: the seed copies from the
-        // (already-wiped) active table, so it never re-introduces this source's old
-        // vectors, and the streaming loop then adds the fresh ones. No duplicates.
-        //
-        // LOCK SCOPE: the entire `run_ingest` runs under the single-permit
-        // `ingest_lock` (acquired by `ingest_source`), and it is held for the FULL
-        // streaming duration — the wipe-before-seed ordering requires it. The lock
-        // is NOT released during the loop (lock-free ingest populate is a tracked
-        // follow-up). For a large PDF this can hold the permit for 1-2 minutes;
-        // acceptable per spec.
-        let lock_start = std::time::Instant::now();
-
-        // (1) Sweep any orphan building tables from a prior crashed ingest of this
-        //     coordinate (bounds orphan accumulation to one per coordinate).
-        store.sweep_orphan_building_tables(&coord).await?;
-
-        // (2) Create a fresh gen-suffixed building table. For a notebook whose FIRST
-        //     source is a PDF this creates a gen-1 building table (not gen-0 active);
-        //     the flip below promotes it. For a later source it co-exists beside the
-        //     live active table. Both converge on registry-driven resolution.
-        let building_name = store.create_building_table(&coord).await?;
-        tracing::info!(
-            source_id,
-            notebook = %notebook,
-            building = %building_name,
-            "streaming PDF ingest: created building table"
-        );
-
-        // (3) Seed the building table with every OTHER source's vectors copied from
-        //     the active table, so the flip (which promotes the building table to be
-        //     the notebook's WHOLE active table) preserves them. A NO-OP when there
-        //     is no active table yet (first-source-is-PDF) — `seed_building_from_active`
-        //     returns `Ok(())` early in that case.
-        store
-            .seed_building_from_active(&coord, &building_name, source_id)
-            .await?;
-
-        // (4) Stream: embed each EMBED_BATCH, insert its rows into the building table
-        //     WITHOUT building the index per batch, then drop the rows (memory freed).
-        let mut embedded: u64 = 0;
-        for batch in chunks.chunks(EMBED_BATCH) {
-            let rows = embed_batch_to_rows(batch, &embedder, source_id, &notebook).await?;
-            let inserted = rows.len();
-            store
-                .add_to_table_no_index(&building_name, rows, embed_dim)
-                .await?;
-            // `rows` was moved into `add_to_table_no_index` and dropped there — the
-            // batch's vectors are freed before the next batch is embedded.
-            tracing::info!(
-                source_id,
-                building = %building_name,
-                inserted,
-                "streaming PDF ingest: inserted batch into building table"
-            );
-
-            // Crash seam (issue #71, Step 5): after at least one batch has landed in
-            // the building table but BEFORE the flip, simulate a process crash.
-            #[cfg(feature = "test-util")]
-            if crate::vector_store::CRASH_AFTER_STREAMING_ADD_BEFORE_FLIP
-                .swap(false, std::sync::atomic::Ordering::SeqCst)
-            {
-                return Err(LensError::Internal(
-                    "CRASH_AFTER_STREAMING_ADD_BEFORE_FLIP (test-only crash injection)".to_string(),
-                ));
-            }
-
-            embedded += batch.len() as u64;
-            on_progress(IngestProgress::new(
-                ingest_phase::EMBEDDING,
-                embedded,
-                Some(total),
-            ));
-        }
-
-        // ── INDEX ─────────────────────────────────────────────────────────
-        // (5) Build the ANN index ONCE over the complete building table, then
-        //     (6) atomically flip building → active.
-        on_progress(IngestProgress::new(ingest_phase::INDEXING, 0, Some(1)));
-        store
-            .build_index_on_table(&building_name, embed_dim)
-            .await?;
-        store.flip_active(&coord, &building_name).await?;
-        tracing::info!(
-            source_id,
-            notebook = %notebook,
-            building = %building_name,
-            lock_hold_ms = lock_start.elapsed().as_millis() as u64,
-            "streaming PDF ingest: built index + flipped building → active"
-        );
-        on_progress(IngestProgress::new(ingest_phase::INDEXING, 1, Some(1)));
-    } else {
-        // ── Non-PDF: existing single-shot accumulate + `store.add` path ────
-        // Non-PDF sources are realistically small (the configurable cap bounds
-        // them), so the whole-document `Vec<VectorRow>` accumulation is unchanged.
-        let mut rows: Vec<VectorRow> = Vec::with_capacity(chunks.len());
-        let mut embedded: u64 = 0;
-        for batch in chunks.chunks(EMBED_BATCH) {
-            let mut batch_rows =
-                embed_batch_to_rows(batch, &embedder, source_id, &notebook).await?;
-            rows.append(&mut batch_rows);
-            embedded += batch.len() as u64;
-            on_progress(IngestProgress::new(
-                ingest_phase::EMBEDDING,
-                embedded,
-                Some(total),
-            ));
-        }
-
-        // ── INDEX ───────────────────────────────────────────────────────────
-        on_progress(IngestProgress::new(ingest_phase::INDEXING, 0, Some(1)));
-        store.add(&coord, rows).await?;
-        on_progress(IngestProgress::new(ingest_phase::INDEXING, 1, Some(1)));
-    }
-
-    // ── Finalize: metadata + indexed status ──────────────────────────────
-    repo.update_source_metadata(source_id, total_tokens, &content_hash)
-        .await?;
-    repo.update_source_status(source_id, crate::notebooks::SourceStatus::Indexed.as_str())
-        .await?;
-    on_progress(IngestProgress::new(ingest_phase::DONE, 1, Some(1)));
-    Ok(())
 }
 
 /// SHA-256 of `bytes`, lowercase hex.
