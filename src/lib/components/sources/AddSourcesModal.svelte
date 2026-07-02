@@ -1,7 +1,8 @@
 <!-- AddSourcesModal — tabbed "Add sources" modal (M4).
      Three tabs: Upload | URL | Paste text.
      Upload: functional (md/txt via @tauri-apps/plugin-dialog + existing addFileSource/ingest).
-     URL:    deferred (Phase 2) — input rendered, action disabled with inline hint.
+     URL:    functional (addUrlSource + ingest). Static pages take the fast static extract
+             path; near-empty SPAs fall through to the offscreen webview JS-render path (#78).
      Paste:  functional (addTextSource + ingest).
      Drag region: modal and ALL its controls are data-tauri-drag-region=none (no-drag).
      Tokens only — no hardcoded hex. -->
@@ -10,10 +11,10 @@
   import { isTauri } from '@tauri-apps/api/core';
   import X from '@lucide/svelte/icons/x';
   import Upload from '@lucide/svelte/icons/upload';
-  import Link from '@lucide/svelte/icons/link';
+  import Check from '@lucide/svelte/icons/check';
   import { cn } from '$lib/utils.js';
   import { Button } from '$lib/components/ui/button/index.js';
-  import { addFileSource, addTextSource } from '$lib/sources/ipc.js';
+  import { addFileSource, addTextSource, addUrlSource } from '$lib/sources/ipc.js';
   import { addSourceLocal, loadSources, ingest } from '$lib/sources/sources-state.svelte.js';
   import { notebookStore } from '$lib/notebooks/index.js';
   import { registerDropTarget, PICKER_FILTERS } from '$lib/sources/dragDrop.js';
@@ -46,6 +47,10 @@
 
   /** URL tab */
   let urlValue = $state('');
+  let urlError = $state<string | null>(null);
+  let urlSubmitting = $state(false);
+  /** #78: mark the URL as a JS app / SPA so ingest always JS-renders it. */
+  let urlIsSpa = $state(false);
 
   /** Paste tab */
   let pasteTitle = $state('');
@@ -69,6 +74,19 @@
 
   const pasteCanSubmit = $derived(pasteContent.trim().length > 0 && !pasteSubmitting);
 
+  /** A URL is submittable when it parses as an absolute http(s) URL. */
+  function isValidHttpUrl(value: string): boolean {
+    let parsed: URL;
+    try {
+      parsed = new URL(value.trim());
+    } catch {
+      return false;
+    }
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+  }
+
+  const urlCanSubmit = $derived(isValidHttpUrl(urlValue) && !urlSubmitting);
+
   // ---------------------------------------------------------------------------
   // Reset on open
   // ---------------------------------------------------------------------------
@@ -77,6 +95,9 @@
     if (open) {
       activeTab = 'upload';
       urlValue = '';
+      urlError = null;
+      urlSubmitting = false;
+      urlIsSpa = false;
       pasteTitle = '';
       pasteContent = '';
       pasteError = null;
@@ -260,20 +281,64 @@
   }
 
   // ---------------------------------------------------------------------------
+  // URL tab handler
+  // ---------------------------------------------------------------------------
+
+  /** Derive a human-readable title from a URL (hostname, else the raw URL). */
+  function titleFromUrl(value: string): string {
+    try {
+      return new URL(value.trim()).hostname || value.trim();
+    } catch {
+      return value.trim();
+    }
+  }
+
+  async function handleUrlSubmit(): Promise<void> {
+    if (!urlCanSubmit || !activeNotebookId) return;
+    urlError = null;
+    urlSubmitting = true;
+    try {
+      const url = urlValue.trim();
+      const { source, wasExisting } = await addUrlSource(
+        activeNotebookId,
+        titleFromUrl(url),
+        url,
+        urlIsSpa
+      );
+      if (wasExisting) {
+        // Backend content-dedup hit (#100) — do NOT insert or ingest.
+        showToast('Already in notebook');
+      } else {
+        // Optimistically insert the row BEFORE ingest so progress events find the
+        // entry in the store immediately (mirrors the paste flow).
+        addSourceLocal(source);
+        void ingest(source.id);
+      }
+      onclose?.();
+      void loadSources(activeNotebookId);
+    } catch (err) {
+      urlError = 'Could not add URL. Please check the address and try again.';
+      console.error('AddSourcesModal: handleUrlSubmit failed', err);
+    } finally {
+      urlSubmitting = false;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // Footer action dispatcher
   // ---------------------------------------------------------------------------
 
   async function handlePrimaryAction(): Promise<void> {
     if (activeTab === 'upload') await handleBrowse();
+    else if (activeTab === 'url') await handleUrlSubmit();
     else if (activeTab === 'paste') await handlePasteSubmit();
-    // 'url' tab: action is disabled — no-op
   }
 
-  // Note: pasteCanSubmit already incorporates !pasteSubmitting, so we don't need a
-  // standalone pasteSubmitting clause here (which would wrongly disable the upload tab
-  // while a paste submission is in flight on another tab).
+  // Note: paste/urlCanSubmit already incorporate their own !*Submitting flag, so we
+  // don't add a standalone submitting clause here (which would wrongly disable a
+  // different tab while a submission is in flight).
   const primaryDisabled = $derived(
-    activeTab === 'url' ||
+    (activeTab === 'url' && !urlCanSubmit) ||
       (activeTab === 'paste' && !pasteCanSubmit) ||
       (activeTab === 'upload' && uploadSubmitting)
   );
@@ -443,18 +508,40 @@
                 style="-webkit-app-region: no-drag;"
               />
             </div>
+            <!-- #78: SPA / JS-render opt-in. Token-styled (appearance-none) so it
+                 follows light/dark mode AND the selected accent — a native
+                 checkbox ignores the app theme (no color-scheme is set). -->
+            <label
+              class="mb-3 flex items-start gap-2 text-[12px] text-foreground"
+              for="add-sources-url-spa"
+              style="-webkit-app-region: no-drag;"
+            >
+              <span class="relative mt-0.5 inline-flex size-4 shrink-0 items-center justify-center">
+                <input
+                  id="add-sources-url-spa"
+                  type="checkbox"
+                  class="peer size-4 shrink-0 cursor-pointer appearance-none rounded border border-input bg-background outline-none checked:border-primary checked:bg-primary focus-visible:ring-2 focus-visible:ring-ring/50"
+                  bind:checked={urlIsSpa}
+                  style="-webkit-app-region: no-drag;"
+                />
+                <Check
+                  class="pointer-events-none absolute size-3 text-primary-foreground opacity-0 peer-checked:opacity-100"
+                  strokeWidth={3}
+                />
+              </span>
+              <span class="leading-relaxed">
+                This page needs JavaScript to load
+                <span class="text-muted-foreground/70">(render it before extracting)</span>
+              </span>
+            </label>
             <p class="text-[12px] text-muted-foreground/70 leading-relaxed">
               Supports web pages, blog posts, documentation and GitHub repos. Content is fetched and
               indexed locally.
             </p>
-            <!-- Phase 2 deferral notice -->
-            <p
-              class="mt-3 flex items-center gap-1.5 rounded-lg bg-muted/60 px-3 py-2 text-[11px] text-muted-foreground"
-              role="note"
-            >
-              <Link class="size-3 shrink-0" strokeWidth={2} />
-              URL ingestion is available in the next update.
-            </p>
+            <!-- URL error feedback -->
+            {#if urlError}
+              <p class="mt-3 text-[12px] text-destructive" role="alert">{urlError}</p>
+            {/if}
           </div>
 
           <!-- PASTE TEXT TAB -->
@@ -533,6 +620,8 @@
           style="-webkit-app-region: no-drag;"
         >
           {#if activeTab === 'upload' && uploadSubmitting}
+            Adding…
+          {:else if activeTab === 'url' && urlSubmitting}
             Adding…
           {:else if activeTab === 'paste' && pasteSubmitting}
             Adding…

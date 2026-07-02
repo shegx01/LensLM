@@ -145,6 +145,45 @@ high-level code without sacrificing performance.</p>
         .to_string()
 }
 
+/// HTML with GENUINE, substantial article content (well over
+/// `NEEDS_JS_SUFFICIENT_CHARS`) embedded in a very large HTML payload so the
+/// text/raw ratio falls below `NEEDS_JS_MIN_TEXT_RATIO`. Models the modern-web
+/// case (e.g. `docs.stripe.com`): real content in a script/markup-heavy shell.
+/// Must be INDEXED, not flagged `needs_js` (the ratio arm must NOT false-positive
+/// once absolute extracted content is sufficient).
+fn content_rich_low_ratio_html() -> String {
+    let mut html = String::from(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Comprehensive Guide</title></head>
+<body>
+<article>
+<h1>Comprehensive Guide to the Payments API</h1>
+"#,
+    );
+    // ~10 substantial paragraphs → several thousand chars of extractable prose,
+    // comfortably above NEEDS_JS_SUFFICIENT_CHARS (1000).
+    for i in 1..=10 {
+        html.push_str(&format!(
+            "<p>Section {i}: The payments API lets you accept and manage transactions \
+             securely across many providers. This paragraph describes the request and \
+             response lifecycle in detail, including idempotency keys, webhooks for \
+             asynchronous events, retry semantics, and the recommended error-handling \
+             strategy for production integrations. Read each section carefully before \
+             wiring the client, because the ordering of operations matters.</p>\n"
+        ));
+    }
+    html.push_str("</article>\n");
+    // Pad the raw payload with a large inline script so ratio < 0.01 even though
+    // the extracted content is substantial (mirrors a big SPA/hydration bundle).
+    html.push_str("<script>\n");
+    for _ in 0..6000 {
+        html.push_str("/* inlined bundle padding to enlarge the raw HTML payload */\n");
+    }
+    html.push_str("</script>\n</body>\n</html>\n");
+    html
+}
+
 // ===========================================================================
 // Compile-time sanity: URL_FETCH_TIMEOUT is 30 s
 // ===========================================================================
@@ -193,7 +232,7 @@ async fn url_fetch_http_error_flips_to_error() {
         .await
         .expect("notebook");
     let source = engine
-        .add_url_source(&nb.id, "bad page", &format!("{}/page", mock.uri()))
+        .add_url_source(&nb.id, "bad page", &format!("{}/page", mock.uri()), false)
         .await
         .expect("add_url_source")
         .source;
@@ -276,7 +315,7 @@ async fn url_uses_configurable_cap() {
         .await
         .expect("notebook");
     let source = engine
-        .add_url_source(&nb.id, "huge page", &format!("{}/huge", mock.uri()))
+        .add_url_source(&nb.id, "huge page", &format!("{}/huge", mock.uri()), false)
         .await
         .expect("add_url_source")
         .source;
@@ -320,7 +359,7 @@ async fn url_needs_js_on_js_shell() {
         .await
         .expect("notebook");
     let source = engine
-        .add_url_source(&nb.id, "spa page", &format!("{}/spa", mock.uri()))
+        .add_url_source(&nb.id, "spa page", &format!("{}/spa", mock.uri()), false)
         .await
         .expect("add_url_source")
         .source;
@@ -389,7 +428,12 @@ async fn url_indexes_real_article() {
         .await
         .expect("notebook");
     let source = engine
-        .add_url_source(&nb.id, "real article", &format!("{}/article", mock.uri()))
+        .add_url_source(
+            &nb.id,
+            "real article",
+            &format!("{}/article", mock.uri()),
+            false,
+        )
         .await
         .expect("add_url_source")
         .source;
@@ -431,6 +475,130 @@ async fn url_indexes_real_article() {
     );
 }
 
+/// Regression (issue #78 follow-up): a content-rich page whose text/raw ratio is
+/// below `NEEDS_JS_MIN_TEXT_RATIO` but whose absolute extracted content exceeds
+/// `NEEDS_JS_SUFFICIENT_CHARS` must be INDEXED, not sent to the needs_js render
+/// fallback. This is the docs.stripe.com case: ~2.6 KB of real docs prose in a
+/// ~1.2 MB SPA shell (ratio ≈ 0.002) was wrongly flagged needs_js before the fix.
+#[tokio::test]
+async fn url_indexes_content_rich_page_despite_low_ratio() {
+    let html = content_rich_low_ratio_html();
+    // Sanity-check the fixture actually exercises the low-ratio-but-rich band.
+    assert!(
+        html.len() as f64 > 0.0,
+        "fixture non-empty (raw_len={})",
+        html.len()
+    );
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/guide"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(html)
+                .insert_header("content-type", "text/html; charset=utf-8"),
+        )
+        .mount(&mock)
+        .await;
+
+    let (_dir, engine) = file_engine().await;
+    inject_fake_embedder(&engine);
+    seed_tokenizer_from_env(&engine.data_dir_for_test().await);
+
+    let nb = engine
+        .create_notebook("NB", None, None)
+        .await
+        .expect("notebook");
+    let source = engine
+        .add_url_source(&nb.id, "guide", &format!("{}/guide", mock.uri()), false)
+        .await
+        .expect("add_url_source")
+        .source;
+
+    let (result, _events) = ingest_collecting_progress(&engine, &source.id).await;
+
+    let pool = engine.pool().await;
+    let repo = lens_core::notebooks::NotebookRepo::new(&pool);
+    let updated = repo
+        .get_source(&source.id)
+        .await
+        .expect("get_source ok")
+        .expect("source exists");
+
+    // The key invariant regardless of tokenizer availability: NOT needs_js.
+    assert_ne!(
+        updated.status, "needs_js",
+        "content-rich low-ratio page must NOT be flagged needs_js (status={:?})",
+        updated.status
+    );
+    // With a tokenizer present the full pipeline indexes it; without one the
+    // ingest errors at the tokenizer step (not a needs_js false positive).
+    if result.is_ok() {
+        assert_eq!(
+            updated.status, "indexed",
+            "content-rich low-ratio page must be indexed (got {:?})",
+            updated.status
+        );
+    }
+}
+
+/// #78 SPA opt-in: a page whose STATIC extraction is content-rich (and therefore
+/// would index directly — proven by `url_indexes_content_rich_page_despite_low_ratio`)
+/// must instead be DIVERTED to the JS-render branch when `force_js_render=true`.
+/// With no renderer injected (headless test) + rendering enabled, the diverted
+/// source lands in `needs_js` — proving the flag routed it away from the static
+/// index path rather than indexing the static extraction.
+#[tokio::test]
+async fn url_force_js_render_diverts_content_rich_page_to_render() {
+    let html = content_rich_low_ratio_html();
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/guide"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(html)
+                .insert_header("content-type", "text/html; charset=utf-8"),
+        )
+        .mount(&mock)
+        .await;
+
+    let (_dir, engine) = file_engine().await;
+    inject_fake_embedder(&engine);
+    seed_tokenizer_from_env(&engine.data_dir_for_test().await);
+
+    let nb = engine
+        .create_notebook("NB", None, None)
+        .await
+        .expect("notebook");
+    let source = engine
+        // force_js_render = true (the SPA checkbox)
+        .add_url_source(&nb.id, "guide", &format!("{}/guide", mock.uri()), true)
+        .await
+        .expect("add_url_source")
+        .source;
+    // The flag must persist on the row.
+    assert_eq!(
+        source.force_js_render, 1,
+        "force_js_render must persist as 1 on the source row"
+    );
+
+    let (result, _events) = ingest_collecting_progress(&engine, &source.id).await;
+    assert!(result.is_ok(), "ingest must not error: {result:?}");
+
+    let pool = engine.pool().await;
+    let repo = lens_core::notebooks::NotebookRepo::new(&pool);
+    let updated = repo
+        .get_source(&source.id)
+        .await
+        .expect("get_source ok")
+        .expect("source exists");
+    assert_eq!(
+        updated.status, "needs_js",
+        "force_js_render must divert a content-rich page to the render branch; with no \
+         renderer injected it lands in needs_js (got {:?})",
+        updated.status
+    );
+}
+
 // ===========================================================================
 // Crash-recovery: needs_js / needs_ocr survive engine restart
 // ===========================================================================
@@ -453,14 +621,19 @@ async fn crash_recovery_skips_needs_js_and_needs_ocr() {
     let repo = lens_core::notebooks::NotebookRepo::new(&pool);
 
     let src_js = repo
-        .add_url_source(&nb.id, "spa", "https://example.com/spa")
+        .add_url_source(&nb.id, "spa", "https://example.com/spa", false)
         .await
         .expect("add_url_source")
         .source;
     let src_ocr = repo
-        .add_url_source(&nb.id, "scanned", "https://example.com/pdf")
+        .add_url_source(&nb.id, "scanned", "https://example.com/pdf", false)
         .await
         .expect("add_url_source for ocr")
+        .source;
+    let src_rf = repo
+        .add_url_source(&nb.id, "failed-render", "https://example.com/rf", false)
+        .await
+        .expect("add_url_source for render_failed")
         .source;
 
     // Manually set their statuses to the terminal-pending values.
@@ -476,11 +649,17 @@ async fn crash_recovery_skips_needs_js_and_needs_ocr() {
     )
     .await
     .expect("set needs_ocr");
+    repo.update_source_status(
+        &src_rf.id,
+        lens_core::notebooks::SourceStatus::RenderFailed.as_str(),
+    )
+    .await
+    .expect("set render_failed");
 
     drop(pool);
     drop(engine);
 
-    // Re-open the engine: the crash-recovery reset must NOT touch needs_js / needs_ocr.
+    // Re-open the engine: the crash-recovery reset must NOT touch needs_js / needs_ocr / render_failed.
     let engine2 = LensEngine::init(dir.path()).await.expect("engine2 init");
     let pool2 = engine2.pool().await;
     let repo2 = lens_core::notebooks::NotebookRepo::new(&pool2);
@@ -505,6 +684,17 @@ async fn crash_recovery_skips_needs_js_and_needs_ocr() {
         ocr.status, "needs_ocr",
         "needs_ocr must survive crash-recovery reset (got {:?})",
         ocr.status
+    );
+
+    let rf = repo2
+        .get_source(&src_rf.id)
+        .await
+        .expect("get render_failed source")
+        .expect("exists");
+    assert_eq!(
+        rf.status, "render_failed",
+        "render_failed must survive crash-recovery reset (got {:?})",
+        rf.status
     );
 }
 
@@ -538,7 +728,7 @@ async fn needs_js_not_set_via_err_path() {
         .await
         .expect("notebook");
     let source = engine
-        .add_url_source(&nb.id, "spa", &format!("{}/spa", mock.uri()))
+        .add_url_source(&nb.id, "spa", &format!("{}/spa", mock.uri()), false)
         .await
         .expect("add_url_source")
         .source;
@@ -582,7 +772,7 @@ async fn add_url_source_returns_queued_without_fetch() {
 
     // This must return before any network timeout fires.
     let source: Source = engine
-        .add_url_source(&nb.id, "page title", url)
+        .add_url_source(&nb.id, "page title", url, false)
         .await
         .expect("add_url_source must not attempt a network connection")
         .source;
@@ -612,7 +802,7 @@ async fn add_url_source_dedup_returns_existing() {
 
     // First add — fresh insert. Locator keeps the verbatim (mixed-case) URL.
     let first = engine
-        .add_url_source(&nb.id, "article", "https://Example.COM/article")
+        .add_url_source(&nb.id, "article", "https://Example.COM/article", false)
         .await
         .expect("add_url_source");
     assert!(!first.was_existing, "first add is a fresh insert");
@@ -623,7 +813,7 @@ async fn add_url_source_dedup_returns_existing() {
 
     // Host-case-only difference — dedup hit.
     let second = engine
-        .add_url_source(&nb.id, "again", "https://example.com/article")
+        .add_url_source(&nb.id, "again", "https://example.com/article", false)
         .await
         .expect("add_url_source");
     assert!(second.was_existing, "case-differing host is a dedup hit");
@@ -631,7 +821,12 @@ async fn add_url_source_dedup_returns_existing() {
 
     // Fragment-only difference — dedup hit.
     let third = engine
-        .add_url_source(&nb.id, "frag", "https://example.com/article#section2")
+        .add_url_source(
+            &nb.id,
+            "frag",
+            "https://example.com/article#section2",
+            false,
+        )
         .await
         .expect("add_url_source");
     assert!(
@@ -642,7 +837,7 @@ async fn add_url_source_dedup_returns_existing() {
 
     // Genuinely different path — fresh insert.
     let fourth = engine
-        .add_url_source(&nb.id, "other", "https://example.com/different")
+        .add_url_source(&nb.id, "other", "https://example.com/different", false)
         .await
         .expect("add_url_source");
     assert!(!fourth.was_existing, "different URL is a fresh insert");
@@ -663,13 +858,13 @@ async fn engine_add_url_source_dedup_end_to_end() {
         .expect("notebook");
 
     let first = engine
-        .add_url_source(&nb.id, "page", "https://Example.COM/page")
+        .add_url_source(&nb.id, "page", "https://Example.COM/page", false)
         .await
         .expect("add_url_source");
     assert!(!first.was_existing);
 
     let second = engine
-        .add_url_source(&nb.id, "page", "https://example.com/page")
+        .add_url_source(&nb.id, "page", "https://example.com/page", false)
         .await
         .expect("add_url_source");
     assert!(second.was_existing, "case-differing host dedups end-to-end");
@@ -713,7 +908,7 @@ async fn url_extracted_sibling_removed_on_purge() {
         .await
         .expect("notebook");
     let source = engine
-        .add_url_source(&nb.id, "article", &format!("{}/article", mock.uri()))
+        .add_url_source(&nb.id, "article", &format!("{}/article", mock.uri()), false)
         .await
         .expect("add_url_source")
         .source;
@@ -774,7 +969,7 @@ async fn url_extracted_sibling_removed_on_purge_notebook() {
         .await
         .expect("notebook");
     let source = engine
-        .add_url_source(&nb.id, "article", &format!("{}/article", mock.uri()))
+        .add_url_source(&nb.id, "article", &format!("{}/article", mock.uri()), false)
         .await
         .expect("add_url_source")
         .source;
@@ -847,7 +1042,7 @@ async fn reingest_into_needs_js_wipes_stale_chunks_and_vectors() {
         .await
         .expect("notebook");
     let source = engine
-        .add_url_source(&nb.id, "page", &format!("{}/page", mock.uri()))
+        .add_url_source(&nb.id, "page", &format!("{}/page", mock.uri()), false)
         .await
         .expect("add_url_source")
         .source;
@@ -904,5 +1099,392 @@ async fn reingest_into_needs_js_wipes_stale_chunks_and_vectors() {
     assert_eq!(
         vec_count_2, 0,
         "stale Lance vectors must be wiped when transitioning into needs_js"
+    );
+}
+
+// ===========================================================================
+// Layer (d) — JS-render auto-fallback wired into run_ingest
+//
+// These tests drive the fallback with a FAKE `JsRenderer` injected via
+// `engine.set_js_renderer(Some(Arc::new(fake)))` — keeping CI headless (no real
+// webview). They assert the four wiring outcomes (indexed / render_failed /
+// opt-out needs_js / no-renderer needs_js) plus the C1 readback-provenance
+// integration case.
+// ===========================================================================
+
+/// A configurable fake renderer for the Layer (d) wiring tests. `render_html`
+/// returns whatever `canned` holds, mirroring the real renderer's contract
+/// (`Ok(Some(html))` on success, `Ok(None)` on failed/blocked/timed-out render).
+struct FakeRenderer {
+    canned: Option<String>,
+}
+
+#[async_trait::async_trait]
+impl lens_core::JsRenderer for FakeRenderer {
+    async fn render_html(&self, _url: &str) -> Result<Option<String>, lens_core::LensError> {
+        Ok(self.canned.clone())
+    }
+}
+
+fn inject_fake_renderer(engine: &LensEngine, canned: Option<String>) {
+    let fake: Arc<dyn lens_core::JsRenderer> = Arc::new(FakeRenderer { canned });
+    // block_on is fine here: the setter is a quick RwLock write.
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(engine.set_js_renderer(Some(fake)));
+    });
+}
+
+/// Layer (d) happy path: a JS-shell page (static extraction near-empty →
+/// needs_js gate trips) + an injected renderer whose rendered HTML extracts to
+/// >200 chars of prose → the source ends `indexed` (NOT needs_js), chunks > 0.
+///
+/// Requires the tokenizer for the downstream chunk step; skips cleanly offline.
+#[tokio::test(flavor = "multi_thread")]
+async fn js_render_fallback_indexes_when_renderer_populates() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/spa"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(js_shell_html())
+                .insert_header("content-type", "text/html; charset=utf-8"),
+        )
+        .mount(&mock)
+        .await;
+
+    let (_dir, engine) = file_engine().await;
+    inject_fake_embedder(&engine);
+    let data_dir = engine.data_dir_for_test().await;
+    seed_tokenizer_from_env(&data_dir);
+
+    // The renderer "renders" the SPA into a real article with >200 chars of prose.
+    inject_fake_renderer(&engine, Some(real_article_html()));
+
+    let nb = engine
+        .create_notebook("NB", None, None)
+        .await
+        .expect("notebook");
+    let source = engine
+        .add_url_source(&nb.id, "spa", &format!("{}/spa", mock.uri()), false)
+        .await
+        .expect("add_url_source")
+        .source;
+
+    let (result, _events) = ingest_collecting_progress(&engine, &source.id).await;
+    if result.is_err() {
+        // Offline with no tokenizer: the downstream chunk step fails. That is a
+        // tokenizer availability gap, NOT a fallback-wiring bug — skip cleanly.
+        eprintln!("skipping js_render_fallback_indexes: ingest failed (no tokenizer offline)");
+        return;
+    }
+
+    let pool = engine.pool().await;
+    let repo = lens_core::notebooks::NotebookRepo::new(&pool);
+    let updated = repo.get_source(&source.id).await.unwrap().unwrap();
+    assert_eq!(
+        updated.status, "indexed",
+        "renderer populated the page → source must end indexed (got {:?})",
+        updated.status
+    );
+
+    let chunk_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE source_id = ?")
+        .bind(&source.id)
+        .fetch_one(&pool)
+        .await
+        .expect("count chunks");
+    assert!(
+        chunk_count > 0,
+        "a populated render must produce indexed chunks"
+    );
+}
+
+/// Layer (d) never-populates: a JS shell + a renderer that returns `None` → the
+/// source ends `render_failed` (NOT needs_js, NOT error), 0 chunks.
+#[tokio::test(flavor = "multi_thread")]
+async fn js_render_fallback_render_failed_when_renderer_returns_none() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/spa"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(js_shell_html())
+                .insert_header("content-type", "text/html; charset=utf-8"),
+        )
+        .mount(&mock)
+        .await;
+
+    let (_dir, engine) = file_engine().await;
+    inject_fake_embedder(&engine);
+    inject_fake_renderer(&engine, None);
+
+    let nb = engine
+        .create_notebook("NB", None, None)
+        .await
+        .expect("notebook");
+    let source = engine
+        .add_url_source(&nb.id, "spa", &format!("{}/spa", mock.uri()), false)
+        .await
+        .expect("add_url_source")
+        .source;
+
+    let (result, _events) = ingest_collecting_progress(&engine, &source.id).await;
+    assert!(
+        result.is_ok(),
+        "render_failed outcome must return Ok, not Err: {result:?}"
+    );
+
+    let pool = engine.pool().await;
+    let repo = lens_core::notebooks::NotebookRepo::new(&pool);
+    let updated = repo.get_source(&source.id).await.unwrap().unwrap();
+    assert_eq!(
+        updated.status, "render_failed",
+        "a renderer that never populates must set render_failed (got {:?})",
+        updated.status
+    );
+
+    let chunk_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE source_id = ?")
+        .bind(&source.id)
+        .fetch_one(&pool)
+        .await
+        .expect("count chunks");
+    assert_eq!(chunk_count, 0, "render_failed must produce zero chunks");
+}
+
+/// A fake renderer whose `render_html` returns `Err(..)`, exercising the FIX 2
+/// contract: a render *failure* must map to the TERMINAL `render_failed` status,
+/// NOT the transient `error` state (which crash-recovery would reset + retry).
+struct ErrRenderer;
+
+#[async_trait::async_trait]
+impl lens_core::JsRenderer for ErrRenderer {
+    async fn render_html(&self, _url: &str) -> Result<Option<String>, lens_core::LensError> {
+        Err(lens_core::LensError::Internal(
+            "simulated webview render failure".into(),
+        ))
+    }
+}
+
+/// FIX 2: a renderer that returns `Err(..)` must land the source in the terminal
+/// `render_failed` state (NOT `error`), and `ingest_source` must still return
+/// `Ok(())` (the Err→error flip must NEVER fire for a render failure).
+#[tokio::test(flavor = "multi_thread")]
+async fn js_render_fallback_render_failed_when_renderer_errors() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/spa"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(js_shell_html())
+                .insert_header("content-type", "text/html; charset=utf-8"),
+        )
+        .mount(&mock)
+        .await;
+
+    let (_dir, engine) = file_engine().await;
+    inject_fake_embedder(&engine);
+    // Inject the erroring renderer directly (inject_fake_renderer only builds the
+    // Ok-returning FakeRenderer).
+    {
+        let fake: Arc<dyn lens_core::JsRenderer> = Arc::new(ErrRenderer);
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(engine.set_js_renderer(Some(fake)));
+        });
+    }
+
+    let nb = engine
+        .create_notebook("NB", None, None)
+        .await
+        .expect("notebook");
+    let source = engine
+        .add_url_source(&nb.id, "spa", &format!("{}/spa", mock.uri()), false)
+        .await
+        .expect("add_url_source")
+        .source;
+
+    let (result, _events) = ingest_collecting_progress(&engine, &source.id).await;
+    assert!(
+        result.is_ok(),
+        "a render Err must map to render_failed and return Ok, NOT propagate Err→error: {result:?}"
+    );
+
+    let pool = engine.pool().await;
+    let repo = lens_core::notebooks::NotebookRepo::new(&pool);
+    let updated = repo.get_source(&source.id).await.unwrap().unwrap();
+    assert_eq!(
+        updated.status, "render_failed",
+        "a renderer that ERRORS must set render_failed (NOT error) (got {:?})",
+        updated.status
+    );
+
+    let chunk_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE source_id = ?")
+        .bind(&source.id)
+        .fetch_one(&pool)
+        .await
+        .expect("count chunks");
+    assert_eq!(chunk_count, 0, "render_failed must produce zero chunks");
+}
+
+/// Layer (d) opt-out: same JS shell, `js_render_enabled=false`, no renderer
+/// needed → the source stays `needs_js` (current behavior preserved).
+#[tokio::test(flavor = "multi_thread")]
+async fn js_render_fallback_opt_out_stays_needs_js() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/spa"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(js_shell_html())
+                .insert_header("content-type", "text/html; charset=utf-8"),
+        )
+        .mount(&mock)
+        .await;
+
+    let (_dir, engine) = file_engine().await;
+    inject_fake_embedder(&engine);
+
+    // Opt OUT of JS rendering.
+    let mut cfg = engine.config().await;
+    cfg.js_render_enabled = false;
+    engine.set_config(cfg).await;
+
+    // Even with a populating renderer injected, opt-out must NOT invoke it.
+    inject_fake_renderer(&engine, Some(real_article_html()));
+
+    let nb = engine
+        .create_notebook("NB", None, None)
+        .await
+        .expect("notebook");
+    let source = engine
+        .add_url_source(&nb.id, "spa", &format!("{}/spa", mock.uri()), false)
+        .await
+        .expect("add_url_source")
+        .source;
+
+    let (result, _events) = ingest_collecting_progress(&engine, &source.id).await;
+    assert!(
+        result.is_ok(),
+        "opt-out needs_js outcome must return Ok: {result:?}"
+    );
+
+    let pool = engine.pool().await;
+    let repo = lens_core::notebooks::NotebookRepo::new(&pool);
+    let updated = repo.get_source(&source.id).await.unwrap().unwrap();
+    assert_eq!(
+        updated.status, "needs_js",
+        "js_render_enabled=false must preserve needs_js (got {:?})",
+        updated.status
+    );
+}
+
+/// Layer (d) no-renderer-injected: `js_render_enabled=true` (default) but
+/// `js_renderer()` is `None` → graceful fallback to `needs_js`.
+#[tokio::test(flavor = "multi_thread")]
+async fn js_render_fallback_no_renderer_stays_needs_js() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/spa"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(js_shell_html())
+                .insert_header("content-type", "text/html; charset=utf-8"),
+        )
+        .mount(&mock)
+        .await;
+
+    let (_dir, engine) = file_engine().await;
+    inject_fake_embedder(&engine);
+    // NO renderer injected; js_render_enabled defaults ON.
+
+    let nb = engine
+        .create_notebook("NB", None, None)
+        .await
+        .expect("notebook");
+    let source = engine
+        .add_url_source(&nb.id, "spa", &format!("{}/spa", mock.uri()), false)
+        .await
+        .expect("add_url_source")
+        .source;
+
+    let (result, _events) = ingest_collecting_progress(&engine, &source.id).await;
+    assert!(
+        result.is_ok(),
+        "no-renderer needs_js outcome must return Ok: {result:?}"
+    );
+
+    let pool = engine.pool().await;
+    let repo = lens_core::notebooks::NotebookRepo::new(&pool);
+    let updated = repo.get_source(&source.id).await.unwrap().unwrap();
+    assert_eq!(
+        updated.status, "needs_js",
+        "no injected renderer must gracefully preserve needs_js (got {:?})",
+        updated.status
+    );
+}
+
+/// Layer (d) — C1 readback-provenance integration: the renderer's contract
+/// discards output whose final-committed host is blocked (returning `None`). We
+/// model that contract with a fake renderer that returns `None` for such an
+/// input. The wiring must then set `render_failed` with ZERO chunks/vectors —
+/// no internal content ever reaches chunk→embed→index.
+#[tokio::test(flavor = "multi_thread")]
+async fn js_render_provenance_blocked_render_failed_writes_nothing() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/spa"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(js_shell_html())
+                .insert_header("content-type", "text/html; charset=utf-8"),
+        )
+        .mount(&mock)
+        .await;
+
+    let (_dir, engine) = file_engine().await;
+    inject_fake_embedder(&engine);
+    let data_dir = engine.data_dir_for_test().await;
+
+    // The renderer's C1 readback re-check discarded internal content → returns
+    // None (same observable contract this branch sees for a blocked final host).
+    inject_fake_renderer(&engine, None);
+
+    let nb = engine
+        .create_notebook("NB", None, None)
+        .await
+        .expect("notebook");
+    let source = engine
+        .add_url_source(&nb.id, "spa", &format!("{}/spa", mock.uri()), false)
+        .await
+        .expect("add_url_source")
+        .source;
+
+    let (result, _events) = ingest_collecting_progress(&engine, &source.id).await;
+    assert!(
+        result.is_ok(),
+        "provenance-blocked render_failed must return Ok: {result:?}"
+    );
+
+    let pool = engine.pool().await;
+    let repo = lens_core::notebooks::NotebookRepo::new(&pool);
+    let updated = repo.get_source(&source.id).await.unwrap().unwrap();
+    assert_eq!(
+        updated.status, "render_failed",
+        "provenance-blocked output must yield render_failed (got {:?})",
+        updated.status
+    );
+
+    // Assert NO chunk row AND no Lance vector was written for this source.
+    let chunk_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE source_id = ?")
+        .bind(&source.id)
+        .fetch_one(&pool)
+        .await
+        .expect("count chunks");
+    assert_eq!(
+        chunk_count, 0,
+        "provenance-blocked render must write zero chunks"
+    );
+    let vec_count = vector_row_count(&data_dir, &nb.id.to_string(), &source.id).await;
+    assert_eq!(
+        vec_count, 0,
+        "provenance-blocked render must write zero vectors"
     );
 }

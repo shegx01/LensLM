@@ -123,6 +123,10 @@ pub enum SourceStatus {
     /// Terminal-pending: URL source returned near-empty text — likely a JS-rendered
     /// SPA. Must NOT be reset to `error` on crash recovery (it is not transient).
     NeedsJs,
+    /// Terminal: URL source was attempted via JS renderer but the render failed
+    /// (timeout, blocked host, or empty DOM). Must NOT be reset to `error` on
+    /// crash recovery (it is not transient).
+    RenderFailed,
 }
 
 impl SourceStatus {
@@ -139,6 +143,7 @@ impl SourceStatus {
             Self::Error => "error",
             Self::NeedsOcr => "needs_ocr",
             Self::NeedsJs => "needs_js",
+            Self::RenderFailed => "render_failed",
         }
     }
 
@@ -159,7 +164,8 @@ impl SourceStatus {
             | Self::Indexed
             | Self::Error
             | Self::NeedsOcr
-            | Self::NeedsJs => false,
+            | Self::NeedsJs
+            | Self::RenderFailed => false,
         }
     }
 }
@@ -177,9 +183,11 @@ impl FromStr for SourceStatus {
             "error" => Ok(Self::Error),
             "needs_ocr" => Ok(Self::NeedsOcr),
             "needs_js" => Ok(Self::NeedsJs),
+            "render_failed" => Ok(Self::RenderFailed),
             other => Err(LensError::Validation(format!(
                 "unknown source status: {other:?}; expected one of \"pending\", \"queued\", \
-                 \"parsing\", \"embedding\", \"indexed\", \"error\", \"needs_ocr\", \"needs_js\""
+                 \"parsing\", \"embedding\", \"indexed\", \"error\", \"needs_ocr\", \"needs_js\", \
+                 \"render_failed\""
             ))),
         }
     }
@@ -304,6 +312,13 @@ pub struct Source {
     /// JSON enrichment metadata (composite cache key + budget/skip reason),
     /// written by the enrichment worker. `None` until the source is enriched.
     pub enrichment_meta: Option<String>,
+    /// Per-source "SPA / render this page" opt-in (#78). SQLite integer boolean
+    /// (`0` = off, `1` = on), mirroring [`selected`](Self::selected). When set,
+    /// [`run_ingest`](crate::ingest) ALWAYS routes this URL source through the
+    /// offscreen-webview JS-render path instead of relying on static-extraction
+    /// auto-detection. Only URL sources render — file/text/onboarding rows keep
+    /// the default `0`. Persisted, so re-ingest and crash-recovery honor it.
+    pub force_js_render: i64,
 }
 
 /// A trashed source with its parent notebook's title, used by the Trash modal.
@@ -555,7 +570,7 @@ fn validate_title(title: &str) -> Result<String, LensError> {
 /// rows only; returns at most one row (LIMIT 1 matches the partial unique index).
 const SOURCE_DEDUP_SELECT: &str = "SELECT id, notebook_id, kind, title, status, locator, \
      selected, token_count, content_hash, raw_content_hash, created_at, trashed_at, \
-     enrichment_status, enrichment_meta \
+     enrichment_status, enrichment_meta, force_js_render \
      FROM sources WHERE notebook_id = ? AND raw_content_hash = ? AND trashed_at IS NULL LIMIT 1";
 
 /// Repository over the `notebooks` table. Borrows a pool; holds no state.
@@ -646,7 +661,8 @@ impl<'a> NotebookRepo<'a> {
         let rows = sqlx::query(
             "SELECT s.id, s.notebook_id, s.kind, s.title, s.status, s.locator, s.selected, \
                     s.token_count, s.content_hash, s.raw_content_hash, s.created_at, s.trashed_at, \
-                    s.enrichment_status, s.enrichment_meta, n.title AS notebook_title \
+                    s.enrichment_status, s.enrichment_meta, s.force_js_render, \
+                    n.title AS notebook_title \
              FROM sources s \
              JOIN notebooks n ON n.id = s.notebook_id \
              WHERE s.trashed_at IS NOT NULL AND n.trashed_at IS NULL \
@@ -673,6 +689,7 @@ impl<'a> NotebookRepo<'a> {
                         trashed_at: row.try_get("trashed_at")?,
                         enrichment_status: row.try_get("enrichment_status")?,
                         enrichment_meta: row.try_get("enrichment_meta")?,
+                        force_js_render: row.try_get("force_js_render")?,
                     },
                     notebook_title: row.try_get("notebook_title")?,
                 })
@@ -968,6 +985,8 @@ impl<'a> NotebookRepo<'a> {
                 trashed_at: None,
                 enrichment_status: None,
                 enrichment_meta: None,
+                // Onboarding sources never JS-render; only URL sources do (#78).
+                force_js_render: 0,
             },
             was_existing: false,
         })
@@ -1118,6 +1137,8 @@ impl<'a> NotebookRepo<'a> {
                 trashed_at: None,
                 enrichment_status: None,
                 enrichment_meta: None,
+                // Text/markdown sources never JS-render; only URL sources do (#78).
+                force_js_render: 0,
             },
             was_existing: false,
         })
@@ -1305,6 +1326,8 @@ impl<'a> NotebookRepo<'a> {
                 trashed_at: None,
                 enrichment_status: None,
                 enrichment_meta: None,
+                // Local file sources never JS-render; only URL sources do (#78).
+                force_js_render: 0,
             },
             was_existing: false,
         })
@@ -1327,11 +1350,17 @@ impl<'a> NotebookRepo<'a> {
     /// `raw_content_hash` short-circuits to a dedup hit (`was_existing = true`).
     /// The partial unique index is the authoritative guard; `SELECT` is the
     /// fast path and `INSERT … ON CONFLICT DO NOTHING` resolves any race.
+    ///
+    /// `force_js_render` (#78) persists the per-source "SPA / render this page"
+    /// opt-in: when `true`, ingest ALWAYS routes this source through the
+    /// JS-render path. A dedup short-circuit returns the EXISTING source
+    /// unchanged (its stored flag wins — a re-add cannot flip it).
     pub async fn add_url_source(
         &self,
         notebook_id: &NotebookId,
         title: &str,
         url: &str,
+        force_js_render: bool,
     ) -> Result<AddSourceOutcome, LensError> {
         // Hash the NORMALIZED URL (not the verbatim string) as the dedup key so
         // case/port/fragment/trailing-slash variants of the same URL collide.
@@ -1362,8 +1391,8 @@ impl<'a> NotebookRepo<'a> {
         // insert a no-op via `ON CONFLICT DO NOTHING`.
         let result = sqlx::query(
             "INSERT INTO sources (id, notebook_id, kind, title, status, locator, selected, \
-             created_at, raw_content_hash) \
-             VALUES (?, ?, 'url', ?, ?, ?, 1, ?, ?) \
+             created_at, raw_content_hash, force_js_render) \
+             VALUES (?, ?, 'url', ?, ?, ?, 1, ?, ?, ?) \
              ON CONFLICT DO NOTHING",
         )
         .bind(&id)
@@ -1373,6 +1402,7 @@ impl<'a> NotebookRepo<'a> {
         .bind(url)
         .bind(&now)
         .bind(&raw_content_hash)
+        .bind(i64::from(force_js_render))
         .execute(self.pool)
         .await?;
 
@@ -1411,6 +1441,8 @@ impl<'a> NotebookRepo<'a> {
                 trashed_at: None,
                 enrichment_status: None,
                 enrichment_meta: None,
+                // Per-source SPA render opt-in (#78): carry the caller's flag.
+                force_js_render: i64::from(force_js_render),
             },
             was_existing: false,
         })
@@ -1739,7 +1771,8 @@ impl<'a> NotebookRepo<'a> {
     pub async fn get_source(&self, id: &str) -> Result<Option<Source>, LensError> {
         let row = sqlx::query_as::<_, Source>(
             "SELECT id, notebook_id, kind, title, status, locator, selected, token_count, \
-             content_hash, raw_content_hash, created_at, trashed_at, enrichment_status, enrichment_meta \
+             content_hash, raw_content_hash, created_at, trashed_at, enrichment_status, \
+             enrichment_meta, force_js_render \
              FROM sources WHERE id = ?",
         )
         .bind(id)
@@ -1752,7 +1785,8 @@ impl<'a> NotebookRepo<'a> {
     pub async fn list_sources(&self, notebook_id: &NotebookId) -> Result<Vec<Source>, LensError> {
         let rows = sqlx::query_as::<_, Source>(
             "SELECT id, notebook_id, kind, title, status, locator, selected, token_count, \
-             content_hash, raw_content_hash, created_at, trashed_at, enrichment_status, enrichment_meta \
+             content_hash, raw_content_hash, created_at, trashed_at, enrichment_status, \
+             enrichment_meta, force_js_render \
              FROM sources WHERE notebook_id = ? AND trashed_at IS NULL ORDER BY created_at DESC",
         )
         .bind(notebook_id)
@@ -1854,6 +1888,7 @@ mod tests {
             (SourceStatus::Error, "error"),
             (SourceStatus::NeedsOcr, "needs_ocr"),
             (SourceStatus::NeedsJs, "needs_js"),
+            (SourceStatus::RenderFailed, "render_failed"),
         ];
         for (status, s) in cases {
             assert_eq!(status.as_str(), s, "as_str must equal legacy wire string");
@@ -1879,6 +1914,7 @@ mod tests {
             (SourceStatus::Error, false),
             (SourceStatus::NeedsOcr, false),
             (SourceStatus::NeedsJs, false),
+            (SourceStatus::RenderFailed, false),
         ];
         for (status, transient) in cases {
             assert_eq!(

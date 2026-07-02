@@ -15,9 +15,9 @@
 //   AddSourcesModal:
 //     - renders all three tabs: Upload, URL, Paste text
 //     - Upload tab shows drop zone and format list
-//     - URL tab shows the URL input and deferral notice
+//     - URL tab shows the URL input; submit validates + calls addUrlSource then ingests
 //     - Paste text tab shows title + content fields
-//     - "Add to notebook →" button disabled on URL tab
+//     - "Add to notebook →" button disabled on URL tab until a valid URL is entered
 //     - "Add to notebook →" button disabled when paste content is empty
 //     - "Add to notebook →" button enabled when paste content is filled
 //     - Cancel button calls onclose
@@ -85,6 +85,7 @@ const { mockSourcesStore, mockNotebookStore } = vi.hoisted(() => {
 
 vi.mock('$lib/sources/sources-state.svelte.js', () => ({
   sourcesStore: mockSourcesStore,
+  addSourceLocal: vi.fn(),
   loadSources: vi.fn().mockResolvedValue(undefined),
   ingest: vi.fn().mockResolvedValue(undefined),
   toggleSelected: vi.fn().mockResolvedValue(undefined),
@@ -102,6 +103,9 @@ vi.mock('$lib/sources/ipc.js', () => ({
   addFileSource: vi
     .fn()
     .mockResolvedValue({ source: { id: 'src-new', status: 'pending' }, wasExisting: false }),
+  addUrlSource: vi
+    .fn()
+    .mockResolvedValue({ source: { id: 'src-url', status: 'queued' }, wasExisting: false }),
   ingestSource: vi.fn().mockResolvedValue(undefined),
   setSourceSelected: vi.fn().mockResolvedValue(undefined),
   trashSource: vi.fn().mockResolvedValue(undefined),
@@ -124,7 +128,13 @@ vi.mock('@tauri-apps/plugin-dialog', () => ({
 // Import components after mocks.
 import SourcesRail from './SourcesRail.svelte';
 import AddSourcesModal from './AddSourcesModal.svelte';
-import { removeSource, undoRemove, disposeTrashTimers } from '$lib/sources/sources-state.svelte.js';
+import {
+  removeSource,
+  undoRemove,
+  disposeTrashTimers,
+  ingest
+} from '$lib/sources/sources-state.svelte.js';
+import { addUrlSource } from '$lib/sources/ipc.js';
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -146,6 +156,7 @@ function makeSource(overrides?: Partial<Source>): Source {
     trashed_at: null,
     enrichment_status: null,
     enrichment_meta: null,
+    force_js_render: 0,
     ...overrides
   };
 }
@@ -601,17 +612,70 @@ describe('AddSourcesModal', () => {
     expect(screen.getByLabelText(/web page url/i)).toBeInTheDocument();
   });
 
-  it('URL tab shows the deferral notice', async () => {
+  it('URL tab no longer shows the deferral notice', async () => {
     render(AddSourcesModal, { open: true });
     await fireEvent.click(screen.getByRole('tab', { name: /url/i }));
-    expect(screen.getByText(/available in the next update/i)).toBeInTheDocument();
+    expect(screen.queryByText(/available in the next update/i)).not.toBeInTheDocument();
   });
 
-  it('"Add to notebook →" is disabled on the URL tab', async () => {
+  it('"Add to notebook →" is disabled on the URL tab when the field is empty', async () => {
     render(AddSourcesModal, { open: true });
     await fireEvent.click(screen.getByRole('tab', { name: /url/i }));
     const addBtn = screen.getByRole('button', { name: /add to notebook/i });
     expect(addBtn).toBeDisabled();
+  });
+
+  it('"Add to notebook →" is enabled once a valid URL is entered', async () => {
+    render(AddSourcesModal, { open: true });
+    await fireEvent.click(screen.getByRole('tab', { name: /url/i }));
+    const input = screen.getByLabelText(/web page url/i);
+    await fireEvent.input(input, { target: { value: 'https://example.com/article' } });
+    const addBtn = screen.getByRole('button', { name: /add to notebook/i });
+    expect(addBtn).not.toBeDisabled();
+  });
+
+  it('"Add to notebook →" stays disabled for an invalid URL', async () => {
+    render(AddSourcesModal, { open: true });
+    await fireEvent.click(screen.getByRole('tab', { name: /url/i }));
+    const input = screen.getByLabelText(/web page url/i);
+    await fireEvent.input(input, { target: { value: 'not a url' } });
+    const addBtn = screen.getByRole('button', { name: /add to notebook/i });
+    expect(addBtn).toBeDisabled();
+  });
+
+  it('submitting a URL calls addUrlSource then ingests', async () => {
+    const onclose = vi.fn();
+    render(AddSourcesModal, { open: true, onclose });
+    await fireEvent.click(screen.getByRole('tab', { name: /url/i }));
+    const input = screen.getByLabelText(/web page url/i);
+    await fireEvent.input(input, { target: { value: 'https://example.com/article' } });
+    await fireEvent.click(screen.getByRole('button', { name: /add to notebook/i }));
+    expect(addUrlSource).toHaveBeenCalledWith(
+      'nb-001',
+      expect.any(String),
+      'https://example.com/article',
+      false
+    );
+    expect(ingest).toHaveBeenCalledWith('src-url');
+    expect(onclose).toHaveBeenCalled();
+  });
+
+  it('checking the SPA checkbox then submitting calls addUrlSource with forceJsRender=true', async () => {
+    const onclose = vi.fn();
+    render(AddSourcesModal, { open: true, onclose });
+    await fireEvent.click(screen.getByRole('tab', { name: /url/i }));
+    const input = screen.getByLabelText(/web page url/i);
+    await fireEvent.input(input, { target: { value: 'https://example.com/spa' } });
+    await fireEvent.click(screen.getByLabelText(/needs javascript to load/i));
+    await fireEvent.click(screen.getByRole('button', { name: /add to notebook/i }));
+    expect(addUrlSource).toHaveBeenCalledWith(
+      'nb-001',
+      expect.any(String),
+      'https://example.com/spa',
+      true
+    );
+    expect(ingest).toHaveBeenCalledWith('src-url');
+    expect(onclose).toHaveBeenCalled();
   });
 
   it('clicking Paste text tab switches to paste panel', async () => {

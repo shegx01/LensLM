@@ -24,6 +24,7 @@ export function baseAppConfig(overrides?: Partial<AppConfig>): AppConfig {
     onboarding_complete: false,
     embedding_model: '',
     embedding_backend: '',
+    js_render_enabled: true,
     ...overrides
   };
 }

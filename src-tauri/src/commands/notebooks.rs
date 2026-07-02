@@ -109,16 +109,27 @@ pub async fn add_text_source(
 /// (`{ source, wasExisting }` on the wire) — on a content-dedup hit (issue #100,
 /// keyed on the normalized URL) the existing live source is returned.
 /// Call `ingest_source` separately to fetch + extract the page in the background.
+///
+/// `force_js_render` (#78) persists the per-source "SPA / render this page"
+/// opt-in. It is `Option<bool>` so a caller that omits it (older frontend / the
+/// non-SPA paths) deserializes to `None` → treated as `false`; Tauri command
+/// params cannot carry `#[serde(default)]`, so `Option` is the idiomatic default.
 #[tracing::instrument(skip(engine))]
 #[tauri::command]
 pub async fn add_url_source(
     notebook_id: String,
     title: String,
     url: String,
+    force_js_render: Option<bool>,
     engine: tauri::State<'_, LensEngine>,
 ) -> Result<AddSourceOutcome, LensError> {
     engine
-        .add_url_source(&NotebookId::from(notebook_id), &title, &url)
+        .add_url_source(
+            &NotebookId::from(notebook_id),
+            &title,
+            &url,
+            force_js_render.unwrap_or(false),
+        )
         .await
 }
 

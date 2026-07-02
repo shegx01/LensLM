@@ -29,6 +29,21 @@ tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
 # Native file picker for the onboarding "Add sources" step (Tauri 2.x plugin).
 tauri-plugin-dialog = "2"
+# `#[async_trait]` to implement lens-core's `JsRenderer` trait (issue #78).
+async-trait = "0.1"
+# `FutureExt::catch_unwind` so a panic in the untrusted-JS render body still
+# schedules the explicit webview teardown before re-propagating (issue #78, C2).
+futures = "0.3"
+# Unique offscreen render-window labels (`lens-render-<uuid>`); v7 for time-order.
+uuid = { workspace = true }
+
+# macOS: used ONLY by the inactive `OnscreenAlphaZero` render fallback (#78), which
+# sets the render window's native NSWindow alphaValue to 0 (a public AppKit API; no
+# `macos-private-api` needed). The production path is `Offscreen` (off-screen +
+# invisible), which needs no native calls; this dep is retained so the fallback
+# compiles if ever activated. Version tracks the objc2 already in the tree via tauri.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
 
 [dev-dependencies]
 # The `test` feature (mock runtime) is unioned in only for test builds.
@@ -37,7 +52,7 @@ tauri = { version = "2", features = ["test"] }
 tempfile = { workspace = true }
 # Inspector-command test seeds chunk + embedding_index rows via raw SQL on the
 # engine's pool (the embed worker is stubbed under `for_test`, so ingest yields
-# none); ids/timestamps mint via uuid/chrono — test-only deps.
+# none); ids/timestamps mint via uuid/chrono — test-only deps (uuid is a
+# non-dev dependency now, used by the render-window labels).
 sqlx = { workspace = true }
-uuid = { workspace = true }
 chrono = { workspace = true }

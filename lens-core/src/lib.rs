@@ -26,6 +26,7 @@ pub mod llm;
 pub mod model_catalog;
 pub mod notebooks;
 pub mod parse;
+pub mod render;
 pub mod system_check;
 pub mod tts;
 pub mod url_normalize;
@@ -42,7 +43,7 @@ pub use error::LensError;
 pub use extract::{ExtractOutput, Extractor, SourceAnchor, extractor_for};
 pub use ingest::{
     IngestProgress, NEEDS_JS_MIN_CHARS, NEEDS_JS_MIN_TEXT_RATIO, URL_FETCH_TIMEOUT, ingest_source,
-    resolve_nomic_tokenizer,
+    readback_host_allowed, resolve_nomic_tokenizer, ssrf_check_host, ssrf_check_url,
 };
 pub use llm::{
     GenaiProvider, LlmProvider, LlmRequest, LlmResponse, LlmRouting, ReasoningEffort, StreamChunk,
@@ -57,6 +58,7 @@ pub use notebooks::{
     AddSourceOutcome, EmbeddingStats, InspectorChunk, Notebook, NotebookId, NotebookSummary,
     Source, TrashedSource,
 };
+pub use render::JsRenderer;
 pub use system_check::{
     ALLOWED_EMBEDDING_MODELS, CheckAction, CheckId, CheckResult, CheckStatus, LlmDetection,
     ModelValidation, detect_llm, fastembed_weights_cached, is_allowlisted_embedding_id,
@@ -189,6 +191,17 @@ pub struct LensEngine {
     /// provider on an unreachable→reachable transition, which `OnceCell` (write-
     /// once) forbids. Write the cell to swap the provider; read it to dispatch.
     llm_provider: Arc<RwLock<Option<Arc<dyn LlmProvider>>>>,
+    /// The injected JS renderer for the SPA URL-render fallback (issue #78), or
+    /// `None` when none is installed (headless `lens-core` tests, or before
+    /// `src-tauri` wires `TauriJsRenderer`).
+    ///
+    /// Mirrors the `llm_provider` DI seam EXACTLY (`Arc<RwLock<Option<Arc<dyn
+    /// _>>>>`): `lens-core` cannot depend on `tauri`, so the concrete webview
+    /// renderer lives in `src-tauri` and is injected via
+    /// [`set_js_renderer`](Self::set_js_renderer). The URL-ingest fallback reads
+    /// it via [`js_renderer`](Self::js_renderer); when `None` the near-empty SPA
+    /// path degrades gracefully to `needs_js` (unchanged legacy behavior).
+    js_renderer: Arc<RwLock<Option<Arc<dyn render::JsRenderer>>>>,
     /// In-memory cache of the loaded model catalog (cached `models-catalog.json`,
     /// else the bundled snapshot), behind an `Arc` so a hit is a cheap pointer
     /// clone — NOT a ~2.6 MB read + parse on every picker open (fix #5). Populated
@@ -252,12 +265,17 @@ impl LensEngine {
         // reset here. They are deliberately absent from the `IN (?, ?)` clause.
         // Run_ingest sets them directly via `update_source_status` and returns
         // `Ok(())` so they are never surfaced via the Err→error flip path.
-        // The transient set is derived from `SourceStatus::is_transient` (an
-        // exhaustive match), so adding a status variant forces a recovery
-        // decision rather than silently leaving a new transient state stranded.
-        // For the in-progress states this is exactly `(parsing, embedding)`, the
-        // same `IN (?, ?)` clause as before — `needs_ocr`/`needs_js` are NOT
-        // transient and stay excluded.
+        // The candidate array below is HAND-MAINTAINED and intentionally lists
+        // only the statuses that are transient CANDIDATES; it is NOT derived from
+        // an exhaustive match, so it deliberately omits the terminal-pending
+        // states (`RenderFailed`/`NeedsJs`/`NeedsOcr` — set directly by run_ingest
+        // and never crash-reset). The REAL guard is the `is_transient` filter
+        // (an exhaustive match in `notebooks.rs`, so adding a status variant
+        // forces a recovery decision there) plus the `debug_assert_eq!` below,
+        // which pins the derived set to exactly `[Parsing, Embedding]`. Since
+        // those terminal-pending states are `is_transient() == false`, they are
+        // excluded from the reset whether or not they appear in this array — and
+        // we deliberately leave them out (plan Principle 3).
         use notebooks::SourceStatus;
         let transient: Vec<SourceStatus> = [
             SourceStatus::Pending,
@@ -330,6 +348,7 @@ impl LensEngine {
             ingest_lock: Arc::new(Semaphore::new(1)),
             enrichment_tx,
             llm_provider: Arc::new(RwLock::new(None)),
+            js_renderer: Arc::new(RwLock::new(None)),
             catalog_cache: Arc::new(RwLock::new(None)),
             #[cfg(feature = "test-util")]
             enrichment_gate: Arc::new(RwLock::new(None)),
@@ -417,6 +436,7 @@ impl LensEngine {
             ingest_lock: Arc::new(Semaphore::new(1)),
             enrichment_tx,
             llm_provider: Arc::new(RwLock::new(None)),
+            js_renderer: Arc::new(RwLock::new(None)),
             catalog_cache: Arc::new(RwLock::new(None)),
             #[cfg(feature = "test-util")]
             enrichment_gate: Arc::new(RwLock::new(None)),
@@ -608,16 +628,21 @@ impl LensEngine {
     /// to fetch and extract the page in the background. Returns an
     /// [`AddSourceOutcome`]: on a content-dedup hit (issue #100, keyed on the
     /// normalized URL) the existing live source is returned (`was_existing = true`).
+    ///
+    /// `force_js_render` (#78) persists the per-source "SPA / render this page"
+    /// opt-in; when `true`, ingest ALWAYS routes this source through the JS-render
+    /// path rather than relying on static-extraction auto-detection.
     #[tracing::instrument(skip(self))]
     pub async fn add_url_source(
         &self,
         notebook_id: &NotebookId,
         title: &str,
         url: &str,
+        force_js_render: bool,
     ) -> Result<AddSourceOutcome, LensError> {
         let pool = self.pool().await;
         NotebookRepo::new(&pool)
-            .add_url_source(notebook_id, title, url)
+            .add_url_source(notebook_id, title, url, force_js_render)
             .await
     }
 
@@ -794,6 +819,22 @@ impl LensEngine {
     /// this to decide whether to dispatch; `None` → degrade to raw vectors).
     pub async fn llm_provider(&self) -> Option<Arc<dyn LlmProvider>> {
         self.llm_provider.read().await.clone()
+    }
+
+    /// Installs (or replaces) the JS renderer for the SPA URL-render fallback
+    /// (issue #78). `None` clears it (the near-empty SPA path degrades to
+    /// `needs_js`). Mirrors [`set_llm_provider`](Self::set_llm_provider): the
+    /// concrete `TauriJsRenderer` lives in `src-tauri` and is injected here at
+    /// app setup because `lens-core` cannot depend on `tauri`.
+    pub async fn set_js_renderer(&self, renderer: Option<Arc<dyn render::JsRenderer>>) {
+        *self.js_renderer.write().await = renderer;
+    }
+
+    /// Returns a clone of the active JS renderer handle, or `None` when none is
+    /// installed (the URL-ingest fallback then keeps the legacy `needs_js`
+    /// behavior).
+    pub async fn js_renderer(&self) -> Option<Arc<dyn render::JsRenderer>> {
+        self.js_renderer.read().await.clone()
     }
 
     /// Non-blocking enqueue of a source for background enrichment (AC3).
