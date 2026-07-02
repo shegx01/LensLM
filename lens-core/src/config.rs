@@ -972,6 +972,50 @@ mod tests {
     }
 
     #[test]
+    fn chat_model_round_trips_persist_and_reload() {
+        // Issue #90 Rev-2: Studio & Chat model persists to `EnrichmentConfig.chat_model`
+        // (the reserved M5 field). This test verifies the full serialize → save → reload
+        // round-trip so the persistence path is confirmed before M5 wires the consumer.
+        // `chat_model` is `#[serde(default)]`, so `None` round-trips for free (covered
+        // in `missing_per_task_models_deserialize_to_none`). This test exercises `Some`.
+        let dir = tempfile::tempdir().unwrap();
+        let config = AppConfig {
+            enrichment: EnrichmentConfig {
+                enabled: true,
+                chat_model: Some(TaskModel {
+                    provider: "openai".to_string(),
+                    model: "gpt-4o".to_string(),
+                }),
+                ..EnrichmentConfig::default()
+            },
+            ..AppConfig::default()
+        };
+        config.save(dir.path()).unwrap();
+        let loaded = AppConfig::load(dir.path()).unwrap();
+        assert_eq!(
+            loaded.enrichment.chat_model,
+            Some(TaskModel {
+                provider: "openai".to_string(),
+                model: "gpt-4o".to_string(),
+            }),
+            "chat_model must survive a save→reload cycle intact"
+        );
+        // Sanity: other task-model pins are unaffected.
+        assert_eq!(loaded.enrichment.coref_model, None);
+        assert_eq!(loaded.enrichment.map_model, None);
+        // The JSON on disk must carry a `chat_model` key with the correct values.
+        let on_disk = std::fs::read_to_string(dir.path().join(CONFIG_FILE_NAME)).unwrap();
+        assert!(
+            on_disk.contains("\"chat_model\""),
+            "chat_model key must appear in config.json"
+        );
+        assert!(
+            on_disk.contains("\"gpt-4o\""),
+            "chat_model.model must appear in config.json"
+        );
+    }
+
+    #[test]
     fn task_model_serializes_to_flat_snake_case() {
         // The on-disk JSON + TS mirror depend on the flat `{provider, model}` shape.
         let tm = TaskModel {

@@ -506,9 +506,16 @@ async fn rescan_rebinds_provider_and_reenqueues() {
     // (the consent flag is no longer a threaded param), so enable enrichment.
     let mut config = engine.config().await;
     config.enrichment.enabled = true;
+    // A fixed always-refused port (127.0.0.1:1), NOT the default Ollama port
+    // (11434): the enrichment-model preflight (issue #90) now marks a source
+    // `failed` when a REACHABLE Ollama is missing the configured model, so a real
+    // Ollama running on 11434 (dev machines) would flip this test's expected
+    // `pending` to `failed`. Port 1 is deterministically unreachable everywhere
+    // (the parallel-test-safe pattern used across the suite), so `reachable()` is
+    // false ⇒ the preflight proceeds ⇒ the worker degrades to `pending` as intended.
     config.models = vec![lens_core::config::ModelConfig {
         provider: "ollama".to_string(),
-        base_url: "http://127.0.0.1:11434".to_string(),
+        base_url: "http://127.0.0.1:1".to_string(),
         model: "llama3".to_string(),
         ..Default::default()
     }];
@@ -529,7 +536,7 @@ async fn rescan_rebinds_provider_and_reenqueues() {
         engine.llm_provider().await.is_some(),
         "rescan must install the provider from config"
     );
-    // The provider points at an unbound localhost port (not reachable in CI), and
+    // The provider points at an always-refused localhost port (not reachable), and
     // the source has no chunks ⇒ the re-enqueued job degrades to `pending`. The
     // assertion is that the rescan RE-ENQUEUED it (the worker dequeued + advanced).
     assert!(

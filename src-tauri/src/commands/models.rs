@@ -6,7 +6,67 @@
 
 use std::collections::BTreeMap;
 
-use lens_core::{LensEngine, LensError, ModelInfo, ProviderEntry};
+use lens_core::{
+    LensEngine, LensError, ModelInfo, ModelValidation, ProviderEntry,
+    validate_model_interactive as core_validate_model_interactive,
+};
+use serde::Serialize;
+
+/// Result of an interactive enrichment-model validation (issue #90).
+///
+/// FROZEN IPC CONTRACT: the frontend depends on this shape verbatim — `status` is
+/// `"valid"` or `"invalid"`, and `reason` is present (with an actionable message)
+/// only when `status == "invalid"`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ModelValidationResult {
+    /// `"valid"` when the model is usable, `"invalid"` otherwise.
+    pub status: String,
+    /// Human-readable, actionable reason when `status == "invalid"`; `None` when valid.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl From<ModelValidation> for ModelValidationResult {
+    fn from(v: ModelValidation) -> Self {
+        match v {
+            ModelValidation::Pass => ModelValidationResult {
+                status: "valid".to_string(),
+                reason: None,
+            },
+            ModelValidation::Invalid(reason) => ModelValidationResult {
+                status: "invalid".to_string(),
+                reason: Some(reason),
+            },
+        }
+    }
+}
+
+/// Validates a model for ANY role (enrichment or studio/chat) from RAW,
+/// not-yet-persisted params (issue #90) so the onboarding `LlmConfigPanel` can
+/// block a bad model BEFORE persisting config.
+///
+/// - Local: `provider == "ollama"` ⇒ tags-membership of `model` in the runtime at
+///   `base_url` (free, deterministic).
+/// - Cloud: builds a temporary provider from the raw params and runs a `max_tokens:1`
+///   live probe with a 10s timeout.
+///
+/// The `provider` id is derived by the frontend from the active tab (local tab sends
+/// `"ollama"`; cloud tab sends the selected cloud provider id). This does NOT read
+/// [`lens_core::AppConfig`] — it validates exactly what the user typed.
+///
+/// Invoked as `invoke("validate_model_interactive", { provider, model, base_url, api_key })`.
+#[tracing::instrument(skip_all, fields(provider = %provider, model = %model))]
+#[tauri::command(rename_all = "snake_case")]
+pub async fn validate_model_interactive(
+    provider: String,
+    model: String,
+    base_url: String,
+    api_key: String,
+) -> Result<ModelValidationResult, LensError> {
+    let validation = core_validate_model_interactive(&provider, &model, &base_url, &api_key).await;
+    Ok(validation.into())
+}
 
 /// Returns the full typed model catalog (provider key → entry), loaded from the
 /// cached `models-catalog.json` or the bundled snapshot. Never fails hard.
@@ -120,6 +180,42 @@ mod tests {
             .await
             .expect("graceful empty, never an error");
         assert!(models.is_empty());
+    }
+
+    #[tokio::test]
+    async fn validate_model_interactive_local_unreachable_is_invalid() {
+        // Ollama not running (always-refused port) ⇒ the model is not in an (empty)
+        // tags list ⇒ `invalid` with an actionable `ollama pull` reason. Mirrors the
+        // graceful `list_ollama_models_empty_when_unreachable` pattern (no error).
+        let result = validate_model_interactive(
+            "ollama".to_string(),
+            "llama3.2:3b".to_string(),
+            "http://127.0.0.1:1".to_string(),
+            String::new(),
+        )
+        .await
+        .expect("validation returns Ok, never an Err");
+        assert_eq!(result.status, "invalid");
+        let reason = result.reason.expect("invalid carries a reason");
+        assert!(reason.contains("llama3.2:3b"), "got {reason}");
+        assert!(reason.contains("ollama pull"), "got {reason}");
+    }
+
+    #[test]
+    fn model_validation_result_serializes_frozen_ipc_shape() {
+        // FROZEN IPC CONTRACT the frontend lane depends on: `{ status, reason? }`.
+        // Valid ⇒ `reason` omitted (skip_serializing_if None); invalid ⇒ present.
+        let valid: ModelValidationResult = ModelValidation::Pass.into();
+        assert_eq!(
+            serde_json::to_value(&valid).unwrap(),
+            serde_json::json!({ "status": "valid" })
+        );
+        let invalid: ModelValidationResult =
+            ModelValidation::Invalid("bad model".to_string()).into();
+        assert_eq!(
+            serde_json::to_value(&invalid).unwrap(),
+            serde_json::json!({ "status": "invalid", "reason": "bad model" })
+        );
     }
 
     #[tokio::test]

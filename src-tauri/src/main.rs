@@ -74,6 +74,7 @@ fn main() {
             commands::models::list_models,
             commands::models::list_provider_models,
             commands::models::list_ollama_models,
+            commands::models::validate_model_interactive,
             commands::models::refresh_models,
             // Dev-only streaming demonstrator; absent from the release surface.
             #[cfg(debug_assertions)]

@@ -31,6 +31,10 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434";
 /// Default LM Studio OpenAI-compatible base URL.
 const DEFAULT_LMSTUDIO_BASE_URL: &str = "http://localhost:1234";
+/// Timeout for the cloud enrichment-model live probe (issue #90). A single
+/// `max_tokens:1` generate proves key + model + reachability; the timeout caps a
+/// hanging endpoint so a system check never stalls onboarding.
+const CLOUD_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Allowlisted embedding model ids the embedding-model gate accepts.
 ///
 /// DERIVED from [`crate::embedder::registry::REGISTRY`] at init time (NOT a
@@ -419,6 +423,155 @@ async fn detect_lmstudio(client: &reqwest::Client, base_url: &str) -> bool {
     !probe_openai_endpoint(client, base_url).await.is_empty()
 }
 
+/// Outcome of the enrichment-model validation (issue #90). NOT a [`CheckStatus`]
+/// variant — that enum is the frozen IPC contract and stays two-valued.
+///
+/// `Pass` means the resolved enrichment model is usable (or enrichment is opted
+/// out); `Invalid(reason)` carries a human-readable, actionable message that
+/// [`probe_llm_runtime`] folds into the `LlmRuntime` row's `detail`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelValidation {
+    /// The resolved enrichment model is usable (or enrichment is disabled).
+    Pass,
+    /// The resolved enrichment model is unusable; the string is an actionable reason.
+    Invalid(String),
+}
+
+/// Returns a standardized "model not installed in Ollama" message.
+///
+/// The canonical wording is used at all three validation sites
+/// (system-check path, interactive-panel path, enrichment worker preflight)
+/// so the user always sees the same actionable message.
+pub fn ollama_model_missing_reason(model: &str) -> String {
+    format!("Model '{model}' is not installed in Ollama. Run `ollama pull {model}` to install it.")
+}
+
+/// Runs a single `max_tokens:1` live probe against `provider`, wrapped in a
+/// [`CLOUD_PROBE_TIMEOUT`] timeout.  Returns [`ModelValidation::Pass`] on success
+/// or an [`ModelValidation::Invalid`] with a prefixed reason on failure.
+///
+/// `err_prefix` is prepended to "probe failed" / "probe timed out" messages so
+/// call-sites can distinguish enrichment-check failures from interactive-panel
+/// failures in logs and UI copy.
+async fn cloud_probe(provider: &dyn crate::llm::LlmProvider, err_prefix: &str) -> ModelValidation {
+    let req = crate::llm::LlmRequest {
+        system: None,
+        prompt: "hi".to_string(),
+        max_tokens: 1,
+        temperature: 0.0,
+        json: false,
+        thinking: false,
+        reasoning_effort: None,
+    };
+    match tokio::time::timeout(CLOUD_PROBE_TIMEOUT, provider.generate(&req)).await {
+        Ok(Ok(_)) => ModelValidation::Pass,
+        Ok(Err(e)) => ModelValidation::Invalid(format!("{err_prefix} probe failed: {e}")),
+        Err(_) => ModelValidation::Invalid(format!(
+            "{err_prefix} probe timed out after {}s",
+            CLOUD_PROBE_TIMEOUT.as_secs()
+        )),
+    }
+}
+
+/// Validates that the ENRICHMENT model the worker will actually use is available.
+///
+/// Resolves the provider through the SAME [`crate::llm::provider_from_config`]
+/// factory the engine startup uses (`lib.rs`), so validation targets exactly the
+/// model the worker will generate with (routing- and consent-aware). Asymmetric by
+/// design (issue #90 Principle 3):
+///
+/// - `enrichment.enabled == false` (informed opt-out) ⇒ [`ModelValidation::Pass`].
+/// - No provider resolves while enabled ⇒ [`ModelValidation::Invalid`] (config error).
+/// - Local Ollama ⇒ tags-membership check via [`list_ollama_models`] (free,
+///   deterministic; no token spend).
+/// - Cloud ⇒ a live `max_tokens:1` [`generate`](crate::llm::LlmProvider::generate)
+///   probe wrapped in a [`CLOUD_PROBE_TIMEOUT`] `tokio::time::timeout`.
+/// - Local non-Ollama (LM Studio) or a non-`GenaiProvider` ⇒ reachability is
+///   sufficient (no `/api/tags` equivalent), so [`ModelValidation::Pass`].
+pub async fn validate_enrichment_model(config: &AppConfig) -> ModelValidation {
+    // 1. Opt-out short-circuit.
+    if !config.enrichment.enabled {
+        return ModelValidation::Pass;
+    }
+
+    // 2. Resolve the provider via the SAME factory the worker/startup uses.
+    let provider = match crate::llm::provider_from_config(config, config.enrichment.cloud_consent) {
+        Some(p) => p,
+        // 3. No provider resolved while enrichment is enabled ⇒ Invalid.
+        None => {
+            return ModelValidation::Invalid(
+                "Enrichment is enabled but no LLM provider is configured for the current routing policy"
+                    .to_string(),
+            );
+        }
+    };
+
+    // 4. Inspect the resolved provider. Only a local Ollama `GenaiProvider` gets a
+    // tags-membership check; a cloud `GenaiProvider` gets a live probe; anything
+    // else (local non-Ollama, or a non-`GenaiProvider` mock) is reachability-
+    // sufficient.
+    let genai = provider
+        .as_any()
+        .downcast_ref::<crate::llm::GenaiProvider>();
+    match genai {
+        Some(g) if g.is_ollama() => {
+            let model = provider.model_id().to_string();
+            let installed = list_ollama_models(&ollama_base_url(config)).await;
+            if installed.iter().any(|m| m == &model) {
+                ModelValidation::Pass
+            } else {
+                ModelValidation::Invalid(format!(
+                    "LLM runtime detected, but {}",
+                    ollama_model_missing_reason(&model)
+                ))
+            }
+        }
+        // Cloud provider (a `GenaiProvider` whose adapter is not Ollama): live probe.
+        Some(_) => cloud_probe(provider.as_ref(), "Cloud enrichment model").await,
+        // Non-`GenaiProvider` (e.g. a test mock) or a local non-Ollama runtime:
+        // reachability (already confirmed by the runtime probe) is sufficient.
+        None => ModelValidation::Pass,
+    }
+}
+
+/// Validates an enrichment model from RAW, not-yet-persisted params (issue #90
+/// interactive path — the `LlmConfigPanel` Save/Test Connection pre-save probe).
+///
+/// Unlike [`validate_enrichment_model`] (which reads the persisted [`AppConfig`] via
+/// `provider_from_config`), this validates exactly the values the user typed BEFORE
+/// they are saved, so the panel can block a bad model without persisting it:
+///
+/// - `provider == "ollama"` ⇒ tags-membership of `model` in `list_ollama_models(base_url)`.
+/// - Otherwise (cloud) ⇒ build a temporary provider from the raw params and run a
+///   `max_tokens:1` live probe wrapped in a [`CLOUD_PROBE_TIMEOUT`] timeout.
+///
+/// The `provider` id is derived by the frontend from the active tab (local → `"ollama"`,
+/// cloud → the selected cloud provider id).
+pub async fn validate_model_interactive(
+    provider: &str,
+    model: &str,
+    base_url: &str,
+    api_key: &str,
+) -> ModelValidation {
+    // Local Ollama: free, deterministic tags-membership check.
+    if provider.eq_ignore_ascii_case("ollama") {
+        let installed = list_ollama_models(base_url).await;
+        return if installed.iter().any(|m| m == model) {
+            ModelValidation::Pass
+        } else {
+            ModelValidation::Invalid(ollama_model_missing_reason(model))
+        };
+    }
+
+    // Cloud: build a temp provider from the raw params and run a live probe.
+    let Some(provider) = crate::llm::build_provider_raw(provider, model, base_url, api_key) else {
+        return ModelValidation::Invalid(
+            "Unrecognized provider or missing endpoint for the selected model".to_string(),
+        );
+    };
+    cloud_probe(provider.as_ref(), "Cloud model").await
+}
+
 /// Probe 1 — LLM runtime readiness gate.
 ///
 /// PASSES when EITHER a local runtime is reachable OR a cloud provider is
@@ -443,7 +596,7 @@ async fn probe_llm_runtime(config: &AppConfig) -> LlmRuntimeProbe {
     let ollama_up = ollama_version.is_some();
     let cloud_ok = has_cloud_llm(config);
 
-    let result = match (ollama_up, lmstudio_up, cloud_ok) {
+    let mut result = match (ollama_up, lmstudio_up, cloud_ok) {
         (true, _, _) | (_, true, _) => CheckResult {
             id: CheckId::LlmRuntime,
             label: "LLM runtime".to_string(),
@@ -466,6 +619,19 @@ async fn probe_llm_runtime(config: &AppConfig) -> LlmRuntimeProbe {
             action: Some(CheckAction::Configure),
         },
     };
+
+    // Enrichment-model validation (issue #90): only when the preliminary
+    // reachability check PASSED does an invalid enrichment model override the row to
+    // Fail. A preliminary Fail (no runtime at all) stays Fail — the enrichment check
+    // is moot without a runtime. Opt-out (enrichment disabled) is handled inside
+    // `validate_enrichment_model` (returns Pass).
+    if result.status == CheckStatus::Pass
+        && let ModelValidation::Invalid(reason) = validate_enrichment_model(config).await
+    {
+        result.status = CheckStatus::Fail;
+        result.detail = reason;
+        result.action = Some(CheckAction::Configure);
+    }
 
     LlmRuntimeProbe {
         result,
@@ -1587,6 +1753,362 @@ mod tests {
             .await;
         let models = list_ollama_models(&server.uri()).await;
         assert!(models.is_empty(), "no /api/version ⇒ Ollama absent ⇒ empty");
+    }
+
+    // --- enrichment model validation (issue #90) ---------------------------
+    //
+    // These tests exercise `validate_enrichment_model` and its integration into
+    // `probe_llm_runtime`. The Ollama tags path is mocked via wiremock; the cloud
+    // path is mocked by pointing an `openai-compatible` provider at a wiremock
+    // server that answers `/v1/chat/completions` — NO real network in CI.
+
+    use crate::config::EnrichmentConfig;
+    use crate::llm::LlmRouting;
+
+    /// An OpenAI-compatible `/v1/chat/completions` success body (genai parses
+    /// `choices[0].message.content` + `usage`).
+    fn openai_chat_body(content: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "gpt-test",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": content },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+        })
+    }
+
+    /// Config with a single local Ollama enrichment entry, `enabled` + LocalFirst
+    /// routing so the resolved provider is deterministically the Ollama entry.
+    fn config_enrichment_ollama(base_url: &str, model: &str, enabled: bool) -> AppConfig {
+        AppConfig {
+            models: vec![ModelConfig {
+                provider: "ollama".to_string(),
+                base_url: base_url.to_string(),
+                model: model.to_string(),
+                ..ModelConfig::default()
+            }],
+            enrichment: EnrichmentConfig {
+                enabled,
+                routing: LlmRouting::LocalFirst,
+                ..EnrichmentConfig::default()
+            },
+            ..AppConfig::default()
+        }
+    }
+
+    /// Config with a single cloud (openai-compatible) enrichment entry pointed at
+    /// `base_url`, consented so the provider resolves.
+    fn config_enrichment_cloud(base_url: &str, model: &str) -> AppConfig {
+        AppConfig {
+            models: vec![ModelConfig {
+                provider: "openai-compatible".to_string(),
+                base_url: base_url.to_string(),
+                model: model.to_string(),
+                api_key: "sk-test".to_string(),
+                ..ModelConfig::default()
+            }],
+            enrichment: EnrichmentConfig {
+                enabled: true,
+                cloud_consent: true,
+                routing: LlmRouting::CloudFirst,
+                ..EnrichmentConfig::default()
+            },
+            ..AppConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn enrichment_validation_opt_out() {
+        // enrichment.enabled == false ⇒ Pass regardless of model state (no provider
+        // resolution, no probe).
+        let config = config_enrichment_ollama("http://127.0.0.1:1", "llama3.2:3b", false);
+        assert!(matches!(
+            validate_enrichment_model(&config).await,
+            ModelValidation::Pass
+        ));
+    }
+
+    #[tokio::test]
+    async fn enrichment_validation_no_provider_but_enabled() {
+        // enabled but NO models configured ⇒ no provider resolves ⇒ Invalid.
+        let config = AppConfig {
+            enrichment: EnrichmentConfig {
+                enabled: true,
+                ..EnrichmentConfig::default()
+            },
+            ..AppConfig::default()
+        };
+        match validate_enrichment_model(&config).await {
+            ModelValidation::Invalid(reason) => {
+                assert!(
+                    reason.to_lowercase().contains("no llm provider"),
+                    "got {reason}"
+                );
+            }
+            ModelValidation::Pass => panic!("expected Invalid when enabled + no provider"),
+        }
+    }
+
+    #[tokio::test]
+    async fn enrichment_validation_local_model_present() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/version"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "version": "0.4.1"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [{ "name": "llama3.2:3b" }]
+            })))
+            .mount(&server)
+            .await;
+
+        let config = config_enrichment_ollama(&server.uri(), "llama3.2:3b", true);
+        assert!(matches!(
+            validate_enrichment_model(&config).await,
+            ModelValidation::Pass
+        ));
+    }
+
+    #[tokio::test]
+    async fn enrichment_validation_local_model_missing() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/version"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "version": "0.4.1"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [{ "name": "mistral:7b" }]
+            })))
+            .mount(&server)
+            .await;
+
+        let config = config_enrichment_ollama(&server.uri(), "llama3.2:3b", true);
+        match validate_enrichment_model(&config).await {
+            ModelValidation::Invalid(reason) => {
+                assert!(reason.contains("llama3.2:3b"), "got {reason}");
+            }
+            ModelValidation::Pass => panic!("expected Invalid for a missing local model"),
+        }
+    }
+
+    #[tokio::test]
+    async fn enrichment_validation_cloud_probe_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(openai_chat_body("ok")))
+            .mount(&server)
+            .await;
+
+        let config = config_enrichment_cloud(&server.uri(), "gpt-test");
+        assert!(
+            matches!(
+                validate_enrichment_model(&config).await,
+                ModelValidation::Pass
+            ),
+            "a successful cloud probe passes"
+        );
+    }
+
+    #[tokio::test]
+    async fn enrichment_validation_cloud_probe_fail() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let config = config_enrichment_cloud(&server.uri(), "gpt-test");
+        match validate_enrichment_model(&config).await {
+            ModelValidation::Invalid(reason) => {
+                assert!(
+                    reason.to_lowercase().contains("cloud"),
+                    "reason names the cloud probe: {reason}"
+                );
+            }
+            ModelValidation::Pass => panic!("expected Invalid on a failing cloud probe"),
+        }
+    }
+
+    #[tokio::test]
+    async fn enrichment_validation_cloud_probe_timeout() {
+        // A cloud endpoint that hangs beyond the 10s probe timeout ⇒ Invalid. The
+        // wiremock delay (11s) exceeds `CLOUD_PROBE_TIMEOUT` (10s), so the
+        // `tokio::time::timeout` fires first.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(openai_chat_body("ok"))
+                    .set_delay(Duration::from_secs(11)),
+            )
+            .mount(&server)
+            .await;
+
+        let config = config_enrichment_cloud(&server.uri(), "gpt-test");
+        match validate_enrichment_model(&config).await {
+            ModelValidation::Invalid(reason) => {
+                assert!(
+                    reason.to_lowercase().contains("timed out")
+                        || reason.to_lowercase().contains("timeout"),
+                    "reason names the timeout: {reason}"
+                );
+            }
+            ModelValidation::Pass => panic!("expected Invalid on a hanging cloud probe"),
+        }
+    }
+
+    #[tokio::test]
+    async fn enrichment_validation_routing_resolves_correct_model() {
+        // Two local Ollama entries; Explicit routing pins the SECOND (mistral:7b).
+        // Validation must check mistral:7b (the pinned model), which IS in tags,
+        // even though the first entry (llama3.2:3b) is NOT — proving validation
+        // targets the routing-resolved model, not just any config entry.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/version"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "version": "0.4.1"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [{ "name": "mistral:7b" }]
+            })))
+            .mount(&server)
+            .await;
+
+        let config = AppConfig {
+            models: vec![
+                ModelConfig {
+                    provider: "ollama".to_string(),
+                    base_url: server.uri(),
+                    model: "llama3.2:3b".to_string(),
+                    ..ModelConfig::default()
+                },
+                ModelConfig {
+                    provider: "ollama".to_string(),
+                    base_url: server.uri(),
+                    model: "mistral:7b".to_string(),
+                    ..ModelConfig::default()
+                },
+            ],
+            enrichment: EnrichmentConfig {
+                enabled: true,
+                routing: LlmRouting::Explicit {
+                    provider: "ollama".to_string(),
+                    model: "mistral:7b".to_string(),
+                },
+                ..EnrichmentConfig::default()
+            },
+            ..AppConfig::default()
+        };
+        assert!(
+            matches!(
+                validate_enrichment_model(&config).await,
+                ModelValidation::Pass
+            ),
+            "Explicit routing validates the pinned mistral:7b (present), not llama3.2:3b (absent)"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_llm_runtime_fails_enrichment_model_missing() {
+        // Ollama reachable, but the enrichment model is not in tags ⇒ the LlmRuntime
+        // row is overridden to Fail with the enrichment detail + Configure action.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/version"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "version": "0.4.1"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [{ "name": "mistral:7b" }]
+            })))
+            .mount(&server)
+            .await;
+
+        let config = config_enrichment_ollama(&server.uri(), "llama3.2:3b", true);
+        let probe = probe_llm_runtime(&config).await;
+        assert_eq!(probe.result.status, CheckStatus::Fail);
+        assert_eq!(probe.result.action, Some(CheckAction::Configure));
+        assert!(
+            probe.result.detail.contains("llama3.2:3b"),
+            "detail names the missing model: {}",
+            probe.result.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_llm_runtime_passes_enrichment_disabled() {
+        // Ollama reachable + enrichment disabled ⇒ Pass (opt-out), regardless of the
+        // configured model not being installed.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/version"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "version": "0.4.1"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [{ "name": "mistral:7b" }]
+            })))
+            .mount(&server)
+            .await;
+
+        let config = config_enrichment_ollama(&server.uri(), "llama3.2:3b", false);
+        let probe = probe_llm_runtime(&config).await;
+        assert_eq!(probe.result.status, CheckStatus::Pass);
+    }
+
+    #[tokio::test]
+    async fn probe_llm_runtime_passes_enrichment_model_valid() {
+        // Ollama reachable + enrichment model present in tags ⇒ Pass.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/version"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "version": "0.4.1"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [{ "name": "llama3.2:3b" }]
+            })))
+            .mount(&server)
+            .await;
+
+        let config = config_enrichment_ollama(&server.uri(), "llama3.2:3b", true);
+        let probe = probe_llm_runtime(&config).await;
+        assert_eq!(probe.result.status, CheckStatus::Pass);
     }
 
     /// Snapshot the exact serde wire-format of `LlmDetection`. Locks the FROZEN

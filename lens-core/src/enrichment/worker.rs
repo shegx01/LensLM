@@ -168,6 +168,30 @@ async fn process_job(
         return Ok(());
     }
 
+    // ── Pre-enrichment preflight (issue #90 defense-in-depth). BEFORE marking the
+    // source `Enriching`, validate the resolved model is actually usable. A known-bad
+    // model (no provider configured, or a local Ollama model that isn't pulled) is
+    // failed-fast with a human-readable reason in `enrichment_meta.failure_reason` —
+    // instead of a bare WARN / raw 404 mid-pipeline. This is distinct from a
+    // temporarily-unreachable provider, which the `reachable()` check below still
+    // degrades to `pending` (a runtime flap, not a config error).
+    let ollama_base = crate::system_check::ollama_base_url(&engine.config().await);
+    if let PreflightOutcome::Fail(reason) =
+        preflight_enrichment_provider(provider.as_ref(), &ollama_base).await
+    {
+        let meta = EnrichmentMeta {
+            failure_reason: Some(reason.clone()),
+            ..EnrichmentMeta::default()
+        };
+        persist_meta(&repo, &job.source_id, EnrichmentStatus::Failed, &meta).await?;
+        tracing::warn!(
+            source_id = %job.source_id,
+            reason = %reason,
+            "enrichment: preflight failed; source marked failed before enriching"
+        );
+        return Ok(());
+    }
+
     // ── Mark enriching (the Step-4→Step-5 handoff/in-flight state).
     repo.update_enrichment_status(&job.source_id, EnrichmentStatus::Enriching)
         .await?;
@@ -261,6 +285,7 @@ async fn process_job(
             budget_exceeded: false,
             tokens_spent: budget.job_tokens(),
             calls_made: budget.job_calls(),
+            failure_reason: None,
         };
         persist_meta(&repo, &job.source_id, EnrichmentStatus::Skipped, &meta).await?;
         tracing::debug!(
@@ -299,6 +324,7 @@ async fn process_job(
                     budget_exceeded: true,
                     tokens_spent: budget.job_tokens(),
                     calls_made: budget.job_calls(),
+                    failure_reason: None,
                 };
                 persist_meta(&repo, &job.source_id, EnrichmentStatus::Failed, &meta).await?;
                 tracing::warn!(
@@ -317,6 +343,7 @@ async fn process_job(
                     budget_exceeded: false,
                     tokens_spent: budget.job_tokens(),
                     calls_made: budget.job_calls(),
+                    failure_reason: None,
                 };
                 persist_meta(&repo, &job.source_id, EnrichmentStatus::Failed, &meta).await?;
                 tracing::warn!(source_id = %job.source_id, "enrichment: LLM error, failed: {e}");
@@ -360,6 +387,7 @@ async fn process_job(
                     budget_exceeded: true,
                     tokens_spent: budget.job_tokens(),
                     calls_made: budget.job_calls(),
+                    failure_reason: None,
                 };
                 persist_meta(&repo, &job.source_id, EnrichmentStatus::Failed, &meta).await?;
                 tracing::warn!(
@@ -423,6 +451,7 @@ async fn process_job(
         budget_exceeded: false,
         tokens_spent: budget.job_tokens(),
         calls_made: budget.job_calls(),
+        failure_reason: None,
     };
     // Re-check existence before the terminal-ish write (the body may have spanned
     // a purge): a vanished source means the job is moot (AC13 b).
@@ -459,6 +488,7 @@ async fn process_job(
             budget_exceeded: false,
             tokens_spent: budget.job_tokens(),
             calls_made: budget.job_calls(),
+            failure_reason: None,
         };
         persist_meta(&repo, &job.source_id, EnrichmentStatus::Failed, &fail_meta).await?;
         tracing::warn!(source_id = %job.source_id, "enrichment: re-embed flip failed: {e}");
@@ -512,6 +542,82 @@ async fn write_prefix_only(
         })
         .collect();
     repo.write_chunk_enrichment(&updates).await
+}
+
+/// Outcome of the worker's pre-enrichment preflight (issue #90).
+///
+/// `Proceed` means the model is usable, OR the situation is a transient/normal
+/// degrade the DOWNSTREAM AC10 path already handles gracefully (no provider yet, or
+/// a provider whose runtime is temporarily unreachable — both stay `Pending`).
+/// `Fail(reason)` means the model is KNOWN-BAD (the runtime is reachable but the
+/// configured model isn't installed), so the worker persists
+/// `EnrichmentStatus::Failed` with `reason` in `enrichment_meta.failure_reason`
+/// instead of a bare WARN / raw 404.
+#[derive(Debug, PartialEq, Eq)]
+enum PreflightOutcome {
+    /// Continue: the model is usable, or the case is a transient/normal degrade the
+    /// existing AC10 reachability path handles (no provider, or runtime unreachable).
+    Proceed,
+    /// The model is known-bad (runtime reachable but model absent); fail-fast with
+    /// this human-readable reason.
+    Fail(String),
+}
+
+/// Pre-enrichment preflight: catches a KNOWN-BAD local model BEFORE the source is
+/// marked `Enriching` (issue #90 defense-in-depth), while leaving the existing AC10
+/// graceful-degrade contract intact.
+///
+/// - `None` provider ⇒ `Proceed`. A missing provider is the normal first-launch
+///   state (before onboarding installs one); the existing degrade-to-`Pending` path
+///   handles it, and the rescan hook re-drives the source once a provider appears.
+///   (Deviation from the plan's literal "None ⇒ Failed": marking sources Failed on
+///   first launch — before the user has configured anything — is wrong, and would
+///   break the AC10 contract encoded in the integration suite. Architect-ratified.)
+/// - Local Ollama that is UNREACHABLE ⇒ `Proceed`: a runtime flap, not a bad model —
+///   the downstream `reachable()` check degrades it to `Pending` (AC10). We gate on
+///   `provider.reachable()` (a `GET /api/version`) so an unreachable runtime (which
+///   also yields an empty `/api/tags`) is never conflated with an absent model.
+/// - Local Ollama that is REACHABLE but whose `model_id()` is NOT in
+///   `list_ollama_models(base_url)` ⇒ `Fail` — this is the known-bad model #90 targets.
+/// - Any other provider (cloud, or a local non-Ollama / non-`GenaiProvider`) ⇒
+///   `Proceed`: cloud misconfiguration is caught by the onboarding gate plus the
+///   existing `reachable()` + `generate` error handling; there is no `/api/tags`
+///   equivalent to check for a non-Ollama local runtime.
+async fn preflight_enrichment_provider(
+    provider: Option<&std::sync::Arc<dyn crate::llm::LlmProvider>>,
+    ollama_base_url: &str,
+) -> PreflightOutcome {
+    // No provider yet ⇒ let the existing AC10 degrade-to-`Pending` path handle it.
+    let Some(provider) = provider else {
+        return PreflightOutcome::Proceed;
+    };
+
+    // Only a LOCAL Ollama `GenaiProvider` gets a tags-membership check; other
+    // adapters (cloud) or a non-`GenaiProvider` (e.g. a test mock) are reachability-
+    // sufficient here.
+    let is_ollama = provider
+        .as_any()
+        .downcast_ref::<crate::llm::GenaiProvider>()
+        .is_some_and(|p| p.is_ollama());
+    if !is_ollama {
+        return PreflightOutcome::Proceed;
+    }
+
+    // Gate the model-absence check on the runtime being REACHABLE. An unreachable
+    // Ollama also returns an empty `/api/tags`, so without this gate a runtime flap
+    // would be wrongly failed as a missing model (the plan's Pending-vs-Failed
+    // distinction, worker.rs ~234). `reachable()` for Ollama is a free GET /api/version.
+    if !provider.reachable().await {
+        return PreflightOutcome::Proceed;
+    }
+
+    let model = provider.model_id().to_string();
+    let installed = crate::list_ollama_models(ollama_base_url).await;
+    if installed.iter().any(|m| m == &model) {
+        PreflightOutcome::Proceed
+    } else {
+        PreflightOutcome::Fail(crate::system_check::ollama_model_missing_reason(&model))
+    }
 }
 
 #[cfg(test)]
@@ -642,5 +748,162 @@ mod tests {
 
         drop(instruct_server);
         drop(coder_server);
+    }
+
+    // --- Worker pre-enrichment preflight (issue #90) ------------------------
+
+    use super::{PreflightOutcome, preflight_enrichment_provider};
+    use crate::llm::LlmProvider;
+    use std::sync::Arc;
+
+    /// A minimal non-Ollama mock provider (the default `as_any` never downcasts to
+    /// `GenaiProvider`), used to assert the preflight treats a non-`GenaiProvider`
+    /// / non-Ollama provider as reachability-sufficient (Proceed).
+    struct MockCloudProvider;
+    #[async_trait::async_trait]
+    impl LlmProvider for MockCloudProvider {
+        fn model_id(&self) -> &str {
+            "mock-cloud-model"
+        }
+        async fn reachable(&self) -> bool {
+            true
+        }
+        async fn generate(
+            &self,
+            _req: &crate::llm::LlmRequest,
+        ) -> Result<crate::llm::LlmResponse, crate::LensError> {
+            Ok(crate::llm::LlmResponse {
+                text: "ok".to_string(),
+                tokens_used: 1,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_preflight_no_provider() {
+        // No provider at all ⇒ Proceed (the existing AC10 path degrades to `Pending`
+        // and the rescan hook re-drives once a provider appears). Marking sources
+        // Failed on first launch — before onboarding configures anything — would be
+        // wrong; only a KNOWN-BAD local model (runtime reachable, model absent) fails
+        // here. Architect-ratified deviation from the plan's literal "None ⇒ Failed".
+        let outcome = preflight_enrichment_provider(None, "http://127.0.0.1:1").await;
+        assert!(matches!(outcome, PreflightOutcome::Proceed));
+    }
+
+    #[tokio::test]
+    async fn worker_preflight_local_unreachable_proceeds() {
+        // A local Ollama provider whose runtime is UNREACHABLE (dead port) must NOT
+        // be failed as a missing model — it is a runtime flap that the downstream
+        // reachability check degrades to `Pending` (AC10). The preflight proceeds.
+        let config = AppConfig {
+            models: vec![ModelConfig {
+                provider: "ollama".to_string(),
+                base_url: "http://127.0.0.1:1".to_string(),
+                model: "llama3.2:3b".to_string(),
+                ..ModelConfig::default()
+            }],
+            enrichment: EnrichmentConfig {
+                enabled: true,
+                routing: crate::llm::LlmRouting::LocalFirst,
+                ..EnrichmentConfig::default()
+            },
+            ..AppConfig::default()
+        };
+        let provider = provider_from_config(&config, false).expect("local provider");
+        let outcome = preflight_enrichment_provider(Some(&provider), "http://127.0.0.1:1").await;
+        assert!(matches!(outcome, PreflightOutcome::Proceed));
+    }
+
+    #[tokio::test]
+    async fn worker_preflight_local_model_missing() {
+        // Local Ollama up, but the configured model is NOT in /api/tags ⇒ Fail with
+        // an actionable `ollama pull` reason.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/version"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "version": "0.4.1"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [{ "name": "some-other-model:latest" }]
+            })))
+            .mount(&server)
+            .await;
+
+        let config = AppConfig {
+            models: vec![ModelConfig {
+                provider: "ollama".to_string(),
+                base_url: server.uri(),
+                model: "llama3.2:3b".to_string(),
+                ..ModelConfig::default()
+            }],
+            enrichment: EnrichmentConfig {
+                enabled: true,
+                routing: crate::llm::LlmRouting::LocalFirst,
+                ..EnrichmentConfig::default()
+            },
+            ..AppConfig::default()
+        };
+        let provider = provider_from_config(&config, false).expect("local provider");
+        let outcome = preflight_enrichment_provider(Some(&provider), &server.uri()).await;
+        match outcome {
+            PreflightOutcome::Fail(reason) => {
+                assert!(reason.contains("llama3.2:3b"), "got {reason}");
+                assert!(reason.contains("ollama pull"), "got {reason}");
+            }
+            PreflightOutcome::Proceed => panic!("expected Fail for a missing local model"),
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_preflight_local_model_present() {
+        // Local Ollama up AND the configured model IS in /api/tags ⇒ Proceed.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/version"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "version": "0.4.1"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [{ "name": "llama3.2:3b" }]
+            })))
+            .mount(&server)
+            .await;
+
+        let config = AppConfig {
+            models: vec![ModelConfig {
+                provider: "ollama".to_string(),
+                base_url: server.uri(),
+                model: "llama3.2:3b".to_string(),
+                ..ModelConfig::default()
+            }],
+            enrichment: EnrichmentConfig {
+                enabled: true,
+                routing: crate::llm::LlmRouting::LocalFirst,
+                ..EnrichmentConfig::default()
+            },
+            ..AppConfig::default()
+        };
+        let provider = provider_from_config(&config, false).expect("local provider");
+        let outcome = preflight_enrichment_provider(Some(&provider), &server.uri()).await;
+        assert!(matches!(outcome, PreflightOutcome::Proceed));
+    }
+
+    #[tokio::test]
+    async fn worker_preflight_cloud_provider_proceeds() {
+        // A non-Ollama / non-GenaiProvider provider is reachability-sufficient at
+        // the worker preflight (cloud misconfig is caught by the onboarding gate +
+        // the existing reachable()/generate error handling), so Proceed.
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockCloudProvider);
+        let outcome = preflight_enrichment_provider(Some(&provider), "http://127.0.0.1:1").await;
+        assert!(matches!(outcome, PreflightOutcome::Proceed));
     }
 }

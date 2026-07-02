@@ -530,12 +530,33 @@
       } else {
         cloudModel = defaultModelFor(match.id);
       }
+      // Round-trip fix: if a chat_model override was saved for the same cloud
+      // provider, restore it so the model picker reflects the full saved state.
+      const chatModel = cfg.enrichment?.chat_model;
+      if (chatModel && chatModel.provider === match.id && chatModel.model) {
+        cloudModel = chatModel.model;
+        cloudModelPicked = true;
+      }
       cloudApiKey = '';
       // Reload the catalog for the saved provider so the picker + capability
       // controls reflect the restored selection.
       await loadCloudModels();
     } catch {
       // Non-fatal: fall back to the default empty Cloud form.
+    }
+  }
+
+  // Restores a saved local (Ollama) chat_model override from a prior session.
+  // Called from onMount after loadOllamaModels so the picker is populated first.
+  async function restoreSavedLocal(): Promise<void> {
+    try {
+      const cfg = await invoke<AppConfig>('get_config');
+      const chatModel = cfg.enrichment?.chat_model;
+      if (chatModel && chatModel.provider === 'ollama' && chatModel.model) {
+        localModel = chatModel.model;
+      }
+    } catch {
+      // Non-fatal: keep the default local model.
     }
   }
 
@@ -548,6 +569,9 @@
     // resilient (any throw ⇒ empty options + fallback), so onboarding stays
     // non-blocking.
     await Promise.all([loadCloudModels(), loadOllamaModels()]);
+    // Round-trip fix: restore any saved local chat_model override so the local
+    // picker reflects the full saved state (parallel with restoreSavedCloud).
+    await restoreSavedLocal();
     await restoreSavedCloud();
     // After the immediate (loaded) options are on screen and any saved provider
     // is restored, trigger a LIVE refresh + re-read in the background so an online

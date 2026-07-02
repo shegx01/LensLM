@@ -1396,3 +1396,149 @@ describe('LlmConfigPanel — routing + coref override', () => {
     );
   });
 });
+
+// ──────────────────────────────────────────────────────────────────────────
+// chat_model round-trip — restore + preserve (Fix 1)
+// ──────────────────────────────────────────────────────────────────────────
+
+describe('LlmConfigPanel — chat_model round-trip', () => {
+  it('restores a saved ollama chat_model: local tab model picker shows the saved model', async () => {
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') {
+        const cfg = baseConfig();
+        return {
+          ...cfg,
+          enrichment: {
+            ...cfg.enrichment,
+            chat_model: { provider: 'ollama', model: 'qwen2.5:7b' }
+          }
+        };
+      }
+      if (cmd === 'set_config') return null;
+      if (cmd === 'list_provider_models')
+        return cloudCatalog((args as { provider: string }).provider);
+      if (cmd === 'list_ollama_models') return ['llama3.2:3b', 'qwen2.5:7b'];
+    });
+
+    render(SystemCheckRow, { props: { result: llmRow(), oncheck: vi.fn() } });
+    await fireEvent.click(screen.getByRole('button', { name: /configure/i }));
+
+    // The local model picker must reflect the saved chat_model.
+    const modelSelect = (await waitFor(() =>
+      screen.getByLabelText('Model', { selector: '#llm-model-local' })
+    )) as HTMLSelectElement;
+    await waitFor(() => expect(modelSelect.value).toBe('qwen2.5:7b'));
+  });
+
+  it('restores a saved openai chat_model: cloud tab model picker shows the saved model', async () => {
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') {
+        const cfg = baseConfig();
+        return {
+          ...cfg,
+          models: [
+            {
+              provider: 'openai',
+              base_url: '',
+              model: 'gpt-4o',
+              context: 128000,
+              temperature: 0.7,
+              api_key: 'sk-saved-secret'
+            }
+          ],
+          enrichment: {
+            ...cfg.enrichment,
+            chat_model: { provider: 'openai', model: 'gpt-4o' }
+          }
+        };
+      }
+      if (cmd === 'set_config') return null;
+      if (cmd === 'list_provider_models')
+        return cloudCatalog((args as { provider: string }).provider);
+      if (cmd === 'list_ollama_models') return [];
+    });
+
+    render(SystemCheckRow, { props: { result: llmRow(), oncheck: vi.fn() } });
+    await fireEvent.click(screen.getByRole('button', { name: /configure/i }));
+    await waitFor(() =>
+      expect(screen.getByRole('tab', { name: /cloud api/i })).toBeInTheDocument()
+    );
+    await fireEvent.click(screen.getByRole('tab', { name: /cloud api/i }));
+
+    // The cloud model picker must reflect the saved chat_model.
+    const cloudSelect = (await waitFor(() =>
+      screen.getByLabelText('Model', { selector: '#llm-cloud-model' })
+    )) as HTMLSelectElement;
+    await waitFor(() => expect(cloudSelect.value).toBe('gpt-4o'));
+  });
+
+  it('a subsequent save preserves chat_model: it round-trips and is not cleared to null', async () => {
+    const setConfig = vi.fn();
+    const oncheck = vi.fn().mockResolvedValue(undefined);
+
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') {
+        const cfg = baseConfig();
+        return {
+          ...cfg,
+          models: [
+            {
+              provider: 'openai',
+              base_url: '',
+              model: 'gpt-4o',
+              context: 128000,
+              temperature: 0.7,
+              api_key: 'sk-saved-secret'
+            }
+          ],
+          enrichment: {
+            ...cfg.enrichment,
+            chat_model: { provider: 'openai', model: 'gpt-4o' }
+          }
+        };
+      }
+      if (cmd === 'set_config') {
+        setConfig(args);
+        return null;
+      }
+      if (cmd === 'list_provider_models')
+        return cloudCatalog((args as { provider: string }).provider);
+      if (cmd === 'list_ollama_models') return [];
+    });
+
+    render(SystemCheckRow, { props: { result: llmRow(), oncheck } });
+    await fireEvent.click(screen.getByRole('button', { name: /configure/i }));
+    await waitFor(() =>
+      expect(screen.getByRole('tab', { name: /cloud api/i })).toBeInTheDocument()
+    );
+    await fireEvent.click(screen.getByRole('tab', { name: /cloud api/i }));
+
+    // Wait for the cloud model to be restored.
+    const cloudSelect = (await waitFor(() =>
+      screen.getByLabelText('Model', { selector: '#llm-cloud-model' })
+    )) as HTMLSelectElement;
+    await waitFor(() => expect(cloudSelect.value).toBe('gpt-4o'));
+
+    // Re-enter a key (masked) and save — the chat_model must not be cleared.
+    const keyField = screen.getByLabelText(/api key/i);
+    await fireEvent.focus(keyField);
+    await fireEvent.input(keyField, { target: { value: 'sk-new-key' } });
+    await fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+    // The saved model entry must still carry the restored model id.
+    await waitFor(() =>
+      expect(setConfig).toHaveBeenCalledWith(
+        expect.objectContaining({
+          config: expect.objectContaining({
+            models: expect.arrayContaining([
+              expect.objectContaining({
+                provider: 'openai',
+                model: 'gpt-4o'
+              })
+            ])
+          })
+        })
+      )
+    );
+  });
+});
