@@ -79,12 +79,26 @@ use tauri::{Manager, Url, WebviewUrl};
 /// even begin fetching data, then need time to fetch + render. 20s leaves headroom
 /// for a ~5s-to-start SPA plus fetch/render, while still bounding the held ingest
 /// permit.
+/// TEMPORARY (issue #78 debugging): when `true`, the render window is created
+/// VISIBLE + decorated at an on-screen spot so we can watch what the page actually
+/// renders (blank / bot wall / real content) while diagnosing the WKWebView
+/// suspension. Flip to `false` to restore the hidden (alpha-0, macOS) behavior for
+/// production. Paired with the per-poll `eval` diagnostics.
+const DEBUG_SHOW_RENDER_WINDOW: bool = true;
+
 const JS_RENDER_MAX_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// How often the Rust side polls the webview (via `eval_with_callback`). Matched
 /// to the in-page `SETTLE_MS` settle window so a page that quiesces is observed
 /// within roughly one interval.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Per-poll cap on how long we wait for one `eval_with_callback` result before
+/// giving up on THAT poll (and retrying). Without it, a webview that accepts the
+/// eval but never runs the callback JS (suspended/throttled) hangs the whole
+/// render on a single poll. Repeated timeouts here are the signature of a
+/// suspended webview (JS not executing).
+const EVAL_CALLBACK_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Minimum growth in visible body-text length (chars) over the FIRST poll's
 /// reading before a `quiescent` signal is accepted. The initial shell of a
@@ -290,23 +304,37 @@ async fn poll_once(app: &tauri::AppHandle, label: &str) -> Option<Readback> {
             return;
         };
         let tx = tx.clone();
-        let _ = w.eval_with_callback(POLL_JS, move |json: String| {
+        // Log whether the eval could even be DISPATCHED. If this errors, the
+        // webview rejected the eval outright (vs. accepting it but never running
+        // the JS — the two are distinguished by the callback-fired timeout below).
+        if let Err(e) = w.eval_with_callback(POLL_JS, move |json: String| {
             if let Ok(mut guard) = tx.lock()
                 && let Some(sender) = guard.take()
             {
                 let _ = sender.send(json);
             }
-        });
+        }) {
+            tracing::warn!(target: "lens::js_render", label = %label_owned, error = %e, "poll: eval_with_callback dispatch FAILED");
+        }
     });
 
     if dispatched.is_err() {
         return None;
     }
 
-    match rx.await {
-        Ok(json) => Some(parse_readback(&json)),
+    // Per-poll timeout: if the eval callback never fires within EVAL_CALLBACK_TIMEOUT
+    // the webview accepted the eval but its JS is not executing (suspended/throttled)
+    // — return None so the loop retries + logs, rather than hanging the whole render
+    // on one poll. This distinguishes "JS suspended" (repeated timeouts here) from
+    // "eval dispatch failed" (the warn above) from "window gone" (the warn above).
+    match tokio::time::timeout(EVAL_CALLBACK_TIMEOUT, rx).await {
+        Ok(Ok(json)) => Some(parse_readback(&json)),
         // Sender dropped (window gone before the callback fired) ⇒ stop polling.
-        Err(_) => None,
+        Ok(Err(_)) => None,
+        Err(_) => {
+            tracing::warn!(target: "lens::js_render", label = %label, "poll: eval callback did not fire within timeout (JS not executing — webview likely suspended)");
+            None
+        }
     }
 }
 
@@ -457,30 +485,41 @@ async fn render_inner(
     let label_owned = label.to_string();
 
     let dispatch = app.run_on_main_thread(move || {
-        // macOS suspends JS for an off-screen/occluded webview, so on macOS the
-        // render window must be genuinely on-screen — we position it at the origin
-        // and hide it via a zero native alpha after build. On other platforms we
-        // keep the off-screen position (best-effort; a native-alpha equivalent is a
-        // follow-up).
+        // macOS suspends JS for an off-screen/occluded webview, so the render window
+        // must be genuinely on-screen. Positioning + hiding depends on DEBUG mode:
+        //   DEBUG_SHOW_RENDER_WINDOW=true  → a real, VISIBLE, decorated window at a
+        //     visible spot so we can WATCH what the page renders (blank? bot wall?
+        //     real content?) while diagnosing.
+        //   false → on-screen at the origin but hidden via a zero native alpha
+        //     (macOS) / off-screen (other OSes).
         #[cfg(target_os = "macos")]
-        let (pos_x, pos_y) = (0.0_f64, 0.0_f64);
+        let (pos_x, pos_y) = if DEBUG_SHOW_RENDER_WINDOW {
+            (120.0_f64, 120.0_f64)
+        } else {
+            (0.0_f64, 0.0_f64)
+        };
         #[cfg(not(target_os = "macos"))]
-        let (pos_x, pos_y) = (OFFSCREEN_XY, OFFSCREEN_XY);
+        let (pos_x, pos_y) = if DEBUG_SHOW_RENDER_WINDOW {
+            (120.0_f64, 120.0_f64)
+        } else {
+            (OFFSCREEN_XY, OFFSCREEN_XY)
+        };
 
         let builder =
             WebviewWindowBuilder::new(&app_for_build, &label_owned, WebviewUrl::External(parsed))
-                // On-screen but hidden. Build it HIDDEN, then (macOS) zero the native
-                // NSWindow alpha and `show()` it → on-screen (JS runs) + invisible, no
-                // flash. Chrome/focus/taskbar stripped; always-on-top so the main
-                // window can't occlude → suspend it.
+                // See DEBUG_SHOW_RENDER_WINDOW above. In hidden mode we build HIDDEN,
+                // then (macOS) zero the native NSWindow alpha and `show()` → on-screen
+                // (JS runs) + invisible, no flash. always-on-top so the main window
+                // can't occlude → suspend it.
                 .position(pos_x, pos_y)
                 .inner_size(RENDER_WIDTH, RENDER_HEIGHT)
-                .visible(false)
-                .decorations(false)
+                .visible(DEBUG_SHOW_RENDER_WINDOW)
+                .decorations(DEBUG_SHOW_RENDER_WINDOW)
                 .shadow(false)
-                .skip_taskbar(true)
+                .skip_taskbar(!DEBUG_SHOW_RENDER_WINDOW)
                 .focused(false)
                 .always_on_top(true)
+                .title("LensLM · rendering (debug)")
                 // Ephemeral session: no shared cookies/localStorage/cache to exfiltrate
                 // or bleed across renders.
                 .incognito(true)
@@ -512,33 +551,36 @@ async fn render_inner(
 
         match builder.build() {
             Ok(_window) => {
-                // macOS: make the on-screen window invisible by zeroing its native
-                // NSWindow alpha (public AppKit API — no `macos-private-api`), then
-                // reveal it. It stays composited/on-screen so WebKit runs the page's
-                // JS (and our eval), but the user sees nothing. Also make it
-                // click-through so an alpha-0 always-on-top window can't eat input.
-                #[cfg(target_os = "macos")]
-                {
-                    if let Ok(ns_ptr) = _window.ns_window() {
-                        let ns = ns_ptr as *mut objc2::runtime::AnyObject;
-                        if !ns.is_null() {
-                            // SAFETY: `ns_window()` returns this window's `NSWindow*`
-                            // and we are on the main thread; `setAlphaValue:` is a
-                            // standard main-thread NSWindow setter.
-                            unsafe {
-                                let _: () = objc2::msg_send![&*ns, setAlphaValue: 0.0_f64];
+                // In DEBUG mode the window was built visible+decorated — leave it
+                // shown so we can watch the render. In hidden mode, (macOS) zero the
+                // native NSWindow alpha (public AppKit API — no `macos-private-api`)
+                // and make it click-through, then reveal it: on-screen so WebKit runs
+                // the page's JS + our eval, but invisible to the user.
+                if DEBUG_SHOW_RENDER_WINDOW {
+                    let _ = _window.show();
+                } else {
+                    #[cfg(target_os = "macos")]
+                    {
+                        if let Ok(ns_ptr) = _window.ns_window() {
+                            let ns = ns_ptr as *mut objc2::runtime::AnyObject;
+                            if !ns.is_null() {
+                                // SAFETY: `ns_window()` returns this window's
+                                // `NSWindow*` and we are on the main thread;
+                                // `setAlphaValue:` is a standard NSWindow setter.
+                                unsafe {
+                                    let _: () = objc2::msg_send![&*ns, setAlphaValue: 0.0_f64];
+                                }
                             }
                         }
+                        let _ = _window.set_ignore_cursor_events(true);
+                        let _ = _window.show();
                     }
-                    let _ = _window.set_ignore_cursor_events(true);
-                    // Reveal it: now on-screen (JS un-throttles) but alpha 0 (unseen).
-                    let _ = _window.show();
-                }
-                #[cfg(not(target_os = "macos"))]
-                {
-                    // Best-effort on other platforms (off-screen; may still be
-                    // throttled — a native-hide equivalent is a follow-up).
-                    let _ = _window.show();
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        // Best-effort on other platforms (off-screen; native-hide
+                        // equivalent is a follow-up).
+                        let _ = _window.show();
+                    }
                 }
                 // Diagnostic: confirm the window is findable by label immediately
                 // after build (same main-thread tick). If this logs `false`, the
