@@ -79,12 +79,29 @@ use tauri::{Manager, Url, WebviewUrl};
 /// even begin fetching data, then need time to fetch + render. 20s leaves headroom
 /// for a ~5s-to-start SPA plus fetch/render, while still bounding the held ingest
 /// permit.
-/// TEMPORARY (issue #78 debugging): when `true`, the render window is created
-/// VISIBLE + decorated at an on-screen spot so we can watch what the page actually
-/// renders (blank / bot wall / real content) while diagnosing the WKWebView
-/// suspension. Flip to `false` to restore the hidden (alpha-0, macOS) behavior for
-/// production. Paired with the per-poll `eval` diagnostics.
-const DEBUG_SHOW_RENDER_WINDOW: bool = true;
+/// How the render window is hidden (issue #78). WKWebView needs a window it
+/// considers on-screen to run JS at full speed; the open question was whether an
+/// OFF-SCREEN window also runs — earlier off-screen tests captured nothing, but
+/// that turned out to be the double-encoded-readback bug (now fixed), NOT
+/// necessarily suspension. With that fixed + a per-poll `eval` timeout that
+/// definitively detects a suspended webview, we can test the off-screen path.
+#[derive(PartialEq, Eq)]
+enum RenderVisibility {
+    /// A real, VISIBLE, decorated window — for watching the render while debugging.
+    DebugVisible,
+    /// Off-screen (invisible; never covers on-screen content). The ideal, IF
+    /// WKWebView does not suspend an off-screen window.
+    Offscreen,
+    /// On-screen at the origin but native-alpha 0 + click-through (invisible and
+    /// non-covering). The fallback if off-screen proves to be suspended.
+    OnscreenAlphaZero,
+}
+
+/// Active render-window visibility strategy. Currently testing `Offscreen` (the
+/// ideal, non-covering) now that the capture bug is fixed; fall back to
+/// `OnscreenAlphaZero` if the logs show a suspended webview, or `DebugVisible` to
+/// watch it.
+const RENDER_VISIBILITY: RenderVisibility = RenderVisibility::Offscreen;
 
 const JS_RENDER_MAX_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -114,11 +131,10 @@ const CONTENT_GROWTH_MIN: usize = 800;
 /// settled render.
 const MIN_RENDER_WAIT: Duration = Duration::from_secs(3);
 
-/// Off-screen position (logical px), used on NON-macOS only. NOTE: on macOS an
-/// off-screen window is occlusion-suspended by WebKit (JS never runs), which is
-/// why macOS positions the window on-screen and hides it via a zero native alpha
-/// instead. A native-hide equivalent for Windows/Linux is a follow-up.
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+/// Off-screen position (logical px) for the `Offscreen` visibility strategy — far
+/// outside any real display, so the window is never seen and never covers on-screen
+/// content. (Whether WebKit keeps an off-screen window's JS running is exactly what
+/// the `Offscreen` mode tests.)
 const OFFSCREEN_XY: f64 = -32000.0;
 const RENDER_WIDTH: f64 = 1280.0;
 const RENDER_HEIGHT: f64 = 800.0;
@@ -503,38 +519,29 @@ async fn render_inner(
     let label_owned = label.to_string();
 
     let dispatch = app.run_on_main_thread(move || {
-        // macOS suspends JS for an off-screen/occluded webview, so the render window
-        // must be genuinely on-screen. Positioning + hiding depends on DEBUG mode:
-        //   DEBUG_SHOW_RENDER_WINDOW=true  → a real, VISIBLE, decorated window at a
-        //     visible spot so we can WATCH what the page renders (blank? bot wall?
-        //     real content?) while diagnosing.
-        //   false → on-screen at the origin but hidden via a zero native alpha
-        //     (macOS) / off-screen (other OSes).
-        #[cfg(target_os = "macos")]
-        let (pos_x, pos_y) = if DEBUG_SHOW_RENDER_WINDOW {
-            (120.0_f64, 120.0_f64)
-        } else {
-            (0.0_f64, 0.0_f64)
+        // Position depends on the visibility strategy (see RenderVisibility):
+        //   DebugVisible      → an on-screen spot we can watch.
+        //   Offscreen         → far off any display (invisible, never covers content).
+        //   OnscreenAlphaZero → the origin; hidden after build via a zero alpha.
+        let (pos_x, pos_y) = match RENDER_VISIBILITY {
+            RenderVisibility::DebugVisible => (120.0_f64, 120.0_f64),
+            RenderVisibility::Offscreen => (OFFSCREEN_XY, OFFSCREEN_XY),
+            RenderVisibility::OnscreenAlphaZero => (0.0_f64, 0.0_f64),
         };
-        #[cfg(not(target_os = "macos"))]
-        let (pos_x, pos_y) = if DEBUG_SHOW_RENDER_WINDOW {
-            (120.0_f64, 120.0_f64)
-        } else {
-            (OFFSCREEN_XY, OFFSCREEN_XY)
-        };
+        let debug_visible = RENDER_VISIBILITY == RenderVisibility::DebugVisible;
 
         let builder =
             WebviewWindowBuilder::new(&app_for_build, &label_owned, WebviewUrl::External(parsed))
-                // See DEBUG_SHOW_RENDER_WINDOW above. In hidden mode we build HIDDEN,
-                // then (macOS) zero the native NSWindow alpha and `show()` → on-screen
-                // (JS runs) + invisible, no flash. always-on-top so the main window
-                // can't occlude → suspend it.
+                // Visible for Offscreen (off-screen, so still unseen) + DebugVisible;
+                // built HIDDEN only for OnscreenAlphaZero (revealed after zeroing the
+                // native alpha, avoiding a flash). Decorations/taskbar only in debug.
+                // always-on-top so an on-screen render window can't be occluded.
                 .position(pos_x, pos_y)
                 .inner_size(RENDER_WIDTH, RENDER_HEIGHT)
-                .visible(DEBUG_SHOW_RENDER_WINDOW)
-                .decorations(DEBUG_SHOW_RENDER_WINDOW)
+                .visible(RENDER_VISIBILITY != RenderVisibility::OnscreenAlphaZero)
+                .decorations(debug_visible)
                 .shadow(false)
-                .skip_taskbar(!DEBUG_SHOW_RENDER_WINDOW)
+                .skip_taskbar(!debug_visible)
                 .focused(false)
                 .always_on_top(true)
                 .title("LensLM · rendering (debug)")
@@ -569,34 +576,33 @@ async fn render_inner(
 
         match builder.build() {
             Ok(_window) => {
-                // In DEBUG mode the window was built visible+decorated — leave it
-                // shown so we can watch the render. In hidden mode, (macOS) zero the
-                // native NSWindow alpha (public AppKit API — no `macos-private-api`)
-                // and make it click-through, then reveal it: on-screen so WebKit runs
-                // the page's JS + our eval, but invisible to the user.
-                if DEBUG_SHOW_RENDER_WINDOW {
-                    let _ = _window.show();
-                } else {
-                    #[cfg(target_os = "macos")]
-                    {
-                        if let Ok(ns_ptr) = _window.ns_window() {
-                            let ns = ns_ptr as *mut objc2::runtime::AnyObject;
-                            if !ns.is_null() {
-                                // SAFETY: `ns_window()` returns this window's
-                                // `NSWindow*` and we are on the main thread;
-                                // `setAlphaValue:` is a standard NSWindow setter.
-                                unsafe {
-                                    let _: () = objc2::msg_send![&*ns, setAlphaValue: 0.0_f64];
+                // OnscreenAlphaZero (macOS): the window was built HIDDEN at the
+                // origin; zero its native NSWindow alpha (public AppKit API — no
+                // `macos-private-api`), make it click-through, then reveal it —
+                // on-screen so WebKit runs the page's JS + our eval, invisible +
+                // non-covering. DebugVisible / Offscreen were built visible; just
+                // ensure they're shown (Offscreen is off any display, so unseen).
+                match RENDER_VISIBILITY {
+                    RenderVisibility::OnscreenAlphaZero => {
+                        #[cfg(target_os = "macos")]
+                        {
+                            if let Ok(ns_ptr) = _window.ns_window() {
+                                let ns = ns_ptr as *mut objc2::runtime::AnyObject;
+                                if !ns.is_null() {
+                                    // SAFETY: `ns_window()` returns this window's
+                                    // `NSWindow*`; we are on the main thread;
+                                    // `setAlphaValue:` is a standard NSWindow setter.
+                                    unsafe {
+                                        let _: () =
+                                            objc2::msg_send![&*ns, setAlphaValue: 0.0_f64];
+                                    }
                                 }
                             }
+                            let _ = _window.set_ignore_cursor_events(true);
                         }
-                        let _ = _window.set_ignore_cursor_events(true);
                         let _ = _window.show();
                     }
-                    #[cfg(not(target_os = "macos"))]
-                    {
-                        // Best-effort on other platforms (off-screen; native-hide
-                        // equivalent is a follow-up).
+                    RenderVisibility::DebugVisible | RenderVisibility::Offscreen => {
                         let _ = _window.show();
                     }
                 }
