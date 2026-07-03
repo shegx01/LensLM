@@ -28,6 +28,7 @@ pub mod notebooks;
 pub mod parse;
 pub mod render;
 pub mod system_check;
+pub mod transcription;
 pub mod tts;
 pub mod url_normalize;
 pub mod vector_store;
@@ -64,6 +65,7 @@ pub use system_check::{
     ModelValidation, detect_llm, fastembed_weights_cached, is_allowlisted_embedding_id,
     list_ollama_models, ollama_base_url, validate_model_interactive,
 };
+pub use transcription::{WindowConfig, decode_and_resample_audio, decode_resample_windows};
 pub use tts::{
     DownloadProgress, Gender, KOKORO_MODEL_FILENAME, KOKORO_MODEL_RELPATH, KOKORO_MODEL_URL,
     TtsVoice, download_kokoro_model, kokoro_model_path, list_tts_voices,

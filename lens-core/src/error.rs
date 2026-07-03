@@ -41,6 +41,23 @@ pub enum LensError {
     /// A vector-store (LanceDB / Arrow) operation failed.
     #[error("vector store error: {0}")]
     Vector(String),
+
+    /// An audio/media file used a codec/container this build cannot decode
+    /// (issue #41). The payload names the offending extension/codec. Distinct
+    /// from [`MediaDecodeFailed`](Self::MediaDecodeFailed): the input is valid
+    /// but unsupported, not corrupt.
+    #[error("unsupported media codec: {0}")]
+    UnsupportedMediaCodec(String),
+
+    /// Decoding an audio/media file failed — the container/bitstream is corrupt,
+    /// truncated, or otherwise undecodable (issue #41).
+    #[error("media decode failed: {0}")]
+    MediaDecodeFailed(String),
+
+    /// An audio file decoded successfully but yielded no usable audio (empty or
+    /// all-silent PCM) — there is nothing to transcribe (issue #41).
+    #[error("empty audio: {0}")]
+    EmptyAudio(String),
 }
 
 // Manual `From` mappings (NOT `#[from]`): source error types are not `Serialize`
@@ -103,6 +120,9 @@ impl LensError {
             LensError::Model(_) => "Model",
             LensError::Network(_) => "Network",
             LensError::Vector(_) => "Vector",
+            LensError::UnsupportedMediaCodec(_) => "UnsupportedMediaCodec",
+            LensError::MediaDecodeFailed(_) => "MediaDecodeFailed",
+            LensError::EmptyAudio(_) => "EmptyAudio",
         }
     }
 
@@ -117,7 +137,10 @@ impl LensError {
             | LensError::Parse(m)
             | LensError::Model(m)
             | LensError::Network(m)
-            | LensError::Vector(m) => m,
+            | LensError::Vector(m)
+            | LensError::UnsupportedMediaCodec(m)
+            | LensError::MediaDecodeFailed(m)
+            | LensError::EmptyAudio(m) => m,
         }
     }
 }
@@ -132,8 +155,11 @@ impl LensError {
 /// `timestamp` is the RFC3339 instant of THIS failure.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorMeta {
-    /// The `LensError` discriminant (`Validation`/`Internal`/`Io`/`Parse`/
-    /// `Model`/`Network`/`Vector`).
+    /// The `LensError` discriminant — the stable variant name as a string (e.g.
+    /// `"Validation"`, `"Internal"`, `"Io"`, `"Parse"`, `"Model"`, `"Network"`,
+    /// `"Vector"`, `"UnsupportedMediaCodec"`, `"MediaDecodeFailed"`,
+    /// `"EmptyAudio"`). Matches the `kind` field of the `{kind, message}` IPC
+    /// wire shape. New variants are additive and do not change existing names.
     pub kind: String,
     /// The human-readable failure message (the `LensError` inner payload).
     pub message: String,
