@@ -63,7 +63,7 @@ async fn migration_is_idempotent_second_run_is_noop() {
         .unwrap();
 
     assert_eq!(count_before, count_after);
-    assert_eq!(count_after, 10, "all migration files applied (0001..0010)");
+    assert_eq!(count_after, 11, "all migration files applied (0001..0011)");
 }
 
 #[tokio::test]
@@ -601,7 +601,7 @@ async fn cold_init_under_budget_on_empty_temp_db() {
     let engine = LensEngine::init(dir.path()).await.unwrap();
     let elapsed = start.elapsed();
     // Sanity: the engine works.
-    assert_eq!(engine.migration_count().await.unwrap(), 10);
+    assert_eq!(engine.migration_count().await.unwrap(), 11);
     // Generous smoke guard against accidentally-expensive migrations (e.g. a
     // future migration that scans/rewrites large tables on cold start). This is
     // NOT a tight perf benchmark — the wide 2s budget keeps it non-flaky on
@@ -749,6 +749,56 @@ async fn migration_0009_renames_file_hash_to_raw_content_hash() {
         "old idx_sources_notebook_file_hash must be gone after 0009"
     );
 
-    // Migration count reflects all ten migrations.
-    assert_eq!(engine.migration_count().await.unwrap(), 10);
+    // Migration count reflects all eleven migrations.
+    assert_eq!(engine.migration_count().await.unwrap(), 11);
+}
+
+#[tokio::test]
+async fn migration_0011_adds_last_activity_at_and_backfills_to_created_at() {
+    let engine = LensEngine::for_test().await;
+    let pool = engine.pool().await;
+
+    // Column added by migration 0011.
+    let notebook_cols: HashSet<String> = sqlx::query("PRAGMA table_info(notebooks)")
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.get::<String, _>("name"))
+        .collect();
+    assert!(
+        notebook_cols.contains("last_activity_at"),
+        "notebooks.last_activity_at must exist after 0011"
+    );
+
+    // Simulate a pre-migration row (last_activity_at NULL) and re-run the
+    // backfill statement to prove existing rows are seeded to created_at.
+    let nb = engine
+        .create_notebook("Backfill probe", None, None)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE notebooks SET last_activity_at = NULL WHERE id = ?")
+        .bind(&nb.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    // The exact backfill statement from 0011.
+    sqlx::query(
+        "UPDATE notebooks SET last_activity_at = created_at WHERE last_activity_at IS NULL",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (created_at, last_activity_at): (String, Option<String>) =
+        sqlx::query_as("SELECT created_at, last_activity_at FROM notebooks WHERE id = ?")
+            .bind(&nb.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        last_activity_at.as_deref(),
+        Some(created_at.as_str()),
+        "backfill must set last_activity_at = created_at for pre-migration rows"
+    );
 }

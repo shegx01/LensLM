@@ -60,6 +60,24 @@ pub use registry::{
     resolve, resolve_opt,
 };
 
+/// L2-normalizes `v` in place. The single normalization primitive shared by the
+/// backends that must normalize themselves ([`OllamaEmbedder`], which talks to a
+/// server that does NOT normalize) and by [`CountingEmbedder`]'s deterministic
+/// test vectors — so the zero-norm guard and epsilon live in exactly one place.
+///
+/// Zero-norm guard in f32 space: a near-zero vector would divide by ~0 and
+/// produce NaN/Inf; `1e-9` is comfortably above f32 rounding noise yet far below
+/// any real unit-vector norm, so a genuine embedding always normalizes while a
+/// degenerate zero vector is left untouched.
+pub(crate) fn l2_normalize(v: &mut [f32]) {
+    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 1e-9 {
+        for x in v.iter_mut() {
+            *x /= norm;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public constants
 // ---------------------------------------------------------------------------
@@ -190,8 +208,22 @@ impl FastembedEmbedder {
     /// Returns [`LensError::Model`] if the fastembed session cannot be
     /// initialized (download failure, corrupt weights, onnxruntime error, …).
     pub fn new_with_spec(data_dir: &Path, spec: &EmbeddingModelSpec) -> Result<Self, LensError> {
+        // Defense-in-depth backend guard (issue #80): a spec that has no fastembed
+        // variant (an Ollama-only model) can never be served by fastembed. Reject
+        // it here with a clear error rather than unwrapping `None` — the primary
+        // guard lives in `embedder_for`, this is the last line of defense.
+        if !spec.supports(EmbeddingBackend::Fastembed) || spec.fastembed_variant.is_none() {
+            return Err(LensError::Validation(format!(
+                "model {} does not support the fastembed backend",
+                spec.id
+            )));
+        }
+        let variant = spec
+            .fastembed_variant
+            .clone()
+            .expect("fastembed_variant present: guarded by the check above");
         let cache_dir = data_dir.join("models").join("fastembed");
-        let opts = InitOptions::new(spec.fastembed_variant.clone()).with_cache_dir(cache_dir);
+        let opts = InitOptions::new(variant).with_cache_dir(cache_dir);
         let inner = TextEmbedding::try_new(opts)
             .map_err(|e| LensError::Model(format!("fastembed init failed: {e}")))?;
         Ok(Self {
@@ -418,13 +450,7 @@ impl CountingEmbedder {
             // Map to [-1, 1] range before normalizing.
             *val = ((h & 0xFFFF) as f32 / 32767.5) - 1.0;
         }
-        // L2-normalize.
-        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if norm > 1e-9 {
-            for x in v.iter_mut() {
-                *x /= norm;
-            }
-        }
+        l2_normalize(&mut v);
         v
     }
 }
@@ -740,6 +766,27 @@ mod tests {
             Arc::clone(&in_flight),
         );
         assert_eq!(load.load(Ordering::SeqCst), 1);
+    }
+
+    /// Step 4 (issue #80): the construction-time backend guard rejects an
+    /// Ollama-only spec BEFORE any ONNX/network work, with a clear error naming the
+    /// model. Runs WITHOUT a download because the guard returns early — the
+    /// defense-in-depth backstop under `embedder_for`'s primary guard.
+    #[test]
+    fn fastembed_new_with_spec_rejects_ollama_only_model() {
+        let dir = std::env::temp_dir();
+        // `FastembedEmbedder` is not `Debug`, so `.err()` (no Debug bound) instead
+        // of `expect_err` (which requires the Ok type to be Debug).
+        let err = FastembedEmbedder::new_with_spec(&dir, resolve("qwen3-embedding:4b"))
+            .err()
+            .expect("an ollama-only model must be rejected by the fastembed backend guard");
+        match err {
+            LensError::Validation(msg) => {
+                assert!(msg.contains("qwen3-embedding:4b"), "names the model: {msg}");
+                assert!(msg.contains("fastembed"), "names the backend: {msg}");
+            }
+            other => panic!("expected LensError::Validation, got {other:?}"),
+        }
     }
 
     // --- Step 2: FastembedEmbedder real-model test (gated) ---

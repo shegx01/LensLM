@@ -405,6 +405,66 @@ async fn add_to_table_accepts_1024_dim_rows() {
     );
 }
 
+/// Step 11 (issue #80): a 2560-dim coordinate (the Ollama-only `qwen3-embedding:4b`)
+/// round-trips through the full add → IVF_PQ build → search path. This is the
+/// EVIDENCE (not an assumption) that switching to the largest new model re-embeds
+/// into a fresh coordinate: 2560 exercises the `num_sub_vectors = dim/16 = 160` PQ
+/// path, well above the 768/1024 dims the pre-#80 registry ever produced.
+#[tokio::test]
+async fn roundtrip_2560_dim_coordinate_builds_index_and_searches() {
+    let (dir, _engine, pool, nb) = engine_and_notebook().await;
+    // Threshold 256 so the index actually TRAINS (IVF_PQ 8-bit needs ≥256 varied
+    // training vectors) without building a 100k-row table.
+    let store = LanceVectorStore::new(dir.path(), pool).with_ann_index_min_rows(256);
+
+    let model = "qwen3-embedding:4b";
+    let dim = 2560usize;
+    assert_eq!(
+        dim % 16,
+        0,
+        "2560 must divide by 16 → num_sub_vectors = 160"
+    );
+    let co = Coordinate::new(&nb, EmbeddingBackend::Ollama, model, dim);
+
+    // 400 background rows + one uniquely-identifiable planted point.
+    let mut rows: Vec<VectorRow> = (0..400)
+        .map(|i| VectorRow {
+            chunk_id: format!("chunk-{i}"),
+            source_id: "src-1".to_string(),
+            notebook_id: nb.clone(),
+            level: 1,
+            vector: unit_vector_dim(i, dim),
+        })
+        .collect();
+    let planted = unit_vector_dim(2_560_000, dim);
+    rows.push(VectorRow {
+        chunk_id: "planted".to_string(),
+        source_id: "src-1".to_string(),
+        notebook_id: nb.clone(),
+        level: 1,
+        vector: planted.clone(),
+    });
+
+    store.add(&co, rows).await.unwrap();
+
+    // The IVF_PQ index must have built for the 2560-dim table (the dim/16 = 160
+    // sub-vector path); this is the crash surface the test guards.
+    let table = format!("vec__{nb}__ollama__qwen3_embedding_4b__d{dim}");
+    assert_eq!(
+        vector_index_count(&vector_indices(dir.path(), &table).await),
+        1,
+        "a single IVF_PQ index builds on the 2560-dim table"
+    );
+
+    // The planted vector round-trips back through ANN search at 2560 dims.
+    let hits = store.search(&co, &planted, 10).await.unwrap();
+    let ids: HashSet<String> = hits.into_iter().map(|h| h.chunk_id).collect();
+    assert!(
+        ids.contains("planted"),
+        "2560-dim ANN search returns the planted hit: {ids:?}"
+    );
+}
+
 #[tokio::test]
 async fn existing_gen0_table_resolved_by_stored_name_not_regenerated() {
     // CRITICAL invariant: a coordinate is resolved by its STORED lance_table_name

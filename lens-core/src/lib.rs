@@ -1320,6 +1320,20 @@ impl LensEngine {
         workload: crate::embedder::WorkloadKind,
     ) -> Result<Arc<dyn Embedder>, LensError> {
         let spec = crate::embedder::resolve(model_id);
+        // Primary backend guard (issue #80): the model↔backend partition is strict.
+        // Reject a `(model, backend)` pair the spec does not support BEFORE the
+        // match arm so callers (including `warm_fastembed_model`) get one clean,
+        // user-facing validation error naming the model + backend — never a
+        // downstream fastembed-init or embed error. The construction-time guards in
+        // `FastembedEmbedder::new_with_spec` / `OllamaEmbedder::new` are the
+        // defense-in-depth backstop.
+        if !spec.supports(backend) {
+            return Err(LensError::Validation(format!(
+                "model {} does not support the {} backend",
+                spec.id,
+                backend.as_str()
+            )));
+        }
         // issue #91: resolve the execution device from the per-job policy (hardware
         // probe + model hint + backend + workload). CPU everywhere the policy can't
         // justify the GPU; Metal only for a GPU-eligible model on a bulk job on
@@ -1555,11 +1569,19 @@ impl LensEngine {
             .cloned()
     }
 
-    /// Renames a notebook, bumping `updated_at`.
+    /// Renames a notebook, bumping `updated_at` and `last_activity_at`.
     #[tracing::instrument(skip_all)]
     pub async fn rename_notebook(&self, id: &NotebookId, title: &str) -> Result<(), LensError> {
         let pool = self.pool().await;
         NotebookRepo::new(&pool).rename(id, title).await
+    }
+
+    /// Bumps a live notebook's `last_activity_at` (records an "open" for
+    /// cold-launch MRU auto-open).
+    #[tracing::instrument(skip_all)]
+    pub async fn touch_notebook_activity(&self, id: &NotebookId) -> Result<(), LensError> {
+        let pool = self.pool().await;
+        NotebookRepo::new(&pool).touch_activity(id).await
     }
 
     /// Soft-deletes a notebook (backward-compat alias for `trash_notebook`).

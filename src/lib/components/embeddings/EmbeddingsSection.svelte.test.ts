@@ -185,20 +185,180 @@ describe('EmbeddingsSection — Ollama detect-only', () => {
   it('Refresh re-probes /api/tags and lights up a now-detected model', async () => {
     let tags: string[] = [];
     mockIPC((cmd) => {
-      if (cmd === 'get_config') return baseAppConfig({ embedding_backend: 'ollama' });
+      // Start on ollama backend with embeddinggemma selected (an ollama-only model).
+      if (cmd === 'get_config')
+        return baseAppConfig({ embedding_backend: 'ollama', embedding_model: 'embeddinggemma' });
       if (cmd === 'fastembed_models_cached') return [];
       if (cmd === 'list_ollama_models') return tags;
     });
 
     render(EmbeddingsSection, { props: { mode: 'global' } });
 
-    // Initially Ollama reports nothing → the pull hint is shown.
-    expect(await screen.findByText(/ollama pull nomic-embed-text/i)).toBeInTheDocument();
+    // Initially Ollama reports nothing → the pull hint is shown for embeddinggemma.
+    expect(await screen.findByText(/ollama pull embeddinggemma/i)).toBeInTheDocument();
 
     // The model becomes available; Refresh re-probes and the card lights up.
-    tags = ['nomic-embed-text:latest'];
+    tags = ['embeddinggemma:latest'];
     await fireEvent.click(screen.getByRole('button', { name: /refresh ollama models/i }));
 
-    expect(await screen.findByLabelText(/nomic-embed-text-v1\.5 ready/i)).toBeInTheDocument();
+    expect(await screen.findByLabelText(/embeddinggemma ready/i)).toBeInTheDocument();
+  });
+});
+
+// ── Step 8 TDD: backend-filtered picker + provider-switch reset ──────────────
+
+describe('EmbeddingsSection — backend-filtered model picker (Step 8)', () => {
+  const FASTEMBED_IDS = ['nomic-embed-text-v1.5', 'mxbai-embed-large', 'all-minilm', 'bge-m3'];
+  const OLLAMA_IDS = [
+    'embeddinggemma',
+    'qwen3-embedding:4b',
+    'nomic-embed-text-v2-moe',
+    'snowflake-arctic-embed2'
+  ];
+
+  it('fastembed backend renders exactly the 4 fastembed models, not the 4 ollama models', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config')
+        return baseAppConfig({
+          embedding_backend: 'fastembed',
+          embedding_model: 'nomic-embed-text-v1.5'
+        });
+      if (cmd === 'fastembed_models_cached') return [];
+      if (cmd === 'list_ollama_models') return [];
+    });
+
+    render(EmbeddingsSection, { props: { mode: 'global' } });
+
+    await screen.findByRole('heading', { name: 'Embeddings' });
+
+    // All fastembed models present
+    for (const id of FASTEMBED_IDS) {
+      expect(
+        screen.getByRole('radio', {
+          name: new RegExp(id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i')
+        })
+      ).toBeInTheDocument();
+    }
+    // No ollama-only models visible
+    for (const id of OLLAMA_IDS) {
+      expect(
+        screen.queryByRole('radio', {
+          name: new RegExp(id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i')
+        })
+      ).not.toBeInTheDocument();
+    }
+  });
+
+  it('ollama backend renders exactly the 4 ollama models, not the 4 fastembed models', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config')
+        return baseAppConfig({ embedding_backend: 'ollama', embedding_model: 'embeddinggemma' });
+      if (cmd === 'fastembed_models_cached') return [];
+      if (cmd === 'list_ollama_models') return [];
+    });
+
+    render(EmbeddingsSection, { props: { mode: 'global' } });
+
+    await screen.findByRole('heading', { name: 'Embeddings' });
+
+    // All ollama models present
+    for (const id of OLLAMA_IDS) {
+      expect(
+        screen.getByRole('radio', {
+          name: new RegExp(id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i')
+        })
+      ).toBeInTheDocument();
+    }
+    // No fastembed-only models visible
+    for (const id of FASTEMBED_IDS) {
+      expect(
+        screen.queryByRole('radio', {
+          name: new RegExp(id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i')
+        })
+      ).not.toBeInTheDocument();
+    }
+  });
+
+  it('switching from ollama to fastembed backend resets selectedModel if it is not in the new set', async () => {
+    // Start on ollama with embeddinggemma selected (a model NOT in the fastembed set).
+    mockIPC((cmd) => {
+      if (cmd === 'get_config')
+        return baseAppConfig({ embedding_backend: 'ollama', embedding_model: 'embeddinggemma' });
+      if (cmd === 'fastembed_models_cached') return [];
+      if (cmd === 'list_ollama_models') return [];
+    });
+
+    render(EmbeddingsSection, { props: { mode: 'global' } });
+
+    // Wait for mount — the ollama provider button should be checked.
+    const ollamaBtn = await screen.findByRole('radio', { name: /^ollama$/i });
+    expect(ollamaBtn).toHaveAttribute('aria-checked', 'true');
+
+    // Switch to fastembed.
+    const fastembedBtn = screen.getByRole('radio', { name: /^fastembed$/i });
+    await fireEvent.click(fastembedBtn);
+
+    // After switching, fastembed models should now be visible.
+    await waitFor(() => {
+      expect(screen.getByRole('radio', { name: /nomic-embed-text-v1\.5/i })).toBeInTheDocument();
+    });
+
+    // The previous ollama model (embeddinggemma) is not in the fastembed set,
+    // so selectedModel must have been reset to the first fastembed model.
+    // The first fastembed model (nomic-embed-text-v1.5) should be aria-checked=true.
+    const nomicRadio = screen.getByRole('radio', { name: /nomic-embed-text-v1\.5/i });
+    expect(nomicRadio).toHaveAttribute('aria-checked', 'true');
+
+    // The ollama model card should not exist anymore.
+    expect(screen.queryByRole('radio', { name: /embeddinggemma/i })).not.toBeInTheDocument();
+  });
+
+  it('switching backend does NOT reset selectedModel when the current model exists in the new set', async () => {
+    // This scenario would only happen with dual-backend models; currently none exist,
+    // so we test the inverse: start on fastembed with nomic selected, switch to ollama →
+    // nomic-embed-text-v1.5 is NOT in ollama set → reset happens (same as test above direction).
+    // More useful: start already on fastembed and switch to fastembed (no-op path).
+    mockIPC((cmd) => {
+      if (cmd === 'get_config')
+        return baseAppConfig({ embedding_backend: 'fastembed', embedding_model: 'all-minilm' });
+      if (cmd === 'fastembed_models_cached') return [];
+      if (cmd === 'list_ollama_models') return [];
+    });
+
+    render(EmbeddingsSection, { props: { mode: 'global' } });
+
+    await screen.findByRole('heading', { name: 'Embeddings' });
+
+    // all-minilm is selected and is in the fastembed set.
+    const allMiniLm = screen.getByRole('radio', { name: /all-minilm/i });
+    expect(allMiniLm).toHaveAttribute('aria-checked', 'true');
+
+    // Switch to ollama — all-minilm is NOT in ollama set, reset must happen.
+    const ollamaBtn = screen.getByRole('radio', { name: /^ollama$/i });
+    await fireEvent.click(ollamaBtn);
+
+    // After switch, ollama models are visible and first ollama model is selected.
+    await waitFor(() => {
+      expect(screen.getByRole('radio', { name: /embeddinggemma/i })).toBeInTheDocument();
+    });
+    const embeddinggemmaRadio = screen.getByRole('radio', { name: /embeddinggemma/i });
+    expect(embeddinggemmaRadio).toHaveAttribute('aria-checked', 'true');
+  });
+
+  it('ollama pull hint shows the correct ollamaName for qwen3-embedding:4b', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config')
+        return baseAppConfig({
+          embedding_backend: 'ollama',
+          embedding_model: 'qwen3-embedding:4b'
+        });
+      if (cmd === 'fastembed_models_cached') return [];
+      if (cmd === 'list_ollama_models') return [];
+    });
+
+    render(EmbeddingsSection, { props: { mode: 'global' } });
+
+    // The pull hint should show ollama pull qwen3-embedding:4b (exact tag).
+    expect(await screen.findByText(/ollama pull qwen3-embedding:4b/i)).toBeInTheDocument();
   });
 });

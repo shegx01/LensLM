@@ -38,6 +38,7 @@ export type AppConfig = {
   onboarding_complete: boolean;
   embedding_model: string;
   embedding_backend: string;
+  reopen_last_notebook: boolean;
 };
 
 // SYNC-CHECK: must match src/lib/onboarding/system-check.ts CheckResult
@@ -63,7 +64,11 @@ export function makeConfig(onboardingComplete: boolean): AppConfig {
     tier_thresholds: { tier1_token_cap: 4000, tier2_token_cap: 16000 },
     onboarding_complete: onboardingComplete,
     embedding_model: '',
-    embedding_backend: ''
+    embedding_backend: '',
+    // Mirrors the real AppConfig default (on). Tests that assert the empty
+    // "Your workspace" state with ≥1 notebook stubbed must pass
+    // `reopenLastNotebook: false` to suppress cold-launch auto-open.
+    reopen_last_notebook: true
   };
 }
 
@@ -111,6 +116,12 @@ export type InstallTauriStubOptions = {
   notebookEmbedding?: { model_id: string; dim: number; backend: string; status: string };
   /** Notebook summaries returned by `list_notebooks` (defaults to none). */
   notebooks?: { id: string; title: string }[];
+  /**
+   * `get_config`'s `reopen_last_notebook` flag (defaults to true, the real
+   * app default). Set false to suppress cold-launch auto-open — needed by
+   * tests that stub ≥1 notebook but assert the empty "Your workspace" state.
+   */
+  reopenLastNotebook?: boolean;
 };
 
 /**
@@ -125,7 +136,8 @@ export async function installTauriStub(
     fastembedCached = [],
     ollamaModels = [],
     notebookEmbedding,
-    notebooks = []
+    notebooks = [],
+    reopenLastNotebook = true
   }: InstallTauriStubOptions
 ): Promise<void> {
   await page.addInitScript(
@@ -211,6 +223,9 @@ export async function installTauriStub(
             case 'list_recent_documents':
               // Empty → the "Suggested from your library" section stays hidden.
               return Promise.resolve([]);
+            case 'touch_notebook_activity':
+              // Fire-and-forget recency bump on select; no return payload.
+              return Promise.resolve(null);
             case 'list_notebooks':
               // NotebookSummary-shaped rows so the sidebar can render + select.
               return Promise.resolve(
@@ -279,7 +294,7 @@ export async function installTauriStub(
       };
     },
     {
-      cfg: makeConfig(onboardingComplete),
+      cfg: { ...makeConfig(onboardingComplete), reopen_last_notebook: reopenLastNotebook },
       checks,
       fastembedCached,
       ollamaModels,

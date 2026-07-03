@@ -120,12 +120,18 @@
   // Disable the picker while a notebook re-embed is in flight (status-driven).
   const pickerDisabled = $derived(reembedding);
 
+  // ── Backend-filtered model list (Step 8) ───────────────────────────────────
+  // Only models whose `backends` includes the currently-selected backend are
+  // shown in the picker (strict fastembed/ollama partition, issue #80).
+  const filteredModels = $derived(EMBEDDING_MODELS.filter((m) => m.backends.includes(backend)));
+
   async function refreshOllama(): Promise<void> {
     refreshing = true;
     try {
       const names = await listOllamaModels(ollamaEndpoint);
       const found = new Set<EmbeddingModelId>();
-      for (const m of EMBEDDING_MODELS) {
+      // Only check models that support the ollama backend (Step 8: partition-aware).
+      for (const m of EMBEDDING_MODELS.filter((m) => m.backends.includes('ollama'))) {
         if (names.some((d) => ollamaMatches(d, m))) found.add(m.id);
       }
       ollamaInstalled = found;
@@ -175,6 +181,11 @@
     if (pickerDisabled) return;
     backend = b;
     actionError = null;
+    // Reset selectedModel if it is not in the newly-filtered set (Step 8).
+    const newFiltered = EMBEDDING_MODELS.filter((m) => m.backends.includes(b));
+    if (!newFiltered.some((m) => m.id === selectedModel)) {
+      selectedModel = newFiltered[0]?.id ?? DEFAULT_EMBEDDING_MODEL;
+    }
   }
 
   function pickModel(id: EmbeddingModelId): void {
@@ -330,7 +341,7 @@
     Embedding model
   </p>
   <div class="mt-2.5 flex flex-col gap-1.5" role="radiogroup" aria-label="Embedding model">
-    {#each EMBEDDING_MODELS as model (model.id)}
+    {#each filteredModels as model (model.id)}
       {@const isSelected = selectedModel === model.id}
       {@const isReady = installed.has(model.id)}
       <div

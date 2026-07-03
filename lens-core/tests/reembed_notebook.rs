@@ -146,14 +146,27 @@ async fn set_model(engine: &LensEngine, nb: &str, model: &str) {
         .unwrap();
 }
 
-async fn set_backend(engine: &LensEngine, nb: &str, backend: EmbeddingBackend) {
-    sqlx::query("UPDATE notebooks SET embedding_backend = ? WHERE id = ?")
+/// Sets BOTH the backend and the model (issue #80: a cross-backend switch to
+/// ollama must also select an ollama-valid model — the strict model↔backend
+/// partition forbids serving a fastembed-only id like nomic-v1.5 on ollama).
+async fn set_backend_and_model(
+    engine: &LensEngine,
+    nb: &str,
+    backend: EmbeddingBackend,
+    model: &str,
+) {
+    sqlx::query("UPDATE notebooks SET embedding_backend = ?, embedding_model = ? WHERE id = ?")
         .bind(backend.as_str())
+        .bind(model)
         .bind(nb)
         .execute(&engine.pool().await)
         .await
         .unwrap();
 }
+
+/// The ollama-valid, 768-dim model used as the cross-backend switch target so the
+/// switch stays same-dim (768) while respecting the strict partition.
+const OLLAMA_768_MODEL: &str = "nomic-embed-text-v2-moe";
 
 /// COUNT of `embedding_index` rows for the FULL 4-tuple coordinate + status.
 async fn coord_count_backend(
@@ -352,8 +365,9 @@ async fn r2_second_switch_mid_build_aborts_flip() {
 async fn r2_same_dim_cross_backend_switch_reembeds_and_retires_old() {
     let dir = tempfile::tempdir().unwrap();
     let engine = LensEngine::init(dir.path()).await.unwrap();
-    // The TARGET embedder is the SAME model id but under the OLLAMA backend slot.
-    inject_embedder_for(&engine, DEFAULT_EMBED_MODEL_ID, EmbeddingBackend::Ollama);
+    // The TARGET embedder is an ollama-valid 768-dim model (same dim as the
+    // fastembed source; issue #80 strict partition forbids nomic-v1.5 on ollama).
+    inject_embedder_for(&engine, OLLAMA_768_MODEL, EmbeddingBackend::Ollama);
     let (nb, _src) = seed_nomic_notebook(&engine).await;
 
     // Before: fastembed/nomic/768 is the lone active coordinate.
@@ -370,22 +384,23 @@ async fn r2_same_dim_cross_backend_switch_reembeds_and_retires_old() {
         1
     );
 
-    // Switch ONLY the backend (model + dim unchanged).
-    set_backend(&engine, &nb, EmbeddingBackend::Ollama).await;
+    // Switch the backend to ollama AND the model to the ollama-valid 768-dim id
+    // (dim unchanged at 768).
+    set_backend_and_model(&engine, &nb, EmbeddingBackend::Ollama, OLLAMA_768_MODEL).await;
     let outcome = engine
         .reembed_notebook(&NotebookId::from(nb.clone()), |_, _| {})
         .await
         .expect("reembed");
 
-    // NOT a NoOp — the backend changed even though model + dim did not.
+    // NOT a NoOp — the coordinate changed (backend + model) though dim did not.
     assert_eq!(
         outcome,
         ReembedOutcome::Switched {
-            model: DEFAULT_EMBED_MODEL_ID.to_string(),
+            model: OLLAMA_768_MODEL.to_string(),
             dim: DEFAULT_EMBED_DIM,
             retired: 1,
         },
-        "a same-(model,dim) backend switch must re-embed + retire, never NoOp"
+        "a same-dim cross-backend switch must re-embed + retire, never NoOp"
     );
 
     // NEW coordinate (ollama) active; OLD coordinate (fastembed) fully retired.
@@ -394,7 +409,7 @@ async fn r2_same_dim_cross_backend_switch_reembeds_and_retires_old() {
             &engine,
             &nb,
             EmbeddingBackend::Ollama,
-            DEFAULT_EMBED_MODEL_ID,
+            OLLAMA_768_MODEL,
             DEFAULT_EMBED_DIM,
             "active"
         )
@@ -425,7 +440,7 @@ async fn r2_same_dim_cross_backend_switch_reembeds_and_retires_old() {
             &Coordinate::new(
                 nb.clone(),
                 EmbeddingBackend::Ollama,
-                DEFAULT_EMBED_MODEL_ID,
+                OLLAMA_768_MODEL,
                 DEFAULT_EMBED_DIM,
             ),
             &q,
@@ -448,9 +463,9 @@ async fn r2_same_dim_cross_backend_switch_reembeds_and_retires_old() {
 async fn r2_flip_guard_aborts_on_concurrent_backend_change() {
     let dir = tempfile::tempdir().unwrap();
     let engine = LensEngine::init(dir.path()).await.unwrap();
-    // First switch targets the OLLAMA backend; the second targets a THIRD model so
-    // the in-lock re-resolve disagrees with what we built.
-    inject_embedder_for(&engine, DEFAULT_EMBED_MODEL_ID, EmbeddingBackend::Ollama);
+    // First switch targets the OLLAMA backend (ollama-valid 768-dim model); the
+    // second switches back so the in-lock re-resolve disagrees with what we built.
+    inject_embedder_for(&engine, OLLAMA_768_MODEL, EmbeddingBackend::Ollama);
     let (nb, _src) = seed_nomic_notebook(&engine).await;
 
     let gate = Arc::new(tokio::sync::Notify::new());
@@ -458,8 +473,8 @@ async fn r2_flip_guard_aborts_on_concurrent_backend_change() {
         .set_reembed_preflip_gate_for_test(Some(gate.clone()))
         .await;
 
-    // First switch: fastembed/nomic -> ollama/nomic. Build then park.
-    set_backend(&engine, &nb, EmbeddingBackend::Ollama).await;
+    // First switch: fastembed/nomic-v1.5 -> ollama/nomic-v2-moe. Build then park.
+    set_backend_and_model(&engine, &nb, EmbeddingBackend::Ollama, OLLAMA_768_MODEL).await;
     let engine2 = engine.clone();
     let nb2 = nb.clone();
     let handle = tokio::spawn(async move {
@@ -468,11 +483,17 @@ async fn r2_flip_guard_aborts_on_concurrent_backend_change() {
             .await
     });
 
-    // While parked, a SECOND switch lands: ollama/nomic -> fastembed/nomic (back to
-    // the original backend). The configured coordinate no longer matches what the
-    // parked task built (ollama).
+    // While parked, a SECOND switch lands: ollama/nomic-v2-moe -> fastembed/nomic-v1.5
+    // (back to the original coordinate). The configured coordinate no longer matches
+    // what the parked task built (ollama/nomic-v2-moe).
     tokio::time::sleep(Duration::from_millis(150)).await;
-    set_backend(&engine, &nb, EmbeddingBackend::Fastembed).await;
+    set_backend_and_model(
+        &engine,
+        &nb,
+        EmbeddingBackend::Fastembed,
+        DEFAULT_EMBED_MODEL_ID,
+    )
+    .await;
 
     gate.notify_one();
     let outcome = handle.await.unwrap().expect("reembed");
@@ -501,7 +522,7 @@ async fn r2_flip_guard_aborts_on_concurrent_backend_change() {
             &engine,
             &nb,
             EmbeddingBackend::Ollama,
-            DEFAULT_EMBED_MODEL_ID,
+            OLLAMA_768_MODEL,
             DEFAULT_EMBED_DIM,
             "active"
         )

@@ -57,11 +57,12 @@ const OLLAMA_READ_TIMEOUT: Duration = Duration::from_secs(120);
 /// `EMBED_BATCH` (32) and `reembed.rs` by `REEMBED_BATCH` (32); `post_embed` itself
 /// accepts an unbounded slice, so this cap is sized against that caller convention,
 /// not an internal limit. A single embed request thus POSTs at most 32 inputs, so
-/// the response is at most 32 vectors of the largest registry dim (1024) of `f32`s.
-/// Each float serializes to ~12 JSON bytes (sign/digits/`.`/exponent + a `,`
-/// delimiter), so a worst-case legitimate body is `32 * 1024 * 12 ≈ 393 KiB`. We
-/// set an 8 MiB cap — ~20x headroom for whitespace / extra fields / future batch
-/// growth — well below anything that could pressure memory.
+/// the response is at most 32 vectors of the largest registry dim (2560, for the
+/// Ollama-only `qwen3-embedding:4b`; was 1024 before issue #80) of `f32`s. Each
+/// float serializes to ~12 JSON bytes (sign/digits/`.`/exponent + a `,`
+/// delimiter), so a worst-case legitimate body is `32 * 2560 * 12 ≈ 960 KiB`. We
+/// keep the 8 MiB cap — still ~8x headroom for whitespace / extra fields / future
+/// batch growth — well below anything that could pressure memory.
 const MAX_OLLAMA_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Response shape of Ollama's `POST /api/embed`: a list of embedding vectors,
@@ -118,7 +119,18 @@ impl OllamaEmbedder {
     /// Every production construction site (`LensEngine::embedder_for`) is async,
     /// so a runtime is always present.
     pub fn new(base_url: &str, spec: &EmbeddingModelSpec) -> Result<Self, LensError> {
-        // Loopback gate FIRST — a rejected URL must make NO request. On success it
+        // Defense-in-depth backend guard (issue #80): a spec that does not list
+        // Ollama among its backends must never be served by this embedder. The
+        // primary, user-facing guard lives in `embedder_for`; this is the last
+        // line of defense so a direct construction can't smuggle a fastembed-only
+        // model onto the Ollama path.
+        if !spec.supports(crate::embedder::EmbeddingBackend::Ollama) {
+            return Err(LensError::Validation(format!(
+                "model {} does not support the ollama backend",
+                spec.id
+            )));
+        }
+        // Loopback gate — a rejected URL must make NO request. On success it
         // returns the resolved loopback addrs so we can PIN reqwest to them.
         let target = crate::ingest::require_loopback(base_url)?;
         let base = base_url.trim_end_matches('/');
@@ -203,24 +215,11 @@ impl OllamaEmbedder {
         Ok(resp.embeddings)
     }
 
-    /// L2-normalizes `v` in place (Ollama does NOT normalize; fastembed does, so
-    /// we normalize here to keep both backends' vectors directly comparable by
-    /// cosine distance).
-    fn normalize(v: &mut [f32]) {
-        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-        // Zero-norm guard in f32 space: a near-zero vector (all components ~0)
-        // would divide by ~0 and produce NaNs/Inf; `1e-9` is comfortably above
-        // f32 rounding noise yet far below any real unit-vector norm, so a genuine
-        // embedding always normalizes while a degenerate zero vector is left as-is.
-        if norm > 1e-9 {
-            for x in v.iter_mut() {
-                *x /= norm;
-            }
-        }
-    }
-
-    /// Validates each returned vector has the expected dimension, then normalizes
-    /// it. A wrong-dim response (the wrong Ollama model tag) is an error.
+    /// Validates each returned vector has the expected dimension, then
+    /// L2-normalizes it via the shared [`crate::embedder::l2_normalize`] (Ollama
+    /// does NOT normalize; fastembed does, so we normalize here to keep both
+    /// backends' vectors directly comparable by cosine distance). A wrong-dim
+    /// response (the wrong Ollama model tag) is an error.
     fn finalize(&self, mut vecs: Vec<Vec<f32>>) -> Result<Vec<Vec<f32>>, LensError> {
         for (i, v) in vecs.iter_mut().enumerate() {
             if v.len() != self.dim {
@@ -230,7 +229,7 @@ impl OllamaEmbedder {
                     self.dim
                 )));
             }
-            Self::normalize(v);
+            crate::embedder::l2_normalize(v);
         }
         Ok(vecs)
     }
@@ -271,18 +270,38 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    /// Step 4 (issue #80): the construction-time backend guard rejects a
+    /// fastembed-only spec BEFORE the loopback check, with a clear error naming the
+    /// model. This is the defense-in-depth backstop under `embedder_for`'s guard.
+    #[tokio::test]
+    async fn rejects_fastembed_only_model() {
+        // A valid loopback URL, so ONLY the backend guard can reject this.
+        let err = OllamaEmbedder::new("http://127.0.0.1:11434", resolve("nomic-embed-text-v1.5"))
+            .expect_err("a fastembed-only model must be rejected by the ollama backend guard");
+        match err {
+            LensError::Validation(msg) => {
+                assert!(
+                    msg.contains("nomic-embed-text-v1.5"),
+                    "names the model: {msg}"
+                );
+                assert!(msg.contains("ollama"), "names the backend: {msg}");
+            }
+            other => panic!("expected LensError::Validation, got {other:?}"),
+        }
+    }
+
     // --- Loopback gate: rejected URLs make NO request (validated in `new`) ---
 
     #[tokio::test]
     async fn rejects_private_lan_url() {
-        let err = OllamaEmbedder::new("http://10.0.0.5:11434", resolve("nomic-embed-text-v1.5"))
+        let err = OllamaEmbedder::new("http://10.0.0.5:11434", resolve("nomic-embed-text-v2-moe"))
             .expect_err("a private LAN URL must be rejected");
         assert!(matches!(err, LensError::Validation(_)), "got {err:?}");
     }
 
     #[tokio::test]
     async fn rejects_public_hostname_url() {
-        let err = OllamaEmbedder::new("http://evil.example", resolve("nomic-embed-text-v1.5"))
+        let err = OllamaEmbedder::new("http://evil.example", resolve("nomic-embed-text-v2-moe"))
             .expect_err("a public hostname must be rejected");
         // Either a Validation (resolved to non-loopback) or a Network (DNS) error,
         // but NEVER an Ok — and crucially no embed request is ever issued.
@@ -299,7 +318,7 @@ mod tests {
             "http://127.0.0.1:11434",
             "http://[::1]:11434",
         ] {
-            OllamaEmbedder::new(base, resolve("nomic-embed-text-v1.5"))
+            OllamaEmbedder::new(base, resolve("nomic-embed-text-v2-moe"))
                 .unwrap_or_else(|e| panic!("{base} should be accepted: {e:?}"));
         }
     }
@@ -327,7 +346,7 @@ mod tests {
             .await;
 
         let embedder =
-            OllamaEmbedder::new(&server.uri(), resolve("nomic-embed-text-v1.5")).unwrap();
+            OllamaEmbedder::new(&server.uri(), resolve("nomic-embed-text-v2-moe")).unwrap();
         // The embed call is sync + blocks on the runtime; run it off the worker.
         let vecs = tokio::task::spawn_blocking(move || embedder.embed_documents(&["a", "b"]))
             .await
@@ -355,7 +374,7 @@ mod tests {
             .await;
 
         let embedder =
-            OllamaEmbedder::new(&server.uri(), resolve("nomic-embed-text-v1.5")).unwrap();
+            OllamaEmbedder::new(&server.uri(), resolve("nomic-embed-text-v2-moe")).unwrap();
         let v = tokio::task::spawn_blocking(move || embedder.embed_query("hello"))
             .await
             .unwrap()
@@ -376,7 +395,7 @@ mod tests {
             .await;
 
         let embedder =
-            OllamaEmbedder::new(&server.uri(), resolve("nomic-embed-text-v1.5")).unwrap();
+            OllamaEmbedder::new(&server.uri(), resolve("nomic-embed-text-v2-moe")).unwrap();
         let vecs = tokio::task::spawn_blocking(move || embedder.embed_documents(&["doc text"]))
             .await
             .unwrap()
@@ -400,7 +419,7 @@ mod tests {
             .await;
 
         let embedder =
-            OllamaEmbedder::new(&server.uri(), resolve("nomic-embed-text-v1.5")).unwrap();
+            OllamaEmbedder::new(&server.uri(), resolve("nomic-embed-text-v2-moe")).unwrap();
         let err = tokio::task::spawn_blocking(move || embedder.embed_documents(&["x"]))
             .await
             .unwrap()
@@ -496,7 +515,7 @@ mod tests {
             .await;
 
         let embedder =
-            OllamaEmbedder::new(&server.uri(), resolve("nomic-embed-text-v1.5")).unwrap();
+            OllamaEmbedder::new(&server.uri(), resolve("nomic-embed-text-v2-moe")).unwrap();
         let err = tokio::task::spawn_blocking(move || embedder.embed_documents(&["x"]))
             .await
             .unwrap()

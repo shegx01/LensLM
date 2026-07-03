@@ -310,6 +310,13 @@ fn default_js_render_enabled() -> bool {
     true
 }
 
+/// Serde default fn: `reopen_last_notebook` is `true` when absent from
+/// `config.json` (last-edited-notebook default — on by default, user may opt
+/// out). Mirrors [`default_js_render_enabled`].
+fn default_reopen_last_notebook() -> bool {
+    true
+}
+
 /// Top-level application configuration.
 ///
 /// Loaded from / saved to `{data_dir}/config.json`. A missing file yields
@@ -381,6 +388,13 @@ pub struct AppConfig {
     /// the SAME additive pattern as `tts`/`enrichment`).
     #[serde(default = "default_js_render_enabled")]
     pub js_render_enabled: bool,
+    /// Whether cold app launch auto-opens the most-recently-active live notebook
+    /// (last-edited-notebook default). Defaults to `true` (on); an absent field
+    /// in an older `config.json` reads back as `true` via
+    /// [`default_reopen_last_notebook`] (backward compatibility — the SAME
+    /// additive pattern as `js_render_enabled`).
+    #[serde(default = "default_reopen_last_notebook")]
+    pub reopen_last_notebook: bool,
     /// Filesystem paths.
     pub paths: PathConfig,
     /// Tier token thresholds.
@@ -404,6 +418,7 @@ impl Default for AppConfig {
             tts: TtsConfig::default(),
             enrichment: EnrichmentConfig::default(),
             js_render_enabled: default_js_render_enabled(),
+            reopen_last_notebook: default_reopen_last_notebook(),
             paths: PathConfig::default(),
             tier_thresholds: TierThresholds::default(),
             onboarding_complete: false,
@@ -1091,6 +1106,43 @@ mod tests {
         assert!(
             config.js_render_enabled,
             "absent js_render_enabled key must read back as true"
+        );
+    }
+
+    // ── reopen_last_notebook (last-edited-notebook default) ──────────────────
+
+    #[test]
+    fn default_reopen_last_notebook_is_true() {
+        assert!(
+            AppConfig::default().reopen_last_notebook,
+            "reopen_last_notebook must default ON"
+        );
+    }
+
+    #[test]
+    fn missing_reopen_last_notebook_deserializes_to_true() {
+        // A config.json written before the `reopen_last_notebook` field existed has
+        // no such key; it must read back as `true` (default ON) rather than failing
+        // to deserialize (backward compatibility — the SAME additive pattern as
+        // `js_render_enabled`).
+        let json = r#"{
+            "theme": "dark",
+            "accent": "purple",
+            "user_name": "",
+            "embedding_model": "",
+            "embedding_backend": "",
+            "models": [],
+            "endpoints": {},
+            "voices": { "host": "", "guest": "" },
+            "tts": { "provider": "", "api_key": "" },
+            "paths": { "data_dir": "" },
+            "tier_thresholds": { "tier1_token_cap": 4000, "tier2_token_cap": 16000 },
+            "onboarding_complete": true
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert!(
+            config.reopen_last_notebook,
+            "absent reopen_last_notebook key must read back as true"
         );
     }
 }
