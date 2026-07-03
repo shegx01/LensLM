@@ -38,9 +38,15 @@ use fastembed::{InitOptions, TextEmbedding};
 
 use crate::LensError;
 
+// STEP-0 SPIKE (issue #91): the candle + Metal embedding backend. Feature-gated to
+// aarch64-apple-darwin only (see Cargo.toml `native-ml-metal`). Throwaway.
+#[cfg(feature = "native-ml-metal")]
+pub mod candle_backend;
 pub mod ollama;
 pub mod registry;
 
+#[cfg(feature = "native-ml-metal")]
+pub use candle_backend::{CandleCompute, CandleNomicEmbedder};
 pub use ollama::OllamaEmbedder;
 pub use registry::{
     DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, EmbeddingBackend, EmbeddingModelSpec, REGISTRY,
