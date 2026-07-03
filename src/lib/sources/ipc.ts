@@ -168,3 +168,35 @@ export async function purgeSource(sourceId: string): Promise<void> {
   if (!isTauri()) return;
   return invoke<void>('purge_source', { sourceId });
 }
+
+/**
+ * Retry ingesting a single errored source, streaming progress events via a Channel.
+ * The source must be in `error` status and not trashed; the backend rejects otherwise.
+ *
+ * Mirrors `ingestSource` channel setup. The returned Promise resolves when the
+ * command completes (after `done` or `failed`).
+ */
+export async function retryIngestSource(
+  sourceId: string,
+  onProgress: (e: StreamEvent<IngestProgress>) => void
+): Promise<void> {
+  if (!isTauri()) return;
+  const channel = new Channel<StreamEvent<IngestProgress>>();
+  channel.onmessage = onProgress;
+  await invoke<void>('retry_ingest_source', { sourceId, onProgress: channel });
+}
+
+/**
+ * Retry all non-trashed errored sources in a notebook, streaming progress events.
+ * Runs sequentially with continue-on-failure: one failure re-writes its own
+ * `error_meta` (incrementing `attempt_count`) and does not abort the rest.
+ */
+export async function retryAllFailedSources(
+  notebookId: string,
+  onProgress: (e: StreamEvent<IngestProgress>) => void
+): Promise<void> {
+  if (!isTauri()) return;
+  const channel = new Channel<StreamEvent<IngestProgress>>();
+  channel.onmessage = onProgress;
+  await invoke<void>('retry_all_failed_sources', { notebookId, onProgress: channel });
+}

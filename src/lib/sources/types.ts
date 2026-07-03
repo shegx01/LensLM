@@ -45,6 +45,32 @@ export type SourceKind =
   | 'csv'
   | 'file';
 
+/**
+ * Known error kinds mirroring the Rust `LensError` enum variants.
+ * Treat as an open set — unknown kinds are valid (forward-compat).
+ */
+export type LensErrorKind =
+  | 'Validation'
+  | 'Internal'
+  | 'Io'
+  | 'Parse'
+  | 'Model'
+  | 'Network'
+  | 'Vector'
+  | (string & Record<never, never>); // allow unknown future variants
+
+/**
+ * Structured ingest failure reason persisted in the `error_meta` DB column.
+ * Mirrors the Rust `ErrorMeta` struct (serde JSON). `null` means the source
+ * reached the `error` status before migration 0012 (crash-recovery rows).
+ */
+export interface ErrorMeta {
+  kind: LensErrorKind;
+  message: string;
+  timestamp: string;
+  attempt_count: number;
+}
+
 // SYNC-CHECK: must match lens-core/src/notebooks.rs Source struct (around line 82)
 export interface Source {
   id: string;
@@ -73,6 +99,15 @@ export interface Source {
    * (`0` = off, `1` = on), mirroring `selected`. When set, ingest ALWAYS routes
    * the URL source through the JS-render path. Only URL sources render. */
   force_js_render: number;
+  /**
+   * Parsed ingest failure reason from the `error_meta` DB column (#73).
+   * `null` for non-errored sources or pre-migration crash-recovery rows.
+   * Gate error UI on `status === 'error'`, NOT on this field being non-null.
+   *
+   * The backend sends a JSON string; parse it at the IPC boundary in
+   * `sources-state.svelte.ts` `loadSources` / `handleEvent`.
+   */
+  error_meta: ErrorMeta | null;
 }
 
 /** Return type of all add-source IPC calls (add_file_source, add_source,

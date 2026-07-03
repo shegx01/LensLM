@@ -89,3 +89,119 @@ impl From<sqlx::migrate::MigrateError> for LensError {
         LensError::Internal("database migration failed".into())
     }
 }
+
+impl LensError {
+    /// The stable `kind` discriminant string — identical to the `kind` field of
+    /// this error's serialized `{kind, message}` wire shape. Used to build the
+    /// persisted [`ErrorMeta`] without a serialize round-trip.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            LensError::Validation(_) => "Validation",
+            LensError::Internal(_) => "Internal",
+            LensError::Io(_) => "Io",
+            LensError::Parse(_) => "Parse",
+            LensError::Model(_) => "Model",
+            LensError::Network(_) => "Network",
+            LensError::Vector(_) => "Vector",
+        }
+    }
+
+    /// The inner `String` payload — identical to the `message` field of this
+    /// error's serialized `{kind, message}` wire shape (NOT the `Display` text,
+    /// which prefixes the kind).
+    pub fn message(&self) -> &str {
+        match self {
+            LensError::Validation(m)
+            | LensError::Internal(m)
+            | LensError::Io(m)
+            | LensError::Parse(m)
+            | LensError::Model(m)
+            | LensError::Network(m)
+            | LensError::Vector(m) => m,
+        }
+    }
+}
+
+/// A structured, persisted snapshot of the failure that flipped a source to
+/// `status="error"` (issue #73). Serialized to JSON in the nullable
+/// `sources.error_meta` TEXT column and surfaced in the UI.
+///
+/// `kind`/`message` mirror the [`LensError`] `{kind, message}` wire shape via
+/// [`ErrorMeta::from_error`]. `attempt_count` is the cumulative number of failed
+/// ingest attempts (1 on the first failure; incremented on each failed retry).
+/// `timestamp` is the RFC3339 instant of THIS failure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErrorMeta {
+    /// The `LensError` discriminant (`Validation`/`Internal`/`Io`/`Parse`/
+    /// `Model`/`Network`/`Vector`).
+    pub kind: String,
+    /// The human-readable failure message (the `LensError` inner payload).
+    pub message: String,
+    /// RFC3339 timestamp of this failure.
+    pub timestamp: String,
+    /// Cumulative failed-attempt count (>= 1); increments on each failed retry.
+    pub attempt_count: u32,
+}
+
+impl ErrorMeta {
+    /// Builds an [`ErrorMeta`] from the failing [`LensError`] plus the new
+    /// `attempt_count`, stamping the current time. `attempt_count` is supplied by
+    /// the caller (prior count, NULL⇒0, plus one).
+    pub fn from_error(err: &LensError, attempt_count: u32) -> Self {
+        ErrorMeta {
+            kind: err.kind().to_string(),
+            message: err.message().to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            attempt_count,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_meta_serde_round_trip() {
+        let meta = ErrorMeta {
+            kind: "Network".to_string(),
+            message: "connection refused".to_string(),
+            timestamp: "2026-07-03T00:00:00+00:00".to_string(),
+            attempt_count: 2,
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let back: ErrorMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(meta, back);
+    }
+
+    #[test]
+    fn error_meta_from_lens_error_maps_kind_and_message() {
+        let cases = [
+            (LensError::Validation("bad".into()), "Validation", "bad"),
+            (LensError::Internal("oops".into()), "Internal", "oops"),
+            (LensError::Io("disk".into()), "Io", "disk"),
+            (LensError::Parse("json".into()), "Parse", "json"),
+            (LensError::Model("onnx".into()), "Model", "onnx"),
+            (LensError::Network("dns".into()), "Network", "dns"),
+            (LensError::Vector("lance".into()), "Vector", "lance"),
+        ];
+        for (err, kind, message) in cases {
+            let meta = ErrorMeta::from_error(&err, 1);
+            assert_eq!(meta.kind, kind);
+            assert_eq!(meta.message, message);
+            assert_eq!(meta.attempt_count, 1);
+            assert!(!meta.timestamp.is_empty());
+        }
+    }
+
+    #[test]
+    fn error_meta_kind_message_match_serialized_wire_shape() {
+        // The `kind()`/`message()` helpers must match the serde `{kind, message}`
+        // wire shape (locked by the tagged enum), so the persisted ErrorMeta and
+        // the IPC error carry identical discriminants.
+        let err = LensError::Model("mismatched vector count".into());
+        let wire = serde_json::to_value(&err).unwrap();
+        assert_eq!(wire["kind"], err.kind());
+        assert_eq!(wire["message"], err.message());
+    }
+}

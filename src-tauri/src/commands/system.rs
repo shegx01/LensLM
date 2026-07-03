@@ -485,8 +485,9 @@ mod tests {
         // Phase 4b-B), 0008_source_file_hash (#96 add-time content dedup),
         // 0009_source_raw_content_hash_rename (#100 rename file_hash),
         // 0010_source_force_js_render (#78 per-source SPA render opt-in),
-        // 0011_notebook_last_activity_at (last-edited-notebook default).
-        assert_eq!(status.migration_count, 11);
+        // 0011_notebook_last_activity_at (last-edited-notebook default),
+        // 0012_source_error_meta (#73 structured ingest failure reason).
+        assert_eq!(status.migration_count, 12);
     }
 
     #[tokio::test]

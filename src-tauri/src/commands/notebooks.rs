@@ -251,6 +251,118 @@ pub async fn ingest_source(
     result
 }
 
+/// Retries a FAILED source in place (issue #73), re-running the ingest pipeline
+/// on the SAME row and streaming progress over `on_progress` as
+/// `StreamEvent<IngestProgress>` (mirrors [`ingest_source`]).
+///
+/// Rejects non-`error` and trashed sources (`Failed(LensError::Validation)`);
+/// on success the source is `indexed` with its `error_meta` cleared, and its
+/// id/order/selected flag are preserved (no new row).
+///
+/// Invoked as `invoke("retry_ingest_source", { sourceId, onProgress })`.
+#[tracing::instrument(skip(on_progress, engine))]
+#[tauri::command]
+pub async fn retry_ingest_source(
+    source_id: String,
+    on_progress: Channel<StreamEvent<IngestProgress>>,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<(), LensError> {
+    if let Err(e) = send_event(&on_progress, StreamEvent::Started) {
+        tracing::warn!("retry_ingest_source: started event send failed: {e}");
+    }
+
+    let result = engine
+        .retry_source(&source_id, |progress| {
+            let done = progress.done;
+            let total = progress.total;
+            if let Err(e) = send_event(&on_progress, StreamEvent::Chunk(progress)) {
+                tracing::warn!("retry_ingest_source: progress chunk send failed: {e}");
+            }
+            if let Err(e) = send_event(&on_progress, StreamEvent::Progress { done, total }) {
+                tracing::warn!("retry_ingest_source: progress event send failed: {e}");
+            }
+        })
+        .await;
+
+    match &result {
+        Ok(()) => {
+            if let Err(e) = send_event(&on_progress, StreamEvent::Done) {
+                tracing::warn!("retry_ingest_source: done event send failed: {e}");
+            }
+        }
+        Err(err) => {
+            if let Err(e) = send_event(&on_progress, StreamEvent::Failed(err.clone())) {
+                tracing::warn!("retry_ingest_source: failed event send failed: {e}");
+            }
+        }
+    }
+
+    result
+}
+
+/// Retries EVERY failed source in a notebook (issue #73, "Retry all failed").
+///
+/// Enumerates the notebook's live (non-trashed) `error` sources and retries them
+/// SEQUENTIALLY through the single-permit ingest path, with a CONTINUE-ON-FAILURE
+/// policy: a source that fails again re-writes only its own `error_meta`
+/// (incremented `attempt_count`) and does NOT abort the rest of the batch. All
+/// per-source progress streams over the one shared `on_progress` channel; the
+/// command returns `Ok(())` once every source has been attempted.
+///
+/// Invoked as `invoke("retry_all_failed_sources", { notebookId, onProgress })`.
+#[tracing::instrument(skip(on_progress, engine))]
+#[tauri::command]
+pub async fn retry_all_failed_sources(
+    notebook_id: String,
+    on_progress: Channel<StreamEvent<IngestProgress>>,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<(), LensError> {
+    // Snapshot the failed set up front. `list_sources` already excludes trashed
+    // rows; filter to the error status (enum, not a magic string).
+    let failed: Vec<String> = engine
+        .list_sources(&NotebookId::from(notebook_id))
+        .await?
+        .into_iter()
+        .filter(|s| s.status == lens_core::notebooks::SourceStatus::Error.as_str())
+        .map(|s| s.id)
+        .collect();
+
+    if let Err(e) = send_event(&on_progress, StreamEvent::Started) {
+        tracing::warn!("retry_all_failed_sources: started event send failed: {e}");
+    }
+
+    // Sequential (bounded by the single ingest permit inside each retry) with a
+    // continue-on-failure policy: one source's failure must not abort the rest.
+    for source_id in &failed {
+        let result = engine
+            .retry_source(source_id, |progress| {
+                let done = progress.done;
+                let total = progress.total;
+                if let Err(e) = send_event(&on_progress, StreamEvent::Chunk(progress)) {
+                    tracing::warn!("retry_all_failed_sources: progress chunk send failed: {e}");
+                }
+                if let Err(e) = send_event(&on_progress, StreamEvent::Progress { done, total }) {
+                    tracing::warn!("retry_all_failed_sources: progress event send failed: {e}");
+                }
+            })
+            .await;
+        if let Err(err) = &result {
+            // Continue-on-failure: the source is left in `error` with fresh
+            // metadata by the retry path; log and move to the next one.
+            tracing::warn!(
+                source_id,
+                "retry_all_failed_sources: source retry failed: {err}"
+            );
+        }
+    }
+
+    if let Err(e) = send_event(&on_progress, StreamEvent::Done) {
+        tracing::warn!("retry_all_failed_sources: done event send failed: {e}");
+    }
+
+    Ok(())
+}
+
 /// Renames a notebook.
 #[tracing::instrument(skip_all)]
 #[tauri::command]

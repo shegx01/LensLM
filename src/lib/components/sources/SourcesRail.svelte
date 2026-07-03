@@ -11,6 +11,7 @@
   import Check from '@lucide/svelte/icons/check';
   import Plus from '@lucide/svelte/icons/plus';
   import Trash from '@lucide/svelte/icons/trash';
+  import RotateCcw from '@lucide/svelte/icons/rotate-ccw';
   import PanelRight from '@lucide/svelte/icons/panel-right';
   import PanelRightClose from '@lucide/svelte/icons/panel-right-close';
   import Headphones from '@lucide/svelte/icons/headphones';
@@ -21,7 +22,8 @@
     toggleSelected,
     removeSource,
     undoRemove,
-    disposeTrashTimers
+    disposeTrashTimers,
+    retrySource
   } from '$lib/sources/sources-state.svelte.js';
   import { notebookStore } from '$lib/notebooks/index.js';
   import type { SourceStatus } from '$lib/sources/types.js';
@@ -386,28 +388,91 @@
               </div>
             </div>
 
-            <!-- Right-side affordance: fixed-width 20px reserved slot.
-                 Status dot is visible by default; on row hover/focus the dot
-                 fades out and the trash button fades in — occupying the same
-                 slot so they never overlap. The trash button is sized to 20px
-                 (matching the reserved slot) so there is no layout shift.
-                 -webkit-app-region: no-drag on the button prevents the titlebar
-                 drag region from swallowing the click. -->
+            <!-- Right-side affordance: fixed-width reserved slot.
+                 For non-error sources: 20px slot — status dot fades out on hover,
+                 trash button fades in (same layout as before).
+                 For error sources: wider slot — dot + tooltip on hover + retry button
+                 beside trash. The retry button only appears on hover/focus on error rows.
+                 -webkit-app-region: no-drag on all buttons prevents titlebar drag
+                 region from swallowing clicks. -->
             <div
-              class="relative mt-1 flex size-5 shrink-0 items-center justify-center"
+              class={cn(
+                'relative mt-1 flex shrink-0 items-center justify-end gap-0.5',
+                status === 'error' ? 'w-auto' : 'size-5'
+              )}
               aria-label="Status: {statusDotLabel(status)}"
             >
-              <!-- Status dot — fades out on group-hover, invisible when trash is shown.
-                   group-hover:animate-none stops the in-progress `animate-pulse`
-                   keyframes from re-driving opacity (which would otherwise bleed the
-                   pulsing dot through under the trash icon). -->
-              <span
-                class={cn(
-                  'pointer-events-none absolute block size-[7px] rounded-full transition-opacity duration-150 group-hover:animate-none group-hover:opacity-0',
-                  statusDotClass(status)
-                )}
-                aria-hidden="true"
-              ></span>
+              <!-- Status dot — fades out on group-hover. For error dots, shows a
+                   tooltip with the short failure reason on hover.
+                   group-hover:animate-none stops animate-pulse from bleeding through. -->
+              {#if status === 'error'}
+                <!-- Error dot with tooltip wrapper -->
+                <div class="relative flex items-center">
+                  <span
+                    class={cn(
+                      'pointer-events-none block size-[7px] rounded-full transition-opacity duration-150 group-hover:animate-none group-hover:opacity-0',
+                      statusDotClass(status)
+                    )}
+                    aria-hidden="true"
+                  ></span>
+                  <!-- Error reason tooltip — visible on group-hover, positioned above the dot.
+                       Hidden when the dot fades (group-hover:opacity-0 above keeps space clean). -->
+                  <div
+                    class={cn(
+                      'pointer-events-none absolute bottom-full right-0 z-10 mb-1.5',
+                      'w-max max-w-[200px] rounded-md border border-destructive/30 bg-popover px-2.5 py-1.5 shadow-md',
+                      'opacity-0 transition-opacity duration-150 group-hover:opacity-100'
+                    )}
+                    role="tooltip"
+                    data-error-tooltip
+                  >
+                    <p class="text-[0.6875rem] font-medium text-destructive leading-snug">
+                      {source.error_meta
+                        ? source.error_meta.message
+                        : 'Ingest failed (no details captured)'}
+                    </p>
+                    {#if source.error_meta?.kind}
+                      <p class="mt-0.5 text-[0.625rem] text-muted-foreground">
+                        {source.error_meta.kind}
+                        {#if source.error_meta.attempt_count > 1}
+                          · attempt {source.error_meta.attempt_count}
+                        {/if}
+                      </p>
+                    {/if}
+                  </div>
+                </div>
+
+                <!-- Retry button — appears on hover for error sources only. -->
+                <button
+                  type="button"
+                  aria-label="Retry ingesting {source.title}"
+                  data-retry-source-btn
+                  onclick={(e) => {
+                    e.stopPropagation();
+                    void retrySource(source.id);
+                  }}
+                  class={cn(
+                    'flex size-5 items-center justify-center rounded-[5px]',
+                    'opacity-0 transition-opacity duration-150',
+                    'bg-transparent text-muted-foreground/40',
+                    'hover:bg-destructive/15 hover:text-destructive',
+                    'focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+                    'group-hover:opacity-100'
+                  )}
+                  style="-webkit-app-region: no-drag;"
+                >
+                  <RotateCcw class="size-3" strokeWidth={2} />
+                </button>
+              {:else}
+                <!-- Non-error: status dot -->
+                <span
+                  class={cn(
+                    'pointer-events-none absolute block size-[7px] rounded-full transition-opacity duration-150 group-hover:animate-none group-hover:opacity-0',
+                    statusDotClass(status)
+                  )}
+                  aria-hidden="true"
+                ></span>
+              {/if}
 
               <!-- Delete button — invisible by default, fades in on hover/focus.
                    Sized to fill the same 20px reserved slot as the dot wrapper
@@ -421,7 +486,8 @@
                   void removeSource(source.id);
                 }}
                 class={cn(
-                  'absolute flex size-5 items-center justify-center rounded-[5px]',
+                  'flex size-5 items-center justify-center rounded-[5px]',
+                  status !== 'error' && 'absolute',
                   'opacity-0 transition-opacity duration-150',
                   'bg-transparent text-muted-foreground/40',
                   'hover:bg-destructive/15 hover:text-destructive',
