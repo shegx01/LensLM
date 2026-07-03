@@ -56,7 +56,8 @@
     listOllamaModels,
     warmFastembedModel,
     getNotebookEmbeddingModel,
-    setNotebookEmbeddingModel
+    setNotebookEmbeddingModel,
+    gpuAcceleratedModels
   } from '$lib/embeddings/ipc.js';
 
   let {
@@ -103,6 +104,12 @@
   let ollamaInstalled = $state<Set<EmbeddingModelId>>(new Set());
   let ollamaEndpoint = $state('http://localhost:11434');
   let refreshing = $state(false);
+  // The registry model ids that actually run on the Apple GPU on this build —
+  // `{nomic}` on Apple Silicon today, empty elsewhere (issue #91). GPU acceleration
+  // is PER-MODEL (candle wires nomic; mxbai/bge-m3 fall back to fastembed-CPU until
+  // wired; all-minilm is CPU by design), so the badge + "fastest" hint are keyed on
+  // THIS set, not the provider.
+  let gpuModels = $state<Set<string>>(new Set());
 
   // ── fastembed install state ─────────────────────────────────────────────────
   let installProgress = $state<number | null>(null);
@@ -124,6 +131,16 @@
   // Only models whose `backends` includes the currently-selected backend are
   // shown in the picker (strict fastembed/ollama partition, issue #80).
   const filteredModels = $derived(EMBEDDING_MODELS.filter((m) => m.backends.includes(backend)));
+
+  // Provider buttons. The on-device provider is labeled neutrally "On-device" (its
+  // persisted backend token stays `fastembed`): GPU acceleration is a per-MODEL
+  // property shown as a badge on the model card, NOT a provider attribute — the
+  // on-device provider serves both GPU (nomic) and CPU (mxbai/bge-m3/all-minilm)
+  // models, so a provider-level "Apple GPU" label would misrepresent them (#91).
+  const providers = [
+    { id: 'fastembed', label: 'On-device' },
+    { id: 'ollama', label: 'Ollama' }
+  ];
 
   async function refreshOllama(): Promise<void> {
     refreshing = true;
@@ -152,6 +169,11 @@
   }
 
   onMount(async () => {
+    // Capability probe (issue #91): which models run on the Apple GPU? Cosmetic
+    // (badge + hint), so fetch WITHOUT blocking the init/selection sequence below.
+    void gpuAcceleratedModels().then((ids) => {
+      gpuModels = new Set(ids);
+    });
     if (mode === 'global') {
       if (isTauri()) {
         try {
@@ -311,7 +333,7 @@
       Select your local embeddings provider
     </p>
     <div class="mt-2.5 grid grid-cols-2 gap-2" role="radiogroup" aria-label="Embeddings provider">
-      {#each [{ id: 'fastembed', label: 'fastembed' }, { id: 'ollama', label: 'Ollama' }] as p (p.id)}
+      {#each providers as p (p.id)}
         {@const isSel = backend === p.id}
         <button
           type="button"
@@ -334,6 +356,14 @@
         </button>
       {/each}
     </div>
+    {#if gpuModels.has(selectedModel)}
+      <!-- issue #91: only when the SELECTED model actually runs on the GPU (candle +
+           Metal, ~2.6× the CPU throughput and frees the CPU) — not for CPU models. -->
+      <p class="mt-2 flex items-center gap-1.5 text-[0.7rem] text-muted-foreground">
+        <span aria-hidden="true">⚡</span>
+        Best performance — embeds on your Apple GPU.
+      </p>
+    {/if}
   </div>
 
   <!-- ── Embedding model radio-list ── -->
@@ -344,6 +374,7 @@
     {#each filteredModels as model (model.id)}
       {@const isSelected = selectedModel === model.id}
       {@const isReady = installed.has(model.id)}
+      {@const isGpu = gpuModels.has(model.id)}
       <div
         class={cn(
           'w-full rounded-[10px] border px-3 py-3 transition-colors',
@@ -367,6 +398,18 @@
             <span class="mt-0.5 block text-[0.68rem] text-muted-foreground">{modelMeta(model)}</span
             >
           </span>
+          {#if isGpu}
+            <!-- issue #91: this model actually runs on the Apple GPU (candle+Metal).
+                 Per-model (not per-provider) — only candle-wired, GPU-eligible
+                 models qualify; CPU models never show this. -->
+            <span
+              class="flex shrink-0 items-center gap-1 text-[0.66rem] font-semibold text-primary"
+              aria-label={`${model.label} runs on the Apple GPU`}
+            >
+              <span aria-hidden="true">⚡</span>
+              Apple GPU
+            </span>
+          {/if}
           {#if isReady}
             <span
               class="flex shrink-0 items-center gap-1 text-[0.66rem] font-semibold text-green-primary"

@@ -27,11 +27,37 @@ describe('EmbeddingsSection — global mode', () => {
     expect(await screen.findByRole('heading', { name: 'Embeddings' })).toBeInTheDocument();
     expect(screen.getByText(/local only — all vectors computed on-device/i)).toBeInTheDocument();
     expect(screen.getByText(/select your local embeddings provider/i)).toBeInTheDocument();
-    expect(screen.getByRole('radio', { name: 'fastembed' })).toBeInTheDocument();
+    // The on-device provider is labeled "On-device" (or "On-device · Apple GPU" on
+    // Apple Silicon, issue #91); tests run outside Tauri so gpuActive is false.
+    expect(screen.getByRole('radio', { name: 'On-device' })).toBeInTheDocument();
     expect(screen.getByRole('radio', { name: 'Ollama' })).toBeInTheDocument();
     // All four models are present.
     expect(screen.getByRole('radio', { name: /nomic-embed-text-v1\.5/i })).toBeInTheDocument();
     expect(screen.getByRole('radio', { name: /bge-m3/i })).toBeInTheDocument();
+  });
+
+  it('badges only GPU-accelerated models and shows the hint when one is selected (issue #91)', async () => {
+    // Simulate an Apple-Silicon build where nomic runs on the GPU (candle+Metal)
+    // but the other models do not (CPU fallback / by design).
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return baseAppConfig({ embedding_model: 'nomic-embed-text-v1.5' });
+      if (cmd === 'fastembed_models_cached') return ['nomic-embed-text-v1.5'];
+      if (cmd === 'list_ollama_models') return [];
+      if (cmd === 'gpu_accelerated_models') return ['nomic-embed-text-v1.5'];
+    });
+
+    render(EmbeddingsSection, { props: { mode: 'global' } });
+
+    // nomic is badged "Apple GPU"; the CPU models (e.g. all-minilm) are NOT.
+    await waitFor(() =>
+      expect(
+        screen.getByLabelText(/nomic-embed-text-v1\.5 runs on the apple gpu/i)
+      ).toBeInTheDocument()
+    );
+    expect(screen.queryByLabelText(/all-minilm runs on the apple gpu/i)).not.toBeInTheDocument();
+
+    // nomic is the selected (default) model → the best-performance hint shows.
+    expect(screen.getByText(/best performance — embeds on your apple gpu/i)).toBeInTheDocument();
   });
 
   it('NEVER shows the re-embed warning in global mode', async () => {
@@ -294,8 +320,8 @@ describe('EmbeddingsSection — backend-filtered model picker (Step 8)', () => {
     const ollamaBtn = await screen.findByRole('radio', { name: /^ollama$/i });
     expect(ollamaBtn).toHaveAttribute('aria-checked', 'true');
 
-    // Switch to fastembed.
-    const fastembedBtn = screen.getByRole('radio', { name: /^fastembed$/i });
+    // Switch to fastembed (the on-device provider; labeled "On-device", issue #91).
+    const fastembedBtn = screen.getByRole('radio', { name: /^on-device$/i });
     await fireEvent.click(fastembedBtn);
 
     // After switching, fastembed models should now be visible.

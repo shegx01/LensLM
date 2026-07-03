@@ -124,6 +124,24 @@ export async function warmFastembedModel(model: string): Promise<void> {
 }
 
 /**
+ * The registry model ids that actually run on the Apple GPU (candle + Metal) on
+ * this build — `["nomic-embed-text-v1.5"]` on Apple Silicon today, `[]` elsewhere
+ * (issue #91). GPU acceleration is per-model: the UI badges exactly these models
+ * "Apple GPU" and shows the "best performance" hint only when one is selected.
+ *
+ * Outside Tauri (component tests / `vite dev`) returns `[]` — no native backend to
+ * query, so no model shows a GPU badge.
+ */
+export async function gpuAcceleratedModels(): Promise<string[]> {
+  if (!isTauri()) return [];
+  try {
+    return await invoke<string[]>('gpu_accelerated_models');
+  } catch {
+    return [];
+  }
+}
+
+/**
  * The locally-pulled Ollama models at `baseUrl` via the live `/api/tags` probe.
  * Graceful by contract: an unreachable runtime yields `[]`, never an error.
  *

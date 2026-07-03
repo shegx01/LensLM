@@ -45,6 +45,15 @@ uuid = { workspace = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 
+# issue #91: turn ON candle + Metal (Apple GPU) embedding for the SHIPPING app on
+# Apple Silicon. Cargo UNIONS this with the base `lens-core` dep in [dependencies],
+# so on aarch64-apple-darwin lens-core is built with `native-ml-metal` (candle is
+# the default embedding engine for supported models — Metal for bulk, candle-CPU
+# for queries), while every other target keeps the feature-less fastembed build.
+# The feature is target-gated in lens-core too, so it can ONLY activate here.
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+lens-core = { path = "../lens-core", features = ["native-ml-metal"] }
+
 [dev-dependencies]
 # The `test` feature (mock runtime) is unioned in only for test builds.
 tauri = { version = "2", features = ["test"] }

@@ -29,7 +29,9 @@ describe('EmbeddingConfigPanel — Step 9 rework (backend-aware)', () => {
     });
 
     expect(await screen.findByText(/select your local embeddings provider/i)).toBeInTheDocument();
-    expect(screen.getByRole('radio', { name: 'fastembed' })).toBeInTheDocument();
+    // On-device provider (labeled "On-device"; "· Apple GPU" on Apple Silicon,
+    // issue #91). Tests run outside Tauri so the GPU signal is false.
+    expect(screen.getByRole('radio', { name: 'On-device' })).toBeInTheDocument();
     expect(screen.getByRole('radio', { name: 'Ollama' })).toBeInTheDocument();
     expect(screen.getByText(/Ollama must be installed if chosen/i)).toBeInTheDocument();
     expect(screen.getByText(/permanently linked/i)).toBeInTheDocument();

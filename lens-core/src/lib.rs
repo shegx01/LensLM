@@ -98,6 +98,105 @@ pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
+/// Builds the candle embedder for a `fastembed`-coordinate spec on the requested
+/// `compute` device, or returns `None` so [`LensEngine::embedder_for`] falls back
+/// to fastembed. issue #91.
+///
+/// On the `native-ml-metal` build (Apple Silicon), candle is the DEFAULT engine for
+/// a candle-supported model — this builds candle-**Metal** for a `Bulk` job
+/// (`Compute::Metal`) and candle-**CPU** for an interactive query (`Compute::Cpu`),
+/// so a notebook's whole embedding coordinate is served by candle (one weight set,
+/// no fastembed ONNX download). Returns `None` — deferring to fastembed — for a
+/// model candle doesn't implement yet (mxbai / bge-m3) or on any candle init
+/// failure. Runs the ~547 MB weight load off the async runtime via `spawn_blocking`.
+///
+/// The no-feature build is a `None` stub: fastembed serves everything on
+/// non-Apple-Silicon targets.
+#[cfg(feature = "native-ml-metal")]
+async fn build_candle_if_supported(
+    compute: crate::embedder::Compute,
+    data_dir: &Path,
+    spec: &'static crate::embedder::EmbeddingModelSpec,
+) -> Option<Arc<dyn Embedder>> {
+    // A GPU-eligible model that candle doesn't YET implement (e.g. mxbai / bge-m3)
+    // is an EXPECTED fastembed fallback, not a failure — skip the construction
+    // attempt entirely and log at debug (no scary warn, no wasted model load).
+    if !crate::embedder::candle_supports_model(spec.id) {
+        tracing::debug!(
+            model = %spec.id,
+            "candle backend does not yet implement this model; using fastembed"
+        );
+        return None;
+    }
+    let candle_dir = data_dir.join("models").join("candle");
+    match tokio::task::spawn_blocking(move || {
+        crate::embedder::CandleNomicEmbedder::new_with_spec(&candle_dir, compute, spec)
+    })
+    .await
+    {
+        Ok(Ok(e)) => {
+            let e: Arc<dyn Embedder> = Arc::new(e);
+            Some(e)
+        }
+        // A supported model that genuinely failed to init (Metal/device unavailable,
+        // bad weights) — THIS is a real warn; still fall back so no job fails.
+        Ok(Err(err)) => {
+            tracing::warn!(
+                model = %spec.id,
+                device = compute.as_str(),
+                error = %err,
+                "candle embedder init failed; falling back to fastembed"
+            );
+            None
+        }
+        Err(join) => {
+            tracing::warn!(
+                error = %join,
+                "candle init task panicked; falling back to fastembed"
+            );
+            None
+        }
+    }
+}
+
+/// No-feature stub: fastembed serves everything on non-Apple-Silicon targets, so
+/// candle is never selected.
+#[cfg(not(feature = "native-ml-metal"))]
+async fn build_candle_if_supported(
+    _compute: crate::embedder::Compute,
+    _data_dir: &Path,
+    _spec: &'static crate::embedder::EmbeddingModelSpec,
+) -> Option<Arc<dyn Embedder>> {
+    None
+}
+
+/// Builds the NVIDIA-CUDA embedder for a `Compute::Cuda` job — issue #91 INTERFACE
+/// ONLY. Returns `None` today (no candle-CUDA backend), so a CUDA-resolved job falls
+/// back to fastembed-CPU. The future implementation builds a `CandleCudaEmbedder`
+/// here behind `native-ml-cuda`; the selection policy already routes to it.
+#[cfg(feature = "native-ml-cuda")]
+async fn build_cuda_if_supported(
+    _compute: crate::embedder::Compute,
+    _data_dir: &Path,
+    spec: &'static crate::embedder::EmbeddingModelSpec,
+) -> Option<Arc<dyn Embedder>> {
+    tracing::debug!(
+        model = %spec.id,
+        "candle-CUDA backend not yet implemented (interface only); using fastembed-CPU"
+    );
+    None
+}
+
+/// No-feature stub: without `native-ml-cuda` the policy never resolves `Cuda`.
+#[cfg(not(feature = "native-ml-cuda"))]
+async fn build_cuda_if_supported(
+    _compute: crate::embedder::Compute,
+    _data_dir: &Path,
+    _spec: &'static crate::embedder::EmbeddingModelSpec,
+) -> Option<Arc<dyn Embedder>> {
+    None
+}
+
 /// Mutable engine resources live here: the database connection pool and the
 /// loaded application configuration.
 ///
@@ -165,6 +264,13 @@ pub struct LensEngine {
     /// per-key `OnceCell` (init outside the map lock) is the M9 follow-up if cold
     /// multi-model startup latency becomes a concern.
     embedders: Arc<Mutex<HashMap<String, Arc<dyn Embedder>>>>,
+    /// Native-ML acceleration probe (issue #91) — the polymorphic seam that tells
+    /// [`embedder_for`](Self::embedder_for)'s device policy whether an Apple Metal
+    /// GPU is available. Defaults to [`crate::embedder::default_accelerator`] (a
+    /// Metal probe on aarch64-apple-darwin + `native-ml-metal`, else CPU-only);
+    /// held behind a trait object so tests can inject a fake and future
+    /// accelerators (MLX-Swift, CUDA) drop in without touching the policy.
+    accelerator: Arc<dyn crate::embedder::NativeAccelerator>,
     /// Lazily-resolved, shared nomic tokenizer (parallel to `embedder`).
     ///
     /// The nomic `tokenizer.json` is a multi-MB file; resolving it per-ingest
@@ -344,6 +450,7 @@ impl LensEngine {
         let engine = Self {
             inner: Arc::new(RwLock::new(LensEngineInner { db, config })),
             embedders: Arc::new(Mutex::new(HashMap::new())),
+            accelerator: crate::embedder::default_accelerator(),
             tokenizer: Arc::new(OnceCell::new()),
             ingest_lock: Arc::new(Semaphore::new(1)),
             enrichment_tx,
@@ -432,6 +539,7 @@ impl LensEngine {
                 config: AppConfig::default(),
             })),
             embedders: Arc::new(Mutex::new(HashMap::new())),
+            accelerator: crate::embedder::default_accelerator(),
             tokenizer: Arc::new(OnceCell::new()),
             ingest_lock: Arc::new(Semaphore::new(1)),
             enrichment_tx,
@@ -1153,7 +1261,20 @@ impl LensEngine {
         embedder: Arc<dyn Embedder>,
         backend: crate::embedder::EmbeddingBackend,
     ) -> Result<(), LensError> {
-        let key = Self::embedder_cache_key(embedder.model_id(), backend);
+        // Register under the SAME device key `embedder_for` will resolve for a Bulk
+        // request (the workload every injection-based test drives): run the real
+        // policy against the engine's own accelerator (issue #91). Feature-off this
+        // is always `Compute::Cpu`; feature-on on Metal hardware it correctly
+        // resolves `Compute::Metal`, so the injected double is found either way
+        // instead of being missed (which would trigger a real model download).
+        let spec = crate::embedder::resolve(embedder.model_id());
+        let compute = crate::embedder::select_compute(
+            self.accelerator.probe(),
+            spec,
+            backend,
+            crate::embedder::WorkloadKind::Bulk,
+        );
+        let key = Self::embedder_cache_key(embedder.model_id(), backend, compute);
         // `try_lock` (not `blocking_lock`) keeps this a sync fn that is safe to
         // call from inside a `#[tokio::test]` async context: the cache is
         // uncontended at injection time, so the lock is always immediately
@@ -1180,18 +1301,31 @@ impl LensEngine {
         model_id: &str,
         backend: crate::embedder::EmbeddingBackend,
     ) -> Result<Arc<dyn Embedder>, LensError> {
-        self.embedder_for(model_id, backend).await
+        // Tests don't exercise device selection (they run feature-off → always CPU);
+        // Bulk is the representative workload of every real call site.
+        self.embedder_for(model_id, backend, crate::embedder::WorkloadKind::Bulk)
+            .await
     }
 
-    /// The embedder-cache key for a `(resolved-model-id, backend)` pair.
+    /// The embedder-cache key for a `(resolved-model-id, backend, compute)` triple.
     ///
     /// The backend is part of the key (M4 Phase 4b-B): the SAME registry model
     /// served by `fastembed` vs `ollama` is two physically-distinct embedders
     /// (different numerical vectors), so they MUST occupy separate cache slots —
     /// a model-id-only key would alias them and return the wrong backend's
-    /// embedder for a notebook. Format: `"{backend}:{model_id}"`.
-    fn embedder_cache_key(model_id: &str, backend: crate::embedder::EmbeddingBackend) -> String {
-        format!("{}:{model_id}", backend.as_str())
+    /// embedder for a notebook.
+    ///
+    /// The `compute` device is ALSO part of the key (issue #91): a CPU
+    /// (`fastembed`/ONNX) and a Metal (`candle`) embedder for the same
+    /// `(model, backend)` are distinct instances that can coexist for one notebook
+    /// — licensed by their numerical parity — and must not alias. Format:
+    /// `"{backend}:{model_id}:{compute}"`.
+    fn embedder_cache_key(
+        model_id: &str,
+        backend: crate::embedder::EmbeddingBackend,
+        compute: crate::embedder::Compute,
+    ) -> String {
+        format!("{}:{model_id}:{}", backend.as_str(), compute.as_str())
     }
 
     /// Lazily constructs (once per `(model_id, backend)`) and returns the shared
@@ -1222,6 +1356,7 @@ impl LensEngine {
         &self,
         model_id: &str,
         backend: crate::embedder::EmbeddingBackend,
+        workload: crate::embedder::WorkloadKind,
     ) -> Result<Arc<dyn Embedder>, LensError> {
         let spec = crate::embedder::resolve(model_id);
         // Primary backend guard (issue #80): the model↔backend partition is strict.
@@ -1238,7 +1373,13 @@ impl LensEngine {
                 backend.as_str()
             )));
         }
-        let key = Self::embedder_cache_key(spec.id, backend);
+        // issue #91: resolve the execution device from the per-job policy (hardware
+        // probe + model hint + backend + workload). CPU everywhere the policy can't
+        // justify the GPU; Metal only for a GPU-eligible model on a bulk job on
+        // Apple Silicon.
+        let compute =
+            crate::embedder::select_compute(self.accelerator.probe(), spec, backend, workload);
+        let key = Self::embedder_cache_key(spec.id, backend, compute);
         let mut cache = self.embedders.lock().await;
         if let Some(existing) = cache.get(&key) {
             return Ok(Arc::clone(existing));
@@ -1246,14 +1387,34 @@ impl LensEngine {
         let embedder: Arc<dyn Embedder> = match backend {
             crate::embedder::EmbeddingBackend::Fastembed => {
                 let data_dir = self.data_dir().await;
-                // `spec` is a `&'static EmbeddingModelSpec` (Copy), so the closure
-                // can capture it directly without a clone or move of `key`.
-                let e = tokio::task::spawn_blocking(move || {
-                    FastembedEmbedder::new_with_spec(&data_dir, spec)
-                })
-                .await
-                .map_err(|e| LensError::Model(format!("embedder init task panicked: {e}")))??;
-                Arc::new(e)
+                // On the native-ml-metal build (Apple Silicon), candle is the
+                // default engine for a candle-supported model — Metal for bulk,
+                // candle-CPU for interactive queries. `Compute::Cuda` routes to the
+                // (interface-only) CUDA builder, which returns None until a
+                // candle-CUDA backend is implemented. On ANY GPU failure, an
+                // unimplemented model/device, or any other target, this returns None
+                // and we use fastembed. Never fail a job over a device choice; the
+                // result is cached under the resolved compute key.
+                let gpu = if compute == crate::embedder::Compute::Cuda {
+                    build_cuda_if_supported(compute, &data_dir, spec).await
+                } else {
+                    build_candle_if_supported(compute, &data_dir, spec).await
+                };
+                match gpu {
+                    Some(e) => e,
+                    None => {
+                        // `spec` is a `&'static EmbeddingModelSpec` (Copy), so the
+                        // closure captures it directly without a clone.
+                        let e = tokio::task::spawn_blocking(move || {
+                            FastembedEmbedder::new_with_spec(&data_dir, spec)
+                        })
+                        .await
+                        .map_err(|e| {
+                            LensError::Model(format!("embedder init task panicked: {e}"))
+                        })??;
+                        Arc::new(e)
+                    }
+                }
             }
             crate::embedder::EmbeddingBackend::Ollama => {
                 let base_url = ollama_base_url(&self.config().await);
@@ -1274,10 +1435,24 @@ impl LensEngine {
     /// readiness gate ([`crate::fastembed_weights_cached`]) for a fastembed
     /// selection on a fresh, Ollama-less machine. Always `Fastembed` (Ollama is
     /// detect-only — the app never pulls).
+    ///
+    /// Warms with [`WorkloadKind::Interactive`](crate::embedder::WorkloadKind) so it
+    /// builds the CPU **fastembed** engine specifically (issue #91). The readiness
+    /// gate checks the fastembed ONNX cache (`{data_dir}/models/fastembed/`) and the
+    /// retrieval/query path is CPU-only, so THAT is the engine onboarding must warm.
+    /// Warming with `Bulk` on an Apple-Silicon `native-ml-metal` build would instead
+    /// download the candle-Metal safetensors (a DIFFERENT artifact, under
+    /// `models/candle/`), leaving the readiness gate unsatisfied and the query path
+    /// cold. The candle-Metal bulk weights download lazily on the first ingest
+    /// (surfaced by the ingest `model_download` progress phase).
     pub async fn warm_fastembed_model(&self, model_id: &str) -> Result<(), LensError> {
-        self.embedder_for(model_id, crate::embedder::EmbeddingBackend::Fastembed)
-            .await
-            .map(|_| ())
+        self.embedder_for(
+            model_id,
+            crate::embedder::EmbeddingBackend::Fastembed,
+            crate::embedder::WorkloadKind::Interactive,
+        )
+        .await
+        .map(|_| ())
     }
 
     /// Resolves a notebook's configured embedding coordinate components
