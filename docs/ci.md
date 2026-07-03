@@ -36,7 +36,7 @@ The Rust tests are gated by a `signoff` commit status posted with
 install basecamp/gh-signoff`. Per change, after pushing:
 
 ```
-./scripts/signoff.sh   # runs `cargo test --workspace`, then `gh signoff` on green
+bun run signoff   # runs `cargo test --workspace`, then `gh signoff` on green
 ```
 
 `gh signoff` refuses to sign a dirty or unpushed tree, so the status always
