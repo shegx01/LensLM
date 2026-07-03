@@ -42,4 +42,12 @@ ffmpeg -y -v error -f lavfi -i "sine=frequency=$FREQ:duration=35:sample_rate=441
 ffmpeg -y -v error -f lavfi -i "sine=frequency=$FREQ:duration=$DUR:sample_rate=44100" \
   -af "volume=0.99" tone_nearclip_44100_mono.wav
 
+# Cross-validation reference: ffmpeg swr resample of the stereo WAV to 16 kHz mono
+# raw f32le. Committed so CI needs no ffmpeg. Used by cross_validates_against_ffmpeg_reference.
+ffmpeg -y -v error -i tone_44100_stereo.wav -ar 16000 -ac 1 -f f32le tone_44100_stereo.ref16k.f32le
+
+# Anti-aliasing fixture: 12 kHz tone at 44.1 kHz. A broken low-pass would let this alias
+# to |16000-12000|=4000 Hz in the output. Used by sinc_filter_rejects_above_nyquist_alias.
+ffmpeg -y -v error -f lavfi -i "sine=frequency=12000:duration=1:sample_rate=44100" -ac 1 tone_12k_44100_mono.wav
+
 echo "fixtures regenerated in $(pwd)"
