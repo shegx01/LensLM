@@ -130,6 +130,22 @@ impl NativeAccelerator for MetalAccelerator {
     }
 }
 
+/// Whether the GPU (candle + Apple Metal) embedding path is compiled AND active on
+/// this build — i.e. an aarch64-apple-darwin build with `native-ml-metal`. This is
+/// the SAME condition that lets [`select_compute`] pick `Metal` and that makes
+/// candle the default engine for a supported model.
+///
+/// The UI uses it to label the on-device provider ("On-device · Apple GPU") and to
+/// tell the user it's the fastest local option. `false` on every other build (where
+/// the on-device engine is fastembed/ONNX on the CPU).
+pub const fn gpu_embedding_active() -> bool {
+    cfg!(all(
+        target_os = "macos",
+        target_arch = "aarch64",
+        feature = "native-ml-metal"
+    ))
+}
+
 /// The engine's default accelerator for this build target: [`MetalAccelerator`] on
 /// aarch64-apple-darwin with `native-ml-metal`, else [`CpuOnlyAccelerator`].
 pub fn default_accelerator() -> std::sync::Arc<dyn NativeAccelerator> {
@@ -208,6 +224,22 @@ mod tests {
     fn cpu_only_accelerator_reports_none() {
         assert_eq!(CpuOnlyAccelerator.probe(), Acceleration::None);
         assert!(!CpuOnlyAccelerator.probe().is_metal());
+    }
+
+    #[test]
+    fn gpu_embedding_active_tracks_the_feature() {
+        // The signal is exactly the aarch64-macOS + native-ml-metal build condition.
+        assert_eq!(
+            gpu_embedding_active(),
+            cfg!(all(
+                target_os = "macos",
+                target_arch = "aarch64",
+                feature = "native-ml-metal"
+            ))
+        );
+        // Feature-off (default CI build) it MUST be false.
+        #[cfg(not(feature = "native-ml-metal"))]
+        assert!(!gpu_embedding_active());
     }
 
     #[test]

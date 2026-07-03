@@ -90,6 +90,7 @@ fn main() {
             commands::system::kokoro_downloaded,
             commands::system::fastembed_models_cached,
             commands::system::warm_fastembed_model,
+            commands::system::embedding_gpu_active,
             commands::models::list_models,
             commands::models::list_provider_models,
             commands::models::list_ollama_models,

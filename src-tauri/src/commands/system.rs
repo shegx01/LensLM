@@ -243,6 +243,18 @@ pub async fn warm_fastembed_model(
     engine.warm_fastembed_model(&model).await
 }
 
+/// Whether the GPU (candle + Apple Metal) embedding path is compiled and active on
+/// this build — true on an Apple-Silicon build with `native-ml-metal`, false
+/// everywhere else (issue #91). The Embeddings UI uses it to label the on-device
+/// provider "On-device · Apple GPU" and surface that it's the fastest local option.
+///
+/// A pure build-capability query (no engine state), so it takes no `State`.
+/// Invoked as `invoke("embedding_gpu_active")`.
+#[tauri::command]
+pub fn embedding_gpu_active() -> bool {
+    lens_core::embedder::gpu_embedding_active()
+}
+
 /// Allowed document extensions (lowercased, no dot) for recent-doc suggestions.
 const RECENT_DOC_EXTS: [&str; 4] = ["pdf", "docx", "txt", "md"];
 

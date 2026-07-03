@@ -56,7 +56,8 @@
     listOllamaModels,
     warmFastembedModel,
     getNotebookEmbeddingModel,
-    setNotebookEmbeddingModel
+    setNotebookEmbeddingModel,
+    embeddingGpuActive
   } from '$lib/embeddings/ipc.js';
 
   let {
@@ -103,6 +104,10 @@
   let ollamaInstalled = $state<Set<EmbeddingModelId>>(new Set());
   let ollamaEndpoint = $state('http://localhost:11434');
   let refreshing = $state(false);
+  // Whether the on-device engine is GPU-accelerated (candle + Apple Metal) on this
+  // build — Apple Silicon only (issue #91). Drives the on-device provider label +
+  // the "fastest" hint. `false` off Apple Silicon and outside Tauri.
+  let gpuActive = $state(false);
 
   // ── fastembed install state ─────────────────────────────────────────────────
   let installProgress = $state<number | null>(null);
@@ -124,6 +129,16 @@
   // Only models whose `backends` includes the currently-selected backend are
   // shown in the picker (strict fastembed/ollama partition, issue #80).
   const filteredModels = $derived(EMBEDDING_MODELS.filter((m) => m.backends.includes(backend)));
+
+  // Provider buttons. The on-device provider's LABEL reflects the actual engine —
+  // "On-device · Apple GPU" (candle + Metal) on Apple Silicon, else the neutral
+  // built-in "On-device" — but its persisted backend token stays `fastembed` either
+  // way (candle is a parity-identical compute swap for the same coordinate, not a
+  // new backend, so no migration). Ollama is unchanged. (issue #91)
+  const providers = $derived([
+    { id: 'fastembed', label: gpuActive ? 'On-device · Apple GPU' : 'On-device' },
+    { id: 'ollama', label: 'Ollama' }
+  ]);
 
   async function refreshOllama(): Promise<void> {
     refreshing = true;
@@ -152,6 +167,12 @@
   }
 
   onMount(async () => {
+    // Capability probe (issue #91): does this build embed on the Apple GPU? This is
+    // a cosmetic label signal, so fetch it WITHOUT blocking the init/selection
+    // sequence below — it flips the provider label when it resolves.
+    void embeddingGpuActive().then((v) => {
+      gpuActive = v;
+    });
     if (mode === 'global') {
       if (isTauri()) {
         try {
@@ -311,7 +332,7 @@
       Select your local embeddings provider
     </p>
     <div class="mt-2.5 grid grid-cols-2 gap-2" role="radiogroup" aria-label="Embeddings provider">
-      {#each [{ id: 'fastembed', label: 'fastembed' }, { id: 'ollama', label: 'Ollama' }] as p (p.id)}
+      {#each providers as p (p.id)}
         {@const isSel = backend === p.id}
         <button
           type="button"
@@ -334,6 +355,14 @@
         </button>
       {/each}
     </div>
+    {#if gpuActive && backend === 'fastembed'}
+      <!-- issue #91: tell the user the on-device Apple-GPU path is the fastest local
+           option (candle + Metal, ~2.6× the CPU throughput and frees the CPU). -->
+      <p class="mt-2 flex items-center gap-1.5 text-[0.7rem] text-muted-foreground">
+        <span aria-hidden="true">⚡</span>
+        Best performance — embeds on your Apple GPU.
+      </p>
+    {/if}
   </div>
 
   <!-- ── Embedding model radio-list ── -->

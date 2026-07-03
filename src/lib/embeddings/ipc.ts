@@ -124,6 +124,23 @@ export async function warmFastembedModel(model: string): Promise<void> {
 }
 
 /**
+ * Whether the GPU (candle + Apple Metal) embedding path is active on this build —
+ * `true` on Apple Silicon, `false` elsewhere (issue #91). Drives the on-device
+ * provider label ("On-device · Apple GPU") and the "fastest" hint.
+ *
+ * Outside Tauri (component tests / `vite dev`) returns `false` — the neutral
+ * "On-device" label, no native backend to query.
+ */
+export async function embeddingGpuActive(): Promise<boolean> {
+  if (!isTauri()) return false;
+  try {
+    return await invoke<boolean>('embedding_gpu_active');
+  } catch {
+    return false;
+  }
+}
+
+/**
  * The locally-pulled Ollama models at `baseUrl` via the live `/api/tags` probe.
  * Graceful by contract: an unreachable runtime yields `[]`, never an error.
  *
