@@ -83,6 +83,12 @@ fn candle_device(compute: Compute) -> Result<Device, LensError> {
         Compute::Cpu => Ok(Device::Cpu),
         Compute::Metal => Device::new_metal(0)
             .map_err(|e| LensError::Model(format!("candle Metal device init failed: {e}"))),
+        // CUDA is interface-only (issue #91): the policy never routes a CUDA job to
+        // THIS Metal-only backend, so it's unreachable here — but the match must be
+        // total. A CUDA embedder is a separate (unimplemented) backend.
+        Compute::Cuda => Err(LensError::Model(
+            "candle Metal backend cannot serve a CUDA device".into(),
+        )),
     }
 }
 

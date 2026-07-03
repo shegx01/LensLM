@@ -53,17 +53,23 @@ pub enum Compute {
     /// The `fastembed`/ONNX CPU path (or Ollama). The default.
     #[default]
     Cpu,
-    /// The `candle` Apple-Metal GPU path.
+    /// The `candle` Apple-Metal GPU path (implemented; Apple Silicon).
     Metal,
+    /// The NVIDIA CUDA GPU path (issue #91 — INTERFACE ONLY; not yet implemented).
+    /// Reserved so the seam accommodates Win/Linux NVIDIA without reshaping the
+    /// policy. Until a candle-CUDA backend is wired, a job resolving to `Cuda` falls
+    /// back to fastembed-CPU (see `LensEngine::embedder_for`).
+    Cuda,
 }
 
 impl Compute {
-    /// Stable token used in the embedder-cache key so a CPU and a Metal embedder
-    /// for the same `(model, backend)` occupy distinct slots.
+    /// Stable token used in the embedder-cache key so embedders for the same
+    /// `(model, backend)` on different devices occupy distinct slots.
     pub fn as_str(self) -> &'static str {
         match self {
             Compute::Cpu => "cpu",
             Compute::Metal => "metal",
+            Compute::Cuda => "cuda",
         }
     }
 }
@@ -71,8 +77,11 @@ impl Compute {
 /// Hardware acceleration a [`NativeAccelerator`] reports as available RIGHT NOW.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Acceleration {
-    /// An Apple Metal GPU device is constructible (Apple Silicon + feature built).
+    /// An Apple Metal GPU is available (Apple Silicon + `native-ml-metal`).
     Metal,
+    /// An NVIDIA CUDA GPU is available (Win/Linux + `native-ml-cuda`) — issue #91
+    /// INTERFACE ONLY; no accelerator constructs this yet.
+    Cuda,
     /// No usable accelerator — fall back to CPU.
     None,
 }
@@ -81,6 +90,17 @@ impl Acceleration {
     /// Whether a Metal GPU is available.
     pub fn is_metal(self) -> bool {
         matches!(self, Acceleration::Metal)
+    }
+
+    /// The [`Compute`] device a **bulk** job should use for this acceleration, or
+    /// `None` when there's no GPU (→ CPU). Keeps [`select_compute`] accelerator-
+    /// agnostic: adding an accelerator is one arm here, not a policy rewrite.
+    pub fn bulk_compute(self) -> Option<Compute> {
+        match self {
+            Acceleration::Metal => Some(Compute::Metal),
+            Acceleration::Cuda => Some(Compute::Cuda),
+            Acceleration::None => Option::None,
+        }
     }
 }
 
@@ -169,14 +189,41 @@ pub fn gpu_accelerated_model_ids() -> Vec<&'static str> {
     Vec::new()
 }
 
+/// NVIDIA-CUDA accelerator — issue #91 INTERFACE ONLY.
+///
+/// The polymorphic seam ([`NativeAccelerator`]) is meant to accommodate more than
+/// Metal: this is the reserved slot for Win/Linux NVIDIA GPUs. It is feature-gated
+/// to `native-ml-cuda` (which pulls NO dependencies yet — the candle-CUDA backend +
+/// toolchain are the future implementation). It reports [`Acceleration::Cuda`] so
+/// the selection policy is exercised end-to-end, but until a candle-CUDA embedder
+/// is wired, a `Compute::Cuda` job falls back to fastembed-CPU in
+/// [`crate::LensEngine::embedder_for`]. Implementing CUDA = fill in that arm +
+/// a `CandleCudaEmbedder`, with ZERO changes to this policy.
+#[cfg(feature = "native-ml-cuda")]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CudaAccelerator;
+
+#[cfg(feature = "native-ml-cuda")]
+impl NativeAccelerator for CudaAccelerator {
+    fn probe(&self) -> Acceleration {
+        Acceleration::Cuda
+    }
+}
+
 /// The engine's default accelerator for this build target: [`MetalAccelerator`] on
-/// aarch64-apple-darwin with `native-ml-metal`, else [`CpuOnlyAccelerator`].
+/// aarch64-apple-darwin with `native-ml-metal`, [`CudaAccelerator`] with
+/// `native-ml-cuda` (Win/Linux NVIDIA — interface only), else
+/// [`CpuOnlyAccelerator`].
 pub fn default_accelerator() -> std::sync::Arc<dyn NativeAccelerator> {
     #[cfg(feature = "native-ml-metal")]
     {
         std::sync::Arc::new(MetalAccelerator)
     }
-    #[cfg(not(feature = "native-ml-metal"))]
+    #[cfg(all(feature = "native-ml-cuda", not(feature = "native-ml-metal")))]
+    {
+        std::sync::Arc::new(CudaAccelerator)
+    }
+    #[cfg(not(any(feature = "native-ml-metal", feature = "native-ml-cuda")))]
     {
         std::sync::Arc::new(CpuOnlyAccelerator)
     }
@@ -206,15 +253,15 @@ pub fn select_compute(
     if backend != EmbeddingBackend::Fastembed {
         return Compute::Cpu; // gate 1: only fastembed has a parity GPU twin
     }
-    if !acceleration.is_metal() {
-        return Compute::Cpu; // gate 2: hardware
-    }
+    let Some(gpu) = acceleration.bulk_compute() else {
+        return Compute::Cpu; // gate 2: hardware (no GPU → CPU)
+    };
     if !spec.accelerate_hint {
         return Compute::Cpu; // gate 3: model (GPU-loser models stay CPU)
     }
     match workload {
         WorkloadKind::Interactive => Compute::Cpu, // gate 4: queries → CPU
-        WorkloadKind::Bulk => Compute::Metal,      // gate 4: bulk → GPU
+        WorkloadKind::Bulk => gpu,                 // gate 4: bulk → the GPU (Metal/Cuda)
     }
 }
 
@@ -277,6 +324,65 @@ mod tests {
             assert!(ids.contains(&"nomic-embed-text-v1.5"));
             assert!(!ids.contains(&"all-minilm"));
         }
+    }
+
+    #[test]
+    fn default_model_is_gpu_accelerated_on_the_flag_build() {
+        // On the Apple-GPU build the DEFAULT model must itself be GPU-accelerated so
+        // a fresh install gets the GPU path by default (issue #91) — guards the
+        // default from silently drifting to a CPU-only model.
+        #[cfg(feature = "native-ml-metal")]
+        assert!(
+            gpu_accelerated_model_ids()
+                .contains(&crate::embedder::registry::DEFAULT_EMBED_MODEL_ID)
+        );
+    }
+
+    // ── CUDA interface (issue #91, interface only — enum variants + routing exist
+    // regardless of feature; no candle-CUDA impl yet) ──────────────────────────
+    #[test]
+    fn bulk_compute_maps_each_accelerator() {
+        assert_eq!(Acceleration::Metal.bulk_compute(), Some(Compute::Metal));
+        assert_eq!(Acceleration::Cuda.bulk_compute(), Some(Compute::Cuda));
+        assert_eq!(Acceleration::None.bulk_compute(), None);
+    }
+
+    #[test]
+    fn compute_cuda_cache_token() {
+        assert_eq!(Compute::Cuda.as_str(), "cuda");
+    }
+
+    #[test]
+    fn cuda_routes_symmetrically_to_metal() {
+        // Bulk + fastembed + a GPU-eligible model + CUDA available → Compute::Cuda.
+        assert_eq!(
+            select_compute(
+                Acceleration::Cuda,
+                nomic(),
+                EmbeddingBackend::Fastembed,
+                WorkloadKind::Bulk
+            ),
+            Compute::Cuda
+        );
+        // Same gates as Metal: interactive → CPU, GPU-loser model → CPU.
+        assert_eq!(
+            select_compute(
+                Acceleration::Cuda,
+                nomic(),
+                EmbeddingBackend::Fastembed,
+                WorkloadKind::Interactive
+            ),
+            Compute::Cpu
+        );
+        assert_eq!(
+            select_compute(
+                Acceleration::Cuda,
+                minilm(),
+                EmbeddingBackend::Fastembed,
+                WorkloadKind::Bulk
+            ),
+            Compute::Cpu
+        );
     }
 
     #[test]

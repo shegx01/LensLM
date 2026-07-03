@@ -170,6 +170,33 @@ async fn build_candle_if_supported(
     None
 }
 
+/// Builds the NVIDIA-CUDA embedder for a `Compute::Cuda` job — issue #91 INTERFACE
+/// ONLY. Returns `None` today (no candle-CUDA backend), so a CUDA-resolved job falls
+/// back to fastembed-CPU. The future implementation builds a `CandleCudaEmbedder`
+/// here behind `native-ml-cuda`; the selection policy already routes to it.
+#[cfg(feature = "native-ml-cuda")]
+async fn build_cuda_if_supported(
+    _compute: crate::embedder::Compute,
+    _data_dir: &Path,
+    spec: &'static crate::embedder::EmbeddingModelSpec,
+) -> Option<Arc<dyn Embedder>> {
+    tracing::debug!(
+        model = %spec.id,
+        "candle-CUDA backend not yet implemented (interface only); using fastembed-CPU"
+    );
+    None
+}
+
+/// No-feature stub: without `native-ml-cuda` the policy never resolves `Cuda`.
+#[cfg(not(feature = "native-ml-cuda"))]
+async fn build_cuda_if_supported(
+    _compute: crate::embedder::Compute,
+    _data_dir: &Path,
+    _spec: &'static crate::embedder::EmbeddingModelSpec,
+) -> Option<Arc<dyn Embedder>> {
+    None
+}
+
 /// Mutable engine resources live here: the database connection pool and the
 /// loaded application configuration.
 ///
@@ -1362,12 +1389,18 @@ impl LensEngine {
                 let data_dir = self.data_dir().await;
                 // On the native-ml-metal build (Apple Silicon), candle is the
                 // default engine for a candle-supported model — Metal for bulk,
-                // candle-CPU for interactive queries. On ANY candle failure, or for
-                // a model candle doesn't implement yet, or on any other target, this
-                // returns None and we use fastembed. Never fail a job over a device
-                // choice. The result is cached under the resolved compute key, so a
-                // fastembed fallback isn't retried every job.
-                match build_candle_if_supported(compute, &data_dir, spec).await {
+                // candle-CPU for interactive queries. `Compute::Cuda` routes to the
+                // (interface-only) CUDA builder, which returns None until a
+                // candle-CUDA backend is implemented. On ANY GPU failure, an
+                // unimplemented model/device, or any other target, this returns None
+                // and we use fastembed. Never fail a job over a device choice; the
+                // result is cached under the resolved compute key.
+                let gpu = if compute == crate::embedder::Compute::Cuda {
+                    build_cuda_if_supported(compute, &data_dir, spec).await
+                } else {
+                    build_candle_if_supported(compute, &data_dir, spec).await
+                };
+                match gpu {
                     Some(e) => e,
                     None => {
                         // `spec` is a `&'static EmbeddingModelSpec` (Copy), so the

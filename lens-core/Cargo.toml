@@ -44,6 +44,16 @@ native-ml-metal = [
     "dep:hf-hub",
 ]
 
+# issue #91: the NVIDIA-CUDA GPU embedding path for Win/Linux — INTERFACE ONLY.
+# Deliberately pulls NO dependencies: it activates the reserved `CudaAccelerator`
+# seam + `Compute::Cuda` routing so the polymorphic device policy is proven to
+# accommodate CUDA, but a job resolving to CUDA still falls back to fastembed-CPU
+# until a candle-CUDA backend is implemented. The future implementation adds the
+# candle deps with their `cuda` feature (needs the CUDA toolkit at build time,
+# NVIDIA-only) behind THIS flag. MUST NOT be enabled together with
+# `native-ml-metal` (different platforms).
+native-ml-cuda = []
+
 [dependencies]
 serde = { workspace = true }
 thiserror = { workspace = true }
