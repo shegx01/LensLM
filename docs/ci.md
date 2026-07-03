@@ -16,7 +16,7 @@ cross-platform bundling is verified later at release time.
 | **Rust (fmt)**                  | `cargo fmt --all -- --check`                                                    | Yes                      |
 | **Rust (clippy)**               | `cargo clippy --workspace --all-targets -- -D warnings`                         | Yes                      |
 | **Rust (build + archive tests)**| Compiles every test binary once (`cargo nextest archive`), uploads the archive | Yes                      |
-| **Rust (test shard 1–3/3)**     | Runs the archived binaries partitioned across 3 shards (`cargo nextest run`)    | Yes                      |
+| **Rust (test/1–3)**             | Runs the archived binaries partitioned across 3 shards (`cargo nextest run`)    | Yes                      |
 | **Frontend**                    | `bun run format:check`, `bun run check`, `bun run test`                         | Yes                      |
 | **E2E**                         | Playwright against the SvelteKit dev server (`bun run test:e2e`)               | No (`continue-on-error`) |
 
@@ -30,8 +30,8 @@ runtime. Toolchains are pinned: Rust `1.94.1` (`rust-toolchain.toml`), Bun
 `.tool-versions`).
 
 > **Scaling shards:** the shard count is duplicated in `ci.yml` — the `shard`
-> matrix, `env.SHARD_TOTAL`, and the `/3` in the job's display name. Update all
-> three together, and update the required-check names below to match.
+> matrix and `env.SHARD_TOTAL` (the nextest partition denominator). Update both
+> together, and add the new `Rust (test/N)` required-check names below to match.
 
 ### `Audit` — `.github/workflows/audit.yml`
 
@@ -57,7 +57,7 @@ required:
    - `Rust (fmt)`
    - `Rust (clippy)`
    - `Rust (build + archive tests)`
-   - `Rust (test shard 1/3)`, `Rust (test shard 2/3)`, `Rust (test shard 3/3)`
+   - `Rust (test/1)`, `Rust (test/2)`, `Rust (test/3)`
    - `Frontend (format + check + unit tests)`
    - Leave **E2E** unselected — it is intentionally non-blocking.
 4. Optionally enable **Require branches to be up to date before merging**.

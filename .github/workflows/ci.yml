@@ -98,8 +98,8 @@ jobs:
   rust-test:
     # SHARD COUNT lives in two places that MUST stay in sync: the `shard` matrix
     # below and env.SHARD_TOTAL (used for the nextest partition denominator).
-    # The `/3` in the display name is cosmetic — update it too when scaling.
-    name: Rust (test shard ${{ matrix.shard }}/3)
+    # The display name shows the shard index only (e.g. "Rust (test/1)").
+    name: Rust (test/${{ matrix.shard }})
     needs: rust-archive
     runs-on: ubuntu-latest
     timeout-minutes: 20
