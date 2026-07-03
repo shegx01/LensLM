@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use lens_core::chunk::chunk_blocks_deterministic;
-use lens_core::embedder::{CandleCompute, CandleNomicEmbedder, Embedder, FastembedEmbedder};
+use lens_core::embedder::{CandleNomicEmbedder, Compute, Embedder, FastembedEmbedder};
 use lens_core::parse::{SourceKind, parse_blocks};
 
 /// Main eval corpus stems (matches `eval.rs` MAIN_DOCS) — raw recall@5 = 1.00 with
@@ -94,7 +94,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 // ids line up, then brute-force cosine top-5 (no LanceDB needed for the invariant
 // check). Prints the fastembed/fastembed control alongside — they must match, and
 // both must clear RECALL_FLOOR (0.75).
-fn recall(cache: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn recall(cache: &Path) -> Result<(), Box<dyn std::error::Error>> {
     println!("######## Q4 — CROSS-ENGINE RECALL@{K} (docs=candle, query=fastembed) ########");
 
     // Reuse the SAME tokenizer eval uses so chunk boundaries — and thus the
@@ -118,7 +118,11 @@ fn recall(cache: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
             chunk_texts.push(c.text);
         }
     }
-    println!("corpus: {} chunks over {} docs", chunk_ids.len(), MAIN_DOCS.len());
+    println!(
+        "corpus: {} chunks over {} docs",
+        chunk_ids.len(),
+        MAIN_DOCS.len()
+    );
 
     #[derive(serde::Deserialize)]
     struct Q {
@@ -129,7 +133,7 @@ fn recall(cache: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         serde_json::from_str(&std::fs::read_to_string(fixtures.join("queries.json"))?)?;
 
     let fe = FastembedEmbedder::new(cache)?;
-    let cand = CandleNomicEmbedder::new(cache, CandleCompute::Cpu)?;
+    let cand = CandleNomicEmbedder::new(cache, Compute::Cpu)?;
 
     let refs: Vec<&str> = chunk_texts.iter().map(String::as_str).collect();
     let fe_docs = fe.embed_documents(&refs)?;
@@ -180,11 +184,11 @@ fn recall(cache: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
 // embedded on fastembed/ORT within tolerance, or a candle-doc / fastembed-query
 // notebook mis-retrieves. Report cosine(candle_cpu, fastembed) and
 // cosine(candle_metal, fastembed) per doc, plus the mins.
-fn parity(cache: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn parity(cache: &Path) -> Result<(), Box<dyn std::error::Error>> {
     println!("######## Q4 — CROSS-ENGINE PARITY (candle vs fastembed) ########");
     let fe = FastembedEmbedder::new(cache)?;
-    let cpu = CandleNomicEmbedder::new(cache, CandleCompute::Cpu)?;
-    let metal = CandleNomicEmbedder::new(cache, CandleCompute::Metal).ok();
+    let cpu = CandleNomicEmbedder::new(cache, Compute::Cpu)?;
+    let metal = CandleNomicEmbedder::new(cache, Compute::Metal).ok();
 
     let fe_v = fe.embed_documents(CORPUS)?;
     let cpu_v = cpu.embed_documents(CORPUS)?;
@@ -238,15 +242,15 @@ fn parity(cache: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 // ── Q1: throughput (candle-cpu vs fastembed-cpu vs candle-metal) ────────────
-fn throughput(cache: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn throughput(cache: &Path) -> Result<(), Box<dyn std::error::Error>> {
     println!("######## Q1 — THROUGHPUT (docs/sec, batch=16) ########");
     let batch: Vec<&str> = CORPUS.to_vec();
     let rounds = 20usize;
     let total_docs = batch.len() * rounds;
 
     let fe = FastembedEmbedder::new(cache)?;
-    let cpu = CandleNomicEmbedder::new(cache, CandleCompute::Cpu)?;
-    let metal = CandleNomicEmbedder::new(cache, CandleCompute::Metal).ok();
+    let cpu = CandleNomicEmbedder::new(cache, Compute::Cpu)?;
+    let metal = CandleNomicEmbedder::new(cache, Compute::Metal).ok();
 
     // Warmup each (first batch pays lazy init / kernel compile).
     fe.embed_documents(&batch)?;
@@ -290,15 +294,15 @@ fn throughput(cache: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
 // genuinely GPU-offloaded engine leaves the CPU mostly idle (avg cores ≈ the
 // tokenize/dispatch overhead, ~1 or less). Runs the SAME sustained workload on
 // candle-cpu, fastembed-cpu, and candle-metal so the offload delta is direct.
-fn offload(cache: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn offload(cache: &Path) -> Result<(), Box<dyn std::error::Error>> {
     println!("######## Q2 — METAL CPU OFFLOAD (avg CPU cores on sustained bulk) ########");
     let big_rounds = 60usize;
     let batch: Vec<&str> = CORPUS.to_vec();
     let total = batch.len() * big_rounds;
 
     let fe = FastembedEmbedder::new(cache)?;
-    let cpu = CandleNomicEmbedder::new(cache, CandleCompute::Cpu)?;
-    let metal = CandleNomicEmbedder::new(cache, CandleCompute::Metal).ok();
+    let cpu = CandleNomicEmbedder::new(cache, Compute::Cpu)?;
+    let metal = CandleNomicEmbedder::new(cache, Compute::Metal).ok();
 
     // warmups
     fe.embed_documents(&batch)?;

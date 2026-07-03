@@ -98,6 +98,66 @@ pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
+/// Builds the candle Metal embedder for a `fastembed`-coordinate spec IFF the
+/// device policy selected [`Compute::Metal`](crate::embedder::Compute::Metal) —
+/// otherwise (or on any candle init failure) returns `None` so
+/// [`LensEngine::embedder_for`] falls back to the fastembed CPU path. issue #91.
+///
+/// Runs the ~547 MB weight load off the async runtime via `spawn_blocking`. The
+/// no-feature build is a `None` stub (the policy can never select Metal without
+/// the `native-ml-metal` accelerator, so this is unreachable there anyway).
+#[cfg(feature = "native-ml-metal")]
+async fn build_candle_metal_if_selected(
+    compute: crate::embedder::Compute,
+    data_dir: &Path,
+    spec: &'static crate::embedder::EmbeddingModelSpec,
+) -> Option<Arc<dyn Embedder>> {
+    if compute != crate::embedder::Compute::Metal {
+        return None;
+    }
+    let candle_dir = data_dir.join("models").join("candle");
+    match tokio::task::spawn_blocking(move || {
+        crate::embedder::CandleNomicEmbedder::new_with_spec(
+            &candle_dir,
+            crate::embedder::Compute::Metal,
+            spec,
+        )
+    })
+    .await
+    {
+        Ok(Ok(e)) => {
+            let e: Arc<dyn Embedder> = Arc::new(e);
+            Some(e)
+        }
+        Ok(Err(err)) => {
+            tracing::warn!(
+                model = %spec.id,
+                error = %err,
+                "candle-Metal embedder init failed; falling back to fastembed-CPU"
+            );
+            None
+        }
+        Err(join) => {
+            tracing::warn!(
+                error = %join,
+                "candle-Metal init task panicked; falling back to fastembed-CPU"
+            );
+            None
+        }
+    }
+}
+
+/// No-feature stub: the device policy can never select Metal without the
+/// `native-ml-metal` accelerator, so this always returns `None`.
+#[cfg(not(feature = "native-ml-metal"))]
+async fn build_candle_metal_if_selected(
+    _compute: crate::embedder::Compute,
+    _data_dir: &Path,
+    _spec: &'static crate::embedder::EmbeddingModelSpec,
+) -> Option<Arc<dyn Embedder>> {
+    None
+}
+
 /// Mutable engine resources live here: the database connection pool and the
 /// loaded application configuration.
 ///
@@ -165,6 +225,13 @@ pub struct LensEngine {
     /// per-key `OnceCell` (init outside the map lock) is the M9 follow-up if cold
     /// multi-model startup latency becomes a concern.
     embedders: Arc<Mutex<HashMap<String, Arc<dyn Embedder>>>>,
+    /// Native-ML acceleration probe (issue #91) — the polymorphic seam that tells
+    /// [`embedder_for`](Self::embedder_for)'s device policy whether an Apple Metal
+    /// GPU is available. Defaults to [`crate::embedder::default_accelerator`] (a
+    /// Metal probe on aarch64-apple-darwin + `native-ml-metal`, else CPU-only);
+    /// held behind a trait object so tests can inject a fake and future
+    /// accelerators (MLX-Swift, CUDA) drop in without touching the policy.
+    accelerator: Arc<dyn crate::embedder::NativeAccelerator>,
     /// Lazily-resolved, shared nomic tokenizer (parallel to `embedder`).
     ///
     /// The nomic `tokenizer.json` is a multi-MB file; resolving it per-ingest
@@ -344,6 +411,7 @@ impl LensEngine {
         let engine = Self {
             inner: Arc::new(RwLock::new(LensEngineInner { db, config })),
             embedders: Arc::new(Mutex::new(HashMap::new())),
+            accelerator: crate::embedder::default_accelerator(),
             tokenizer: Arc::new(OnceCell::new()),
             ingest_lock: Arc::new(Semaphore::new(1)),
             enrichment_tx,
@@ -432,6 +500,7 @@ impl LensEngine {
                 config: AppConfig::default(),
             })),
             embedders: Arc::new(Mutex::new(HashMap::new())),
+            accelerator: crate::embedder::default_accelerator(),
             tokenizer: Arc::new(OnceCell::new()),
             ingest_lock: Arc::new(Semaphore::new(1)),
             enrichment_tx,
@@ -1153,7 +1222,11 @@ impl LensEngine {
         embedder: Arc<dyn Embedder>,
         backend: crate::embedder::EmbeddingBackend,
     ) -> Result<(), LensError> {
-        let key = Self::embedder_cache_key(embedder.model_id(), backend);
+        // Register under the CPU device key: tests run feature-off, where the
+        // device policy always resolves to `Compute::Cpu`, so this is exactly the
+        // key `embedder_for` will look up for the injected embedder (issue #91).
+        let key =
+            Self::embedder_cache_key(embedder.model_id(), backend, crate::embedder::Compute::Cpu);
         // `try_lock` (not `blocking_lock`) keeps this a sync fn that is safe to
         // call from inside a `#[tokio::test]` async context: the cache is
         // uncontended at injection time, so the lock is always immediately
@@ -1180,18 +1253,31 @@ impl LensEngine {
         model_id: &str,
         backend: crate::embedder::EmbeddingBackend,
     ) -> Result<Arc<dyn Embedder>, LensError> {
-        self.embedder_for(model_id, backend).await
+        // Tests don't exercise device selection (they run feature-off → always CPU);
+        // Bulk is the representative workload of every real call site.
+        self.embedder_for(model_id, backend, crate::embedder::WorkloadKind::Bulk)
+            .await
     }
 
-    /// The embedder-cache key for a `(resolved-model-id, backend)` pair.
+    /// The embedder-cache key for a `(resolved-model-id, backend, compute)` triple.
     ///
     /// The backend is part of the key (M4 Phase 4b-B): the SAME registry model
     /// served by `fastembed` vs `ollama` is two physically-distinct embedders
     /// (different numerical vectors), so they MUST occupy separate cache slots —
     /// a model-id-only key would alias them and return the wrong backend's
-    /// embedder for a notebook. Format: `"{backend}:{model_id}"`.
-    fn embedder_cache_key(model_id: &str, backend: crate::embedder::EmbeddingBackend) -> String {
-        format!("{}:{model_id}", backend.as_str())
+    /// embedder for a notebook.
+    ///
+    /// The `compute` device is ALSO part of the key (issue #91): a CPU
+    /// (`fastembed`/ONNX) and a Metal (`candle`) embedder for the same
+    /// `(model, backend)` are distinct instances that can coexist for one notebook
+    /// — licensed by their numerical parity — and must not alias. Format:
+    /// `"{backend}:{model_id}:{compute}"`.
+    fn embedder_cache_key(
+        model_id: &str,
+        backend: crate::embedder::EmbeddingBackend,
+        compute: crate::embedder::Compute,
+    ) -> String {
+        format!("{}:{model_id}:{}", backend.as_str(), compute.as_str())
     }
 
     /// Lazily constructs (once per `(model_id, backend)`) and returns the shared
@@ -1222,9 +1308,16 @@ impl LensEngine {
         &self,
         model_id: &str,
         backend: crate::embedder::EmbeddingBackend,
+        workload: crate::embedder::WorkloadKind,
     ) -> Result<Arc<dyn Embedder>, LensError> {
         let spec = crate::embedder::resolve(model_id);
-        let key = Self::embedder_cache_key(spec.id, backend);
+        // issue #91: resolve the execution device from the per-job policy (hardware
+        // probe + model hint + backend + workload). CPU everywhere the policy can't
+        // justify the GPU; Metal only for a GPU-eligible model on a bulk job on
+        // Apple Silicon.
+        let compute =
+            crate::embedder::select_compute(self.accelerator.probe(), spec, backend, workload);
+        let key = Self::embedder_cache_key(spec.id, backend, compute);
         let mut cache = self.embedders.lock().await;
         if let Some(existing) = cache.get(&key) {
             return Ok(Arc::clone(existing));
@@ -1232,14 +1325,26 @@ impl LensEngine {
         let embedder: Arc<dyn Embedder> = match backend {
             crate::embedder::EmbeddingBackend::Fastembed => {
                 let data_dir = self.data_dir().await;
-                // `spec` is a `&'static EmbeddingModelSpec` (Copy), so the closure
-                // can capture it directly without a clone or move of `key`.
-                let e = tokio::task::spawn_blocking(move || {
-                    FastembedEmbedder::new_with_spec(&data_dir, spec)
-                })
-                .await
-                .map_err(|e| LensError::Model(format!("embedder init task panicked: {e}")))??;
-                Arc::new(e)
+                // When the policy picked Metal, try the candle GPU engine first;
+                // on ANY failure (unavailable device, unsupported model, init
+                // error) fall back to the fastembed CPU path. Never fail a job over
+                // a device choice. A fallback is cached under the Metal key so a
+                // failed candle init isn't retried on every subsequent bulk job.
+                match build_candle_metal_if_selected(compute, &data_dir, spec).await {
+                    Some(e) => e,
+                    None => {
+                        // `spec` is a `&'static EmbeddingModelSpec` (Copy), so the
+                        // closure captures it directly without a clone.
+                        let e = tokio::task::spawn_blocking(move || {
+                            FastembedEmbedder::new_with_spec(&data_dir, spec)
+                        })
+                        .await
+                        .map_err(|e| {
+                            LensError::Model(format!("embedder init task panicked: {e}"))
+                        })??;
+                        Arc::new(e)
+                    }
+                }
             }
             crate::embedder::EmbeddingBackend::Ollama => {
                 let base_url = ollama_base_url(&self.config().await);
@@ -1261,9 +1366,14 @@ impl LensEngine {
     /// selection on a fresh, Ollama-less machine. Always `Fastembed` (Ollama is
     /// detect-only — the app never pulls).
     pub async fn warm_fastembed_model(&self, model_id: &str) -> Result<(), LensError> {
-        self.embedder_for(model_id, crate::embedder::EmbeddingBackend::Fastembed)
-            .await
-            .map(|_| ())
+        // Warming targets the ingest path, which is a Bulk workload.
+        self.embedder_for(
+            model_id,
+            crate::embedder::EmbeddingBackend::Fastembed,
+            crate::embedder::WorkloadKind::Bulk,
+        )
+        .await
+        .map(|_| ())
     }
 
     /// Resolves a notebook's configured embedding coordinate components

@@ -1,16 +1,21 @@
-//! STEP-0 SPIKE (issue #91) — candle NomicBERT embedding backend (CPU + Metal).
+//! candle NomicBERT embedding backend (CPU + Apple Metal GPU) — issue #91.
 //!
-//! A second [`Embedder`] implementation alongside [`FastembedEmbedder`], backed by
-//! `candle-transformers`' native `nomic_bert` model. Runs the WHOLE forward pass on
-//! one device — CPU or the Apple Metal GPU — which is the property the dead
-//! ORT-CoreML-EP path lacked (it fragmented the graph across CoreML↔CPU boundaries;
-//! see memory `issue-91-native-ml-seam`). Implementing the production [`Embedder`]
-//! trait lets the spike reuse it unchanged for the cross-engine parity + recall gate.
+//! A second [`Embedder`] implementation alongside [`crate::embedder::FastembedEmbedder`],
+//! backed by `candle-transformers`' native `nomic_bert` model. Unlike the
+//! `fastembed`/ONNX path it runs the WHOLE forward pass on ONE device — so on the
+//! Apple Metal GPU it delivers a clean CPU offload (measured ~99% of CPU cores
+//! freed) and ~2.6× the bulk throughput, while producing vectors that are
+//! numerically identical to fastembed (cosine 1.000000, recall@5 identical — see
+//! `.omc/plans/issue-91-candle-metal-spike-results.md`). That parity is what lets
+//! the device be a per-job runtime choice ([`crate::embedder::device`]) rather than
+//! a persisted notebook property.
 //!
-//! Weights load as `DType::F32` on BOTH devices: fp16 on Apple Silicon is only
-//! ~1.1× faster but drops cross-engine cosine parity to ~0.998; F32 targets ~0.9999.
+//! Weights load as [`DType::F32`] on BOTH devices: fp16 on Apple Silicon is only
+//! ~1.1× faster but drops cross-engine cosine parity to ~0.998; F32 holds ~0.9999.
 //!
-//! Feature-gated (`native-ml-metal`, aarch64-apple-darwin only). Throwaway.
+//! Feature-gated (`native-ml-metal`, aarch64-apple-darwin only). Currently wires
+//! the default `nomic-embed-text-v1.5`; other GPU-eligible models
+//! (`accelerate_hint = true`) fall back to CPU until wired here.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -22,57 +27,40 @@ use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 
 use crate::LensError;
 use crate::embedder::Embedder;
-use crate::embedder::registry::{DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, EmbeddingModelSpec};
+use crate::embedder::device::Compute;
+use crate::embedder::registry::{DEFAULT_EMBED_MODEL_ID, EmbeddingModelSpec};
 
 /// HuggingFace repo the candle backend loads nomic weights from. NOTE this is the
 /// ORIGINAL nomic repo (F32 safetensors + `tokenizer.json`), distinct from
 /// fastembed's `Qdrant/…-onnx` mirror — the two engines fetch different artifacts.
 const NOMIC_HF_REPO: &str = "nomic-ai/nomic-embed-text-v1.5";
 
-/// Which device the candle forward pass runs on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CandleCompute {
-    /// Portable CPU path (candle's own CPU kernels, NOT ONNX).
-    Cpu,
-    /// Apple Metal GPU — the bulk-offload target under test.
-    Metal,
-}
-
-impl CandleCompute {
-    /// Human label for logs / bench rows.
-    pub fn label(self) -> &'static str {
-        match self {
-            CandleCompute::Cpu => "candle-cpu",
-            CandleCompute::Metal => "candle-metal",
-        }
-    }
-
-    /// Resolves this choice to a concrete candle [`Device`]. `Metal` on a machine
-    /// without a constructible Metal device is a hard error here (the spike wants
-    /// to KNOW, not silently fall back — production would fall back per the policy).
-    fn device(self) -> Result<Device, LensError> {
-        match self {
-            CandleCompute::Cpu => Ok(Device::Cpu),
-            CandleCompute::Metal => Device::new_metal(0)
-                .map_err(|e| LensError::Model(format!("candle Metal device init failed: {e}"))),
-        }
-    }
-}
-
 /// Max tokens per input. nomic-v1.5 trained at 2048; our chunks are ~512, so this
 /// only guards a pathological input. Truncation MUST be set explicitly — the
 /// serialized `tokenizer.json` bakes in neither truncation nor padding, and an
-/// over-length input crashes the forward pass otherwise.
+/// over-length input would otherwise crash the forward pass.
 const MAX_TOKENS: usize = 2048;
+
+/// Maps a [`Compute`] to the concrete candle [`Device`]. `Metal` on a machine
+/// without a constructible Metal device is a hard error here — the caller
+/// ([`crate::LensEngine::embedder_for`]) is responsible for falling back to the
+/// fastembed CPU path, so this stays strict and surfaces the failure.
+fn candle_device(compute: Compute) -> Result<Device, LensError> {
+    match compute {
+        Compute::Cpu => Ok(Device::Cpu),
+        Compute::Metal => Device::new_metal(0)
+            .map_err(|e| LensError::Model(format!("candle Metal device init failed: {e}"))),
+    }
+}
 
 /// candle-backed NomicBERT embedder (768-dim), device-selectable.
 pub struct CandleNomicEmbedder {
-    /// `NomicBertModel::forward` is `&self`, but tokenizer padding config mutation
-    /// and the batch encode path keep this behind a mutex for a uniform `&self`
-    /// trait surface and to serialize device access (mirrors `FastembedEmbedder`).
+    /// `NomicBertModel::forward` is `&self`, but the tokenizer + device access are
+    /// serialized behind a mutex for a uniform `&self` trait surface (mirrors
+    /// [`crate::embedder::FastembedEmbedder`]).
     inner: Mutex<Inner>,
     device: Device,
-    compute: CandleCompute,
+    compute: Compute,
     dim: usize,
     prefix_doc: String,
     prefix_query: String,
@@ -87,9 +75,15 @@ struct Inner {
 impl CandleNomicEmbedder {
     /// Builds the candle nomic embedder on `compute`, loading F32 weights.
     ///
-    /// `cache_dir` is where HF artifacts are fetched/read (a `models/candle`
-    /// subdir under the app data dir by convention). Downloads on cold cache.
-    pub fn new(cache_dir: &Path, compute: CandleCompute) -> Result<Self, LensError> {
+    /// `cache_dir` is where HF artifacts are fetched/read — by convention
+    /// `{data_dir}/models/candle/` (kept apart from fastembed's ONNX cache, since
+    /// the two engines download different files). Downloads ~547 MB on a cold cache.
+    ///
+    /// # Errors
+    /// [`LensError::Model`] on Metal-device init failure, weight/tokenizer load
+    /// failure, or an unsupported model id (only nomic is wired). Callers treat any
+    /// error as "fall back to the CPU fastembed path".
+    pub fn new(cache_dir: &Path, compute: Compute) -> Result<Self, LensError> {
         Self::new_with_spec(
             cache_dir,
             compute,
@@ -97,24 +91,27 @@ impl CandleNomicEmbedder {
         )
     }
 
-    /// Builds the candle nomic embedder for `spec` (currently only the nomic
-    /// default is wired — other models are future work).
+    /// Builds the candle nomic embedder for `spec`.
+    ///
+    /// Only `nomic-embed-text-v1.5` is currently wired; any other id is rejected
+    /// with [`LensError::Model`] so the caller falls back to fastembed-CPU.
     pub fn new_with_spec(
         cache_dir: &Path,
-        compute: CandleCompute,
+        compute: Compute,
         spec: &EmbeddingModelSpec,
     ) -> Result<Self, LensError> {
         if spec.id != DEFAULT_EMBED_MODEL_ID {
             return Err(LensError::Model(format!(
-                "candle spike backend only wires {DEFAULT_EMBED_MODEL_ID}; got {}",
+                "candle backend currently wires only {DEFAULT_EMBED_MODEL_ID}; got {} \
+                 (caller should fall back to fastembed-CPU)",
                 spec.id
             )));
         }
-        let device = compute.device()?;
+        let device = candle_device(compute)?;
         let (config_path, tokenizer_path, weights_path) = fetch_artifacts(cache_dir)?;
 
         // Parse config.json; #[serde(default)] fills any absent field, and the
-        // struct's Default IS nomic-v1.5 — so a parse failure still yields the
+        // struct's Default IS nomic-v1.5 — so even a parse failure yields the
         // correct architecture. Unknown JSON fields are ignored by serde.
         let config: Config = std::fs::read_to_string(&config_path)
             .ok()
@@ -122,8 +119,7 @@ impl CandleNomicEmbedder {
             .unwrap_or_default();
 
         // SAFETY: from_mmaped_safetensors mmaps the file read-only; the file is a
-        // trusted, checksummed model artifact fetched above and not mutated while
-        // mapped.
+        // trusted model artifact fetched above and not mutated while mapped.
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(&[weights_path], DType::F32, &device)
                 .map_err(|e| LensError::Model(format!("candle safetensors load failed: {e}")))?
@@ -156,7 +152,7 @@ impl CandleNomicEmbedder {
     }
 
     /// The compute device this embedder is pinned to.
-    pub fn compute(&self) -> CandleCompute {
+    pub fn compute(&self) -> Compute {
         self.compute
     }
 
@@ -186,7 +182,8 @@ impl CandleNomicEmbedder {
             mask.extend_from_slice(enc.get_attention_mask());
         }
 
-        let cd = |e: candle_core::Error, what: &str| LensError::Model(format!("candle {what}: {e}"));
+        let cd =
+            |e: candle_core::Error, what: &str| LensError::Model(format!("candle {what}: {e}"));
         let input_ids =
             Tensor::from_vec(ids, (batch, seq), &self.device).map_err(|e| cd(e, "input_ids"))?;
         let attn_mask =
@@ -230,6 +227,15 @@ impl Embedder for CandleNomicEmbedder {
         self.embed_batch(&prefixed)
     }
 
+    fn embed_documents_owned(&self, mut texts: Vec<String>) -> Result<Vec<Vec<f32>>, LensError> {
+        if !self.prefix_doc.is_empty() {
+            for t in texts.iter_mut() {
+                t.insert_str(0, &self.prefix_doc);
+            }
+        }
+        self.embed_batch(&texts)
+    }
+
     fn embed_query(&self, text: &str) -> Result<Vec<f32>, LensError> {
         let prefixed = vec![format!("{}{text}", self.prefix_query)];
         let mut out = self.embed_batch(&prefixed)?;
@@ -240,9 +246,8 @@ impl Embedder for CandleNomicEmbedder {
 }
 
 /// Fetch (or read from cache) `config.json`, `tokenizer.json`, `model.safetensors`
-/// for nomic-v1.5. Uses `hf-hub`'s blocking API rooted at `cache_dir` so the spike
-/// controls where the ~547 MB weight file lands (under the app data dir, not the
-/// user's global `~/.cache/huggingface`).
+/// for nomic-v1.5, rooted at `cache_dir` (so the ~547 MB weight file lands under
+/// the app data dir, not the user's global `~/.cache/huggingface`).
 fn fetch_artifacts(
     cache_dir: &Path,
 ) -> Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf), LensError> {
@@ -263,8 +268,3 @@ fn fetch_artifacts(
     let weights = get("model.safetensors")?;
     Ok((config, tokenizer, weights))
 }
-
-/// Sanity-visible default dim (used only to keep the const referenced in
-/// feature-off analyzers happy; the real dim comes from the spec).
-#[allow(dead_code)]
-const _NOMIC_DIM: usize = DEFAULT_EMBED_DIM;

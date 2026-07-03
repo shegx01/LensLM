@@ -38,15 +38,22 @@ use fastembed::{InitOptions, TextEmbedding};
 
 use crate::LensError;
 
-// STEP-0 SPIKE (issue #91): the candle + Metal embedding backend. Feature-gated to
-// aarch64-apple-darwin only (see Cargo.toml `native-ml-metal`). Throwaway.
+// issue #91: the candle + Metal (Apple GPU) embedding backend. Feature-gated to
+// aarch64-apple-darwin only (see Cargo.toml `native-ml-metal`).
 #[cfg(feature = "native-ml-metal")]
 pub mod candle_backend;
+// issue #91: per-job compute-device selection policy + the polymorphic
+// NativeAccelerator seam. Always compiled (the policy is pure + testable without
+// the GPU feature); only the Metal accelerator impl is feature-gated.
+pub mod device;
 pub mod ollama;
 pub mod registry;
 
 #[cfg(feature = "native-ml-metal")]
-pub use candle_backend::{CandleCompute, CandleNomicEmbedder};
+pub use candle_backend::CandleNomicEmbedder;
+pub use device::{
+    Acceleration, Compute, NativeAccelerator, WorkloadKind, default_accelerator, select_compute,
+};
 pub use ollama::OllamaEmbedder;
 pub use registry::{
     DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, EmbeddingBackend, EmbeddingModelSpec, REGISTRY,

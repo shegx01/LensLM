@@ -1086,7 +1086,15 @@ impl IngestContext<'_> {
         // Lazily get the cached embedder. Emit a `model_download` phase BEFORE the
         // first construction so a cold-cache download surfaces in the UI.
         on_progress(IngestProgress::new(ingest_phase::MODEL_DOWNLOAD, 0, None));
-        let embedder = engine.embedder_for(&embed_model, embed_backend).await?;
+        // Ingest embeds many chunks → Bulk workload (issue #91: GPU-eligible on
+        // Apple Silicon for a GPU-hinted model, else CPU).
+        let embedder = engine
+            .embedder_for(
+                &embed_model,
+                embed_backend,
+                crate::embedder::WorkloadKind::Bulk,
+            )
+            .await?;
         on_progress(IngestProgress::new(
             ingest_phase::MODEL_DOWNLOAD,
             1,

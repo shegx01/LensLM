@@ -127,6 +127,27 @@ pub struct EmbeddingModelSpec {
     /// `{data_dir}/models/fastembed/`. Recorded here (not read from fastembed's
     /// private tables) so the registry stays the single source of truth.
     pub hf_repo: &'static str,
+    /// Whether this model benefits from GPU (Metal) acceleration for **bulk**
+    /// embedding on Apple Silicon (issue #91). Gate 2 of the per-job device policy
+    /// ([`crate::embedder::device::select_compute`]): a model with `false` always
+    /// runs on the CPU fastembed backend regardless of hardware/workload.
+    ///
+    /// MEASURED (2026-07-03 candle+Metal spike, M1 Pro; see
+    /// `.omc/plans/issue-91-candle-metal-spike-results.md`): the small
+    /// `all-minilm` (22M / 384d) is a GPU LOSER — launch/dispatch overhead exceeds
+    /// its tiny compute, so it stays CPU-only (`false`). The larger models
+    /// (nomic 137M, mxbai 335M, bge-m3 567M) are GPU-eligible (`true`): the candle
+    /// Metal engine holds cross-engine parity (cosine 1.000000 vs fastembed) AND
+    /// frees ~99% of the CPU on sustained bulk. An explicit per-model flag beats a
+    /// `dim` heuristic — the crossover is empirical, not a clean size threshold.
+    ///
+    /// NOTE: `true` means "would benefit"; whether a GPU engine is actually
+    /// available for this model at run time is a SEPARATE concern the device layer
+    /// resolves (candle currently wires only nomic; others fall back to CPU
+    /// gracefully until wired). This field is deliberately NOT mirrored in
+    /// `src/lib/embeddings/models.ts` — it is backend-execution-only with no UI
+    /// surface, unlike the SYNC-CHECK'd `id`/`dim`.
+    pub accelerate_hint: bool,
 }
 
 impl EmbeddingModelSpec {
@@ -177,6 +198,8 @@ pub static REGISTRY: &[EmbeddingModelSpec] = &[
         prefix_doc: "search_document: ",
         prefix_query: "search_query: ",
         hf_repo: "nomic-ai/nomic-embed-text-v1.5",
+        // 137M/768d — GPU-eligible; candle-Metal is wired + parity-proven for it.
+        accelerate_hint: true,
     },
     EmbeddingModelSpec {
         id: "mxbai-embed-large",
@@ -185,6 +208,9 @@ pub static REGISTRY: &[EmbeddingModelSpec] = &[
         prefix_doc: "",
         prefix_query: "Represent this sentence for searching relevant passages: ",
         hf_repo: "mixedbread-ai/mxbai-embed-large-v1",
+        // 335M/1024d — GPU-eligible; candle backend wiring is follow-up (falls back
+        // to CPU until then).
+        accelerate_hint: true,
     },
     EmbeddingModelSpec {
         id: "all-minilm",
@@ -193,6 +219,8 @@ pub static REGISTRY: &[EmbeddingModelSpec] = &[
         prefix_doc: "",
         prefix_query: "",
         hf_repo: "Qdrant/all-MiniLM-L6-v2-onnx",
+        // 22M/384d — measured GPU LOSER (dispatch overhead > compute). CPU only.
+        accelerate_hint: false,
     },
     EmbeddingModelSpec {
         id: "bge-m3",
@@ -201,6 +229,8 @@ pub static REGISTRY: &[EmbeddingModelSpec] = &[
         prefix_doc: "",
         prefix_query: "",
         hf_repo: "BAAI/bge-m3",
+        // 567M/1024d — GPU-eligible; candle backend wiring is follow-up.
+        accelerate_hint: true,
     },
 ];
 
@@ -329,6 +359,15 @@ mod tests {
     #[test]
     fn registry_has_exactly_four_models() {
         assert_eq!(REGISTRY.len(), 4);
+    }
+
+    #[test]
+    fn accelerate_hint_matches_measured_verdict() {
+        // Measured 2026-07-03 (candle+Metal spike): only all-minilm is a GPU loser.
+        assert!(resolve("nomic-embed-text-v1.5").accelerate_hint);
+        assert!(resolve("mxbai-embed-large").accelerate_hint);
+        assert!(resolve("bge-m3").accelerate_hint);
+        assert!(!resolve("all-minilm").accelerate_hint);
     }
 
     #[test]
