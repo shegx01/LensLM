@@ -11,14 +11,14 @@ app is ready to distribute.
 Runs on every pull request and on pushes to `main`. Linux-only (`ubuntu-latest`);
 cross-platform bundling is verified later at release time.
 
-| Job                             | What it runs                                                                    | Blocks merge?            |
-| ------------------------------- | ------------------------------------------------------------------------------ | ------------------------ |
-| **Rust (fmt)**                  | `cargo fmt --all -- --check`                                                    | Yes                      |
-| **Rust (clippy)**               | `cargo clippy --workspace --all-targets -- -D warnings`                         | Yes                      |
-| **Rust (build + archive tests)**| Compiles every test binary once (`cargo nextest archive`), uploads the archive | Yes                      |
-| **Rust (test/1–3)**             | Runs the archived binaries partitioned across 3 shards (`cargo nextest run`)    | Yes                      |
-| **Frontend**                    | `bun run format:check`, `bun run check`, `bun run test`                         | Yes                      |
-| **E2E**                         | Playwright against the SvelteKit dev server (`bun run test:e2e`)               | No (`continue-on-error`) |
+| Job                              | What it runs                                                                   | Blocks merge?            |
+| -------------------------------- | ------------------------------------------------------------------------------ | ------------------------ |
+| **Rust (fmt)**                   | `cargo fmt --all -- --check`                                                   | Yes                      |
+| **Rust (clippy)**                | `cargo clippy --workspace --all-targets -- -D warnings`                        | Yes                      |
+| **Rust (build + archive tests)** | Compiles every test binary once (`cargo nextest archive`), uploads the archive | Yes                      |
+| **Rust (test/1–3)**              | Runs the archived binaries partitioned across 3 shards (`cargo nextest run`)   | Yes                      |
+| **Frontend**                     | `bun run format:check`, `bun run check`, `bun run test`                        | Yes                      |
+| **E2E**                          | Playwright against the SvelteKit dev server (`bun run test:e2e`)               | No (`continue-on-error`) |
 
 The Rust pipeline is a fan-out DAG: `fmt`, `clippy`, and the archive build run
 in parallel sharing one warm cargo cache (only the archive job writes it); the
