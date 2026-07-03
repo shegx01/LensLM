@@ -4,6 +4,7 @@ import AppShell from './AppShell.svelte';
 import { notebookStore, resetNotebookStore } from '$lib/notebooks/notebooks-state.svelte.js';
 import { listTrashed } from '$lib/notebooks/ipc.js';
 import { listTrashedSources } from '$lib/sources/ipc.js';
+import { invoke } from '@tauri-apps/api/core';
 
 // AppShell mounts NotebooksSidebar (loads notebooks via the store) + CommandPalette
 // + NotebookCreateDialog. Mock the IPC layer so the store's loadNotebooks() resolves
@@ -15,7 +16,8 @@ vi.mock('$lib/notebooks/ipc.js', () => ({
   trashNotebook: vi.fn(),
   restoreNotebook: vi.fn(),
   listTrashed: vi.fn().mockResolvedValue([]),
-  purgeNotebook: vi.fn()
+  purgeNotebook: vi.fn(),
+  touchNotebookActivity: vi.fn().mockResolvedValue(undefined)
 }));
 
 vi.mock('$lib/sources/ipc.js', () => ({
@@ -31,14 +33,50 @@ vi.mock('$lib/sources/ipc.js', () => ({
   restoreSource: vi.fn()
 }));
 
+const mockIsTauri = vi.fn(() => false);
+
 vi.mock('@tauri-apps/api/core', () => ({
-  isTauri: () => false,
+  isTauri: () => mockIsTauri(),
   invoke: vi.fn()
 }));
 
-beforeEach(() => {
+// Minimal NotebookSummary fixture.
+function makeNotebook(id: string): import('$lib/notebooks/types.js').NotebookSummary {
+  return {
+    id,
+    title: `Notebook ${id}`,
+    description: null,
+    focus_mode: null,
+    embedding_model: null,
+    embedding_backend: null,
+    created_at: '2026-01-01T00:00:00Z',
+    updated_at: '2026-01-01T00:00:00Z',
+    trashed_at: null,
+    last_activity_at: '2026-01-01T00:00:00Z',
+    source_count: 0
+  };
+}
+
+// Minimal AppConfig fixture — only the fields the auto-select path reads.
+function makeConfig(
+  reopenLastNotebook: boolean | undefined = true
+): Partial<import('$lib/theme/types.js').AppConfig> {
+  return {
+    user_name: 'Test User',
+    reopen_last_notebook: reopenLastNotebook
+  };
+}
+
+beforeEach(async () => {
   vi.clearAllMocks();
   resetNotebookStore();
+  // Default: non-Tauri environment (preserves old synchronous test behavior).
+  mockIsTauri.mockReturnValue(false);
+  // Reset listNotebooks to empty list so each test starts clean.
+  const { listNotebooks } = await import('$lib/notebooks/ipc.js');
+  vi.mocked(listNotebooks).mockResolvedValue([]);
+  // Default: get_config returns config with reopen_last_notebook: true.
+  vi.mocked(invoke).mockResolvedValue(makeConfig(true));
 });
 
 afterEach(() => {
@@ -46,16 +84,18 @@ afterEach(() => {
 });
 
 describe('AppShell.svelte', () => {
-  it('renders the sidebar, the centre empty state, and the right rail', () => {
+  it('renders the sidebar, the centre empty state, and the right rail', async () => {
     render(AppShell);
     // Left rail: NotebooksSidebar renders the "Notebooks" section label + search trigger.
     expect(screen.getByText('Notebooks')).toBeInTheDocument();
     expect(screen.getByLabelText(/search notebooks/i)).toBeInTheDocument();
-    // Centre: empty state (no active notebook).
-    expect(screen.getByText('Your workspace')).toBeInTheDocument();
-    expect(screen.getByText(/select or create a notebook/i)).toBeInTheDocument();
-    // Right rail: SourcesRail now renders "Sources" heading.
+    // Right rail: SourcesRail renders "Sources" heading.
     expect(screen.getByText('Sources')).toBeInTheDocument();
+    // Centre: empty state renders after loading completes (gated on !loading).
+    await vi.waitFor(() => {
+      expect(screen.getByText('Your workspace')).toBeInTheDocument();
+      expect(screen.getByText(/select or create a notebook/i)).toBeInTheDocument();
+    });
   });
 
   it('uses semantic landmarks for the regions', () => {
@@ -133,6 +173,48 @@ describe('AppShell.svelte', () => {
     await vi.waitFor(() => {
       expect(vi.mocked(listTrashed)).toHaveBeenCalled();
       expect(vi.mocked(listTrashedSources)).toHaveBeenCalled();
+    });
+  });
+
+  // ── Auto-select tests (last-active-notebook feature) ────────────────────
+
+  it('auto-selects the first (MRU) notebook when reopen_last_notebook is true and notebooks exist', async () => {
+    mockIsTauri.mockReturnValue(true);
+    const { listNotebooks } = await import('$lib/notebooks/ipc.js');
+    vi.mocked(listNotebooks).mockResolvedValue([makeNotebook('nb-1'), makeNotebook('nb-2')]);
+    vi.mocked(invoke).mockResolvedValue(makeConfig(true));
+
+    render(AppShell);
+
+    await vi.waitFor(() => {
+      // With an active notebook, the workspace region (not the empty state) shows.
+      expect(screen.queryByText(/select or create a notebook/i)).not.toBeInTheDocument();
+    });
+  });
+
+  it('does NOT auto-select and shows empty state when reopen_last_notebook is false', async () => {
+    mockIsTauri.mockReturnValue(true);
+    const { listNotebooks } = await import('$lib/notebooks/ipc.js');
+    vi.mocked(listNotebooks).mockResolvedValue([makeNotebook('nb-1')]);
+    vi.mocked(invoke).mockResolvedValue(makeConfig(false));
+
+    render(AppShell);
+
+    await vi.waitFor(() => {
+      expect(screen.getByText(/select or create a notebook/i)).toBeInTheDocument();
+    });
+  });
+
+  it('does NOT auto-select when notebook list is empty, and empty state is shown', async () => {
+    mockIsTauri.mockReturnValue(true);
+    // listNotebooks is already mocked to [] by default.
+    vi.mocked(invoke).mockResolvedValue(makeConfig(true));
+
+    render(AppShell);
+
+    // After mount settles, empty state should still show.
+    await vi.waitFor(() => {
+      expect(screen.getByText(/select or create a notebook/i)).toBeInTheDocument();
     });
   });
 });

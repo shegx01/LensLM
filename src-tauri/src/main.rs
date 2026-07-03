@@ -61,6 +61,7 @@ fn main() {
             commands::notebooks::list_notebooks,
             commands::notebooks::create_notebook,
             commands::notebooks::rename_notebook,
+            commands::notebooks::touch_notebook_activity,
             commands::notebooks::delete_notebook,
             commands::notebooks::trash_notebook,
             commands::notebooks::restore_notebook,

@@ -25,6 +25,7 @@ export function baseAppConfig(overrides?: Partial<AppConfig>): AppConfig {
     embedding_model: '',
     embedding_backend: '',
     js_render_enabled: true,
+    reopen_last_notebook: true,
     ...overrides
   };
 }

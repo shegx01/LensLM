@@ -496,6 +496,12 @@ pub struct Notebook {
     pub updated_at: String,
     /// RFC3339 soft-delete timestamp, or `None` if live.
     pub trashed_at: Option<String>,
+    /// RFC3339 last-activity timestamp — the single source of truth for
+    /// most-recently-active ordering / cold-launch auto-open. Bumped on open
+    /// (`touch_activity`), rename, and each non-dedup source-add. Nullable on
+    /// pre-migration rows (backfilled to `created_at` by migration 0011); read
+    /// paths order by `COALESCE(last_activity_at, created_at)`.
+    pub last_activity_at: Option<String>,
 }
 
 /// A notebook list response with its maintained source count.
@@ -590,8 +596,9 @@ impl<'a> NotebookRepo<'a> {
     pub async fn list(&self) -> Result<Vec<Notebook>, LensError> {
         let rows = sqlx::query_as::<_, Notebook>(
             "SELECT id, title, description, focus_mode, embedding_model, embedding_backend, \
-                    created_at, updated_at, trashed_at \
-             FROM notebooks WHERE trashed_at IS NULL ORDER BY created_at DESC",
+                    created_at, updated_at, trashed_at, last_activity_at \
+             FROM notebooks WHERE trashed_at IS NULL \
+             ORDER BY COALESCE(last_activity_at, created_at) DESC",
         )
         .fetch_all(self.pool)
         .await?;
@@ -613,12 +620,13 @@ impl<'a> NotebookRepo<'a> {
         self.list_summaries(
             "SELECT n.id, n.title, n.description, n.focus_mode, n.embedding_model, \
                     n.embedding_backend, n.created_at, n.updated_at, n.trashed_at, \
+                    n.last_activity_at, \
                     COALESCE(COUNT(s.id), 0) AS source_count \
              FROM notebooks n \
              LEFT JOIN sources s ON s.notebook_id = n.id AND s.trashed_at IS NULL \
              WHERE n.trashed_at IS NULL \
              GROUP BY n.id \
-             ORDER BY n.created_at DESC",
+             ORDER BY COALESCE(n.last_activity_at, n.created_at) DESC",
         )
         .await
     }
@@ -635,6 +643,7 @@ impl<'a> NotebookRepo<'a> {
         self.list_summaries(
             "SELECT n.id, n.title, n.description, n.focus_mode, n.embedding_model, \
                     n.embedding_backend, n.created_at, n.updated_at, n.trashed_at, \
+                    n.last_activity_at, \
                     COALESCE(COUNT(s.id), 0) AS source_count \
              FROM notebooks n \
              LEFT JOIN sources s ON s.notebook_id = n.id \
@@ -704,8 +713,8 @@ impl<'a> NotebookRepo<'a> {
     /// [`list_trashed_with_counts`](Self::list_trashed_with_counts), which differ
     /// only in their `WHERE`/`ORDER BY`. The `SELECT` projection must expose the
     /// columns `id, title, description, focus_mode, embedding_model,
-    /// embedding_backend, created_at, updated_at, trashed_at, source_count` in any
-    /// order.
+    /// embedding_backend, created_at, updated_at, trashed_at, last_activity_at,
+    /// source_count` in any order.
     async fn list_summaries(&self, query: &str) -> Result<Vec<NotebookSummary>, LensError> {
         use sqlx::Row;
         let rows = sqlx::query(query).fetch_all(self.pool).await?;
@@ -723,6 +732,7 @@ impl<'a> NotebookRepo<'a> {
                         created_at: row.try_get("created_at")?,
                         updated_at: row.try_get("updated_at")?,
                         trashed_at: row.try_get("trashed_at")?,
+                        last_activity_at: row.try_get("last_activity_at")?,
                     },
                     source_count: row.try_get("source_count")?,
                 })
@@ -764,8 +774,8 @@ impl<'a> NotebookRepo<'a> {
         sqlx::query(
             "INSERT INTO notebooks \
                  (id, title, description, focus_mode, embedding_model, embedding_backend, \
-                  created_at, updated_at, trashed_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+                  created_at, updated_at, trashed_at, last_activity_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
         )
         .bind(&id)
         .bind(&title)
@@ -773,6 +783,7 @@ impl<'a> NotebookRepo<'a> {
         .bind(&focus_mode)
         .bind(&embedding_model)
         .bind(&embedding_backend)
+        .bind(&now)
         .bind(&now)
         .bind(&now)
         .execute(self.pool)
@@ -785,12 +796,14 @@ impl<'a> NotebookRepo<'a> {
             embedding_model: Some(embedding_model),
             embedding_backend: Some(embedding_backend),
             created_at: now.clone(),
-            updated_at: now,
+            updated_at: now.clone(),
             trashed_at: None,
+            last_activity_at: Some(now),
         })
     }
 
-    /// Renames a notebook, bumping `updated_at`. The title is validated.
+    /// Renames a notebook, bumping `updated_at` and `last_activity_at` (a rename
+    /// counts as user activity for recency). The title is validated.
     ///
     /// The `AND trashed_at IS NULL` guard is defense-in-depth: the UI never
     /// exposes renaming a trashed notebook, but the clause prevents misuse via a
@@ -799,9 +812,11 @@ impl<'a> NotebookRepo<'a> {
         let title = validate_title(title)?;
         let now = chrono::Utc::now().to_rfc3339();
         let result = sqlx::query(
-            "UPDATE notebooks SET title = ?, updated_at = ? WHERE id = ? AND trashed_at IS NULL",
+            "UPDATE notebooks SET title = ?, updated_at = ?, last_activity_at = ? \
+             WHERE id = ? AND trashed_at IS NULL",
         )
         .bind(&title)
+        .bind(&now)
         .bind(&now)
         .bind(id)
         .execute(self.pool)
@@ -809,6 +824,46 @@ impl<'a> NotebookRepo<'a> {
         if result.rows_affected() == 0 {
             return Err(LensError::Validation(format!("no notebook with id {id}")));
         }
+        Ok(())
+    }
+
+    /// Bumps a live notebook's `last_activity_at` to now (records an "open").
+    ///
+    /// The single write behind cold-launch MRU auto-open: clicking a notebook
+    /// fires this so its recency advances. The `AND trashed_at IS NULL` guard
+    /// means a trashed or unknown id affects 0 rows and returns a validation
+    /// error (a trashed notebook must never surface as "most recent").
+    pub async fn touch_activity(&self, id: &NotebookId) -> Result<(), LensError> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let result = sqlx::query(
+            "UPDATE notebooks SET last_activity_at = ? WHERE id = ? AND trashed_at IS NULL",
+        )
+        .bind(&now)
+        .bind(id)
+        .execute(self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(LensError::Validation(format!(
+                "no live notebook with id {id}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Bumps `last_activity_at` on the success path of a source-add.
+    ///
+    /// Unlike [`touch_activity`](Self::touch_activity) this never errors on 0
+    /// rows — the caller has just inserted a source, so the notebook exists —
+    /// but it mirrors the same `AND trashed_at IS NULL` guard so a trashed
+    /// notebook can never gain recency. Shared by all four `add_*` methods.
+    async fn bump_activity(&self, id: &NotebookId, now: &str) -> Result<(), LensError> {
+        sqlx::query(
+            "UPDATE notebooks SET last_activity_at = ? WHERE id = ? AND trashed_at IS NULL",
+        )
+        .bind(now)
+        .bind(id)
+        .execute(self.pool)
+        .await?;
         Ok(())
     }
 
@@ -969,6 +1024,11 @@ impl<'a> NotebookRepo<'a> {
             });
         }
 
+        // Adding a source is user activity: bump the notebook's recency (success
+        // path only — the dedup/`was_existing: true` early returns above do NOT
+        // bump). Uses `&now` before it is moved into the returned `Source`.
+        self.bump_activity(notebook_id, &now).await?;
+
         Ok(AddSourceOutcome {
             source: Source {
                 id,
@@ -1120,6 +1180,10 @@ impl<'a> NotebookRepo<'a> {
                 was_existing: true,
             });
         }
+
+        // Adding a source is user activity: bump the notebook's recency (success
+        // path only — the dedup early returns above do NOT bump).
+        self.bump_activity(notebook_id, &now).await?;
 
         Ok(AddSourceOutcome {
             source: Source {
@@ -1310,6 +1374,10 @@ impl<'a> NotebookRepo<'a> {
             });
         }
 
+        // Adding a source is user activity: bump the notebook's recency (success
+        // path only — the dedup early returns above do NOT bump).
+        self.bump_activity(notebook_id, &now).await?;
+
         Ok(AddSourceOutcome {
             source: Source {
                 id,
@@ -1424,6 +1492,10 @@ impl<'a> NotebookRepo<'a> {
                 was_existing: true,
             });
         }
+
+        // Adding a source is user activity: bump the notebook's recency (success
+        // path only — the dedup early returns above do NOT bump).
+        self.bump_activity(notebook_id, &now).await?;
 
         Ok(AddSourceOutcome {
             source: Source {
@@ -2091,6 +2163,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             trashed_at: None,
+            last_activity_at: Some("2026-01-01T00:00:00Z".into()),
         };
         let json = serde_json::to_value(&nb).unwrap();
         assert_eq!(json["embedding_model"], "bge-m3");
@@ -2213,6 +2286,152 @@ mod tests {
         repo.rename(&nb.id, "Renamed").await.unwrap();
         let summaries = repo.list_with_counts().await.unwrap();
         assert_eq!(summaries[0].notebook.title, "Renamed");
+    }
+
+    /// Small helper: creates a live notebook and returns its id. Sleeps a few ms
+    /// first so successive creates get strictly-increasing RFC3339 timestamps
+    /// (they carry sub-second precision), making recency ordering deterministic.
+    async fn create_after_tick(repo: &NotebookRepo<'_>, title: &str) -> NotebookId {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        repo.create(
+            title,
+            None,
+            None,
+            crate::embedder::registry::DEFAULT_EMBED_MODEL_ID,
+            "fastembed",
+        )
+        .await
+        .unwrap()
+        .id
+    }
+
+    #[tokio::test]
+    async fn touch_activity_surfaces_notebook_to_front_of_mru_list() {
+        let pool = test_pool().await;
+        let repo = NotebookRepo::new(&pool);
+
+        let a = create_after_tick(&repo, "A").await;
+        let b = create_after_tick(&repo, "B").await;
+        let c = create_after_tick(&repo, "C").await;
+
+        // Freshly created: MRU order is C, B, A (newest last_activity_at first).
+        let ids: Vec<_> = repo
+            .list_with_counts()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| s.notebook.id)
+            .collect();
+        assert_eq!(ids, vec![c.clone(), b.clone(), a.clone()]);
+
+        // Touch the MIDDLE notebook -> it becomes most-recent.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        repo.touch_activity(&b).await.unwrap();
+
+        let ids: Vec<_> = repo
+            .list_with_counts()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| s.notebook.id)
+            .collect();
+        assert_eq!(ids, vec![b, c, a], "touched notebook must surface first");
+    }
+
+    #[tokio::test]
+    async fn touch_activity_updates_last_activity_at_timestamp() {
+        let pool = test_pool().await;
+        let repo = NotebookRepo::new(&pool);
+        let nb = repo
+            .create(
+                "N",
+                None,
+                None,
+                crate::embedder::registry::DEFAULT_EMBED_MODEL_ID,
+                "fastembed",
+            )
+            .await
+            .unwrap();
+        let before = nb.last_activity_at.clone().unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        repo.touch_activity(&nb.id).await.unwrap();
+
+        let after = repo
+            .list_with_counts()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.notebook.id == nb.id)
+            .unwrap()
+            .notebook
+            .last_activity_at
+            .unwrap();
+        assert!(after > before, "touch must advance last_activity_at");
+    }
+
+    #[tokio::test]
+    async fn touch_activity_on_trashed_notebook_is_validation_error() {
+        let pool = test_pool().await;
+        let repo = NotebookRepo::new(&pool);
+        let nb = repo
+            .create(
+                "N",
+                None,
+                None,
+                crate::embedder::registry::DEFAULT_EMBED_MODEL_ID,
+                "fastembed",
+            )
+            .await
+            .unwrap();
+        repo.trash(&nb.id).await.unwrap();
+        let err = repo.touch_activity(&nb.id).await.unwrap_err();
+        assert!(matches!(err, LensError::Validation(_)));
+    }
+
+    #[tokio::test]
+    async fn touch_activity_on_missing_notebook_is_validation_error() {
+        let pool = test_pool().await;
+        let repo = NotebookRepo::new(&pool);
+        let err = repo.touch_activity(&NotebookId::new()).await.unwrap_err();
+        assert!(matches!(err, LensError::Validation(_)));
+    }
+
+    #[tokio::test]
+    async fn add_source_bumps_notebook_last_activity_at() {
+        let pool = test_pool().await;
+        let repo = NotebookRepo::new(&pool);
+        let nb = repo
+            .create(
+                "N",
+                None,
+                None,
+                crate::embedder::registry::DEFAULT_EMBED_MODEL_ID,
+                "fastembed",
+            )
+            .await
+            .unwrap();
+        let before = nb.last_activity_at.clone().unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        repo.add_source(&nb.id, "file.pdf", "/abs/file.pdf")
+            .await
+            .unwrap();
+
+        let after = repo
+            .list_with_counts()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.notebook.id == nb.id)
+            .unwrap()
+            .notebook
+            .last_activity_at
+            .unwrap();
+        assert!(
+            after > before,
+            "adding a source must advance last_activity_at"
+        );
     }
 
     #[tokio::test]
@@ -2561,6 +2780,7 @@ mod tests {
                 created_at: "2026-06-23T00:00:00+00:00".to_string(),
                 updated_at: "2026-06-23T00:00:00+00:00".to_string(),
                 trashed_at: None,
+                last_activity_at: Some("2026-06-23T00:00:00+00:00".to_string()),
             },
             source_count: 5,
         };
@@ -2582,6 +2802,7 @@ mod tests {
                 "embedding_model",
                 "focus_mode",
                 "id",
+                "last_activity_at",
                 "source_count",
                 "title",
                 "trashed_at",

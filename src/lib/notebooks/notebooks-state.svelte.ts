@@ -20,7 +20,8 @@ import {
   trashNotebook,
   restoreNotebook,
   listTrashed,
-  purgeNotebook
+  purgeNotebook,
+  touchNotebookActivity
 } from './ipc.js';
 import { listTrashedSources, restoreSource, purgeSource } from '$lib/sources/ipc.js';
 import type { TrashedSource } from '$lib/sources/types.js';
@@ -347,11 +348,15 @@ export async function purgeNotebookAction(id: string): Promise<void> {
  * palette mirrors the `notebookStore.paletteOpen` setter semantics (clears the
  * query too) so a stale palette query can't linger. Idempotent when the palette
  * is already closed.
+ *
+ * Fire-and-forget activity touch: records the open for MRU ordering. A DB write
+ * failure is intentionally swallowed — it must not block selection.
  */
 export function selectNotebook(id: string): void {
   activeNotebookId = id;
   paletteOpen = false;
   paletteQuery = '';
+  void touchNotebookActivity(id).catch(() => {});
 }
 
 /**

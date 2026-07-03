@@ -24,6 +24,7 @@
   import { notebookStore } from '$lib/notebooks/index.js';
   import { cn } from '$lib/utils.js';
   import EmbeddingsSection from './EmbeddingsSection.svelte';
+  import GeneralSection from './GeneralSection.svelte';
   import IngestionSection from './IngestionSection.svelte';
   import ArrowLeft from '@lucide/svelte/icons/arrow-left';
   import Settings2 from '@lucide/svelte/icons/settings-2';
@@ -51,7 +52,7 @@
   // and `ingestion` are live (`stub: false`); the rest are coming-soon stubs.
   // `About` sits at the bottom in the design (pushed down by a spacer).
   const NAV: { id: SectionId; label: string; icon: typeof Settings2; stub: boolean }[] = [
-    { id: 'general', label: 'General', icon: Settings2, stub: true },
+    { id: 'general', label: 'General', icon: Settings2, stub: false },
     { id: 'ai', label: 'AI Model', icon: Cpu, stub: true },
     { id: 'embeddings', label: 'Embeddings', icon: Share2, stub: false },
     { id: 'ingestion', label: 'Ingestion', icon: Download, stub: false },
@@ -133,7 +134,9 @@
 
     <!-- ── Section content pane ── -->
     <div class="flex-1 overflow-y-auto px-10 py-8">
-      {#if active === 'embeddings'}
+      {#if active === 'general'}
+        <GeneralSection />
+      {:else if active === 'embeddings'}
         <EmbeddingsSection mode="global" />
       {:else if active === 'ingestion'}
         <IngestionSection />

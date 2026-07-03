@@ -12,7 +12,8 @@
     notebookStore,
     loadNotebooks,
     refreshTrashed,
-    refreshTrashedSources
+    refreshTrashedSources,
+    selectNotebook
   } from '$lib/notebooks/index.js';
   import SourcesRail from '$lib/components/sources/SourcesRail.svelte';
   import PreferencesShell from '$lib/components/embeddings/PreferencesShell.svelte';
@@ -90,22 +91,30 @@
   onMount(() => {
     window.addEventListener('keydown', handleKeydown);
 
-    // Load notebooks + user name on mount (guarded for non-Tauri test/SSR env).
-    void loadNotebooks();
+    // Load notebooks + config in parallel. Auto-select the most-recently-active
+    // notebook only after BOTH have resolved, so there is no race between the
+    // notebook list and the reopen_last_notebook flag.
+    void (async () => {
+      const [, cfg] = await Promise.all([
+        loadNotebooks(),
+        isTauri() ? invoke<AppConfig>('get_config') : Promise.resolve(null)
+      ]);
+      if (cfg) userName = (cfg as AppConfig).user_name ?? '';
+      // default-on: null/undefined ⇒ open; only explicit `false` suppresses it.
+      if (
+        (cfg as AppConfig | null)?.reopen_last_notebook !== false &&
+        !notebookStore.activeNotebookId &&
+        notebookStore.notebooks.length > 0
+      ) {
+        selectNotebook(notebookStore.notebooks[0].id);
+      }
+    })();
+
     // Pre-load trash counts so the badge is correct from startup without a
     // loading flash. Uses raw refresh helpers (not loadTrashed/loadTrashedSources)
     // to avoid toggling the shared `loading` flag and flashing the UI.
     void refreshTrashed().catch(() => {});
     void refreshTrashedSources().catch(() => {});
-    if (isTauri()) {
-      invoke<AppConfig>('get_config')
-        .then((cfg) => {
-          userName = cfg.user_name ?? '';
-        })
-        .catch((err) => {
-          console.error('AppShell: get_config failed', err);
-        });
-    }
 
     return () => {
       window.removeEventListener('keydown', handleKeydown);
@@ -151,7 +160,8 @@
       {#if activeNotebook}
         <!-- Empty content region — chat/notes fill this in M5/M6. -->
         <div class="flex flex-1 flex-col overflow-hidden"></div>
-      {:else}
+      {:else if !notebookStore.loading}
+        <!-- Gate on !loading to prevent an empty-state flash before auto-select fires. -->
         <div class="flex flex-1 flex-col items-center justify-center gap-2">
           <Aperture class="size-8 text-muted-foreground/40" />
           <p class="text-sm text-muted-foreground">Your workspace</p>
