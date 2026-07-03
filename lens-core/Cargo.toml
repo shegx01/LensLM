@@ -23,17 +23,6 @@ workspace = true
 name = "eval"
 path = "src/bin/eval.rs"
 
-# STEP-0 SPIKE (issue #91, candle+Metal validation): loads nomic-embed-text-v1.5
-# via candle on CPU and Metal, measures cross-engine cosine parity vs the production
-# FastembedEmbedder, throughput (candle-CPU vs ORT-CPU, candle-Metal), and CPU
-# offload. Throwaway; gated to the `native-ml-metal` feature (aarch64-apple-darwin
-# only). Never runs `./target/...` binaries directly — always `cargo run` (provenance
-# lock). Delete with the spike.
-[[bin]]
-name = "spike_candle"
-path = "src/bin/spike_candle.rs"
-required-features = ["native-ml-metal"]
-
 [features]
 # Exposes test-only seams on the public API (e.g. `LensEngine::set_embedder_for_test`,
 # which pre-fills the embedder `OnceCell` with a caller-supplied `Arc<dyn Embedder>`
@@ -42,7 +31,7 @@ required-features = ["native-ml-metal"]
 # `dev-dependencies` self-edge below; never enabled in a production build.
 test-util = []
 
-# STEP-0 SPIKE (issue #91): the candle + Metal (Apple GPU) embedding backend.
+# issue #91: the candle + Metal (Apple GPU) embedding backend.
 # Pulls candle-core/candle-nn/candle-transformers + hf-hub, all gated to
 # aarch64-apple-darwin in the target table below (they only build there). OFF by
 # default, so non-macOS / non-aarch64 CI never compiles candle. The GPU-offload
@@ -53,7 +42,6 @@ native-ml-metal = [
     "dep:candle-nn",
     "dep:candle-transformers",
     "dep:hf-hub",
-    "dep:libc",
 ]
 
 [dependencies]
@@ -206,7 +194,7 @@ async-trait = "0.1"
 # the integration tests; declaring it here makes it available to the bin target.)
 tempfile = { workspace = true }
 
-# --- STEP-0 SPIKE (issue #91): candle + Metal embedding backend ---
+# --- issue #91: candle + Metal embedding backend ---
 # Gated to aarch64-apple-darwin: candle's `metal` feature pulls Apple's Metal
 # Shading Language kernels (objc2-metal) that ONLY build on Apple Silicon macOS,
 # and the whole point (GPU offload) is Apple-Silicon-specific. All four crates are
@@ -220,15 +208,10 @@ tempfile = { workspace = true }
 candle-core = { version = "=0.11.0", features = ["metal"], optional = true }
 candle-nn = { version = "=0.11.0", features = ["metal"], optional = true }
 candle-transformers = { version = "=0.11.0", features = ["metal"], optional = true }
-# HF weight/config/tokenizer fetch for the spike. hf-hub 0.5.0 is ALREADY resolved
-# in the lock tree (transitive via fastembed), so this pulls NO new copy — it just
-# promotes it to a direct, feature-gated dependency for the spike download path.
+# HF weight/config/tokenizer fetch for the candle backend. hf-hub 0.5.0 is ALREADY
+# resolved in the lock tree (transitive via fastembed), so this pulls NO new copy —
+# it just promotes it to a direct, feature-gated dependency for the download path.
 hf-hub = { version = "=0.5.0", optional = true }
-# getrusage() for the Q2 offload measurement (avg CPU cores = CPU-secs/wall-secs,
-# no sudo needed — the sudo-free analog of the CoreML spike's powermetrics). libc
-# 0.2.186 is ALREADY in the lock (transitive via candle et al.), so this pins to
-# the resolved version and pulls no new copy. MIT OR Apache-2.0 (deny.toml).
-libc = { version = "=0.2.186", optional = true }
 
 [dev-dependencies]
 # Self-edge: enables the `test-util` feature for this crate's own test/bench

@@ -13,14 +13,14 @@
 //!   cargo test -p lens-core --features native-ml-metal --test candle_metal_parity \
 //!     -- --ignored --nocapture
 //!
-//! The full parity + throughput + offload + recall evidence lives in the
-//! `spike_candle` bin and `.omc/plans/issue-91-candle-metal-spike-results.md`.
+//! The full parity + throughput + offload + recall evidence is recorded in
+//! `.omc/plans/issue-91-candle-metal-spike-results.md`.
 
 #![cfg(feature = "native-ml-metal")]
 
 use lens_core::embedder::{CandleNomicEmbedder, Compute, Embedder, FastembedEmbedder};
 
-/// Minimum acceptable cross-engine cosine. The spike measured 1.000000; 0.999 is a
+/// Minimum acceptable cross-engine cosine. Measured at 1.000000; 0.999 is a
 /// generous guardrail that still catches a real divergence (e.g. an accidental
 /// fp16 regression, which drops parity to ~0.998).
 const PARITY_FLOOR: f32 = 0.999;

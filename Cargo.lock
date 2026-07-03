@@ -5237,7 +5237,6 @@ dependencies = [
  "insta",
  "lancedb",
  "lens-core",
- "libc",
  "pdfium-render",
  "printpdf",
  "pulldown-cmark",
