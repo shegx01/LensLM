@@ -640,25 +640,36 @@ async fn probe_llm_runtime(config: &AppConfig) -> LlmRuntimeProbe {
     }
 }
 
-/// Returns `true` when an Ollama model name matches an allowlisted embedding
-/// model (e.g. `"nomic-embed-text:latest"` matches `"nomic-embed-text"`) OR the
-/// user's configured `embedding_model`. Matches on the bare name (ignoring an
-/// `:tag` suffix), case-insensitively.
+/// Returns `true` when an installed Ollama model name matches an allowlisted
+/// embedding model OR the user's configured `embedding_model`.
+///
+/// EXACT-TAG rule (issue #80, symmetric with the TS `ollamaMatches` D3 rule): a
+/// registry id may itself contain a colon (`qwen3-embedding:4b`). Blindly
+/// stripping the `:tag` suffix would turn that into `qwen3-embedding`, which is
+/// NOT a registry id — so `qwen3-embedding:4b` would fail the readiness gate while
+/// `qwen3-embedding:0.6b` (a DIFFERENT, unlisted model) would spuriously pass.
+///
+/// Resolution order, case-insensitive:
+/// 1. Match the FULL installed name against the registry first — this accepts
+///    colon-bearing ids (`qwen3-embedding:4b`) EXACTLY, and rejects sibling tags.
+/// 2. Only if that misses, fall back to tag-stripping so an untagged registry id
+///    served with a default tag (`nomic-embed-text:latest`) still matches.
+/// 3. The configured-id escape hatch lets a user's chosen model pass even if it
+///    is not (yet) in the registry (matched against both full and bare names).
 fn is_allowlisted_embedding(installed_name: &str, configured: &str) -> bool {
+    let full = installed_name.to_ascii_lowercase();
     let bare = installed_name
         .split_once(':')
         .map_or(installed_name, |(name, _tag)| name)
         .to_ascii_lowercase();
-    // `is_allowlisted_embedding_id` is the single registry-derived check: it
-    // accepts every canonical id (the same set `ALLOWED_EMBEDDING_MODELS` is
-    // derived from) AND bridges the Ollama alias `"nomic-embed-text"` →
-    // canonical via `resolve_opt` (the 4b-B desync fix). A separate scan of
-    // `ALLOWED_EMBEDDING_MODELS` would be fully redundant, so we omit it. The
-    // configured-id escape hatch lets a user's chosen model pass even if it is
-    // not (yet) in the registry. All comparisons are case-insensitive against
-    // the bare (tag-stripped) name.
-    is_allowlisted_embedding_id(&bare)
-        || (!configured.is_empty() && configured.eq_ignore_ascii_case(&bare))
+    // `is_allowlisted_embedding_id` is the single registry-derived check (accepts
+    // every canonical id + bridges the Ollama alias `"nomic-embed-text"` via
+    // `resolve_opt`). Try the FULL name first (exact colon-bearing match), then
+    // the tag-stripped bare name (untagged-id-with-`:latest` case).
+    is_allowlisted_embedding_id(&full)
+        || is_allowlisted_embedding_id(&bare)
+        || (!configured.is_empty()
+            && (configured.eq_ignore_ascii_case(&full) || configured.eq_ignore_ascii_case(&bare)))
 }
 
 /// Returns `true` when the SPECIFIC `model_id`'s fastembed weights are already
@@ -686,10 +697,12 @@ fn is_allowlisted_embedding(installed_name: &str, configured: &str) -> bool {
 /// "cached".
 pub fn fastembed_weights_cached(data_dir: &Path, model_id: &str) -> bool {
     let spec = crate::embedder::resolve(model_id);
-    let model_dir = data_dir
-        .join("models")
-        .join("fastembed")
-        .join(spec.fastembed_cache_subdir());
+    // An Ollama-only model (issue #80) has no fastembed cache directory at all —
+    // fastembed never downloads it — so it can never be "fastembed-cached".
+    let Some(subdir) = spec.fastembed_cache_subdir() else {
+        return false;
+    };
+    let model_dir = data_dir.join("models").join("fastembed").join(subdir);
     if !model_dir.is_dir() {
         return false;
     }
@@ -1197,7 +1210,9 @@ mod tests {
     /// Creates a non-empty per-model fastembed cache subdir for `model_id`
     /// (OBSERVED hf-hub shape `models/fastembed/models--{org}--{model}/…`).
     fn seed_fastembed_cache(data_dir: &Path, model_id: &str) {
-        let subdir = crate::embedder::resolve(model_id).fastembed_cache_subdir();
+        let subdir = crate::embedder::resolve(model_id)
+            .fastembed_cache_subdir()
+            .expect("a fastembed model has a cache subdir");
         let model_dir = data_dir.join("models").join("fastembed").join(subdir);
         std::fs::create_dir_all(model_dir.join("snapshots")).unwrap();
         std::fs::write(model_dir.join("snapshots").join("model.onnx"), b"fake").unwrap();
@@ -1270,7 +1285,9 @@ mod tests {
     #[test]
     fn fastembed_weights_cached_false_for_empty_dir() {
         let dir = tempfile::tempdir().unwrap();
-        let subdir = crate::embedder::resolve("nomic-embed-text-v1.5").fastembed_cache_subdir();
+        let subdir = crate::embedder::resolve("nomic-embed-text-v1.5")
+            .fastembed_cache_subdir()
+            .expect("nomic has a cache subdir");
         std::fs::create_dir_all(dir.path().join("models").join("fastembed").join(subdir)).unwrap();
         assert!(!fastembed_weights_cached(
             dir.path(),
@@ -1283,12 +1300,21 @@ mod tests {
     #[test]
     fn fastembed_cache_subdir_matches_observed_shape() {
         assert_eq!(
-            crate::embedder::resolve("all-minilm").fastembed_cache_subdir(),
-            "models--Qdrant--all-MiniLM-L6-v2-onnx"
+            crate::embedder::resolve("all-minilm")
+                .fastembed_cache_subdir()
+                .as_deref(),
+            Some("models--Qdrant--all-MiniLM-L6-v2-onnx")
         );
         assert_eq!(
-            crate::embedder::resolve("nomic-embed-text-v1.5").fastembed_cache_subdir(),
-            "models--nomic-ai--nomic-embed-text-v1.5"
+            crate::embedder::resolve("nomic-embed-text-v1.5")
+                .fastembed_cache_subdir()
+                .as_deref(),
+            Some("models--nomic-ai--nomic-embed-text-v1.5")
+        );
+        // An Ollama-only model (issue #80) has NO fastembed cache subdir.
+        assert_eq!(
+            crate::embedder::resolve("qwen3-embedding:4b").fastembed_cache_subdir(),
+            None
         );
     }
 
@@ -1360,6 +1386,44 @@ mod tests {
         ));
         // A non-embed chat model never matches.
         assert!(!is_allowlisted_embedding("llama3:latest", ""));
+    }
+
+    /// Step 6 (issue #80): a colon-bearing registry id (`qwen3-embedding:4b`) must
+    /// be allowlisted for its EXACT tag only, mirroring the TS D3 rule. A sibling
+    /// tag of the same base (`:0.6b`, `:8b`) is a DIFFERENT, unlisted model and
+    /// must NOT pass — the old blind tag-strip would have wrongly accepted them all.
+    #[test]
+    fn allowlisted_embedding_exact_tag_for_colon_bearing_ids() {
+        // Exact colon-bearing id → allowlisted.
+        assert!(is_allowlisted_embedding("qwen3-embedding:4b", ""));
+        // Sibling tags of the same base are NOT the registered model → rejected.
+        assert!(!is_allowlisted_embedding("qwen3-embedding:0.6b", ""));
+        assert!(!is_allowlisted_embedding("qwen3-embedding:8b", ""));
+        // The bare base alone (no tag) is not a registry id → rejected.
+        assert!(!is_allowlisted_embedding("qwen3-embedding", ""));
+        // The other curated Ollama ids (no colon) still match.
+        assert!(is_allowlisted_embedding("embeddinggemma", ""));
+        assert!(is_allowlisted_embedding("embeddinggemma:latest", ""));
+        assert!(is_allowlisted_embedding("nomic-embed-text-v2-moe", ""));
+        assert!(is_allowlisted_embedding("snowflake-arctic-embed2", ""));
+        // The untagged alias-with-default-tag case still works (regression guard).
+        assert!(is_allowlisted_embedding("nomic-embed-text:latest", ""));
+    }
+
+    /// Step 6 (issue #80): every curated Ollama id is in the derived allowlist.
+    #[test]
+    fn new_ollama_ids_are_in_allowlist() {
+        for id in [
+            "embeddinggemma",
+            "qwen3-embedding:4b",
+            "nomic-embed-text-v2-moe",
+            "snowflake-arctic-embed2",
+        ] {
+            assert!(
+                ALLOWED_EMBEDDING_MODELS.contains(&id),
+                "{id} must be in the registry-derived allowlist"
+            );
+        }
     }
 
     #[test]

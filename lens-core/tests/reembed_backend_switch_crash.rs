@@ -1,7 +1,10 @@
 //! M4 Phase 4b-B Step 6 — crash recovery on a SAME-DIM cross-backend re-embed.
 //!
-//! A backend switch (fastembed/nomic/768 → ollama/nomic/768) re-embeds into the
-//! new coordinate, flips it active, then retires the OLD fastembed coordinate. This
+//! A backend switch (fastembed/nomic-v1.5/768 → ollama/nomic-v2-moe/768) re-embeds
+//! into the new coordinate, flips it active, then retires the OLD fastembed
+//! coordinate. Both sides are 768-dim so the switch is same-dim, but issue #80's
+//! strict model↔backend partition means the OLLAMA side must be an ollama-valid
+//! id (`nomic-embed-text-v2-moe`, 768) — nomic-v1.5 is fastembed-only. This
 //! test arms the global retire crash seam
 //! (`CRASH_AFTER_RETIRE_STALE_BEFORE_LANCE_DROP`) so the old-coordinate retire
 //! demotes to `stale` and returns early — modeling a process crash between the
@@ -130,6 +133,7 @@ async fn coord_count(
     engine: &LensEngine,
     nb: &str,
     backend: EmbeddingBackend,
+    model: &str,
     status: &str,
 ) -> i64 {
     sqlx::query_scalar::<_, i64>(
@@ -138,7 +142,7 @@ async fn coord_count(
     )
     .bind(nb)
     .bind(backend.as_str())
-    .bind(DEFAULT_EMBED_MODEL_ID)
+    .bind(model)
     .bind(DEFAULT_EMBED_DIM as i64)
     .bind(status)
     .fetch_one(&engine.pool().await)
@@ -152,16 +156,24 @@ async fn coord_count(
 /// ollama coordinate keeps serving search.
 #[tokio::test]
 async fn backend_switch_crash_before_drop_recovered_by_gc() {
+    // The ollama-valid, 768-dim target model (issue #80 strict partition: the
+    // ollama side cannot be nomic-v1.5, which is fastembed-only).
+    const OLLAMA_MODEL: &str = "nomic-embed-text-v2-moe";
+
     let dir = tempfile::tempdir().unwrap();
     let engine = LensEngine::init(dir.path()).await.unwrap();
-    inject_embedder_for(&engine, DEFAULT_EMBED_MODEL_ID, EmbeddingBackend::Ollama);
+    inject_embedder_for(&engine, OLLAMA_MODEL, EmbeddingBackend::Ollama);
     let (nb, _src) = seed_nomic_notebook(&engine).await;
 
-    sqlx::query("UPDATE notebooks SET embedding_backend = 'ollama' WHERE id = ?")
-        .bind(&nb)
-        .execute(&engine.pool().await)
-        .await
-        .unwrap();
+    // Switch the notebook to the ollama backend AND the ollama-valid 768-dim model.
+    sqlx::query(
+        "UPDATE notebooks SET embedding_backend = 'ollama', embedding_model = ? WHERE id = ?",
+    )
+    .bind(OLLAMA_MODEL)
+    .bind(&nb)
+    .execute(&engine.pool().await)
+    .await
+    .unwrap();
 
     // Arm the retire crash seam: the old-coordinate retire demotes to stale, then
     // returns early BEFORE dropping its Lance table / deleting its row.
@@ -175,11 +187,25 @@ async fn backend_switch_crash_before_drop_recovered_by_gc() {
 
     // New ollama coordinate is active; the OLD fastembed row lingers as `stale`.
     assert_eq!(
-        coord_count(&engine, &nb, EmbeddingBackend::Ollama, "active").await,
+        coord_count(
+            &engine,
+            &nb,
+            EmbeddingBackend::Ollama,
+            OLLAMA_MODEL,
+            "active"
+        )
+        .await,
         1
     );
     assert_eq!(
-        coord_count(&engine, &nb, EmbeddingBackend::Fastembed, "stale").await,
+        coord_count(
+            &engine,
+            &nb,
+            EmbeddingBackend::Fastembed,
+            DEFAULT_EMBED_MODEL_ID,
+            "stale"
+        )
+        .await,
         1,
         "the old fastembed coordinate lingers as stale after the simulated crash"
     );
@@ -208,7 +234,7 @@ async fn backend_switch_crash_before_drop_recovered_by_gc() {
             &Coordinate::new(
                 nb.clone(),
                 EmbeddingBackend::Ollama,
-                DEFAULT_EMBED_MODEL_ID,
+                OLLAMA_MODEL,
                 DEFAULT_EMBED_DIM,
             ),
             &q,
