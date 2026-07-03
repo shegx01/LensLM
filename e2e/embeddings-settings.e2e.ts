@@ -68,17 +68,16 @@ test('onboarding embed panel sets the global default (model + backend)', async (
   await expect(page.getByText('Select your local embeddings provider')).toBeVisible();
   await expect(page.getByText(/permanently linked/)).toBeVisible();
 
-  // Install the default fastembed model → warm + persist as the global default.
-  await page.getByRole('button', { name: /Install nomic-embed-text-v1\.5/i }).click();
-
-  await expect
-    .poll(() => readSetConfigCalls(page), { timeout: 15_000 })
-    .toContainEqual(
+  // Retry click+read as a unit: the click can drop while the panel settles.
+  await expect(async () => {
+    await page.getByRole('button', { name: /Install nomic-embed-text-v1\.5/i }).click();
+    expect(await readSetConfigCalls(page)).toContainEqual(
       expect.objectContaining({
         embedding_model: 'nomic-embed-text-v1.5',
         embedding_backend: 'fastembed'
       })
     );
+  }).toPass({ timeout: 15_000 });
 });
 
 // ── Step 10: global Settings>Embeddings changes the default for new notebooks ─
