@@ -200,12 +200,23 @@ pub async fn fastembed_models_cached(app: tauri::AppHandle) -> Result<Vec<String
         .path()
         .app_data_dir()
         .map_err(|e| LensError::Io(e.to_string()))?;
-    let cached = lens_core::REGISTRY
+    Ok(fastembed_cached_ids(&data_dir))
+}
+
+/// The registry ids whose fastembed weights are cached under `data_dir` (the pure
+/// core of [`fastembed_models_cached`], extracted so it is unit-testable without a
+/// live `AppHandle`).
+///
+/// Only fastembed-capable models have an on-disk fastembed cache to probe (issue
+/// #80): Ollama-only models are served by the daemon, never downloaded by
+/// fastembed, so they can never be "fastembed-cached" and are skipped entirely.
+fn fastembed_cached_ids(data_dir: &std::path::Path) -> Vec<String> {
+    lens_core::REGISTRY
         .iter()
-        .filter(|spec| lens_core::fastembed_weights_cached(&data_dir, spec.id))
+        .filter(|spec| spec.supports(lens_core::EmbeddingBackend::Fastembed))
+        .filter(|spec| lens_core::fastembed_weights_cached(data_dir, spec.id))
         .map(|spec| spec.id.to_string())
-        .collect();
-    Ok(cached)
+        .collect()
 }
 
 /// Warms (downloads + caches) a fastembed model's weights so a fastembed
@@ -344,6 +355,44 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tauri::Manager;
     use tauri::ipc::Channel;
+
+    /// Step 5 (issue #80): `fastembed_cached_ids` returns ONLY fastembed-capable
+    /// ids from the mixed 8-model registry — an Ollama-only model can never appear,
+    /// even if a directory bearing a similar name exists, because it has no
+    /// fastembed cache subdir to probe.
+    #[test]
+    fn fastembed_cached_ids_excludes_ollama_only_models() {
+        let dir = tempfile::tempdir().unwrap();
+        // Seed a real, non-empty fastembed cache dir for a fastembed model.
+        let nomic_subdir = lens_core::resolve("nomic-embed-text-v1.5")
+            .fastembed_cache_subdir()
+            .expect("nomic has a fastembed cache subdir");
+        let model_dir = dir
+            .path()
+            .join("models")
+            .join("fastembed")
+            .join(&nomic_subdir);
+        std::fs::create_dir_all(model_dir.join("snapshots")).unwrap();
+        std::fs::write(model_dir.join("snapshots").join("model.onnx"), b"x").unwrap();
+
+        let ids = fastembed_cached_ids(dir.path());
+        assert!(
+            ids.contains(&"nomic-embed-text-v1.5".to_string()),
+            "the seeded fastembed model is reported cached: {ids:?}"
+        );
+        // No Ollama-only id may ever appear in the fastembed-cached list.
+        for ollama_only in [
+            "embeddinggemma",
+            "qwen3-embedding:4b",
+            "nomic-embed-text-v2-moe",
+            "snowflake-arctic-embed2",
+        ] {
+            assert!(
+                !ids.contains(&ollama_only.to_string()),
+                "ollama-only {ollama_only} must not be fastembed-cached: {ids:?}"
+            );
+        }
+    }
 
     #[test]
     fn sanitize_url_for_log_strips_userinfo_and_path() {

@@ -1224,6 +1224,20 @@ impl LensEngine {
         backend: crate::embedder::EmbeddingBackend,
     ) -> Result<Arc<dyn Embedder>, LensError> {
         let spec = crate::embedder::resolve(model_id);
+        // Primary backend guard (issue #80): the model↔backend partition is strict.
+        // Reject a `(model, backend)` pair the spec does not support BEFORE the
+        // match arm so callers (including `warm_fastembed_model`) get one clean,
+        // user-facing validation error naming the model + backend — never a
+        // downstream fastembed-init or embed error. The construction-time guards in
+        // `FastembedEmbedder::new_with_spec` / `OllamaEmbedder::new` are the
+        // defense-in-depth backstop.
+        if !spec.supports(backend) {
+            return Err(LensError::Validation(format!(
+                "model {} does not support the {} backend",
+                spec.id,
+                backend.as_str()
+            )));
+        }
         let key = Self::embedder_cache_key(spec.id, backend);
         let mut cache = self.embedders.lock().await;
         if let Some(existing) = cache.get(&key) {

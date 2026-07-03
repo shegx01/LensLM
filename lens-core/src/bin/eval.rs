@@ -209,9 +209,20 @@ async fn run() -> Result<ExitCode, LensError> {
     let spec: &'static EmbeddingModelSpec = match lens_core::resolve_opt(&model_id) {
         Some(spec) => spec,
         None => {
+            // Derive the known-id list from the registry (issue #80) so it never
+            // drifts as models are added/removed. Each id is annotated with its
+            // backend(s) so a `--backend`/`--model` mismatch is easy to diagnose.
+            let known: Vec<String> = lens_core::REGISTRY
+                .iter()
+                .map(|s| {
+                    let backends: Vec<&str> = s.backends.iter().map(|b| b.as_str()).collect();
+                    format!("{} [{}]", s.id, backends.join(","))
+                })
+                .collect();
             eprintln!(
-                "error: unknown --model {model_id:?}; known ids: nomic-embed-text-v1.5 \
-                 (alias nomic-embed-text), mxbai-embed-large, all-minilm, bge-m3"
+                "error: unknown --model {model_id:?}; known ids (alias nomic-embed-text → \
+                 nomic-embed-text-v1.5): {}",
+                known.join(", ")
             );
             std::process::exit(2);
         }

@@ -98,10 +98,11 @@ describe('EmbeddingConfigPanel — Step 9 rework (backend-aware)', () => {
     await fireEvent.click(await screen.findByRole('radio', { name: 'Ollama' }));
 
     // Detect-only affordances: a Refresh action + a pull hint (no Install button).
+    // After switching to ollama, the first ollama model (embeddinggemma) is auto-selected.
     expect(
       await screen.findByRole('button', { name: /refresh ollama models/i })
     ).toBeInTheDocument();
-    expect(screen.getByText(/ollama pull nomic-embed-text/i)).toBeInTheDocument();
+    expect(screen.getByText(/ollama pull embeddinggemma/i)).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /install nomic/i })).not.toBeInTheDocument();
   });
 });

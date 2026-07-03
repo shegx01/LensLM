@@ -2,14 +2,18 @@
 // renders (onboarding + global Settings + per-notebook settings).
 //
 // SYNC-CHECK: keep in sync with lens-core/src/embedder/registry.rs REGISTRY
-// (fastembed model specs — `id`, `dim`, `hf_repo`) and ALLOWED_EMBEDDING_MODELS
-// in lens-core/src/system_check.rs (the Ollama install allowlist). Adding or
-// removing a model means editing both Rust files too.
+// (model specs — `id`, `dim`, `backends`, `hf_repo`/`ollamaName`) and
+// ALLOWED_EMBEDDING_MODELS in lens-core/src/system_check.rs (the Ollama
+// install allowlist). Adding or removing a model means editing both Rust files.
 //
 // The `id` here is the CANONICAL, storage-facing model id persisted on a
 // notebook + in AppConfig.embedding_model and used by the fastembed on-disk
 // cache check (`fastembed_models_cached`). Ollama reports a DIFFERENT name for
 // nomic (the `-v1.5`-less alias), bridged by `ollamaName`.
+//
+// For Ollama-only models, `ollamaName` EQUALS `id` (including the `:tag` for
+// qwen3-embedding:4b). The `backends` field partitions the catalog:
+// fastembed-only models have `['fastembed']`, Ollama-only have `['ollama']`.
 
 /** The two local embedding backends. Mirrors lens-core `EmbeddingBackend`. */
 export type EmbeddingBackend = 'fastembed' | 'ollama';
@@ -18,7 +22,11 @@ export type EmbeddingModelId =
   | 'nomic-embed-text-v1.5'
   | 'mxbai-embed-large'
   | 'all-minilm'
-  | 'bge-m3';
+  | 'bge-m3'
+  | 'embeddinggemma'
+  | 'qwen3-embedding:4b'
+  | 'nomic-embed-text-v2-moe'
+  | 'snowflake-arctic-embed2';
 
 export interface EmbeddingModelSpec {
   /** Canonical, storage-facing id (persisted; matches the registry `id`). */
@@ -34,14 +42,22 @@ export interface EmbeddingModelSpec {
   /** One-line description (the design's per-model meta tail). */
   desc: string;
   /**
-   * The model name Ollama reports via `/api/tags` (without a `:tag` suffix).
-   * Differs from `id` only for nomic (the runtime-facing alias).
+   * The model name Ollama reports via `/api/tags`.
+   * For fastembed models, this is the Ollama alias (e.g. `nomic-embed-text`
+   * without the `-v1.5` suffix). For Ollama-only models, this EQUALS `id`
+   * (including the colon+tag for `qwen3-embedding:4b`).
    */
   ollamaName: string;
+  /**
+   * Which backends support this model. Mirrors the `backends` field in
+   * lens-core's `EmbeddingModelSpec`. Use to filter the picker per provider.
+   */
+  backends: EmbeddingBackend[];
 }
 
 // Copy + dims verbatim from the plan's "Design facts" (build-ui-to-spec).
 export const EMBEDDING_MODELS: EmbeddingModelSpec[] = [
+  // ── fastembed-backed models ───────────────────────────────────────────────
   {
     id: 'nomic-embed-text-v1.5',
     label: 'nomic-embed-text-v1.5',
@@ -49,7 +65,8 @@ export const EMBEDDING_MODELS: EmbeddingModelSpec[] = [
     sizeMb: 274,
     speed: 'Fast',
     desc: 'Best all-round local model',
-    ollamaName: 'nomic-embed-text'
+    ollamaName: 'nomic-embed-text',
+    backends: ['fastembed']
   },
   {
     id: 'mxbai-embed-large',
@@ -58,7 +75,8 @@ export const EMBEDDING_MODELS: EmbeddingModelSpec[] = [
     sizeMb: 670,
     speed: 'Medium',
     desc: 'Highest retrieval accuracy',
-    ollamaName: 'mxbai-embed-large'
+    ollamaName: 'mxbai-embed-large',
+    backends: ['fastembed']
   },
   {
     id: 'all-minilm',
@@ -67,7 +85,8 @@ export const EMBEDDING_MODELS: EmbeddingModelSpec[] = [
     sizeMb: 45,
     speed: 'Very fast',
     desc: 'Lightweight, minimal RAM',
-    ollamaName: 'all-minilm'
+    ollamaName: 'all-minilm',
+    backends: ['fastembed']
   },
   {
     id: 'bge-m3',
@@ -76,7 +95,51 @@ export const EMBEDDING_MODELS: EmbeddingModelSpec[] = [
     sizeMb: 1200,
     speed: 'Medium',
     desc: 'Multilingual',
-    ollamaName: 'bge-m3'
+    ollamaName: 'bge-m3',
+    backends: ['fastembed']
+  },
+
+  // ── Ollama-only models (curated powerful catalog — Issue #80) ──────────────
+  // ollamaName === id for all Ollama-only entries (including colon+tag).
+  {
+    id: 'embeddinggemma',
+    label: 'embeddinggemma',
+    dims: 768,
+    sizeMb: 622,
+    speed: 'Fast',
+    desc: "Google's Gemma embedding model",
+    ollamaName: 'embeddinggemma',
+    backends: ['ollama']
+  },
+  {
+    id: 'qwen3-embedding:4b',
+    label: 'qwen3-embedding:4b',
+    dims: 2560,
+    sizeMb: 2500,
+    speed: 'Medium',
+    desc: 'Qwen3 4B — high-dim multilingual retrieval',
+    ollamaName: 'qwen3-embedding:4b',
+    backends: ['ollama']
+  },
+  {
+    id: 'nomic-embed-text-v2-moe',
+    label: 'nomic-embed-text-v2-moe',
+    dims: 768,
+    sizeMb: 958,
+    speed: 'Fast',
+    desc: 'Nomic v2 MoE — strong multilingual embeddings',
+    ollamaName: 'nomic-embed-text-v2-moe',
+    backends: ['ollama']
+  },
+  {
+    id: 'snowflake-arctic-embed2',
+    label: 'snowflake-arctic-embed2',
+    dims: 1024,
+    sizeMb: 1200,
+    speed: 'Fast',
+    desc: 'Snowflake Arctic Embed 2 — enterprise retrieval',
+    ollamaName: 'snowflake-arctic-embed2',
+    backends: ['ollama']
   }
 ];
 
@@ -115,8 +178,20 @@ export function modelMeta(m: EmbeddingModelSpec): string {
 
 /**
  * Whether an Ollama-reported model name (e.g. `"nomic-embed-text:latest"`)
- * matches a spec — equals the bare `ollamaName` or starts with `"<name>:"`.
+ * matches a spec.
+ *
+ * D3 exact-tag rule: if `m.ollamaName` contains a colon (e.g. qwen3-embedding:4b),
+ * require an EXACT match — `detected === m.ollamaName`. This prevents
+ * `qwen3-embedding:0.6b` or `qwen3-embedding:8b` from spuriously matching.
+ *
+ * For bare names (no colon in ollamaName), keep the existing prefix rule:
+ * `detected === m.ollamaName || detected.startsWith('<name>:')` — so
+ * `nomic-embed-text:latest` still matches `nomic-embed-text`.
  */
 export function ollamaMatches(detected: string, m: EmbeddingModelSpec): boolean {
+  if (m.ollamaName.includes(':')) {
+    // Exact tag match only — the colon in the name IS part of the tag spec.
+    return detected === m.ollamaName;
+  }
   return detected === m.ollamaName || detected.startsWith(`${m.ollamaName}:`);
 }
