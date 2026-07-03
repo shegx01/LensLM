@@ -124,19 +124,20 @@ export async function warmFastembedModel(model: string): Promise<void> {
 }
 
 /**
- * Whether the GPU (candle + Apple Metal) embedding path is active on this build —
- * `true` on Apple Silicon, `false` elsewhere (issue #91). Drives the on-device
- * provider label ("On-device · Apple GPU") and the "fastest" hint.
+ * The registry model ids that actually run on the Apple GPU (candle + Metal) on
+ * this build — `["nomic-embed-text-v1.5"]` on Apple Silicon today, `[]` elsewhere
+ * (issue #91). GPU acceleration is per-model: the UI badges exactly these models
+ * "Apple GPU" and shows the "best performance" hint only when one is selected.
  *
- * Outside Tauri (component tests / `vite dev`) returns `false` — the neutral
- * "On-device" label, no native backend to query.
+ * Outside Tauri (component tests / `vite dev`) returns `[]` — no native backend to
+ * query, so no model shows a GPU badge.
  */
-export async function embeddingGpuActive(): Promise<boolean> {
-  if (!isTauri()) return false;
+export async function gpuAcceleratedModels(): Promise<string[]> {
+  if (!isTauri()) return [];
   try {
-    return await invoke<boolean>('embedding_gpu_active');
+    return await invoke<string[]>('gpu_accelerated_models');
   } catch {
-    return false;
+    return [];
   }
 }
 

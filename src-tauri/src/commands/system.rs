@@ -243,16 +243,20 @@ pub async fn warm_fastembed_model(
     engine.warm_fastembed_model(&model).await
 }
 
-/// Whether the GPU (candle + Apple Metal) embedding path is compiled and active on
-/// this build — true on an Apple-Silicon build with `native-ml-metal`, false
-/// everywhere else (issue #91). The Embeddings UI uses it to label the on-device
-/// provider "On-device · Apple GPU" and surface that it's the fastest local option.
+/// The registry model ids that ACTUALLY run on the Apple GPU (candle + Metal) on
+/// this build — `["nomic-embed-text-v1.5"]` on Apple Silicon today, `[]` everywhere
+/// else (issue #91). GPU acceleration is per-model, not per-provider: the Embeddings
+/// UI badges exactly these models "Apple GPU" and shows the "best performance" hint
+/// only when one of them is selected. Models not in this set run on fastembed-CPU.
 ///
 /// A pure build-capability query (no engine state), so it takes no `State`.
-/// Invoked as `invoke("embedding_gpu_active")`.
+/// Invoked as `invoke("gpu_accelerated_models")`.
 #[tauri::command]
-pub fn embedding_gpu_active() -> bool {
-    lens_core::embedder::gpu_embedding_active()
+pub fn gpu_accelerated_models() -> Vec<String> {
+    lens_core::embedder::gpu_accelerated_model_ids()
+        .into_iter()
+        .map(String::from)
+        .collect()
 }
 
 /// Allowed document extensions (lowercased, no dot) for recent-doc suggestions.

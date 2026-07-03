@@ -146,6 +146,29 @@ pub const fn gpu_embedding_active() -> bool {
     ))
 }
 
+/// The registry model ids that ACTUALLY run on the GPU on this build — the
+/// candle-wired, GPU-eligible models when the Metal path is active (issue #91).
+///
+/// GPU acceleration is a PER-MODEL property, not a provider one: on Apple Silicon
+/// today only `nomic-embed-text-v1.5` is candle-wired, so it alone runs on the GPU;
+/// `mxbai`/`bge-m3` are GPU-eligible (`accelerate_hint`) but not yet wired, so they
+/// fall back to fastembed-CPU, and `all-minilm` is CPU by design
+/// (`accelerate_hint = false`). The UI badges exactly this set "Apple GPU". Empty on
+/// every non-Apple-Silicon / feature-off build (fastembed-CPU serves everything).
+pub fn gpu_accelerated_model_ids() -> Vec<&'static str> {
+    #[cfg(feature = "native-ml-metal")]
+    {
+        if gpu_embedding_active() {
+            return crate::embedder::registry::REGISTRY
+                .iter()
+                .filter(|s| s.accelerate_hint && crate::embedder::candle_supports_model(s.id))
+                .map(|s| s.id)
+                .collect();
+        }
+    }
+    Vec::new()
+}
+
 /// The engine's default accelerator for this build target: [`MetalAccelerator`] on
 /// aarch64-apple-darwin with `native-ml-metal`, else [`CpuOnlyAccelerator`].
 pub fn default_accelerator() -> std::sync::Arc<dyn NativeAccelerator> {
@@ -240,6 +263,20 @@ mod tests {
         // Feature-off (default CI build) it MUST be false.
         #[cfg(not(feature = "native-ml-metal"))]
         assert!(!gpu_embedding_active());
+    }
+
+    #[test]
+    fn gpu_accelerated_models_empty_without_the_feature() {
+        // Feature-off: nothing runs on the GPU; fastembed-CPU serves everything.
+        #[cfg(not(feature = "native-ml-metal"))]
+        assert!(gpu_accelerated_model_ids().is_empty());
+        // Feature-on: only candle-wired, GPU-eligible models — never all-minilm.
+        #[cfg(feature = "native-ml-metal")]
+        {
+            let ids = gpu_accelerated_model_ids();
+            assert!(ids.contains(&"nomic-embed-text-v1.5"));
+            assert!(!ids.contains(&"all-minilm"));
+        }
     }
 
     #[test]

@@ -53,7 +53,7 @@ pub mod registry;
 pub use candle_backend::{CandleNomicEmbedder, candle_cache_subdir, candle_supports_model};
 pub use device::{
     Acceleration, Compute, NativeAccelerator, WorkloadKind, default_accelerator,
-    gpu_embedding_active, select_compute,
+    gpu_accelerated_model_ids, gpu_embedding_active, select_compute,
 };
 pub use ollama::OllamaEmbedder;
 pub use registry::{
