@@ -91,6 +91,7 @@ function makeTrashedSource(overrides?: Partial<TrashedSource>): TrashedSource {
     enrichment_status: null,
     enrichment_meta: null,
     force_js_render: 0,
+    error_meta: null,
     notebook_title: 'My Notebook',
     ...overrides
   };

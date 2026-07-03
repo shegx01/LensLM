@@ -288,15 +288,32 @@ pub async fn ingest_source(
 
         let result = run_ingest(engine, source_id, on_progress).await;
 
-        // On any failure, best-effort flip the source to `error` (Risk R10: treat a
-        // missing/cascade-deleted row as a graceful no-op, never a panic).
-        if result.is_err() {
+        // On any failure, best-effort flip the source to `error` AND persist a
+        // structured `error_meta` snapshot (#73): read the prior attempt_count
+        // (NULL/absent ⇒ 0), increment, and write `{kind, message, timestamp,
+        // attempt_count}` atomically with the status. Risk R10: treat a
+        // missing/cascade-deleted row as a graceful no-op, never a panic.
+        if let Err(err) = &result {
             let pool = engine.pool().await;
             let repo = crate::notebooks::NotebookRepo::new(&pool);
-            if let Err(e) = repo
-                .update_source_status(source_id, crate::notebooks::SourceStatus::Error.as_str())
+            let prior_attempts = repo
+                .get_source(source_id)
                 .await
-            {
+                .ok()
+                .flatten()
+                .and_then(|s| s.error_meta)
+                .and_then(|json| serde_json::from_str::<crate::error::ErrorMeta>(&json).ok())
+                .map(|m| m.attempt_count)
+                .unwrap_or(0);
+            let meta = crate::error::ErrorMeta::from_error(err, prior_attempts.saturating_add(1));
+            tracing::error!(
+                source_id,
+                kind = %meta.kind,
+                attempt_count = meta.attempt_count,
+                "ingest failed: {}",
+                meta.message
+            );
+            if let Err(e) = repo.set_source_error(source_id, &meta).await {
                 tracing::warn!(
                     source_id,
                     "failed to mark source as error after ingest failure: {e}"
@@ -318,6 +335,60 @@ pub async fn ingest_source(
     }
 
     result
+}
+
+/// Retries a FAILED source in place (issue #73), re-running the full ingest
+/// pipeline on the SAME row (id/order/selection preserved — no new row, so the
+/// `raw_content_hash` dedup index is never stressed).
+///
+/// Guards: the source must exist, be `status="error"`, AND be live
+/// (`trashed_at IS NULL`); otherwise a [`LensError::Validation`] is returned and
+/// nothing is mutated. The row is transitioned `error → parsing` DIRECTLY (a
+/// TRANSIENT, crash-recoverable state — never `queued`, which
+/// [`SourceStatus::is_transient`](crate::notebooks::SourceStatus::is_transient)
+/// classifies as non-transient and would zombie the row on a mid-retry crash),
+/// then handed to the PUBLIC [`ingest_source`] entry point so the retry reuses
+/// the exact same permit lock, `Err` handler (which overwrites `error_meta` with
+/// an incremented `attempt_count`), success clear, and enrichment enqueue. The
+/// existing `error_meta` is left intact until it is overwritten (fail) or cleared
+/// (success by `run_ingest`).
+#[tracing::instrument(skip(engine, on_progress))]
+pub async fn retry_source(
+    engine: &LensEngine,
+    source_id: &str,
+    on_progress: impl FnMut(IngestProgress),
+) -> Result<(), LensError> {
+    {
+        let pool = engine.pool().await;
+        let repo = crate::notebooks::NotebookRepo::new(&pool);
+        let source = repo
+            .get_source(source_id)
+            .await?
+            .ok_or_else(|| LensError::Validation(format!("no source with id {source_id}")))?;
+        if source.trashed_at.is_some() {
+            return Err(LensError::Validation(
+                "cannot retry a trashed source; restore it first".into(),
+            ));
+        }
+        if source.status != crate::notebooks::SourceStatus::Error.as_str() {
+            return Err(LensError::Validation(format!(
+                "cannot retry source in status {:?}; only errored sources can be retried",
+                source.status
+            )));
+        }
+        // Transition error → parsing (transient/crash-recoverable) BEFORE entering
+        // the ingest run. `run_ingest` also sets `parsing` at its start, but doing
+        // it here means the row never dwells in a non-transient state during the
+        // window before the ingest permit is acquired.
+        tracing::info!(source_id, "retrying errored source");
+        repo.update_source_status(source_id, crate::notebooks::SourceStatus::Parsing.as_str())
+            .await?;
+    }
+
+    // Reuse the public ingest entry: same single-permit lock, Err handler
+    // (rewrites error_meta with attempt_count+1), success clear, and enrichment
+    // enqueue. On failure it re-flips to `error` with fresh metadata.
+    ingest_source(engine, source_id, on_progress).await
 }
 
 /// Embeds one `EMBED_BATCH`-sized slice of chunks and builds their [`VectorRow`]s.
@@ -1072,6 +1143,8 @@ impl IngestContext<'_> {
                 .await?;
             repo.update_source_status(source_id, crate::notebooks::SourceStatus::Indexed.as_str())
                 .await?;
+            // A successful (re-)ingest wipes any stale failure reason (#73).
+            repo.clear_source_error_meta(source_id).await?;
             on_progress(IngestProgress::new(ingest_phase::DONE, 1, Some(1)));
             return Ok(());
         }
@@ -1239,6 +1312,8 @@ impl IngestContext<'_> {
             .await?;
         repo.update_source_status(source_id, crate::notebooks::SourceStatus::Indexed.as_str())
             .await?;
+        // A successful (re-)ingest wipes any stale failure reason (#73).
+        repo.clear_source_error_meta(source_id).await?;
         on_progress(IngestProgress::new(ingest_phase::DONE, 1, Some(1)));
         Ok(())
     }

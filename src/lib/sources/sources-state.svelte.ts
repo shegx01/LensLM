@@ -9,8 +9,16 @@
 // ERROR HANDLING: try/catch on every action; console.error on failure; transient
 // `error` field for future surfacing. Polished error UI is M9 scope.
 
-import { listSources, ingestSource, setSourceSelected, trashSource, restoreSource } from './ipc.js';
-import type { Source, SourceStatus, StreamEvent, IngestProgress } from './types.js';
+import {
+  listSources,
+  ingestSource,
+  retryIngestSource,
+  retryAllFailedSources,
+  setSourceSelected,
+  trashSource,
+  restoreSource
+} from './ipc.js';
+import type { Source, SourceStatus, StreamEvent, IngestProgress, ErrorMeta } from './types.js';
 import { notebookStore, refreshTrashedSources } from '$lib/notebooks/notebooks-state.svelte.js';
 
 // ---------------------------------------------------------------------------
@@ -103,12 +111,33 @@ export function drainTrashQueueEntry(sourceId: string): void {
 // Actions (exported top-level functions)
 // ---------------------------------------------------------------------------
 
+/**
+ * Parse a raw `error_meta` value from the backend.
+ * The backend persists `error_meta` as a JSON TEXT column string; serde may
+ * deserialise it as a string (if the column is TEXT) or as a nested object
+ * depending on the sqlx mapping. We normalise both shapes here.
+ */
+function parseErrorMeta(raw: unknown): ErrorMeta | null {
+  if (raw === null || raw === undefined) return null;
+  if (typeof raw === 'object') return raw as ErrorMeta;
+  if (typeof raw === 'string') {
+    try {
+      return JSON.parse(raw) as ErrorMeta;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
 /** Fetch all sources for the given notebook and populate the store. */
 export async function loadSources(notebookId: string): Promise<void> {
   error = null;
   loading = true;
   try {
-    sources = await listSources(notebookId);
+    const raw = await listSources(notebookId);
+    // Parse the error_meta JSON string at the IPC boundary.
+    sources = raw.map((s) => ({ ...s, error_meta: parseErrorMeta(s.error_meta) }));
   } catch (err) {
     console.error('loadSources: failed', err);
     error = String(err);
@@ -160,35 +189,103 @@ function phaseToStatus(phase: string): SourceStatus {
   }
 }
 
-function updateSourceStatus(sourceId: string, status: SourceStatus): void {
+function updateSourceStatus(
+  sourceId: string,
+  status: SourceStatus,
+  errorMeta?: ErrorMeta | null
+): void {
   // Mutate in place by index — avoids replacing the whole array on every
   // progress event (prevents full-list re-renders / derived recomputes per tick).
   const i = sources.findIndex((s) => s.id === sourceId);
-  if (i >= 0) sources[i] = { ...sources[i], status };
+  if (i < 0) return;
+  const update: Source = { ...sources[i], status };
+  // Merge error_meta when explicitly provided (undefined = leave as-is).
+  if (errorMeta !== undefined) update.error_meta = errorMeta;
+  sources[i] = update;
 }
 
-export async function ingest(sourceId: string): Promise<void> {
-  function handleEvent(e: StreamEvent<IngestProgress>): void {
+/** Shared event handler for ingest + retry streams. */
+function makeIngestHandler(sourceId: string): (e: StreamEvent<IngestProgress>) => void {
+  return function handleEvent(e: StreamEvent<IngestProgress>): void {
     if (e.type === 'chunk' && e.data) {
       // 'chunk' carries IngestProgress { phase, done, total } — update row status.
       updateSourceStatus(sourceId, phaseToStatus(e.data.phase));
     } else if (e.type === 'progress') {
       // 'progress' carries only { done, total } — no phase; reserved for future progress bar.
     } else if (e.type === 'done') {
-      updateSourceStatus(sourceId, 'indexed');
+      // On success, clear any stale error_meta so no stale reason lingers.
+      updateSourceStatus(sourceId, 'indexed', null);
     } else if (e.type === 'failed') {
-      updateSourceStatus(sourceId, 'error');
+      // Capture the {kind, message} payload and merge it as error_meta.
+      // `attempt_count` and `timestamp` are authoritative from the backend DB;
+      // here we only know kind+message from the stream event, so we store a
+      // partial object. A subsequent loadSources will reconcile the full record.
+      const partialMeta: ErrorMeta = {
+        kind: e.data.kind,
+        message: e.data.message,
+        timestamp: new Date().toISOString(),
+        attempt_count: 1
+      };
+      updateSourceStatus(sourceId, 'error', partialMeta);
     } else if (e.type === 'started') {
       updateSourceStatus(sourceId, 'parsing');
     }
-  }
+  };
+}
 
+export async function ingest(sourceId: string): Promise<void> {
   try {
-    await ingestSource(sourceId, handleEvent);
+    await ingestSource(sourceId, makeIngestHandler(sourceId));
   } catch (err) {
     console.error('ingest: failed for source', sourceId, err);
     updateSourceStatus(sourceId, 'error');
     error = String(err);
+  }
+}
+
+/**
+ * Retry a single errored source. Resets status to `parsing` optimistically,
+ * streams progress, and updates the row in place (same id/order/selected).
+ * The backend rejects non-error and trashed sources.
+ */
+export async function retrySource(sourceId: string): Promise<void> {
+  // Optimistic transition: error → parsing so the dot starts animating immediately.
+  updateSourceStatus(sourceId, 'parsing');
+  try {
+    await retryIngestSource(sourceId, makeIngestHandler(sourceId));
+  } catch (err) {
+    console.error('retrySource: failed for source', sourceId, err);
+    updateSourceStatus(sourceId, 'error');
+    error = String(err);
+  }
+}
+
+/**
+ * Retry every non-trashed errored source in the given notebook.
+ * Sequentially streams each source; continue-on-failure — one failure does not
+ * abort the rest. Progress for each individual source flows through the shared
+ * handler, updating dots in real time.
+ */
+export async function retryAllFailed(notebookId: string): Promise<void> {
+  // Optimistically flip all error sources to parsing so their dots animate.
+  const errorIds = sources.filter((s) => s.status === 'error' && !s.trashed_at).map((s) => s.id);
+  for (const id of errorIds) {
+    updateSourceStatus(id, 'parsing');
+  }
+  try {
+    // The backend runs each source sequentially with continue-on-failure.
+    // The shared handler updates the correct row via sourceId captured in the closure.
+    // Since we cannot inject a per-source handler into the bulk command, we reload
+    // after the bulk completes to reconcile final states from the DB.
+    await retryAllFailedSources(notebookId, (_e) => {
+      // Bulk stream events carry progress but not sourceId — reload on done/failed.
+    });
+  } catch (err) {
+    console.error('retryAllFailed: failed for notebook', notebookId, err);
+    error = String(err);
+  } finally {
+    // Reconcile with the backend to get final statuses + updated error_meta.
+    await loadSources(notebookId);
   }
 }
 

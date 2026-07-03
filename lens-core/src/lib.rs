@@ -39,7 +39,7 @@ pub use embedder::{
 };
 pub use embedding::{InstallProgress, pull_embedding_model};
 pub use enrichment::{ENRICHMENT_QUEUE_CAPACITY, EnrichmentJob};
-pub use error::LensError;
+pub use error::{ErrorMeta, LensError};
 pub use extract::{ExtractOutput, Extractor, SourceAnchor, extractor_for};
 pub use ingest::{
     IngestProgress, NEEDS_JS_MIN_CHARS, NEEDS_JS_MIN_TEXT_RATIO, URL_FETCH_TIMEOUT, ingest_source,
@@ -890,6 +890,19 @@ impl LensEngine {
         on_progress: impl FnMut(crate::ingest::IngestProgress),
     ) -> Result<(), LensError> {
         crate::ingest::ingest_source(self, source_id, on_progress).await
+    }
+
+    /// Retries a FAILED source in place (issue #73): guards it is `error` and
+    /// live, transitions `error → parsing`, and re-runs the pipeline via the
+    /// public [`ingest_source`](Self::ingest_source) entry (streaming through
+    /// `on_progress`). See [`crate::ingest::retry_source`].
+    #[tracing::instrument(skip(self, on_progress))]
+    pub async fn retry_source(
+        &self,
+        source_id: &str,
+        on_progress: impl FnMut(crate::ingest::IngestProgress),
+    ) -> Result<(), LensError> {
+        crate::ingest::retry_source(self, source_id, on_progress).await
     }
 
     /// Returns the resolved data directory from the loaded config.

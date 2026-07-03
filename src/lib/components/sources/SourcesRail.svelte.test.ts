@@ -157,6 +157,7 @@ function makeSource(overrides?: Partial<Source>): Source {
     enrichment_status: null,
     enrichment_meta: null,
     force_js_render: 0,
+    error_meta: null,
     ...overrides
   };
 }

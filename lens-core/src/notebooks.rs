@@ -319,6 +319,13 @@ pub struct Source {
     /// auto-detection. Only URL sources render — file/text/onboarding rows keep
     /// the default `0`. Persisted, so re-ingest and crash-recovery honor it.
     pub force_js_render: i64,
+    /// JSON snapshot of the failure that flipped this source to `status="error"`
+    /// (issue #73), serialized [`ErrorMeta`](crate::error::ErrorMeta)
+    /// `{kind, message, timestamp, attempt_count}`. `None` unless the source is
+    /// currently errored (cleared to NULL on a successful re-ingest); also `None`
+    /// for pre-#73 error rows and crash-recovery-flipped rows (UI shows a
+    /// graceful fallback). Written by [`NotebookRepo::set_source_error`].
+    pub error_meta: Option<String>,
 }
 
 /// A trashed source with its parent notebook's title, used by the Trash modal.
@@ -576,7 +583,7 @@ fn validate_title(title: &str) -> Result<String, LensError> {
 /// rows only; returns at most one row (LIMIT 1 matches the partial unique index).
 const SOURCE_DEDUP_SELECT: &str = "SELECT id, notebook_id, kind, title, status, locator, \
      selected, token_count, content_hash, raw_content_hash, created_at, trashed_at, \
-     enrichment_status, enrichment_meta, force_js_render \
+     enrichment_status, enrichment_meta, force_js_render, error_meta \
      FROM sources WHERE notebook_id = ? AND raw_content_hash = ? AND trashed_at IS NULL LIMIT 1";
 
 /// Repository over the `notebooks` table. Borrows a pool; holds no state.
@@ -670,7 +677,7 @@ impl<'a> NotebookRepo<'a> {
         let rows = sqlx::query(
             "SELECT s.id, s.notebook_id, s.kind, s.title, s.status, s.locator, s.selected, \
                     s.token_count, s.content_hash, s.raw_content_hash, s.created_at, s.trashed_at, \
-                    s.enrichment_status, s.enrichment_meta, s.force_js_render, \
+                    s.enrichment_status, s.enrichment_meta, s.force_js_render, s.error_meta, \
                     n.title AS notebook_title \
              FROM sources s \
              JOIN notebooks n ON n.id = s.notebook_id \
@@ -699,6 +706,7 @@ impl<'a> NotebookRepo<'a> {
                         enrichment_status: row.try_get("enrichment_status")?,
                         enrichment_meta: row.try_get("enrichment_meta")?,
                         force_js_render: row.try_get("force_js_render")?,
+                        error_meta: row.try_get("error_meta")?,
                     },
                     notebook_title: row.try_get("notebook_title")?,
                 })
@@ -1047,6 +1055,7 @@ impl<'a> NotebookRepo<'a> {
                 enrichment_meta: None,
                 // Onboarding sources never JS-render; only URL sources do (#78).
                 force_js_render: 0,
+                error_meta: None,
             },
             was_existing: false,
         })
@@ -1203,6 +1212,7 @@ impl<'a> NotebookRepo<'a> {
                 enrichment_meta: None,
                 // Text/markdown sources never JS-render; only URL sources do (#78).
                 force_js_render: 0,
+                error_meta: None,
             },
             was_existing: false,
         })
@@ -1396,6 +1406,7 @@ impl<'a> NotebookRepo<'a> {
                 enrichment_meta: None,
                 // Local file sources never JS-render; only URL sources do (#78).
                 force_js_render: 0,
+                error_meta: None,
             },
             was_existing: false,
         })
@@ -1515,6 +1526,7 @@ impl<'a> NotebookRepo<'a> {
                 enrichment_meta: None,
                 // Per-source SPA render opt-in (#78): carry the caller's flag.
                 force_js_render: i64::from(force_js_render),
+                error_meta: None,
             },
             was_existing: false,
         })
@@ -1652,6 +1664,43 @@ impl<'a> NotebookRepo<'a> {
         if result.rows_affected() == 0 {
             return Err(LensError::Validation(format!("no source with id {id}")));
         }
+        Ok(())
+    }
+
+    /// Atomically flips a source to `status='error'` AND writes its structured
+    /// `error_meta` JSON in ONE statement (issue #73). A dedicated sibling of
+    /// [`update_source_status`](Self::update_source_status) — that method has many
+    /// non-error callers, so error metadata never contaminates its signature.
+    ///
+    /// A missing row is a benign no-op (`Ok(())`), NOT an error: the ingest `Err`
+    /// arm calls this best-effort and a concurrent `purge_source` may have already
+    /// deleted the row (Risk R10 — treat a cascade-deleted row as a graceful
+    /// no-op, never a panic).
+    pub async fn set_source_error(
+        &self,
+        id: &str,
+        meta: &crate::error::ErrorMeta,
+    ) -> Result<(), LensError> {
+        let meta_json = serde_json::to_string(meta)?;
+        sqlx::query("UPDATE sources SET status = 'error', error_meta = ? WHERE id = ?")
+            .bind(meta_json)
+            .bind(id)
+            .execute(self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Clears a source's `error_meta` to NULL (issue #73). Called on the
+    /// `Indexed` success transitions so a successfully re-ingested source never
+    /// carries a stale failure reason.
+    ///
+    /// A missing row is a benign no-op (`Ok(())`), consistent with the other
+    /// ingest-time status writers.
+    pub async fn clear_source_error_meta(&self, id: &str) -> Result<(), LensError> {
+        sqlx::query("UPDATE sources SET error_meta = NULL WHERE id = ?")
+            .bind(id)
+            .execute(self.pool)
+            .await?;
         Ok(())
     }
 
@@ -1844,7 +1893,7 @@ impl<'a> NotebookRepo<'a> {
         let row = sqlx::query_as::<_, Source>(
             "SELECT id, notebook_id, kind, title, status, locator, selected, token_count, \
              content_hash, raw_content_hash, created_at, trashed_at, enrichment_status, \
-             enrichment_meta, force_js_render \
+             enrichment_meta, force_js_render, error_meta \
              FROM sources WHERE id = ?",
         )
         .bind(id)
@@ -1858,7 +1907,7 @@ impl<'a> NotebookRepo<'a> {
         let rows = sqlx::query_as::<_, Source>(
             "SELECT id, notebook_id, kind, title, status, locator, selected, token_count, \
              content_hash, raw_content_hash, created_at, trashed_at, enrichment_status, \
-             enrichment_meta, force_js_render \
+             enrichment_meta, force_js_render, error_meta \
              FROM sources WHERE notebook_id = ? AND trashed_at IS NULL ORDER BY created_at DESC",
         )
         .bind(notebook_id)
