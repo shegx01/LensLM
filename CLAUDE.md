@@ -84,7 +84,7 @@ These are project conventions. Follow them; they override generic habits.
 
 ### Comments
 
-**No superfluous comments.** Comments exist to (1) give directives to human readers and (2) explain *complicated or non-obvious* code — invariants, ordering constraints, why a workaround exists, ABI/version locks. Otherwise, do not comment the code. Never narrate what the code plainly says (`// increment i`, `// return the result`). If a comment only restates the line below it, delete it and let the code speak.
+**No superfluous comments.** Comments exist to (1) give directives to human readers and (2) explain _complicated or non-obvious_ code — invariants, ordering constraints, why a workaround exists, ABI/version locks. Otherwise, do not comment the code. Never narrate what the code plainly says (`// increment i`, `// return the result`). If a comment only restates the line below it, delete it and let the code speak.
 
 ### Rust
 
