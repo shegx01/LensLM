@@ -850,6 +850,23 @@ impl<'a> NotebookRepo<'a> {
         Ok(())
     }
 
+    /// Bumps `last_activity_at` on the success path of a source-add.
+    ///
+    /// Unlike [`touch_activity`](Self::touch_activity) this never errors on 0
+    /// rows — the caller has just inserted a source, so the notebook exists —
+    /// but it mirrors the same `AND trashed_at IS NULL` guard so a trashed
+    /// notebook can never gain recency. Shared by all four `add_*` methods.
+    async fn bump_activity(&self, id: &NotebookId, now: &str) -> Result<(), LensError> {
+        sqlx::query(
+            "UPDATE notebooks SET last_activity_at = ? WHERE id = ? AND trashed_at IS NULL",
+        )
+        .bind(now)
+        .bind(id)
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Soft-deletes a notebook: an alias for [`trash`](Self::trash).
     ///
     /// Historically this was a hard `DELETE`; M3 reframes deletion as a recoverable
@@ -1010,11 +1027,7 @@ impl<'a> NotebookRepo<'a> {
         // Adding a source is user activity: bump the notebook's recency (success
         // path only — the dedup/`was_existing: true` early returns above do NOT
         // bump). Uses `&now` before it is moved into the returned `Source`.
-        sqlx::query("UPDATE notebooks SET last_activity_at = ? WHERE id = ?")
-            .bind(&now)
-            .bind(notebook_id)
-            .execute(self.pool)
-            .await?;
+        self.bump_activity(notebook_id, &now).await?;
 
         Ok(AddSourceOutcome {
             source: Source {
@@ -1170,11 +1183,7 @@ impl<'a> NotebookRepo<'a> {
 
         // Adding a source is user activity: bump the notebook's recency (success
         // path only — the dedup early returns above do NOT bump).
-        sqlx::query("UPDATE notebooks SET last_activity_at = ? WHERE id = ?")
-            .bind(&now)
-            .bind(notebook_id)
-            .execute(self.pool)
-            .await?;
+        self.bump_activity(notebook_id, &now).await?;
 
         Ok(AddSourceOutcome {
             source: Source {
@@ -1367,11 +1376,7 @@ impl<'a> NotebookRepo<'a> {
 
         // Adding a source is user activity: bump the notebook's recency (success
         // path only — the dedup early returns above do NOT bump).
-        sqlx::query("UPDATE notebooks SET last_activity_at = ? WHERE id = ?")
-            .bind(&now)
-            .bind(notebook_id)
-            .execute(self.pool)
-            .await?;
+        self.bump_activity(notebook_id, &now).await?;
 
         Ok(AddSourceOutcome {
             source: Source {
@@ -1490,11 +1495,7 @@ impl<'a> NotebookRepo<'a> {
 
         // Adding a source is user activity: bump the notebook's recency (success
         // path only — the dedup early returns above do NOT bump).
-        sqlx::query("UPDATE notebooks SET last_activity_at = ? WHERE id = ?")
-            .bind(&now)
-            .bind(notebook_id)
-            .execute(self.pool)
-            .await?;
+        self.bump_activity(notebook_id, &now).await?;
 
         Ok(AddSourceOutcome {
             source: Source {
