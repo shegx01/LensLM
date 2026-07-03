@@ -1,0 +1,70 @@
+name: Rust CI environment
+description: >-
+  Shared setup for the Rust jobs: cached apt system deps, the pinned toolchain,
+  an (optionally shared/writable) cargo cache, the pinned libpdfium supply-chain
+  gate, and an optional cargo-nextest. Centralised here so the build/clippy/test
+  jobs stay in lockstep on the same deps.
+
+inputs:
+  cache:
+    description: Restore the shared cargo registry + target cache ('true'/'false').
+    default: 'true'
+  save-cache:
+    description: >-
+      Whether THIS job writes the shared cache ('true'/'false'). Exactly one job
+      (the archive build) should set this so parallel jobs don't race on the key.
+    default: 'false'
+  fetch-pdfium:
+    description: >-
+      Fetch + SHA-256-verify the pinned libpdfium dylib ('true'/'false'). Needed
+      by every job that compiles the workspace (the checksum is the gate).
+    default: 'false'
+  install-nextest:
+    description: Install cargo-nextest ('true'/'false') — to archive/run test binaries.
+    default: 'false'
+
+runs:
+  using: composite
+  steps:
+    # Tauri v2 needs the WebKitGTK stack to compile src-tauri (and the workspace
+    # test build) and to LOAD the resulting test binaries at runtime, so shards
+    # need these too. protobuf-compiler (protoc) is required by lance-encoding's
+    # build script. cache-apt-pkgs caches the .debs so repeat installs drop from
+    # ~30s to a few seconds. SHA-pinned (this action installs system packages).
+    - name: Cache + install apt system deps
+      uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
+      with:
+        packages: >-
+          libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
+          libgtk-3-dev libxdo-dev libssl-dev patchelf build-essential
+          protobuf-compiler curl wget file
+        version: '1.0'
+
+    # rust-toolchain.toml pins 1.94.1 + clippy + rustfmt; `rustup show`
+    # materializes it up front so later steps don't pay the install cost mid-run.
+    - name: Install pinned Rust toolchain
+      shell: bash
+      run: rustup show
+
+    - name: Cache cargo registry + target
+      if: ${{ inputs.cache != 'false' }}
+      uses: Swatinem/rust-cache@v2
+      with:
+        # Fixed key so all Rust jobs share one cache; only the archive job writes.
+        shared-key: rust-ci
+        save-if: ${{ inputs.save-cache }}
+
+    # Supply-chain gate: fetch the pinned libpdfium dylib and verify its SHA-256
+    # against the committed CHECKSUMS before any build runs. (Runtime loading is
+    # macOS-only; on Linux this is purely the integrity check.)
+    - name: Fetch + verify pinned libpdfium dylib
+      if: ${{ inputs.fetch-pdfium == 'true' }}
+      shell: bash
+      run: scripts/fetch-pdfium.sh --verify
+
+    # SHA-pinned: this action downloads + executes a prebuilt nextest binary.
+    - name: Install cargo-nextest
+      if: ${{ inputs.install-nextest == 'true' }}
+      uses: taiki-e/install-action@c93ccc03e00cd0e08e494f5fd058a6c55a6a1907 # v2.82.8
+      with:
+        tool: nextest
