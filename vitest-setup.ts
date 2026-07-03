@@ -11,11 +11,24 @@ import { afterEach, beforeAll, beforeEach } from 'vitest';
 // happy-dom, that callback can fire AFTER happy-dom has already torn down the
 // *next* file's `document`, throwing at the process level and failing the run.
 //
-// Strategy: wrap globalThis.{setTimeout,setInterval} to register every pending
-// id in a Set; wrap clearTimeout/clearInterval to deregister; auto-deregister
-// a setTimeout id when its callback fires (so the Set only holds genuinely
-// pending timers). In afterEach, after cleanup() + the 0-delay drain, forcibly
-// clear any remaining ids so no callback can outlive the file boundary.
+// Two layers, because one alone is incomplete:
+//
+//  1. Tracking + clearing: wrap globalThis.{setTimeout,setInterval} to register
+//     every pending id in a Set; wrap clearTimeout/clearInterval to deregister;
+//     auto-deregister a setTimeout id when its callback fires. In afterEach,
+//     after cleanup() + the 0-delay drain, forcibly clear any remaining ids so
+//     no *already-scheduled* callback can outlive the file boundary.
+//
+//  2. Callback guard: clearing can only cancel timers that exist when the hook
+//     runs — it cannot touch a timer scheduled AFTER afterEach (a promise/
+//     microtask continuation from the test, or the cross-file boundary itself).
+//     That residual window is exactly when bits-ui's focus-restore fires into a
+//     torn-down document. So every wrapped callback runs inside a guard that
+//     swallows ONLY the benign post-teardown "document/window is not defined"
+//     ReferenceError. It is provably safe to swallow: a real bug touching the
+//     DOM while it still exists throws a different error (not "not defined"),
+//     and the leaked callback is pure teardown (focus restore / scroll unlock)
+//     with nothing left to act on. Any other error still propagates.
 //
 // The internal drain uses the REAL setTimeout (captured before wrapping) so it
 // is never tracked and never self-cleared.
@@ -34,6 +47,13 @@ const _realClearInterval = globalThis.clearInterval;
 const _pendingTimeouts = new Set<ReturnType<typeof _realSetTimeout>>();
 const _pendingIntervals = new Set<ReturnType<typeof _realSetInterval>>();
 
+// A timer callback that fires after happy-dom has torn down the document throws
+// `ReferenceError: document is not defined` (or `window …`). That is benign —
+// the callback is leftover teardown (bits-ui focus restore / scroll unlock) with
+// nothing to act on. Swallow ONLY that; anything else must propagate.
+const _isPostTeardownDomError = (err: unknown): boolean =>
+  err instanceof ReferenceError && /\b(?:document|window)\b is not defined/.test(err.message);
+
 globalThis.setTimeout = (<TArgs extends unknown[]>(
   handler: (...args: TArgs) => void,
   delay?: number,
@@ -43,7 +63,11 @@ globalThis.setTimeout = (<TArgs extends unknown[]>(
   id = _realSetTimeout(
     (...a: TArgs) => {
       _pendingTimeouts.delete(id);
-      handler(...a);
+      try {
+        handler(...a);
+      } catch (err) {
+        if (!_isPostTeardownDomError(err)) throw err;
+      }
     },
     delay,
     ...args
@@ -57,7 +81,17 @@ globalThis.setInterval = (<TArgs extends unknown[]>(
   delay?: number,
   ...args: TArgs
 ): ReturnType<typeof _realSetInterval> => {
-  const id = _realSetInterval(handler, delay, ...args);
+  const id = _realSetInterval(
+    (...a: TArgs) => {
+      try {
+        handler(...a);
+      } catch (err) {
+        if (!_isPostTeardownDomError(err)) throw err;
+      }
+    },
+    delay,
+    ...args
+  );
   _pendingIntervals.add(id);
   return id;
 }) as typeof globalThis.setInterval;
