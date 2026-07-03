@@ -108,6 +108,37 @@ async fn wait_for_status(engine: &LensEngine, source_id: &str, want: &str) -> bo
     false
 }
 
+/// Polls until `want` is observed on `stable` CONSECUTIVE reads (proving a SETTLED
+/// terminal state), or the timeout elapses. Any other status resets the streak.
+///
+/// This exists because some flows legitimately pass THROUGH a transient status on
+/// the way to their terminal one: e.g. the enrichment worker unconditionally writes
+/// `enriching` (worker.rs) before it discovers a re-enqueued job has no work and
+/// degrades back to `pending`. A one-shot read of "is it `pending`?" races that
+/// transient `enriching`; requiring the target to *hold* across consecutive reads
+/// asserts the settled state instead. A genuinely STUCK source never forms the
+/// streak, so the real bug (a reset that failed to clear `enriching`) still fails.
+async fn wait_for_stable_status(
+    engine: &LensEngine,
+    source_id: &str,
+    want: &str,
+    stable: usize,
+) -> bool {
+    let mut streak = 0usize;
+    for _ in 0..300 {
+        if enrichment_status(engine, source_id).await.as_deref() == Some(want) {
+            streak += 1;
+            if streak >= stable {
+                return true;
+            }
+        } else {
+            streak = 0;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    false
+}
+
 /// Inserts a registry row directly with the given physical table name + status.
 async fn seed_registry_row(engine: &LensEngine, notebook: &str, table: &str, status: &str) {
     let pool = engine.pool().await;
@@ -393,18 +424,19 @@ async fn restart_resets_enriching_to_pending_and_reenqueues() {
 
     let engine2 = reopen_engine(&dir).await;
     // The reset+rebuild ran in init: `enriching → pending`, then the queue-rebuild
-    // re-enqueues it. With no chunks/provider the Step-4 worker degrades back to
-    // `pending` (the stable terminal state); the key invariant is that the stranded
-    // `enriching` was reset off `enriching` (never left stuck).
+    // re-enqueues it. With no chunks/provider the Step-4 worker briefly re-enters
+    // `enriching` (worker.rs marks it before discovering there's no work) and then
+    // degrades back to `pending`, the stable terminal state. The invariant AC12
+    // guarantees is that the stranded `enriching` is cleared and the source SETTLES
+    // off `enriching` — so assert a settled `pending` (held across consecutive
+    // reads), not a one-shot read that would race the worker's transient
+    // `enriching`. A source truly STUCK in `enriching` (a broken reset) never forms
+    // the streak and this fails, which is exactly the regression we want to catch.
     assert!(
-        wait_for_status(&engine2, &source_id, "pending").await,
-        "a stranded `enriching` source must be reset to `pending` and re-enqueued; got {:?}",
+        wait_for_stable_status(&engine2, &source_id, "pending", 5).await,
+        "a stranded `enriching` source must be reset off `enriching` and settle at \
+         `pending`; got {:?}",
         enrichment_status(&engine2, &source_id).await
-    );
-    assert_ne!(
-        enrichment_status(&engine2, &source_id).await.as_deref(),
-        Some("enriching"),
-        "the stranded `enriching` must not survive the restart reset"
     );
     // SourceStatus is untouched (still indexed — searchable on raw vectors).
     let pool = engine2.pool().await;
