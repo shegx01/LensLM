@@ -35,6 +35,19 @@ use crate::embedder::registry::{DEFAULT_EMBED_MODEL_ID, EmbeddingModelSpec};
 /// fastembed's `Qdrant/…-onnx` mirror — the two engines fetch different artifacts.
 const NOMIC_HF_REPO: &str = "nomic-ai/nomic-embed-text-v1.5";
 
+/// PINNED repo revision (a specific commit, NOT `main`) so the download is
+/// deterministic and the [`NOMIC_SAFETENSORS_SHA256`] check below stays valid — an
+/// upstream `main` update can't silently change the weights under us.
+const NOMIC_HF_REVISION: &str = "e9b6763023c676ca8431644204f50c2b100d9aab";
+
+/// Expected SHA-256 of `model.safetensors` at [`NOMIC_HF_REVISION`] (its HF LFS
+/// `oid`). Verified after fetch — the SAME supply-chain integrity pattern the
+/// Kokoro model download uses (`KOKORO_MODEL_SHA256`). hf-hub already fetches over
+/// HTTPS into content-addressed blobs, but the ~547 MB file is mmapped straight
+/// into the process, so we verify it end-to-end before trusting it.
+const NOMIC_SAFETENSORS_SHA256: &str =
+    "9e7d262b1fe5ea350782829496efa831901b77486bbde1cea54a4c822d010d5c";
+
 /// Max tokens per input. nomic-v1.5 trained at 2048; our chunks are ~512, so this
 /// only guards a pathological input. Truncation MUST be set explicitly — the
 /// serialized `tokenizer.json` bakes in neither truncation nor padding, and an
@@ -113,13 +126,28 @@ impl CandleNomicEmbedder {
         // Parse config.json; #[serde(default)] fills any absent field, and the
         // struct's Default IS nomic-v1.5 — so even a parse failure yields the
         // correct architecture. Unknown JSON fields are ignored by serde.
+        //
+        // COUPLING: this fallback correctness relies on `candle-transformers`'
+        // `nomic_bert::Config::default()` matching nomic-v1.5 (vocab 30528, 12
+        // layers, RoPE base 1000, swiglu, …), which holds for the pinned
+        // candle-transformers 0.11.0. A future candle-transformers bump could change
+        // that default; the fetched `config.json` normally supplies the real values,
+        // so this only matters if BOTH the config read fails AND the default drifts.
         let config: Config = std::fs::read_to_string(&config_path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
 
-        // SAFETY: from_mmaped_safetensors mmaps the file read-only; the file is a
-        // trusted model artifact fetched above and not mutated while mapped.
+        // SAFETY: `from_mmaped_safetensors` mmaps the file read-only via `memmap2`.
+        // The `unsafe` contract requires the mapped file is not modified by any
+        // process for the lifetime of the mapping (= the lifetime of the returned
+        // `VarBuilder` and the `NomicBertModel` built from it, which hold
+        // `Storage::Mmap` references for as long as this `CandleNomicEmbedder`
+        // lives in the engine's embedder cache). Upheld because: (1) the file is in
+        // `{data_dir}/models/candle/` (app-private); (2) the engine enforces one
+        // process per data dir; (3) hf-hub writes content-addressed blob paths and
+        // never overwrites in place; and (4) its bytes were sha256-verified against
+        // `NOMIC_SAFETENSORS_SHA256` in `fetch_artifacts` before we mapped them.
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(&[weights_path], DType::F32, &device)
                 .map_err(|e| LensError::Model(format!("candle safetensors load failed: {e}")))?
@@ -246,18 +274,27 @@ impl Embedder for CandleNomicEmbedder {
 }
 
 /// Fetch (or read from cache) `config.json`, `tokenizer.json`, `model.safetensors`
-/// for nomic-v1.5, rooted at `cache_dir` (so the ~547 MB weight file lands under
-/// the app data dir, not the user's global `~/.cache/huggingface`).
+/// for nomic-v1.5 at the PINNED [`NOMIC_HF_REVISION`], rooted at `cache_dir` (so the
+/// ~547 MB weight file lands under the app data dir, not the user's global
+/// `~/.cache/huggingface`). The weights are SHA-256-verified against
+/// [`NOMIC_SAFETENSORS_SHA256`] before being returned (Kokoro-style integrity gate).
 fn fetch_artifacts(
     cache_dir: &Path,
 ) -> Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf), LensError> {
     use hf_hub::api::sync::ApiBuilder;
+    use hf_hub::{Repo, RepoType};
 
     let api = ApiBuilder::new()
         .with_cache_dir(cache_dir.to_path_buf())
         .build()
         .map_err(|e| LensError::Model(format!("hf-hub api build failed: {e}")))?;
-    let repo = api.model(NOMIC_HF_REPO.to_string());
+    // Pin the exact commit (not `main`) so the download is reproducible and the
+    // sha256 check stays valid across upstream repo updates.
+    let repo = api.repo(Repo::with_revision(
+        NOMIC_HF_REPO.to_string(),
+        RepoType::Model,
+        NOMIC_HF_REVISION.to_string(),
+    ));
 
     let get = |file: &str| {
         repo.get(file)
@@ -266,5 +303,25 @@ fn fetch_artifacts(
     let config = get("config.json")?;
     let tokenizer = get("tokenizer.json")?;
     let weights = get("model.safetensors")?;
+    verify_sha256(&weights, NOMIC_SAFETENSORS_SHA256)?;
     Ok((config, tokenizer, weights))
+}
+
+/// Verifies `path`'s SHA-256 equals `expected` (lowercase hex). On mismatch the
+/// (untrusted) file is removed so a subsequent run re-downloads it. Mirrors the
+/// Kokoro model-download integrity check.
+fn verify_sha256(path: &Path, expected: &str) -> Result<(), LensError> {
+    use sha2::{Digest, Sha256};
+
+    let bytes = std::fs::read(path)
+        .map_err(|e| LensError::Model(format!("candle weights read for hash failed: {e}")))?;
+    let actual = format!("{:x}", Sha256::digest(&bytes));
+    if actual != expected {
+        // Drop the tampered/corrupt artifact so the next attempt re-fetches it.
+        let _ = std::fs::remove_file(path);
+        return Err(LensError::Model(format!(
+            "candle model.safetensors integrity check failed: expected {expected}, got {actual}"
+        )));
+    }
+    Ok(())
 }

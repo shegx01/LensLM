@@ -1,8 +1,12 @@
-//! STEP-0 SPIKE (issue #91) — candle + Metal validation harness.
+//! candle + Metal validation & benchmark harness (issue #91).
 //!
-//! Throwaway. Proves (or disproves) the GPU-offload path that replaced the dead
-//! ORT-CoreML-EP path (see memory `issue-91-native-ml-seam` + the `.omc` HANDOFF).
-//! Answers the four open questions:
+//! RETAINED dev tool (not shipped — gated behind `native-ml-metal`, and the
+//! `[[bin]]` builds only with that feature). Reproduces the evidence behind the
+//! candle+Metal decision (see `.omc/plans/issue-91-candle-metal-spike-results.md`)
+//! so parity/throughput/offload can be re-measured on demand — e.g. after a candle
+//! upgrade or on new Apple-Silicon hardware. The production assertion guardrail
+//! lives in `tests/candle_metal_parity.rs`; this bin is for measurement.
+//! Answers the four questions that greenlit the path:
 //!   Q4 — cross-engine cosine parity (candle-CPU/Metal vs production fastembed/ORT).
 //!        (recall@5 docs=candle/query=fastembed lives in the `recall` subcommand.)
 //!   Q1 — candle-CPU vs ORT/fastembed-CPU throughput (replace vs supplement).

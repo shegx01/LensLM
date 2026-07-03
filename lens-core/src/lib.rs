@@ -1222,11 +1222,20 @@ impl LensEngine {
         embedder: Arc<dyn Embedder>,
         backend: crate::embedder::EmbeddingBackend,
     ) -> Result<(), LensError> {
-        // Register under the CPU device key: tests run feature-off, where the
-        // device policy always resolves to `Compute::Cpu`, so this is exactly the
-        // key `embedder_for` will look up for the injected embedder (issue #91).
-        let key =
-            Self::embedder_cache_key(embedder.model_id(), backend, crate::embedder::Compute::Cpu);
+        // Register under the SAME device key `embedder_for` will resolve for a Bulk
+        // request (the workload every injection-based test drives): run the real
+        // policy against the engine's own accelerator (issue #91). Feature-off this
+        // is always `Compute::Cpu`; feature-on on Metal hardware it correctly
+        // resolves `Compute::Metal`, so the injected double is found either way
+        // instead of being missed (which would trigger a real model download).
+        let spec = crate::embedder::resolve(embedder.model_id());
+        let compute = crate::embedder::select_compute(
+            self.accelerator.probe(),
+            spec,
+            backend,
+            crate::embedder::WorkloadKind::Bulk,
+        );
+        let key = Self::embedder_cache_key(embedder.model_id(), backend, compute);
         // `try_lock` (not `blocking_lock`) keeps this a sync fn that is safe to
         // call from inside a `#[tokio::test]` async context: the cache is
         // uncontended at injection time, so the lock is always immediately

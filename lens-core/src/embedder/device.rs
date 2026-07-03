@@ -34,12 +34,14 @@ use crate::embedder::registry::EmbeddingModelSpec;
 /// CPU to relieve and per-batch throughput matters); a single interactive query is
 /// not (GPU launch/first-use latency loses for one vector, and there is no CPU load
 /// to offload).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// Deliberately NOT `Default`: every caller must state its workload explicitly. A
+/// `Default` of `Bulk` would be a foot-gun for the future query path — a bare
+/// `WorkloadKind::default()` would silently route a single query to the GPU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkloadKind {
     /// Large ingest, full-notebook re-embed, batch-select add, drag-drop add — all
-    /// funnel through `run_ingest`/`reembed_notebook` and embed many chunks. The
-    /// default: the only real embed call sites today are bulk.
-    #[default]
+    /// funnel through `run_ingest`/`reembed_notebook` and embed many chunks.
     Bulk,
     /// A single query embedded at retrieval time (reserved for the query path).
     Interactive,
@@ -106,19 +108,28 @@ impl NativeAccelerator for CpuOnlyAccelerator {
 /// Apple-Metal accelerator: reports [`Acceleration::Metal`] iff a candle Metal
 /// device is actually constructible on this machine (not merely compiled in).
 ///
+/// The probe result is cached in a [`OnceLock`](std::sync::OnceLock) — Metal
+/// availability does not change within a process lifetime, so the (non-trivial)
+/// `Device::new_metal(0)` enumeration runs at most once, honoring the
+/// [`NativeAccelerator`] contract's "cache any expensive discovery internally".
+///
 /// Only built with `native-ml-metal` (aarch64-apple-darwin). Everywhere else the
 /// engine uses [`CpuOnlyAccelerator`].
 #[cfg(feature = "native-ml-metal")]
-#[derive(Debug, Default, Clone, Copy)]
-pub struct MetalAccelerator;
+#[derive(Debug, Default)]
+pub struct MetalAccelerator {
+    cached: std::sync::OnceLock<Acceleration>,
+}
 
 #[cfg(feature = "native-ml-metal")]
 impl NativeAccelerator for MetalAccelerator {
     fn probe(&self) -> Acceleration {
-        match candle_core::Device::new_metal(0) {
-            Ok(_) => Acceleration::Metal,
-            Err(_) => Acceleration::None,
-        }
+        *self
+            .cached
+            .get_or_init(|| match candle_core::Device::new_metal(0) {
+                Ok(_) => Acceleration::Metal,
+                Err(_) => Acceleration::None,
+            })
     }
 }
 
@@ -127,7 +138,7 @@ impl NativeAccelerator for MetalAccelerator {
 pub fn default_accelerator() -> std::sync::Arc<dyn NativeAccelerator> {
     #[cfg(feature = "native-ml-metal")]
     {
-        std::sync::Arc::new(MetalAccelerator)
+        std::sync::Arc::new(MetalAccelerator::default())
     }
     #[cfg(not(feature = "native-ml-metal"))]
     {
@@ -190,9 +201,10 @@ mod tests {
     }
 
     #[test]
-    fn defaults_are_cpu_and_bulk() {
+    fn compute_defaults_to_cpu() {
+        // Compute has a safe default (CPU); WorkloadKind deliberately does NOT
+        // (every caller must state its workload — see the enum doc).
         assert_eq!(Compute::default(), Compute::Cpu);
-        assert_eq!(WorkloadKind::default(), WorkloadKind::Bulk);
     }
 
     #[test]
