@@ -22,14 +22,20 @@ env:
 
 jobs:
   # ─────────────────────────── Rust ───────────────────────────
-  # The old single `rust` job ran fmt → clippy → test serially, paying the
-  # workspace compile twice (clippy + test use different profiles) and running
-  # the whole suite (~880 tests as of 2026-07) in one lane. It is now a fan-out
-  # DAG that shares one warm cache: fmt / clippy / archive run in parallel, then
-  # the test binaries built once by `rust-archive` are downloaded and run across
-  # 3 partitioned shards with cargo-nextest (no recompilation in the shards).
+  # The old single `rust` job ran fmt → clippy → test serially in one lane. It
+  # is now a fan-out: fmt / clippy / and 3 test shards run in parallel, all
+  # sharing one warm cargo cache (deps built once, restored everywhere). Each
+  # shard compiles the workspace from the warm cache and runs its slice of the
+  # suite via `cargo nextest run --partition` — so the ~3m of test execution is
+  # split 3 ways, and fmt/clippy give fast fail-first feedback without waiting
+  # behind the test build.
   #
-  # NOTE (required checks): these four job display names replace the old
+  # Why no prebuilt "archive" hand-off: the nextest archive of this workspace is
+  # ~6 GB (debug binaries + stdlib); re-downloading it per shard cost more than
+  # recompiling from the warm cache does. Recompile-from-cache is the cheaper
+  # seam here.
+  #
+  # NOTE (required checks): these job display names replace the old
   # "Rust (fmt + clippy + test)" check. Update the branch-protection ruleset to
   # require the new names — see docs/ci.md.
 
@@ -58,6 +64,7 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+      # Reads the shared cache; the test shards keep it warm (save-if there).
       - name: Set up Rust environment
         uses: ./.github/actions/rust-env
         with:
@@ -65,71 +72,38 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-  rust-archive:
-    name: Rust (build + archive tests)
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      # Gates the test-binary compile on rustc warnings (was `cargo test`'s job).
-      RUSTFLAGS: '-D warnings'
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-      # The one job that writes the shared cache, so parallel jobs don't race.
-      - name: Set up Rust environment
-        uses: ./.github/actions/rust-env
-        with:
-          save-cache: 'true'
-          fetch-pdfium: 'true'
-          install-nextest: 'true'
-      # Compile every test binary in the workspace exactly once and pack them
-      # (plus the metadata nextest needs) into a self-contained archive.
-      - name: Build + archive test binaries
-        run: cargo nextest archive --workspace --archive-file target/nextest-archive.tar.zst
-      - name: Upload nextest archive
-        uses: actions/upload-artifact@v7
-        with:
-          name: nextest-archive
-          path: target/nextest-archive.tar.zst
-          # Short-lived, but long enough that "Re-run failed jobs" works over a
-          # weekend without rebuilding the archive.
-          retention-days: 3
-
   rust-test:
     # SHARD COUNT lives in two places that MUST stay in sync: the `shard` matrix
-    # below and env.SHARD_TOTAL (used for the nextest partition denominator).
-    # The display name shows the shard index only (e.g. "Rust (test/1)").
+    # below and env.SHARD_TOTAL (the nextest partition denominator). The display
+    # name shows the shard index only (e.g. "Rust (test/1)").
     name: Rust (test/${{ matrix.shard }})
-    needs: rust-archive
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     strategy:
       # One shard failing shouldn't cancel the others — we want the full picture.
       fail-fast: false
       matrix:
         shard: [1, 2, 3]
     env:
+      # Gates the test-binary compile on rustc warnings (was `cargo test`'s job).
+      RUSTFLAGS: '-D warnings'
       SHARD_TOTAL: '3'
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-      # No compile here, so skip the cargo cache; we still need the apt runtime
-      # libs (to load the binaries) and nextest (to run the archive).
+      # All shards restore the shared cache; shard 1 is the sole writer so the
+      # parallel shards don't race on the same key. Each shard compiles the
+      # workspace test binaries from the warm cache (deps already built) and
+      # runs its partition.
       - name: Set up Rust environment
         uses: ./.github/actions/rust-env
         with:
-          cache: 'false'
+          save-cache: ${{ matrix.shard == 1 }}
+          fetch-pdfium: 'true'
           install-nextest: 'true'
-      - name: Download nextest archive
-        uses: actions/download-artifact@v8
-        with:
-          name: nextest-archive
-          path: target
-      # Run this shard's slice of the suite straight from the prebuilt binaries.
       - name: Run test shard
         run: >-
-          cargo nextest run
-          --archive-file target/nextest-archive.tar.zst
+          cargo nextest run --workspace
           --partition count:${{ matrix.shard }}/${{ env.SHARD_TOTAL }}
 
   # ───────────────────────── Frontend ─────────────────────────
