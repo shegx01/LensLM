@@ -10,8 +10,6 @@
 import { render, screen, fireEvent, waitFor } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-// ── Hoisted mocks ─────────────────────────────────────────────────────────────
-
 import type { Notebook } from '$lib/notebooks/types.js';
 
 const { mockCreate, storeState } = vi.hoisted(() => ({
@@ -49,8 +47,6 @@ const CREATED: Notebook = {
   embedding_backend: null
 };
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
 function renderDialog(overrides: { open?: boolean; onOpenChange?: (v: boolean) => void } = {}) {
   const onOpenChange = vi.fn();
   const { component, ...rest } = render(NotebookCreateDialog, {
@@ -62,8 +58,6 @@ function renderDialog(overrides: { open?: boolean; onOpenChange?: (v: boolean) =
   return { component, onOpenChange, ...rest };
 }
 
-// ── Setup / teardown ─────────────────────────────────────────────────────────
-
 beforeEach(() => {
   mockCreate.mockReset();
   mockCreate.mockResolvedValue(CREATED);
@@ -73,8 +67,6 @@ beforeEach(() => {
 afterEach(() => {
   vi.clearAllMocks();
 });
-
-// ── Tests: field rendering ─────────────────────────────────────────────────
 
 describe('NotebookCreateDialog — field rendering', () => {
   it('renders the NAME label and input', () => {
@@ -116,12 +108,9 @@ describe('NotebookCreateDialog — field rendering', () => {
 
   it('does NOT render when open is false', () => {
     renderDialog({ open: false });
-    // Dialog portal content should not be present
     expect(screen.queryByLabelText(/name/i)).not.toBeInTheDocument();
   });
 });
-
-// ── Tests: focus mode selection ───────────────────────────────────────────────
 
 describe('NotebookCreateDialog — focus mode selection', () => {
   it('defaults to Research selected (aria-checked="true")', () => {
@@ -165,8 +154,6 @@ describe('NotebookCreateDialog — focus mode selection', () => {
   });
 });
 
-// ── Tests: Create button disabled/enabled logic ──────────────────────────────
-
 describe('NotebookCreateDialog — Create button state', () => {
   it('Create is disabled when name is empty', () => {
     renderDialog();
@@ -188,8 +175,6 @@ describe('NotebookCreateDialog — Create button state', () => {
     expect(screen.getByRole('button', { name: /create notebook/i })).toBeEnabled();
   });
 });
-
-// ── Tests: Create action ─────────────────────────────────────────────────────
 
 describe('NotebookCreateDialog — Create action', () => {
   it('calls createNotebookAction with (trimmed title, null description, focusMode)', async () => {
@@ -243,8 +228,6 @@ describe('NotebookCreateDialog — Create action', () => {
   });
 
   it('shows the store error inline and keeps dialog open when createNotebookAction returns null', async () => {
-    // The action catches IPC failures internally, sets the store error, and
-    // returns null; the dialog surfaces that error and stays open.
     mockCreate.mockResolvedValue(null);
     storeState.error = 'IPC failure';
     const onOpenChange = vi.fn();
@@ -253,7 +236,6 @@ describe('NotebookCreateDialog — Create action', () => {
     await fireEvent.click(screen.getByRole('button', { name: /create notebook/i }));
     await waitFor(() => expect(screen.getByRole('alert')).toBeInTheDocument());
     expect(screen.getByText(/IPC failure/i)).toBeInTheDocument();
-    // Dialog should remain open (onOpenChange not called with false)
     expect(onOpenChange).not.toHaveBeenCalledWith(false);
   });
 
@@ -269,8 +251,6 @@ describe('NotebookCreateDialog — Create action', () => {
     expect(onOpenChange).not.toHaveBeenCalledWith(false);
   });
 });
-
-// ── Tests: Cancel ─────────────────────────────────────────────────────────────
 
 describe('NotebookCreateDialog — Cancel', () => {
   it('Cancel button calls onOpenChange(false)', async () => {

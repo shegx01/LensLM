@@ -36,8 +36,6 @@ pub struct UrlExtractor;
 
 impl Extractor for UrlExtractor {
     fn extract(&self, raw: &[u8]) -> Result<ExtractOutput, LensError> {
-        // `extract_bytes` handles character-encoding detection internally
-        // (reads `<meta charset>` / `Content-Type` meta and transcodes to UTF-8).
         let result = rs_trafilatura::extract_bytes(raw)
             .map_err(|e| LensError::Validation(format!("URL content extraction failed: {e}")))?;
 
@@ -52,23 +50,16 @@ impl Extractor for UrlExtractor {
             });
         }
 
-        // Split the extracted flat text into paragraph blocks on double-newline
-        // boundaries (trafilatura separates paragraphs with `\n\n`). Single
-        // newlines within a paragraph are preserved verbatim — they may be
-        // structural (list items). Blank-line groups become one block each.
         let mut blocks = Vec::new();
         let mut anchors = Vec::new();
 
-        // Manual byte-offset splitter (not `str::split("\n\n")`): we must track
-        // each block's exact byte `block_start`/`block_end` to set `char_start`/
-        // `char_end` byte-identically into `extracted_text` (the byte-identity
-        // invariant). `str::split` discards offsets, so we walk positions by hand.
+        // `str::split("\n\n")` discards byte offsets; walk positions by hand to
+        // set `char_start`/`char_end` byte-identically into `extracted_text`.
         let mut pos = 0usize;
         let bytes = extracted_text.as_bytes();
         let len = bytes.len();
 
         while pos < len {
-            // Skip leading newlines between blocks.
             while pos < len && bytes[pos] == b'\n' {
                 pos += 1;
             }
@@ -77,7 +68,6 @@ impl Extractor for UrlExtractor {
             }
             let block_start = pos;
 
-            // Find the end of this block: a double-newline or EOF.
             while pos < len {
                 if pos + 1 < len && bytes[pos] == b'\n' && bytes[pos + 1] == b'\n' {
                     break;
@@ -86,9 +76,6 @@ impl Extractor for UrlExtractor {
             }
             let block_end = pos;
 
-            // The slice [block_start..block_end] is one paragraph.
-            // Skip empty slices (shouldn't happen given leading-newline skip, but
-            // be defensive).
             if block_start == block_end {
                 continue;
             }
@@ -101,14 +88,10 @@ impl Extractor for UrlExtractor {
                 char_end: block_end,
                 text,
             });
-            // text_offset = decimal BYTE offset of the block's first character in
-            // the extracted text buffer (a stable, round-trippable pointer).
             anchors.push(SourceAnchor::Url {
                 text_offset: block_start.to_string(),
             });
 
-            // Ensure we make forward progress when the split point lands on
-            // exactly two newlines.
             if pos < len && bytes[pos] == b'\n' {
                 pos += 1;
             }
@@ -127,7 +110,6 @@ impl Extractor for UrlExtractor {
 mod tests {
     use super::*;
 
-    /// A plain article HTML page with enough text to clear the needs_js threshold.
     const ARTICLE_HTML: &[u8] = br#"<!DOCTYPE html>
 <html>
 <head><title>Test Article</title></head>
@@ -140,7 +122,6 @@ mod tests {
 </body>
 </html>"#;
 
-    /// A JS-shell page: minimal real text, all content behind JavaScript.
     const JS_SHELL_HTML: &[u8] = br#"<!DOCTYPE html>
 <html>
 <head><title>App</title></head>
@@ -168,7 +149,6 @@ mod tests {
             out.anchors.len(),
             "blocks and anchors must be index-aligned"
         );
-        // Every anchor must be Url variant.
         for a in &out.anchors {
             assert!(
                 matches!(a, SourceAnchor::Url { .. }),

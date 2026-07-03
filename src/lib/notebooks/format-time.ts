@@ -1,14 +1,6 @@
-// Relative-time formatter for notebook timestamps.
-//
-// Pure function — no external deps, no Date.now() side-channel injection
-// (callers can control `now` via the optional second arg for tests).
-
 /**
- * Format an RFC3339 / ISO 8601 timestamp as a human-readable relative time
- * string (e.g. "just now", "2h ago", "3d ago", "1w ago", "3mo ago").
- *
- * @param isoString - An RFC3339 / ISO 8601 date string (as returned by Rust chrono)
- * @param now       - Reference timestamp in ms (defaults to Date.now()). Inject in tests.
+ * Format an ISO 8601 timestamp as a relative-time string: "just now", "2h ago", "3mo ago".
+ * `now` defaults to `Date.now()` — inject in tests.
  */
 export function formatRelativeTime(isoString: string, now: number = Date.now()): string {
   const then = Date.parse(isoString);

@@ -1,11 +1,6 @@
-<!-- AddSourcesModal — tabbed "Add sources" modal (M4).
-     Three tabs: Upload | URL | Paste text.
-     Upload: functional (md/txt via @tauri-apps/plugin-dialog + existing addFileSource/ingest).
-     URL:    functional (addUrlSource + ingest). Static pages take the fast static extract
-             path; near-empty SPAs fall through to the offscreen webview JS-render path (#78).
-     Paste:  functional (addTextSource + ingest).
-     Drag region: modal and ALL its controls are data-tauri-drag-region=none (no-drag).
-     Tokens only — no hardcoded hex. -->
+<!-- AddSourcesModal — tabbed "Add sources" modal (Upload | URL | Paste).
+     All controls carry -webkit-app-region: no-drag. Tokens only — no hardcoded hex.
+     URL tab: static pages use fast extract; JS/SPA pages fall through to offscreen webview (#78). -->
 <script lang="ts">
   import { open as openFilePicker } from '@tauri-apps/plugin-dialog';
   import { isTauri } from '@tauri-apps/api/core';
@@ -20,10 +15,6 @@
   import { registerDropTarget, PICKER_FILTERS } from '$lib/sources/dragDrop.js';
   import { showToast } from '$lib/sources/toast.svelte.js';
 
-  // ---------------------------------------------------------------------------
-  // Props
-  // ---------------------------------------------------------------------------
-
   let {
     open = false,
     onclose
@@ -33,10 +24,6 @@
     /** Called when the modal should close. */
     onclose?: () => void;
   } = $props();
-
-  // ---------------------------------------------------------------------------
-  // Local state
-  // ---------------------------------------------------------------------------
 
   type Tab = 'upload' | 'url' | 'paste';
 
@@ -65,10 +52,6 @@
   /** Drop zone element ref — used by the native drag-drop manager. */
   let dropZoneEl = $state<HTMLDivElement | undefined>(undefined);
 
-  // ---------------------------------------------------------------------------
-  // Derived
-  // ---------------------------------------------------------------------------
-
   const activeNotebookId = $derived(notebookStore.activeNotebookId);
   const activeNotebook = $derived(notebookStore.activeNotebook);
 
@@ -87,10 +70,6 @@
 
   const urlCanSubmit = $derived(isValidHttpUrl(urlValue) && !urlSubmitting);
 
-  // ---------------------------------------------------------------------------
-  // Reset on open
-  // ---------------------------------------------------------------------------
-
   $effect(() => {
     if (open) {
       activeTab = 'upload';
@@ -108,10 +87,6 @@
     }
   });
 
-  // ---------------------------------------------------------------------------
-  // Keyboard close (Escape)
-  // ---------------------------------------------------------------------------
-
   function handleKeydown(e: KeyboardEvent): void {
     if (e.key === 'Escape') {
       e.preventDefault();
@@ -119,19 +94,10 @@
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Upload tab handlers
-  // ---------------------------------------------------------------------------
-
   /**
-   * Shared multi-path ingest dispatch used by BOTH the browse picker and the
-   * native drop handler (DRY — one place to unit-test the batch behavior).
-   *
-   * Per path: adds the file source via the backend (which enforces content-hash
-   * dedup, #96). The backend's `wasExisting` flag is the single source of truth:
-   * an existing (duplicate) source is counted as `skipped` and is NOT inserted
-   * into the store or re-ingested. A per-file failure is caught and counted as
-   * `failed` — one file's failure never aborts the rest of the batch.
+   * Shared ingest dispatch for browse picker and native drop (DRY).
+   * `wasExisting` (backend content-hash dedup, #96) determines skip vs. add;
+   * per-file failures are caught and counted without aborting the batch.
    */
   async function ingestPaths(
     notebookId: string,
@@ -164,11 +130,7 @@
     return { added, failed, skipped };
   }
 
-  /**
-   * Surfaces a batch summary toast when anything was skipped or failed. A clean
-   * batch (all added, nothing skipped/failed) shows no toast — the modal simply
-   * closes.
-   */
+  /** Shows a summary toast when anything was skipped or failed; clean batches close silently. */
   function showBatchSummary(result: { added: number; failed: number; skipped: number }): void {
     if (result.skipped === 0 && result.failed === 0) return;
     const parts: string[] = [];
@@ -205,19 +167,9 @@
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Native drag-drop (Tauri v2) — registered via the app-level drop manager.
-  // The drop zone only exists while the modal is open AND the Upload tab is
-  // active (it lives behind `{#if open}` + `{#if activeTab === 'upload'}`), so a
-  // one-shot onMount registration would miss it. Instead, (re)register whenever
-  // the bound element mounts and clean up when it unmounts — an $effect keyed on
-  // `dropZoneEl` handles open/close and tab switches in both directions.
-  // ---------------------------------------------------------------------------
-
+  // $effect keyed on dropZoneEl re-registers on mount and cleans up on unmount,
+  // handling open/close and tab switches. No coordinate hit-test needed.
   $effect(() => {
-    // Registering only while the drop-zone element is mounted (modal open +
-    // Upload tab active) scopes the drop to this surface — the manager routes
-    // drops to the active (last-registered) target. No coordinate hit-test.
     if (!dropZoneEl) return;
     return registerDropTarget({
       setHover: (h) => {
@@ -228,13 +180,9 @@
         uploadError = null;
         uploadSubmitting = true;
         try {
-          // Backend content-hash dedup (#96) is authoritative — no frontend
-          // locator-based dedup guessing. Shared with the browse flow.
           const result = await ingestPaths(activeNotebookId, paths);
           showBatchSummary(result);
-          // Dismiss the modal after a successful drop so the new sources are
-          // visible in the rail (mirrors the browse flow). Stay open when nothing
-          // was added (all duplicates / all failed) so the toast/error remains.
+          // Stay open when nothing was added (all duplicates / all failed).
           if (result.added > 0) onclose?.();
         } finally {
           uploadSubmitting = false;
@@ -243,10 +191,6 @@
       }
     });
   });
-
-  // ---------------------------------------------------------------------------
-  // Paste tab handler
-  // ---------------------------------------------------------------------------
 
   async function handlePasteSubmit(): Promise<void> {
     if (!pasteCanSubmit || !activeNotebookId) return;
@@ -279,10 +223,6 @@
       pasteSubmitting = false;
     }
   }
-
-  // ---------------------------------------------------------------------------
-  // URL tab handler
-  // ---------------------------------------------------------------------------
 
   /** Derive a human-readable title from a URL (hostname, else the raw URL). */
   function titleFromUrl(value: string): string {
@@ -324,10 +264,6 @@
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Footer action dispatcher
-  // ---------------------------------------------------------------------------
-
   async function handlePrimaryAction(): Promise<void> {
     if (activeTab === 'upload') await handleBrowse();
     else if (activeTab === 'url') await handleUrlSubmit();
@@ -361,10 +297,8 @@
       style="-webkit-app-region: no-drag;"
       role="document"
     >
-      <!-- ── Header ── -->
       <div class="flex items-start justify-between px-5 pt-5 pb-0">
         <div class="flex items-center gap-2.5">
-          <!-- Upload icon pill -->
           <div
             class="flex size-7 shrink-0 items-center justify-center rounded-lg bg-primary/10"
             aria-hidden="true"
@@ -382,7 +316,6 @@
             {/if}
           </div>
         </div>
-        <!-- Close X — no-drag -->
         <button
           class="flex size-6 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
           type="button"
@@ -394,7 +327,6 @@
         </button>
       </div>
 
-      <!-- ── Tabs ── -->
       <div class="flex items-center gap-1.5 px-5 pt-4 pb-0" role="tablist" aria-label="Source type">
         {#each ['upload', 'url', 'paste'] as Tab[] as tab (tab)}
           {@const label = tab === 'upload' ? 'Upload' : tab === 'url' ? 'URL' : 'Paste text'}
@@ -417,9 +349,7 @@
         {/each}
       </div>
 
-      <!-- ── Tab content ── -->
       <div class="px-5 py-4">
-        <!-- UPLOAD TAB -->
         {#if activeTab === 'upload'}
           <div
             id="sources-tab-panel-upload"
@@ -427,7 +357,6 @@
             aria-label="Upload files"
             style="-webkit-app-region: no-drag;"
           >
-            <!-- Drop zone -->
             <div
               bind:this={dropZoneEl}
               class={cn(
@@ -457,7 +386,6 @@
               </div>
             </div>
 
-            <!-- Supported format list -->
             <div class="mt-4 space-y-1.5 text-center text-[11px] text-muted-foreground/70">
               <p>
                 <span class="font-semibold uppercase tracking-wide text-muted-foreground/50"
@@ -477,13 +405,10 @@
               </p>
             </div>
 
-            <!-- Upload error feedback -->
             {#if uploadError}
               <p class="mt-3 text-[12px] text-destructive" role="alert">{uploadError}</p>
             {/if}
           </div>
-
-          <!-- URL TAB -->
         {:else if activeTab === 'url'}
           <div
             id="sources-tab-panel-url"
@@ -538,13 +463,10 @@
               Supports web pages, blog posts, documentation and GitHub repos. Content is fetched and
               indexed locally.
             </p>
-            <!-- URL error feedback -->
             {#if urlError}
               <p class="mt-3 text-[12px] text-destructive" role="alert">{urlError}</p>
             {/if}
           </div>
-
-          <!-- PASTE TEXT TAB -->
         {:else}
           <div
             id="sources-tab-panel-paste"
@@ -552,7 +474,6 @@
             aria-label="Paste text"
             style="-webkit-app-region: no-drag;"
           >
-            <!-- Title input -->
             <div class="mb-3">
               <label
                 class="mb-1.5 flex items-center gap-1 text-[10px] font-semibold uppercase tracking-widest text-muted-foreground"
@@ -574,7 +495,6 @@
               />
             </div>
 
-            <!-- Content textarea -->
             <div class="mb-1">
               <label
                 class="mb-1.5 block text-[10px] font-semibold uppercase tracking-widest text-muted-foreground"
@@ -600,7 +520,6 @@
         {/if}
       </div>
 
-      <!-- ── Footer ── -->
       <div
         class="flex items-center justify-between border-t border-border px-5 py-3"
         style="-webkit-app-region: no-drag;"

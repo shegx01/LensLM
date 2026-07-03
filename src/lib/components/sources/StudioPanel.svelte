@@ -1,20 +1,6 @@
-<!-- StudioPanel — the bottom region of the right rail (M4 visual shell).
-     TODO(M6/M7): this is a non-functional visual shell. The "Generate Audio
-     Overview" action lands with the Audio-Overview milestone (M7) and the study
-     tools (Study Guide, Briefing Doc, …) land with the Notes milestone (M6).
-     Every action here is DISABLED with a "coming soon" affordance.
-
-     Layout: a "Studio" header with a "RESEARCH" tag, an accent Audio Overview
-     card, then a 2-column grid of study-tool buttons. The panel owns its own
-     vertical scroll (max-height + no-scrollbar) so it never crowds out the
-     Sources list above it.
-
-     Drag region: this panel sits BELOW the rail's drag bar, so it is not a drag
-     region. Every interactive control still carries -webkit-app-region: no-drag
-     (belt + suspenders) so a future drag bar can't swallow clicks.
-
-     Theming: tokens only — the accent drives the Generate button (bg-primary).
-     No hardcoded hex. -->
+<!-- StudioPanel — non-functional visual shell (M4). All actions are disabled.
+     TODO(M6/M7): study tools land with M6 (Notes), Audio Overview lands with M7.
+     Tokens only — no hardcoded hex. -->
 <script lang="ts">
   import Headphones from '@lucide/svelte/icons/headphones';
   import BookOpen from '@lucide/svelte/icons/book-open';
@@ -30,10 +16,6 @@
   import Table2 from '@lucide/svelte/icons/table-2';
   import type { Component } from 'svelte';
 
-  // ---------------------------------------------------------------------------
-  // Props — selection counts so the Audio Overview card can read "{n} of {m}".
-  // ---------------------------------------------------------------------------
-
   let {
     selectedCount = 0,
     totalCount = 0
@@ -44,13 +26,7 @@
     totalCount?: number;
   } = $props();
 
-  // ---------------------------------------------------------------------------
-  // Study tools — visual shell only (all disabled). TODO(M6) wire to Notes.
-  //
-  // Layout: Study Guide is the "hero" tool and spans a full row on its own
-  // (matching the shot1 reference). The remaining tools fill a 2-col grid below.
-  // ---------------------------------------------------------------------------
-
+  // Study Guide is the hero tool (full-width); remaining tools fill a 2-col grid.
   /** The hero tool — rendered full-width above the grid. */
   const heroTool: { label: string; sub: string; icon: Component } = {
     label: 'Study Guide',
@@ -73,12 +49,10 @@
   ];
 </script>
 
-<!-- Studio region — own scroll, hidden scrollbar, capped height. -->
 <section
   class="no-scrollbar flex max-h-[55%] shrink-0 flex-col gap-3 overflow-y-auto border-t border-border px-3 py-3"
   aria-label="Studio"
 >
-  <!-- Studio header with a RESEARCH tag — text-sm matches left rail section labels -->
   <div class="flex items-center gap-2">
     <span class="text-sm font-semibold text-foreground">Studio</span>
     <span
@@ -88,7 +62,6 @@
     </span>
   </div>
 
-  <!-- Audio Overview card -->
   <div class="rounded-xl border border-border bg-muted/30 p-3">
     <div class="flex items-center gap-2">
       <div
@@ -105,7 +78,6 @@
       </div>
     </div>
 
-    <!-- Generate button — accent, disabled (M7). no-drag. -->
     <button
       type="button"
       class="mt-3 flex w-full items-center justify-center gap-1.5 rounded-lg bg-primary px-3 py-2 text-sm font-semibold text-primary-foreground opacity-60 transition-opacity disabled:cursor-not-allowed"
@@ -122,10 +94,7 @@
     </p>
   </div>
 
-  <!-- Study tools — Study Guide hero (full row) + 2-col grid for the rest.
-       Per shot1: Study Guide spans the full width as the first item. -->
   <div aria-label="Study tools">
-    <!-- Hero tool: Study Guide — full-width button -->
     <button
       type="button"
       class="mb-1.5 flex w-full items-center gap-2 rounded-lg border border-border bg-card px-2.5 py-2 text-left opacity-60 transition-opacity disabled:cursor-not-allowed"
@@ -145,7 +114,6 @@
       </span>
     </button>
 
-    <!-- Remaining tools — 2-col grid -->
     <div class="grid grid-cols-2 gap-1.5">
       {#each gridTools as tool (tool.label)}
         <button

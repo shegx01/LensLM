@@ -1,22 +1,10 @@
-//! Background enrichment infrastructure for the M4 Phase-3 pass.
+//! Background enrichment infrastructure: the [`EnrichmentJob`] message, the bounded
+//! `mpsc` queue, and the dedicated background [`worker`] task (M4 Phase-3 Steps 3–5).
 //!
-//! This module owns the *wiring* (Step 3): the [`EnrichmentJob`] message, the
-//! bounded `mpsc` queue, and the dedicated background [`worker`] task spawned in
-//! [`crate::LensEngine::init`]. It deliberately does NOT yet implement the LLM
-//! structural-map / `embedding_text` jobs (Step 4) or the re-embed new-table-flip
-//! (Step 5): the worker's job body is a CLEARLY-MARKED stub that walks a source
-//! through the [`EnrichmentStatus`](crate::notebooks::EnrichmentStatus) lifecycle
-//! (`pending → enriching → enriched`) so the queue + worker lifecycle + recovery
-//! are observable and testable now.
-//!
-//! ## Concurrency contract (the load-bearing part of Step 3)
-//!
-//! The worker holds NO [`ingest_lock`](crate::LensEngine) permit during its job
-//! body (lock #3 of the plan). Enqueue is a non-blocking `try_send` issued by the
-//! ingest path AFTER the source reaches `Indexed` AND the ingest permit has been
-//! released — so it never awaits the lock and a full channel can never deadlock
-//! against the held permit (a dropped job is recovered by the startup/rescan
-//! queue-rebuild). See [`crate::LensEngine::enqueue_enrichment`].
+//! Concurrency invariant (lock #3): the worker holds NO `ingest_lock` during its job
+//! body. Enqueue is a non-blocking `try_send` issued after the ingest permit is
+//! released, so a full channel can never deadlock. Dropped jobs are recovered by the
+//! startup/rescan queue-rebuild.
 
 mod batching;
 pub mod coref;
@@ -26,9 +14,8 @@ pub mod meta;
 pub mod reembed;
 pub mod worker;
 
-/// Shared enrichment test mock ([`test_util::ScriptedProvider`]). Available to the
-/// in-crate unit tests (`#[cfg(test)]`) AND, under the `test-util` feature, to the
-/// separate integration-test crate so both share ONE configurable mock provider.
+/// Shared enrichment test mock. Available in-crate (`#[cfg(test)]`) and to the
+/// integration-test crate via the `test-util` feature.
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_util;
 
@@ -42,10 +29,6 @@ pub use meta::{
 };
 pub use worker::{EnrichmentJob, spawn_worker};
 
-/// Bounded capacity of the enrichment `mpsc` queue (plan Step 3: ~1024).
-///
-/// `try_send` into a full channel logs and drops the job; the startup/rescan
-/// queue-rebuild ([`crate::LensEngine::rebuild_enrichment_queue`]) re-enqueues any
-/// `Indexed && enrichment_status IN (none, failed, pending)` source, so an
-/// overflow is self-healing rather than a lost-update.
+/// Bounded capacity of the enrichment `mpsc` queue. A full channel drops the job;
+/// the startup/rescan queue-rebuild re-enqueues any missed source (self-healing).
 pub const ENRICHMENT_QUEUE_CAPACITY: usize = 1024;

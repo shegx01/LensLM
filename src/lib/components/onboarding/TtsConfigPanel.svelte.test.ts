@@ -60,7 +60,7 @@ describe('TtsConfigPanel — voices', () => {
     const setConfig = vi.fn();
     mockIPC((cmd, args) => {
       if (cmd === 'download_tts_engine') return driveDownload(args);
-      if (cmd === 'list_tts_voices') return []; // engine not really available
+      if (cmd === 'list_tts_voices') return [];
       if (cmd === 'set_config') {
         setConfig(args);
         return null;
@@ -114,7 +114,6 @@ describe('TtsConfigPanel — cloud (ElevenLabs)', () => {
       provider: 'elevenlabs',
       api_key: 'sk-elevenlabs-1234'
     });
-    // Re-runs the system check and collapses on success (same as the LLM panel).
     await waitFor(() => expect(oncheck).toHaveBeenCalledOnce());
     expect(oncollapse).toHaveBeenCalledOnce();
   });
@@ -150,7 +149,6 @@ describe('TtsConfigPanel — cloud (ElevenLabs)', () => {
     expect(keyField).not.toHaveValue('sk-saved-eleven');
     expect(keyField).toHaveAttribute('placeholder', expect.stringMatching(/saved/i));
 
-    // Save disabled until the user edits the key.
     expect(save).toBeDisabled();
 
     await fireEvent.focus(keyField);
@@ -190,7 +188,6 @@ describe('TtsConfigPanel — local engine detection', () => {
 
     render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
 
-    // Engine detected on disk → voice selectors render; no "Download Kokoro".
     await waitFor(() => expect(screen.getByText(/kokoro engine ready/i)).toBeInTheDocument());
     expect(screen.queryByRole('button', { name: /download kokoro/i })).not.toBeInTheDocument();
   });

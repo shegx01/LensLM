@@ -25,37 +25,19 @@ use crate::LensError;
 use super::json::{Segment, Sink, strip_bom, validate_utf8, walk_value};
 use super::{ExtractOutput, Extractor};
 
-/// Maximum number of YAML documents processed from a multi-document stream.
-/// A pathological stream of thousands of `---`-separated documents would
-/// otherwise fan out unbounded work; documents beyond this cap are dropped with
-/// a `tracing::warn!` (never silently).
+/// Cap on documents from a multi-doc stream; excess are dropped with `tracing::warn!`.
 const MAX_YAML_DOCUMENTS: usize = 1024;
 
-/// Maximum YAML structural nesting depth enforced by `serde_saphyr`'s pre-parse
-/// budget (finding H2). serde_saphyr's own default is `max_depth: 2000`; this
-/// tighter ceiling rejects pathologically deep YAML far earlier while staying
-/// comfortably above any legitimate configuration document.
+/// Tighter nesting budget than serde_saphyr's default (2000); rejects adversarial
+/// input far earlier while staying above any legitimate config document.
 const YAML_MAX_DEPTH: usize = 128;
 
-/// Stack size for the dedicated thread on which `serde_saphyr` deserializes.
-///
-/// WHY a scoped large stack: production calls [`YamlExtractor::extract`] under
-/// `tokio::task::spawn_blocking` (see `ingest.rs`), whose blocking-pool threads
-/// carry the default ~2 MB stack. serde_saphyr enforces [`YAML_MAX_DEPTH`] as a
-/// pre-parse *budget*, but it does so WHILE the recursive deserializer pulls
-/// events — so the deserializer recurses to ~`YAML_MAX_DEPTH` (≈3 MB of stack at
-/// depth 128) BEFORE the budget breach fires and returns `Err`. On a 2 MB stack
-/// that recursion overflows and crashes the worker instead of producing a clean
-/// error. Running the parse on a thread with this 8 MB stack (comfortably above
-/// the ~3 MB the depth-128 budget needs) guarantees the budget breach reliably
-/// returns `Err` regardless of the caller's stack — closing a DoS hole.
+/// Large stack for the YAML parse thread. serde_saphyr enforces `YAML_MAX_DEPTH`
+/// WHILE the recursive deserializer pulls events, recursing to ~3 MB at depth 128
+/// BEFORE the breach fires. A `spawn_blocking` thread's ~2 MB default overflows
+/// before the budget error is returned; 8 MB guarantees a clean `Err` instead.
 const YAML_PARSE_STACK_BYTES: usize = 8 * 1024 * 1024;
 
-/// Deserializes one YAML document into a [`Value`] on a dedicated thread with a
-/// [`YAML_PARSE_STACK_BYTES`] stack, so the [`YAML_MAX_DEPTH`] budget breach
-/// returns an `Err` instead of overflowing the caller's (possibly ~2 MB) stack.
-/// A panic inside the parse thread (or a join failure) is converted into a
-/// [`LensError::Parse`] rather than being allowed to unwind into a crash.
 fn parse_yaml_document(doc_src: &str) -> Result<Value, LensError> {
     let owned = doc_src.to_owned();
     let handle = std::thread::Builder::new()
@@ -71,10 +53,8 @@ fn parse_yaml_document(doc_src: &str) -> Result<Value, LensError> {
         .map_err(|_| LensError::Parse("YAML parse thread panicked".to_string()))?
 }
 
-/// Builds the `serde_saphyr` deserialization options with our tightened nesting
-/// budget. All other budget limits keep their library defaults. The `options!`
-/// / `budget!` macros are the crate's supported construction path (direct
-/// struct-literal construction of `Options`/`Budget` is `#[deprecated]`).
+/// Builds serde_saphyr options with our tightened depth budget. `options!`/`budget!`
+/// macros are the crate's supported path (direct struct construction is `#[deprecated]`).
 fn yaml_options() -> Options {
     serde_saphyr::options! {
         budget: serde_saphyr::budget! {
@@ -83,34 +63,20 @@ fn yaml_options() -> Options {
     }
 }
 
-/// Splits a YAML stream into its constituent document source slices using a
-/// spec-aware boundary scan: a boundary marker must be at column 0 (no leading
-/// whitespace). Per the YAML spec, block-scalar content (`|` / `>`) is ALWAYS
-/// indented relative to its key, so a `---` or `...` appearing inside a block
-/// scalar is never at column 0 — column-0 checking is therefore sufficient and
-/// no explicit block-scalar indentation tracking is performed.
-///
-/// A document boundary is a line whose TRIMMED-of-trailing form is exactly `---`
-/// or starts with `--- ` (a directives-end marker at column 0). A line that is
-/// exactly `...` (or starts with `... `) at column 0 ends the current document.
-///
-/// Returns the non-empty document slices in order. An input with no explicit
-/// boundary markers yields a single document (the whole input).
+/// Splits a YAML stream on spec-aware `---`/`...` boundaries at column 0.
+/// Block-scalar content is always indented so a `---` inside a block scalar
+/// never appears at column 0 — no explicit indentation tracking is needed.
 fn split_documents(s: &str) -> Vec<&str> {
-    // Byte offsets at which each document's content begins (after the marker).
     let mut docs: Vec<&str> = Vec::new();
     let mut doc_start: usize = 0;
     let mut pos: usize = 0;
 
-    // Walk line by line tracking byte offsets so slices are exact.
     while pos <= s.len() {
         let line_end = s[pos..].find('\n').map(|i| pos + i + 1).unwrap_or(s.len());
         let line = &s[pos..line_end];
-        // The line content without the trailing newline, for marker detection.
         let trimmed_nl = line.strip_suffix('\n').unwrap_or(line);
         let trimmed_nl = trimmed_nl.strip_suffix('\r').unwrap_or(trimmed_nl);
 
-        // A boundary marker must be at column 0 (no leading whitespace).
         let is_doc_start = trimmed_nl == "---" || trimmed_nl.starts_with("--- ");
         let is_doc_end = trimmed_nl == "..." || trimmed_nl.starts_with("... ");
 
@@ -126,8 +92,6 @@ fn split_documents(s: &str) -> Vec<&str> {
             // A leading `---` just opens the first document; skip the marker.
             doc_start = line_end;
         } else if is_doc_end {
-            // End the current document at the marker; the next document (if any)
-            // begins after it. A `...` with no following `---` simply terminates.
             let slice = &s[doc_start..pos];
             if !slice.trim().is_empty() {
                 docs.push(slice);
@@ -145,7 +109,6 @@ fn split_documents(s: &str) -> Vec<&str> {
         }
     }
 
-    // Push the trailing document (content after the last boundary).
     if doc_start < s.len() {
         let slice = &s[doc_start..];
         if !slice.trim().is_empty() {
@@ -167,8 +130,6 @@ impl Extractor for YamlExtractor {
         let docs = split_documents(s);
         let multi_doc = docs.len() > 1;
 
-        // Cap the number of documents processed to bound fan-out on a
-        // pathological multi-document stream; warn (never silently) on truncation.
         let docs: &[&str] = if docs.len() > MAX_YAML_DOCUMENTS {
             tracing::warn!(
                 total = docs.len(),
@@ -196,10 +157,6 @@ impl Extractor for YamlExtractor {
         Ok(sink.finish())
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests (TDD: RED first)
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -292,7 +249,6 @@ mod tests {
     #[test]
     fn yaml_multi_document_two_docs() {
         let out = extract("---\na: 1\n---\nb: 2\n");
-        // Both documents contribute blocks, prefixed with [0] / [1].
         let first = out
             .blocks
             .iter()
@@ -311,7 +267,6 @@ mod tests {
     #[test]
     fn yaml_single_document_no_separator() {
         let out = extract("a: 1\n");
-        // No `[N]` prefix for a single document.
         let b = &out.blocks[0];
         assert_eq!(b.text, "/a: 1");
         assert!(!b.section_path.starts_with('['));
@@ -335,17 +290,13 @@ mod tests {
 
     #[test]
     fn yaml_multi_document_trailing_ellipsis() {
-        // A trailing `...` terminator must not produce an extra empty document.
         let out = extract("a: 1\n...\n");
-        // Single document, no `[N]` prefix.
         assert_eq!(out.blocks.len(), 1);
         assert_eq!(out.blocks[0].text, "/a: 1");
     }
 
     #[test]
     fn yaml_multi_document_count_capped() {
-        // Build a stream of MAX_YAML_DOCUMENTS + 50 single-key documents.
-        // Only the first MAX_YAML_DOCUMENTS must be processed (one block each).
         let extra = 50;
         let total = MAX_YAML_DOCUMENTS + extra;
         let mut s = String::new();
@@ -359,7 +310,6 @@ mod tests {
             MAX_YAML_DOCUMENTS,
             "only the first {MAX_YAML_DOCUMENTS} documents are processed"
         );
-        // The last processed document is index MAX_YAML_DOCUMENTS - 1.
         let last_idx = MAX_YAML_DOCUMENTS - 1;
         assert!(
             out.blocks
@@ -367,7 +317,6 @@ mod tests {
                 .any(|b| b.text == format!("/{last_idx}/k: {last_idx}")),
             "last in-cap document present"
         );
-        // A dropped document (the very last one) must NOT appear.
         let dropped_idx = total - 1;
         assert!(
             !out.blocks
@@ -380,21 +329,10 @@ mod tests {
 
     #[test]
     fn yaml_deeply_nested_rejected_by_budget() {
-        // A YAML mapping nested far beyond YAML_MAX_DEPTH must be rejected by
-        // serde_saphyr's depth budget (a Parse error), not silently accepted —
-        // and crucially, WITHOUT crashing on the caller's stack.
-        //
-        // serde_saphyr enforces the budget WHILE the recursive deserializer
-        // pulls events, so the deserializer recurses to ~depth before the breach
-        // fires. At YAML_MAX_DEPTH (128) that recursion needs ~3 MB of stack —
-        // more than a `spawn_blocking` worker's (or this test harness's) default
-        // ~2 MB stack. The guard now runs the parse on its own
-        // YAML_PARSE_STACK_BYTES (8 MB) thread, so it returns a clean `Err`
-        // regardless of the caller's stack. This test therefore exercises the
-        // PRODUCTION path directly — calling `YamlExtractor::extract` on the
-        // default test thread, NOT a hand-rolled large-stack thread — proving the
-        // guard no longer depends on the caller providing a big stack.
-        let depth = 200; // well beyond YAML_MAX_DEPTH (128)
+        // Exercises the PRODUCTION path on the default test thread (not a hand-rolled
+        // large-stack thread), proving the 8 MB parse-thread guard returns a clean Err
+        // regardless of the caller's stack. See YAML_PARSE_STACK_BYTES for context.
+        let depth = 200;
         let mut s = String::new();
         for i in 0..depth {
             for _ in 0..i {
@@ -438,7 +376,6 @@ mod tests {
 
     #[test]
     fn yaml_invalid_yaml_returns_parse_error() {
-        // Unbalanced flow mapping is invalid YAML.
         let err = YamlExtractor
             .extract(b"a: [1, 2\nb: }")
             .expect_err("malformed YAML errors");

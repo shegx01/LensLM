@@ -1,8 +1,5 @@
 <!-- PROP CONTRACT (do not change without updating +layout.svelte):
-     onadvance: () => void  — advance to 'add-sources' (after create_notebook, storing draft.notebookId)
-     onback:    () => void  — return to 'make-it-yours'
-     Reads/writes the shared draft via $lib/components/onboarding/onboarding-state.svelte.ts
-     (draft.nbName, draft.nbDesc, draft.focusMode, draft.notebookId). -->
+     onadvance → 'add-sources', onback → 'make-it-yours'. Reads/writes draft.nbName/nbDesc/focusMode/notebookId. -->
 <script lang="ts">
   import { invoke, isTauri } from '@tauri-apps/api/core';
   import ArrowRight from '@lucide/svelte/icons/arrow-right';
@@ -42,8 +39,7 @@
     submitting = true;
     createError = null;
     try {
-      // Within-session reuse: if notebookId already set the user went Back then
-      // Forward — skip creation to avoid a duplicate, just advance.
+      // Skip creation if user went Back then Forward — avoid a duplicate.
       if (draft.notebookId === null) {
         if (isTauri()) {
           const notebook = await invoke<{ id: string }>('create_notebook', {
@@ -70,13 +66,11 @@
 <main data-tauri-drag-region class="flex min-h-svh items-center justify-center p-6">
   <div class="w-full max-w-[520px]" style="-webkit-app-region: no-drag;">
     <Card class="w-full rounded-[14px] px-10 pt-9 pb-8 shadow-2xl ring-0 gap-0">
-      <!-- Header: Back + progress dots -->
       <div class="flex items-center justify-between mb-7">
         <OnboardingBackButton {onback} />
         <ProgressDots current={2} total={3} />
       </div>
 
-      <!-- Title + subtitle -->
       <h1
         class="m-0 mb-[6px] text-[20px] font-bold text-foreground leading-tight tracking-[-0.35px]"
       >
@@ -86,7 +80,6 @@
         Name your knowledge space and choose a focus mode
       </p>
 
-      <!-- Name field -->
       <div class="mb-3">
         <div
           class="text-[10px] font-bold text-muted-foreground tracking-[0.08em] uppercase mb-[7px]"
@@ -103,7 +96,6 @@
         />
       </div>
 
-      <!-- Description field (optional) -->
       <div class="mb-[22px]">
         <div
           class="text-[10px] font-bold text-muted-foreground tracking-[0.08em] uppercase mb-[7px]"
@@ -124,7 +116,6 @@
         ></textarea>
       </div>
 
-      <!-- Focus mode selector -->
       <div class="mb-7">
         <div
           class="text-[10px] font-bold text-muted-foreground tracking-[0.08em] uppercase mb-[10px]"
@@ -148,7 +139,6 @@
                   : 'border-border bg-card hover:border-muted-foreground/40 hover:bg-accent/30'
               ].join(' ')}
             >
-              <!-- Icon tile -->
               <div
                 class={[
                   'w-[34px] h-[34px] rounded-[9px] flex items-center justify-center mx-auto mb-[9px]',
@@ -159,7 +149,6 @@
                   class={['size-4', selected ? 'text-primary' : 'text-muted-foreground'].join(' ')}
                 />
               </div>
-              <!-- Label -->
               <div
                 class={[
                   'text-[13px] font-bold mb-[3px]',
@@ -168,14 +157,12 @@
               >
                 {mode.label}
               </div>
-              <!-- Description -->
               <div class="text-[10px] text-muted-foreground">{mode.desc}</div>
             </button>
           {/each}
         </div>
       </div>
 
-      <!-- Inline error -->
       {#if createError}
         <p
           class="flex items-center gap-1.5 text-destructive text-sm text-center justify-center mb-3"
@@ -186,7 +173,6 @@
         </p>
       {/if}
 
-      <!-- CTA button -->
       <Button
         class="h-[46px] w-full rounded-[10px] text-[15px] font-semibold"
         onclick={handleNext}

@@ -10,7 +10,6 @@ describe('Button', () => {
   it('default variant carries the bg-primary token class', () => {
     render(Host, { props: { label: 'Save' } });
     const btn = screen.getByRole('button', { name: 'Save' });
-    // Token-wired: the default variant must resolve to the semantic primary token.
     expect(btn.className).toContain('bg-primary');
     expect(btn.className).toContain('text-primary-foreground');
   });

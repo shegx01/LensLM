@@ -52,7 +52,6 @@ pub(crate) fn render_table_markdown(headers: &[String], rows: &[Vec<String>]) ->
     let ncols = headers.len();
     let mut out = String::new();
 
-    // Header row.
     out.push_str("| ");
     out.push_str(
         &headers
@@ -63,12 +62,10 @@ pub(crate) fn render_table_markdown(headers: &[String], rows: &[Vec<String>]) ->
     );
     out.push_str(" |\n");
 
-    // Separator row.
     out.push_str("| ");
     out.push_str(&vec!["---"; ncols].join(" | "));
     out.push_str(" |\n");
 
-    // Data rows (padded/truncated to header width).
     for row in rows {
         out.push_str("| ");
         let cells: Vec<String> = (0..ncols)
@@ -96,13 +93,9 @@ pub(crate) fn verbalize_row(headers: &[String], row: &[String]) -> String {
         .join("; ")
 }
 
-/// Escapes a cell value so it cannot break the markdown table grid: pipes and
-/// backticks are backslash-escaped and newlines/carriage-returns are flattened
-/// to spaces. A lone backtick would otherwise open a GFM code span that can
-/// swallow the cell's trailing ` | ` delimiter and break the table grid.
+/// Escapes `|`, backticks, and newlines so a cell cannot break the markdown grid.
 fn escape_cell(s: &str) -> String {
-    // Escape backslashes BEFORE pipes/backticks so the escape backslash we add
-    // isn't itself re-escaped.
+    // Escape backslashes first so the `\` we add isn't itself re-escaped.
     s.replace('\\', "\\\\")
         .replace('|', "\\|")
         .replace('`', "\\`")
@@ -140,7 +133,6 @@ mod tests {
             ], // long
         ];
         let md = render_table_markdown(&headers, &rows);
-        // Short row padded to 3 cols; long row truncated to 3 cols.
         assert!(md.contains("| 1 |  |  |\n"), "short row padded: {md:?}");
         assert!(md.contains("| 1 | 2 | 3 |\n"), "long row truncated: {md:?}");
     }
@@ -155,13 +147,10 @@ mod tests {
 
     #[test]
     fn render_table_markdown_escapes_backticks() {
-        // A lone backtick must be escaped so it cannot open a GFM code span that
-        // swallows the trailing ` | ` delimiter and breaks the table grid.
         let headers = vec!["H".to_string()];
         let rows = vec![vec!["a`b".to_string()]];
         let md = render_table_markdown(&headers, &rows);
         assert!(md.contains("| a\\`b |\n"), "escaped backtick cell: {md:?}");
-        // The grid is intact: the row still has exactly one trailing delimiter.
         assert!(md.lines().all(|l| l.is_empty() || l.ends_with(" |")));
     }
 
@@ -185,7 +174,6 @@ mod tests {
 
     #[test]
     fn render_table_markdown_multi_sheet_concatenation() {
-        // The caller concatenates per-sheet sections with a `## {sheet}` heading.
         let s1 = render_table_markdown(&["Name".to_string()], &[vec!["Alice".to_string()]]);
         let s2 = render_table_markdown(&["City".to_string()], &[vec!["NYC".to_string()]]);
         let doc = format!("## People\n\n{s1}\n## Cities\n\n{s2}");

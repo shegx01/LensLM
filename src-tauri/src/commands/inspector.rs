@@ -1,33 +1,18 @@
-//! Dev/QA Embeddings Inspector command (M4).
-//!
-//! A single read-only command that surfaces the extract→chunk→enrich→embed
-//! pipeline for a source: its chunks (full metadata) plus the notebook's active
-//! embedding-index stats. Gated behind `debug_assertions` so it never appears on
-//! the release command surface (mirrors `commands::system::stream_demo`).
-
-// The whole inspector surface is dev-only: the command, its response type, and
-// their `lens-core` imports are all `#[cfg(debug_assertions)]`-gated so the
-// release build carries none of it (and emits no dead-code warnings).
+//! Dev/QA Embeddings Inspector (M4): read-only command that surfaces a source's chunks
+//! and its notebook's active embedding-index stats. Gated behind `debug_assertions`
+//! so it never appears on the release command surface.
 #[cfg(debug_assertions)]
 use lens_core::{EmbeddingStats, InspectorChunk, LensEngine, LensError};
 #[cfg(debug_assertions)]
 use serde::Serialize;
 
-/// The inspector payload for one source: its chunks (ordered `level`,
-/// `token_start`) and the notebook's active embedding-index stats (one entry per
-/// active model/dim; empty when the notebook is not yet embedded).
 #[cfg(debug_assertions)]
 #[derive(Serialize)]
 pub struct InspectorResponse {
-    /// Every chunk of the source, with full per-chunk inspector metadata.
     pub chunks: Vec<InspectorChunk>,
-    /// One entry per ACTIVE `(model, dim)` for the notebook; empty when unembedded.
     pub stats: Vec<EmbeddingStats>,
 }
 
-/// Reads a source's chunks and its notebook's active embedding stats for the
-/// dev/QA Embeddings Inspector. Read-only. Dev-only: `#[cfg(debug_assertions)]`
-/// keeps it off the release command surface.
 #[cfg(debug_assertions)]
 #[tracing::instrument(skip_all)]
 #[tauri::command]
@@ -54,9 +39,6 @@ mod tests {
         app.manage(LensEngine::for_test().await);
         let engine = app.state::<LensEngine>();
 
-        // Seed a notebook + source via the engine, then chunk + embedding_index
-        // rows via raw SQL (for_test() stubs the embed worker, so ingest yields
-        // neither chunks nor registry rows).
         let pool = engine.pool().await;
         let nb = engine
             .create_notebook("Notebook", None, None)

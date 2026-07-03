@@ -4,16 +4,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import MakeItYours from './MakeItYours.svelte';
 import { draft, resetDraft } from '$lib/components/onboarding/onboarding-state.svelte.js';
 
-// Stub document.documentElement.dataset so happy-dom doesn't throw
-// when the component writes `document.documentElement.dataset.accent`.
 function getAccentAttr(): string | undefined {
   return document.documentElement.dataset.accent;
 }
 
 beforeEach(() => {
-  // Reset draft between tests so module-singleton state doesn't leak.
   resetDraft();
-  // Clear the data-accent attribute.
   delete document.documentElement.dataset.accent;
 });
 

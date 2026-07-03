@@ -119,12 +119,6 @@ describe('AccountFooter', () => {
     expect(screen.getByText(/switch theme/i)).toBeInTheDocument();
   });
 
-  // -------------------------------------------------------------------------
-  // Embeddings Inspector (DEV-only) menu item — consensus fix #3.
-  // The real notebooks store starts with activeNotebookId = null, so the item
-  // must render DISABLED.
-  // -------------------------------------------------------------------------
-
   it('renders the Embeddings Inspector item in DEV, disabled when no active notebook', async () => {
     render(AccountFooter, { props: { userName: 'Jamie' } });
     await fireEvent.click(screen.getByRole('button', { name: /account menu/i }));

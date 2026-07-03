@@ -1,16 +1,10 @@
-// SYNC-CHECK: must match lens-core/src/notebooks.rs InspectorChunk struct (around line 348)
-// SYNC-CHECK: must match lens-core/src/notebooks.rs EmbeddingStats struct (around line 385)
-//
-// TypeScript mirrors of the dev/QA Embeddings Inspector Rust structs. serde on
-// the Rust side uses verbatim snake_case field names (NO `#[serde(rename)]`), so
-// these shapes must match exactly. `Option<T>` on the Rust side ⇒ `T | null`.
+// SYNC-CHECK: must match lens-core/src/notebooks.rs InspectorChunk + EmbeddingStats structs.
+// serde uses verbatim snake_case field names; `Option<T>` ⇒ `T | null`.
 
-/** Chunk `kind` discriminant — mirrors the `chunk::kind` constants in
- * lens-core/src/chunk.rs (`PARENT`/`CHILD`/`SUMMARY`). `parent` = level 0,
- * `child` = level 1, `summary` = level 2. */
+/** Mirrors `chunk::kind` constants in lens-core/src/chunk.rs (`PARENT`/`CHILD`/`SUMMARY`). */
 export type InspectorChunkKind = 'parent' | 'child' | 'summary';
 
-// SYNC-CHECK: must match lens-core/src/notebooks.rs InspectorChunk struct (around line 348)
+// SYNC-CHECK: must match lens-core/src/notebooks.rs InspectorChunk struct.
 export interface InspectorChunk {
   id: string;
   parent_id: string | null;
@@ -25,17 +19,15 @@ export interface InspectorChunk {
   embedding_text: string | null;
 }
 
-// SYNC-CHECK: must match lens-core/src/notebooks.rs EmbeddingStats struct (around line 385)
+// SYNC-CHECK: must match lens-core/src/notebooks.rs EmbeddingStats struct.
 export interface EmbeddingStats {
   model: string;
   dim: number;
   status: string;
 }
 
-// SYNC-CHECK: must match src-tauri/src/commands/inspector.rs InspectorResponse struct
-// NOTE: `stats` is an ARRAY — a notebook may have multiple active embedding-index
-// rows (partial-unique `uq_embidx_active(notebook_id, model, dim)`), so the header
-// renders one badge per entry.
+// SYNC-CHECK: must match src-tauri/src/commands/inspector.rs InspectorResponse struct.
+// `stats` is an ARRAY — a notebook may have multiple active embedding-index rows.
 export interface InspectorResponse {
   chunks: InspectorChunk[];
   stats: EmbeddingStats[];

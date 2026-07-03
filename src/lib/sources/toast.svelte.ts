@@ -1,12 +1,4 @@
-// Minimal toast primitive for Lens.
-//
-// Module-level `$state` singleton — reactive array of active toasts.
-// Import specifier for consumers:
-//   - Same directory (e.g. dragDrop.ts):  './toast.svelte.js'
-//   - From $lib path:                     '$lib/sources/toast.svelte.js'
-//
-// The ToastContainer component mounts once at the app-shell level (+layout.svelte)
-// and renders this reactive array.
+// Minimal toast primitive — module-level `$state` singleton consumed by `ToastContainer` in +layout.svelte.
 
 // ---------------------------------------------------------------------------
 // Types
@@ -20,12 +12,11 @@ export interface ToastMessage {
 }
 
 // ---------------------------------------------------------------------------
-// Reactive state (Svelte 5 runes — requires .svelte.ts extension)
+// Reactive state
 // ---------------------------------------------------------------------------
 
 let _toasts = $state<ToastMessage[]>([]);
 
-/** Reactive store object — matches the getter pattern used throughout this codebase. */
 export const toastStore = {
   get toasts(): ToastMessage[] {
     return _toasts;

@@ -4,20 +4,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import CreateNotebook from './CreateNotebook.svelte';
 import { draft, resetDraft } from '$lib/components/onboarding/onboarding-state.svelte.js';
 
-// ── Helpers ────────────────────────────────────────────────────────────────
-
 function stubNotebook(id = 'nb-001') {
   mockIPC((cmd) => {
     if (cmd === 'create_notebook') return { id };
   });
 }
 
-// ── Lifecycle ──────────────────────────────────────────────────────────────
-
 beforeEach(() => {
-  // Activate the Tauri path (isTauri() reads globalThis.isTauri in tests).
   (globalThis as { isTauri?: boolean }).isTauri = true;
-  // Always start from a clean draft so tests are independent.
   resetDraft();
 });
 
@@ -26,8 +20,6 @@ afterEach(() => {
   delete (globalThis as { isTauri?: boolean }).isTauri;
   resetDraft();
 });
-
-// ── Rendering ──────────────────────────────────────────────────────────────
 
 describe('CreateNotebook — initial render', () => {
   it('renders title and subtitle', () => {
@@ -50,8 +42,6 @@ describe('CreateNotebook — initial render', () => {
     expect(screen.getByRole('button', { name: 'Back' })).toBeInTheDocument();
   });
 });
-
-// ── Next button disabled/enabled by name ──────────────────────────────────
 
 describe('CreateNotebook — Next button gate', () => {
   it('Next is disabled when name is empty', () => {
@@ -76,8 +66,6 @@ describe('CreateNotebook — Next button gate', () => {
     expect(screen.getByRole('button', { name: 'Next — add sources' })).toBeDisabled();
   });
 });
-
-// ── Focus mode selection ───────────────────────────────────────────────────
 
 describe('CreateNotebook — focus mode selection', () => {
   it('"research" is selected by default (aria-checked=true)', () => {
@@ -119,8 +107,6 @@ describe('CreateNotebook — focus mode selection', () => {
   });
 });
 
-// ── Back button ───────────────────────────────────────────────────────────
-
 describe('CreateNotebook — Back button', () => {
   it('fires onback when Back is clicked', async () => {
     const onback = vi.fn();
@@ -137,8 +123,6 @@ describe('CreateNotebook — Back button', () => {
     expect(onadvance).not.toHaveBeenCalled();
   });
 });
-
-// ── Notebook creation IPC flow ────────────────────────────────────────────
 
 describe('CreateNotebook — create_notebook IPC', () => {
   it('calls create_notebook and fires onadvance when Next is clicked with a name', async () => {
@@ -195,7 +179,6 @@ describe('CreateNotebook — create_notebook IPC', () => {
   });
 
   it('skips create_notebook if draft.notebookId is already set (Back→Forward reuse)', async () => {
-    // Pre-seed the notebookId as if the user came Back.
     draft.notebookId = 'existing-nb';
     const onadvance = vi.fn();
     const createNotebook = vi.fn();
@@ -210,7 +193,6 @@ describe('CreateNotebook — create_notebook IPC', () => {
     await fireEvent.click(screen.getByRole('button', { name: 'Next — add sources' }));
 
     await waitFor(() => expect(onadvance).toHaveBeenCalledOnce());
-    // create_notebook must NOT have been called again.
     expect(createNotebook).not.toHaveBeenCalled();
   });
 
@@ -244,7 +226,6 @@ describe('CreateNotebook — create_notebook IPC', () => {
     await fireEvent.input(screen.getByLabelText('Notebook name'), {
       target: { value: 'No Description Notebook' }
     });
-    // Leave description empty (default)
     await fireEvent.click(screen.getByRole('button', { name: 'Next — add sources' }));
 
     await waitFor(() => expect(createNotebook).toHaveBeenCalledOnce());

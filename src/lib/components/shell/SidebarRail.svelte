@@ -3,10 +3,8 @@
   import { notebookStore } from '$lib/notebooks/index.js';
 
   /**
-   * SidebarRail is the floating left-rail panel. Collapse/expand is controlled
-   * ONLY by the collapse button (no hover behaviour). The parent grid column
-   * width follows `notebookStore.sidebarCollapsed` (88px collapsed / 256px
-   * expanded); this panel fills whatever cell width it is given.
+   * Floating left-rail panel. Collapse/expand is button-only (no hover behaviour).
+   * Fills whatever cell width the parent grid assigns.
    */
   let {
     onnewnotebook,

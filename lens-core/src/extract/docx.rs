@@ -23,17 +23,12 @@ use crate::parse::{Block, BlockType, SectionPathStack};
 
 use super::{ExtractOutput, Extractor, SourceAnchor};
 
-// ---------------------------------------------------------------------------
-// Heading-style detection
-// ---------------------------------------------------------------------------
-
-/// Returns the heading level (1–6) if `style_id` looks like a Word heading style
-/// (`Heading1`…`Heading6`, case-insensitive, with optional space/dash separating
-/// the number), otherwise `None`.
+/// Returns the heading level (1–6) for a Word heading style id
+/// (`Heading1`…`Heading6`, case-insensitive, optional space/dash separator),
+/// or `None`.
 fn heading_level(style_id: &str) -> Option<u8> {
     let s = style_id.to_lowercase();
     let s = s.trim();
-    // Accept "heading1", "heading 1", "heading-1" etc.
     let digits = s
         .strip_prefix("heading")
         .map(|rest| rest.trim_matches(|c: char| c == ' ' || c == '-' || c == '_'));
@@ -48,16 +43,8 @@ fn heading_level(style_id: &str) -> Option<u8> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Text extraction helpers
-// ---------------------------------------------------------------------------
-
-/// Extracts the plain text from a single `docx_rs::Paragraph`.
-///
-/// Concatenates the `text` field of every [`RunChild::Text`] across every
-/// [`ParagraphChild::Run`] in document order.  All other run children
-/// (line-breaks, tab stops, field chars, etc.) are silently ignored — this is
-/// appropriate for Phase 2's linearisation scope.
+/// Extracts plain text from a `docx_rs::Paragraph` by concatenating all
+/// `RunChild::Text` values. Non-text run children are ignored.
 fn para_text(p: &docx_rs::Paragraph) -> String {
     let mut buf = String::new();
     for pc in &p.children {
@@ -72,18 +59,15 @@ fn para_text(p: &docx_rs::Paragraph) -> String {
     buf
 }
 
-/// Extracts the plain text from a `docx_rs::Table` by walking rows → cells →
-/// paragraphs.  Cells are separated by `"  "` (two spaces), rows by a single
-/// `"\n"`.  The result is the linearised table text used as the single
-/// `"table"` block's content.
+/// Extracts linearised table text (cells separated by two spaces, rows by `\n`).
+///
+/// The `#[allow(irrefutable_let_patterns)]` guards are deliberate future-proofing:
+/// `TableChild`/`TableRowChild` are single-variant today, but if an additive
+/// upstream variant is added the `else { continue }` degrades gracefully instead
+/// of failing to compile.
 fn table_text(tbl: &Table) -> String {
     let mut rows: Vec<String> = Vec::new();
     for row_child in &tbl.rows {
-        // `TableChild` / `TableRowChild` are single-variant enums in the current
-        // docx-rs, so these patterns are irrefutable today; the `else { continue }`
-        // is deliberate future-proofing so an additive upstream variant degrades
-        // to "skip the unknown child" rather than failing to compile (matching the
-        // skip-unknown pattern used for `DocumentChild` in `extract` below).
         #[allow(irrefutable_let_patterns)]
         let TableChild::TableRow(row) = row_child else {
             continue;
@@ -113,37 +97,15 @@ fn table_text(tbl: &Table) -> String {
     rows.join("\n")
 }
 
-// ---------------------------------------------------------------------------
-// DocxExtractor
-// ---------------------------------------------------------------------------
-
 /// DOCX extractor — implements [`Extractor`] via `docx-rs`.
-///
-/// Parses the raw `.docx` bytes and walks the top-level document children:
-/// - Heading paragraphs → `"heading"` blocks with an updated `section_path`.
-/// - Tables → a single `"table"` block (linearised cell text).
-/// - Body paragraphs → `"paragraph"` blocks.
-///
-/// Empty paragraphs (no run text) are skipped to avoid spurious blank blocks.
-///
-/// The `extracted_text` buffer is built incrementally; each block's
-/// `char_start..char_end` indexes into it byte-identically.
 pub struct DocxExtractor;
 
 impl Extractor for DocxExtractor {
     fn extract(&self, raw: &[u8]) -> Result<ExtractOutput, LensError> {
-        // ZIP-BOMB RISK: `read_docx` (docx-rs 0.4.20 → zip 0.6.6) decompresses the
-        // DOCX (a ZIP) with NO intermediate inflation limit, so a small crafted
-        // archive could inflate to large transient memory here. Current mitigation
-        // is bounded and accepted for Phase 2:
-        //   1. Stage-1 raw-bytes cap (the configurable `max_source_bytes`, default
-        //      50 MB via `AppConfig.max_source_mb`) rejects the source in
-        //      `run_ingest` BEFORE this call, capping the compressed input.
-        //   2. Stage-2 caps the resulting `extracted_text` length post-extraction.
-        //   3. This whole extraction runs under `spawn_blocking`, so a panic
-        //      (e.g. allocator abort) is isolated to the task, not the runtime.
-        // Stage-1 + Stage-2 bound BOTH the input and the retained output; only the
-        // transient in-`read_docx` inflation is unbounded.
+        // ZIP-BOMB RISK: `read_docx` decompresses with no intermediate inflation
+        // limit. Stage-1 (max_source_bytes) bounds the compressed input; Stage-2
+        // bounds the resulting extracted_text. Only the transient in-read_docx
+        // inflation is unbounded.
         // TODO(phase-3): bound intermediate inflation (zip backend swap / size-checked reader).
         let docx = read_docx(raw)
             .map_err(|e| LensError::Parse(format!("docx-rs failed to parse DOCX: {e:?}")))?;
@@ -154,9 +116,7 @@ impl Extractor for DocxExtractor {
 
         let mut section_path = SectionPathStack::new();
 
-        // Paragraph counter and table counter — used to build unique node_paths.
-        // Each counter increments only for its own element type, so node_paths
-        // are always distinct (a paragraph and a table can never share a path).
+        // Per-type counters ensure distinct node_paths (para and table never share one).
         let mut para_count: usize = 0;
         let mut tbl_count: usize = 0;
 
@@ -164,10 +124,8 @@ impl Extractor for DocxExtractor {
             match child {
                 DocumentChild::Paragraph(p) => {
                     let node_path = format!("body/p[{para_count}]");
-                    // Increment BEFORE the empty-paragraph skip: node_path is the
-                    // document-child index, which must stay stable regardless of
-                    // which paragraphs are skipped (so anchors round-trip to the
-                    // original DOCX position even past blank paragraphs).
+                    // Increment before the empty-paragraph skip so node_path stays
+                    // stable regardless of which paragraphs are skipped.
                     para_count += 1;
 
                     let text = para_text(p);
@@ -175,7 +133,6 @@ impl Extractor for DocxExtractor {
                         continue; // skip blank paragraphs
                     }
 
-                    // Detect heading style.
                     let style_id = p
                         .property
                         .style
@@ -184,8 +141,7 @@ impl Extractor for DocxExtractor {
                         .unwrap_or("");
                     let level = heading_level(style_id);
 
-                    // Update section_path BEFORE emitting the heading block so
-                    // the heading itself carries the full trail it introduces.
+                    // Update before emitting so the heading carries its own trail.
                     if let Some(lvl) = level {
                         section_path.push(lvl, &text);
                     }
@@ -196,15 +152,12 @@ impl Extractor for DocxExtractor {
                         BlockType::Paragraph.as_str()
                     };
 
-                    // The section_path for a heading is the trail INCLUDING itself
-                    // (consistent with parse.rs: the heading block's section_path
-                    // includes its own text).
                     let sp = section_path.current();
 
                     let char_start = extracted_text.len();
                     extracted_text.push_str(&text);
                     extracted_text.push('\n');
-                    let char_end = extracted_text.len() - 1; // exclude the trailing \n from the block slice
+                    let char_end = extracted_text.len() - 1; // trailing \n excluded from block slice
 
                     blocks.push(Block {
                         block_type: btype.to_string(),
@@ -230,7 +183,7 @@ impl Extractor for DocxExtractor {
                     let char_start = extracted_text.len();
                     extracted_text.push_str(&text);
                     extracted_text.push('\n');
-                    let char_end = extracted_text.len() - 1; // exclude trailing \n
+                    let char_end = extracted_text.len() - 1; // trailing \n excluded
 
                     blocks.push(Block {
                         block_type: BlockType::Table.as_str().to_string(),
@@ -247,11 +200,7 @@ impl Extractor for DocxExtractor {
             }
         }
 
-        // Trim trailing newlines from extracted_text while keeping all block
-        // offsets valid (blocks were built against indices before trimming, so
-        // we only trim content that's beyond the last block's char_end).
-        // This is safe because the last '\n' was never included in any block's
-        // char_end.
+        // The trailing '\n' was never part of any block's char_end; safe to trim.
         while extracted_text.ends_with('\n') {
             extracted_text.pop();
         }
@@ -265,10 +214,6 @@ impl Extractor for DocxExtractor {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests (TDD: RED written first, GREEN implemented above)
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
@@ -276,16 +221,7 @@ mod tests {
     use super::*;
     use crate::extract::ExtractOutput;
 
-    // -----------------------------------------------------------------------
-    // Fixture builder
-    // -----------------------------------------------------------------------
-
-    /// Builds a tiny DOCX in memory using `docx-rs`'s write API:
-    ///   - one Heading1 paragraph ("Test Heading")
-    ///   - one body paragraph ("Sentinel body text for extraction.")
-    ///   - one 2×2 table with cells "Cell A1" / "Cell A2" / "Cell B1" / "Cell B2"
-    ///
-    /// This is the SAME DOCX reused by all tests in this module.
+    /// Builds a minimal fixture DOCX: Heading1, body paragraph, 2×2 table.
     fn build_fixture_docx() -> Vec<u8> {
         use docx_rs::{Docx, Paragraph, Run, Table, TableCell, TableRow};
         let docx = Docx::new()
@@ -326,10 +262,6 @@ mod tests {
             .expect("fixture DOCX extraction must succeed")
     }
 
-    // -----------------------------------------------------------------------
-    // AC4a — byte-identity: extracted_text[b.char_start..b.char_end] == b.text
-    // -----------------------------------------------------------------------
-
     #[test]
     fn docx_byte_identity() {
         let out = extract_fixture();
@@ -346,10 +278,6 @@ mod tests {
             );
         }
     }
-
-    // -----------------------------------------------------------------------
-    // AC4c — extraction fidelity: known substrings present in extracted_text
-    // -----------------------------------------------------------------------
 
     #[test]
     fn docx_sentinel_body_text_present() {
@@ -376,10 +304,6 @@ mod tests {
             out.extracted_text
         );
     }
-
-    // -----------------------------------------------------------------------
-    // AC5 — anchors: len == blocks.len(), all Docx, node_paths distinct
-    // -----------------------------------------------------------------------
 
     #[test]
     fn docx_anchors_index_aligned() {
@@ -412,10 +336,6 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // AC5 / AC10 — structural: block types, section_path, heading detection
-    // -----------------------------------------------------------------------
-
     #[test]
     fn docx_heading_block_present() {
         let out = extract_fixture();
@@ -425,7 +345,6 @@ mod tests {
             .find(|b| b.block_type == BlockType::Heading.as_str())
             .expect("at least one heading block expected");
         assert_eq!(heading.text, "Test Heading");
-        // The heading's section_path includes its own text (mirrors parse.rs).
         assert!(
             heading.section_path.contains("Test Heading"),
             "heading section_path must include the heading text; got {:?}",
@@ -442,7 +361,6 @@ mod tests {
             .find(|b| b.block_type == BlockType::Paragraph.as_str())
             .expect("at least one paragraph block expected");
         assert_eq!(para.text, "Sentinel body text for extraction.");
-        // The paragraph is nested under the H1 heading.
         assert!(
             para.section_path.contains("Test Heading"),
             "paragraph section_path must inherit the heading trail; got {:?}",
@@ -482,15 +400,9 @@ mod tests {
         assert!(para_pos < table_pos, "paragraph must come before table");
     }
 
-    // -----------------------------------------------------------------------
-    // AC10 — snapshot: stable block structure
-    // -----------------------------------------------------------------------
-
     #[test]
     fn docx_snapshot_block_structure() {
         let out = extract_fixture();
-        // Serialise just the structural fields (not char offsets, which are
-        // layout-dependent) so the snapshot remains stable.
         #[derive(serde::Serialize)]
         struct BlockSnapshot<'a> {
             block_type: &'a str,
@@ -509,24 +421,16 @@ mod tests {
         insta::assert_json_snapshot!("docx_block_structure", snaps);
     }
 
-    // -----------------------------------------------------------------------
-    // Heading-level helper
-    // -----------------------------------------------------------------------
-
     #[test]
     fn heading_level_detection() {
         assert_eq!(heading_level("Heading1"), Some(1));
         assert_eq!(heading_level("Heading2"), Some(2));
         assert_eq!(heading_level("Heading6"), Some(6));
-        assert_eq!(heading_level("heading1"), Some(1)); // case-insensitive
+        assert_eq!(heading_level("heading1"), Some(1));
         assert_eq!(heading_level("Normal"), None);
         assert_eq!(heading_level(""), None);
         assert_eq!(heading_level("HeadingX"), None);
     }
-
-    // -----------------------------------------------------------------------
-    // Error handling: invalid bytes
-    // -----------------------------------------------------------------------
 
     #[test]
     fn docx_invalid_bytes_returns_parse_error() {
@@ -539,10 +443,6 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // Section-path stack
-    // -----------------------------------------------------------------------
-
     #[test]
     fn section_path_push_and_current() {
         let mut sp = SectionPathStack::new();
@@ -551,17 +451,11 @@ mod tests {
         assert_eq!(sp.current(), "Chapter 1");
         sp.push(2, "Section 1.1");
         assert_eq!(sp.current(), "Chapter 1 > Section 1.1");
-        // A second H2 replaces the previous H2 and all H3+.
         sp.push(2, "Section 1.2");
         assert_eq!(sp.current(), "Chapter 1 > Section 1.2");
-        // An H1 clears everything below level 1 and replaces it.
         sp.push(1, "Chapter 2");
         assert_eq!(sp.current(), "Chapter 2");
     }
-
-    // -----------------------------------------------------------------------
-    // Multi-heading section_path inheritance
-    // -----------------------------------------------------------------------
 
     #[test]
     fn docx_multi_heading_section_path() {

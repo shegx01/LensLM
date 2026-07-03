@@ -70,12 +70,9 @@ function makeConfig(
 beforeEach(async () => {
   vi.clearAllMocks();
   resetNotebookStore();
-  // Default: non-Tauri environment (preserves old synchronous test behavior).
   mockIsTauri.mockReturnValue(false);
-  // Reset listNotebooks to empty list so each test starts clean.
   const { listNotebooks } = await import('$lib/notebooks/ipc.js');
   vi.mocked(listNotebooks).mockResolvedValue([]);
-  // Default: get_config returns config with reopen_last_notebook: true.
   vi.mocked(invoke).mockResolvedValue(makeConfig(true));
 });
 
@@ -86,12 +83,9 @@ afterEach(() => {
 describe('AppShell.svelte', () => {
   it('renders the sidebar, the centre empty state, and the right rail', async () => {
     render(AppShell);
-    // Left rail: NotebooksSidebar renders the "Notebooks" section label + search trigger.
     expect(screen.getByText('Notebooks')).toBeInTheDocument();
     expect(screen.getByLabelText(/search notebooks/i)).toBeInTheDocument();
-    // Right rail: SourcesRail renders "Sources" heading.
     expect(screen.getByText('Sources')).toBeInTheDocument();
-    // Centre: empty state renders after loading completes (gated on !loading).
     await vi.waitFor(() => {
       expect(screen.getByText('Your workspace')).toBeInTheDocument();
       expect(screen.getByText(/select or create a notebook/i)).toBeInTheDocument();
@@ -100,7 +94,6 @@ describe('AppShell.svelte', () => {
 
   it('uses semantic landmarks for the regions', () => {
     const { container } = render(AppShell);
-    // Two <aside> rails + one <main> workspace.
     expect(container.querySelectorAll('aside')).toHaveLength(2);
     expect(container.querySelector('main')).not.toBeNull();
   });
@@ -121,7 +114,6 @@ describe('AppShell.svelte', () => {
   it('collapsed rail shows the icon-only layout (no hover behaviour)', () => {
     notebookStore.sidebarCollapsed = true;
     render(AppShell);
-    // Collapsed: icon rail → "Expand sidebar" affordance, no "Notebooks" label.
     expect(screen.getByRole('button', { name: /expand sidebar/i })).toBeInTheDocument();
     expect(screen.queryByText('Notebooks')).not.toBeInTheDocument();
   });
@@ -132,7 +124,6 @@ describe('AppShell.svelte', () => {
     const rail = container.querySelector('[data-sidebar-rail]') as HTMLElement;
     expect(rail.tagName).toBe('ASIDE');
     expect(rail.className).not.toContain('absolute');
-    // No flyout overlay element exists at all anymore.
     expect(container.querySelector('[data-sidebar-flyout]')).toBeNull();
   });
 
@@ -166,17 +157,12 @@ describe('AppShell.svelte', () => {
   });
 
   it('onMount triggers listTrashed and listTrashedSources so badge counts load at startup', async () => {
-    // FIX C: verify both trash refresh helpers are called on mount without
-    // waiting for the user to open the Trash modal.
     render(AppShell);
-    // Allow the fire-and-forget promises to settle.
     await vi.waitFor(() => {
       expect(vi.mocked(listTrashed)).toHaveBeenCalled();
       expect(vi.mocked(listTrashedSources)).toHaveBeenCalled();
     });
   });
-
-  // ── Auto-select tests (last-active-notebook feature) ────────────────────
 
   it('auto-selects the first (MRU) notebook when reopen_last_notebook is true and notebooks exist', async () => {
     mockIsTauri.mockReturnValue(true);
@@ -187,7 +173,6 @@ describe('AppShell.svelte', () => {
     render(AppShell);
 
     await vi.waitFor(() => {
-      // With an active notebook, the workspace region (not the empty state) shows.
       expect(screen.queryByText(/select or create a notebook/i)).not.toBeInTheDocument();
     });
   });
@@ -207,12 +192,10 @@ describe('AppShell.svelte', () => {
 
   it('does NOT auto-select when notebook list is empty, and empty state is shown', async () => {
     mockIsTauri.mockReturnValue(true);
-    // listNotebooks is already mocked to [] by default.
     vi.mocked(invoke).mockResolvedValue(makeConfig(true));
 
     render(AppShell);
 
-    // After mount settles, empty state should still show.
     await vi.waitFor(() => {
       expect(screen.getByText(/select or create a notebook/i)).toBeInTheDocument();
     });

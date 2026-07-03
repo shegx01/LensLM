@@ -1,21 +1,7 @@
 <script lang="ts">
   // NotebookCreateDialog — Step 4.6 of M3.
-  //
-  // Controlled by the parent via `open` + `onOpenChange`. The parent (AppShell /
-  // NotebooksSidebar) owns the open state; the sidebar's "New notebook" button
-  // triggers it.
-  //
-  // Focus mode defaults to "research" (plan §4.6 acceptance criteria).
-  // Description field added per design brief even though the screenshot omits it.
-  //
-  // On success: calls createNotebookAction, closes dialog, and resets fields.
-  // On failure: shows an inline error banner and keeps the dialog open.
-  // Fields reset whenever the dialog re-opens (via $effect watching `open`).
-  //
-  // Visual fidelity: faithfully reproduces the design source (Lens.dc.html
-  // "New notebook" modal). Every design `c.*` color maps to a design-system
-  // token — no hardcoded colors. Custom circular close button (default shadcn
-  // × hidden via showCloseButton={false}) and a neutral icon tile in the header.
+  // Parent owns open state; fields reset on re-open. On success: closes + resets.
+  // On failure: shows inline error and keeps dialog open so the user can retry.
 
   import type { Component } from 'svelte';
   import BookOpen from '@lucide/svelte/icons/book-open';
@@ -38,23 +24,13 @@
   import { createNotebookAction, notebookStore } from '$lib/notebooks/index.js';
   import type { FocusMode } from '$lib/notebooks/types.js';
 
-  // ---------------------------------------------------------------------------
-  // Props
-  // ---------------------------------------------------------------------------
-
   let {
     open = false,
     onOpenChange
   }: {
-    /** Whether the dialog is visible. Parent owns this state. */
     open: boolean;
-    /** Called by the dialog when it wants to open or close itself. */
     onOpenChange: (v: boolean) => void;
   } = $props();
-
-  // ---------------------------------------------------------------------------
-  // Local form state
-  // ---------------------------------------------------------------------------
 
   let name = $state('');
   let description = $state('');
@@ -62,10 +38,8 @@
   let submitting = $state(false);
   let formError = $state<string | null>(null);
 
-  /** Ref to the name input for autofocus on open */
   let nameInputRef = $state<HTMLInputElement | null>(null);
 
-  // Reset all fields when the dialog opens so re-open shows a blank form.
   $effect(() => {
     if (open) {
       name = '';
@@ -73,20 +47,11 @@
       focusMode = 'research';
       formError = null;
       submitting = false;
-      // Autofocus the name field on open (microtask to allow DOM to settle)
       setTimeout(() => nameInputRef?.focus(), 0);
     }
   });
 
-  // ---------------------------------------------------------------------------
-  // Computed
-  // ---------------------------------------------------------------------------
-
   const canSubmit = $derived(name.trim().length > 0 && !submitting);
-
-  // ---------------------------------------------------------------------------
-  // Actions
-  // ---------------------------------------------------------------------------
 
   async function handleCreate(): Promise<void> {
     if (!canSubmit) return;
@@ -99,8 +64,6 @@
         focusMode
       );
       if (!created) {
-        // Action caught the failure internally and set the store error; surface
-        // it inline and keep the dialog open so the user can retry.
         formError = notebookStore.error ?? 'Could not create the notebook.';
         return;
       }
@@ -115,17 +78,13 @@
   }
 
   function handleKeydown(e: KeyboardEvent): void {
-    // Let Enter insert a newline in the DESCRIPTION textarea instead of submitting.
+    // Textarea Enter inserts a newline; don't submit from there.
     if ((e.target as HTMLElement)?.tagName === 'TEXTAREA') return;
     if (e.key === 'Enter' && canSubmit) {
       e.preventDefault();
       void handleCreate();
     }
   }
-
-  // ---------------------------------------------------------------------------
-  // Focus mode row definitions
-  // ---------------------------------------------------------------------------
 
   type FocusModeOption = {
     id: FocusMode;
@@ -156,13 +115,8 @@
     }
   ];
 
-  // Shared label style for section labels (Name / Description / Focus mode).
-  // Maps c.secLabel + the 10px/700/uppercase/.08em spec from the design source.
   const LABEL_CLASS = 'text-[10px] font-bold tracking-[0.08em] uppercase text-muted-foreground';
 
-  // Shared field-fill style (Name input + Description textarea).
-  // c.modInputBg → surface-raised (distinct/recessed from the card),
-  // c.modInputBdr → border, c.t1 → foreground.
   const FIELD_CLASS = cn(
     'w-full rounded-[10px] border border-border bg-surface-raised text-foreground',
     'text-sm outline-none transition-colors',
@@ -183,10 +137,8 @@
     showCloseButton={false}
   >
     <div class="px-[26px] pt-6 pb-[26px]">
-      <!-- ── Header ───────────────────────────────────────────────────────── -->
       <DialogHeader class="mb-[22px] flex-row items-center justify-between gap-2 space-y-0">
         <div class="flex items-center gap-2.5">
-          <!-- Neutral icon tile — c.iconBtnBg → bg-muted (NOT bg-primary/10) -->
           <div
             class="flex size-[30px] shrink-0 items-center justify-center rounded-[9px] bg-muted text-muted-foreground"
             aria-hidden="true"
@@ -203,7 +155,6 @@
           </div>
         </div>
 
-        <!-- Custom circular close — c.closeBtn → bg-muted, c.closeIcon → muted-fg -->
         <button
           type="button"
           aria-label="Close"
@@ -220,7 +171,6 @@
         </button>
       </DialogHeader>
 
-      <!-- ── Body ─────────────────────────────────────────────────────────── -->
       <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
       <form
         onsubmit={(e) => {
@@ -229,7 +179,6 @@
         }}
         onkeydown={handleKeydown}
       >
-        <!-- Name field -->
         <div class="mb-[18px] flex flex-col gap-[7px]">
           <label for="notebook-name" class={LABEL_CLASS}>Name</label>
           <input
@@ -246,7 +195,6 @@
           />
         </div>
 
-        <!-- Description field (kept per earlier user request; design omits it) -->
         <div class="mb-[18px] flex flex-col gap-[7px]">
           <label for="notebook-description" class={LABEL_CLASS}>Description</label>
           <textarea
@@ -259,7 +207,6 @@
           ></textarea>
         </div>
 
-        <!-- Focus mode — vertical rows -->
         <div class="mb-[22px] flex flex-col gap-[9px]">
           <span class={LABEL_CLASS}>Focus mode</span>
           <div class="flex flex-col gap-[5px]" role="radiogroup" aria-label="Focus mode">
@@ -283,7 +230,6 @@
                     : 'border-border bg-transparent hover:bg-muted/50'
                 )}
               >
-                <!-- Mode icon tile — selected accent / unselected neutral muted -->
                 <div
                   class={cn(
                     'flex size-[34px] shrink-0 items-center justify-center rounded-lg',
@@ -294,7 +240,6 @@
                   <mode.Icon class="size-[15px]" strokeWidth={1.8} />
                 </div>
 
-                <!-- Label + description -->
                 <div class="min-w-0 flex-1">
                   <p class="text-[13px] leading-tight font-bold text-foreground">
                     {mode.label}
@@ -304,7 +249,6 @@
                   </p>
                 </div>
 
-                <!-- Radio indicator on the right -->
                 <div
                   class={cn(
                     'ml-auto flex size-4 shrink-0 items-center justify-center rounded-full border-[1.5px]',
@@ -322,7 +266,6 @@
           </div>
         </div>
 
-        <!-- Inline error banner -->
         {#if formError}
           <div
             role="alert"
@@ -336,9 +279,7 @@
           </div>
         {/if}
 
-        <!-- ── Footer ───────────────────────────────────────────────────────── -->
         <div class="flex gap-2">
-          <!-- Cancel — c.closeBtn fill → subtle muted button -->
           <button
             type="button"
             onclick={handleCancel}
@@ -353,7 +294,6 @@
           >
             Cancel
           </button>
-          <!-- Create — primary filled, flex:2, right arrow -->
           <button
             type="button"
             disabled={!canSubmit}

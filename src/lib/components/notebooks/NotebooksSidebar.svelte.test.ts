@@ -8,9 +8,7 @@
 import { render, screen, fireEvent, waitFor } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-// ── Hoisted mock state ────────────────────────────────────────────────────────
 const { storeProxy, mockOpenTrash, mockSelectNotebook, mockResetStore } = vi.hoisted(() => {
-  // Mutable store state that tests can manipulate directly
   const state = {
     notebooks: [] as import('$lib/notebooks/types.js').NotebookSummary[],
     trashedNotebooks: [] as import('$lib/notebooks/types.js').NotebookSummary[],
@@ -94,8 +92,6 @@ vi.mock('$lib/theme/index.js', () => ({
 import NotebooksSidebar from './NotebooksSidebar.svelte';
 import type { NotebookSummary } from '$lib/notebooks/types.js';
 
-// ── Fixtures ──────────────────────────────────────────────────────────────────
-
 function makeNotebook(id: string, title: string, sourceCount = 2): NotebookSummary {
   return {
     id,
@@ -112,8 +108,6 @@ function makeNotebook(id: string, title: string, sourceCount = 2): NotebookSumma
   };
 }
 
-// ── Setup / teardown ─────────────────────────────────────────────────────────
-
 beforeEach(() => {
   storeProxy.notebooks = [];
   storeProxy.trashCount = 0;
@@ -128,8 +122,6 @@ beforeEach(() => {
 afterEach(() => {
   vi.clearAllMocks();
 });
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 describe('NotebooksSidebar (expanded)', () => {
   it('renders all notebook titles', () => {
@@ -223,7 +215,6 @@ describe('NotebooksSidebar (collapsed)', () => {
   it('renders notebook color icons (collapsed NotebookRow) for each notebook', () => {
     storeProxy.notebooks = [makeNotebook('nb-1', 'Alpha'), makeNotebook('nb-2', 'Beta')];
     render(NotebooksSidebar, { props: { collapsed: true } });
-    // Collapsed rows render as buttons with the notebook title as aria-label
     expect(screen.getByRole('button', { name: 'Alpha' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Beta' })).toBeInTheDocument();
   });
@@ -246,14 +237,12 @@ describe('NotebooksSidebar (collapsed prop fallback)', () => {
   it('store-expanded layout when prop omitted and sidebarCollapsed is false', () => {
     storeProxy.sidebarCollapsed = false;
     render(NotebooksSidebar);
-    // Expanded layout shows the "Notebooks" section label.
     expect(screen.getByText('Notebooks')).toBeInTheDocument();
   });
 
   it('prop overrides the store (collapsed=false while store is collapsed)', () => {
     storeProxy.sidebarCollapsed = true;
     render(NotebooksSidebar, { props: { collapsed: false } });
-    // Effective layout follows the prop → expanded.
     expect(screen.getByText('Notebooks')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /collapse sidebar/i })).toBeInTheDocument();
   });

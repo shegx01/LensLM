@@ -55,68 +55,40 @@ pub async fn run_system_check(
     engine.run_system_check().await
 }
 
-/// Probes `base_url` for both Ollama-style and OpenAI-compatible endpoints,
-/// returning a [`LlmDetection`] that summarizes reachability, server version,
-/// and the list of available model names/ids.
-///
-/// Never returns an `Err` for "not reachable"; `LensError` is reserved for
-/// genuine internal faults. The frontend should invoke this command as:
-/// `invoke("detect_llm", { base_url: "http://..." })`.
-///
-/// We log a SANITIZED target (scheme + host[:port] only) rather than the raw
-/// `base_url`: a user could paste a URL embedding `user:password@` userinfo, and
-/// `%base_url` would leak those credentials into the trace/log stream.
+/// Probes `base_url` for Ollama-style and OpenAI-compatible endpoints. Never returns
+/// `Err` for "not reachable". Logs a sanitized target (scheme+host only) to avoid
+/// leaking `user:password@` userinfo that could appear in a pasted URL.
 #[tracing::instrument(skip_all, fields(target = %sanitize_url_for_log(&base_url)))]
-// `rename_all = "snake_case"` so the snake_case JS arg key `base_url` binds
-// (Tauri v2 defaults to camelCase; without this, auto-detect silently no-ops).
+// `rename_all = "snake_case"`: Tauri v2 defaults to camelCase; without this, `base_url`
+// silently fails to bind and auto-detect no-ops.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn detect_llm(base_url: String) -> Result<LlmDetection, LensError> {
     Ok(lens_core::detect_llm(&base_url).await)
 }
 
-/// Reduces a URL to `scheme://host[:port]` for safe logging, stripping any
-/// `userinfo` (`user:pass@`), path, query, and fragment. Falls back to just the
-/// scheme (or `<redacted>`) when the URL can't be parsed, so we never echo a raw
-/// string that might carry credentials.
+/// Reduces a URL to `scheme://host[:port]`, stripping userinfo/path/query/fragment.
+/// Falls back to `<redacted>` on parse failure so credentials are never echoed.
 fn sanitize_url_for_log(raw: &str) -> String {
     let Some((scheme, rest)) = raw.split_once("://") else {
         return "<redacted>".to_string();
     };
-    // Authority ends at the first '/', '?' or '#'.
     let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    // Drop any userinfo before an '@'.
     let host_port = authority.rsplit_once('@').map_or(authority, |(_, hp)| hp);
     format!("{scheme}://{host_port}")
 }
 
-/// Returns the static Kokoro voice catalog (5 female + 5 male) for the TTS
-/// onboarding panel. Invoked as `invoke("list_tts_voices")`.
+/// Returns the static Kokoro voice catalog (5 female + 5 male) for the TTS panel.
 #[tracing::instrument(skip_all)]
 #[tauri::command]
 pub async fn list_tts_voices() -> Result<Vec<TtsVoice>, LensError> {
     Ok(lens_core::list_tts_voices())
 }
 
-/// Installs an embedding model by streaming Ollama's `POST /api/pull`.
-///
-/// Each NDJSON status line from Ollama is forwarded to the frontend as an
-/// [`InstallProgress`] over the `on_progress` channel. The target runtime is the
-/// configured Ollama base URL (same resolution as the system-check probe). If
-/// Ollama is unreachable the command returns an `Err` for the UI to surface.
-///
-/// `model` is validated via [`lens_core::is_allowlisted_embedding_id`] (the
-/// registry-derived allowlist plus the Ollama alias bridge); anything else is
-/// rejected with a [`LensError::Validation`] before any network call.
-///
-/// RESERVED FOR FUTURE USE (M5+): this command is REGISTERED (`main.rs`) but
-/// currently has no frontend caller — the onboarding/Settings embedding UX moved
-/// to the fastembed warm path + Ollama detect-only flow (4b-B), which never pulls
-/// from Ollama. It is kept (not removed) as the intended consumer is the planned
-/// "pull an Ollama embedding model from the UI" affordance; removing a registered
-/// Tauri command is higher-risk churn than documenting its dormant status.
-///
-/// Invoked as `invoke("install_embedding_model", { model, onProgress })` where
-/// `onProgress` is a `Channel<InstallProgress>`.
+/// Installs an embedding model via Ollama `POST /api/pull`, streaming NDJSON progress.
+/// `model` is validated against the registry allowlist before any network call.
+/// RESERVED FOR FUTURE USE (M5+): registered but has no frontend caller — onboarding
+/// moved to the fastembed warm path. Kept because removing a registered Tauri command
+/// is higher-risk churn than documenting its dormant status.
 #[tracing::instrument(skip(on_progress, engine), fields(model = %model))]
 #[tauri::command]
 pub async fn install_embedding_model(
@@ -131,8 +103,6 @@ pub async fn install_embedding_model(
     }
     let base_url = lens_core::ollama_base_url(&engine.config().await);
     lens_core::pull_embedding_model(&base_url, &model, |progress| {
-        // A send failure means the frontend dropped the channel; log and keep
-        // going (the pull itself is unaffected and will still complete).
         if let Err(e) = on_progress.send(progress) {
             tracing::warn!("install_embedding_model: progress channel send failed: {e}");
         }
@@ -140,13 +110,8 @@ pub async fn install_embedding_model(
     .await
 }
 
-/// Downloads the Kokoro ONNX engine to `{app_data_dir}/models/kokoro/`,
-/// streaming [`DownloadProgress`] over the `on_progress` channel. Idempotent: a
-/// complete file already on disk emits a single `done` event without
-/// re-downloading.
-///
-/// Invoked as `invoke("download_tts_engine", { onProgress })` where `onProgress`
-/// is a `Channel<DownloadProgress>`.
+/// Downloads the Kokoro ONNX engine to `{app_data_dir}/models/kokoro/`. Idempotent:
+/// a complete file on disk emits a single `done` event without re-downloading.
 #[tracing::instrument(skip_all)]
 #[tauri::command]
 pub async fn download_tts_engine(
@@ -166,12 +131,8 @@ pub async fn download_tts_engine(
     .await
 }
 
-/// Returns whether the Kokoro ONNX model is already on disk at
-/// `{app_data_dir}/models/kokoro/...`. Lets the TTS panel skip the download step
-/// and show voice selection when the engine is already installed, instead of
-/// always offering "Download Kokoro".
-///
-/// Invoked as `invoke("kokoro_downloaded")`.
+/// Returns whether the Kokoro ONNX model is already on disk, so the TTS panel
+/// can skip the download step when the engine is already installed.
 #[tracing::instrument(skip_all)]
 #[tauri::command]
 pub async fn kokoro_downloaded(app: tauri::AppHandle) -> Result<bool, LensError> {
@@ -182,17 +143,9 @@ pub async fn kokoro_downloaded(app: tauri::AppHandle) -> Result<bool, LensError>
     Ok(data_dir.join(lens_core::KOKORO_MODEL_RELPATH).is_file())
 }
 
-/// Returns the set of registry embedding-model ids whose fastembed weights are
-/// already cached on disk under `{app_data_dir}/models/fastembed/`.
-///
-/// This is the per-model, fastembed-side counterpart to `list_ollama_models`
-/// (the Ollama-side `/api/tags` probe): the onboarding + Settings Embeddings
-/// surfaces use it to light up a fastembed model card as "Ready" without forcing
-/// a re-download. Reuses the SAME per-model cache predicate the readiness gate
-/// uses ([`lens_core::fastembed_weights_cached`]) so the card state and the gate
-/// can never disagree. Best-effort: an unresolvable data dir yields an empty list.
-///
-/// Invoked as `invoke("fastembed_models_cached")`.
+/// Returns registry model ids whose fastembed weights are cached under
+/// `{app_data_dir}/models/fastembed/`. Uses the same predicate as the readiness gate
+/// so the card state and the gate can never disagree. Best-effort: empty on failure.
 #[tracing::instrument(skip_all)]
 #[tauri::command]
 pub async fn fastembed_models_cached(app: tauri::AppHandle) -> Result<Vec<String>, LensError> {
@@ -203,13 +156,8 @@ pub async fn fastembed_models_cached(app: tauri::AppHandle) -> Result<Vec<String
     Ok(fastembed_cached_ids(&data_dir))
 }
 
-/// The registry ids whose fastembed weights are cached under `data_dir` (the pure
-/// core of [`fastembed_models_cached`], extracted so it is unit-testable without a
-/// live `AppHandle`).
-///
-/// Only fastembed-capable models have an on-disk fastembed cache to probe (issue
-/// #80): Ollama-only models are served by the daemon, never downloaded by
-/// fastembed, so they can never be "fastembed-cached" and are skipped entirely.
+/// Testable core of [`fastembed_models_cached`] (no `AppHandle`). Ollama-only models
+/// are skipped: they are served by the daemon, never downloaded by fastembed (#80).
 fn fastembed_cached_ids(data_dir: &std::path::Path) -> Vec<String> {
     lens_core::REGISTRY
         .iter()
@@ -219,16 +167,9 @@ fn fastembed_cached_ids(data_dir: &std::path::Path) -> Vec<String> {
         .collect()
 }
 
-/// Warms (downloads + caches) a fastembed model's weights so a fastembed
-/// selection can pass the onboarding readiness gate without a first ingest.
-///
-/// `model` is validated against the registry (unknown ids are rejected). On a
-/// warm cache this returns immediately; on a cold cache it blocks while fastembed
-/// fetches the weights from HuggingFace (the `tokio::spawn_blocking` lives inside
-/// `LensEngine::warm_fastembed_model`). There is no byte-level progress (fastembed
-/// init is synchronous + opaque), so the UI shows an indeterminate phase spinner.
-///
-/// Invoked as `invoke("warm_fastembed_model", { model })`.
+/// Warms (downloads + caches) a fastembed model's weights so it passes the readiness
+/// gate without a first ingest. Unknown ids are rejected. No byte-level progress
+/// (fastembed init is synchronous/opaque); the UI shows an indeterminate spinner.
 #[tracing::instrument(skip(engine), fields(model = %model))]
 #[tauri::command]
 pub async fn warm_fastembed_model(
@@ -243,14 +184,9 @@ pub async fn warm_fastembed_model(
     engine.warm_fastembed_model(&model).await
 }
 
-/// The registry model ids that ACTUALLY run on the Apple GPU (candle + Metal) on
-/// this build — `["nomic-embed-text-v1.5"]` on Apple Silicon today, `[]` everywhere
-/// else (issue #91). GPU acceleration is per-model, not per-provider: the Embeddings
-/// UI badges exactly these models "Apple GPU" and shows the "best performance" hint
-/// only when one of them is selected. Models not in this set run on fastembed-CPU.
-///
-/// A pure build-capability query (no engine state), so it takes no `State`.
-/// Invoked as `invoke("gpu_accelerated_models")`.
+/// Returns model ids that run on the Apple GPU (candle + Metal) on this build (#91).
+/// `["nomic-embed-text-v1.5"]` on Apple Silicon; `[]` elsewhere. Used by the
+/// Embeddings UI to badge models "Apple GPU" and surface the "best performance" hint.
 #[tauri::command]
 pub fn gpu_accelerated_models() -> Vec<String> {
     lens_core::embedder::gpu_accelerated_model_ids()
@@ -265,19 +201,13 @@ const RECENT_DOC_EXTS: [&str; 4] = ["pdf", "docx", "txt", "md"];
 /// Maximum number of recent-document suggestions returned.
 const RECENT_DOC_CAP: usize = 8;
 
-/// Shallowly scans `~/Documents`, `~/Downloads`, `~/Desktop` for `pdf|docx|txt|md`
-/// files, returning up to [`RECENT_DOC_CAP`] sorted by mtime descending.
-///
-/// BEST-EFFORT by contract: any failure (missing `$HOME`, unreadable directory,
-/// macOS TCC permission denial, …) is swallowed and yields fewer (or zero)
-/// results — this command NEVER returns an `Err`. The UI hides the "Suggested
-/// from your library" section when the list is empty.
-///
-/// Invoked as `invoke("list_recent_documents")`.
+/// Shallowly scans `~/Documents`, `~/Downloads`, `~/Desktop` for `pdf|docx|txt|md`,
+/// returning up to [`RECENT_DOC_CAP`] sorted by mtime descending. Best-effort: any
+/// failure (missing `$HOME`, unreadable dir, TCC denial) yields fewer/zero results;
+/// never returns an `Err`. NOTE: Unix/macOS path assumptions; revisit for Windows.
 #[tracing::instrument(skip_all)]
 #[tauri::command]
 pub async fn list_recent_documents() -> Result<Vec<RecentDocument>, LensError> {
-    // NOTE: Unix/macOS path assumptions (HOME-based dirs / '/' separator); revisit for Windows.
     let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
         return Ok(Vec::new());
     };
@@ -289,14 +219,12 @@ pub async fn list_recent_documents() -> Result<Vec<RecentDocument>, LensError> {
     Ok(scan_recent_documents(&dirs))
 }
 
-/// Pure, testable core of [`list_recent_documents`]: shallow-scans `dirs` for
-/// allowed-extension files, sorts by mtime desc, and caps at [`RECENT_DOC_CAP`].
-/// Every error is best-effort-ignored (the scan continues), never propagated.
+/// Testable core of [`list_recent_documents`]. Errors are best-effort-ignored.
 fn scan_recent_documents(dirs: &[std::path::PathBuf]) -> Vec<RecentDocument> {
     let mut docs: Vec<RecentDocument> = Vec::new();
     for dir in dirs {
         let Ok(entries) = std::fs::read_dir(dir) else {
-            continue; // unreadable / missing dir → skip (best-effort)
+            continue;
         };
         for entry in entries.flatten() {
             let path = entry.path();
@@ -339,11 +267,8 @@ fn scan_recent_documents(dirs: &[std::path::PathBuf]) -> Vec<RecentDocument> {
     docs
 }
 
-/// Demonstrator that exercises the streaming primitive end to end: emits
-/// `Started`, three `Progress` updates, then `Done` over the channel.
-///
-/// Gated behind `debug_assertions` so it never appears on the release command
-/// surface — it exists only to validate the streaming plumbing during dev.
+/// Dev-only streaming primitive demonstrator. Gated behind `debug_assertions`;
+/// never appears on the release command surface.
 #[cfg(debug_assertions)]
 #[tracing::instrument(skip_all)]
 #[tauri::command]
@@ -372,10 +297,6 @@ mod tests {
     use tauri::Manager;
     use tauri::ipc::Channel;
 
-    /// Step 5 (issue #80): `fastembed_cached_ids` returns ONLY fastembed-capable
-    /// ids from the mixed 8-model registry — an Ollama-only model can never appear,
-    /// even if a directory bearing a similar name exists, because it has no
-    /// fastembed cache subdir to probe.
     #[test]
     fn fastembed_cached_ids_excludes_ollama_only_models() {
         let dir = tempfile::tempdir().unwrap();
@@ -396,7 +317,6 @@ mod tests {
             ids.contains(&"nomic-embed-text-v1.5".to_string()),
             "the seeded fastembed model is reported cached: {ids:?}"
         );
-        // No Ollama-only id may ever appear in the fastembed-cached list.
         for ollama_only in [
             "embeddinggemma",
             "qwen3-embedding:4b",
@@ -412,22 +332,18 @@ mod tests {
 
     #[test]
     fn sanitize_url_for_log_strips_userinfo_and_path() {
-        // Embedded credentials must never survive into the log field.
         assert_eq!(
             sanitize_url_for_log("http://user:secret@localhost:11434/api/version"),
             "http://localhost:11434"
         );
-        // Plain URL: keep scheme + host + port, drop path/query.
         assert_eq!(
             sanitize_url_for_log("https://api.example.com/v1/models?x=1"),
             "https://api.example.com"
         );
-        // No port, no path.
         assert_eq!(
             sanitize_url_for_log("http://localhost:1234"),
             "http://localhost:1234"
         );
-        // Unparseable (no scheme separator) → redacted, never echoed raw.
         assert_eq!(sanitize_url_for_log("not-a-url"), "<redacted>");
     }
 
@@ -436,7 +352,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        // Allowed extensions in mixed case + a disallowed one + a subdir (ignored).
         std::fs::write(root.join("a.pdf"), b"a").unwrap();
         std::fs::write(root.join("b.MD"), b"b").unwrap();
         std::fs::write(root.join("c.docx"), b"c").unwrap();
@@ -445,7 +360,6 @@ mod tests {
         std::fs::create_dir(root.join("sub")).unwrap();
 
         let docs = scan_recent_documents(&[root.to_path_buf()]);
-        // Four allowed files; the .zip and the directory are excluded.
         assert_eq!(docs.len(), 4);
         let exts: std::collections::HashSet<String> = docs.iter().map(|d| d.ext.clone()).collect();
         assert_eq!(
@@ -455,9 +369,7 @@ mod tests {
                 .map(|s| s.to_string())
                 .collect::<std::collections::HashSet<String>>()
         );
-        // Extensions are lowercased even when the file used upper-case.
         assert!(docs.iter().any(|d| d.name == "b.MD" && d.ext == "md"));
-        // Sorted by mtime descending.
         for w in docs.windows(2) {
             assert!(w[0].mtime >= w[1].mtime);
         }
@@ -479,14 +391,6 @@ mod tests {
 
         let status = health_check(engine).await.unwrap();
         assert!(status.db_ok);
-        // All migrations are recorded: 0001_init, 0002_notebook_personalize,
-        // 0003_source_soft_delete, 0004_source_anchor, 0005_enrichment,
-        // 0006_notebook_embedding_model, 0007_notebook_embedding_backend (M4
-        // Phase 4b-B), 0008_source_file_hash (#96 add-time content dedup),
-        // 0009_source_raw_content_hash_rename (#100 rename file_hash),
-        // 0010_source_force_js_render (#78 per-source SPA render opt-in),
-        // 0011_notebook_last_activity_at (last-edited-notebook default),
-        // 0012_source_error_meta (#73 structured ingest failure reason).
         assert_eq!(status.migration_count, 12);
     }
 
@@ -497,8 +401,6 @@ mod tests {
         let engine = app.state::<LensEngine>();
 
         let checks = run_system_check(engine).await.unwrap();
-
-        // The fixed row order matches the design / engine contract.
         let ids: Vec<CheckId> = checks.iter().map(|c| c.id).collect();
         assert_eq!(
             ids,
@@ -511,10 +413,6 @@ mod tests {
 
         let status_of = |id: CheckId| checks.iter().find(|c| c.id == id).unwrap().status;
 
-        // All three are now real readiness gates whose outcome depends on the
-        // host (a local runtime / installed embed model / downloaded Kokoro model
-        // may or may not be present). We assert each resolved to a binary
-        // Pass/Fail — never `Pending` (the old advisory state is gone).
         for id in [
             CheckId::LlmRuntime,
             CheckId::EmbeddingModel,
@@ -534,8 +432,6 @@ mod tests {
         app.manage(LensEngine::for_test().await);
         let engine = app.state::<LensEngine>();
 
-        // A model id outside the allowlist must be rejected with a Validation
-        // error BEFORE any network call (no Ollama is running in the test env).
         let channel = Channel::new(|_: tauri::ipc::InvokeResponseBody| Ok(()));
         let err = install_embedding_model("rm -rf /".to_string(), channel, engine)
             .await
@@ -566,8 +462,6 @@ mod tests {
         let collected = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&collected);
         let channel = Channel::new(move |body: tauri::ipc::InvokeResponseBody| {
-            // The mock receives the already-serialized IPC body; deserialize it
-            // back into the typed envelope to assert ordering/content.
             let event = body.deserialize::<StreamEvent<String>>().unwrap();
             sink.lock().unwrap().push(event);
             Ok(())

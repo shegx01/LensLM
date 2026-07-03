@@ -1,14 +1,8 @@
-// Project animation toolkit. Two kinds of primitive live here:
-//   • Svelte actions built on the `motion` engine (framer-motion's vanilla
-//     `animate`/`inView`) — for mount/scroll entrances on persistent elements.
-//     We use the imperative API, not the `<motion.div>` wrapper, because that
-//     wrapper ships uncompiled TS `.svelte` files our Vite 8 / rolldown bundler
-//     can't process.
-//   • Svelte transitions — for conditionally-rendered ({#if}) content, where a
-//     single coordinated tween (and proper outro-before-unmount) matters.
+// Project animation toolkit.
 //
-// SYNC-CHECK: add new shared transitions/actions here, never inline in a
-// component, so timing/easing stays consistent across the app.
+// Uses the `motion` imperative API (not `<motion.div>`) because the wrapper
+// ships uncompiled TS `.svelte` files the Vite/rolldown bundler can't process.
+// SYNC-CHECK: add shared transitions/actions here, not inline in components.
 
 import type { Action } from 'svelte/action';
 import type { TransitionConfig } from 'svelte/transition';
@@ -37,30 +31,19 @@ export interface FadeRiseParams {
   whenInView?: boolean;
 }
 
-// A premium ease-out curve (≈ easeOutExpo): quick start, gentle settle.
-const EASE_OUT: [number, number, number, number] = [0.16, 1, 0.3, 1];
+const EASE_OUT: [number, number, number, number] = [0.16, 1, 0.3, 1]; // ≈ easeOutExpo
 
-/**
- * Svelte action: fade + rise an element in. Honors the OS "reduce motion"
- * setting (snaps straight to the final state, no animation).
- *
- *   <div use:fadeRise={{ delay: i * 0.06 }}>…</div>
- */
+/** Svelte action: fade + rise. Honors OS "reduce motion" (snaps, no animation). */
 export const fadeRise: Action<HTMLElement, FadeRiseParams | undefined> = (node, params) => {
   const { y = 8, duration = 0.4, delay = 0, whenInView = false } = params ?? {};
 
-  // Snap straight to visible (no animation) when the user asked for reduced
-  // motion, or when the Web Animations API isn't available — e.g. the test DOM
-  // (happy-dom) or any environment lacking `element.animate`. motion's
-  // `animate()` relies on WAAPI, so guard before touching it.
+  // WAAPI guard: happy-dom and reduced-motion environments lack `element.animate`.
   if (prefersReducedMotion() || typeof node.animate !== 'function') {
     node.style.opacity = '1';
     return {};
   }
 
-  // Hide synchronously so there is no flash of the final state before the
-  // animation's first frame.
-  node.style.opacity = '0';
+  node.style.opacity = '0'; // hide synchronously to prevent flash before first frame
 
   const play = () =>
     animate(node, { opacity: [0, 1], y: [y, 0] }, { duration, delay, ease: EASE_OUT });
@@ -71,8 +54,7 @@ export const fadeRise: Action<HTMLElement, FadeRiseParams | undefined> = (node, 
   if (whenInView) {
     stopInView = inView(node, () => {
       controls = play();
-      // Animate once, then stop observing.
-      return () => {};
+      return () => {}; // animate once, then stop observing
     });
   } else {
     controls = play();
@@ -94,16 +76,8 @@ export interface ExpandFadeParams {
 }
 
 /**
- * Svelte transition for conditionally-rendered ({#if}) content: expand/collapse
- * by animating height AND opacity in ONE coordinated tween. Doing both in a
- * single transition (rather than a height `slide` + a separate opacity action)
- * is what makes it smooth — there are no competing animations on nested nodes
- * to desync. Lazy-mounted, so collapsed content stays out of the DOM + focus
- * order (a11y). Honors the OS "reduce motion" setting (snaps, no animation).
- *
- *   {#if open}
- *     <div transition:expandFade>…panel…</div>
- *   {/if}
+ * Svelte transition for `{#if}` content: height + opacity in one tween so there
+ * are no competing animations to desync. Lazy-mounted (a11y). Honors "reduce motion".
  */
 export function expandFade(
   node: HTMLElement,
@@ -112,8 +86,6 @@ export function expandFade(
   if (prefersReducedMotion()) return { duration: 0 };
 
   const height = node.scrollHeight;
-  // Opacity reaches full a little before height does, so the content is solid
-  // as the panel finishes opening (and clears early as it closes).
   return {
     duration,
     easing,

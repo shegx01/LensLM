@@ -1,11 +1,6 @@
 <!--
   GeneralSection — the "General" panel inside the global Preferences view.
-  Mounted by PreferencesShell when the user selects the General nav item.
-
-  Wires to the existing `get_config` / `set_config` commands via the shared
-  `updateConfig` read-modify-write helper — no new Rust command.
-
-  Tokens only — light + dark + every accent ([[theming-light-dark-accent]]).
+  Wires to `get_config` / `set_config` via `updateConfig` — no new Rust command.
 -->
 <script lang="ts">
   import { onMount } from 'svelte';
@@ -14,7 +9,6 @@
   import type { AppConfig } from '$lib/theme/types.js';
   import { updateConfig } from '$lib/config.js';
 
-  // ── State ──────────────────────────────────────────────────────────────────
   let reopenLastNotebook = $state(true);
   let saving = $state(false);
   let saveError = $state<string | null>(null);
@@ -48,13 +42,11 @@
 </script>
 
 <section class="flex flex-col" aria-label="General settings">
-  <!-- Title + subtitle -->
   <h2 class="text-xl font-extrabold tracking-[-0.4px] text-foreground">General</h2>
   <p class="mt-1 text-[0.8rem] text-muted-foreground">
     General application behaviour and startup preferences.
   </p>
 
-  <!-- ── Reopen last notebook toggle ── -->
   <div class="mt-6">
     <p class="text-[0.65rem] font-bold uppercase tracking-[0.08em] text-muted-foreground/70">
       Startup

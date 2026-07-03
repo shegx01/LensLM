@@ -1,14 +1,6 @@
-// CommandPalette.svelte.test.ts
-//
-// Component tests for the ⌘K command palette.
-//
-// Uses the real notebooks store (same pattern as MakeItYours.svelte.test.ts
-// with the onboarding draft store). The IPC layer is mocked so tests run
-// without a Tauri host. `resetNotebookStore()` is called in afterEach to
-// prevent cross-test bleed from module-level $state globals.
-//
-// The global ⌘K listener is AppShell's responsibility (Step 4.10) and is NOT
-// tested here — we drive open/close via the store directly.
+// CommandPalette.svelte — ⌘K palette component tests.
+// IPC is mocked; store is reset between tests to prevent bleed.
+// ⌘K open/close is driven via the store directly (AppShell owns the listener).
 
 import { render, screen, fireEvent, waitFor } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -18,10 +10,6 @@ import {
   resetNotebookStore,
   loadNotebooks
 } from '$lib/notebooks/notebooks-state.svelte.js';
-
-// ---------------------------------------------------------------------------
-// Mock the IPC layer — tests run without a Tauri host.
-// ---------------------------------------------------------------------------
 
 vi.mock('$lib/notebooks/ipc.js', () => ({
   listNotebooks: vi.fn(),
@@ -35,10 +23,6 @@ vi.mock('$lib/notebooks/ipc.js', () => ({
 }));
 
 import { listNotebooks } from '$lib/notebooks/ipc.js';
-
-// ---------------------------------------------------------------------------
-// Fixtures
-// ---------------------------------------------------------------------------
 
 import type { NotebookSummary } from '$lib/notebooks/types.js';
 
@@ -59,10 +43,6 @@ function makeNotebook(overrides?: Partial<NotebookSummary>): NotebookSummary {
   };
 }
 
-// ---------------------------------------------------------------------------
-// Lifecycle
-// ---------------------------------------------------------------------------
-
 beforeEach(() => {
   vi.clearAllMocks();
   resetNotebookStore();
@@ -72,20 +52,12 @@ afterEach(() => {
   resetNotebookStore();
 });
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 /** Seed the store's notebook list and open the palette. */
 async function openWith(notebooks: NotebookSummary[]) {
   vi.mocked(listNotebooks).mockResolvedValue(notebooks);
   await loadNotebooks();
   notebookStore.paletteOpen = true;
 }
-
-// ---------------------------------------------------------------------------
-// Visibility
-// ---------------------------------------------------------------------------
 
 describe('visibility', () => {
   it('renders nothing when paletteOpen is false', () => {
@@ -99,10 +71,6 @@ describe('visibility', () => {
     expect(screen.getByRole('dialog')).toBeInTheDocument();
   });
 });
-
-// ---------------------------------------------------------------------------
-// Search input
-// ---------------------------------------------------------------------------
 
 describe('search input', () => {
   it('has placeholder text exactly "Search notebooks"', async () => {
@@ -133,10 +101,6 @@ describe('search input', () => {
     expect(notebookStore.paletteQuery).toBe('alpha');
   });
 });
-
-// ---------------------------------------------------------------------------
-// Filtering (via real paletteResults derived from paletteQuery)
-// ---------------------------------------------------------------------------
 
 describe('result filtering', () => {
   it('shows all notebooks when query is empty', async () => {
@@ -174,10 +138,6 @@ describe('result filtering', () => {
     expect(screen.getByText('No notebooks found')).toBeInTheDocument();
   });
 });
-
-// ---------------------------------------------------------------------------
-// Keyboard navigation — ↑↓ moves highlight; ↵ selects; Esc closes
-// ---------------------------------------------------------------------------
 
 describe('keyboard navigation', () => {
   it('ArrowDown moves the highlight from the first to the second result', async () => {
@@ -217,7 +177,6 @@ describe('keyboard navigation', () => {
     render(CommandPalette);
 
     const panel = screen.getByRole('dialog');
-    // Move highlight to second item.
     await fireEvent.keyDown(panel, { key: 'ArrowDown' });
     await fireEvent.keyDown(panel, { key: 'Enter' });
 
@@ -260,10 +219,6 @@ describe('keyboard navigation', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Mouse / click interaction
-// ---------------------------------------------------------------------------
-
 describe('mouse interaction', () => {
   it('clicking a result row selects that notebook and closes the palette', async () => {
     await openWith([makeNotebook({ id: 'nb-001', title: 'Alpha Research' })]);
@@ -296,10 +251,6 @@ describe('mouse interaction', () => {
     expect(notebookStore.paletteOpen).toBe(false);
   });
 });
-
-// ---------------------------------------------------------------------------
-// Accessibility
-// ---------------------------------------------------------------------------
 
 describe('accessibility', () => {
   it('dialog has role="dialog" and aria-modal="true"', async () => {
@@ -341,10 +292,6 @@ describe('accessibility', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Scope guard — M3 is notebooks-only
-// ---------------------------------------------------------------------------
-
 describe('scope guard — notebooks-only (M3)', () => {
   it('does not render a SOURCES section header', async () => {
     await openWith([makeNotebook()]);
@@ -358,10 +305,6 @@ describe('scope guard — notebooks-only (M3)', () => {
     expect(screen.queryByText('CHATS')).toBeNull();
   });
 });
-
-// ---------------------------------------------------------------------------
-// Footer hint bar
-// ---------------------------------------------------------------------------
 
 describe('footer hint bar', () => {
   it('renders all three keyboard hint segments', async () => {

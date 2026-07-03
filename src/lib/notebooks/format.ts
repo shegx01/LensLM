@@ -1,14 +1,4 @@
-// Shared display-formatting helpers for the notebooks module.
-//
-// Pure functions — no external deps.
-
-/**
- * Derive up-to-two-character uppercase initials from a display name.
- *
- * Trims, splits on whitespace, drops empty segments, takes the first letter of
- * the first two words, and upper-cases the result. Falls back to `"?"` when the
- * name yields no usable characters (empty / whitespace-only).
- */
+/** Up-to-two-character uppercase initials from a name. Falls back to `"?"`. */
 export function getInitials(name: string): string {
   return (
     name

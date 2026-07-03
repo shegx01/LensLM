@@ -41,12 +41,9 @@ afterEach(() => {
 describe('+page.svelte', () => {
   it('renders the app shell (not the old Hello World placeholder)', async () => {
     render(Page);
-    // The shell replaced the Hello World landing.
     expect(screen.queryByRole('heading', { name: /hello world/i })).not.toBeInTheDocument();
-    // Left rail sidebar and right rail are always present.
     expect(screen.getByText('Notebooks')).toBeInTheDocument();
     expect(screen.getByText('Sources')).toBeInTheDocument();
-    // Empty state renders after loading completes (gated on !loading to prevent flash).
     await waitFor(() => {
       expect(screen.getByText('Your workspace')).toBeInTheDocument();
     });

@@ -2,15 +2,10 @@
 // enough to overflow the default 128-frame limit (E0275) on some toolchains.
 // Compile-time only; no runtime cost.
 #![recursion_limit = "256"]
-//! `lens-core` — the headless engine for LensLM.
+//! `lens-core` — the headless Rust engine for LensLM.
 //!
-//! Pure Rust. Contains no Tauri, windowing, or UI dependencies. All localized
-//! file-parsing, database routines, and inference tasks will be implemented here.
-//!
-//! Domain entities live in per-domain modules (e.g. [`notebooks`]), each owning
-//! its struct, id newtype, and a repository over the connection pool. `lib.rs`
-//! defines no domain entities itself: [`LensEngine`] is a thin handle that
-//! exposes the pool via [`LensEngine::pool`] and delegates to the repos.
+//! No Tauri, windowing, or UI dependencies. [`LensEngine`] is a thin handle
+//! that delegates to per-domain repositories over the shared connection pool.
 
 pub mod chunk;
 pub mod config;
@@ -87,10 +82,8 @@ use tokio::sync::{Mutex, OnceCell, RwLock, RwLockReadGuard, RwLockWriteGuard, Se
 
 use crate::notebooks::{EnrichmentStatus, NotebookRepo};
 
-/// Lowercase-hex encoding of a byte slice.
-///
-/// Single source of truth for the `write!("{b:02x}")` digest-formatting loop
-/// shared by the ingest content-hash and the TTS integrity gate.
+/// Lowercase-hex encoding of a byte slice; shared by the ingest content-hash
+/// and TTS integrity gate.
 pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     use std::fmt::Write;
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -100,29 +93,16 @@ pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
-/// Builds the candle embedder for a `fastembed`-coordinate spec on the requested
-/// `compute` device, or returns `None` so [`LensEngine::embedder_for`] falls back
-/// to fastembed. issue #91.
-///
-/// On the `native-ml-metal` build (Apple Silicon), candle is the DEFAULT engine for
-/// a candle-supported model — this builds candle-**Metal** for a `Bulk` job
-/// (`Compute::Metal`) and candle-**CPU** for an interactive query (`Compute::Cpu`),
-/// so a notebook's whole embedding coordinate is served by candle (one weight set,
-/// no fastembed ONNX download). Returns `None` — deferring to fastembed — for a
-/// model candle doesn't implement yet (mxbai / bge-m3) or on any candle init
-/// failure. Runs the ~547 MB weight load off the async runtime via `spawn_blocking`.
-///
-/// The no-feature build is a `None` stub: fastembed serves everything on
-/// non-Apple-Silicon targets.
+/// Builds the candle embedder for a fastembed-coordinate spec on Apple Silicon
+/// (issue #91): Metal for Bulk, CPU for Interactive. Returns `None` — falling back
+/// to fastembed — for unsupported models or any candle init failure.
 #[cfg(feature = "native-ml-metal")]
 async fn build_candle_if_supported(
     compute: crate::embedder::Compute,
     data_dir: &Path,
     spec: &'static crate::embedder::EmbeddingModelSpec,
 ) -> Option<Arc<dyn Embedder>> {
-    // A GPU-eligible model that candle doesn't YET implement (e.g. mxbai / bge-m3)
-    // is an EXPECTED fastembed fallback, not a failure — skip the construction
-    // attempt entirely and log at debug (no scary warn, no wasted model load).
+    // An unsupported model is an expected fastembed fallback — log at debug, not warn.
     if !crate::embedder::candle_supports_model(spec.id) {
         tracing::debug!(
             model = %spec.id,
@@ -140,8 +120,7 @@ async fn build_candle_if_supported(
             let e: Arc<dyn Embedder> = Arc::new(e);
             Some(e)
         }
-        // A supported model that genuinely failed to init (Metal/device unavailable,
-        // bad weights) — THIS is a real warn; still fall back so no job fails.
+        // A supported model that failed init is a real warn; still fall back.
         Ok(Err(err)) => {
             tracing::warn!(
                 model = %spec.id,
@@ -161,8 +140,7 @@ async fn build_candle_if_supported(
     }
 }
 
-/// No-feature stub: fastembed serves everything on non-Apple-Silicon targets, so
-/// candle is never selected.
+/// No-op stub: fastembed handles all embeddings on non-Apple-Silicon targets.
 #[cfg(not(feature = "native-ml-metal"))]
 async fn build_candle_if_supported(
     _compute: crate::embedder::Compute,
@@ -172,10 +150,8 @@ async fn build_candle_if_supported(
     None
 }
 
-/// Builds the NVIDIA-CUDA embedder for a `Compute::Cuda` job — issue #91 INTERFACE
-/// ONLY. Returns `None` today (no candle-CUDA backend), so a CUDA-resolved job falls
-/// back to fastembed-CPU. The future implementation builds a `CandleCudaEmbedder`
-/// here behind `native-ml-cuda`; the selection policy already routes to it.
+/// Interface stub for CUDA embedding (issue #91). Always returns `None` until a
+/// candle-CUDA backend is implemented; CUDA jobs fall back to fastembed-CPU.
 #[cfg(feature = "native-ml-cuda")]
 async fn build_cuda_if_supported(
     _compute: crate::embedder::Compute,
@@ -189,7 +165,7 @@ async fn build_cuda_if_supported(
     None
 }
 
-/// No-feature stub: without `native-ml-cuda` the policy never resolves `Cuda`.
+/// No-op stub: without `native-ml-cuda` the policy never resolves `Cuda`.
 #[cfg(not(feature = "native-ml-cuda"))]
 async fn build_cuda_if_supported(
     _compute: crate::embedder::Compute,
@@ -199,162 +175,72 @@ async fn build_cuda_if_supported(
     None
 }
 
-/// Mutable engine resources live here: the database connection pool and the
-/// loaded application configuration.
-///
-/// Fields are `pub(crate)` so external code (including the integration-test
-/// crate) cannot reach past the [`LensEngine`] API into raw state; use
-/// [`LensEngine::pool`] / [`LensEngine::config`] instead.
+/// Inner engine state: the database connection pool and loaded configuration.
+/// Accessed only through [`LensEngine::pool`] / [`LensEngine::config`].
 pub struct LensEngineInner {
-    /// Async SQLite connection pool (WAL, foreign keys on).
     pub(crate) db: SqlitePool,
-    /// Loaded application configuration (disk-only `config.json`).
     pub(crate) config: AppConfig,
 }
 
 /// Thread-safe, cheaply-cloneable handle to the LensLM engine state.
 ///
-/// Cloning shares the same underlying state (`Arc`). Mutations go through an
-/// async-aware `RwLock` so guards can be safely held across `.await` points —
-/// this is the interior mutability Tauri's immutable `State<T>` requires.
-///
 /// # Concurrency invariants (load-bearing)
 ///
-/// * **Single ingest at a time.** Every ingest run holds the single-permit
-///   [`ingest_lock`](Self::ingest_lock) semaphore for its whole duration (the
-///   ONNX session is single-threaded; concurrent `embed()` must not overlap).
-/// * **Destructive deletes take `ingest_lock`.** [`purge_source`](Self::purge_source)
-///   and [`purge_notebook`](Self::purge_notebook) acquire the same permit across
-///   their cross-store (Lance-then-SQLite) deletes, so a destructive wipe can
-///   never interleave a live ingest of the same source/notebook and leave orphan
-///   Lance rows. [`trash_source`](Self::trash_source) /
-///   [`restore_source`](Self::restore_source) are flag-only (no cross-store
-///   mutation) and are intentionally lock-free.
-/// * **One app instance per data dir.** There is NO cross-process lock; correct
-///   operation assumes a single process owns a given `data_dir` at a time.
-/// * **Trashed-source vectors stay in Lance.** Trashing a source leaves its Lance
-///   vectors in place so it can be restored; retrieval MUST therefore exclude
-///   trashed sources at query time (an M5 obligation).
+/// * **Single ingest at a time.** Every ingest holds `ingest_lock` (single-permit
+///   semaphore); concurrent `embed()` calls must not overlap.
+/// * **Destructive deletes take `ingest_lock`.** `purge_source`/`purge_notebook`
+///   hold the permit across their Lance-then-SQLite deletes; `trash_source`/
+///   `restore_source` are flag-only and intentionally lock-free.
+/// * **One app instance per data dir.** No cross-process lock exists.
+/// * **Trashed-source vectors stay in Lance** for restorability; retrieval MUST
+///   exclude trashed sources at query time (M5 obligation).
 #[derive(Clone)]
 pub struct LensEngine {
     inner: Arc<RwLock<LensEngineInner>>,
-    /// Lazily-constructed, shared embedding models, keyed by model id
-    /// (Decision D1 / M2, generalized for M4 Phase 4b per-notebook models — R8).
-    ///
-    /// Lives OUTSIDE the `RwLock` so a model load never serializes DB reads.
-    /// Each entry is built exactly once via [`LensEngine::embedder_for`]; the
-    /// same `Arc<dyn Embedder>` is then shared across every ingest/query that
-    /// resolves to that model id.
-    ///
-    /// ## R8 — RAM cost of holding multiple models
-    ///
-    /// A notebook now carries its own embedding model, so different notebooks
-    /// can resolve to different models in the same session. The cache holds every
-    /// model that has been touched, each a live ONNX session (~130 MB for nomic
-    /// up to ~1.3 GB for the larger models). There is intentionally NO eviction
-    /// cap or LRU here: bounding the cache (and unloading idle sessions) is
-    /// deferred to M9. In practice the working set is the handful of models the
-    /// open notebooks use.
-    ///
-    /// Concurrency: this is a single `Mutex` guarding the whole map, held across
-    /// the `spawn_blocking` ONNX init in [`LensEngine::embedder_for`], so ALL
-    /// concurrent `embedder_for` calls serialize on it — including ones for a
-    /// DIFFERENT, already-cached key. This guarantees an expensive ONNX init runs
-    /// exactly once per key (no duplicate construction under a race), at the cost
-    /// of serializing cold-start inits across models. In practice the single-permit
-    /// `ingest_lock` already serializes the embed paths, so this rarely bites; a
-    /// per-key `OnceCell` (init outside the map lock) is the M9 follow-up if cold
-    /// multi-model startup latency becomes a concern.
+    /// Keyed embedder cache (R8). Lives outside the `RwLock` so a model load never
+    /// serializes DB reads. Built exactly once per key via [`embedder_for`]; the
+    /// single `Mutex` over the whole map ensures no duplicate ONNX init under a
+    /// race. No eviction cap — deferred to M9.
     embedders: Arc<Mutex<HashMap<String, Arc<dyn Embedder>>>>,
-    /// Native-ML acceleration probe (issue #91) — the polymorphic seam that tells
-    /// [`embedder_for`](Self::embedder_for)'s device policy whether an Apple Metal
-    /// GPU is available. Defaults to [`crate::embedder::default_accelerator`] (a
-    /// Metal probe on aarch64-apple-darwin + `native-ml-metal`, else CPU-only);
-    /// held behind a trait object so tests can inject a fake and future
-    /// accelerators (MLX-Swift, CUDA) drop in without touching the policy.
+    /// Native-ML acceleration probe (issue #91). Trait object so tests can inject
+    /// a fake and future accelerators (CUDA, MLX) drop in without touching policy.
     accelerator: Arc<dyn crate::embedder::NativeAccelerator>,
-    /// Lazily-resolved, shared nomic tokenizer (parallel to `embedder`).
-    ///
-    /// The nomic `tokenizer.json` is a multi-MB file; resolving it per-ingest
-    /// re-reads and re-parses it from disk every time. Cache it once here —
-    /// built exactly once via [`LensEngine::tokenizer`]'s `get_or_try_init`
-    /// using the shared [`resolve_nomic_tokenizer`] resolver — and reuse the
-    /// `Arc` across ingests. Lives OUTSIDE the `RwLock` for the same reason as
-    /// `embedder`: a resolve/download must never serialize DB reads.
+    /// Shared nomic tokenizer — parsed once via `OnceCell`, outside the `RwLock`
+    /// so a resolve/download never serializes DB reads.
     tokenizer: Arc<OnceCell<Arc<Tokenizer>>>,
-    /// Single-permit gate serializing ingest runs (the ONNX session is
-    /// single-threaded; concurrent `embed()` calls must not overlap).
+    /// Single-permit gate serializing ingest runs (ONNX session is single-threaded).
     ingest_lock: Arc<Semaphore>,
-    /// Sender half of the background enrichment queue (M4 Phase 3, Step 3).
-    ///
-    /// `mpsc::Sender` is `Clone`, so it rides the `#[derive(Clone)]` engine
-    /// handle. Enqueue is a non-blocking [`try_send`](mpsc::Sender::try_send)
-    /// issued OUTSIDE the `ingest_lock` permit (see [`enqueue_enrichment`]).
-    /// Dropping every clone closes the channel and stops the worker.
+    /// Sender half of the background enrichment queue (M4 Phase 3). `Clone` so it
+    /// rides `#[derive(Clone)]`. Dropping every clone closes the channel.
     enrichment_tx: mpsc::Sender<EnrichmentJob>,
-    /// The active enrichment LLM provider, or `None` when none is reachable.
-    ///
-    /// `Arc<RwLock<Option<Arc<dyn LlmProvider>>>>` rather than `OnceCell` (the
-    /// plan's ratified deviation from lock #4): AC10 requires REBINDING the
-    /// provider on an unreachable→reachable transition, which `OnceCell` (write-
-    /// once) forbids. Write the cell to swap the provider; read it to dispatch.
+    /// Active enrichment LLM provider. `RwLock<Option<...>>` rather than `OnceCell`
+    /// because AC10 requires rebinding on an unreachable→reachable transition.
     llm_provider: Arc<RwLock<Option<Arc<dyn LlmProvider>>>>,
-    /// The injected JS renderer for the SPA URL-render fallback (issue #78), or
-    /// `None` when none is installed (headless `lens-core` tests, or before
-    /// `src-tauri` wires `TauriJsRenderer`).
-    ///
-    /// Mirrors the `llm_provider` DI seam EXACTLY (`Arc<RwLock<Option<Arc<dyn
-    /// _>>>>`): `lens-core` cannot depend on `tauri`, so the concrete webview
-    /// renderer lives in `src-tauri` and is injected via
-    /// [`set_js_renderer`](Self::set_js_renderer). The URL-ingest fallback reads
-    /// it via [`js_renderer`](Self::js_renderer); when `None` the near-empty SPA
-    /// path degrades gracefully to `needs_js` (unchanged legacy behavior).
+    /// Injected JS renderer for SPA URL-render fallback (issue #78). `None` in
+    /// headless tests or before `src-tauri` wires `TauriJsRenderer`; degrades to
+    /// `needs_js` when absent.
     js_renderer: Arc<RwLock<Option<Arc<dyn render::JsRenderer>>>>,
-    /// In-memory cache of the loaded model catalog (cached `models-catalog.json`,
-    /// else the bundled snapshot), behind an `Arc` so a hit is a cheap pointer
-    /// clone — NOT a ~2.6 MB read + parse on every picker open (fix #5). Populated
-    /// lazily by [`model_catalog`](Self::model_catalog) (the blocking read+parse
-    /// runs once, off the async runtime via `spawn_blocking`) and INVALIDATED by
-    /// [`refresh_model_catalog`](Self::refresh_model_catalog) when it actually
-    /// rewrites the cache file, so the next load re-reads the fresh catalog while
-    /// repeated opens between refreshes hit the cache. Lives OUTSIDE the inner
-    /// `RwLock` (like `embedder`) so a catalog load never serializes DB reads.
+    /// In-memory catalog cache (fix #5). Populated lazily via `spawn_blocking`;
+    /// invalidated by `refresh_model_catalog`. Outside the inner `RwLock` so a
+    /// catalog load never serializes DB reads.
     catalog_cache: Arc<RwLock<Option<Arc<crate::model_catalog::ModelCatalog>>>>,
-    /// Test-only gate awaited inside the worker's stub job body so an AC3 test can
-    /// hold a job "in flight" and assert the worker holds no `ingest_lock` permit
-    /// during the body. `None` (the default) is a no-op. Compiled out of
-    /// production builds.
+    /// AC3 test seam: blocks the worker in its job body until `notify_one`'d.
     #[cfg(feature = "test-util")]
     enrichment_gate: Arc<RwLock<Option<Arc<tokio::sync::Notify>>>>,
-    /// Test-only gate awaited inside [`reembed::reembed_and_flip`] AFTER the
-    /// lock-free building-table populate but BEFORE the `ingest_lock` flip window,
-    /// so a test can deterministically interleave a `purge_source` (which fully
-    /// completes + releases the lock) into the sequential race the fix #2 re-check
-    /// closes. `None` (the default) is a no-op. Compiled out of production builds.
+    /// Fix-#2 test seam: blocks reembed after populate, before the flip window.
     #[cfg(feature = "test-util")]
     reembed_preflip_gate: Arc<RwLock<Option<Arc<tokio::sync::Notify>>>>,
-    /// Test-only switch: when `true`, [`LensEngine::tokenizer`] fails fast instead
-    /// of resolving/downloading the multi-MB nomic tokenizer. Enrichment tolerates
-    /// a missing tokenizer (it falls back to a whitespace-word token count), so a
-    /// Step-4 integration test can run fully offline. `false` (default) is a no-op.
-    /// Compiled out of production builds.
+    /// When `true`, `tokenizer()` fails fast so Step-4 tests run fully offline.
     #[cfg(feature = "test-util")]
     skip_tokenizer: Arc<std::sync::atomic::AtomicBool>,
-    /// Test-only override for the per-job LLM-call ceiling (AC11 budget seam). `0`
-    /// (the default) means "use [`ENRICHMENT_MAX_CALLS_PER_JOB`]"; a non-zero value
-    /// tightens the per-job budget so a test can assert the circuit-break fires
-    /// after exactly N admitted calls. Compiled out of production builds.
+    /// AC11 test seam: non-zero overrides the per-job LLM-call ceiling.
     #[cfg(feature = "test-util")]
     enrichment_max_calls_override: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl LensEngine {
-    /// Production constructor: ensures the data directory exists, opens the
-    /// on-disk pool (WAL + foreign keys), applies migrations, and loads (or
-    /// initializes) `config.json`.
-    ///
-    /// The loaded config's `paths.data_dir` is populated with the resolved data
-    /// directory so downstream consumers don't have to re-derive it.
+    /// Opens the on-disk pool, applies migrations, and loads `config.json`.
+    /// Populates `config.paths.data_dir` so callers don't re-derive it.
     #[tracing::instrument(skip_all, fields(dir = %data_dir.as_ref().display()))]
     pub async fn init(data_dir: impl AsRef<Path>) -> Result<Self, LensError> {
         let data_dir = data_dir.as_ref();
@@ -362,28 +248,14 @@ impl LensEngine {
             .map_err(|e| LensError::Io(format!("{}: {e}", data_dir.display())))?;
         let db = db::open_pool(data_dir).await?;
         db::run_migrations(&db).await?;
-        // Crash-recovery path: a process that died mid-ingest leaves a source
-        // stuck in a transient `parsing`/`embedding` status with no running task
-        // to advance it. Reset those to `error` once at startup so the UI can
-        // surface them as re-ingestable rather than spinning forever. Terminal
-        // states (`queued`/`indexed`/`error`/`pending`) are untouched.
+        // Crash-recovery: a mid-ingest death leaves sources stuck in a transient
+        // status. Reset them to `error` so the UI surfaces them as re-ingestable.
         //
         // INVARIANT (locked by test `crash_recovery_skips_needs_js_and_needs_ocr`):
-        // `needs_js` and `needs_ocr` are TERMINAL-PENDING — they must NOT be
-        // reset here. They are deliberately absent from the `IN (?, ?)` clause.
-        // Run_ingest sets them directly via `update_source_status` and returns
-        // `Ok(())` so they are never surfaced via the Err→error flip path.
-        // The candidate array below is HAND-MAINTAINED and intentionally lists
-        // only the statuses that are transient CANDIDATES; it is NOT derived from
-        // an exhaustive match, so it deliberately omits the terminal-pending
-        // states (`RenderFailed`/`NeedsJs`/`NeedsOcr` — set directly by run_ingest
-        // and never crash-reset). The REAL guard is the `is_transient` filter
-        // (an exhaustive match in `notebooks.rs`, so adding a status variant
-        // forces a recovery decision there) plus the `debug_assert_eq!` below,
-        // which pins the derived set to exactly `[Parsing, Embedding]`. Since
-        // those terminal-pending states are `is_transient() == false`, they are
-        // excluded from the reset whether or not they appear in this array — and
-        // we deliberately leave them out (plan Principle 3).
+        // `needs_js`/`needs_ocr` are TERMINAL-PENDING — must NOT be reset here.
+        // The REAL guard is `is_transient()` (an exhaustive match in notebooks.rs),
+        // plus the `debug_assert_eq!` below which pins the derived set to exactly
+        // `[Parsing, Embedding]`.
         use notebooks::SourceStatus;
         let transient: Vec<SourceStatus> = [
             SourceStatus::Pending,
@@ -413,14 +285,8 @@ impl LensEngine {
         }
         query.execute(&db).await?;
 
-        // ── Enrichment crash-recovery (AC12) — SEPARATE from the SourceStatus
-        // reset above and deliberately AFTER it. `enrichment_status` is orthogonal
-        // to `SourceStatus` (lock #2): a source mid-enrichment when the process
-        // died is left `enriching` with no task to advance it. Reset it to
-        // `pending` so the queue-rebuild below re-enqueues it; `SourceStatus`
-        // (which stays `indexed` — the source is still searchable on raw vectors)
-        // is untouched, so the compile-locked SourceStatus invariant above is not
-        // affected.
+        // Enrichment crash-recovery (AC12): reset `enriching` → `pending` so the
+        // queue-rebuild re-enqueues it. `SourceStatus` stays `indexed` (untouched).
         sqlx::query("UPDATE sources SET enrichment_status = ? WHERE enrichment_status = ?")
             .bind(EnrichmentStatus::Pending.as_str())
             .bind(EnrichmentStatus::Enriching.as_str())
@@ -430,22 +296,13 @@ impl LensEngine {
         let mut config = AppConfig::load(data_dir)?;
         config.paths.data_dir = data_dir.display().to_string();
 
-        // ── Startup-GC of orphaned transient re-embed tables (AC7). A crash
-        // during the Step-5 re-embed leaves either a `building` row (crash mid-
-        // populate, before the flip) or a `stale` row (crash after the flip-txn
-        // commit but before the Lance-drop). Reclaim BOTH: drop the physical Lance
-        // table (idempotent — a missing table is a no-op) and delete the registry
-        // row even when its Lance table is already gone. The `active` row is never
-        // touched. Best-effort: a GC failure must NOT prevent the engine from
-        // starting (raw vectors still serve search), so it is logged, not fatal.
+        // Startup-GC (AC7): reclaim orphaned `building`/`stale` re-embed tables.
+        // Best-effort — a GC failure must not prevent startup.
         let gc_data_dir = std::path::PathBuf::from(&config.paths.data_dir);
         if let Err(e) = Self::gc_orphan_embedding_tables(&db, &gc_data_dir).await {
             tracing::warn!("startup-GC of orphan embedding tables failed (non-fatal): {e}");
         }
 
-        // ── Build the bounded enrichment queue + spawn the worker. The worker
-        // owns the receiver; the engine keeps the sender. The provider cell starts
-        // empty (the worker / a later detect_llm transition installs a provider).
         let (enrichment_tx, enrichment_rx) =
             mpsc::channel::<EnrichmentJob>(enrichment::ENRICHMENT_QUEUE_CAPACITY);
 
@@ -471,12 +328,8 @@ impl LensEngine {
 
         enrichment::spawn_worker(engine.clone(), enrichment_rx);
 
-        // ── Best-effort model-catalog refresh (Stage 1). Fire-and-forget on a
-        // detached task so a slow/failed fetch NEVER blocks init or panics: a
-        // network/parse error degrades to the cached/bundled copy (mirrors the
-        // startup-GC contract above). The 2-3×/day cadence is achieved by the
-        // staleness check here at startup plus on-demand
-        // `refresh_model_catalog` calls (e.g. when a picker opens).
+        // Best-effort model-catalog refresh at startup; a slow/failed fetch degrades
+        // to the cached/bundled copy — never blocks init.
         {
             let data_dir = std::path::PathBuf::from(&engine.config().await.paths.data_dir);
             tokio::spawn(async move {
@@ -493,13 +346,8 @@ impl LensEngine {
             });
         }
 
-        // ── Install the enrichment LLM provider from the REAL config (Step 6).
-        // When enrichment is enabled, build the provider from `AppConfig.models[]`
-        // gating cloud backends on `enrichment.cloud_consent` (the factory rejects
-        // a cloud provider without consent). When disabled the cell stays empty
-        // and the worker no-ops on each job — sources stay on raw vectors. A later
-        // `detect_llm` unreachable→reachable transition can still rebind via
-        // [`rescan_enrichment_on_provider_change`].
+        // Install the enrichment LLM provider from config (Step 6). When disabled,
+        // the cell stays empty and sources remain on raw vectors.
         {
             let cfg = engine.config().await;
             if cfg.enrichment.enabled {
@@ -508,10 +356,8 @@ impl LensEngine {
             }
         }
 
-        // ── Queue-rebuild (AC10/AC12): enqueue every indexed-but-not-yet-enriched
-        // source so a restart (or a back-fill after a provider becomes reachable)
-        // resumes enrichment. Best-effort — a full channel or a transient DB error
-        // is recovered by the next rescan, so it never blocks startup.
+        // Queue-rebuild (AC10/AC12): enqueue indexed-but-not-yet-enriched sources.
+        // Best-effort — never blocks startup.
         if let Err(e) = engine.rebuild_enrichment_queue().await {
             tracing::warn!("enrichment queue-rebuild at startup failed (non-fatal): {e}");
         }
@@ -521,11 +367,7 @@ impl LensEngine {
     }
 
     /// Test constructor: a fully-migrated in-memory engine with a default config.
-    ///
-    /// Uses a single-connection in-memory pool so the migrated schema persists
-    /// across all queries (`:memory:` is per-connection in SQLite). See
-    /// [`db::open_in_memory_pool`]. Tests needing real concurrency should build
-    /// an engine over a `tempfile` directory via [`LensEngine::init`].
+    /// Uses a single-connection pool so the schema persists across queries.
     pub async fn for_test() -> Self {
         let db = db::open_in_memory_pool()
             .await
@@ -557,38 +399,28 @@ impl LensEngine {
             #[cfg(feature = "test-util")]
             enrichment_max_calls_override: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         };
-        // Spawn the (stub) worker so the enrichment surface behaves identically to
-        // a production engine; it is inert unless a test explicitly enqueues a job.
         enrichment::spawn_worker(engine.clone(), enrichment_rx);
         engine
     }
 
-    /// Acquires a shared read guard over the engine state.
     pub async fn read(&self) -> RwLockReadGuard<'_, LensEngineInner> {
         self.inner.read().await
     }
 
-    /// Acquires an exclusive write guard over the engine state.
     pub async fn write(&self) -> RwLockWriteGuard<'_, LensEngineInner> {
         self.inner.write().await
     }
 
-    /// Returns a clone of the database connection pool.
-    ///
-    /// Cloning a `SqlitePool` is cheap (it's an `Arc` internally) and shares the
-    /// same underlying connections. This is the canonical way to reach the pool
-    /// from repos, commands, and tests — no code should touch `inner.db` directly.
+    /// Returns a clone of the connection pool. Cloning is cheap (`Arc` internally).
     pub async fn pool(&self) -> SqlitePool {
         self.read().await.db.clone()
     }
 
-    /// Returns a clone of the current application configuration.
     pub async fn config(&self) -> AppConfig {
         self.read().await.config.clone()
     }
 
-    /// Replaces the in-memory configuration. Persistence to disk is the caller's
-    /// responsibility (the production command layer saves to `config.json`).
+    /// Replaces the in-memory configuration. Persistence to disk is the caller's responsibility.
     pub async fn set_config(&self, config: AppConfig) {
         self.write().await.config = config;
     }
@@ -603,20 +435,12 @@ impl LensEngine {
         Ok(count)
     }
 
-    /// Runs the three first-run system-check probes and returns the ordered
-    /// results (LlmRuntime, EmbeddingModel, TextToSpeech). The LLM-runtime probe
-    /// runs first, the embedding probe reuses its outcome, then the TTS probe.
-    ///
-    /// Probes that detect an expected-absent subsystem return a `Fail` status
-    /// rather than an `Err`; this method therefore returns `Ok` unless an
-    /// unexpected internal failure occurs. (Today all probe paths are infallible,
-    /// but the `Result` signature is the frozen contract for future probes.)
+    /// Runs the three first-run system-check probes (LlmRuntime, EmbeddingModel,
+    /// TTS) in order. Expected-absent subsystems return `Fail`, not `Err`.
     #[tracing::instrument(skip_all)]
     pub async fn run_system_check(&self) -> Result<Vec<CheckResult>, LensError> {
-        // Clone config under the read guard, then DROP the guard before running
-        // the probes. The probes issue multi-second HTTP requests; doing so while
-        // holding the read guard would block any concurrent writer (`set_config`)
-        // for the whole probe window. The clone is cheap.
+        // Clone config and drop the guard before probes: each probe issues a
+        // multi-second HTTP request that must not hold the read lock.
         let config = self.read().await.config.clone();
         let data_dir = self.data_dir().await;
         Ok(system_check::run_system_check(&config, &data_dir).await)
@@ -654,8 +478,8 @@ impl LensEngine {
         NotebookRepo::new(&pool).list_trashed_sources().await
     }
 
-    /// Creates a notebook with the given (validated) title and optional
-    /// onboarding `description`/`focus_mode`, and returns it.
+    /// Creates a notebook with the given title and optional onboarding fields,
+    /// stamping the app-wide default embedding coordinate (M4 Phase 4b-B, AC7).
     #[tracing::instrument(skip_all)]
     pub async fn create_notebook(
         &self,
@@ -663,11 +487,6 @@ impl LensEngine {
         description: Option<&str>,
         focus_mode: Option<&str>,
     ) -> Result<Notebook, LensError> {
-        // Resolve the app-wide global default coordinate so a NEW notebook adopts
-        // whatever default was set in Settings (M4 Phase 4b-B, AC7). Both fields
-        // collapse an empty / unset config value to the registry/enum default, so
-        // an unconfigured app stamps the same `nomic-embed-text-v1.5`/`fastembed`
-        // pair the previous compile-time consts produced.
         let cfg = self.config().await;
         let embedding_model = crate::embedder::registry::resolve(&cfg.embedding_model).id;
         let embedding_backend =
@@ -732,16 +551,9 @@ impl LensEngine {
             .await
     }
 
-    /// Inserts a URL source: inserts a `queued` `sources` row whose `locator` is
-    /// the verbatim URL string. Returns immediately — no fetch happens here.
-    /// The caller should invoke [`ingest_source`](Self::ingest_source) separately
-    /// to fetch and extract the page in the background. Returns an
-    /// [`AddSourceOutcome`]: on a content-dedup hit (issue #100, keyed on the
-    /// normalized URL) the existing live source is returned (`was_existing = true`).
-    ///
-    /// `force_js_render` (#78) persists the per-source "SPA / render this page"
-    /// opt-in; when `true`, ingest ALWAYS routes this source through the JS-render
-    /// path rather than relying on static-extraction auto-detection.
+    /// Inserts a `queued` URL source row. No fetch occurs here; call
+    /// `ingest_source` separately. `force_js_render` persists the SPA opt-in (issue
+    /// #78). Returns an `AddSourceOutcome`; deduplicates on normalized URL (#100).
     #[tracing::instrument(skip(self))]
     pub async fn add_url_source(
         &self,
@@ -756,11 +568,8 @@ impl LensEngine {
             .await
     }
 
-    /// Inserts a managed text/markdown source: writes `text` to a managed file
-    /// under `{data_dir}/sources/` and inserts a `queued` `sources` row.
-    /// `kind` must be `"text"` or `"markdown"`. Returns an [`AddSourceOutcome`]:
-    /// on a content-dedup hit (issue #100) the existing live source is returned
-    /// (`was_existing = true`) without writing the managed file or inserting a row.
+    /// Inserts a managed text/markdown source. `kind` must be `"text"` or
+    /// `"markdown"`. Deduplicates on content hash (#100).
     #[tracing::instrument(skip(self, text))]
     pub async fn add_text_source(
         &self,
@@ -771,8 +580,7 @@ impl LensEngine {
     ) -> Result<AddSourceOutcome, LensError> {
         let data_dir = self.data_dir().await;
         let pool = self.pool().await;
-        // Resolve the configurable cap (issue #71) from `AppConfig.max_source_mb`
-        // (empty → 50 MB default) and enforce it at the paste boundary.
+        // Enforce the configurable size cap (issue #71) at the paste boundary.
         let max_source_bytes =
             crate::ingest::resolve_max_source_bytes(&self.config().await.max_source_mb);
         NotebookRepo::new(&pool)
@@ -780,14 +588,8 @@ impl LensEngine {
             .await
     }
 
-    /// Inserts a managed local-file source (PDF/DOCX/text/markdown): copies the
-    /// file into managed storage under `{data_dir}/sources/` and inserts a
-    /// `queued` `sources` row. `kind` is detected from the file EXTENSION. `title`
-    /// defaults to the file name when not supplied. Returns an [`AddSourceOutcome`]
-    /// carrying the source plus a `was_existing` flag: on a content-dedup hit
-    /// (issue #96) the existing live source is returned (`was_existing = true`)
-    /// without copying the file or inserting a new row.
-    /// Call [`ingest_source`](Self::ingest_source) separately to extract + index it.
+    /// Copies a local file into managed storage and inserts a `queued` row.
+    /// Deduplicates on file content hash (issue #96). Call `ingest_source` separately.
     #[tracing::instrument(skip(self))]
     pub async fn add_file_source(
         &self,
@@ -819,14 +621,9 @@ impl LensEngine {
         NotebookRepo::new(&pool).restore_source(source_id).await
     }
 
-    /// Permanently deletes a source: drops its Lance vectors first (Lance before
-    /// SQLite ordering), then removes the `sources` row. Child `chunks` rows
-    /// cascade. Errors if the source does not exist or is not trashed.
-    ///
-    /// Holds the `ingest_lock` permit across the whole cross-store delete so a
-    /// destructive wipe cannot interleave a live ingest of the same source (which
-    /// would otherwise re-insert vectors after the drop, leaving orphans). See
-    /// the module-level concurrency invariants on [`LensEngine`].
+    /// Permanently deletes a source: drops Lance vectors first (Lance before SQLite
+    /// ordering), then removes the `sources` row. Holds `ingest_lock` across the
+    /// whole cross-store delete to prevent orphan Lance rows.
     #[tracing::instrument(skip(self))]
     pub async fn purge_source(&self, source_id: &str) -> Result<(), LensError> {
         let _permit = self
@@ -841,15 +638,9 @@ impl LensEngine {
             .await?
             .ok_or_else(|| LensError::Validation(format!("no source with id {source_id}")))?;
         let store = crate::vector_store::LanceVectorStore::new(&data_dir, pool.clone());
-        // R7b: drop the source from EVERY active coordinate the notebook holds, not
-        // just the currently-configured one. A same-(model, dim) cross-backend
-        // switch (or a re-embed mid-flight) can leave MULTIPLE active coordinates
-        // for one notebook (e.g. a lingering fastembed row alongside a new ollama
-        // one); resolving only the configured coordinate would leave the other
-        // backend's vectors dangling (search would return hits no source backs).
-        // Enumerate the active registry rows — each yields its own backend — and
-        // drop from each. A coordinate with no active row is a no-op inside
-        // `drop_source`.
+        // R7b: drop from EVERY active coordinate, not just the configured one.
+        // A cross-backend switch can leave multiple active coordinates; only dropping
+        // the configured one would leave the other backend's vectors dangling.
         let active_coords: Vec<(String, i64, String)> = sqlx::query_as(
             "SELECT DISTINCT model, dim, backend FROM embedding_index \
              WHERE notebook_id = ? AND status = 'active'",
@@ -867,9 +658,7 @@ impl LensEngine {
             store.drop_source(&coord, source_id).await?;
         }
         NotebookRepo::new(&pool).purge_source(source_id).await?;
-        // Best-effort: remove the managed source file AND its `.extracted.txt`
-        // and `.tables.md` siblings so "Delete forever" does not leak any of them
-        // on disk. A missing file (already gone) is not an error.
+        // Best-effort: remove managed source file + siblings; a missing file is not an error.
         remove_managed_source_file(&data_dir, source_id, &source.locator);
         Ok(())
     }
@@ -907,33 +696,23 @@ impl LensEngine {
         crate::ingest::retry_source(self, source_id, on_progress).await
     }
 
-    /// Returns the resolved data directory from the loaded config.
     pub(crate) async fn data_dir(&self) -> std::path::PathBuf {
         std::path::PathBuf::from(self.read().await.config.paths.data_dir.clone())
     }
 
-    /// Test-only accessor for the resolved data directory (the `pub(crate)`
-    /// [`data_dir`](Self::data_dir) is not reachable from the integration-test
-    /// crate). Gated behind `test-util` so it is absent from production builds.
+    /// Test-only accessor: `pub(crate)` `data_dir` is unreachable from the test
+    /// crate; this exposes it. Absent from production builds.
     #[cfg(feature = "test-util")]
     pub async fn data_dir_for_test(&self) -> std::path::PathBuf {
         self.data_dir().await
     }
 
-    /// Borrows the single-permit ingest semaphore (Decision D1 / M2).
     pub(crate) fn ingest_lock(&self) -> &Arc<Semaphore> {
         &self.ingest_lock
     }
 
-    // ── Enrichment wiring (M4 Phase 3, Step 3) ──────────────────────────────
-
-    /// Installs (or replaces) the active enrichment LLM provider under the
-    /// `RwLock` cell. `None` clears it (degrade to raw vectors).
-    ///
-    /// This is the AC10 rebinding seam: on a `detect_llm` unreachable→reachable
-    /// transition (or a config change), call this to swap the provider so the
-    /// queue-rebuild can enrich the back-fill. `OnceCell` could not model this —
-    /// hence the ratified `RwLock` cell.
+    /// Installs (or replaces) the active enrichment LLM provider. `None` clears it
+    /// (degrades to raw vectors). AC10 rebinding seam for unreachable→reachable.
     pub async fn set_llm_provider(&self, provider: Option<Arc<dyn LlmProvider>>) {
         *self.llm_provider.write().await = provider;
     }
@@ -944,11 +723,9 @@ impl LensEngine {
         self.llm_provider.read().await.clone()
     }
 
-    /// Installs (or replaces) the JS renderer for the SPA URL-render fallback
-    /// (issue #78). `None` clears it (the near-empty SPA path degrades to
-    /// `needs_js`). Mirrors [`set_llm_provider`](Self::set_llm_provider): the
-    /// concrete `TauriJsRenderer` lives in `src-tauri` and is injected here at
-    /// app setup because `lens-core` cannot depend on `tauri`.
+    /// Installs (or replaces) the JS renderer for SPA URL-render fallback (issue
+    /// #78). `None` degrades to `needs_js`. The concrete `TauriJsRenderer` is
+    /// injected here because `lens-core` cannot depend on `tauri`.
     pub async fn set_js_renderer(&self, renderer: Option<Arc<dyn render::JsRenderer>>) {
         *self.js_renderer.write().await = renderer;
     }
@@ -960,14 +737,9 @@ impl LensEngine {
         self.js_renderer.read().await.clone()
     }
 
-    /// Non-blocking enqueue of a source for background enrichment (AC3).
-    ///
-    /// A [`try_send`](mpsc::Sender::try_send) — it NEVER awaits and NEVER blocks,
-    /// so the ingest path can call it without holding the `ingest_lock` permit and
-    /// a full channel can never deadlock against a held permit. A full/closed
-    /// channel logs and drops the job; the startup/rescan
-    /// [`rebuild_enrichment_queue`](Self::rebuild_enrichment_queue) recovers any
-    /// dropped source. This is intentionally infallible at the call site.
+    /// Non-blocking enqueue for background enrichment (AC3). Uses `try_send` so
+    /// the ingest path never holds `ingest_lock` and a full channel cannot deadlock.
+    /// A full/closed channel logs and drops the job; `rebuild_enrichment_queue` recovers it.
     pub fn enqueue_enrichment(&self, source_id: &str) {
         let job = EnrichmentJob {
             source_id: source_id.to_string(),
@@ -986,13 +758,8 @@ impl LensEngine {
         }
     }
 
-    /// Scans for sources eligible for enrichment and enqueues them (AC10/AC12).
-    ///
-    /// Eligibility: `SourceStatus::Indexed` (searchable on raw vectors) AND
-    /// `enrichment_status IN (NULL/none, 'pending', 'failed')` (never enriched, or
-    /// reset by crash-recovery, or previously failed). Excludes `enriched`,
-    /// `enriching`, and `skipped`. Called at startup and as the AC10 back-fill
-    /// rescan hook on a provider unreachable→reachable transition.
+    /// Enqueues all indexed-but-not-yet-enriched sources (AC10/AC12). Called at
+    /// startup and on provider unreachable→reachable transitions.
     pub async fn rebuild_enrichment_queue(&self) -> Result<(), LensError> {
         let pool = self.pool().await;
         let ids: Vec<String> = sqlx::query_scalar(
@@ -1016,16 +783,9 @@ impl LensEngine {
         Ok(())
     }
 
-    /// AC10 back-fill hook: re-binds the provider from the current config and, if a
-    /// provider is now installed, re-scans the queue. Intended to be called on a
-    /// `detect_llm` unreachable→reachable transition. Full `system_check`
-    /// integration is deferred (Step 4+); this provides the engine-side seam.
-    ///
-    /// The cloud-consent flag is now sourced from the REAL config
-    /// (`AppConfig.enrichment.cloud_consent`, Step 6) rather than threaded in by
-    /// the caller; `enabled=false` clears the provider (enrichment off ⇒ raw
-    /// vectors). `cloud_consent` gates cloud providers via
-    /// [`crate::llm::provider_from_config`].
+    /// AC10 back-fill hook: re-binds the provider from the current config and
+    /// re-scans the queue if a provider is now installed. `enabled=false` clears
+    /// the provider; `cloud_consent` gates cloud providers.
     pub async fn rescan_enrichment_on_provider_change(&self) -> Result<(), LensError> {
         let config = self.config().await;
         // Honor the master toggle: disabled enrichment clears any provider.
@@ -1042,52 +802,31 @@ impl LensEngine {
         Ok(())
     }
 
-    // ── Model catalog (Stage 1) ─────────────────────────────────────────────
-
-    /// Loads the typed model catalog (cached `models-catalog.json`, else the
-    /// bundled snapshot), behind an `Arc`. Never fails hard — always returns a
-    /// usable catalog.
-    ///
-    /// Hits an in-memory cache so repeated picker opens are a cheap pointer clone
-    /// rather than a ~2.6 MB disk read + JSON parse each time (fix #5). On a cache
-    /// MISS the blocking read+parse runs on the blocking pool via
-    /// [`tokio::task::spawn_blocking`] — never on the async runtime — then the
-    /// result is memoized. [`refresh_model_catalog`](Self::refresh_model_catalog)
-    /// invalidates the cache when it rewrites the file, so the next call re-reads
-    /// the fresh catalog.
+    /// Returns the model catalog (cached `models-catalog.json`, else the bundled
+    /// snapshot). In-memory cache so repeated picker opens are a cheap pointer clone
+    /// (fix #5). A cache miss loads via `spawn_blocking` and memoizes.
     #[tracing::instrument(skip_all)]
     pub async fn model_catalog(&self) -> Arc<crate::model_catalog::ModelCatalog> {
-        // Fast path: a cache hit is a pointer clone under a read lock.
         if let Some(catalog) = self.catalog_cache.read().await.as_ref() {
             return catalog.clone();
         }
-        // Miss: load off the async runtime, then memoize. The read+parse is the
-        // blocking work `spawn_blocking` keeps off the executor thread.
         let data_dir = self.data_dir().await;
         let loaded =
             tokio::task::spawn_blocking(move || crate::model_catalog::load_catalog(&data_dir))
                 .await
                 .map(Arc::new)
-                // A `JoinError` (the load task panicked) is non-fatal: fall back to the
-                // bundled snapshot so the catalog surface never fails hard.
+                // A JoinError (load task panicked) is non-fatal; fall back to the bundled snapshot.
                 .unwrap_or_else(|e| {
                     tracing::warn!("model-catalog load task panicked; using bundled snapshot: {e}");
                     Arc::new(crate::model_catalog::ModelCatalog::bundled())
                 });
-        // Populate the cache. If another task raced us, either copy is equivalent
-        // (both read the same on-disk/bundled catalog), so simply overwrite.
         *self.catalog_cache.write().await = Some(loaded.clone());
         loaded
     }
 
-    /// Forces an on-demand model-catalog refresh (e.g. when a model picker
-    /// opens). Best-effort: still gated by the staleness check, so a fresh cache
-    /// is left untouched. Returns `Ok(true)` when the cache was refreshed.
-    ///
-    /// When the on-disk cache is actually rewritten (`Ok(true)`), the in-memory
-    /// catalog cache is INVALIDATED so the next [`model_catalog`](Self::model_catalog)
-    /// re-reads the fresh file (fix #5). A no-op refresh (fresh cache, `Ok(false)`)
-    /// leaves the in-memory cache intact.
+    /// Forces an on-demand model-catalog refresh. Returns `Ok(true)` when the
+    /// on-disk cache was rewritten; invalidates the in-memory cache so the next
+    /// `model_catalog()` re-reads the fresh file (fix #5).
     #[tracing::instrument(skip_all)]
     pub async fn refresh_model_catalog(&self) -> Result<bool, LensError> {
         let data_dir = self.data_dir().await;
@@ -1106,15 +845,8 @@ impl LensEngine {
     }
 
     /// Startup-GC (AC7): drop every orphaned `building`/`stale` re-embed table and
-    /// delete its registry row, idempotently.
-    ///
-    /// A static helper (takes the raw pool/data_dir) so `init` can call it BEFORE
-    /// the engine handle exists. Sweeps `embedding_index` rows where
-    /// `status IN ('building','stale')`: `drop_tables` removes the physical Lance
-    /// tables (a missing table is a no-op), then a single DELETE removes the rows —
-    /// even when the Lance table was already gone (crash between the flip-txn
-    /// commit and the Lance-drop). The `active` row is never selected, so the live
-    /// index is untouched.
+    /// delete its registry row. Static helper (no engine handle) so `init` can call
+    /// it early. The `active` row is never touched.
     async fn gc_orphan_embedding_tables(db: &SqlitePool, data_dir: &Path) -> Result<(), LensError> {
         let table_names: Vec<String> = sqlx::query_scalar(
             "SELECT lance_table_name FROM embedding_index WHERE status IN ('building', 'stale')",
@@ -1125,10 +857,8 @@ impl LensEngine {
             return Ok(());
         }
         let store = crate::vector_store::LanceVectorStore::new(data_dir, db.clone());
-        // Drop the physical tables first (idempotent), THEN delete the registry
-        // rows. If the drop fails the rows survive and a later GC retries; if the
-        // process dies between the drop and the delete, the rows are reclaimed on
-        // the next startup (the table is already gone, so drop_tables no-ops).
+        // Drop tables first (idempotent), then delete rows. A crash between the two
+        // leaves only a dangling stale row; the next startup's GC no-ops the drop.
         crate::vector_store::VectorStore::drop_tables(&store, &table_names).await?;
         sqlx::query("DELETE FROM embedding_index WHERE status IN ('building', 'stale')")
             .execute(db)
@@ -1140,9 +870,7 @@ impl LensEngine {
         Ok(())
     }
 
-    /// Test-only: awaited inside the worker's stub job body so a test can hold a
-    /// job "in flight". Returns immediately when no gate is installed. Compiled out
-    /// of production builds.
+    /// Awaited inside the worker job body to hold it "in flight" for AC3 tests.
     #[cfg(feature = "test-util")]
     pub(crate) async fn enrichment_job_gate(&self) {
         let gate = self.enrichment_gate.read().await.clone();
@@ -1151,21 +879,13 @@ impl LensEngine {
         }
     }
 
-    /// Test-only seam: installs (or clears) the worker job gate. While a gate is
-    /// installed, the worker blocks in its job body until the returned `Notify` is
-    /// `notify_one`'d — letting an AC3 test assert the worker holds no
-    /// `ingest_lock` permit during the body (a concurrent `purge_source`
-    /// proceeds). Gated behind `test-util`; absent from production builds.
+    /// Installs (or clears) the worker job gate for AC3 tests.
     #[cfg(feature = "test-util")]
     pub async fn set_enrichment_gate_for_test(&self, gate: Option<Arc<tokio::sync::Notify>>) {
         *self.enrichment_gate.write().await = gate;
     }
 
-    /// Test-only: awaited inside [`reembed::reembed_and_flip`] after the lock-free
-    /// populate and before the `ingest_lock` flip window. Returns immediately when
-    /// no gate is installed. Lets a fix #2 test hold the reembed "just before the
-    /// flip" while it runs a `purge_source` to completion (sequential race).
-    /// Compiled out of production builds.
+    /// Awaited after populate and before the flip window for fix-#2 race tests.
     #[cfg(feature = "test-util")]
     pub(crate) async fn reembed_preflip_gate(&self) {
         let gate = self.reembed_preflip_gate.read().await.clone();
@@ -1174,10 +894,7 @@ impl LensEngine {
         }
     }
 
-    /// Test-only seam: installs (or clears) the reembed pre-flip gate. While
-    /// installed, [`reembed::reembed_and_flip`] blocks after populate (before the
-    /// flip) until the `Notify` is `notify_one`'d. Gated behind `test-util`; absent
-    /// from production builds.
+    /// Installs (or clears) the reembed pre-flip gate for fix-#2 tests.
     #[cfg(feature = "test-util")]
     pub async fn set_reembed_preflip_gate_for_test(&self, gate: Option<Arc<tokio::sync::Notify>>) {
         *self.reembed_preflip_gate.write().await = gate;
@@ -1191,12 +908,8 @@ impl LensEngine {
         self.enqueue_enrichment(source_id);
     }
 
-    /// Test-only seam: runs the Step-5 re-embed new-table-flip directly (the
-    /// production path is internal to the worker). Lets a test drive the
-    /// purge-vs-flip race deterministically — populate the building table via this
-    /// call AFTER a `purge_source` has already removed the source — to assert the
-    /// in-lock re-check SKIPS the flip (fix #2). Gated behind `test-util`; absent
-    /// from production builds.
+    /// Drives the Step-5 re-embed flip directly so fix-#2 race tests can control
+    /// the purge-vs-flip ordering. Absent from production builds.
     #[cfg(feature = "test-util")]
     pub async fn reembed_and_flip_for_test(
         &self,
@@ -1217,10 +930,7 @@ impl LensEngine {
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Test-only seam (AC11 budget): override the worker's per-job LLM-call ceiling
-    /// so a test can assert the circuit-break fires after exactly `max_calls`
-    /// admitted calls (`0` restores the default). Gated behind `test-util`; absent
-    /// from production builds.
+    /// AC11 budget test seam: `0` restores the production default.
     #[cfg(feature = "test-util")]
     pub fn set_enrichment_max_calls_for_test(&self, max_calls: u32) {
         self.enrichment_max_calls_override
@@ -1251,37 +961,17 @@ impl LensEngine {
         self.enrichment_tx.capacity()
     }
 
-    /// Test-only seam: pre-fills the keyed embedder cache with a caller-supplied
-    /// [`Embedder`] so integration tests can inject a `CountingEmbedder` (and so
-    /// avoid the ~130 MB `FastembedEmbedder` model download).
-    ///
-    /// The embedder is registered under `(model_id, backend)` (its own
-    /// [`Embedder::model_id`] plus the caller-supplied `backend`), so a later
-    /// [`embedder_for`](Self::embedder_for) for that `(id, backend)` returns this
-    /// injected instance instead of building a real model. Inject one per
-    /// `(model, backend)` a test exercises (e.g. a default-nomic Fastembed
-    /// embedder AND the same nomic id under Ollama, each under its own key).
-    ///
-    /// Gated behind the `test-util` feature so it is NEVER present in a
-    /// production build. Returns `Err` if an embedder is already cached for that
-    /// model id (e.g. a prior `ingest_source` already lazily constructed it).
-    ///
-    /// The injected embedder is shared exactly like the lazily-constructed one,
-    /// so the cached-once AC (`load_count == 1` across two ingests) and the
-    /// concurrency AC (`in_flight` never exceeds `1`) are both observable through
-    /// the same `Arc` the pipeline reuses.
+    /// Pre-fills the embedder cache so tests inject a `CountingEmbedder` instead of
+    /// downloading a real model. Returns `Err` if an embedder for that key is already
+    /// cached. Absent from production builds.
     #[cfg(feature = "test-util")]
     pub fn set_embedder_for_test(
         &self,
         embedder: Arc<dyn Embedder>,
         backend: crate::embedder::EmbeddingBackend,
     ) -> Result<(), LensError> {
-        // Register under the SAME device key `embedder_for` will resolve for a Bulk
-        // request (the workload every injection-based test drives): run the real
-        // policy against the engine's own accelerator (issue #91). Feature-off this
-        // is always `Compute::Cpu`; feature-on on Metal hardware it correctly
-        // resolves `Compute::Metal`, so the injected double is found either way
-        // instead of being missed (which would trigger a real model download).
+        // Register under the key `embedder_for` resolves for a Bulk workload so the
+        // injected double is found on Metal hardware too (issue #91).
         let spec = crate::embedder::resolve(embedder.model_id());
         let compute = crate::embedder::select_compute(
             self.accelerator.probe(),
@@ -1290,10 +980,8 @@ impl LensEngine {
             crate::embedder::WorkloadKind::Bulk,
         );
         let key = Self::embedder_cache_key(embedder.model_id(), backend, compute);
-        // `try_lock` (not `blocking_lock`) keeps this a sync fn that is safe to
-        // call from inside a `#[tokio::test]` async context: the cache is
-        // uncontended at injection time, so the lock is always immediately
-        // available.
+        // `try_lock` keeps this a sync fn safe inside `#[tokio::test]`: the cache
+        // is uncontended at injection time.
         let mut cache = self
             .embedders
             .try_lock()
@@ -1307,34 +995,21 @@ impl LensEngine {
         Ok(())
     }
 
-    /// Test-only seam: returns the cached/lazily-built embedder for `model_id`
-    /// (the `pub(crate)` [`embedder_for`](Self::embedder_for) is not reachable
-    /// from the integration-test crate). Gated behind `test-util`.
+    /// Returns the cached/lazily-built embedder for tests (`pub(crate)` `embedder_for`
+    /// is unreachable from the test crate). Absent from production builds.
     #[cfg(feature = "test-util")]
     pub async fn embedder_for_test_get(
         &self,
         model_id: &str,
         backend: crate::embedder::EmbeddingBackend,
     ) -> Result<Arc<dyn Embedder>, LensError> {
-        // Tests don't exercise device selection (they run feature-off → always CPU);
-        // Bulk is the representative workload of every real call site.
         self.embedder_for(model_id, backend, crate::embedder::WorkloadKind::Bulk)
             .await
     }
 
-    /// The embedder-cache key for a `(resolved-model-id, backend, compute)` triple.
-    ///
-    /// The backend is part of the key (M4 Phase 4b-B): the SAME registry model
-    /// served by `fastembed` vs `ollama` is two physically-distinct embedders
-    /// (different numerical vectors), so they MUST occupy separate cache slots —
-    /// a model-id-only key would alias them and return the wrong backend's
-    /// embedder for a notebook.
-    ///
-    /// The `compute` device is ALSO part of the key (issue #91): a CPU
-    /// (`fastembed`/ONNX) and a Metal (`candle`) embedder for the same
-    /// `(model, backend)` are distinct instances that can coexist for one notebook
-    /// — licensed by their numerical parity — and must not alias. Format:
-    /// `"{backend}:{model_id}:{compute}"`.
+    /// Cache key for a `(backend, model_id, compute)` triple. Backend and compute
+    /// are both in the key so a fastembed/Metal pair never aliases a fastembed/CPU
+    /// or Ollama entry for the same model. Format: `"{backend}:{model_id}:{compute}"`.
     fn embedder_cache_key(
         model_id: &str,
         backend: crate::embedder::EmbeddingBackend,
@@ -1343,30 +1018,11 @@ impl LensEngine {
         format!("{}:{model_id}:{}", backend.as_str(), compute.as_str())
     }
 
-    /// Lazily constructs (once per `(model_id, backend)`) and returns the shared
-    /// embedder for that coordinate, caching it in the keyed embedder cache (R8).
-    ///
-    /// On a cache hit the cached `Arc` is cloned and returned. On a miss the
-    /// model id is resolved through the registry ([`crate::embedder::resolve`],
-    /// which falls back to the default for an unknown/empty id) and an embedder is
-    /// built for that spec PER BACKEND:
-    ///
-    /// - [`EmbeddingBackend::Fastembed`](crate::embedder::EmbeddingBackend::Fastembed):
-    ///   a [`FastembedEmbedder`] over `{data_dir}/models/fastembed/` (a
-    ///   ~130 MB–1.3 GB ONNX session, with a one-time HuggingFace download on a
-    ///   cold cache). Construction runs under [`tokio::task::spawn_blocking`]
-    ///   because fastembed init is synchronous and CPU/IO-heavy.
-    /// - [`EmbeddingBackend::Ollama`](crate::embedder::EmbeddingBackend::Ollama):
-    ///   an [`OllamaEmbedder`](crate::embedder::OllamaEmbedder) targeting the
-    ///   configured (loopback-only) Ollama base URL.
-    ///
-    /// The cache is keyed by `(resolved-spec-id, backend)`
-    /// ([`embedder_cache_key`](Self::embedder_cache_key)) so the legacy alias and
-    /// an unknown id both collapse onto the canonical entry, while the two
-    /// backends for the same model NEVER alias. The whole construct-and-insert
-    /// runs while holding the cache `Mutex`, so concurrent callers for the same
-    /// key serialize: the expensive init runs exactly once (see the field's R8
-    /// doc).
+    /// Lazily constructs and caches the embedder for `(model_id, backend, workload)`
+    /// (R8). Cache hit returns the cached `Arc`. Cache miss resolves the spec,
+    /// selects the device, and builds: `Fastembed` via `spawn_blocking` (ONNX, may
+    /// download weights); `Ollama` via a lightweight client. The whole
+    /// construct-and-insert holds the cache `Mutex` so init runs exactly once.
     pub(crate) async fn embedder_for(
         &self,
         model_id: &str,
@@ -1374,13 +1030,8 @@ impl LensEngine {
         workload: crate::embedder::WorkloadKind,
     ) -> Result<Arc<dyn Embedder>, LensError> {
         let spec = crate::embedder::resolve(model_id);
-        // Primary backend guard (issue #80): the model↔backend partition is strict.
-        // Reject a `(model, backend)` pair the spec does not support BEFORE the
-        // match arm so callers (including `warm_fastembed_model`) get one clean,
-        // user-facing validation error naming the model + backend — never a
-        // downstream fastembed-init or embed error. The construction-time guards in
-        // `FastembedEmbedder::new_with_spec` / `OllamaEmbedder::new` are the
-        // defense-in-depth backstop.
+        // Reject an unsupported (model, backend) pair early (issue #80) so callers
+        // get a single clean error; construction-time guards are the backstop.
         if !spec.supports(backend) {
             return Err(LensError::Validation(format!(
                 "model {} does not support the {} backend",
@@ -1388,10 +1039,8 @@ impl LensEngine {
                 backend.as_str()
             )));
         }
-        // issue #91: resolve the execution device from the per-job policy (hardware
-        // probe + model hint + backend + workload). CPU everywhere the policy can't
-        // justify the GPU; Metal only for a GPU-eligible model on a bulk job on
-        // Apple Silicon.
+        // Resolve the execution device (issue #91): Metal only for a GPU-eligible
+        // bulk job on Apple Silicon; CPU everywhere else.
         let compute =
             crate::embedder::select_compute(self.accelerator.probe(), spec, backend, workload);
         let key = Self::embedder_cache_key(spec.id, backend, compute);
@@ -1402,14 +1051,8 @@ impl LensEngine {
         let embedder: Arc<dyn Embedder> = match backend {
             crate::embedder::EmbeddingBackend::Fastembed => {
                 let data_dir = self.data_dir().await;
-                // On the native-ml-metal build (Apple Silicon), candle is the
-                // default engine for a candle-supported model — Metal for bulk,
-                // candle-CPU for interactive queries. `Compute::Cuda` routes to the
-                // (interface-only) CUDA builder, which returns None until a
-                // candle-CUDA backend is implemented. On ANY GPU failure, an
-                // unimplemented model/device, or any other target, this returns None
-                // and we use fastembed. Never fail a job over a device choice; the
-                // result is cached under the resolved compute key.
+                // Try candle (Metal/CUDA) first; fall back to fastembed on any failure
+                // or unsupported model. Never fail a job over a device choice.
                 let gpu = if compute == crate::embedder::Compute::Cuda {
                     build_cuda_if_supported(compute, &data_dir, spec).await
                 } else {
@@ -1418,8 +1061,6 @@ impl LensEngine {
                 match gpu {
                     Some(e) => e,
                     None => {
-                        // `spec` is a `&'static EmbeddingModelSpec` (Copy), so the
-                        // closure captures it directly without a clone.
                         let e = tokio::task::spawn_blocking(move || {
                             FastembedEmbedder::new_with_spec(&data_dir, spec)
                         })
@@ -1440,26 +1081,12 @@ impl LensEngine {
         Ok(embedder)
     }
 
-    /// Warms (constructs + caches) the fastembed embedder for `model_id`,
-    /// downloading its HuggingFace weights to `{data_dir}/models/fastembed/` on a
-    /// cold cache. Idempotent: a warm cache hit returns immediately.
+    /// Warms (constructs + caches) the fastembed embedder for `model_id`.
     ///
-    /// This is the onboarding/Settings "Install [fastembed model]" path: fastembed
-    /// has no separate download step (weights land lazily on first embedder
-    /// construction), so warming up-front lets onboarding pass the per-backend
-    /// readiness gate ([`crate::fastembed_weights_cached`]) for a fastembed
-    /// selection on a fresh, Ollama-less machine. Always `Fastembed` (Ollama is
-    /// detect-only — the app never pulls).
-    ///
-    /// Warms with [`WorkloadKind::Interactive`](crate::embedder::WorkloadKind) so it
-    /// builds the CPU **fastembed** engine specifically (issue #91). The readiness
-    /// gate checks the fastembed ONNX cache (`{data_dir}/models/fastembed/`) and the
-    /// retrieval/query path is CPU-only, so THAT is the engine onboarding must warm.
-    /// Warming with `Bulk` on an Apple-Silicon `native-ml-metal` build would instead
-    /// download the candle-Metal safetensors (a DIFFERENT artifact, under
-    /// `models/candle/`), leaving the readiness gate unsatisfied and the query path
-    /// cold. The candle-Metal bulk weights download lazily on the first ingest
-    /// (surfaced by the ingest `model_download` progress phase).
+    /// Uses `WorkloadKind::Interactive` so it always builds the CPU/ONNX fastembed
+    /// engine (issue #91): the readiness gate checks the fastembed ONNX cache, so
+    /// `Bulk` on Apple Silicon would download candle-Metal weights instead, leaving
+    /// the gate unsatisfied. The candle-Metal weights download lazily on first ingest.
     pub async fn warm_fastembed_model(&self, model_id: &str) -> Result<(), LensError> {
         self.embedder_for(
             model_id,
@@ -1470,32 +1097,14 @@ impl LensEngine {
         .map(|_| ())
     }
 
-    /// Resolves a notebook's configured embedding coordinate components
-    /// `(model_id, dim, backend)` (R1, M4 Phase 4b-B widened from `(model, dim)`).
-    ///
-    /// This is the SINGLE read-path entry point every query / ingest / re-embed
-    /// caller resolves through before touching the vector store: it reads the
-    /// notebook row's `embedding_model` (NULL/absent for pre-migration rows) and
-    /// runs it through the registry ([`crate::embedder::resolve`]), which falls
-    /// back to the default ([`DEFAULT_EMBED_MODEL_ID`]) for a NULL, empty, or
-    /// unknown value. The returned id is the *canonical* registry id (the legacy
-    /// alias and unknown ids collapse onto a canonical entry), so it is safe to
-    /// thread straight into [`embedder_for`](Self::embedder_for) and the
-    /// `VectorStore` coordinate APIs.
-    ///
-    /// The backend (M4 Phase 4b-B) is the THIRD coordinate axis: a NULL/empty/
-    /// unknown `embedding_backend` column resolves to the global default backend
-    /// via [`crate::embedder::EmbeddingBackend::from_opt_str`] (which, with an
-    /// unset config, is `fastembed`). The returned `(model, dim, backend)` triple
-    /// is everything a caller needs to construct a `VectorStore` `Coordinate`.
+    /// Resolves a notebook's `(model_id, dim, backend)` embedding coordinate (R1,
+    /// M4 Phase 4b-B). NULL/unknown columns fall back to registry/enum defaults.
+    /// The canonical model id is safe to thread into `embedder_for` and `Coordinate`.
     pub async fn resolve_notebook_embedding(
         &self,
         notebook_id: &NotebookId,
     ) -> Result<(String, usize, crate::embedder::EmbeddingBackend), LensError> {
         let pool = self.pool().await;
-        // `fetch_optional` → None means NO such notebook row (fail fast); `Some(row)`
-        // with NULL columns means the row exists with a NULL model/backend (resolve
-        // each to the default).
         let row: (Option<String>, Option<String>) =
             sqlx::query_as("SELECT embedding_model, embedding_backend FROM notebooks WHERE id = ?")
                 .bind(notebook_id.as_str())
@@ -1510,31 +1119,17 @@ impl LensEngine {
         Ok((spec.id.to_string(), spec.dim, backend))
     }
 
-    /// Persists a new embedding model choice for a notebook.
-    ///
-    /// Validates that `model_id` is a known registry entry (unknown ids are
-    /// rejected with a [`LensError::Validation`] rather than silently falling
-    /// through to the nomic default). Writes `notebooks.embedding_model = model_id`
-    /// so subsequent [`resolve_notebook_embedding`](Self::resolve_notebook_embedding)
-    /// calls return the new coordinate.
-    ///
-    /// This does NOT kick off re-embedding — the Tauri command layer calls
-    /// [`reembed_notebook`](Self::reembed_notebook) after persisting.
-    ///
-    /// `backend` (M4 Phase 4b-B) is the THIRD coordinate axis: it is persisted to
-    /// `notebooks.embedding_backend` alongside the model so a same-(model, dim)
-    /// backend switch is a genuine coordinate change that
-    /// [`reembed_notebook`](Self::reembed_notebook) re-embeds + retires (R2).
+    /// Persists a new embedding model/backend choice for a notebook. Rejects unknown
+    /// model ids. Does NOT kick off re-embedding — the Tauri command layer calls
+    /// `reembed_notebook` after persisting. Backend is the third coordinate axis (R2).
     pub async fn set_notebook_embedding_model(
         &self,
         notebook_id: &NotebookId,
         model_id: &str,
         backend: crate::embedder::EmbeddingBackend,
     ) -> Result<(), LensError> {
-        // Reject genuinely-unknown ids via the registry's strict lookup (which
-        // accepts the legacy alias `nomic-embed-text` → nomic). Persist the
-        // CANONICAL `spec.id` (e.g. the frontend's Ollama-facing `nomic-embed-text`
-        // is stored as `nomic-embed-text-v1.5`) so resolution downstream is exact.
+        // Persist the canonical spec.id (e.g. `nomic-embed-text` → `nomic-embed-text-v1.5`)
+        // so downstream resolution is exact.
         let spec = crate::embedder::resolve_opt(model_id).ok_or_else(|| {
             LensError::Validation(format!(
                 "unknown embedding model id: {model_id:?}; known ids: nomic-embed-text-v1.5 \
@@ -1560,19 +1155,10 @@ impl LensEngine {
         Ok(())
     }
 
-    /// Returns `(model_id, dim, backend, status)` for a notebook's current
-    /// embedding coordinate, where `status` is `"active"` when a live
-    /// `embedding_index` row exists for the FULL `(notebook, backend, model, dim)`
-    /// coordinate, or `"none"` otherwise.
-    ///
-    /// R4/R7a (M4 Phase 4b-B): the status query is backend-scoped (`AND backend =
-    /// ?`). After a same-dim cross-backend switch — e.g. fastembed-nomic-768 →
-    /// ollama-nomic-768 — the OLD backend's row may still be `stale`/being retired
-    /// while the NEW backend's row is `active`. A backend-blind query (matching
-    /// only `(model, dim)`) would report the WRONG backend's status; binding the
-    /// resolved backend returns the configured coordinate's true status.
-    ///
-    /// Used by [`get_notebook_embedding_model`] in the Tauri command layer.
+    /// Returns `(model_id, dim, backend, status)` for a notebook's embedding
+    /// coordinate. Status query is backend-scoped (R4/R7a, M4 Phase 4b-B): a
+    /// cross-backend switch can leave the old backend `stale` while the new one
+    /// is `active`; a backend-blind query would report the wrong status.
     pub async fn get_notebook_embedding_info(
         &self,
         notebook_id: &NotebookId,
@@ -1593,17 +1179,9 @@ impl LensEngine {
         Ok((model_id, dim, backend, status))
     }
 
-    /// Re-embeds every chunk of `notebook_id` into the notebook's currently
-    /// configured embedding coordinate, flips it active, and retires the previous
-    /// coordinate(s) (M4 Phase 4b, Step 9 — the model-switch re-embed).
-    ///
-    /// Background-safe: the embed + populate runs lock-free; only the brief flip +
-    /// retirement take `ingest_lock`, and the OLD index keeps serving search until
-    /// the flip. A no-op when the configured model already matches the active
-    /// coordinate. `on_progress(done, total)` fires after each populated batch
-    /// (pass a no-op closure for headless callers). See
-    /// [`enrichment::reembed::reembed_notebook`] for the crash-safety + R2
-    /// coordinate-re-check details.
+    /// Re-embeds every chunk into the notebook's configured coordinate and retires
+    /// previous coordinates (M4 Phase 4b, Step 9). Populate runs lock-free; only
+    /// the brief flip takes `ingest_lock`. No-op when already at the active coordinate.
     #[tracing::instrument(skip_all, fields(notebook = %notebook_id.as_str()))]
     pub async fn reembed_notebook(
         &self,
@@ -1613,13 +1191,8 @@ impl LensEngine {
         crate::enrichment::reembed::reembed_notebook(self, notebook_id, on_progress).await
     }
 
-    /// Lazily resolves (once) and returns the shared nomic tokenizer.
-    ///
-    /// The first caller resolves the nomic `tokenizer.json` via the shared
-    /// [`resolve_nomic_tokenizer`] resolver (locating a cached copy or
-    /// downloading it once); subsequent callers reuse the cached `Arc`. This
-    /// mirrors [`LensEngine::embedder_for`] so the multi-MB tokenizer is parsed
-    /// from disk exactly once per engine rather than on every ingest.
+    /// Lazily resolves (once) and returns the shared nomic tokenizer, caching it
+    /// so the multi-MB `tokenizer.json` is parsed exactly once per engine.
     pub(crate) async fn tokenizer(&self) -> Result<Arc<Tokenizer>, LensError> {
         #[cfg(feature = "test-util")]
         if self
@@ -1679,19 +1252,9 @@ impl LensEngine {
         NotebookRepo::new(&pool).restore(id).await
     }
 
-    /// Permanently deletes a notebook. Child rows cascade via `ON DELETE CASCADE`.
-    /// This is the sole hard-delete path (used by "Delete forever").
-    ///
-    /// Drops the notebook's per-notebook Lance tables FIRST (Lance before SQLite,
-    /// mirroring [`purge_source`](Self::purge_source)): the SQLite delete cascades
-    /// the `embedding_index` rows away, so unless the Lance tables are dropped
-    /// beforehand they would be orphaned on disk forever (no registry row left to
-    /// find them by). A crash between the Lance drop and the SQLite commit is
-    /// benign — a re-purge re-drops the (already-gone) tables idempotently.
-    ///
-    /// Holds the `ingest_lock` permit across the whole cross-store delete so a
-    /// destructive wipe cannot interleave a live ingest into the same notebook.
-    /// See the module-level concurrency invariants on [`LensEngine`].
+    /// Permanently deletes a notebook. Drops Lance tables FIRST (Lance before
+    /// SQLite) so the cascade that removes `embedding_index` rows cannot orphan
+    /// them on disk. Holds `ingest_lock` across the cross-store delete.
     #[tracing::instrument(skip_all)]
     pub async fn purge_notebook(&self, id: &NotebookId) -> Result<(), LensError> {
         let _permit = self
@@ -1701,24 +1264,16 @@ impl LensEngine {
             .map_err(|e| LensError::Internal(format!("ingest semaphore closed: {e}")))?;
         let pool = self.pool().await;
         let data_dir = self.data_dir().await;
-        // Capture every source (id, locator) pair (live AND trashed) BEFORE the
-        // cascade deletes the `sources` rows, so the managed source files AND
-        // their `.extracted.txt` / `.tables.md` siblings can be removed afterwards
-        // rather than leaked on disk forever. The id is needed to derive the
-        // sibling paths.
+        // Capture (id, locator) pairs BEFORE the cascade deletes `sources` rows,
+        // so managed files can be cleaned up afterwards.
         let sources: Vec<(String, String)> =
             sqlx::query_as("SELECT id, locator FROM sources WHERE notebook_id = ?")
                 .bind(id.as_str())
                 .fetch_all(&pool)
                 .await?;
-        // Lance-first: drop the per-notebook tables BEFORE the SQLite delete
-        // cascades the `embedding_index` rows that name them.
         let store = crate::vector_store::LanceVectorStore::new(&data_dir, pool.clone());
         store.drop_notebook_tables(id.as_str()).await?;
         NotebookRepo::new(&pool).purge(id).await?;
-        // Best-effort: remove the managed source files. A missing file (e.g. an
-        // M1 `file` record whose locator points outside the managed dir, or an
-        // already-deleted file) is ignored — purge must not fail on it.
         for (source_id, locator) in &sources {
             remove_managed_source_file(&data_dir, source_id, locator);
         }
@@ -1726,31 +1281,15 @@ impl LensEngine {
     }
 }
 
-/// Best-effort removal of a managed source file AND its canonical
-/// `.extracted.txt` and `.tables.md` siblings, ignoring a missing file.
-///
-/// Used by the purge paths to reclaim `{data_dir}/sources/{id}.{ext}` files
-/// written by `add_text_source`, PLUS the canonical
-/// `{data_dir}/sources/{id}.extracted.txt` sibling that Phase 2 persists for
-/// DERIVED (pdf/docx/url) kinds (see [`ingest`]). The sibling is derived from
-/// `(data_dir, source_id)` via the SHARED [`ingest::extracted_sibling_path`] —
-/// the SAME builder the ingest write site uses — so the write and purge paths
-/// can never diverge. Deriving it from `(data_dir, source_id)` (NOT the
-/// locator's parent+stem) is REQUIRED because a URL source's locator is the URL
-/// string, whose parent/stem do not point at `{data_dir}/sources/{id}`.
-///
-/// A `NotFound` is silently ignored (the file may already be gone, or the
-/// locator may point at an external file an M1 `file` record references); any
-/// other error is logged but never fails the purge.
+/// Best-effort removal of a managed source file and its `.extracted.txt` /
+/// `.tables.md` siblings. Siblings are derived from `(data_dir, source_id)` via the
+/// shared `ingest::*_sibling_path` builders — NOT from the locator — so URL sources
+/// (whose locator is a URL string) are handled correctly. `NotFound` is silently ignored.
 fn remove_managed_source_file(data_dir: &Path, source_id: &str, locator: &str) {
     remove_file_best_effort(Path::new(locator));
-    // The `.extracted.txt` sibling lives at {data_dir}/sources/{id}.extracted.txt
-    // regardless of the locator (a URL locator is not a filesystem path).
     let sibling = crate::ingest::extracted_sibling_path(data_dir, source_id);
     remove_file_best_effort(&sibling);
-    // The `.tables.md` sibling for TABULAR kinds (XLSX/XLS/CSV — issue #76). Same
-    // shared builder the ingest write site uses. Unconditional + best-effort: for
-    // non-tabular kinds the file does not exist, so `NotFound` is silently ignored.
+    // Unconditional + best-effort: non-tabular kinds produce no file so NotFound is ignored.
     let tables_sibling = crate::ingest::tables_sibling_path(data_dir, source_id);
     remove_file_best_effort(&tables_sibling);
 }

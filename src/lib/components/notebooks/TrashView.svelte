@@ -25,27 +25,15 @@
     DialogDescription
   } from '$lib/components/ui/dialog/index.js';
 
-  // ---------------------------------------------------------------------------
-  // Modal open state — driven by the shared store flag (`trashOpen`).
-  // ---------------------------------------------------------------------------
-
   const trashOpen = $derived(notebookStore.trashOpen);
 
   function closeTrash(): void {
     notebookStore.trashOpen = false;
   }
 
-  // ---------------------------------------------------------------------------
-  // Empty-state: only shown when BOTH lists are empty
-  // ---------------------------------------------------------------------------
-
   const isEmpty = $derived(
     notebookStore.trashedNotebooks.length === 0 && notebookStore.trashedSources.length === 0
   );
-
-  // ---------------------------------------------------------------------------
-  // Confirm-dialog state — independent vars for notebooks and sources
-  // ---------------------------------------------------------------------------
 
   /** The id of the notebook awaiting a purge confirmation, or null if none. */
   let pendingPurgeId = $state<string | null>(null);
@@ -70,10 +58,6 @@
   /** Whether the confirm dialog is open. Either a notebook or source is pending purge. */
   const confirmOpen = $derived(pendingPurgeId !== null || pendingPurgeSourceId !== null);
 
-  // ---------------------------------------------------------------------------
-  // Handlers — notebooks
-  // ---------------------------------------------------------------------------
-
   function openConfirm(id: string): void {
     pendingPurgeId = id;
   }
@@ -95,21 +79,14 @@
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Handlers — sources
-  // ---------------------------------------------------------------------------
-
   function openSourceConfirm(id: string): void {
     pendingPurgeSourceId = id;
   }
 </script>
 
 <!--
-  TrashView — centered modal dialog (per design source "Trash" modal).
-  Opens when `notebookStore.trashOpen` is true; loaded via `openTrash()`.
-  Header: small trash icon + "Trash" title + subtitle, with the shadcn close
-  (×) affordance top-right. Body lists trashed notebooks and sources with
-  Restore + Delete-forever (confirm). Empty state = centered trash icon + copy.
+  Trash modal: lists trashed notebooks and sources with Restore + Delete-forever
+  (confirm dialog). Opens when `notebookStore.trashOpen` is true.
 -->
 <Dialog
   open={trashOpen}
@@ -121,7 +98,6 @@
     class="flex max-h-[640px] flex-col gap-0 overflow-hidden p-0 sm:max-w-[520px]"
     data-trash-modal
   >
-    <!-- ── Header ──────────────────────────────────────────────────────────── -->
     <DialogHeader class="shrink-0 space-y-0 px-6 pt-6 pb-4 text-left" data-trash-header>
       <div class="flex items-center gap-2.5">
         <div
@@ -141,11 +117,9 @@
       </div>
     </DialogHeader>
 
-    <!-- ── Body ────────────────────────────────────────────────────────────── -->
     <ScrollArea class="min-h-0 flex-1">
       <div class="px-6 pb-4" data-trash-list>
         {#if isEmpty}
-          <!-- Empty state — shown only when both lists are empty -->
           <div class="flex flex-col items-center gap-0 py-12 text-center" data-empty-state>
             <div
               class="mb-3.5 flex size-11 items-center justify-center rounded-xl bg-muted text-muted-foreground"
@@ -157,7 +131,6 @@
             <p class="text-xs text-muted-foreground">Deleted items will appear here</p>
           </div>
         {:else}
-          <!-- ── Notebooks section ────────────────────────────────────────── -->
           {#if notebookStore.trashedNotebooks.length > 0}
             <ul role="list" class="flex flex-col gap-1" data-notebooks-section>
               {#each notebookStore.trashedNotebooks as notebook (notebook.id)}
@@ -170,7 +143,6 @@
                   class={cn('flex items-center gap-2.5 rounded-[10px] bg-muted/60 px-3 py-2.5')}
                   data-trash-row
                 >
-                  <!-- Color icon -->
                   <div
                     class={cn(
                       'flex size-8 shrink-0 items-center justify-center rounded-lg opacity-70',
@@ -181,7 +153,6 @@
                     <BookOpen class="size-3.5" />
                   </div>
 
-                  <!-- Title + subtitle -->
                   <div class="min-w-0 flex-1">
                     <p
                       class="truncate text-[13px] font-semibold leading-tight text-foreground"
@@ -194,7 +165,6 @@
                     </p>
                   </div>
 
-                  <!-- Actions -->
                   <div class="flex shrink-0 items-center gap-1">
                     <Button
                       variant="default"
@@ -225,7 +195,6 @@
             </ul>
           {/if}
 
-          <!-- ── Sources section ─────────────────────────────────────────── -->
           {#if notebookStore.trashedSources.length > 0}
             <ul
               role="list"
@@ -240,7 +209,6 @@
                   class={cn('flex items-center gap-2.5 rounded-[10px] bg-muted/60 px-3 py-2.5')}
                   data-trash-source-row
                 >
-                  <!-- Source-kind icon -->
                   <div
                     class="flex size-8 shrink-0 items-center justify-center rounded-lg bg-muted text-muted-foreground opacity-70"
                     aria-hidden="true"
@@ -248,7 +216,6 @@
                     <FileText class="size-3.5" />
                   </div>
 
-                  <!-- Title + subtitle -->
                   <div class="min-w-0 flex-1">
                     <p
                       class="truncate text-[13px] font-semibold leading-tight text-foreground"
@@ -261,7 +228,6 @@
                     </p>
                   </div>
 
-                  <!-- Actions -->
                   <div class="flex shrink-0 items-center gap-1">
                     <Button
                       variant="default"
@@ -297,12 +263,9 @@
   </DialogContent>
 </Dialog>
 
-<!-- ── Confirm purge Dialog ──────────────────────────────────────────────────
-  There is no AlertDialog primitive — built from Dialog + destructive Button.
-  The `open` binding drives visibility via `pendingPurgeId` or `pendingPurgeSourceId`.
-  `showCloseButton=false` keeps the header clean; Cancel/Delete-forever buttons
-  in the footer are the only affordances.
--->
+<!-- Confirm purge: no AlertDialog primitive, so built from Dialog + destructive
+     Button. Visibility driven by `pendingPurgeId` / `pendingPurgeSourceId`. -->
+
 <Dialog
   open={confirmOpen}
   onOpenChange={(v) => {

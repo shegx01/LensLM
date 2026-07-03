@@ -1,32 +1,12 @@
-//! Real LLM-driven coreference resolution for the `LlmInline` strategy (Step 4 /
-//! M4 Phase-3) — schema-constrained SUBSTITUTION extraction, applied
-//! DETERMINISTICALLY in Rust.
+//! LLM-driven coreference resolution for the `LlmInline` strategy (Step 4).
 //!
-//! The LLM only IDENTIFIES referential expressions (pronouns; definite
-//! descriptions like "the company"/"this approach") whose antecedent is a named
-//! entity present in the passage OR the provided entity list, returning each as a
-//! `{mention, char_start, char_end, antecedent}` substitution into the chunk's
-//! OWN text, where the offsets are CHARACTER (Unicode codepoint) indices. Our Rust
-//! code then converts those codepoint indices to byte ranges and APPLIES the
-//! surviving substitutions with strict validation
-//! (offset-range/mention/antecedent checks) and a RIGHT-TO-LEFT splice so earlier
-//! offsets stay valid. This bounds hallucination
-//! (an invented antecedent that is not in the allow-list is dropped) and keeps the
-//! transform deterministic + cacheable.
-//!
-//! ## What is and is NOT mutated
-//!
-//! Coref resolution only ever rewrites the BODY that feeds a chunk's
-//! `embedding_text`; the canonical `chunks.text` is NEVER touched (it remains the
-//! immutable citation text). When coref degrades (malformed output, budget) the
-//! worker falls back to the raw body — coref never fails the source.
-//!
-//! ## Budget + circuit-break (AC11)
-//!
-//! Like the structural map, the shared [`Budget`](super::meta::Budget) is checked
-//! BEFORE every `generate()`; a breach surfaces [`MapError::BudgetExceeded`] so the
-//! worker fails the source. The coref pass shares the SAME `Budget` instance as the
-//! map, so the per-job circuit-break covers both passes together.
+//! The LLM identifies referential expressions whose antecedent is a named entity in
+//! the passage or entity list, returning `{mention, char_start, char_end, antecedent}`
+//! substitutions with Unicode codepoint offsets. Rust converts offsets to byte ranges,
+//! validates, and applies surviving subs RIGHT-TO-LEFT (deterministic + cacheable).
+//! Invented antecedents are dropped (hallucination guard). `chunks.text` is never
+//! mutated; coref rewrites the body only in `embedding_text`. Budget shared with the
+//! structural-map pass (AC11).
 
 use std::collections::HashMap;
 
@@ -41,24 +21,13 @@ use super::meta::{
     ENRICHMENT_COREF_MAX_TOKENS, STRUCTURAL_MAP_MAX_FIELD_CHARS, truncate_chars,
 };
 
-/// Soft input-byte budget for a single coref batch (the shared enrichment
-/// batch budget). Chunk bodies are batched under this ceiling (each tagged with its
-/// `id`); a single chunk larger than the budget forms its own batch (the provider
-/// truncates if needed; never a panic). Shared with the structural-map pass via
-/// [`ENRICHMENT_BATCH_BYTE_BUDGET`] so the two batchers stay in sync.
+/// Soft input-byte budget per coref batch. Shared with the structural-map pass so
+/// the two batchers stay in sync.
 const COREF_BATCH_BYTE_BUDGET: usize = ENRICHMENT_BATCH_BYTE_BUDGET;
 
-/// Per-item byte overhead the coref batch-cost accounting adds for each chunk
-/// (mirrors the original `+ 2` separator allowance in the cost check).
+/// Per-item byte overhead added to the batch-cost accounting.
 const COREF_SEPARATOR_LEN: usize = 2;
 
-/// The system prompt pinning the LLM to emit STRICT coref-substitution JSON.
-///
-/// It identifies ONLY referential expressions whose antecedent is a named entity
-/// in the passage or the supplied entity list, returns char offsets into THAT
-/// chunk's text, resolves in the document's own language, and NEVER invents an
-/// antecedent (empty `subs` when there is nothing to resolve). The strict serde
-/// parse + the Rust-side validation in [`apply_substitutions`] are the real guards.
 const COREF_SYSTEM_PROMPT: &str = "You resolve coreferences in document passages. \
 For each passage you are given its integer id and its text. Identify ONLY referential \
 expressions — pronouns (it, they, he, she, this, that, …) and definite descriptions \
@@ -72,56 +41,41 @@ markdown fences, with EXACTLY this shape: \
 {\"results\":[{\"id\":<int>,\"subs\":[{\"mention\":<str>,\"char_start\":<int>,\"char_end\":<int>,\"antecedent\":<str>}]}]}. \
 Do not add any other keys.";
 
-/// The strict serde schema for the coref response. Unknown fields are rejected so
-/// a garbled/hallucinated shape triggers a reprompt rather than silent acceptance.
+/// Strict serde schema for the coref response (`deny_unknown_fields` triggers a
+/// reprompt rather than silent acceptance of a garbled shape).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CorefResponse {
-    /// Per-chunk substitution sets, each tagged with the chunk's batch `id`.
     pub results: Vec<ChunkCoref>,
 }
 
-/// The coref substitutions identified for a single chunk (by its batch `id`).
+/// Coref substitutions for a single chunk.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChunkCoref {
-    /// The chunk's batch id (the positional index supplied in the request).
+    /// Positional batch id supplied in the request.
     pub id: usize,
-    /// The substitutions to apply to this chunk's text.
     pub subs: Vec<CorefSub>,
 }
 
-/// A single coref substitution: replace the mention spanning the character
-/// (Unicode scalar) range `[char_start, char_end)` (which must equal `mention`)
-/// with `antecedent`.
-///
-/// **Offset semantics (multilingual contract).** `char_start`/`char_end` are
-/// 0-based **Unicode scalar (codepoint) indices**, NOT byte indices. This is what
-/// the LLM naturally emits when asked for "character offsets" (LLMs handle
-/// codepoint offsets far better than byte offsets), so on non-ASCII text the field
-/// names are accurate. Rust converts these codepoint indices to byte ranges
-/// internally (see [`apply_substitutions`] / [`is_valid_sub`]) before slicing, so a
-/// multibyte mention is matched correctly.
+/// A single coref substitution: replace `mention` at the Unicode codepoint range
+/// `[char_start, char_end)` with `antecedent`. Offsets are codepoint indices (not
+/// bytes); Rust converts them to byte ranges before slicing so multibyte text is
+/// handled correctly.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CorefSub {
-    /// The referential expression as it appears in the chunk text.
     pub mention: String,
-    /// Inclusive start character (Unicode scalar) offset of the mention in the
-    /// chunk text.
+    /// Inclusive codepoint start offset of the mention.
     pub char_start: usize,
-    /// Exclusive end character (Unicode scalar) offset of the mention in the chunk
-    /// text.
+    /// Exclusive codepoint end offset of the mention.
     pub char_end: usize,
-    /// The named-entity antecedent to substitute in.
     pub antecedent: String,
 }
 
 impl CorefResponse {
-    /// Parses + strictly validates an LLM response body as a [`CorefResponse`],
-    /// tolerating markdown fences / chat preamble by extracting the first balanced
-    /// `{...}` object before parsing (mirrors [`super::meta::StructuralMap::parse_strict`]).
-    /// Returns `Err` on any parse/validation miss so the caller can reprompt.
+    /// Parses + validates an LLM response, tolerating markdown fences / preamble.
+    /// Returns `Err` on any parse miss so the caller can reprompt.
     pub fn parse_strict(body: &str) -> Result<Self, crate::LensError> {
         let json = super::meta::extract_json_object(body).unwrap_or(body);
         let mut resp = serde_json::from_str::<CorefResponse>(json)
@@ -130,10 +84,8 @@ impl CorefResponse {
         Ok(resp)
     }
 
-    /// Caps the response collections + per-sub string lengths to the `COREF_MAX_*`
-    /// / [`STRUCTURAL_MAP_MAX_FIELD_CHARS`] bounds, TRUNCATING (never rejecting) so
-    /// a bloated/prompt-injected LLM response can't inflate SQLite while coref
-    /// still degrades gracefully (mirrors [`super::meta::StructuralMap::bound_sizes`]).
+    /// Caps collections + string lengths to their bounds by TRUNCATING (never
+    /// rejecting) so a bloated response degrades rather than failing the source.
     fn bound_sizes(&mut self) {
         self.results.truncate(COREF_MAX_RESULTS);
         for chunk in &mut self.results {
@@ -146,10 +98,6 @@ impl CorefResponse {
     }
 }
 
-/// Splits `(id, text)` chunks into batches whose concatenated text stays under
-/// [`COREF_BATCH_BYTE_BUDGET`]. A single chunk that alone exceeds the budget forms
-/// its own batch. Delegates the accumulate-until-budget grouping to the shared
-/// [`batch_by_char_budget`] (DRY with the structural-map pass).
 fn batch_chunks<'a>(chunks: &[(usize, &'a str)]) -> Vec<Vec<(usize, &'a str)>> {
     batch_by_char_budget(
         chunks.iter().copied(),
@@ -159,8 +107,6 @@ fn batch_chunks<'a>(chunks: &[(usize, &'a str)]) -> Vec<Vec<(usize, &'a str)>> {
     )
 }
 
-/// Renders one batch's `(id, text)` chunks + the doc entity list into the coref
-/// user prompt.
 fn render_batch_prompt(batch: &[(usize, &str)], entities: &[String]) -> String {
     let entity_line = if entities.is_empty() {
         "(none provided)".to_string()
@@ -177,15 +123,9 @@ fn render_batch_prompt(batch: &[(usize, &str)], entities: &[String]) -> String {
     prompt
 }
 
-/// Resolves coreferences over `chunks` (each `(id, text)`), returning the
-/// per-`id` surviving substitutions. The same [`Budget`] instance as the
-/// structural map is threaded in so the per-job circuit-break covers both passes
-/// (AC11): a pre-dispatch budget breach surfaces [`MapError::BudgetExceeded`] so
-/// the worker fails the source.
-///
-/// On persistent malformed output for a batch the result DEGRADES to empty subs
-/// for that batch's chunks (the source is NOT failed — the worker falls back to the
-/// raw body). A provider/transport error propagates as [`MapError::Llm`].
+/// Resolves coreferences over `chunks`, returning per-`id` surviving substitutions.
+/// Shares the structural-map `Budget` so the per-job circuit-break (AC11) covers both
+/// passes. Persistent malformed output degrades to empty subs (not a source failure).
 pub async fn resolve_coref_batch(
     provider: &dyn LlmProvider,
     budget: &mut Budget,
@@ -199,9 +139,6 @@ pub async fn resolve_coref_batch(
 
     for batch in batch_chunks(chunks) {
         let user_prompt = render_batch_prompt(&batch, entities);
-        // Shared retry/budget/parse loop (DRY with the structural map). On
-        // persistent malformed output → `None` → degrade to empty subs for this
-        // batch; a budget breach / provider error propagates as `MapError`.
         let parsed = run_llm_with_retries(
             provider,
             budget,
@@ -220,45 +157,22 @@ pub async fn resolve_coref_batch(
                         .extend(chunk_coref.subs);
                 }
             }
-            // Malformed×retries → degrade to empty subs for this batch (the worker
-            // falls back to the raw body for these chunks; never a source failure).
-            None => continue,
+            None => continue, // malformed×retries → degrade to empty subs for this batch
         }
     }
 
     Ok(out)
 }
 
-/// Applies the surviving coref substitutions to `text`, returning the resolved
-/// text. PURE + deterministic — never panics on bad offsets.
-///
-/// `char_start`/`char_end` are **codepoint** (Unicode scalar) indices, `[start,
-/// end)` — see [`CorefSub`]. They are converted to byte offsets here (via
-/// [`codepoint_range_to_bytes`]) before any slicing, so a multibyte (non-English)
-/// mention is matched + spliced correctly.
-///
-/// Validation rules (a sub is DROPPED on any failure):
-/// 1. `char_start <= char_end <= text.chars().count()`; the derived byte range is
-///    then always on UTF-8 char boundaries by construction (an out-of-range
-///    codepoint index drops the sub — never a panic);
-/// 2. `text[byte_start..byte_end] == mention` (the LLM's offsets must actually
-///    point at the claimed mention — correct for multibyte by construction);
-/// 3. `antecedent` is non-empty;
-/// 4. `antecedent` matches an entry in `allowed_antecedents` case-INsensitively
-///    (Unicode-aware `to_lowercase`) — this is the hallucination guard: an invented
-///    antecedent that is not in the allow-list is dropped, but a casing drift on a
-///    real entity is tolerated (important for multilingual text).
-///
-/// Surviving subs are applied RIGHT-TO-LEFT (sorted by codepoint `char_start`
-/// descending) so each splice leaves the offsets of the not-yet-applied (earlier)
-/// subs valid. Overlapping subs are skipped (a later splice whose codepoint range
-/// intersects an already-applied one is dropped) so the result stays well-defined.
+/// Applies surviving coref substitutions to `text`. Pure + deterministic; never
+/// panics on bad offsets. Subs are validated (range check, mention match,
+/// non-empty antecedent, allow-list membership case-insensitively) and applied
+/// RIGHT-TO-LEFT so earlier offsets stay valid. Overlapping subs are skipped.
 pub fn apply_substitutions(
     text: &str,
     subs: &[CorefSub],
     allowed_antecedents: &[String],
 ) -> String {
-    // Validate + collect the survivors.
     let mut valid: Vec<&CorefSub> = subs
         .iter()
         .filter(|s| is_valid_sub(text, s, allowed_antecedents))
@@ -268,16 +182,11 @@ pub fn apply_substitutions(
         return text.to_string();
     }
 
-    // Right-to-left: descending by codepoint char_start so earlier offsets stay
-    // valid as we splice from the end.
     valid.sort_by(|a, b| b.char_start.cmp(&a.char_start));
 
     let mut result = text.to_string();
-    // Overlap tracking is in CODEPOINT space (char_start/char_end), independent of
-    // the byte conversion done per splice.
     let mut last_applied_start = usize::MAX;
     for sub in valid {
-        // Skip an overlap with an already-applied (further-right) sub.
         if sub.char_end > last_applied_start {
             tracing::debug!(
                 mention = %sub.mention,
@@ -285,11 +194,8 @@ pub fn apply_substitutions(
             );
             continue;
         }
-        // Derive byte offsets from the ORIGINAL `text` (the codepoint indices are
-        // indices into `text`). Right-to-left order + the overlap-skip above mean
-        // everything up to `char_end` is still byte-identical in `result`, so these
-        // byte offsets are valid against `result` too. Validated above → `Some` and
-        // on char boundaries; the splice can't panic.
+        // Right-to-left order means byte offsets from the original `text` are still
+        // valid against `result` up to `char_end`. Validated above → `Some`.
         let Some((byte_start, byte_end)) =
             codepoint_range_to_bytes(text, sub.char_start, sub.char_end)
         else {
@@ -301,10 +207,8 @@ pub fn apply_substitutions(
     result
 }
 
-/// Converts a codepoint (Unicode scalar) range `[char_start, char_end)` into the
-/// corresponding byte range in `text`. Returns `None` (drop the sub) when either
-/// index is out of range (`> text.chars().count()`) or `char_start > char_end`.
-/// The returned byte offsets are always on UTF-8 char boundaries by construction.
+/// Converts `[char_start, char_end)` codepoint indices to byte offsets in `text`.
+/// Returns `None` when either index is out of range or `char_start > char_end`.
 fn codepoint_range_to_bytes(
     text: &str,
     char_start: usize,
@@ -323,8 +227,7 @@ fn codepoint_range_to_bytes(
             byte_end = Some(byte_idx);
         }
     }
-    // An index equal to the total codepoint count maps to `text.len()` (the end of
-    // the string), which `char_indices()` never yields above.
+    // char_indices() never yields the past-the-end index; map it manually.
     let total = text.chars().count();
     if char_start == total {
         byte_start = Some(text.len());
@@ -334,15 +237,12 @@ fn codepoint_range_to_bytes(
     }
     match (byte_start, byte_end) {
         (Some(s), Some(e)) => Some((s, e)),
-        // An index strictly beyond the codepoint count is out of range → drop.
         _ => None,
     }
 }
 
-/// Whether a single sub passes every validation rule against `text`. Treats
-/// `char_start`/`char_end` as codepoint indices, converting to bytes before the
-/// mention check. Emits a cheap `tracing::debug!` whenever a sub is dropped so
-/// production diagnostics can see WHY coref no-opped.
+/// Returns true if `sub` passes all validation rules (range, mention match,
+/// non-empty antecedent, allow-list membership). Emits `tracing::debug!` on drop.
 fn is_valid_sub(text: &str, sub: &CorefSub, allowed_antecedents: &[String]) -> bool {
     if sub.antecedent.trim().is_empty() {
         tracing::debug!(
@@ -351,7 +251,6 @@ fn is_valid_sub(text: &str, sub: &CorefSub, allowed_antecedents: &[String]) -> b
         );
         return false;
     }
-    // Codepoint indices → byte range (drops on out-of-range; never panics).
     let Some((byte_start, byte_end)) = codepoint_range_to_bytes(text, sub.char_start, sub.char_end)
     else {
         tracing::debug!(
@@ -369,9 +268,7 @@ fn is_valid_sub(text: &str, sub: &CorefSub, allowed_antecedents: &[String]) -> b
         );
         return false;
     }
-    // Hallucination guard: the antecedent must be a known doc entity / term.
-    // Case-INsensitive + Unicode-aware (`to_lowercase`, not `eq_ignore_ascii_case`)
-    // so a casing drift on a real multilingual entity is tolerated.
+    // Hallucination guard: case-insensitive Unicode comparison tolerates casing drift.
     let antecedent_lower = sub.antecedent.to_lowercase();
     let allowed = allowed_antecedents
         .iter()
@@ -392,8 +289,6 @@ mod tests {
     use crate::enrichment::test_util::ScriptedProvider;
 
     use std::sync::atomic::Ordering;
-
-    // --- schema parse -------------------------------------------------------
 
     #[test]
     fn parse_strict_accepts_valid_coref() {
@@ -426,8 +321,6 @@ mod tests {
         );
     }
 
-    // --- apply_substitutions -----------------------------------------------
-
     fn sub(mention: &str, start: usize, end: usize, antecedent: &str) -> CorefSub {
         CorefSub {
             mention: mention.to_string(),
@@ -450,8 +343,6 @@ mod tests {
 
     #[test]
     fn apply_multi_sub_right_to_left_keeps_offsets_valid() {
-        // Two subs in one text; applying left-to-right would shift the 2nd offset.
-        // Right-to-left keeps both valid.
         let text = "It cited it again.";
         // "It" @ [0,2), "it" @ [9,11)
         let subs = vec![sub("It", 0, 2, "Babbage"), sub("it", 9, 11, "the engine")];
@@ -465,7 +356,6 @@ mod tests {
     #[test]
     fn drop_sub_when_mention_mismatches_offsets() {
         let text = "She wrote it.";
-        // Offsets point at "She" but mention claims "He" → drop.
         let subs = vec![sub("He", 0, 3, "Ada")];
         let allowed = vec!["Ada".to_string()];
         assert_eq!(apply_substitutions(text, &subs, &allowed), text);
@@ -473,10 +363,7 @@ mod tests {
 
     #[test]
     fn codepoint_offsets_address_multibyte_chars_not_bytes() {
-        // "café" is 5 bytes (é is 2) but 4 CODEPOINTS. The mention "it" sits at
-        // codepoints [5,7) — which would be the WRONG bytes under a byte-index
-        // reading. The codepoint→byte conversion makes the slice correct.
-        let text = "café it"; // c a f é ' ' i t  -> 7 codepoints
+        let text = "café it"; // 7 codepoints; é is 2 bytes
         let subs = vec![sub("it", 5, 7, "Coffee")];
         let allowed = vec!["Coffee".to_string()];
         assert_eq!(apply_substitutions(text, &subs, &allowed), "café Coffee");
@@ -486,7 +373,6 @@ mod tests {
     fn drop_sub_with_invented_antecedent_not_in_entities() {
         let text = "It is fast.";
         let subs = vec![sub("It", 0, 2, "Imaginary Corp")];
-        // allow-list does NOT contain the antecedent → drop (hallucination guard).
         let allowed = vec!["Real Entity".to_string()];
         assert_eq!(apply_substitutions(text, &subs, &allowed), text);
     }
@@ -573,11 +459,8 @@ mod tests {
 
     #[test]
     fn antecedent_allow_list_match_is_case_insensitive() {
-        // The allow-list entry differs only in casing from the LLM's antecedent.
-        // A Unicode-aware case-insensitive compare must still accept the sub.
         let text = "It is fast.";
         let subs = vec![sub("It", 0, 2, "ACME corp")];
-        // allow-list has different casing — must still match.
         let allowed = vec!["Acme Corp".to_string()];
         assert_eq!(
             apply_substitutions(text, &subs, &allowed),
@@ -587,26 +470,17 @@ mod tests {
 
     #[test]
     fn overlapping_subs_apply_only_one() {
-        // Two subs whose codepoint ranges OVERLAP. Applied right-to-left, the
-        // further-right sub wins; the overlapping (earlier-start) one is dropped so
-        // the result stays well-defined.
         let text = "the big engine ran";
-        // "big engine" @ [4,14) and "engine" @ [8,14) overlap.
         let subs = vec![
             sub("big engine", 4, 14, "Babbage"),
             sub("engine", 8, 14, "the device"),
         ];
         let allowed = vec!["Babbage".to_string(), "the device".to_string()];
-        // Right-to-left: "engine" @ [8,14) applies first; then "big engine" @
-        // [4,14) overlaps the applied range (char_end 14 > last_applied_start 8) →
-        // dropped. Only the rightmost sub survives.
         assert_eq!(
             apply_substitutions(text, &subs, &allowed),
             "the big the device ran"
         );
     }
-
-    // --- bound_sizes (security: cap an oversized response) ------------------
 
     #[test]
     fn parse_strict_truncates_oversized_coref_response() {
@@ -631,7 +505,6 @@ mod tests {
                 "antecedent": "y",
             }));
         }
-        // Too many results too.
         let results: Vec<serde_json::Value> = (0..(COREF_MAX_RESULTS + 50))
             .map(|i| serde_json::json!({ "id": i, "subs": subs.clone() }))
             .collect();
@@ -649,8 +522,6 @@ mod tests {
             STRUCTURAL_MAP_MAX_FIELD_CHARS
         );
     }
-
-    // --- resolve_coref_batch (mock provider) --------------------------------
 
     fn valid_coref_for(id: usize, mention: &str, start: usize, end: usize, ant: &str) -> String {
         format!(
@@ -689,9 +560,6 @@ mod tests {
 
     #[tokio::test]
     async fn budget_short_circuits_before_second_batch_dispatch() {
-        // Two batches (each chunk just over the batch budget), budget admits exactly
-        // 1 call. The mock must see EXACTLY 1 generate() — the 2nd batch is never
-        // dispatched — and the error is BudgetExceeded.
         let big = "x ".repeat(COREF_BATCH_BYTE_BUDGET);
         let resp = valid_coref_for(0, "x", 0, 1, "Ada");
         let (provider, calls) = ScriptedProvider::new(vec![&resp]);
@@ -710,8 +578,6 @@ mod tests {
 
     #[tokio::test]
     async fn deterministic_same_input_same_resolved_text() {
-        // Same mock script + same input + same allow-list → IDENTICAL resolved text
-        // on every run (greedy temperature 0.0 + deterministic Rust application).
         let resp = valid_coref_for(0, "She", 0, 3, "Ada Lovelace");
         let allowed = vec!["Ada Lovelace".to_string()];
         let body = "She wrote the first algorithm.";

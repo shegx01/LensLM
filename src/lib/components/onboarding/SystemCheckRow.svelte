@@ -50,18 +50,13 @@
     choose: 'Choose'
   };
 
-  // Expandable rows:
-  //   llm_runtime  + configure → LlmConfigPanel
-  //   embedding_model + choose → EmbeddingConfigPanel
-  //   text_to_speech  + choose → TtsConfigPanel
+  // llm_runtime+configure, embedding_model+choose, text_to_speech+choose expand inline.
   const isExpandable = $derived(
     (result.id === 'llm_runtime' && result.action === 'configure') ||
       (result.id === 'embedding_model' && result.action === 'choose') ||
       (result.id === 'text_to_speech' && result.action === 'choose')
   );
 
-  // Expandable rows are available (they expand inline). All other
-  // configure/choose actions are disabled (Settings not built yet).
   const available = $derived(isExpandable);
 
   let expanded = $state(false);
@@ -70,19 +65,13 @@
     expanded = !expanded;
   }
 
-  // Uniform border on every row (the Card default ring). Per design, a failed
-  // or actionable row is differentiated ONLY by its icon badge + label color,
-  // never by a heavier border — so no per-row ring override here.
-  //
-  // Always column-stretch so the header row's layout is IDENTICAL whether
-  // collapsed or expanded — clicking the action button only reveals the panel
-  // below, it never reflows the header (no button "jump"). gap-0: the panels
-  // bring their own top border/padding.
+  // Always column-stretch so the header layout is identical collapsed or expanded —
+  // clicking only reveals the panel below, never reflows the header (no "jump").
+  // Rows differ ONLY by icon badge + label color, never by border.
   const cardClass = 'flex-col items-stretch gap-0 px-4 py-3';
 </script>
 
 <Card size="sm" class={cardClass}>
-  <!-- Row header: always visible; w-full + identical layout in both states -->
   <div class="flex w-full items-center gap-3">
     <span
       class={cn(

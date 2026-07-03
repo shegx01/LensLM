@@ -15,7 +15,6 @@ describe('/showcase', () => {
     expect(screen.getByRole('heading', { name: /lens design system/i })).toBeInTheDocument();
     // A primitive from the page is present (Button group).
     expect(screen.getByRole('button', { name: 'Primary' })).toBeInTheDocument();
-    // Token swatch wall + type-scale specimens.
     expect(screen.getByText(/Display — Extrabold 800/)).toBeInTheDocument();
     expect(screen.getByText('primary')).toBeInTheDocument();
   });

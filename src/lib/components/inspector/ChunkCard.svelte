@@ -1,11 +1,6 @@
 <!--
-  ChunkCard — one chunk in the EmbeddingsInspector right pane: level + block_type
-  badges, section_path trail, char range, the canonical text (expand/collapse),
-  the source_anchor JSON, and the enriched embedding_text (collapsible).
-
-  Owns its OWN expand state locally ($state) — simpler than threading per-chunk
-  Sets through the parent. All DB content renders via Svelte interpolation
-  (auto-escaped); no {@html}.
+  ChunkCard — one chunk in the right pane. Owns expand state locally; all DB
+  content renders via Svelte interpolation (auto-escaped, no {@html}).
 -->
 <script lang="ts">
   import ChevronDown from '@lucide/svelte/icons/chevron-down';
@@ -25,7 +20,6 @@
 </script>
 
 <li class="rounded-xl border border-border bg-card p-4 text-card-foreground">
-  <!-- Meta row -->
   <div class="mb-2 flex flex-wrap items-center gap-2">
     <Badge variant="outline" class="text-[0.625rem] font-semibold uppercase">
       L{chunk.level}
@@ -44,7 +38,6 @@
     {/if}
   </div>
 
-  <!-- Text -->
   <p
     class={cn(
       'whitespace-pre-wrap text-sm leading-relaxed text-foreground',
@@ -65,13 +58,11 @@
     {/if}
   </button>
 
-  <!-- source_anchor (JSON, if present) -->
   {#if chunk.source_anchor}
     <pre
       class="mt-2 overflow-x-auto rounded-md bg-muted px-2.5 py-1.5 text-[10px] leading-snug text-muted-foreground">{chunk.source_anchor}</pre>
   {/if}
 
-  <!-- embedding_text (collapsible "Enriched text", if present) -->
   {#if chunk.embedding_text}
     <button
       type="button"

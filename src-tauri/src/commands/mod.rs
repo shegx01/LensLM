@@ -31,9 +31,6 @@ mod tests {
     use lens_core::LensEngine;
     use tauri::Manager;
 
-    /// Build a headless mock app, register the managed `LensEngine`, and invoke
-    /// the command with the real `State<LensEngine>` injected — exactly as the
-    /// runtime does, but with no webview.
     #[tokio::test]
     async fn invoke_core_action_returns_empty_string() {
         let app = tauri::test::mock_app();

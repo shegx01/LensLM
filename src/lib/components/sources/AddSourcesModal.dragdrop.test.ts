@@ -29,10 +29,6 @@ import { render, screen, waitFor } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Source } from '$lib/sources/types.js';
 
-// ---------------------------------------------------------------------------
-// Hoisted mocks
-// ---------------------------------------------------------------------------
-
 const { mockSourcesStore, mockNotebookStore } = vi.hoisted(() => {
   let _sources: Source[] = [];
 
@@ -141,17 +137,9 @@ vi.mock('$lib/sources/toast.svelte.js', () => ({
   showToast: vi.fn()
 }));
 
-// ---------------------------------------------------------------------------
-// @tauri-apps/api/webview mock — CAPTURE the handler
-// ---------------------------------------------------------------------------
-//
-// The drag-drop manager (dragDrop.ts) dynamically imports this module and calls
-// getCurrentWebview().onDragDropEvent(handler). We intercept the call so tests
-// can invoke `capturedHandler` to simulate native drop events.
-//
-// The mock is defined at module-evaluation time (before any test runs) so the
-// dynamic import inside registerDropTarget always gets this mock.
-
+// Capture the onDragDropEvent handler so tests can simulate native drop events.
+// Must be defined at module-evaluation time so the dynamic import in registerDropTarget
+// always resolves to this mock.
 let capturedHandler: ((e: unknown) => void) | null = null;
 
 vi.mock('@tauri-apps/api/webview', () => ({
@@ -163,17 +151,12 @@ vi.mock('@tauri-apps/api/webview', () => ({
   })
 }));
 
-// ---------------------------------------------------------------------------
-// Import component + mocked dependencies after mocks are established
-// ---------------------------------------------------------------------------
-
 import AddSourcesModal from './AddSourcesModal.svelte';
 import { addFileSource } from '$lib/sources/ipc.js';
 import { open as openFilePicker } from '@tauri-apps/plugin-dialog';
 import { addSourceLocal, ingest } from '$lib/sources/sources-state.svelte.js';
 import { showToast } from '$lib/sources/toast.svelte.js';
 
-// Typed handles onto the mocked functions (each is a vi.fn()).
 const mockAddFileSource = vi.mocked(addFileSource);
 const mockOpenFilePicker = vi.mocked(openFilePicker);
 const mockAddSourceLocal = vi.mocked(addSourceLocal);
@@ -205,20 +188,12 @@ function outcome(id: string, wasExisting: boolean) {
   };
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 /** Tick the microtask queue N times to let Svelte $effect / promises settle. */
 async function flushEffects(ticks = 5): Promise<void> {
   for (let i = 0; i < ticks; i++) {
     await Promise.resolve();
   }
 }
-
-// ---------------------------------------------------------------------------
-// Lifecycle
-// ---------------------------------------------------------------------------
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -227,44 +202,21 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  // @testing-library/svelte cleanup() is called globally by vitest-setup.ts.
-  // Reset capturedHandler after each test to prevent cross-test leakage.
   capturedHandler = null;
 });
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 describe('AddSourcesModal — native drag-drop registration ($effect fix)', () => {
-  // ─────────────────────────────────────────────────────────────────────────
-  // Case 1: Mounting closed → open registers the drop listener
-  //
-  // REGRESSION GUARD — this test would FAIL with the old onMount approach:
-  //   onMount fires once while open=false; dropZoneEl is undefined; the guard
-  //   `if (!dropZoneEl) return` bails out immediately. Subsequent renders with
-  //   open=true never re-trigger onMount, so capturedHandler stays null.
-  //
-  // With $effect keyed on dropZoneEl: when open flips true, the drop-zone div
-  // mounts, Svelte updates the $state binding, the $effect re-runs, and
-  // registerDropTarget is called → capturedHandler becomes non-null.
-  // ─────────────────────────────────────────────────────────────────────────
-
+  // REGRESSION GUARD: onMount fires once while open=false; dropZoneEl is undefined
+  // and registration is skipped forever. $effect keyed on dropZoneEl re-runs when
+  // the element mounts, so capturedHandler becomes non-null.
   it('registers the drop listener when the modal transitions from closed to open', async () => {
-    // Render with open=false — the drop zone is not in the DOM yet.
     const { rerender } = render(AddSourcesModal, { open: false });
     await flushEffects();
-
-    // The drop zone has not mounted; the handler must not be registered yet.
     expect(capturedHandler).toBeNull();
 
-    // Flip open → true — the drop zone div enters the DOM.
     await rerender({ open: true });
     await flushEffects(10);
 
-    // The $effect must have fired and called registerDropTarget, which called
-    // onDragDropEvent and stored the handler. This assertion is the regression
-    // guard — it would be null under the old onMount approach.
     await waitFor(
       () => {
         expect(capturedHandler).not.toBeNull();
@@ -272,16 +224,11 @@ describe('AddSourcesModal — native drag-drop registration ($effect fix)', () =
       { timeout: 500 }
     );
   });
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // Case 1b: Rendering open=true from the start also registers
-  // ─────────────────────────────────────────────────────────────────────────
 
   it('registers the drop listener when rendered with open=true from the start', async () => {
     render(AddSourcesModal, { open: true });
     await flushEffects(10);
 
-    // The drop zone is rendered immediately; registration must happen.
     await waitFor(
       () => {
         expect(capturedHandler).not.toBeNull();
@@ -289,17 +236,12 @@ describe('AddSourcesModal — native drag-drop registration ($effect fix)', () =
       { timeout: 500 }
     );
   });
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // Case 2: A drop on the zone ingests files and dismisses the modal
-  // ─────────────────────────────────────────────────────────────────────────
 
   it('calls addFileSource and fires onclose when a supported file is dropped', async () => {
     const onclose = vi.fn();
     render(AddSourcesModal, { open: true, onclose });
     await flushEffects(10);
 
-    // Wait for registration.
     await waitFor(
       () => {
         expect(capturedHandler).not.toBeNull();
@@ -307,8 +249,6 @@ describe('AddSourcesModal — native drag-drop registration ($effect fix)', () =
       { timeout: 500 }
     );
 
-    // Simulate a native drop event — no position field; the active target
-    // receives the drop unconditionally (no coordinate hit-test).
     capturedHandler!({
       payload: {
         type: 'drop',
@@ -316,7 +256,6 @@ describe('AddSourcesModal — native drag-drop registration ($effect fix)', () =
       }
     });
 
-    // The onDrop handler is async; wait for all async work to settle.
     await waitFor(
       () => {
         expect(addFileSource).toHaveBeenCalledWith('nb-001', 'a.pdf', '/tmp/a.pdf');
@@ -332,10 +271,6 @@ describe('AddSourcesModal — native drag-drop registration ($effect fix)', () =
     );
   });
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // Case 3: A drop of only unsupported files does NOT dismiss the modal
-  // ─────────────────────────────────────────────────────────────────────────
-
   it('does NOT call addFileSource or onclose when only unsupported files are dropped', async () => {
     const onclose = vi.fn();
     render(AddSourcesModal, { open: true, onclose });
@@ -348,8 +283,6 @@ describe('AddSourcesModal — native drag-drop registration ($effect fix)', () =
       { timeout: 500 }
     );
 
-    // Drop an unsupported audio file — dragDrop.ts will partition it to
-    // `rejected`; onDrop is never called because accepted.length === 0.
     capturedHandler!({
       payload: {
         type: 'drop',
@@ -357,21 +290,12 @@ describe('AddSourcesModal — native drag-drop registration ($effect fix)', () =
       }
     });
 
-    // Give async paths time to settle (they should NOT fire here).
     await flushEffects(10);
 
     expect(addFileSource).not.toHaveBeenCalled();
     expect(onclose).not.toHaveBeenCalled();
   });
 });
-
-// ===========================================================================
-// #96 — shared ingestPaths dispatch (exercised via the drop handler) + the
-// multi-select browse picker. ingestPaths is an internal helper; it is tested
-// through its two real entry points (drop + browse) — the same surface the app
-// uses — asserting on addFileSource / addSourceLocal / ingest / showToast /
-// onclose, which fully pins its behavior.
-// ===========================================================================
 
 /** Render an open modal and wait until the native drop handler is registered. */
 async function renderOpenWithDrop(onclose = vi.fn()) {
@@ -400,7 +324,6 @@ describe('AddSourcesModal — ingestPaths batch dispatch (#96, via drop)', () =>
     await waitFor(() => expect(onclose).toHaveBeenCalledOnce(), { timeout: 1000 });
     expect(mockAddSourceLocal).toHaveBeenCalledTimes(3);
     expect(mockIngest).toHaveBeenCalledTimes(3);
-    // Clean batch (all added) → no summary toast.
     expect(mockShowToast).not.toHaveBeenCalled();
   });
 
@@ -415,7 +338,6 @@ describe('AddSourcesModal — ingestPaths batch dispatch (#96, via drop)', () =>
 
     await waitFor(() => expect(mockAddFileSource).toHaveBeenCalledTimes(3), { timeout: 1000 });
     await waitFor(() => expect(onclose).toHaveBeenCalledOnce(), { timeout: 1000 });
-    // Only the two successes were inserted + ingested.
     expect(mockAddSourceLocal).toHaveBeenCalledTimes(2);
     expect(mockIngest).toHaveBeenCalledTimes(2);
     await waitFor(() => expect(mockShowToast).toHaveBeenCalledWith('2 added, 1 failed'), {
@@ -449,7 +371,6 @@ describe('AddSourcesModal — ingestPaths batch dispatch (#96, via drop)', () =>
 
     await waitFor(() => expect(mockAddFileSource).toHaveBeenCalledTimes(2), { timeout: 1000 });
     await waitFor(() => expect(onclose).toHaveBeenCalledOnce(), { timeout: 1000 });
-    // Only the non-duplicate was inserted + ingested.
     expect(mockAddSourceLocal).toHaveBeenCalledTimes(1);
     expect(mockIngest).toHaveBeenCalledTimes(1);
     await waitFor(
@@ -508,7 +429,6 @@ describe('AddSourcesModal — multi-select browse picker (#96)', () => {
     browseBtn.click();
 
     await waitFor(() => expect(mockAddFileSource).toHaveBeenCalledTimes(3), { timeout: 1000 });
-    // The picker must be opened in multi-select mode.
     expect(mockOpenFilePicker).toHaveBeenCalledWith(expect.objectContaining({ multiple: true }));
     expect(mockAddFileSource).toHaveBeenNthCalledWith(1, 'nb-001', 'a.pdf', '/tmp/a.pdf');
     expect(mockAddFileSource).toHaveBeenNthCalledWith(3, 'nb-001', 'c.md', '/tmp/c.md');

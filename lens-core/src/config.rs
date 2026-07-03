@@ -1,5 +1,4 @@
 //! Application configuration, persisted as disk-only `config.json`.
-//!
 //! There is intentionally NO `app_config` table in SQLite (see plan §2): the
 //! config shape is still evolving, and disk JSON avoids checksum-locking a guess
 //! into a migration. If DB-resident flags are ever needed, add an `app_flags`
@@ -16,35 +15,20 @@ use crate::LensError;
 const CONFIG_FILE_NAME: &str = "config.json";
 
 /// Per-provider model endpoint configuration (LLM or embedding backend).
-///
-/// `Debug` is implemented MANUALLY (not derived) so the `api_key` is never
-/// echoed verbatim into logs / panic messages: it is redacted to `"***"` when
-/// present and shown as `""` when empty. See the `impl Debug` below.
+/// `Debug` is manual so `api_key` is redacted in logs (`"***"` or `""`).
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModelConfig {
-    /// Provider identifier (e.g. `"ollama"`, `"openai"`).
     pub provider: String,
-    /// Base URL of the provider API.
     pub base_url: String,
-    /// Model name/id to request.
     pub model: String,
-    /// Maximum context window in tokens.
     pub context: u32,
-    /// Sampling temperature.
     pub temperature: f32,
-    /// Optional API key (empty when not required, e.g. local providers).
-    ///
-    /// NOTE: stored in PLAINTEXT inside `config.json`. The file is written with
-    /// restrictive `0o600` permissions on Unix (owner read/write only) as a
-    /// stopgap. Migrating secrets into the OS keychain is deferred to M2; do not
-    /// rely on this field being secure at rest.
+    /// Empty for local providers. Stored in PLAINTEXT in `config.json` (written
+    /// with `0o600` on Unix); keychain migration is deferred to M2.
     pub api_key: String,
 }
 
 impl std::fmt::Debug for ModelConfig {
-    /// Redacts `api_key` so a secret can never leak through a `{:?}` format (logs,
-    /// panic messages, tracing). A non-empty key prints as `"***"`; an empty key
-    /// prints as `""`. All other fields are shown verbatim.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let api_key = if self.api_key.is_empty() { "" } else { "***" };
         f.debug_struct("ModelConfig")
@@ -58,38 +42,23 @@ impl std::fmt::Debug for ModelConfig {
     }
 }
 
-/// Host/guest voice identifiers used by the (future) TTS subsystem.
+/// Host/guest voice identifiers used by the TTS subsystem.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct VoiceConfig {
-    /// Voice id for the "host" speaker.
     pub host: String,
-    /// Voice id for the "guest" speaker.
     pub guest: String,
 }
 
-/// Cloud text-to-speech provider configuration (e.g. ElevenLabs).
-///
-/// Empty `provider`/`api_key` means no cloud TTS is configured (the default);
-/// the system-check then falls back to the local Kokoro-on-disk gate.
-///
-/// `Debug` is implemented MANUALLY (not derived), exactly like [`ModelConfig`],
-/// so the `api_key` is never echoed verbatim into logs / panic messages: it is
-/// redacted to `"***"` when present and shown as `""` when empty.
+/// Cloud TTS provider configuration (e.g. ElevenLabs). Empty means no cloud TTS.
+/// `Debug` is manual so `api_key` is redacted, exactly like [`ModelConfig`].
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TtsConfig {
-    /// Cloud TTS provider identifier (e.g. `"elevenlabs"`). Empty when unset.
     pub provider: String,
-    /// Optional API key for the cloud provider (empty when not configured).
-    ///
-    /// NOTE: stored in PLAINTEXT inside `config.json` — see [`ModelConfig::api_key`]
-    /// for the at-rest caveat. Migrating secrets into the OS keychain is deferred.
+    /// Stored in PLAINTEXT — see [`ModelConfig::api_key`] for the at-rest caveat.
     pub api_key: String,
 }
 
 impl std::fmt::Debug for TtsConfig {
-    /// Redacts `api_key` so a secret can never leak through a `{:?}` format (logs,
-    /// panic messages, tracing). A non-empty key prints as `"***"`; an empty key
-    /// prints as `""`. All other fields are shown verbatim.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let api_key = if self.api_key.is_empty() { "" } else { "***" };
         f.debug_struct("TtsConfig")
@@ -99,111 +68,53 @@ impl std::fmt::Debug for TtsConfig {
     }
 }
 
-/// A per-task model pin (M4 Phase 3, Stage 3).
-///
-/// Names one exact `(provider, model)` for a single enrichment task (coref / map /
-/// chat). `provider` is a canonical id (`"anthropic"`, `"openai-compatible"`,
-/// `"ollama"`, …) and `model` is a catalog model id. For CLOUD providers the pair
-/// is validated against the [`crate::model_catalog::ModelCatalog`] before dispatch
-/// (anti-free-string guard); local Ollama is exempt (user-pulled models aren't in
-/// models.dev). Serde-stable snake_case so it round-trips in `config.json` and the
-/// TS mirror without leaking a Rust shape.
+/// Per-task model pin (M4 Phase 3, Stage 3): one exact `(provider, model)` for
+/// a single enrichment task. Cloud pairs are validated against the catalog;
+/// Ollama is exempt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskModel {
-    /// Canonical provider id (matches `ModelConfig.provider`).
     pub provider: String,
-    /// The model id to pin for this task.
     pub model: String,
 }
 
-/// Optional, additive background-enrichment configuration (M4 Phase 3).
-///
-/// Enrichment uses the configured LLM to improve RETRIEVAL after a source is
-/// `Indexed` — it never mutates canonical text and never blocks the demo. This
-/// section is OPTIONAL in `config.json`: an older config written before Phase 3
-/// has no `enrichment` key and reads back as [`EnrichmentConfig::default`] via
-/// the `#[serde(default)]` on the `AppConfig::enrichment` field (mirroring the
-/// `tts`/[`TtsConfig`] backward-compat pattern).
-///
-/// `coref_strategy` is the typed [`CorefStrategy`] (single source of truth shared
-/// with the enrichment worker — no stringly-typed config); it serializes to the
-/// stable snake_case strings (`none`/`llm_inline`) so the on-disk JSON and the
-/// TS mirror stay byte-compatible.
-///
-/// ## Per-task model overrides (M4 Phase 3, Stage 3)
-/// `coref_model`/`map_model`/`chat_model` are OPTIONAL per-task pins ([`TaskModel`]).
-/// When unset (`None`, the default) the task uses the routing default; when set, the
-/// enrichment worker builds a cheap per-task provider pinned to that exact
-/// `(provider, model)`. They are `#[serde(default)]` so an older `config.json`
-/// written before Stage 3 (no per-task keys) reads back as `None` for each.
-///
-/// ## Provider-driven defaults
-/// The onboarding LLM step picks defaults from the configured provider (see
-/// [`EnrichmentConfig::for_provider`]): a reachable LOCAL provider (Ollama) →
-/// `enabled=true`, `coref=LlmInline`; a CLOUD provider → `enabled=false` and
-/// `cloud_consent` must be explicitly granted (document text leaving the machine
-/// is a privacy/cost decision); NO provider → effectively `none`/disabled.
+/// Optional additive background-enrichment configuration (M4 Phase 3). Absent
+/// from older `config.json` files reads back as [`EnrichmentConfig::default`].
+/// Per-task model pins (`coref_model`/`map_model`/`chat_model`) default to `None`
+/// (routing default) and are backward-compatible via `#[serde(default)]`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EnrichmentConfig {
-    /// Master toggle. When `false`, enrichment never runs (sources stay on raw
-    /// vectors — `none`/`pending`, the same graceful path as no provider).
     pub enabled: bool,
-    /// OPTIONAL per-task model override for the COREF pass (M4 Phase 3, Stage 3).
-    /// When `Some`, the enrichment worker pins the coref pass to this exact
-    /// `(provider, model)` (catalog-validated for cloud providers; Ollama-local
-    /// exempt); when `None` the coref pass uses the routing default. The product
-    /// ask: a user may pick a coder model for coref while enrichment/chat default
-    /// to a generalist. `#[serde(default)]` for backward-compat.
+    /// Pins the coref pass to a specific `(provider, model)`; `None` uses the
+    /// routing default. `#[serde(default)]` for backward-compat.
     #[serde(default)]
     pub coref_model: Option<TaskModel>,
-    /// OPTIONAL per-task model override for the structural-MAP pass (Stage 3).
-    /// Same semantics as [`coref_model`](Self::coref_model): `Some` pins the map
-    /// pass to that model, `None` falls back to the routing default.
+    /// Pins the structural-map pass; `None` uses the routing default.
     #[serde(default)]
     pub map_model: Option<TaskModel>,
-    /// OPTIONAL per-task model override for the CHAT task (M5's concern; added now
-    /// only for symmetry). Defaulted `None`; NO chat wiring exists in Phase 3 —
-    /// the field is reserved so the config shape is stable when M5 lands chat.
+    /// Reserved for M5 chat; no wiring exists in Phase 3. `#[serde(default)]`.
     #[serde(default)]
     pub chat_model: Option<TaskModel>,
-    /// Coreference-resolution strategy applied while composing `embedding_text`.
-    /// Typed (the canonical [`CorefStrategy`]); defaults to `LlmInline`. Read
-    /// through [`deserialize_coref_strategy`] so a legacy `"dedicated_model"`
-    /// string (the now-removed stub) round-trips to `LlmInline` instead of
-    /// failing to deserialize.
+    /// Coref strategy. Legacy `"dedicated_model"` round-trips to `LlmInline`
+    /// via [`deserialize_coref_strategy`] so old configs don't fail.
     #[serde(deserialize_with = "deserialize_coref_strategy")]
     pub coref_strategy: CorefStrategy,
-    /// Explicit consent to send document text to a CLOUD LLM. Defaults to `false`
-    /// (local-first): cloud enrichment is gated on this and never dispatches
-    /// without it (AC11). Local (Ollama) enrichment ignores this flag.
+    /// Explicit consent to send document text to a cloud LLM (AC11). Ollama
+    /// enrichment ignores this flag.
     pub cloud_consent: bool,
-    /// Typed routing policy for selecting the enrichment LLM from `models[]`
-    /// (M4 Phase 3, Stage 2). Defaults to [`LlmRouting::CloudFirst`] (prefer a
-    /// configured + consented cloud provider, else local Ollama) per product
-    /// direction. An absent field in an older `config.json` reads back as the
-    /// default via `#[serde(default)]` (backward compatibility, mirroring the
-    /// other additive enrichment fields).
+    /// Routing policy for selecting the enrichment LLM. `#[serde(default)]`.
     #[serde(default)]
     pub routing: LlmRouting,
 }
 
-/// Re-export of the typed routing policy so `config::LlmRouting` resolves at the
-/// config layer without callers reaching into the `llm` module, and so there is
-/// exactly ONE definition (it lives in [`crate::llm`] with the provider factory
-/// that consumes it).
+/// Re-export so `config::LlmRouting` resolves without callers reaching into `llm`.
 pub use crate::llm::LlmRouting;
 
-/// Re-export of the canonical coref enum so `config::CorefStrategy` resolves at
-/// the config layer without callers reaching into the enrichment module, and so
-/// there is exactly ONE definition (de-duplicated — the enum lives in
-/// [`crate::enrichment::embedding_text`] and is the worker's runtime strategy).
+/// Re-export so `config::CorefStrategy` resolves without callers reaching into
+/// the enrichment module. Single definition lives in `crate::enrichment`.
 pub use crate::enrichment::CorefStrategy;
 
-/// Tolerant deserializer for [`EnrichmentConfig::coref_strategy`]: parses the
-/// snake_case string via [`CorefStrategy::from_config`], so the canonical
-/// `"none"`/`"llm_inline"` values AND a legacy `"dedicated_model"` string (the
-/// removed Phase-3 stub) all deserialize without error — the latter mapping to
-/// `LlmInline`. Keeps an old `config.json` round-tripping instead of panicking.
+/// Tolerant deserializer for [`EnrichmentConfig::coref_strategy`]. Legacy
+/// `"dedicated_model"` maps to `LlmInline` so old `config.json` files survive.
 fn deserialize_coref_strategy<'de, D>(deserializer: D) -> Result<CorefStrategy, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -213,10 +124,8 @@ where
 }
 
 impl Default for EnrichmentConfig {
-    /// The conservative default: enrichment OFF, `LlmInline` coref, cloud consent
-    /// withheld. An older `config.json` with no `enrichment` key reads back as
-    /// this via `#[serde(default)]`, and the demo degrades to raw vectors until
-    /// the user opts in through onboarding.
+    /// Conservative default: enrichment OFF, cloud consent withheld. An older
+    /// `config.json` with no `enrichment` key reads back as this via `#[serde(default)]`.
     fn default() -> Self {
         Self {
             enabled: false,
@@ -231,18 +140,8 @@ impl Default for EnrichmentConfig {
 }
 
 impl EnrichmentConfig {
-    /// Provider-driven defaults for the onboarding LLM step.
-    ///
-    /// * a LOCAL provider (Ollama) is configured → `enabled=true`,
-    ///   `coref=LlmInline`, `cloud_consent` preserved/false (local never sends
-    ///   text off-machine);
-    /// * a CLOUD provider is configured → `enabled=false` (explicit-enable) and
-    ///   `cloud_consent=false` — the onboarding step surfaces the consent note;
-    /// * NO usable provider → disabled, `coref` unchanged (effectively `none`).
-    ///
-    /// This encodes the spec's "local Ollama → on + LlmInline; cloud → off +
-    /// consent; no LLM → none/disabled" rule in one place so the engine and the
-    /// onboarding UI agree.
+    /// Provider-driven defaults: local (Ollama) → `enabled=true` + `LlmInline`;
+    /// cloud → `enabled=false` (requires explicit consent); no provider → default.
     pub fn for_provider(has_local: bool, has_cloud: bool) -> Self {
         if has_local {
             Self {
@@ -253,7 +152,6 @@ impl EnrichmentConfig {
                 ..Self::default()
             }
         } else if has_cloud {
-            // Cloud configured but consent must be explicit; default OFF.
             Self {
                 enabled: false,
                 coref_strategy: CorefStrategy::LlmInline,
@@ -270,22 +168,18 @@ impl EnrichmentConfig {
 /// Filesystem paths the engine cares about.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PathConfig {
-    /// Root data directory (where `lens.db` and `config.json` live).
     pub data_dir: String,
 }
 
-/// Token-budget thresholds controlling the tiered retrieval/synthesis pipeline.
+/// Token-budget thresholds for the tiered retrieval/synthesis pipeline.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TierThresholds {
-    /// Upper token cap for tier-1 (cheap/fast) context assembly.
     pub tier1_token_cap: u32,
-    /// Upper token cap for tier-2 (expanded) context assembly.
     pub tier2_token_cap: u32,
 }
 
 impl Default for TierThresholds {
     fn default() -> Self {
-        // Conservative defaults; tuned per milestone as the pipeline lands.
         Self {
             tier1_token_cap: 4_000,
             tier2_token_cap: 16_000,
@@ -293,113 +187,58 @@ impl Default for TierThresholds {
     }
 }
 
-/// Default accent token name. Drives the `[data-accent]` token layer in the UI.
 const DEFAULT_ACCENT: &str = "purple";
 
-/// The serde default for [`AppConfig::accent`]: configs written before the
-/// `accent` field existed (or with it omitted) deserialize to `"purple"` rather
-/// than the empty string, so the persisted accent always resolves to a real
-/// token name.
+/// Serde default: configs without an `accent` key read back as `"purple"`.
 fn default_accent() -> String {
     DEFAULT_ACCENT.to_string()
 }
 
-/// Serde default fn: `js_render_enabled` is `true` when absent from
-/// `config.json` (issue #78 — on by default, user may opt out).
+/// Serde default: `js_render_enabled` is `true` when absent (#78).
 fn default_js_render_enabled() -> bool {
     true
 }
 
-/// Serde default fn: `reopen_last_notebook` is `true` when absent from
-/// `config.json` (last-edited-notebook default — on by default, user may opt
-/// out). Mirrors [`default_js_render_enabled`].
+/// Serde default: `reopen_last_notebook` is `true` when absent.
 fn default_reopen_last_notebook() -> bool {
     true
 }
 
-/// Top-level application configuration.
-///
-/// Loaded from / saved to `{data_dir}/config.json`. A missing file yields
-/// [`AppConfig::default`] (and is written back); a malformed file yields
-/// [`LensError::Parse`] rather than panicking.
+/// Top-level application configuration. Loaded from / saved to `{data_dir}/config.json`;
+/// missing file writes the default back; malformed file yields [`LensError::Parse`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppConfig {
-    /// UI theme name (e.g. `"system"`, `"light"`, `"dark"`).
     pub theme: String,
-    /// UI accent token name (drives the `[data-accent]` layer). Defaults to
-    /// `"purple"`; an absent field in an older `config.json` reads back as
-    /// `"purple"` via [`default_accent`].
+    /// Drives the `[data-accent]` token layer. Absent key reads as `"purple"`.
     #[serde(default = "default_accent")]
     pub accent: String,
-    /// User-supplied display name captured during onboarding ("Make it yours").
-    /// Defaults to `""`; an absent field in an older `config.json` reads back as
-    /// `""` via `#[serde(default)]` (forward compatibility, mirroring the
-    /// `accent`/[`default_accent`] pattern above).
     #[serde(default)]
     pub user_name: String,
-    /// Selected embedding model id (e.g. `"nomic-embed-text"`). Empty when the
-    /// user has not yet chosen one. Defaults to `""`; an absent field in an older
-    /// `config.json` reads back as `""` via `#[serde(default)]`.
+    /// Empty string resolves to the registry default at the embedder boundary.
     #[serde(default)]
     pub embedding_model: String,
-    /// Selected embedding *backend* (`"fastembed"` | `"ollama"`). Empty when the
-    /// user has not yet chosen one. Defaults to `""`; an absent field in an older
-    /// `config.json` reads back as `""` via `#[serde(default)]`. An empty value
-    /// resolves to the default backend (`fastembed`) via
-    /// [`crate::embedder::EmbeddingBackend::from_opt_str`] — the SAME
-    /// empty-string-resolves-to-default pattern as `embedding_model`. This is the
-    /// app-wide default applied to NEW notebooks (M4 Phase 4b-B, R5/m2); it lives
-    /// here, NOT in SQL.
+    /// `"fastembed"` | `"ollama"`. Empty resolves to `fastembed`. App-wide default
+    /// for new notebooks (M4 Phase 4b-B); lives here, NOT in SQL.
     #[serde(default)]
     pub embedding_backend: String,
-    /// Maximum accepted source size, in **megabytes**, for non-PDF formats
-    /// (issue #71). Empty when the user has not configured it; an absent field in
-    /// an older `config.json` reads back as `""` via `#[serde(default)]`. An empty
-    /// (or unparseable / non-positive) value resolves to the 50 MB default via
-    /// [`crate::ingest::resolve_max_source_bytes`] — the SAME
-    /// empty-string-resolves-to-default pattern as `embedding_backend`. PDF sources
-    /// are EXEMPT from this cap (they stream into a building table); only paste,
-    /// raw-bytes, extracted-text, and URL enforcement sites read it. Stored as a
-    /// `String` (not a number) to match the config's stringly-typed user-editable
-    /// fields and keep an absent/empty value forward-compatible. Config-file-only;
-    /// no settings UI (deferred).
+    /// Max source size in MB for non-PDF formats (#71). Empty resolves to 50 MB.
     #[serde(default)]
     pub max_source_mb: String,
-    /// Configured chat/inference models keyed by role.
     pub models: Vec<ModelConfig>,
-    /// Arbitrary named endpoints (label -> URL).
     pub endpoints: BTreeMap<String, String>,
-    /// Host/guest TTS voices.
     pub voices: VoiceConfig,
-    /// Cloud TTS provider config (e.g. ElevenLabs). Defaults to empty; an absent
-    /// field in an older `config.json` reads back as the default via
-    /// `#[serde(default)]` (backward compatibility).
     #[serde(default)]
     pub tts: TtsConfig,
-    /// Optional background-enrichment config (M4 Phase 3). Defaults to disabled;
-    /// an absent field in an older `config.json` reads back as the default via
-    /// `#[serde(default)]` (backward compatibility, mirroring `tts`).
     #[serde(default)]
     pub enrichment: EnrichmentConfig,
-    /// Whether to use the JS-render path for web pages that return near-empty
-    /// text via the static extractor (issue #78 SPA fallback). Defaults to
-    /// `true` (on); an absent field in an older `config.json` reads back as
-    /// `true` via [`default_js_render_enabled`] (backward compatibility —
-    /// the SAME additive pattern as `tts`/`enrichment`).
+    /// SPA JS-render fallback (#78). Defaults to `true`; absent key reads as `true`.
     #[serde(default = "default_js_render_enabled")]
     pub js_render_enabled: bool,
-    /// Whether cold app launch auto-opens the most-recently-active live notebook
-    /// (last-edited-notebook default). Defaults to `true` (on); an absent field
-    /// in an older `config.json` reads back as `true` via
-    /// [`default_reopen_last_notebook`] (backward compatibility — the SAME
-    /// additive pattern as `js_render_enabled`).
+    /// Auto-open most-recently-active notebook on cold launch. Defaults to `true`.
     #[serde(default = "default_reopen_last_notebook")]
     pub reopen_last_notebook: bool,
-    /// Filesystem paths.
     pub paths: PathConfig,
-    /// Tier token thresholds.
     pub tier_thresholds: TierThresholds,
-    /// Whether first-run onboarding has completed.
     pub onboarding_complete: bool,
 }
 
@@ -427,10 +266,7 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
-    /// Loads config from `{dir}/config.json`.
-    ///
-    /// * Missing file -> returns [`AppConfig::default`] and writes it to disk.
-    /// * Malformed JSON -> returns [`LensError::Parse`].
+    /// Loads config from `{dir}/config.json`. Missing file → writes the default.
     #[tracing::instrument(skip_all, fields(dir = %dir.as_ref().display()))]
     pub fn load(dir: impl AsRef<Path>) -> Result<Self, LensError> {
         let path = dir.as_ref().join(CONFIG_FILE_NAME);
@@ -458,11 +294,8 @@ impl AppConfig {
         }
     }
 
-    /// Serializes and writes this config to `{dir}/config.json` (pretty JSON).
-    ///
-    /// On Unix the file is given `0o600` permissions (owner read/write only)
-    /// because it may hold a plaintext `api_key`. This is a stopgap until M2
-    /// moves secrets into the OS keychain.
+    /// Writes config to `{dir}/config.json` (pretty JSON) with `0o600` permissions
+    /// on Unix (plaintext `api_key` stopgap until M2).
     #[tracing::instrument(skip_all, fields(dir = %dir.as_ref().display()))]
     pub fn save(&self, dir: impl AsRef<Path>) -> Result<(), LensError> {
         let dir = dir.as_ref();
@@ -481,8 +314,6 @@ impl AppConfig {
         Ok(())
     }
 
-    /// Restricts `config.json` to owner read/write (`0o600`) on Unix; a no-op on
-    /// other platforms (Windows ACLs are not addressed in M0).
     #[cfg(unix)]
     fn restrict_permissions(path: &Path) -> Result<(), LensError> {
         use std::os::unix::fs::PermissionsExt;
@@ -494,7 +325,6 @@ impl AppConfig {
         Ok(())
     }
 
-    /// Permission-tightening is Unix-only; elsewhere this is intentionally inert.
     #[cfg(not(unix))]
     fn restrict_permissions(_path: &Path) -> Result<(), LensError> {
         Ok(())
@@ -516,10 +346,8 @@ mod tests {
             api_key: "sk-supersecret-token-value".to_string(),
         };
         let debug = format!("{cfg:?}");
-        // The secret must never appear in the Debug output.
         assert!(!debug.contains("sk-supersecret-token-value"));
         assert!(!debug.contains("supersecret"));
-        // Redaction marker present; other fields still visible.
         assert!(debug.contains("***"));
         assert!(debug.contains("openai"));
         assert!(debug.contains("gpt-4"));
@@ -532,7 +360,6 @@ mod tests {
             ..ModelConfig::default()
         };
         let debug = format!("{cfg:?}");
-        // An empty key is shown as "" (not redacted to ***).
         assert!(debug.contains("api_key: \"\""));
         assert!(!debug.contains("***"));
     }
@@ -544,8 +371,6 @@ mod tests {
 
     #[test]
     fn missing_accent_deserializes_to_purple() {
-        // A config.json written before the `accent` field existed has no
-        // `accent` key; it must read back as the default rather than failing.
         let json = r#"{
             "theme": "dark",
             "models": [],
@@ -567,9 +392,6 @@ mod tests {
 
     #[test]
     fn missing_user_name_deserializes_to_empty() {
-        // A config.json written before the `user_name` field existed has no
-        // `user_name` key; it must read back as the empty string (the serde
-        // default) rather than failing to deserialize (forward compatibility).
         let json = r#"{
             "theme": "dark",
             "accent": "purple",
@@ -604,9 +426,6 @@ mod tests {
 
     #[test]
     fn missing_embedding_model_deserializes_to_empty() {
-        // A config.json written before the `embedding_model` field existed has no
-        // `embedding_model` key; it must read back as the empty string (the serde
-        // default) rather than failing to deserialize (backward compatibility).
         let json = r#"{
             "theme": "dark",
             "accent": "purple",
@@ -640,11 +459,6 @@ mod tests {
 
     #[test]
     fn missing_embedding_backend_deserializes_to_empty() {
-        // A config.json written before the `embedding_backend` field existed has
-        // no `embedding_backend` key; it must read back as the empty string (the
-        // serde default) rather than failing to deserialize (backward
-        // compatibility — the SAME pattern as `embedding_model`). An empty value
-        // resolves to the default backend (`fastembed`) at the resolver boundary.
         let json = r#"{
             "theme": "dark",
             "accent": "purple",
@@ -672,22 +486,13 @@ mod tests {
         assert_eq!(loaded.embedding_backend, "ollama");
     }
 
-    // ── max_source_mb (issue #71: configurable ingest cap) ────────────────
-
     #[test]
     fn test_max_source_mb_default() {
-        // Empty by default — the resolver (`ingest::resolve_max_source_bytes`)
-        // maps an empty value to the 50 MB default, mirroring the
-        // empty-string-resolves-to-default pattern of `embedding_backend`.
         assert_eq!(AppConfig::default().max_source_mb, "");
     }
 
     #[test]
     fn test_max_source_mb_missing_deserializes_to_empty() {
-        // A config.json written before the `max_source_mb` field existed has no
-        // `max_source_mb` key; it must read back as the empty string (the serde
-        // default) rather than failing to deserialize (backward compatibility —
-        // the SAME pattern as `embedding_backend`).
         let json = r#"{
             "theme": "dark",
             "accent": "purple",
@@ -723,10 +528,8 @@ mod tests {
             api_key: "sk-elevenlabs-supersecret".to_string(),
         };
         let debug = format!("{cfg:?}");
-        // The secret must never appear in the Debug output.
         assert!(!debug.contains("sk-elevenlabs-supersecret"));
         assert!(!debug.contains("supersecret"));
-        // Redaction marker present; provider still visible.
         assert!(debug.contains("***"));
         assert!(debug.contains("elevenlabs"));
     }
@@ -735,7 +538,6 @@ mod tests {
     fn tts_config_debug_shows_empty_api_key_as_empty() {
         let cfg = TtsConfig::default();
         let debug = format!("{cfg:?}");
-        // An empty key is shown as "" (not redacted to ***).
         assert!(debug.contains("api_key: \"\""));
         assert!(!debug.contains("***"));
     }
@@ -749,9 +551,6 @@ mod tests {
 
     #[test]
     fn missing_tts_deserializes_to_default() {
-        // A config.json written before the `tts` field existed has no `tts` key;
-        // it must read back as the default (empty) rather than failing to
-        // deserialize (backward compatibility).
         let json = r#"{
             "theme": "dark",
             "accent": "purple",
@@ -795,8 +594,6 @@ mod tests {
         assert_eq!(loaded.accent, "emerald");
     }
 
-    // ── EnrichmentConfig (M4 Phase 3, AC14) ────────────────────────────────
-
     #[test]
     fn default_enrichment_is_disabled_llm_inline_no_consent() {
         let e = AppConfig::default().enrichment;
@@ -812,9 +609,6 @@ mod tests {
 
     #[test]
     fn missing_routing_deserializes_to_cloud_first() {
-        // An enrichment section written before the Stage-2 `routing` field existed
-        // has no `routing` key; it must read back as the default (cloud-first)
-        // rather than failing to deserialize (backward compatibility).
         let json = r#"{
             "enabled": true,
             "coref_strategy": "llm_inline",
@@ -826,7 +620,6 @@ mod tests {
 
     #[test]
     fn coref_strategy_serializes_to_stable_snake_case() {
-        // The on-disk JSON + the TS mirror both depend on these exact strings.
         assert_eq!(
             serde_json::to_string(&CorefStrategy::None).unwrap(),
             "\"none\""
@@ -835,17 +628,12 @@ mod tests {
             serde_json::to_string(&CorefStrategy::LlmInline).unwrap(),
             "\"llm_inline\""
         );
-        // …and deserialize back (only `none`/`llm_inline` are emitted now).
         let s: CorefStrategy = serde_json::from_str("\"llm_inline\"").unwrap();
         assert_eq!(s, CorefStrategy::LlmInline);
     }
 
     #[test]
     fn legacy_dedicated_model_coref_deserializes_to_llm_inline() {
-        // An older build shipped a `dedicated_model` coref stub that has since been
-        // removed (no stub ships). A `config.json` written by that build must still
-        // load: the legacy string round-trips to `LlmInline` rather than failing to
-        // deserialize the enrichment section.
         let json = r#"{
             "enabled": true,
             "coref_strategy": "dedicated_model",
@@ -858,10 +646,6 @@ mod tests {
 
     #[test]
     fn missing_enrichment_deserializes_to_default() {
-        // A config.json written before the `enrichment` field existed has no
-        // `enrichment` key; it must read back as the default (disabled) rather
-        // than failing to deserialize (backward compatibility — the AC14 core
-        // round-trip). This mirrors `missing_tts_deserializes_to_default`.
         let json = r#"{
             "theme": "dark",
             "accent": "purple",
@@ -883,8 +667,6 @@ mod tests {
 
     #[test]
     fn explicit_enrichment_round_trips() {
-        // serialize → deserialize is stable, AND the snake_case coref string is
-        // what lands on disk (so an existing config.json keeps working).
         let dir = tempfile::tempdir().unwrap();
         let config = AppConfig {
             enrichment: EnrichmentConfig {
@@ -901,18 +683,14 @@ mod tests {
         assert!(loaded.enrichment.enabled);
         assert_eq!(loaded.enrichment.coref_strategy, CorefStrategy::None);
         assert!(loaded.enrichment.cloud_consent);
-        // The typed routing policy round-trips intact.
         assert_eq!(loaded.enrichment.routing, LlmRouting::LocalFirst);
 
-        // The persisted JSON carries the snake_case string, not a struct variant.
         let on_disk = std::fs::read_to_string(dir.path().join(CONFIG_FILE_NAME)).unwrap();
         assert!(on_disk.contains("\"coref_strategy\": \"none\""));
     }
 
     #[test]
     fn provider_driven_defaults_match_the_locked_rule() {
-        // local Ollama → enabled + LlmInline; cloud → disabled + (no consent yet);
-        // no LLM → disabled / default.
         let local = EnrichmentConfig::for_provider(true, false);
         assert!(local.enabled);
         assert_eq!(local.coref_strategy, CorefStrategy::LlmInline);
@@ -926,18 +704,13 @@ mod tests {
         assert_eq!(none, EnrichmentConfig::default());
         assert!(!none.enabled);
 
-        // local takes precedence when both are present (local-first).
         let both = EnrichmentConfig::for_provider(true, true);
         assert!(both.enabled);
         assert_eq!(both.coref_strategy, CorefStrategy::LlmInline);
     }
 
-    // ── Per-task model overrides (M4 Phase 3, Stage 3) ─────────────────────
-
     #[test]
     fn default_per_task_models_are_none() {
-        // The conservative default: no per-task pins ⇒ every task uses the routing
-        // default. This is what an onboarding "use the configured model" choice maps to.
         let e = EnrichmentConfig::default();
         assert_eq!(e.coref_model, None);
         assert_eq!(e.map_model, None);
@@ -946,9 +719,6 @@ mod tests {
 
     #[test]
     fn missing_per_task_models_deserialize_to_none() {
-        // An enrichment section written before Stage 3 (no `coref_model`/`map_model`/
-        // `chat_model` keys) must read back as `None` for each rather than failing
-        // to deserialize (backward compatibility — the Stage-3 additive shape).
         let json = r#"{
             "enabled": true,
             "coref_strategy": "llm_inline",
@@ -963,7 +733,6 @@ mod tests {
 
     #[test]
     fn explicit_per_task_models_round_trip() {
-        // serialize → deserialize preserves the per-task pins exactly.
         let dir = tempfile::tempdir().unwrap();
         let config = AppConfig {
             enrichment: EnrichmentConfig {
@@ -996,17 +765,11 @@ mod tests {
                 model: "claude-sonnet-4-5".to_string(),
             })
         );
-        // chat_model stays None (M5's concern; not set here).
         assert_eq!(loaded.enrichment.chat_model, None);
     }
 
     #[test]
     fn chat_model_round_trips_persist_and_reload() {
-        // Issue #90 Rev-2: Studio & Chat model persists to `EnrichmentConfig.chat_model`
-        // (the reserved M5 field). This test verifies the full serialize → save → reload
-        // round-trip so the persistence path is confirmed before M5 wires the consumer.
-        // `chat_model` is `#[serde(default)]`, so `None` round-trips for free (covered
-        // in `missing_per_task_models_deserialize_to_none`). This test exercises `Some`.
         let dir = tempfile::tempdir().unwrap();
         let config = AppConfig {
             enrichment: EnrichmentConfig {
@@ -1029,10 +792,8 @@ mod tests {
             }),
             "chat_model must survive a save→reload cycle intact"
         );
-        // Sanity: other task-model pins are unaffected.
         assert_eq!(loaded.enrichment.coref_model, None);
         assert_eq!(loaded.enrichment.map_model, None);
-        // The JSON on disk must carry a `chat_model` key with the correct values.
         let on_disk = std::fs::read_to_string(dir.path().join(CONFIG_FILE_NAME)).unwrap();
         assert!(
             on_disk.contains("\"chat_model\""),
@@ -1046,7 +807,6 @@ mod tests {
 
     #[test]
     fn task_model_serializes_to_flat_snake_case() {
-        // The on-disk JSON + TS mirror depend on the flat `{provider, model}` shape.
         let tm = TaskModel {
             provider: "anthropic".to_string(),
             model: "claude-sonnet-4-5".to_string(),
@@ -1059,20 +819,15 @@ mod tests {
 
     #[test]
     fn per_task_model_validates_against_catalog() {
-        // A cloud per-task model must be a real catalog entry (anti-free-string).
         let catalog = crate::model_catalog::ModelCatalog::bundled();
         let coref = TaskModel {
             provider: "anthropic".to_string(),
             model: "claude-sonnet-4-5".to_string(),
         };
         assert!(catalog.validate(&coref.provider, &coref.model).is_ok());
-        // A made-up cloud model is rejected by the same guard.
         assert!(catalog.validate("anthropic", "totally-made-up").is_err());
-        // Local Ollama is exempt (user-pulled): any non-empty id is valid.
         assert!(catalog.is_valid("ollama", "qwen2.5-coder"));
     }
-
-    // ── js_render_enabled (issue #78: JS-render toggle) ──────────────────────
 
     #[test]
     fn default_js_render_enabled_is_true() {
@@ -1084,10 +839,6 @@ mod tests {
 
     #[test]
     fn missing_js_render_enabled_deserializes_to_true() {
-        // A config.json written before the `js_render_enabled` field existed has no
-        // such key; it must read back as `true` (default ON) rather than failing to
-        // deserialize (backward compatibility — the SAME additive pattern as
-        // `tts`/`enrichment`).
         let json = r#"{
             "theme": "dark",
             "accent": "purple",
@@ -1109,8 +860,6 @@ mod tests {
         );
     }
 
-    // ── reopen_last_notebook (last-edited-notebook default) ──────────────────
-
     #[test]
     fn default_reopen_last_notebook_is_true() {
         assert!(
@@ -1121,10 +870,6 @@ mod tests {
 
     #[test]
     fn missing_reopen_last_notebook_deserializes_to_true() {
-        // A config.json written before the `reopen_last_notebook` field existed has
-        // no such key; it must read back as `true` (default ON) rather than failing
-        // to deserialize (backward compatibility — the SAME additive pattern as
-        // `js_render_enabled`).
         let json = r#"{
             "theme": "dark",
             "accent": "purple",

@@ -1,19 +1,8 @@
-// Onboarding draft store (Svelte 5 runes, module singleton).
-//
-// Holds the in-progress onboarding input so Back/Forward across the step
-// machine preserves what the user typed without prop-drilling through the
-// layout. This is intentionally a module-level `$state` singleton: the
-// onboarding flow is a single first-run session and there is never more than
-// one in flight. `resetDraft()` MUST be called after completion so a future
-// re-arm (settings/showcase reset) starts from clean initial values rather than
-// stale globals.
-//
-// PERSISTENCE NOTE: this store is the DRAFT only. Durable writes (user_name +
-// accent via one RMW set_config at Make-it-yours; the notebook at Create;
-// onboarding_complete at the end) happen in the screen components — never here.
+// Module-level $state singleton for the onboarding draft. `resetDraft()` MUST
+// be called after completion so a re-arm starts from clean values. Durable
+// writes happen in the screen components — never here.
 
-/** A selected source file, captured from the dialog/recent-docs pickers.
- *  Same shape as the backend `RecentDocument` IPC payload (re-exported below). */
+/** Selected source file; same shape as the backend `RecentDocument` IPC payload. */
 export interface DraftSource {
   path: string;
   name: string;
@@ -22,8 +11,7 @@ export interface DraftSource {
   mtime: number;
 }
 
-/** A recent-document suggestion from the `list_recent_documents` command —
- *  identical shape to a {@link DraftSource}. Canonical type lives here. */
+/** Recent-document suggestion from `list_recent_documents`; identical shape to {@link DraftSource}. */
 export type RecentDocument = DraftSource;
 
 const INITIAL = {
@@ -44,11 +32,7 @@ let focusMode = $state(INITIAL.focusMode);
 let selectedSources = $state<DraftSource[]>([...INITIAL.selectedSources]);
 let notebookId = $state<string | null>(INITIAL.notebookId);
 
-/**
- * The onboarding draft. Read the reactive getters in markup/`$derived`; call the
- * setters to mutate. Backed by module-level `$state` so every screen sees the
- * same live values.
- */
+/** Onboarding draft — reactive getters/setters backed by module-level `$state`. */
 export const draft = {
   get userName() {
     return userName;
@@ -94,10 +78,7 @@ export const draft = {
   }
 };
 
-/**
- * Restore every draft field to its initial value. Call AFTER onboarding
- * completes so a subsequent re-arm starts clean (avoids stale module globals).
- */
+/** Reset all draft fields to initial values. Call after onboarding completes. */
 export function resetDraft(): void {
   userName = INITIAL.userName;
   accent = INITIAL.accent;

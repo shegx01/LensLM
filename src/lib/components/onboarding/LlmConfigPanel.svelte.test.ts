@@ -4,8 +4,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import SystemCheckRow from './SystemCheckRow.svelte';
 import type { CheckResult } from '$lib/onboarding/system-check.js';
 
-// Helpers ──────────────────────────────────────────────────────────────────
-
 /** A CheckResult for the llm_runtime row with the configure action. */
 function llmRow(over: Partial<CheckResult> = {}): CheckResult {
   return {
@@ -102,10 +100,6 @@ afterEach(() => {
   delete (globalThis as { isTauri?: boolean }).isTauri;
 });
 
-// ──────────────────────────────────────────────────────────────────────────
-// Panel expand / collapse
-// ──────────────────────────────────────────────────────────────────────────
-
 describe('LlmConfigPanel — expand/collapse', () => {
   it('panel is hidden by default; clicking Configure expands it', async () => {
     render(SystemCheckRow, { props: { result: llmRow(), oncheck: vi.fn() } });
@@ -131,10 +125,6 @@ describe('LlmConfigPanel — expand/collapse', () => {
     expect(btn).toHaveAttribute('aria-expanded', 'false');
   });
 });
-
-// ──────────────────────────────────────────────────────────────────────────
-// Two model roles — labels present on both tabs
-// ──────────────────────────────────────────────────────────────────────────
 
 describe('LlmConfigPanel — two model roles', () => {
   it('renders BOTH "Enrichment model" and "Studio & Chat model" selectors on the local tab', async () => {
@@ -185,10 +175,6 @@ describe('LlmConfigPanel — two model roles', () => {
   });
 });
 
-// ──────────────────────────────────────────────────────────────────────────
-// Local model picker vs. free-text pull prompt (Rev 2)
-// ──────────────────────────────────────────────────────────────────────────
-
 describe('LlmConfigPanel — local model picker / pull prompt', () => {
   it('renders a picker of detected models (no hardcoded default; enrichment auto-selects first)', async () => {
     mockIPC((cmd) => {
@@ -205,7 +191,6 @@ describe('LlmConfigPanel — local model picker / pull prompt', () => {
     expect(enrichment.tagName).toBe('SELECT');
     expect(within(enrichment).getByRole('option', { name: 'llama3.2:3b' })).toBeInTheDocument();
     expect(within(enrichment).getByRole('option', { name: 'mistral:7b' })).toBeInTheDocument();
-    // ENRICHMENT auto-selects the FIRST detected model (not a hardcoded llama3.2:3b).
     await waitFor(() => expect(enrichment.value).toBe('llama3.2:3b'));
   });
 
@@ -224,9 +209,7 @@ describe('LlmConfigPanel — local model picker / pull prompt', () => {
     expect(enrichment.tagName).toBe('INPUT');
     expect(enrichment).toHaveValue('');
     expect(enrichment).toHaveAttribute('placeholder', 'e.g. llama3.2:3b');
-    // Copyable pull command as PLAIN text in <code> (defaults to the suggestion).
     expect(screen.getAllByText(/ollama pull llama3\.2:3b/i).length).toBeGreaterThan(0);
-    // Re-check button present for the enrichment role.
     expect(
       screen.getByRole('button', { name: /re-check ollama models for enrichment model/i })
     ).toBeInTheDocument();
@@ -242,7 +225,6 @@ describe('LlmConfigPanel — local model picker / pull prompt', () => {
     render(SystemCheckRow, { props: { result: llmRow(), oncheck: vi.fn() } });
     await expandPanel();
 
-    // Initially: free-text (no models).
     await waitFor(() =>
       expect(
         (screen.getByLabelText('Enrichment model', { selector: '#llm-model-local' }) as HTMLElement)
@@ -250,7 +232,6 @@ describe('LlmConfigPanel — local model picker / pull prompt', () => {
       ).toBe('INPUT')
     );
 
-    // A model is now pulled; clicking Re-check populates the picker.
     pulled = true;
     await fireEvent.click(
       screen.getByRole('button', { name: /re-check ollama models for enrichment model/i })
@@ -280,10 +261,6 @@ describe('LlmConfigPanel — local model picker / pull prompt', () => {
     expect(studio.value).toBe('');
   });
 });
-
-// ──────────────────────────────────────────────────────────────────────────
-// Auto-detect
-// ──────────────────────────────────────────────────────────────────────────
 
 describe('LlmConfigPanel — Auto-detect', () => {
   it('populates the enrichment model select with detected models on reachable response', async () => {
@@ -329,10 +306,6 @@ describe('LlmConfigPanel — Auto-detect', () => {
   });
 });
 
-// ──────────────────────────────────────────────────────────────────────────
-// Empty-model guard — disables Test Connection / Save
-// ──────────────────────────────────────────────────────────────────────────
-
 describe('LlmConfigPanel — empty enrichment-model guard', () => {
   it('disables local Test Connection while the enrichment model is empty', async () => {
     mockIPC((cmd) => {
@@ -346,7 +319,6 @@ describe('LlmConfigPanel — empty enrichment-model guard', () => {
     const test = await waitFor(() => screen.getByRole('button', { name: /test connection/i }));
     expect(test).toBeDisabled();
 
-    // Typing an enrichment model enables it.
     await fireEvent.input(
       screen.getByLabelText('Enrichment model', { selector: '#llm-model-local' }),
       { target: { value: 'llama3.2:3b' } }
@@ -363,7 +335,6 @@ describe('LlmConfigPanel — empty enrichment-model guard', () => {
     render(SystemCheckRow, { props: { result: llmRow(), oncheck: vi.fn() } });
     await expandPanel();
 
-    // Enrichment auto-selected → Test enabled even though studio/chat is "Not set".
     const test = await waitFor(() => screen.getByRole('button', { name: /test connection/i }));
     await waitFor(() => expect(test).not.toBeDisabled());
     const studio = screen.getByLabelText('Studio & Chat model', {
@@ -384,8 +355,6 @@ describe('LlmConfigPanel — empty enrichment-model guard', () => {
     await expandPanel();
     await switchToCloud();
 
-    // Switch to the custom (catalog-less) provider so the enrichment model is
-    // free-text and can be emptied.
     await selectCloudProvider(/custom \(openai-compatible\)/i);
 
     const enrichment = screen.getByLabelText('Enrichment model', {
@@ -401,10 +370,6 @@ describe('LlmConfigPanel — empty enrichment-model guard', () => {
     expect(save).not.toBeDisabled();
   });
 });
-
-// ──────────────────────────────────────────────────────────────────────────
-// Enrichment validation gate — blocking (local)
-// ──────────────────────────────────────────────────────────────────────────
 
 describe('LlmConfigPanel — enrichment blocking (local Test connection)', () => {
   it('blocks save + does NOT call oncheck when the enrichment model is invalid', async () => {
@@ -431,7 +396,6 @@ describe('LlmConfigPanel — enrichment blocking (local Test connection)', () =>
 
     await fireEvent.click(screen.getByRole('button', { name: /test connection/i }));
 
-    // The invalid reason is shown inline and the config was NOT persisted.
     await waitFor(() =>
       expect(
         screen.getAllByRole('alert').some((el) => /not installed/i.test(el.textContent ?? ''))
@@ -516,10 +480,6 @@ describe('LlmConfigPanel — enrichment blocking (local Test connection)', () =>
   });
 });
 
-// ──────────────────────────────────────────────────────────────────────────
-// Studio & Chat — non-blocking + chat_model persistence
-// ──────────────────────────────────────────────────────────────────────────
-
 describe('LlmConfigPanel — studio/chat non-blocking + chat_model persist', () => {
   it('shows the studio/chat invalid status BUT still saves + calls oncheck (non-blocking)', async () => {
     const setConfig = vi.fn();
@@ -552,11 +512,10 @@ describe('LlmConfigPanel — studio/chat non-blocking + chat_model persist', () 
 
     await fireEvent.click(screen.getByRole('button', { name: /test connection/i }));
 
-    // Studio/chat invalid status is shown…
     await waitFor(() =>
       expect(screen.getAllByText(/'qwen2\.5:7b' is not installed/i).length).toBeGreaterThan(0)
     );
-    // …but the save proceeded and oncheck ran (non-blocking), with chat_model set.
+    // Save still proceeds and oncheck runs (studio/chat is non-blocking), with chat_model set.
     await waitFor(() =>
       expect(setConfig).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -606,10 +565,6 @@ describe('LlmConfigPanel — studio/chat non-blocking + chat_model persist', () 
   });
 });
 
-// ──────────────────────────────────────────────────────────────────────────
-// chat_model round-trip — restore + preserve
-// ──────────────────────────────────────────────────────────────────────────
-
 describe('LlmConfigPanel — chat_model round-trip', () => {
   it('restores a saved ollama chat_model into the local Studio & Chat picker', async () => {
     mockIPC((cmd) => {
@@ -632,7 +587,6 @@ describe('LlmConfigPanel — chat_model round-trip', () => {
     )) as HTMLSelectElement;
     await waitFor(() => expect(studio.value).toBe('qwen2.5:7b'));
 
-    // The ENRICHMENT model is NOT clobbered by chat_model (auto-selects first).
     const enrichment = screen.getByLabelText('Enrichment model', {
       selector: '#llm-model-local'
     }) as HTMLSelectElement;
@@ -720,7 +674,6 @@ describe('LlmConfigPanel — chat_model round-trip', () => {
     )) as HTMLSelectElement;
     await waitFor(() => expect(studio.value).toBe('gpt-4o'));
 
-    // Grant consent so the enrichment gate runs (valid), then re-enter the key + save.
     await fireEvent.click(screen.getByRole('checkbox', { name: /send document text/i }));
     const keyField = screen.getByLabelText(/api key/i);
     await fireEvent.focus(keyField);
@@ -740,10 +693,6 @@ describe('LlmConfigPanel — chat_model round-trip', () => {
     );
   });
 });
-
-// ──────────────────────────────────────────────────────────────────────────
-// Cloud Save — real provider id + key forwarding (enrichment gate off w/o consent)
-// ──────────────────────────────────────────────────────────────────────────
 
 describe('LlmConfigPanel — Save (cloud tab)', () => {
   it('persists the real cloud provider id + entered key (no consent → enrichment gate skipped)', async () => {
@@ -862,10 +811,6 @@ describe('LlmConfigPanel — Save (cloud tab)', () => {
   });
 });
 
-// ──────────────────────────────────────────────────────────────────────────
-// Cloud provider combobox — grouped, searchable
-// ──────────────────────────────────────────────────────────────────────────
-
 describe('LlmConfigPanel — cloud provider combobox', () => {
   async function openCloudCombobox() {
     mockIPC((cmd, args) => {
@@ -906,10 +851,6 @@ describe('LlmConfigPanel — cloud provider combobox', () => {
     expect(screen.queryByRole('option', { name: /^openai$/i })).not.toBeInTheDocument();
   });
 });
-
-// ──────────────────────────────────────────────────────────────────────────
-// Cloud enrichment model picker — catalog-driven
-// ──────────────────────────────────────────────────────────────────────────
 
 describe('LlmConfigPanel — cloud enrichment picker', () => {
   it('renders catalog models in the cloud enrichment select for the selected provider', async () => {
@@ -999,10 +940,6 @@ describe('LlmConfigPanel — cloud enrichment picker', () => {
   });
 });
 
-// ──────────────────────────────────────────────────────────────────────────
-// Enrichment prefs + opt-out
-// ──────────────────────────────────────────────────────────────────────────
-
 describe('LlmConfigPanel — Enrichment prefs', () => {
   it('renders the enable toggle + coref select; cloud consent HIDDEN on the local tab', async () => {
     mockIPC((cmd) => {
@@ -1044,31 +981,24 @@ describe('LlmConfigPanel — Enrichment prefs', () => {
     render(SystemCheckRow, { props: { result: llmRow(), oncheck } });
     await expandPanel();
 
-    // Turn enrichment OFF.
     await fireEvent.click(screen.getByRole('switch', { name: /enable enrichment/i }));
 
-    // Tradeoff text appears.
     await waitFor(() =>
       expect(screen.getByText(/without enrichment quality boosts/i)).toBeInTheDocument()
     );
 
-    // Give the enrichment model a value so the (empty-model) guard doesn't block.
     await fireEvent.input(
       screen.getByLabelText('Enrichment model', { selector: '#llm-model-local' }),
       { target: { value: 'llama3.2:3b' } }
     );
     await fireEvent.click(screen.getByRole('button', { name: /test connection/i }));
 
-    // Enrichment validation was SKIPPED (opt-out), but the save proceeded + oncheck ran.
+    // Validation skipped when enrichment is off, but save + oncheck still run.
     await waitFor(() => expect(oncheck).toHaveBeenCalledOnce());
     expect(validate).not.toHaveBeenCalled();
     expect(setConfig).toHaveBeenCalled();
   });
 });
-
-// ──────────────────────────────────────────────────────────────────────────
-// Routing + coref-model override persistence
-// ──────────────────────────────────────────────────────────────────────────
 
 describe('LlmConfigPanel — routing + coref override', () => {
   it('renders the routing selector and persists local_first on the local Test connection', async () => {

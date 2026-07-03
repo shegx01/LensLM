@@ -12,24 +12,9 @@
     TooltipProvider
   } from '$lib/components/ui/tooltip/index.js';
 
-  /**
-   * The display name of the logged-in user, read from AppConfig `user_name`.
-   * Defaults to an empty string. The parent (NotebooksSidebar / AppShell) should
-   * pass the value from `config.user_name` once it is available.
-   *
-   * Integration note: AppShell (Wave 3) must pass `userName={config.user_name}`.
-   */
   let { userName = '' }: { userName?: string } = $props();
 
-  // ---------------------------------------------------------------------------
-  // Derived initials
-  // ---------------------------------------------------------------------------
-
   const initials = $derived(getInitials(userName));
-
-  // ---------------------------------------------------------------------------
-  // Popover open state
-  // ---------------------------------------------------------------------------
 
   let open = $state(false);
   let containerEl = $state<HTMLDivElement | null>(null);
@@ -51,9 +36,7 @@
     }
   }
 
-  // Dismiss on any click/tap outside the menu. `focusout` alone misses clicks on
-  // non-focusable regions (e.g. the canvas/main pane), so we listen for pointerdown
-  // on the document (capture phase) while open and close when the target is outside.
+  // `focusout` alone misses clicks on non-focusable regions; capture-phase pointerdown covers them.
   $effect(() => {
     if (!open || typeof document === 'undefined') return;
     function onPointerDown(e: PointerEvent): void {
@@ -66,11 +49,6 @@
   });
 </script>
 
-<!--
-  AccountFooter: initials avatar + user name + chevron. Clicking opens a small
-  popover with Settings (disabled) and Switch theme (real). "Sign out" is
-  intentionally OMITTED per spec (accounts are an MVP non-goal).
--->
 <div
   bind:this={containerEl}
   class="relative"
@@ -78,7 +56,6 @@
   onkeydown={handleKeydown}
   role="none"
 >
-  <!-- Trigger row -->
   <button
     type="button"
     aria-haspopup="menu"
@@ -92,7 +69,6 @@
       open && 'bg-sidebar-accent/60'
     )}
   >
-    <!-- Initials avatar — neutral fill + 1px inset ring + subtle outer shadow -->
     <div
       class={cn(
         'flex size-[27px] shrink-0 items-center justify-center rounded-full',
@@ -110,7 +86,6 @@
     />
   </button>
 
-  <!-- Popover menu — anchored above the footer, dismisses on blur/Esc -->
   {#if open}
     <div
       role="menu"
@@ -122,7 +97,6 @@
         'overflow-hidden py-1'
       )}
     >
-      <!-- Settings — opens the global Preferences shell (Settings>Embeddings live). -->
       <button
         type="button"
         class={cn(
@@ -141,7 +115,6 @@
         <span>Settings</span>
       </button>
 
-      <!-- Switch theme — real, embeds ThemeCycleButton as a menu row -->
       <div
         role="menuitem"
         data-switch-theme-item
@@ -154,16 +127,12 @@
           }
         }}
       >
-        <!-- Embed ThemeCycleButton as a ghost button; suppress its border via class override -->
         <ThemeCycleButton
           class="size-6 rounded-md border-0 bg-transparent shadow-none hover:bg-transparent"
         />
         <span class="text-sm text-sidebar-foreground">Switch theme</span>
       </div>
 
-      <!-- Embeddings Inspector — DEV-only dev/QA tool. Disabled (with a tooltip)
-           when there is no active notebook, since the inspector inspects the
-           active notebook's sources only. -->
       {#if import.meta.env.DEV}
         {@const noActive = notebookStore.activeNotebookId === null}
         <TooltipProvider>

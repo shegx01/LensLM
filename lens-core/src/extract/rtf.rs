@@ -68,27 +68,18 @@ fn par_to_line(s: &str) -> String {
 }
 
 /// RTF extractor — implements [`Extractor`] via `rtf-parser`.
-///
-/// Byte-identity offsets follow the DOCX build-as-you-go pattern (see docx.rs:204-207).
-///
-/// RTF has no semantic heading structure, so every emitted block is a
-/// `"paragraph"` with an empty `section_path` (issue #77 spec non-goal).
 pub struct RtfExtractor;
 
 impl Extractor for RtfExtractor {
     fn extract(&self, raw: &[u8]) -> Result<ExtractOutput, LensError> {
-        // RTF is nominally ASCII with escapes, but `rtf-parser` takes a `&str`.
         let s = std::str::from_utf8(raw)
             .map_err(|_| LensError::Validation("source is not valid UTF-8".to_string()))?;
 
-        // Pre-pass: recover paragraph boundaries (see module-level doc).
         let prepared = par_to_line(s);
 
         let doc = RtfDocument::try_from(prepared.as_str())
             .map_err(|e| LensError::Parse(format!("rtf-parser failed to parse RTF: {e:?}")))?;
 
-        // Concatenate every StyleBlock's text in document order, then split on
-        // `\n` (the paragraph separators we injected via `\line`) into blocks.
         let full: String = doc.body.iter().map(|sb| sb.text.as_str()).collect();
 
         let mut extracted_text = String::new();
@@ -98,14 +89,13 @@ impl Extractor for RtfExtractor {
         for line in full.split('\n') {
             let text = line.trim();
             if text.is_empty() {
-                continue; // skip blank paragraphs
+                continue;
             }
 
-            // Build-as-you-go: offsets are correct by construction.
             let char_start = extracted_text.len();
             extracted_text.push_str(text);
             extracted_text.push('\n');
-            let char_end = extracted_text.len() - 1; // exclude the trailing \n
+            let char_end = extracted_text.len() - 1; // trailing \n excluded
 
             blocks.push(Block {
                 block_type: BlockType::Paragraph.as_str().to_string(),
@@ -119,7 +109,6 @@ impl Extractor for RtfExtractor {
             });
         }
 
-        // Trim trailing newlines (the last '\n' was never part of any block).
         while extracted_text.ends_with('\n') {
             extracted_text.pop();
         }
@@ -153,7 +142,6 @@ mod tests {
         }
     }
 
-    // A minimal hand-crafted RTF with three paragraphs separated by `\par`.
     const SAMPLE_RTF: &str =
         r"{\rtf1\ansi\deff0 First paragraph.\par Second paragraph.\par Third paragraph.\par}";
 

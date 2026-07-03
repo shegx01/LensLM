@@ -26,11 +26,8 @@ use crate::parse::{Block, BlockType};
 use super::tabular_utils::{MAX_COLUMNS, normalize_headers, render_table_markdown, verbalize_row};
 use super::{ExtractOutput, Extractor, SourceAnchor};
 
-/// Strips a leading UTF-8 BOM (`EF BB BF`) from the raw bytes, if present.
-///
-/// The `csv` crate's `ReaderBuilder::default()` does NOT strip a BOM, so an
-/// Excel-exported CSV would otherwise carry the BOM into the first header
-/// (`"\u{FEFF}Name"`). We strip the 3 leading bytes when they match.
+/// Strips a leading UTF-8 BOM (`EF BB BF`); the `csv` crate does not strip it,
+/// so an Excel-exported CSV would otherwise carry BOM into the first header.
 fn strip_bom(raw: &[u8]) -> &[u8] {
     if raw.starts_with(&[0xEF, 0xBB, 0xBF]) {
         &raw[3..]
@@ -46,24 +43,17 @@ impl Extractor for CsvExtractor {
     fn extract(&self, raw: &[u8]) -> Result<ExtractOutput, LensError> {
         let raw = strip_bom(raw);
 
-        // `flexible(true)` tolerates ragged rows (short/long); we pad/truncate to
-        // the header width ourselves. `has_headers(false)` so the first record is
-        // returned to us (we decide header semantics, including the no-header
-        // synthetic fallback).
         let mut reader = ::csv::ReaderBuilder::new()
             .flexible(true)
             .has_headers(false)
             .from_reader(raw);
 
-        // Collect all records as owned String rows so we can both verbalize and
-        // render markdown from the SAME single parse (no second pass).
         let mut records: Vec<Vec<String>> = Vec::new();
         for result in reader.records() {
             let rec = result.map_err(|e| LensError::Parse(format!("invalid CSV: {e}")))?;
             records.push(rec.iter().map(str::to_string).collect());
         }
 
-        // No records at all → empty output.
         if records.is_empty() {
             return Ok(ExtractOutput {
                 extracted_text: String::new(),
@@ -73,15 +63,10 @@ impl Extractor for CsvExtractor {
             });
         }
 
-        // First record is the header. If it is empty or all-blank, synthesize
-        // "Column N" headers using its width (or 0 → no columns).
         let first = records.remove(0);
         let headers = normalize_headers(first);
 
-        // Column guard (memory/robustness): a pathological million-column input
-        // would over-allocate per-row `Vec<String>` + verbalized `String` before
-        // any byte-size cap triggers. `flexible(true)` parsing means a data row
-        // can also be wider than the header, so guard the widest record seen.
+        // Guard the widest record seen; `flexible(true)` means a data row can exceed the header width.
         let max_cols = headers
             .len()
             .max(records.iter().map(Vec::len).max().unwrap_or(0));
@@ -99,7 +84,6 @@ impl Extractor for CsvExtractor {
 
         for (i, row) in data_rows.iter().enumerate() {
             let line = verbalize_row(&headers, row);
-            // Build-as-you-go: offsets correct by construction (byte offsets).
             let char_start = extracted_text.len();
             extracted_text.push_str(&line);
             let char_end = extracted_text.len();
@@ -107,7 +91,7 @@ impl Extractor for CsvExtractor {
 
             blocks.push(Block {
                 block_type: BlockType::Table.as_str().to_string(),
-                section_path: String::new(), // CSV has no sheet concept.
+                section_path: String::new(),
                 text: line,
                 char_start,
                 char_end,
@@ -117,7 +101,6 @@ impl Extractor for CsvExtractor {
             });
         }
 
-        // Render markdown DURING this single parse (rows already in memory).
         let table_markdown = render_table_markdown(&headers, &data_rows);
 
         Ok(ExtractOutput {
@@ -128,10 +111,6 @@ impl Extractor for CsvExtractor {
         })
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests (TDD)
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -188,7 +167,6 @@ mod tests {
 
     #[test]
     fn csv_no_header_fallback() {
-        // First row blank → synthesize "Column N"; one data row follows.
         let out = extract(",,\nAlice,30,NYC\n");
         assert_eq!(out.blocks.len(), 1);
         assert_eq!(
@@ -211,14 +189,12 @@ mod tests {
         let out = extract("Name,Age,City\n");
         assert!(out.blocks.is_empty(), "header-only → no data rows");
         assert!(out.extracted_text.is_empty());
-        // Markdown still rendered with the header + separator (no data rows).
         let md = out.table_markdown.expect("markdown present");
         assert!(md.contains("| Name | Age | City |"));
     }
 
     #[test]
     fn csv_embedded_commas_quotes() {
-        // RFC-4180 quoting: a quoted field may contain a comma.
         let out = extract("Name,Nickname\nAl,\"Big, Al\"\n");
         assert_eq!(out.blocks.len(), 1);
         assert_eq!(out.blocks[0].text, "Name: Al; Nickname: Big, Al");
@@ -231,14 +207,12 @@ mod tests {
         assert_eq!(out.blocks.len(), 1);
         assert_byte_identity(&out);
         let b = &out.blocks[0];
-        // Offsets are BYTE offsets.
         assert_eq!(b.char_end - b.char_start, b.text.len());
         assert!(b.text.contains("アリス"));
     }
 
     #[test]
     fn csv_ragged_rows_short_padded() {
-        // Header has 3 cols; data row has 2 → missing value verbalized empty.
         let out = extract("A,B,C\n1,2\n");
         assert_eq!(out.blocks.len(), 1);
         assert_eq!(out.blocks[0].text, "A: 1; B: 2; C: ");
@@ -247,7 +221,6 @@ mod tests {
 
     #[test]
     fn csv_ragged_rows_long_truncated() {
-        // Header has 3 cols; data row has 4 → extra column truncated.
         let out = extract("A,B,C\n1,2,3,4\n");
         assert_eq!(out.blocks.len(), 1);
         assert_eq!(out.blocks[0].text, "A: 1; B: 2; C: 3");
@@ -257,7 +230,6 @@ mod tests {
 
     #[test]
     fn csv_duplicate_blank_headers() {
-        // Headers ["Name","Name",""] kept verbatim.
         let out = extract("Name,Name,\na,b,c\n");
         assert_eq!(out.blocks.len(), 1);
         assert_eq!(out.blocks[0].text, "Name: a; Name: b; : c");
@@ -266,7 +238,6 @@ mod tests {
 
     #[test]
     fn csv_bom_header() {
-        // UTF-8 BOM prefix before the header must be stripped.
         let mut raw: Vec<u8> = vec![0xEF, 0xBB, 0xBF];
         raw.extend_from_slice(b"Name,Age\nAlice,30\n");
         let out = extract_bytes(&raw);
@@ -285,7 +256,6 @@ mod tests {
         assert!(md.contains("| Name | Age |"), "header row: {md:?}");
         assert!(md.contains("| --- | --- |"), "separator row: {md:?}");
         assert!(md.contains("| Alice | 30 |"), "data row: {md:?}");
-        // The pipe-delimited markdown must NOT be in the embedded extracted_text.
         assert!(
             !out.extracted_text.contains('|'),
             "markdown must not leak into extracted_text"
@@ -294,8 +264,6 @@ mod tests {
 
     #[test]
     fn csv_too_many_columns_rejected() {
-        // A header with > MAX_COLUMNS comma-separated columns must be rejected
-        // with a Validation error before any verbalization is allocated.
         let header: String = (0..=MAX_COLUMNS)
             .map(|i| format!("H{i}"))
             .collect::<Vec<_>>()
@@ -312,7 +280,6 @@ mod tests {
             other => panic!("expected Validation, got {other:?}"),
         }
 
-        // Exactly MAX_COLUMNS columns is accepted (boundary: XFD is valid).
         let ok_header: String = (0..MAX_COLUMNS)
             .map(|i| format!("H{i}"))
             .collect::<Vec<_>>()

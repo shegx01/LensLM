@@ -1,24 +1,7 @@
 <script lang="ts">
-  // NotebookTopBar — floating pill header for the center pane (Apple Music style).
-  //
-  // ALWAYS rendered (the header stays visible even with no notebook selected).
-  // The Chat/Notes tabs + share + settings are always shown; only the notebook
-  // title is contextual (rendered only when `activeNotebook` is non-null).
-  //
-  // Layout (per design source "Floating pill header — top right"):
-  //   Outer row: right-aligned (justify-end), padding 10px 12px 2px — sits on the
-  //   window drag region so the window stays draggable from the empty top area.
-  //   The pill itself is an inline-flex rounded-full elevated surface (bg-popover)
-  //   with a soft drop shadow, reading as a floating control over the canvas.
-  //
-  //   Inside the pill, in order:
-  //     [title span] [Chat|Notes segmented] [Share circle] [Settings circle]
-  //
-  // Chat|Notes is real state via `notebookStore.activeTab` ('chat'|'notes').
-  // Share + Settings are honestly disabled with "Available soon" tooltips (M8+).
-  //
-  // The outer row carries `data-tauri-drag-region`; the pill is interactive and is
-  // NOT a drag region (native Tauri: interactive children receive pointer events).
+  // Floating pill header. Always rendered; only the title is conditional on
+  // `activeNotebook`. The outer row is the drag region; the pill is interactive
+  // and is NOT a drag region (Tauri: interactive children receive pointer events).
 
   import Share2 from '@lucide/svelte/icons/share-2';
   import Settings from '@lucide/svelte/icons/settings';
@@ -31,7 +14,6 @@
   } from '$lib/components/ui/tooltip/index.js';
   import { notebookStore } from '$lib/notebooks/index.js';
 
-  // Reactive reads from the shared store
   const activeNotebook = $derived(notebookStore.activeNotebook);
   const activeTab = $derived(notebookStore.activeTab);
 
@@ -55,7 +37,6 @@
       : 'pl-1'}"
   >
     {#if activeNotebook}
-      <!-- Notebook title — lives inside the pill (not large/bold) -->
       <span
         class="max-w-[180px] truncate pr-1.5 text-xs font-semibold tracking-[-0.1px] text-popover-foreground"
         title={activeNotebook.title}
@@ -65,7 +46,6 @@
     {/if}
 
     <TooltipProvider>
-      <!-- Chat | Notes segmented toggle — always present in the header -->
       <div
         role="group"
         aria-label="View toggle"

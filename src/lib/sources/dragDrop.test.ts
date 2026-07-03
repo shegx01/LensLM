@@ -1,13 +1,5 @@
 // Unit tests for the drag-drop manager (src/lib/sources/dragDrop.ts).
-//
-// Pure helpers (partitionPaths) and constants are tested directly.
-// The registry + event-handler branching are tested by mocking
-// `@tauri-apps/api/core` (isTauri) and `@tauri-apps/api/webview` (a fake
-// getCurrentWebview whose onDragDropEvent captures the handler).
-// `./toast.svelte.js` is mocked so showToast is observable.
-//
-// NOTE: physicalToLogical and hitTest were removed from dragDrop.ts — those
-// test suites are deleted. DropTarget no longer has getRect.
+// physicalToLogical and hitTest were removed from dragDrop.ts; DropTarget no longer has getRect.
 
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
 
@@ -15,14 +7,11 @@ import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vite
 // Mocks — configured before the module under test is (dynamically) imported.
 // ---------------------------------------------------------------------------
 
-// `isTauri` is toggled per test via this mutable flag.
 let isTauriValue = false;
 vi.mock('@tauri-apps/api/core', () => ({
   isTauri: () => isTauriValue
 }));
 
-// Capture the handler passed to onDragDropEvent and expose it to tests. The
-// mock onDragDropEvent resolves a Promise<UnlistenFn> with a vi.fn() unlisten.
 let capturedHandler: ((event: unknown) => void) | null = null;
 const unlistenSpy = vi.fn();
 const onDragDropEventMock = vi.fn(async (handler: (event: unknown) => void) => {
@@ -33,7 +22,6 @@ vi.mock('@tauri-apps/api/webview', () => ({
   getCurrentWebview: () => ({ onDragDropEvent: onDragDropEventMock })
 }));
 
-// Observe rejection-toast calls.
 const showToastMock = vi.fn();
 vi.mock('./toast.svelte.js', () => ({
   showToast: (message: string, duration?: number) => showToastMock(message, duration)
@@ -200,7 +188,6 @@ describe('registerDropTarget — non-Tauri', () => {
       unregister();
       unregister();
     }).not.toThrow();
-    // No webview listener wired up when not under Tauri.
     expect(onDragDropEventMock).not.toHaveBeenCalled();
   });
 });
@@ -219,13 +206,11 @@ describe('event-handler branching (Tauri)', () => {
     isTauriValue = true;
     capturedHandler = null;
 
-    // Register two targets; `target` is last-registered so it is the active one.
     other = makeTarget();
     target = makeTarget();
     unregisterOther = registerDropTarget(other);
     unregister = registerDropTarget(target);
 
-    // First registration wires the global listener (async dynamic import).
     await vi.waitFor(() => expect(capturedHandler).not.toBeNull());
   });
 
@@ -267,28 +252,21 @@ describe('event-handler branching (Tauri)', () => {
   });
 
   it("'drop' with no registered target: ignored entirely (no onDrop, no throw)", async () => {
-    // Unregister all targets first so there is no active target.
     unregister();
     unregisterOther();
 
-    // Re-capture handler state before unregistering tore down listener.
-    // We need a fresh registration with isTauri=true to get the handler again,
-    // but since both are unregistered, targets array is empty — just invoke
-    // capturedHandler directly (it was captured before unregister).
-    // The handler's activeTarget() will return null because targets is empty.
+    // capturedHandler was captured before unregister; targets is now empty so activeTarget() returns null.
     expect(() => {
       capturedHandler!({ payload: { type: 'drop', paths: ['/a/file.pdf'] } });
     }).not.toThrow();
     expect(target.onDrop).not.toHaveBeenCalled();
     expect(other.onDrop).not.toHaveBeenCalled();
 
-    // Re-register so afterEach unregister() calls are safe no-ops.
     unregister = () => {};
     unregisterOther = () => {};
   });
 
   it('active = last-registered: drop routes to the last-registered target, not the first', () => {
-    // `target` was registered after `other`, so target is active.
     capturedHandler!({ payload: { type: 'drop', paths: ['/a/file.pdf'] } });
     expect(target.onDrop).toHaveBeenCalledWith(['/a/file.pdf']);
     expect(other.onDrop).not.toHaveBeenCalled();

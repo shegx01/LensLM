@@ -1,13 +1,4 @@
-// Unit tests for the cloud model-picker ordering in catalog.ts.
-//
-// The Tauri IPC layer (`@tauri-apps/api/core`) is mocked so the test runs
-// without a host: `isTauri()` returns true and `invoke` is stubbed to return a
-// `list_provider_models` map. The ordering contract under test:
-//   - `last_updated` DESC (newest first; ISO YYYY-MM-DD compares lexically),
-//   - tiebreak `release_date` DESC,
-//   - then `label` ASC,
-//   - and any model with NO `last_updated`/`release_date` sorts LAST,
-//     alphabetically among the undated.
+// Unit tests for cloud model-picker ordering + text-capability filter in catalog.ts.
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ModelInfo } from './types.js';
@@ -20,9 +11,7 @@ vi.mock('@tauri-apps/api/core', () => ({
 import { invoke } from '@tauri-apps/api/core';
 import { listCloudModelOptions, formatCompact, formatUsd } from './catalog.js';
 
-/** Builds a minimal `ModelInfo` with only the fields the sort reads. Defaults to
- * TEXT-capable modalities so ordering fixtures survive the text-capability
- * filter; the filter tests below override `modalities` to exercise exclusion. */
+/** Minimal `ModelInfo` defaulting to text-capable modalities. */
 function model(overrides: Partial<ModelInfo> & { name: string }): ModelInfo {
   return {
     id: overrides.name,
@@ -46,8 +35,6 @@ beforeEach(() => {
 
 describe('listCloudModelOptions ordering', () => {
   it('orders by last_updated desc, with release_date then label tiebreaks, undated last', async () => {
-    // Insertion order is deliberately NOT the expected order, so a passing
-    // result proves the comparator (not Object.entries order) drives it.
     vi.mocked(invoke).mockResolvedValue({
       // dated, oldest last_updated
       older: model({ name: 'Older', last_updated: '2025-01-01', release_date: '2025-01-01' }),

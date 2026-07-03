@@ -37,7 +37,6 @@ describe('completeOnboarding (read-modify-write)', () => {
     expect(written).not.toBeNull();
     const w = written as unknown as AppConfig;
     expect(w.onboarding_complete).toBe(true);
-    // Every other field is preserved verbatim (no theme/model clobber).
     expect(w.theme).toBe(stored.theme);
     expect(w.models).toEqual(stored.models);
     expect(w.endpoints).toEqual(stored.endpoints);

@@ -19,34 +19,17 @@
   import AccountFooter from '$lib/components/notebooks/AccountFooter.svelte';
   import { notebookStore, openTrash, getInitials } from '$lib/notebooks/index.js';
 
-  /**
-   * Callback fired when the user clicks "New notebook".
-   *
-   * Integration note: AppShell (Wave 3) must wire this to open NotebookCreateDialog,
-   * e.g.:  <NotebooksSidebar onnewnotebook={() => (createDialogOpen = true)} />
-   */
+  // `collapsed` is the effective layout state from AppShell; falls back to the
+  // store's `sidebarCollapsed` when omitted so existing direct usage/tests work.
   let {
     onnewnotebook,
     userName = '',
     collapsed: collapsedProp
   }: {
     onnewnotebook?: () => void;
-    /**
-     * Display name from AppConfig `user_name`. Passed down to AccountFooter.
-     * AppShell wires this from `config.user_name`.
-     */
     userName?: string;
-    /**
-     * EFFECTIVE collapsed layout, supplied by AppShell. When omitted, falls back
-     * to the store's `sidebarCollapsed` so existing direct usage/tests keep
-     * working.
-     */
     collapsed?: boolean;
   } = $props();
-
-  // ---------------------------------------------------------------------------
-  // Derived state — reads from the reactive store
-  // ---------------------------------------------------------------------------
 
   const notebooks = $derived(notebookStore.notebooks);
   const activeId = $derived(notebookStore.activeNotebookId);
@@ -69,25 +52,15 @@
 </script>
 
 <!--
-  NotebooksSidebar: the full-height left rail. In EXPANDED mode it renders the
-  brand row, search trigger, notebooks list, new/trash footer, and account row.
-  In COLLAPSED mode it renders an icon-only rail with tooltips and a + button.
-
-  Width transition is handled by the parent AppShell's aside element via the
-  `sidebarCollapsed` store value; this component fills that element entirely.
+  Full-height left rail: EXPANDED shows brand/search/list/footer; COLLAPSED
+  renders an icon-only rail with tooltips. Width transition is owned by AppShell.
 -->
 <div data-sidebar class={cn('flex h-full flex-col', 'text-sidebar-foreground')}>
   {#if !collapsed}
-    <!-- ──────────────────────────────────────────────────────────────────────
-         EXPANDED LAYOUT
-    ────────────────────────────────────────────────────────────────────────── -->
-
     <!-- Traffic lights spacer (macOS native titlebar overlay) -->
     <div data-tauri-drag-region class="h-14 shrink-0"></div>
 
-    <!-- Brand row -->
     <div class="flex items-center gap-2 px-3 pb-2">
-      <!-- Logo -->
       <div
         class="flex size-7 shrink-0 items-center justify-center rounded-lg bg-sidebar-primary text-sidebar-primary-foreground"
         aria-hidden="true"
@@ -119,7 +92,6 @@
       </TooltipProvider>
     </div>
 
-    <!-- Search trigger (button that looks like an input) -->
     <div class="px-3 pb-3">
       <button
         type="button"
@@ -150,14 +122,12 @@
       </button>
     </div>
 
-    <!-- "NOTEBOOKS" section label -->
     <p
       class="px-3 pb-1.5 text-[0.6875rem] font-medium tracking-widest text-sidebar-foreground/40 uppercase"
     >
       Notebooks
     </p>
 
-    <!-- Notebook list -->
     <ScrollArea class="flex-1 min-h-0 px-1.5">
       <div class="flex flex-col gap-0.5 py-0.5">
         {#if notebooks.length === 0}
@@ -170,7 +140,6 @@
       </div>
     </ScrollArea>
 
-    <!-- Bottom actions: New notebook + Trash -->
     <div class="px-1.5 py-1.5 flex flex-col gap-0.5">
       <!-- New notebook button — surface-raised fill (c.newBg), matches the
            search input above the list. Subtle raised button, no border. -->
@@ -221,15 +190,10 @@
       <AccountFooter {userName} />
     </div>
   {:else}
-    <!-- ──────────────────────────────────────────────────────────────────────
-         COLLAPSED ICON RAIL
-    ────────────────────────────────────────────────────────────────────────── -->
-
     <!-- Traffic lights spacer -->
     <div data-tauri-drag-region class="h-14 shrink-0"></div>
 
     <div class="flex flex-col items-center gap-1.5 px-1.5">
-      <!-- Logo -->
       <div
         class="flex size-8 shrink-0 items-center justify-center rounded-lg bg-sidebar-primary text-sidebar-primary-foreground"
         aria-hidden="true"
@@ -237,7 +201,6 @@
         <Aperture class="size-4" />
       </div>
 
-      <!-- Expand button -->
       <TooltipProvider>
         <Tooltip>
           <TooltipTrigger
@@ -256,7 +219,6 @@
         </Tooltip>
       </TooltipProvider>
 
-      <!-- Search icon -->
       <TooltipProvider>
         <Tooltip>
           <TooltipTrigger
@@ -277,7 +239,6 @@
 
       <Separator class="w-6 bg-sidebar-border/60 my-1" />
 
-      <!-- Notebook icon list -->
       <ScrollArea class="flex-1 min-h-0 w-full">
         <div class="flex flex-col items-center gap-1.5 py-0.5">
           {#each notebooks as nb (nb.id)}
@@ -294,12 +255,9 @@
       </ScrollArea>
     </div>
 
-    <!-- Spacer -->
     <div class="flex-1"></div>
 
-    <!-- Bottom: + Trash Avatar -->
     <div class="flex flex-col items-center gap-1.5 px-1.5 pb-2">
-      <!-- New notebook -->
       <TooltipProvider>
         <Tooltip>
           <TooltipTrigger
@@ -319,7 +277,6 @@
         </Tooltip>
       </TooltipProvider>
 
-      <!-- Trash (with count dot) -->
       <TooltipProvider>
         <Tooltip>
           <TooltipTrigger

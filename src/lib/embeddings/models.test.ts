@@ -1,6 +1,3 @@
-// TDD: Step 7 — TS mirror + exact-tag detection for ollamaMatches()
-// These tests are written FIRST (red phase) and drive the implementation in models.ts.
-
 import { describe, expect, it } from 'vitest';
 import {
   EMBEDDING_MODELS,
@@ -103,10 +100,7 @@ describe('EMBEDDING_MODELS catalog', () => {
       expect(m!.ollamaName).toBe('snowflake-arctic-embed2');
     });
 
-    // Forward-compat invariant (issue #80): the Rust OllamaEmbedder sends
-    // `spec.id` as the Ollama `model` name, so EVERY ollama-backend model MUST
-    // have ollamaName === id. Iterating the catalog auto-covers any future
-    // ollama model, closing the gap a per-model assertion would miss.
+    // Iterating the catalog auto-covers future ollama models (issue #80).
     it('every ollama-backend model has ollamaName === id', () => {
       for (const m of EMBEDDING_MODELS.filter((m) => m.backends.includes('ollama'))) {
         expect(m.ollamaName, `${m.id} ollamaName must equal id`).toBe(m.id);
