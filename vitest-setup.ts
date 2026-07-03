@@ -3,28 +3,15 @@ import { cleanup } from '@testing-library/svelte';
 import { randomFillSync } from 'node:crypto';
 import { afterEach, beforeAll, beforeEach } from 'vitest';
 
-// ── Pending-timer tracking ────────────────────────────────────────────────────
-//
-// Root fix for the intermittent "ReferenceError: document is not defined" CI
-// flake: bits-ui Dialog (focus-restore / scroll-lock cleanup) schedules a
-// `setTimeout(fn, >0)` during component teardown. Under parallel Vitest with
-// happy-dom, that callback can fire AFTER happy-dom has already torn down the
-// *next* file's `document`, throwing at the process level and failing the run.
-//
-// Strategy: wrap globalThis.{setTimeout,setInterval} to register every pending
-// id in a Set; wrap clearTimeout/clearInterval to deregister; auto-deregister
-// a setTimeout id when its callback fires (so the Set only holds genuinely
-// pending timers). In afterEach, after cleanup() + the 0-delay drain, forcibly
-// clear any remaining ids so no callback can outlive the file boundary.
-//
-// The internal drain uses the REAL setTimeout (captured before wrapping) so it
-// is never tracked and never self-cleared.
-//
-// vi.useFakeTimers() — tests that invoke this replace globalThis.setTimeout
-// temporarily and restore it afterwards. Our wrapper is the baseline real impl
-// and is NOT affected: if fake timers are active during afterEach our Set only
-// holds real-timer ids from before/after the fake-timer window; clearing them
-// is safe. Fake-timer ids managed by Vitest are outside our Set entirely.
+// ── Pending-timer tracking ──
+// bits-ui Dialog schedules a focus-restore/scroll-unlock setTimeout during
+// teardown; under parallel happy-dom it can fire after the next file's document
+// is gone → "ReferenceError: document is not defined" fails the run. Two layers:
+//   1. track timer ids and force-clear survivors in afterEach;
+//   2. guard each callback to swallow only that benign error — clearing can't
+//      cancel a timer scheduled after the hook (microtask / cross-file boundary).
+// The drain uses the REAL setTimeout so it's never tracked; Vitest fake-timer
+// ids stay outside our Sets, so clearing is safe.
 
 const _realSetTimeout = globalThis.setTimeout;
 const _realSetInterval = globalThis.setInterval;
@@ -33,6 +20,10 @@ const _realClearInterval = globalThis.clearInterval;
 
 const _pendingTimeouts = new Set<ReturnType<typeof _realSetTimeout>>();
 const _pendingIntervals = new Set<ReturnType<typeof _realSetInterval>>();
+
+// Benign: a teardown callback firing after the DOM is gone. Swallow ONLY this.
+const _isPostTeardownDomError = (err: unknown): boolean =>
+  err instanceof ReferenceError && /\b(?:document|window)\b is not defined/.test(err.message);
 
 globalThis.setTimeout = (<TArgs extends unknown[]>(
   handler: (...args: TArgs) => void,
@@ -43,7 +34,11 @@ globalThis.setTimeout = (<TArgs extends unknown[]>(
   id = _realSetTimeout(
     (...a: TArgs) => {
       _pendingTimeouts.delete(id);
-      handler(...a);
+      try {
+        handler(...a);
+      } catch (err) {
+        if (!_isPostTeardownDomError(err)) throw err;
+      }
     },
     delay,
     ...args
@@ -57,7 +52,17 @@ globalThis.setInterval = (<TArgs extends unknown[]>(
   delay?: number,
   ...args: TArgs
 ): ReturnType<typeof _realSetInterval> => {
-  const id = _realSetInterval(handler, delay, ...args);
+  const id = _realSetInterval(
+    (...a: TArgs) => {
+      try {
+        handler(...a);
+      } catch (err) {
+        if (!_isPostTeardownDomError(err)) throw err;
+      }
+    },
+    delay,
+    ...args
+  );
   _pendingIntervals.add(id);
   return id;
 }) as typeof globalThis.setInterval;
