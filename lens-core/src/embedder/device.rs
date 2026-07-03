@@ -105,31 +105,28 @@ impl NativeAccelerator for CpuOnlyAccelerator {
     }
 }
 
-/// Apple-Metal accelerator: reports [`Acceleration::Metal`] iff a candle Metal
-/// device is actually constructible on this machine (not merely compiled in).
+/// Apple-Metal accelerator: reports [`Acceleration::Metal`] unconditionally.
 ///
-/// The probe result is cached in a [`OnceLock`](std::sync::OnceLock) — Metal
-/// availability does not change within a process lifetime, so the (non-trivial)
-/// `Device::new_metal(0)` enumeration runs at most once, honoring the
-/// [`NativeAccelerator`] contract's "cache any expensive discovery internally".
+/// This is **feature-flag-driven, NOT a runtime device-capability check** (issue
+/// #91 decision): the `native-ml-metal` feature is target-gated to
+/// aarch64-apple-darwin in `Cargo.toml`, and every Apple-Silicon Mac has a Metal
+/// GPU — so the feature being compiled IS the guarantee. We deliberately do NOT
+/// call `Device::new_metal(0)` here: a compile-time flag (rather than a runtime
+/// probe) keeps the two engines cleanly separable, so a feature-off build exercises
+/// the fastembed path for ALL models. The (astronomically unlikely) case of a
+/// Metal device that won't construct is still caught by the graceful fallback at
+/// candle-embedder construction time — never by refusing to select it here.
 ///
-/// Only built with `native-ml-metal` (aarch64-apple-darwin). Everywhere else the
-/// engine uses [`CpuOnlyAccelerator`].
+/// Only built with `native-ml-metal`. Everywhere else the engine uses
+/// [`CpuOnlyAccelerator`].
 #[cfg(feature = "native-ml-metal")]
-#[derive(Debug, Default)]
-pub struct MetalAccelerator {
-    cached: std::sync::OnceLock<Acceleration>,
-}
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MetalAccelerator;
 
 #[cfg(feature = "native-ml-metal")]
 impl NativeAccelerator for MetalAccelerator {
     fn probe(&self) -> Acceleration {
-        *self
-            .cached
-            .get_or_init(|| match candle_core::Device::new_metal(0) {
-                Ok(_) => Acceleration::Metal,
-                Err(_) => Acceleration::None,
-            })
+        Acceleration::Metal
     }
 }
 
@@ -138,7 +135,7 @@ impl NativeAccelerator for MetalAccelerator {
 pub fn default_accelerator() -> std::sync::Arc<dyn NativeAccelerator> {
     #[cfg(feature = "native-ml-metal")]
     {
-        std::sync::Arc::new(MetalAccelerator::default())
+        std::sync::Arc::new(MetalAccelerator)
     }
     #[cfg(not(feature = "native-ml-metal"))]
     {

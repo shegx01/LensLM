@@ -713,6 +713,34 @@ pub fn fastembed_weights_cached(data_dir: &Path, model_id: &str) -> bool {
         .is_some()
 }
 
+/// Whether the LOCAL (non-Ollama) embedding engine's weights for `model_id` are on
+/// disk. This is what the onboarding readiness gate's fastembed arm actually means:
+/// "the on-device embedding model is installed."
+///
+/// On the `native-ml-metal` build (Apple Silicon), a candle-supported model is
+/// served by candle — whose weights live under `{data_dir}/models/candle/`, NOT the
+/// fastembed ONNX cache — so accept EITHER engine's cache (issue #91). This makes
+/// the gate pass whether onboarding warmed candle (the Apple-Silicon default) or
+/// fell back to fastembed, and keeps every non-Apple-Silicon build on the exact
+/// fastembed-only check it had before.
+fn local_embedding_weights_cached(data_dir: &Path, model_id: &str) -> bool {
+    #[cfg(feature = "native-ml-metal")]
+    {
+        if let Some(subdir) = crate::embedder::candle_cache_subdir(model_id) {
+            let candle_dir = data_dir.join("models").join("candle").join(subdir);
+            let candle_cached = candle_dir.is_dir()
+                && std::fs::read_dir(&candle_dir)
+                    .ok()
+                    .and_then(|mut d| d.next())
+                    .is_some();
+            if candle_cached {
+                return true;
+            }
+        }
+    }
+    fastembed_weights_cached(data_dir, model_id)
+}
+
 /// Per-backend embedding-readiness gate predicate (M4 Phase 4b-B, R6 / D2).
 ///
 /// PASSES iff the SELECTED backend's own arm is satisfied:
@@ -775,7 +803,10 @@ async fn probe_embedding_model(
 
     let backend = crate::embedder::EmbeddingBackend::from_opt_str(Some(&config.embedding_backend));
 
-    let fastembed_cached = fastembed_weights_cached(data_dir, &config.embedding_model);
+    // The local (non-Ollama) engine's weights: candle's on Apple Silicon (issue
+    // #91), else fastembed's ONNX. Named `fastembed_cached` for the gate predicate,
+    // which treats it as the on-device arm.
+    let fastembed_cached = local_embedding_weights_cached(data_dir, &config.embedding_model);
 
     // Only probe Ollama when the selected backend is Ollama AND the runtime is up
     // — a fastembed selection must NEVER depend on (or wait on) Ollama (D2).

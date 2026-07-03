@@ -98,30 +98,39 @@ pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
-/// Builds the candle Metal embedder for a `fastembed`-coordinate spec IFF the
-/// device policy selected [`Compute::Metal`](crate::embedder::Compute::Metal) —
-/// otherwise (or on any candle init failure) returns `None` so
-/// [`LensEngine::embedder_for`] falls back to the fastembed CPU path. issue #91.
+/// Builds the candle embedder for a `fastembed`-coordinate spec on the requested
+/// `compute` device, or returns `None` so [`LensEngine::embedder_for`] falls back
+/// to fastembed. issue #91.
 ///
-/// Runs the ~547 MB weight load off the async runtime via `spawn_blocking`. The
-/// no-feature build is a `None` stub (the policy can never select Metal without
-/// the `native-ml-metal` accelerator, so this is unreachable there anyway).
+/// On the `native-ml-metal` build (Apple Silicon), candle is the DEFAULT engine for
+/// a candle-supported model — this builds candle-**Metal** for a `Bulk` job
+/// (`Compute::Metal`) and candle-**CPU** for an interactive query (`Compute::Cpu`),
+/// so a notebook's whole embedding coordinate is served by candle (one weight set,
+/// no fastembed ONNX download). Returns `None` — deferring to fastembed — for a
+/// model candle doesn't implement yet (mxbai / bge-m3) or on any candle init
+/// failure. Runs the ~547 MB weight load off the async runtime via `spawn_blocking`.
+///
+/// The no-feature build is a `None` stub: fastembed serves everything on
+/// non-Apple-Silicon targets.
 #[cfg(feature = "native-ml-metal")]
-async fn build_candle_metal_if_selected(
+async fn build_candle_if_supported(
     compute: crate::embedder::Compute,
     data_dir: &Path,
     spec: &'static crate::embedder::EmbeddingModelSpec,
 ) -> Option<Arc<dyn Embedder>> {
-    if compute != crate::embedder::Compute::Metal {
+    // A GPU-eligible model that candle doesn't YET implement (e.g. mxbai / bge-m3)
+    // is an EXPECTED fastembed fallback, not a failure — skip the construction
+    // attempt entirely and log at debug (no scary warn, no wasted model load).
+    if !crate::embedder::candle_supports_model(spec.id) {
+        tracing::debug!(
+            model = %spec.id,
+            "candle backend does not yet implement this model; using fastembed"
+        );
         return None;
     }
     let candle_dir = data_dir.join("models").join("candle");
     match tokio::task::spawn_blocking(move || {
-        crate::embedder::CandleNomicEmbedder::new_with_spec(
-            &candle_dir,
-            crate::embedder::Compute::Metal,
-            spec,
-        )
+        crate::embedder::CandleNomicEmbedder::new_with_spec(&candle_dir, compute, spec)
     })
     .await
     {
@@ -129,28 +138,31 @@ async fn build_candle_metal_if_selected(
             let e: Arc<dyn Embedder> = Arc::new(e);
             Some(e)
         }
+        // A supported model that genuinely failed to init (Metal/device unavailable,
+        // bad weights) — THIS is a real warn; still fall back so no job fails.
         Ok(Err(err)) => {
             tracing::warn!(
                 model = %spec.id,
+                device = compute.as_str(),
                 error = %err,
-                "candle-Metal embedder init failed; falling back to fastembed-CPU"
+                "candle embedder init failed; falling back to fastembed"
             );
             None
         }
         Err(join) => {
             tracing::warn!(
                 error = %join,
-                "candle-Metal init task panicked; falling back to fastembed-CPU"
+                "candle init task panicked; falling back to fastembed"
             );
             None
         }
     }
 }
 
-/// No-feature stub: the device policy can never select Metal without the
-/// `native-ml-metal` accelerator, so this always returns `None`.
+/// No-feature stub: fastembed serves everything on non-Apple-Silicon targets, so
+/// candle is never selected.
 #[cfg(not(feature = "native-ml-metal"))]
-async fn build_candle_metal_if_selected(
+async fn build_candle_if_supported(
     _compute: crate::embedder::Compute,
     _data_dir: &Path,
     _spec: &'static crate::embedder::EmbeddingModelSpec,
@@ -1348,12 +1360,14 @@ impl LensEngine {
         let embedder: Arc<dyn Embedder> = match backend {
             crate::embedder::EmbeddingBackend::Fastembed => {
                 let data_dir = self.data_dir().await;
-                // When the policy picked Metal, try the candle GPU engine first;
-                // on ANY failure (unavailable device, unsupported model, init
-                // error) fall back to the fastembed CPU path. Never fail a job over
-                // a device choice. A fallback is cached under the Metal key so a
-                // failed candle init isn't retried on every subsequent bulk job.
-                match build_candle_metal_if_selected(compute, &data_dir, spec).await {
+                // On the native-ml-metal build (Apple Silicon), candle is the
+                // default engine for a candle-supported model — Metal for bulk,
+                // candle-CPU for interactive queries. On ANY candle failure, or for
+                // a model candle doesn't implement yet, or on any other target, this
+                // returns None and we use fastembed. Never fail a job over a device
+                // choice. The result is cached under the resolved compute key, so a
+                // fastembed fallback isn't retried every job.
+                match build_candle_if_supported(compute, &data_dir, spec).await {
                     Some(e) => e,
                     None => {
                         // `spec` is a `&'static EmbeddingModelSpec` (Copy), so the

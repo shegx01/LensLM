@@ -48,6 +48,26 @@ const NOMIC_HF_REVISION: &str = "e9b6763023c676ca8431644204f50c2b100d9aab";
 const NOMIC_SAFETENSORS_SHA256: &str =
     "9e7d262b1fe5ea350782829496efa831901b77486bbde1cea54a4c822d010d5c";
 
+/// Whether the candle backend currently has an implementation for `model_id`.
+///
+/// Only `nomic-embed-text-v1.5` is wired today. This is a SEPARATE concern from a
+/// model's registry `accelerate_hint` (which says a model *would* benefit from the
+/// GPU): a model can be GPU-eligible yet not-yet-wired here, in which case the
+/// caller uses fastembed — an EXPECTED, non-error outcome, distinct from a genuine
+/// init failure. Wiring a new model (mxbai / bge-m3) = implement it + extend this.
+pub fn candle_supports_model(model_id: &str) -> bool {
+    model_id == DEFAULT_EMBED_MODEL_ID
+}
+
+/// The hf-hub cache subdirectory (`models--{org}--{model}`) candle downloads a
+/// supported model's weights into under `{data_dir}/models/candle/`, or `None` for
+/// a model candle doesn't serve. Used by the onboarding readiness gate to detect
+/// that the candle engine's weights (not the fastembed ONNX ones) are on disk —
+/// the same `models--{repo-with-slashes-as-dashes}` scheme hf-hub / fastembed use.
+pub fn candle_cache_subdir(model_id: &str) -> Option<String> {
+    candle_supports_model(model_id).then(|| format!("models--{}", NOMIC_HF_REPO.replace('/', "--")))
+}
+
 /// Max tokens per input. nomic-v1.5 trained at 2048; our chunks are ~512, so this
 /// only guards a pathological input. Truncation MUST be set explicitly — the
 /// serialized `tokenizer.json` bakes in neither truncation nor padding, and an

@@ -50,7 +50,7 @@ pub mod ollama;
 pub mod registry;
 
 #[cfg(feature = "native-ml-metal")]
-pub use candle_backend::CandleNomicEmbedder;
+pub use candle_backend::{CandleNomicEmbedder, candle_cache_subdir, candle_supports_model};
 pub use device::{
     Acceleration, Compute, NativeAccelerator, WorkloadKind, default_accelerator, select_compute,
 };
