@@ -29,7 +29,6 @@
 
   let { oncomplete, onback }: { oncomplete: () => void; onback: () => void } = $props();
 
-  // ── State ─────────────────────────────────────────────────────────────────
   let suggestions = $state<RecentDocument[]>([]);
   let dropHover = $state(false);
   let finishing = $state(false);
@@ -43,7 +42,6 @@
   // without re-inserting the sources that already landed (no duplicate rows).
   const addedPaths = new Set<string>();
 
-  // ── Derived ───────────────────────────────────────────────────────────────
   const selectedPaths = $derived(new Set(draft.selectedSources.map((s) => s.path)));
 
   // Cap suggestions display at 4 rows.
@@ -61,7 +59,6 @@
   const visibleAddedFiles = $derived(draft.selectedSources.slice(0, 4));
   const hiddenAddedCount = $derived(Math.max(0, draft.selectedSources.length - 4));
 
-  // ── Mount: load recent documents + register native drop target ───────────
   onMount(() => {
     void loadSuggestions();
 
@@ -98,7 +95,6 @@
     }
   }
 
-  // ── Toggle a suggested document in/out of selectedSources ─────────────────
   function toggleSuggestion(doc: RecentDocument): void {
     if (selectedPaths.has(doc.path)) {
       draft.selectedSources = draft.selectedSources.filter((s) => s.path !== doc.path);
@@ -110,12 +106,10 @@
     }
   }
 
-  // ── Remove a file from selectedSources (ADDED FILES delete action) ─────────
   function removeSource(path: string): void {
     draft.selectedSources = draft.selectedSources.filter((s) => s.path !== path);
   }
 
-  // ── Open native file picker ───────────────────────────────────────────────
   async function browse(): Promise<void> {
     if (!isTauri()) return;
     try {
@@ -139,11 +133,6 @@
     }
   }
 
-  // ── Finish onboarding ──────────────────────────────────────────────────────
-  // Shared by both footer actions. `persistSources` is true for "Launch Lens"
-  // (insert the selected sources first) and false for "Skip for now". The
-  // source-insert loop skips paths already accepted on a prior attempt (see
-  // `addedPaths`) so a retry after a partial failure never duplicates rows.
   async function finish(persistSources: boolean): Promise<void> {
     finishing = true;
     completeError = null;
@@ -151,9 +140,6 @@
       let skipped = 0;
       if (persistSources && isTauri() && draft.notebookId) {
         for (const src of draft.selectedSources) {
-          // Client-side belt-and-suspenders guard: skip paths already accepted on
-          // a prior (partially-failed) attempt to avoid redundant IPC round-trips.
-          // The backend `raw_content_hash` dedup (#100) is the authority.
           if (addedPaths.has(src.path)) continue;
           const { wasExisting } = await invoke<AddSourceOutcome>('add_source', {
             notebookId: draft.notebookId,
@@ -176,7 +162,6 @@
     }
   }
 
-  // ── Ext badge colour (subtle muted palette) ───────────────────────────────
   function extBadgeClass(ext: string): string {
     switch (ext.toLowerCase()) {
       case 'pdf':
@@ -191,7 +176,6 @@
     }
   }
 
-  // ── Format bytes to human-readable size ───────────────────────────────────
   function formatSize(bytes: number): string {
     if (!bytes) return '';
     if (bytes < 1024) return `${bytes} B`;
@@ -206,19 +190,16 @@
 <main data-tauri-drag-region class="flex min-h-svh items-center justify-center p-6">
   <div class="w-full max-w-[520px]" style="-webkit-app-region: no-drag;">
     <Card class="w-full gap-0 rounded-[14px] px-10 pt-9 pb-8 shadow-2xl ring-0">
-      <!-- Header: Back + 3-dot progress -->
       <div class="mb-7 flex items-center justify-between">
         <OnboardingBackButton {onback} />
         <ProgressDots current={3} total={3} />
       </div>
 
-      <!-- Title + subtitle -->
       <h1 class="text-foreground mb-1.5 text-[20px] font-bold tracking-[-0.35px]">Add sources</h1>
       <p class="text-muted-foreground mb-5 text-[13px]">
         Attach documents, PDFs, or notes. You can also add more later.
       </p>
 
-      <!-- Drop zone -->
       <button
         bind:this={dropZoneEl}
         class={cn(
@@ -253,7 +234,6 @@
         </div>
       </button>
 
-      <!-- Suggested from your library (hidden when no suggestions; capped at 4 rows) -->
       {#if visibleSuggestions.length > 0}
         <div class="text-muted-foreground mb-1.5 text-[10px] font-bold uppercase tracking-[0.08em]">
           Suggested from your library
@@ -273,12 +253,10 @@
               aria-pressed={selected}
               aria-label={`${selected ? 'Deselect' : 'Select'} ${doc.name}`}
             >
-              <!-- File icon tile -->
               <div class="bg-muted flex size-7 shrink-0 items-center justify-center rounded-[6px]">
                 <File class="text-muted-foreground size-3" strokeWidth={1.75} />
               </div>
 
-              <!-- Name + meta -->
               <div class="min-w-0 flex-1">
                 <div
                   class={cn(
@@ -305,7 +283,6 @@
                 </div>
               </div>
 
-              <!-- Checkbox -->
               <div
                 class={cn(
                   'flex size-[18px] shrink-0 items-center justify-center rounded-[5px] transition-all duration-[130ms]',
@@ -322,7 +299,6 @@
         </div>
       {/if}
 
-      <!-- ADDED FILES (hidden when selectedSources is empty) -->
       {#if draft.selectedSources.length > 0}
         <div class="text-muted-foreground mb-1.5 text-[10px] font-bold uppercase tracking-[0.08em]">
           Added files
@@ -332,12 +308,10 @@
             <div
               class="bg-muted/30 border-border flex w-full items-center gap-2.5 rounded-[9px] border px-3 py-[9px]"
             >
-              <!-- File icon tile -->
               <div class="bg-muted flex size-7 shrink-0 items-center justify-center rounded-[6px]">
                 <File class="text-muted-foreground size-3" strokeWidth={1.75} />
               </div>
 
-              <!-- Name + meta -->
               <div class="min-w-0 flex-1">
                 <div class="text-foreground truncate text-[12px] font-semibold">
                   {src.name}
@@ -359,7 +333,6 @@
                 </div>
               </div>
 
-              <!-- Remove button -->
               <button
                 class="text-muted-foreground hover:text-destructive flex size-[26px] shrink-0 cursor-pointer items-center justify-center rounded-[5px] transition-colors duration-[130ms]"
                 onclick={() => removeSource(src.path)}
@@ -371,7 +344,6 @@
             </div>
           {/each}
 
-          <!-- "+N more" overflow indicator -->
           {#if hiddenAddedCount > 0}
             <div
               class="text-muted-foreground px-3 py-[7px] text-[11px]"
@@ -383,7 +355,6 @@
         </div>
       {/if}
 
-      <!-- Selected count label (only when nothing in ADDED FILES, to avoid redundancy) -->
       {#if draft.selectedSources.length === 0}
         <div class="text-muted-foreground mb-3.5 text-center text-[12px]">
           {sourceCountLabel}
@@ -392,14 +363,12 @@
         <div class="mb-3.5"></div>
       {/if}
 
-      <!-- Error message -->
       {#if completeError}
         <p class="text-destructive mb-3 w-full text-center text-sm" role="alert">
           {completeError}
         </p>
       {/if}
 
-      <!-- Footer buttons -->
       <div class="flex gap-2">
         <Button
           variant="outline"

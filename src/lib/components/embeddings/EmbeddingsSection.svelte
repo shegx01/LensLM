@@ -1,24 +1,7 @@
 <script lang="ts">
-  // Shared Embeddings section — the single component behind BOTH the global
-  // Settings>Embeddings panel and the per-notebook "{notebook} settings" sheet
-  // (plan Steps 10 + 11, ADR decision B1). Two modes:
-  //
-  //   mode="global"   — sets the APP-WIDE default (new notebooks). Persists
-  //                     config.embedding_model + config.embedding_backend via the
-  //                     standard read-modify-write. NO re-embed warning (changing
-  //                     the default never touches an existing notebook's vectors).
-  //
-  //   mode="notebook" — changes ONE notebook + re-indexes it. Reads the current
-  //                     coordinate via get_notebook_embedding_model; a change with
-  //                     an indexed coordinate opens the re-embed confirm dialog,
-  //                     then streams set_notebook_embedding_model progress (the
-  //                     picker is disabled while a re-embed is in flight).
-  //
-  // Layout matches the design's Embeddings panel verbatim (Lens.dc.html
-  // `stIsEmbed`): title "Embeddings" + subtitle "Local only — all vectors
-  // computed on-device.", a provider selector (the user-specified extension),
-  // then the model radio-list of cards. Tokens only — light + dark + every
-  // accent ([[theming-light-dark-accent]]).
+  // Shared Embeddings section used in both global Settings and per-notebook sheets.
+  // mode="global" sets the app-wide default; mode="notebook" changes one notebook
+  // and streams re-embed progress when the coordinate is already indexed.
 
   import { onMount, onDestroy } from 'svelte';
   import { invoke, isTauri } from '@tauri-apps/api/core';
@@ -70,53 +53,30 @@
     mode: 'global' | 'notebook';
     /** Required in notebook mode — the notebook whose coordinate this edits. */
     notebookId?: string | null;
-    /**
-     * Compact layout (onboarding inline expansion): tighter spacing + `h-9`
-     * provider buttons. The default (`false`) is the roomy Settings/sheet layout
-     * with `h-10` buttons. Behavior is identical; only the chrome differs so the
-     * onboarding panel can reuse this component instead of forking it.
-     */
     compact?: boolean;
-    /**
-     * Render the "Embeddings" title + "Local only…" subtitle. The onboarding
-     * panel supplies its own row label, so it sets this `false`.
-     */
     showHeader?: boolean;
-    /**
-     * Callback after a successful persist/re-embed (e.g. close the sheet, or
-     * re-run the onboarding system-check and collapse the panel). May be async.
-     */
     onchange?: () => void | Promise<void>;
   } = $props();
 
-  // ── Selection state ────────────────────────────────────────────────────────
   let backend = $state<EmbeddingBackend>(DEFAULT_EMBEDDING_BACKEND);
   let selectedModel = $state<EmbeddingModelId>(DEFAULT_EMBEDDING_MODEL);
 
-  // The currently-persisted coordinate (global: config; notebook: the index row).
   let activeModel = $state<EmbeddingModelId>(DEFAULT_EMBEDDING_MODEL);
   let activeBackend = $state<EmbeddingBackend>(DEFAULT_EMBEDDING_BACKEND);
-  // Notebook mode: whether the current coordinate is already indexed ("active").
   let coordinateIndexed = $state(false);
 
-  // ── Availability state (per backend) ────────────────────────────────────────
   let fastembedCached = $state<Set<EmbeddingModelId>>(new Set());
   let ollamaInstalled = $state<Set<EmbeddingModelId>>(new Set());
   let ollamaEndpoint = $state('http://localhost:11434');
   let refreshing = $state(false);
-  // The registry model ids that actually run on the Apple GPU on this build —
-  // `{nomic}` on Apple Silicon today, empty elsewhere (issue #91). GPU acceleration
-  // is PER-MODEL (candle wires nomic; mxbai/bge-m3 fall back to fastembed-CPU until
-  // wired; all-minilm is CPU by design), so the badge + "fastest" hint are keyed on
-  // THIS set, not the provider.
+  // GPU acceleration is per-model (candle+Metal for nomic; CPU for others),
+  // so the badge is keyed on this set, not the provider (issue #91).
   let gpuModels = $state<Set<string>>(new Set());
 
-  // ── fastembed install state ─────────────────────────────────────────────────
   let installProgress = $state<number | null>(null);
   let installPhase = $state<string>('');
   let actionError = $state<string | null>(null);
 
-  // ── notebook re-embed state ──────────────────────────────────────────────────
   let confirmOpen = $state(false);
   let reembedDone = $state(0);
   let reembedTotal = $state(0);
@@ -124,19 +84,10 @@
 
   const installed = $derived(backend === 'fastembed' ? fastembedCached : ollamaInstalled);
   const selectedReady = $derived(installed.has(selectedModel));
-  // Disable the picker while a notebook re-embed is in flight (status-driven).
   const pickerDisabled = $derived(reembedding);
 
-  // ── Backend-filtered model list (Step 8) ───────────────────────────────────
-  // Only models whose `backends` includes the currently-selected backend are
-  // shown in the picker (strict fastembed/ollama partition, issue #80).
   const filteredModels = $derived(EMBEDDING_MODELS.filter((m) => m.backends.includes(backend)));
 
-  // Provider buttons. The on-device provider is labeled neutrally "On-device" (its
-  // persisted backend token stays `fastembed`): GPU acceleration is a per-MODEL
-  // property shown as a badge on the model card, NOT a provider attribute — the
-  // on-device provider serves both GPU (nomic) and CPU (mxbai/bge-m3/all-minilm)
-  // models, so a provider-level "Apple GPU" label would misrepresent them (#91).
   const providers = [
     { id: 'fastembed', label: 'On-device' },
     { id: 'ollama', label: 'Ollama' }
@@ -147,7 +98,6 @@
     try {
       const names = await listOllamaModels(ollamaEndpoint);
       const found = new Set<EmbeddingModelId>();
-      // Only check models that support the ollama backend (Step 8: partition-aware).
       for (const m of EMBEDDING_MODELS.filter((m) => m.backends.includes('ollama'))) {
         if (names.some((d) => ollamaMatches(d, m))) found.add(m.id);
       }
@@ -169,8 +119,6 @@
   }
 
   onMount(async () => {
-    // Capability probe (issue #91): which models run on the Apple GPU? Cosmetic
-    // (badge + hint), so fetch WITHOUT blocking the init/selection sequence below.
     void gpuAcceleratedModels().then((ids) => {
       gpuModels = new Set(ids);
     });
@@ -183,7 +131,7 @@
           const ep = cfg.endpoints?.ollama;
           if (ep) ollamaEndpoint = ep;
         } catch {
-          // Non-fatal: fall back to defaults.
+          // fall back to defaults
         }
       }
     } else if (notebookId) {
@@ -191,8 +139,6 @@
       activeBackend = resolveBackend(info.backend);
       activeModel = resolveModel(info.model_id).id;
       coordinateIndexed = info.status === 'active';
-      // If a re-embed is detected in flight (active but mid-stream), the picker
-      // stays disabled until it completes; the status is the gate.
     }
     backend = activeBackend;
     selectedModel = activeModel;
@@ -203,7 +149,6 @@
     if (pickerDisabled) return;
     backend = b;
     actionError = null;
-    // Reset selectedModel if it is not in the newly-filtered set (Step 8).
     const newFiltered = EMBEDDING_MODELS.filter((m) => m.backends.includes(b));
     if (!newFiltered.some((m) => m.id === selectedModel)) {
       selectedModel = newFiltered[0]?.id ?? DEFAULT_EMBEDDING_MODEL;
@@ -216,14 +161,9 @@
     actionError = null;
   }
 
-  // ── fastembed install (warm: download weights to disk) ───────────────────────
-  // fastembed has no byte-level progress (init is opaque), so we advance the
-  // design's phase copy (Downloading → Extracting → Configuring → Almost ready)
-  // on a timer for feedback, and resolve when the warm command completes.
+  // fastembed has no byte-level progress, so phase copy advances on a timer.
   let phaseTimer: ReturnType<typeof setInterval> | null = null;
 
-  // Clear the phase ticker if the surface is unmounted mid-install (e.g. the
-  // dialog/sheet is closed) so the interval never fires against a destroyed graph.
   onDestroy(() => {
     if (phaseTimer) clearInterval(phaseTimer);
   });
@@ -251,7 +191,6 @@
     }
   }
 
-  // ── commit the selection (the mode-specific persist) ──────────────────────────
   async function commitSelection(): Promise<void> {
     if (mode === 'global') {
       await persistGlobal();
@@ -276,8 +215,7 @@
     }
   }
 
-  // Notebook mode: a change to an INDEXED coordinate needs a re-embed (confirm
-  // first). An unindexed coordinate (no vectors yet) is applied without a warning.
+  // An indexed coordinate change opens the confirm dialog; unindexed applies immediately.
   async function maybeReembed(): Promise<void> {
     if (coordinateIndexed && (selectedModel !== activeModel || backend !== activeBackend)) {
       confirmOpen = true;
@@ -309,7 +247,6 @@
     }
   }
 
-  // The primary action button label depends on backend + readiness + dirty state.
   const isDirty = $derived(selectedModel !== activeModel || backend !== activeBackend);
   const needsInstall = $derived(backend === 'fastembed' && !selectedReady);
 
@@ -320,14 +257,12 @@
 
 <section class="flex flex-col" aria-label="Embeddings settings">
   {#if showHeader}
-    <!-- Title + subtitle (verbatim design copy) -->
     <h2 class="text-xl font-extrabold tracking-[-0.4px] text-foreground">Embeddings</h2>
     <p class="mt-1 text-[0.8rem] text-muted-foreground">
       Local only — all vectors computed on-device.
     </p>
   {/if}
 
-  <!-- ── Provider selector (the design extension the user specified) ── -->
   <div class={compact ? '' : 'mt-6'}>
     <p class="text-[0.65rem] font-bold uppercase tracking-[0.08em] text-muted-foreground/70">
       Select your local embeddings provider
@@ -357,8 +292,6 @@
       {/each}
     </div>
     {#if gpuModels.has(selectedModel)}
-      <!-- issue #91: only when the SELECTED model actually runs on the GPU (candle +
-           Metal, ~2.6× the CPU throughput and frees the CPU) — not for CPU models. -->
       <p class="mt-2 flex items-center gap-1.5 text-[0.7rem] text-muted-foreground">
         <span aria-hidden="true">⚡</span>
         Best performance — embeds on your Apple GPU.
@@ -366,7 +299,6 @@
     {/if}
   </div>
 
-  <!-- ── Embedding model radio-list ── -->
   <p class="mt-6 text-[0.65rem] font-bold uppercase tracking-[0.08em] text-muted-foreground/70">
     Embedding model
   </p>
@@ -399,9 +331,6 @@
             >
           </span>
           {#if isGpu}
-            <!-- issue #91: this model actually runs on the Apple GPU (candle+Metal).
-                 Per-model (not per-provider) — only candle-wired, GPU-eligible
-                 models qualify; CPU models never show this. -->
             <span
               class="flex shrink-0 items-center gap-1 text-[0.66rem] font-semibold text-primary"
               aria-label={`${model.label} runs on the Apple GPU`}
@@ -419,7 +348,6 @@
               Ready
             </span>
           {/if}
-          <!-- Radio dot -->
           <span
             class={cn(
               'flex size-4 shrink-0 items-center justify-center rounded-full border-[1.5px]',
@@ -435,13 +363,11 @@
     {/each}
   </div>
 
-  <!-- ── Action + status row ── -->
   {#if actionError}
     <p class="mt-3 text-[0.75rem] text-destructive" role="alert">{actionError}</p>
   {/if}
 
   {#if reembedding}
-    <!-- Re-embed in progress — amber-pulse dot (shared sources/status idiom). -->
     <div class="mt-4 flex items-center gap-2.5" aria-live="polite">
       <span class="size-2 shrink-0 rounded-full bg-amber-500 animate-pulse" aria-hidden="true"
       ></span>
@@ -452,7 +378,6 @@
       </span>
     </div>
   {:else if backend === 'ollama'}
-    <!-- Ollama: detect-only + Refresh + install hint (the app never pulls). -->
     <div class="mt-4 flex flex-col gap-2.5">
       <div class="flex items-center justify-between gap-2">
         <Button
@@ -486,7 +411,6 @@
       {/if}
     </div>
   {:else if needsInstall}
-    <!-- fastembed: Install + download-progress. -->
     <Button
       class="mt-4 h-10 w-full"
       onclick={handleInstall}
@@ -507,13 +431,11 @@
     </Button>
   {/if}
 
-  <!-- Provider helper note (anchored at the bottom of the panel). -->
   <p class="mt-5 text-[0.7rem] leading-relaxed text-muted-foreground">
     Ollama must be installed if chosen — Lens detects your local models but never downloads them.
   </p>
 </section>
 
-<!-- ── Re-embed confirm dialog (notebook mode only) ── -->
 <Dialog bind:open={confirmOpen}>
   <DialogContent class="max-w-md">
     <DialogHeader>

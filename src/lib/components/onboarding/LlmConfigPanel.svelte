@@ -37,9 +37,7 @@
   // persist a sensible large default that covers modern hosted models.
   const CLOUD_DEFAULT_CONTEXT = 128000;
 
-  // The placeholder shown in the (empty) free-text model fields when no Ollama
-  // model is detected — a SUGGESTION, not a persisted default (Rev 2). Matches the
-  // design mockup (`Lens Onboarding.dc.html`).
+  // A suggestion, not a persisted default (Rev 2). Matches the design mockup.
   const MODEL_PLACEHOLDER = 'e.g. llama3.2:3b';
 
   let {
@@ -50,69 +48,53 @@
     oncollapse: () => void;
   } = $props();
 
-  // --- Segmented tab state ---
   let activeTab = $state<LlmProviderTab>('local');
 
-  // --- Local tab fields ---
   let localEndpoint = $state('http://localhost:11434');
   let contextWindow = $state(8192);
-  // Detected models list (populated by Auto-detect)
   let detectedModels = $state<string[]>([]);
   let detectStatus = $state<'idle' | 'detecting' | 'found' | 'not-found'>('idle');
   let detectError = $state<string | null>(null);
   let testStatus = $state<'idle' | 'testing' | 'success' | 'fail'>('idle');
   let testMessage = $state<string | null>(null);
 
-  // --- Two model roles (Rev 2) ---
-  // ENRICHMENT model (BLOCKING): drives the base `models[]` entry that
-  // `probe_llm_runtime` validates/gates. STUDIO & CHAT model (NON-blocking):
-  // persists to `enrichment.chat_model` for M5. Each role has a Local and a Cloud
-  // value; the active tab decides which pair is live. All start EMPTY (placeholder,
-  // not a hardcoded default) so the picker/pull-prompt drives selection.
+  // Two model roles (Rev 2): ENRICHMENT (blocking, gates probe_llm_runtime) and
+  // STUDIO & CHAT (non-blocking, persisted to enrichment.chat_model for M5).
+  // Both start empty so the picker/pull-prompt drives selection.
   let enrichmentLocalModel = $state('');
   let studioChatLocalModel = $state('');
   let enrichmentCloudModel = $state('');
   let studioChatCloudModel = $state('');
 
-  // Per-role interactive validation status (shown inline). Enrichment BLOCKS save
-  // on 'invalid'; studio/chat is informational only (NEVER blocks).
   let enrichmentValidation = $state<'idle' | 'checking' | 'valid' | 'invalid'>('idle');
   let enrichmentValidationMessage = $state<string | null>(null);
   let studioChatValidation = $state<'idle' | 'checking' | 'valid' | 'invalid'>('idle');
   let studioChatValidationMessage = $state<string | null>(null);
 
-  // --- Cloud API tab fields ---
-  // The canonical provider id (= models.dev catalog key for first-class providers).
   let cloudProvider = $state<string>(CLOUD_PROVIDERS[0].id);
   let providerQuery = $state('');
   let cloudBaseUrl = $state('');
   let cloudApiKey = $state('');
-  // Whether the user has EXPLICITLY chosen an ENRICHMENT cloud model (via the
-  // picker) or restored a saved one. While false, the smart default re-resolves to
-  // the newest text-capable model on every (re)load. Studio/chat has no smart
-  // default (starts "Not set").
+  // While false, the smart default re-resolves to the newest text-capable model
+  // on every (re)load. Studio/chat has no smart default (starts "Not set").
   let cloudModelPicked = $state(false);
 
-  // --- Capability-aware model pickers (M4 Phase 3, Stage 3) ---
   let cloudModelOptions = $state<ModelOption[]>([]);
   let ollamaModelOptions = $state<ModelOption[]>([]);
   let catalogUpdating = $state(false);
 
-  // --- Save state (cloud) ---
   let saving = $state(false);
   let saveError = $state<string | null>(null);
 
-  // --- Saved cloud key masking (per-provider) ---
+  // Saved cloud key is masked per-provider; re-entry required to replace.
   let savedProviderId = $state<string | null>(null);
   let editingKey = $state(false);
   const hasSavedKey = $derived(cloudProvider === savedProviderId);
 
-  // --- Enrichment preferences (M4 Phase 3) ---
   let enrichmentEnabled = $state(true);
   let corefStrategy = $state<CorefStrategy>('llm_inline');
   let cloudConsent = $state(false);
 
-  // --- Routing + per-task overrides (M4 Phase 3, Stage 3) ---
   let routingKind = $state<'cloud_first' | 'local_first' | 'explicit'>('cloud_first');
   let corefModelId = $state('');
 
@@ -580,11 +562,6 @@
   }
 </script>
 
-<!-- ── Per-role LOCAL model selector ─────────────────────────────────────────
-     `role` distinguishes the two ids. `value`/`onModel` bind to the role's state.
-     Picker when Ollama models exist; free-text pull-prompt (empty + placeholder)
-     when none, with a copyable `ollama pull` command + a Re-check button. The
-     `notSet` flag adds a "Not set" option (studio/chat only). -->
 {#snippet localModelSelector(
   id: string,
   role: 'enrichment' | 'studioChat',
@@ -630,10 +607,6 @@
   {/if}
 {/snippet}
 
-<!-- ── Per-role CLOUD model selector ─────────────────────────────────────────
-     Reuses the cloud catalog picker (or free-text for catalog-less providers).
-     Enrichment uses `cloudSelectOptions` (with the offline seed fallback) and pins
-     `cloudModelPicked` on change; studio/chat starts "Not set". -->
 {#snippet cloudModelSelector(
   id: string,
   role: 'enrichment' | 'studioChat',
@@ -662,10 +635,6 @@
   {/if}
 {/snippet}
 
-<!-- ── Per-role validation status cue ─────────────────────────────────────────
-     Compact inline cue: icon + short text, sits close to the field (gap-1.5).
-     Kept lightweight so two cues inside the Models card don't dominate.
-     role="alert" on invalid is preserved — tests assert it. -->
 {#snippet validationStatus(
   status: 'idle' | 'checking' | 'valid' | 'invalid',
   message: string | null
@@ -686,7 +655,6 @@
 {/snippet}
 
 <div class="pt-3">
-  <!-- Segmented tabs: Local | Cloud API -->
   <div
     class="bg-muted flex w-full items-center rounded-lg p-0.5"
     role="tablist"
@@ -724,7 +692,6 @@
     </button>
   </div>
 
-  <!-- Local tab panel -->
   <div
     id="llm-panel-local"
     role="tabpanel"
@@ -732,12 +699,10 @@
     tabindex={activeTab === 'local' ? 0 : -1}
     class={cn('mt-3 flex flex-col gap-5', activeTab !== 'local' && 'hidden')}
   >
-    <!-- Helper text -->
     <p class="text-muted-foreground text-[0.78rem] leading-relaxed">
       Works with Ollama, LM Studio, vLLM, Jan, llama.cpp — any OpenAI-compatible local server.
     </p>
 
-    <!-- ── Group 1: Connection ──────────────────────────────────────────── -->
     <div class="flex flex-col gap-1.5">
       <p class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase">
         Connection
@@ -774,13 +739,11 @@
       {/if}
     </div>
 
-    <!-- ── Group 2: Models ─────────────────────────────────────────────── -->
     <div class="border-border flex flex-col gap-3 border-t pt-4">
       <p class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase">
         Models
       </p>
       <div class="border-border bg-muted/40 flex flex-col gap-4 rounded-lg border p-3">
-        <!-- ENRICHMENT MODEL (local) — BLOCKING -->
         <div class="flex flex-col gap-1.5">
           <div class="flex items-baseline gap-2">
             <label for="llm-model-local" class="text-foreground text-[0.8rem] font-medium">
@@ -801,10 +764,8 @@
           {@render validationStatus(enrichmentValidation, enrichmentValidationMessage)}
         </div>
 
-        <!-- divider -->
         <div class="border-border border-t"></div>
 
-        <!-- STUDIO & CHAT MODEL (local) — NON-blocking -->
         <div class="flex flex-col gap-1.5">
           <div class="flex items-baseline gap-2">
             <label for="studio-chat-model-local" class="text-foreground text-[0.8rem] font-medium">
@@ -882,14 +843,12 @@
       </div>
     </div>
 
-    <!-- Test connection status -->
     {#if testStatus === 'success' && testMessage}
       <p class="text-primary text-[0.75rem]">{testMessage}</p>
     {:else if testStatus === 'fail' && testMessage}
       <p class="text-destructive text-[0.75rem]" role="alert">{testMessage}</p>
     {/if}
 
-    <!-- Test connection button (disabled while enrichment model empty) -->
     <Button class="h-10 w-full" onclick={handleTestConnection} disabled={testConnectionDisabled}>
       {#if testStatus === 'testing'}
         <LoaderCircle class="size-4 animate-spin" />
@@ -900,7 +859,6 @@
     </Button>
   </div>
 
-  <!-- Cloud API tab panel -->
   <div
     id="llm-panel-cloud"
     role="tabpanel"
@@ -908,13 +866,11 @@
     tabindex={activeTab === 'cloud' ? 0 : -1}
     class={cn('mt-3 flex flex-col gap-5', activeTab !== 'cloud' && 'hidden')}
   >
-    <!-- ── Group 1: Connection ──────────────────────────────────────────── -->
     <div class="flex flex-col gap-3">
       <p class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase">
         Connection
       </p>
 
-      <!-- Cloud provider — searchable combobox (type-to-filter, grouped). -->
       <div class="flex flex-col gap-1.5">
         <Combobox.Root
           type="single"
@@ -980,7 +936,6 @@
         </Combobox.Root>
       </div>
 
-      <!-- API KEY -->
       <div class="flex flex-col gap-1.5">
         <label for="llm-cloud-key" class="text-muted-foreground text-[0.68rem] font-medium">
           API Key
@@ -1003,7 +958,6 @@
         {/if}
       </div>
 
-      <!-- BASE URL — only for the custom OpenAI-compatible endpoint. -->
       {#if isCustomProvider}
         <div class="flex flex-col gap-1.5">
           <label for="llm-cloud-url" class="text-muted-foreground text-[0.68rem] font-medium">
@@ -1025,7 +979,6 @@
       {/if}
     </div>
 
-    <!-- ── Group 2: Models ─────────────────────────────────────────────── -->
     <div class="border-border flex flex-col gap-3 border-t pt-4">
       <div class="flex items-baseline gap-2">
         <p class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase">
@@ -1036,7 +989,6 @@
         {/if}
       </div>
       <div class="border-border bg-muted/40 flex flex-col gap-4 rounded-lg border p-3">
-        <!-- ENRICHMENT MODEL (cloud) — BLOCKING -->
         <div class="flex flex-col gap-1.5">
           <div class="flex items-baseline gap-2">
             <label for="llm-cloud-model" class="text-foreground text-[0.8rem] font-medium">
@@ -1062,10 +1014,8 @@
           {@render validationStatus(enrichmentValidation, enrichmentValidationMessage)}
         </div>
 
-        <!-- divider -->
         <div class="border-border border-t"></div>
 
-        <!-- STUDIO & CHAT MODEL (cloud) — NON-blocking -->
         <div class="flex flex-col gap-1.5">
           <div class="flex items-baseline gap-2">
             <label for="studio-chat-model-cloud" class="text-foreground text-[0.8rem] font-medium">
@@ -1087,22 +1037,16 @@
       </div>
     </div>
 
-    <!-- Save error -->
     {#if saveError}
       <p class="text-destructive text-[0.75rem]" role="alert">{saveError}</p>
     {/if}
 
-    <!-- Save button (disabled while enrichment model or key empty) -->
     <Button class="h-10 w-full" onclick={handleSave} disabled={cloudSaveDisabled}>
       {saving ? 'Saving…' : 'Save'}
     </Button>
   </div>
 
-  <!-- ── Enrichment (M4 Phase 3) ──────────────────────────────────────────────
-       Shared across both tabs (the chosen provider runs the optional, additive
-       enrichment pass). Saved alongside the provider above; non-blocking. -->
   <div class="border-border mt-4 flex flex-col gap-3 border-t pt-4">
-    <!-- ENABLE toggle row -->
     <div class="flex items-start justify-between gap-3">
       <div class="flex flex-col gap-0.5">
         <label for="enrichment-enabled" class="text-foreground text-[0.82rem] font-medium">
@@ -1136,7 +1080,6 @@
       </button>
     </div>
 
-    <!-- Opt-out tradeoff text -->
     {#if !enrichmentEnabled}
       <p class="text-muted-foreground text-[0.72rem] leading-relaxed">
         Sources will still be searchable via embeddings, but without enrichment quality boosts
@@ -1144,7 +1087,6 @@
       </p>
     {/if}
 
-    <!-- COREF STRATEGY select -->
     <div class={cn('flex flex-col gap-1.5', !enrichmentEnabled && 'opacity-50')}>
       <label
         for="enrichment-coref"
@@ -1168,7 +1110,6 @@
       </p>
     </div>
 
-    <!-- ROUTING select -->
     <div class={cn('flex flex-col gap-1.5', !enrichmentEnabled && 'opacity-50')}>
       <label
         for="enrichment-routing"
@@ -1194,7 +1135,6 @@
       </p>
     </div>
 
-    <!-- COREF-MODEL OVERRIDE -->
     <div class={cn('flex flex-col gap-1.5', !enrichmentEnabled && 'opacity-50')}>
       <label
         for="enrichment-coref-model"
@@ -1220,7 +1160,6 @@
       </p>
     </div>
 
-    <!-- CLOUD CONSENT — only when a cloud provider is selected. -->
     {#if activeTab === 'cloud'}
       <div class="border-border bg-muted/40 flex flex-col gap-2 rounded-lg border p-3">
         <label class="flex items-start gap-2.5">

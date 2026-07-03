@@ -1,8 +1,4 @@
-// Store unit tests for notebooks-state.svelte.ts.
-//
-// The IPC module is mocked so tests run without a Tauri host.
-// `resetNotebookStore()` is called in afterEach to prevent cross-test bleed
-// from module-level $state globals — same pattern as onboarding tests.
+// Store unit tests for notebooks-state.svelte.ts (IPC mocked, no Tauri host).
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
@@ -26,10 +22,6 @@ import {
 } from './notebooks-state.svelte.js';
 import { NOTEBOOK_PALETTE, notebookAccentClass } from './notebook-color.js';
 
-// ---------------------------------------------------------------------------
-// Mock the IPC layer
-// ---------------------------------------------------------------------------
-
 vi.mock('./ipc.js', () => ({
   listNotebooks: vi.fn(),
   createNotebook: vi.fn(),
@@ -41,20 +33,17 @@ vi.mock('./ipc.js', () => ({
   touchNotebookActivity: vi.fn().mockResolvedValue(undefined)
 }));
 
-// Mock the sources IPC layer (used by notebooks-state for trashed sources).
 vi.mock('$lib/sources/ipc.js', () => ({
   listTrashedSources: vi.fn(),
   purgeSource: vi.fn(),
   restoreSource: vi.fn()
 }));
 
-// Mock the sources store (used for loadSources + drainTrashQueueEntry).
 vi.mock('$lib/sources/sources-state.svelte.js', () => ({
   loadSources: vi.fn(),
   drainTrashQueueEntry: vi.fn()
 }));
 
-// Import the mocked functions so we can configure return values per test.
 import {
   listNotebooks,
   createNotebook,
@@ -66,10 +55,6 @@ import {
 } from './ipc.js';
 import { listTrashedSources, purgeSource, restoreSource } from '$lib/sources/ipc.js';
 import { loadSources, drainTrashQueueEntry } from '$lib/sources/sources-state.svelte.js';
-
-// ---------------------------------------------------------------------------
-// Fixtures
-// ---------------------------------------------------------------------------
 
 import type { NotebookSummary, Notebook } from './types.js';
 import type { TrashedSource } from '$lib/sources/types.js';
@@ -129,10 +114,6 @@ function makeNotebook(overrides?: Partial<Notebook>): Notebook {
     ...overrides
   };
 }
-
-// ---------------------------------------------------------------------------
-// Lifecycle
-// ---------------------------------------------------------------------------
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -397,9 +378,7 @@ describe('openTrash', () => {
 
     await openTrash();
 
-    // Notebooks still rendered despite sources error
     expect(notebookStore.trashedNotebooks).toHaveLength(1);
-    // Error is set from the rejection
     expect(notebookStore.error).toBeTruthy();
     consoleSpy.mockRestore();
   });

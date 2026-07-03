@@ -4,8 +4,7 @@ import { saveLlmProvider, saveEnrichmentPrefs } from './llm-config.js';
 import type { AppConfig } from '$lib/theme/types.js';
 import { baseAppConfig, fullAppConfig } from '$lib/test-fixtures.js';
 
-// A base AppConfig carrying an EXISTING ollama model entry so we can assert the
-// upsert REPLACES it (rather than appending a duplicate).
+// Base config with an existing ollama entry to verify upsert replaces it rather than appending.
 function configWithOllama(): AppConfig {
   return baseAppConfig({
     models: [
@@ -53,7 +52,6 @@ describe('saveLlmProvider (upsert into models[])', () => {
 
     expect(written).not.toBeNull();
     const w = written as unknown as AppConfig;
-    // Still exactly ONE ollama entry — replaced in place, not appended.
     expect(w.models).toHaveLength(1);
     expect(w.models.filter((m) => m.provider === 'ollama')).toHaveLength(1);
     expect(w.models[0]).toMatchObject({
@@ -61,7 +59,6 @@ describe('saveLlmProvider (upsert into models[])', () => {
       base_url: 'http://new-host:11434',
       model: 'new-model'
     });
-    // The stale fields from the previous entry are gone.
     expect(w.models[0].base_url).not.toBe('http://old-host:11434');
     expect(w.models[0].model).not.toBe('old-model');
   });
@@ -111,13 +108,11 @@ describe('saveEnrichmentPrefs (RMW into enrichment)', () => {
 
     expect(written).not.toBeNull();
     const w = written as unknown as AppConfig;
-    // The enrichment section was written.
     expect(w.enrichment).toEqual({
       enabled: true,
       coref_strategy: 'llm_inline',
       cloud_consent: false
     });
-    // Every other field round-tripped verbatim.
     expect(w.models).toEqual(stored.models);
     expect(w.endpoints).toEqual(stored.endpoints);
     expect(w.voices).toEqual(stored.voices);

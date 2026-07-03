@@ -7,7 +7,6 @@
 import { render, screen, fireEvent, waitFor } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-// ── Hoisted mock refs ─────────────────────────────────────────────────────────
 const { mockSelectNotebook, mockRenameAction, mockTrashAction, mockResetStore } = vi.hoisted(
   () => ({
     mockSelectNotebook: vi.fn(),
@@ -34,8 +33,6 @@ vi.mock('$lib/notebooks/index.js', () => ({
 import NotebookRow from './NotebookRow.svelte';
 import type { NotebookSummary } from '$lib/notebooks/types.js';
 
-// ── Fixtures ──────────────────────────────────────────────────────────────────
-
 function makeNotebook(overrides?: Partial<NotebookSummary>): NotebookSummary {
   return {
     id: 'nb-001',
@@ -53,8 +50,6 @@ function makeNotebook(overrides?: Partial<NotebookSummary>): NotebookSummary {
   };
 }
 
-// ── Setup / teardown ─────────────────────────────────────────────────────────
-
 beforeEach(() => {
   mockSelectNotebook.mockClear();
   mockRenameAction.mockClear();
@@ -64,8 +59,6 @@ beforeEach(() => {
 afterEach(() => {
   vi.clearAllMocks();
 });
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 describe('NotebookRow (expanded)', () => {
   it('renders notebook title', () => {
@@ -117,8 +110,6 @@ describe('NotebookRow (expanded)', () => {
     await waitFor(() =>
       expect(screen.queryByRole('textbox', { name: /rename notebook/i })).not.toBeInTheDocument()
     );
-    // Re-entrancy guard: Enter unmounts the input, which fires onblur → a second
-    // commitRename(); the guard must swallow it so the rename IPC fires once.
     expect(mockRenameAction).toHaveBeenCalledTimes(1);
   });
 
@@ -132,16 +123,12 @@ describe('NotebookRow (expanded)', () => {
     await fireEvent.dblClick(title);
     const input = screen.getByRole('textbox', { name: /rename notebook/i }) as HTMLInputElement;
 
-    // Simulate the Space keystroke being dispatched at the input (which bubbles
-    // to the row) followed by the resulting value containing a space.
     await fireEvent.keyDown(input, { key: ' ' });
     await fireEvent.input(input, { target: { value: 'My Notebook Two' } });
 
-    // The space must survive — it is not stripped/swallowed by the row handler.
     expect(input.value).toBe('My Notebook Two');
     expect(input.value).toContain(' ');
 
-    // Enter commits the spaced title via renameNotebookAction.
     await fireEvent.keyDown(input, { key: 'Enter' });
     await waitFor(() => expect(mockRenameAction).toHaveBeenCalledWith('nb-001', 'My Notebook Two'));
   });

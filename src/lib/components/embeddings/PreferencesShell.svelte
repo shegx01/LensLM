@@ -1,24 +1,7 @@
 <!--
-  PreferencesShell — the global Settings surface (plan Step 10, ADR B1).
-
-  IN-PLACE Preferences view (matching the design's settings-inplace.png /
-  Lens.dc.html `showSettingsPage`). NOT a floating modal: it renders inside the
-  normal content region (right of the left notebook sidebar) like a route/view
-  swap — no backdrop, no centered card, no portal. AppShell mounts this in the
-  main+right grid span when `notebookStore.settingsOpen` is true, hiding the
-  notebook top-bar / content / sources rail; the left notebook sidebar stays.
-
-  Layout: a 220px Preferences nav column (a "← Back" affordance at top, then a
-  "PREFERENCES" label, then nav items General · AI Model · Embeddings · Storage
-  · Privacy · Shortcuts · About) and a section content pane to its right. Only
-  EMBEDDINGS is live in 4b-B; every other section is a "coming soon" stub. The
-  live Embeddings section mounts the shared <EmbeddingsSection mode="global" />
-  so the app-wide default (config) is set here — new notebooks adopt it.
-
-  "← Back" closes the view (sets `notebookStore.settingsOpen = false`), returning
-  to the notebook view. Opened by the AccountFooter "Settings" button.
-
-  Tokens only — light + dark + every accent ([[theming-light-dark-accent]]).
+  PreferencesShell — in-place global Settings view (ADR B1, no overlay/portal).
+  Renders in the main content region when `notebookStore.settingsOpen` is true;
+  mounts <EmbeddingsSection mode="global" /> for the app-wide embedding default.
 -->
 <script lang="ts">
   import { notebookStore } from '$lib/notebooks/index.js';
@@ -48,9 +31,7 @@
     | 'shortcuts'
     | 'about';
 
-  // Left-nav order matches the design (Lens.dc.html Preferences nav). `embeddings`
-  // and `ingestion` are live (`stub: false`); the rest are coming-soon stubs.
-  // `About` sits at the bottom in the design (pushed down by a spacer).
+  // `embeddings` and `ingestion` are live; the rest are coming-soon stubs.
   const NAV: { id: SectionId; label: string; icon: typeof Settings2; stub: boolean }[] = [
     { id: 'general', label: 'General', icon: Settings2, stub: false },
     { id: 'ai', label: 'AI Model', icon: Cpu, stub: true },
@@ -62,7 +43,6 @@
     { id: 'about', label: 'About', icon: Info, stub: true }
   ];
 
-  // Open straight to the only live section (4b-B ships Embeddings only).
   let active = $state<SectionId>('embeddings');
 
   function close(): void {
@@ -71,15 +51,11 @@
 </script>
 
 {#if open}
-  <!-- In-place Preferences view: fills the content region (no overlay). The
-       outer row is a normal flex container; the top edge stays a Tauri drag
-       region so the window can still be moved from the empty top band. -->
   <section
     class="flex h-full min-h-0 flex-1 overflow-hidden bg-background"
     aria-label="Preferences"
     data-preferences-shell
   >
-    <!-- ── Preferences nav column ── -->
     <nav
       class="flex w-[220px] shrink-0 flex-col gap-px overflow-y-auto border-r border-border px-2.5 py-3.5"
       aria-label="Preferences sections"
@@ -132,7 +108,6 @@
       {/each}
     </nav>
 
-    <!-- ── Section content pane ── -->
     <div class="flex-1 overflow-y-auto px-10 py-8">
       {#if active === 'general'}
         <GeneralSection />

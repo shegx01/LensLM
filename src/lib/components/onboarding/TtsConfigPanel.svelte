@@ -26,11 +26,9 @@
     oncollapse: () => void;
   } = $props();
 
-  // --- Segmented tab state (mirrors LlmConfigPanel's Local | Cloud control) ---
   type TtsTab = 'local' | 'cloud';
   let activeTab = $state<TtsTab>('local');
 
-  // --- Local tab: Kokoro download + voice selection ---
   let downloadProgress = $state<number | null>(null);
   let downloaded = $state(false);
   let downloadError = $state<string | null>(null);
@@ -47,26 +45,20 @@
   const maleVoices = $derived(voices.filter((v) => v.gender === 'male'));
   const femaleVoices = $derived(voices.filter((v) => v.gender === 'female'));
 
-  // --- Cloud tab: ElevenLabs API key ---
   let cloudApiKey = $state('');
   let savingCloud = $state(false);
   let cloudError = $state<string | null>(null);
 
-  // --- Saved cloud key masking ---
-  // A previously-saved ElevenLabs key is masked, never loaded into the DOM. Save
-  // stays disabled until the user clicks the field to enter a fresh key.
+  // Saved ElevenLabs key is masked; Save re-enables only after the user enters a fresh key.
   let hasSavedKey = $state(false);
   let editingKey = $state(false);
 
-  // Gate is behaviorally identical to LlmConfigPanel's cloud Save. When NOT
-  // configured (`hasSavedKey` false), the button enables as soon as a non-empty
-  // key is typed and is disabled only while the field is empty. When a key IS
-  // saved, masking engages and re-entry of a fresh non-empty key is required.
+  // Identical gate to LlmConfigPanel's cloud Save: disabled until a non-empty
+  // key is typed; when a key is saved, masking re-requires fresh entry.
   const cloudSaveDisabled = $derived(
     savingCloud || (hasSavedKey ? !editingKey || !cloudApiKey.trim() : !cloudApiKey.trim())
   );
 
-  // On mount, detect a saved ElevenLabs config and mask its key.
   onMount(async () => {
     if (!isTauri()) return;
     try {
@@ -137,8 +129,6 @@
     }
   }
 
-  // Cloud save: persist the ElevenLabs provider config, re-run the system check,
-  // then collapse — same shape as LlmConfigPanel's cloud Save.
   async function handleSaveCloud(): Promise<void> {
     savingCloud = true;
     cloudError = null;
@@ -155,7 +145,6 @@
 </script>
 
 <div class="pt-3">
-  <!-- Segmented tabs: Local | Cloud (mirrors LlmConfigPanel) -->
   <div
     class="bg-muted flex w-full items-center rounded-lg p-0.5"
     role="tablist"
@@ -193,7 +182,6 @@
     </button>
   </div>
 
-  <!-- Local tab panel: Kokoro download + voice selectors -->
   <div
     id="tts-panel-local"
     role="tabpanel"
@@ -202,7 +190,6 @@
     class={cn('mt-3 flex flex-col gap-3', activeTab !== 'local' && 'hidden')}
   >
     {#if !downloaded}
-      <!-- Pre-download: show download button -->
       <div class="flex flex-col gap-2">
         <p class="text-muted-foreground text-[0.78rem] leading-relaxed">
           Kokoro is an open-weight TTS engine that runs entirely on-device. Download once — no
@@ -214,7 +201,6 @@
         </div>
 
         {#if downloadProgress !== null && downloadProgress < 100}
-          <!-- Progress bar -->
           <div class="w-full bg-muted rounded-full h-1.5 overflow-hidden">
             <div
               class="bg-primary h-full rounded-full transition-all duration-300"
@@ -245,7 +231,6 @@
         </Button>
       </div>
     {:else}
-      <!-- Post-download: voice selectors -->
       <div class="flex items-center gap-2 text-[0.78rem] text-primary" role="status">
         <CircleCheck class="size-4" />
         Kokoro engine ready
@@ -256,7 +241,6 @@
           Couldn't load voices — is the engine installed?
         </p>
       {:else}
-        <!-- Male voice selector -->
         <div class="flex flex-col gap-1.5">
           <label
             for="tts-male-voice"
@@ -271,7 +255,6 @@
           </select>
         </div>
 
-        <!-- Female voice selector -->
         <div class="flex flex-col gap-1.5">
           <label
             for="tts-female-voice"
@@ -301,7 +284,6 @@
     {/if}
   </div>
 
-  <!-- Cloud tab panel: ElevenLabs API key -->
   <div
     id="tts-panel-cloud"
     role="tabpanel"
@@ -314,7 +296,6 @@
       local download required.
     </p>
 
-    <!-- API KEY -->
     <div class="flex flex-col gap-1.5">
       <label
         for="tts-cloud-key"

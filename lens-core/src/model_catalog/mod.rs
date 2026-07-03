@@ -1,43 +1,13 @@
-//! Typed model catalog sourced from models.dev (Stage 1 of the LLM-interface
-//! overhaul).
+//! Typed model catalog sourced from models.dev.
 //!
-//! The app must never store a model id as an unvalidated free string. This
-//! module parses the [models.dev](https://models.dev/api.json) catalog into
-//! typed structs and exposes [`ModelCatalog::validate`] — the anti-free-string
-//! guard that rejects a model id that isn't in the catalog for its provider.
+//! Parses the [models.dev](https://models.dev/api.json) catalog and exposes [`ModelCatalog::validate`]
+//! — the anti-free-string guard. Schema is tolerant: unknown providers, extra fields, and
+//! unrecognized `reasoning_options` variants never fail the parse; missing optional fields
+//! degrade to `Option`/`Default`.
 //!
-//! `lens-core` stays Tauri-free, so this module owns only the pure pieces: the
-//! typed structs, the [`SupportedProvider`] enum, the parse, the
-//! cache/fetch/refresh routines, and the staleness policy. The Tauri command
-//! layer mirrors the shapes over IPC.
-//!
-//! ## Schema tolerance (load-bearing)
-//!
-//! The real catalog has 100+ heterogeneous providers and evolves over time. We
-//! parse ONLY the fields LensLM needs and deliberately do NOT use
-//! `deny_unknown_fields`: an unknown provider, an unknown model field, or a new
-//! `reasoning_options` variant must NEVER fail the parse. Missing/null optional
-//! fields degrade to `Option`/`Default` rather than erroring.
-//!
-//! ## Fetch / cache / refresh
-//!
-//! [`load_catalog`] reads the cached `models-catalog.json` under
-//! `{data_dir}/models/` when present, else falls back to the bundled catalog —
-//! it NEVER fails hard. [`refresh_if_stale`] re-fetches the live catalog when the
-//! cache is older than [`MODELS_CATALOG_REFRESH_INTERVAL`], mirroring the
-//! hardened streamed/size-capped download pattern from [`crate::tts`].
-//!
-//! ## Bundled offline floor (the full catalog, not a curated slice)
-//!
-//! The bundled fallback is the FULL `https://models.dev/api.json` catalog
-//! (~2.4 MB raw, ~200 KB gzipped), vendored at build time by
-//! `scripts/fetch-models-catalog.sh` and committed as `bundled-catalog.json.gz`.
-//! It is decompressed in [`ModelCatalog::bundled`] via `flate2` (already in the
-//! dependency tree — no new crate). This is the offline floor used on first run
-//! before any live fetch completes; it is refreshed per release by re-running
-//! the script, and SUPERSEDED at runtime by the live fetch + cache, so an online
-//! user always converges to the current full models.dev list (new models appear,
-//! removed ones disappear) with no code change.
+//! The bundled fallback is the FULL catalog (~2.4 MB raw, ~200 KB gzipped), vendored by
+//! `scripts/fetch-models-catalog.sh` and decompressed via `flate2`. [`refresh_if_stale`]
+//! replaces it at runtime so online users always converge to the current list.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -48,132 +18,78 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::LensError;
 
-/// Canonical models.dev catalog endpoint. A parameter rather than a hard-coded
-/// constant at the fetch call site so tests can point it at a mock server.
+/// Catalog endpoint; a constant so tests can substitute a mock server URL.
 pub const MODELS_CATALOG_URL: &str = "https://models.dev/api.json";
 
-/// Relative path (under the app data dir) the cached catalog is written to.
 pub const MODELS_CATALOG_RELPATH: &str = "models/models-catalog.json";
-
-/// Bare filename of the cached catalog.
 pub const MODELS_CATALOG_FILENAME: &str = "models-catalog.json";
 
-/// Refresh the cached catalog when it is older than this. ~8 hours → the catalog
-/// is re-fetched at most ~3×/day (achieved by checking staleness whenever the
-/// app starts or a picker opens — no background timer loop in Stage 1).
+/// ~8 hours → re-fetched at most ~3×/day (checked on app start or picker open).
 pub const MODELS_CATALOG_REFRESH_INTERVAL: Duration = Duration::from_secs(8 * 60 * 60);
 
-/// Connect timeout for the catalog fetch (matches the system-check probe shape).
 const CATALOG_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Overall (read) timeout for the catalog fetch. The body is ~2.4 MB, so this is
-/// longer than a probe but still bounded.
+/// Body is ~2.4 MB, so the read timeout is longer than a system-check probe but still bounded.
 const CATALOG_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Upper bound on the catalog body we will buffer to disk. Defense-in-depth
-/// against a misconfigured/hostile endpoint streaming an unbounded body (the real
-/// catalog is ~2.4 MB; this leaves generous headroom for growth).
+/// Defense-in-depth cap: the real catalog is ~2.4 MB; 16 MB leaves headroom for growth.
 const MAX_CATALOG_BODY_BYTES: u64 = 16 * 1024 * 1024;
 
-/// The bundled offline floor: the FULL `https://models.dev/api.json` catalog,
-/// gzipped at build time by `scripts/fetch-models-catalog.sh` and committed as
-/// `bundled-catalog.json.gz` (redistributed under models.dev's MIT license,
-/// github.com/sst/models.dev). NOT a curated slice — every provider + model the
-/// live catalog carried at vendor time is present, so the typed validation guard
-/// works fully offline against the real surface. Gzipped (~200 KB vs ~2.4 MB raw)
-/// and decompressed in [`ModelCatalog::bundled`] via the already-present `flate2`
-/// crate. The live catalog is fetched + cached at runtime ([`refresh_if_stale`])
-/// and supersedes this floor whenever the user is online.
+/// Full `https://models.dev/api.json` catalog gzipped at build time
+/// (redistributed under models.dev's MIT license, github.com/sst/models.dev).
 const BUNDLED_CATALOG_GZ: &[u8] = include_bytes!("bundled-catalog.json.gz");
 
 // ---------------------------------------------------------------------------
 // Typed schema (tolerant subset of models.dev)
 // ---------------------------------------------------------------------------
 
-/// The full parsed catalog: provider key → provider entry.
-///
-/// `BTreeMap` for a deterministic, sorted iteration order (stable IPC output and
-/// stable test assertions). The models.dev API is a JSON object keyed by provider
-/// id, which deserializes directly into this map.
+/// Full parsed catalog: provider key → entry. `BTreeMap` for deterministic iteration order.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ModelCatalog {
-    /// Provider id → entry. Unknown providers are tolerated (no allowlist gate
-    /// at parse time — the [`SupportedProvider`] enum curates the default
-    /// surface, but any catalog provider stays addressable).
     pub providers: BTreeMap<String, ProviderEntry>,
 }
 
-/// One provider's entry (Anthropic, OpenAI, …). Extra fields present in the real
-/// catalog (`npm`, `api`, …) are tolerated and dropped — NO `deny_unknown_fields`.
+/// One provider's entry. Extra catalog fields (`npm`, `api`, …) are tolerated — no
+/// `deny_unknown_fields`.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ProviderEntry {
-    /// Provider id (e.g. `"anthropic"`). Mirrors the map key.
     #[serde(default)]
     pub id: String,
-    /// Human-readable provider name (e.g. `"Anthropic"`).
     #[serde(default)]
     pub name: String,
-    /// Environment variable names that carry this provider's API key.
     #[serde(default)]
     pub env: Vec<String>,
-    /// Documentation URL, when the catalog provides one.
     #[serde(default)]
     pub doc: Option<String>,
-    /// Model id → model info. Sorted (`BTreeMap`) for deterministic output.
     #[serde(default)]
     pub models: BTreeMap<String, ModelInfo>,
 }
 
-/// One model's capabilities + economics. Parses ONLY the fields LensLM needs;
-/// every optional field degrades to `Option`/`Default` so a heterogeneous or
-/// evolving catalog can never fail the parse.
-///
-/// `context_limit`/`output_limit` are flattened from the catalog's nested
-/// `limit: { context, output }` object by a manual [`Deserialize`] impl (which
-/// parses the source schema), and serialized FLAT as `context_limit` /
-/// `output_limit` numeric fields. The flat serialization is what the IPC layer
-/// emits and what the TS mirror (`src/lib/models/types.ts`) + the Svelte picker
-/// consume (the picker calls `.toLocaleString()` on the numbers), so the derived
-/// `Serialize` keeps both in lockstep — no custom serializer that would emit a
-/// nested object or drop `output_limit`.
+/// One model's capabilities + economics. All optional fields degrade to `Option`/`Default`
+/// rather than failing the parse. `context_limit`/`output_limit` are flattened from the
+/// catalog's nested `limit: { context, output }` by a manual [`Deserialize`] impl, then
+/// serialized FLAT — what the TS mirror and Svelte picker consume (`.toLocaleString()`).
 #[derive(Debug, Clone, PartialEq, Default, Serialize)]
 pub struct ModelInfo {
-    /// Fully-qualified model id (e.g. `"anthropic/claude-sonnet-4-5"`).
     pub id: String,
-    /// Human-readable model name (e.g. `"Claude Sonnet 4.5"`).
     pub name: String,
-    /// Model family (e.g. `"claude-sonnet"`), when present.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub family: Option<String>,
-    /// Whether the model supports a reasoning/thinking mode.
     pub reasoning: bool,
-    /// The reasoning controls the model exposes (effort levels, token budgets, a
-    /// simple toggle, …). Tolerant: an unrecognized variant becomes
-    /// [`ReasoningOption::Other`] rather than failing the parse.
+    /// Tolerant: unrecognized variants become [`ReasoningOption::Other`] rather than failing.
     pub reasoning_options: Vec<ReasoningOption>,
-    /// Whether the model supports tool/function calling.
     pub tool_call: bool,
-    /// Whether the model honors a `temperature` parameter.
     pub temperature: bool,
-    /// Input/output modalities.
     pub modalities: Modalities,
-    /// Maximum context window in tokens (`limit.context`), when known. Serialized
-    /// FLAT as a `context_limit` number (or `null`) for the TS mirror / IPC.
+    /// Serialized FLAT as `context_limit` for the TS mirror / IPC.
     pub context_limit: Option<u32>,
-    /// Maximum output tokens (`limit.output`), when known. Serialized FLAT as an
-    /// `output_limit` number (or `null`) for the TS mirror / IPC.
+    /// Serialized FLAT as `output_limit` for the TS mirror / IPC.
     pub output_limit: Option<u32>,
-    /// Whether the model's weights are openly available.
     pub open_weights: bool,
-    /// Per-token cost (USD per 1M tokens), when the catalog reports it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost: Option<Cost>,
-    /// Catalog `last_updated` date (ISO `YYYY-MM-DD`), when present. The picker
-    /// sorts cloud options by this (newest first). Serialized FLAT for IPC.
+    /// ISO `YYYY-MM-DD`. Picker sorts cloud options by this (newest first).
     pub last_updated: Option<String>,
-    /// Catalog `release_date` (ISO `YYYY-MM-DD`), when present. Tiebreaker for the
-    /// picker sort when `last_updated` matches. Serialized FLAT for IPC.
+    /// ISO `YYYY-MM-DD`. Tiebreaker when `last_updated` matches.
     pub release_date: Option<String>,
 }
 
@@ -182,8 +98,7 @@ impl<'de> Deserialize<'de> for ModelInfo {
     where
         D: serde::Deserializer<'de>,
     {
-        /// Shadow with the catalog's verbatim shape (nested `limit`), tolerant of
-        /// extra fields. Flattened into the public [`ModelInfo`] below.
+        // Inner struct mirrors the catalog's verbatim nested shape; flattened into ModelInfo.
         #[derive(Deserialize)]
         struct Raw {
             #[serde(default)]
@@ -233,76 +148,52 @@ impl<'de> Deserialize<'de> for ModelInfo {
     }
 }
 
-/// A single reasoning control on a model.
-///
-/// Tagged on the catalog's `type` field. models.dev mixes shapes across
-/// providers — `effort` carries `values`, `budget_tokens` carries `min`/`max`
-/// (either or both may be present depending on provider), `toggle` is a bare
-/// switch. An unrecognized `type` falls through to [`ReasoningOption::Other`] so
-/// a future variant never breaks the parse.
+/// A single reasoning control on a model. Tagged on the catalog's `type` field.
+/// An unrecognized `type` falls through to `Other` rather than failing the parse.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ReasoningOption {
-    /// Discrete effort levels (e.g. `["low", "medium", "high"]`).
     Effort {
-        /// Selectable effort level strings. Tolerant: the real catalog sometimes
-        /// includes a `null` element in this array; nulls are dropped rather than
-        /// failing the parse (the schema-tolerance contract).
+        /// Nulls in the array are dropped (the catalog occasionally seeds these).
         #[serde(default, deserialize_with = "deserialize_tolerant_strings")]
         values: Vec<String>,
     },
-    /// A reasoning token budget. `min`/`max` are independently optional because
-    /// providers report one, the other, or both.
     BudgetTokens {
-        /// Minimum reasoning token budget, when reported. Tolerant of a sentinel
-        /// negative (e.g. `-1` = "no minimum") in the real catalog — it degrades
-        /// to `None` rather than failing the parse (the schema-tolerance contract).
+        /// Sentinel negatives (e.g. `-1`) degrade to `None` rather than failing.
         #[serde(default, deserialize_with = "deserialize_tolerant_u32")]
         min: Option<u32>,
-        /// Maximum reasoning token budget, when reported. Same negative tolerance
-        /// as `min`.
         #[serde(default, deserialize_with = "deserialize_tolerant_u32")]
         max: Option<u32>,
     },
-    /// A bare on/off reasoning toggle (no parameters).
     Toggle,
-    /// Any reasoning-option `type` we don't model yet. Tolerated, never an error.
     #[serde(other)]
     Other,
 }
 
-/// Input/output modalities a model accepts/produces (e.g. `text`, `image`, `pdf`).
+/// Input/output modalities a model accepts/produces.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Modalities {
-    /// Accepted input modalities.
     #[serde(default)]
     pub input: Vec<String>,
-    /// Produced output modalities.
     #[serde(default)]
     pub output: Vec<String>,
 }
 
-/// Per-token cost in USD per 1M tokens. Every field is optional — providers
-/// report different subsets (cache pricing is frequently absent).
+/// Per-token cost in USD per 1M tokens. All fields optional — providers report different subsets.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Cost {
-    /// Input (prompt) cost per 1M tokens.
     #[serde(default)]
     pub input: Option<f64>,
-    /// Output (completion) cost per 1M tokens.
     #[serde(default)]
     pub output: Option<f64>,
-    /// Cache-read cost per 1M tokens, when supported.
     #[serde(default)]
     pub cache_read: Option<f64>,
-    /// Cache-write cost per 1M tokens, when supported.
     #[serde(default)]
     pub cache_write: Option<f64>,
 }
 
-/// The catalog's nested `limit: { context, output }` object. Internal only —
-/// flattened into [`ModelInfo::context_limit`] / [`ModelInfo::output_limit`] by
-/// the manual [`ModelInfo`] deserializer so the public struct stays flat.
+/// Catalog's nested `limit: { context, output }`. Internal only — flattened into
+/// [`ModelInfo::context_limit`] / [`ModelInfo::output_limit`] by the manual deserializer.
 #[derive(Debug, Deserialize)]
 struct Limit {
     #[serde(default, deserialize_with = "deserialize_tolerant_u32")]
@@ -311,26 +202,20 @@ struct Limit {
     output: Option<u32>,
 }
 
-/// Deserializes an optional `u32` that TOLERATES out-of-range integers in the
-/// real catalog (the schema-tolerance contract). models.dev occasionally reports
-/// a sentinel like `-1` ("no minimum/unlimited") or a value beyond `u32`; rather
-/// than failing the whole parse, such a value degrades to `None`. A clean
-/// in-range integer parses normally; an explicit JSON `null` stays `None`.
+/// Tolerates out-of-range values (e.g. sentinel `-1`) that degrade to `None` rather than
+/// failing the parse. A clean in-range integer parses normally; JSON `null` stays `None`.
 fn deserialize_tolerant_u32<'de, D>(de: D) -> Result<Option<u32>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    // Accept any JSON number (or null) without erroring, then narrow to u32.
     let raw: Option<serde_json::Value> = Option::deserialize(de)?;
     Ok(raw
         .and_then(|v| v.as_u64())
         .and_then(|n| u32::try_from(n).ok()))
 }
 
-/// Deserializes a `Vec<String>` that TOLERATES `null` array elements (the
-/// schema-tolerance contract). The real catalog occasionally seeds an effort
-/// `values` array with a leading `null`; such elements are dropped rather than
-/// failing the parse. A clean array of strings is preserved verbatim.
+/// Tolerates `null` array elements (the catalog occasionally seeds effort `values` with nulls);
+/// they are dropped rather than failing the parse.
 fn deserialize_tolerant_strings<'de, D>(de: D) -> Result<Vec<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -343,30 +228,20 @@ where
 // SupportedProvider — the curated default surface
 // ---------------------------------------------------------------------------
 
-/// The providers LensLM surfaces by default, with a mapping to the models.dev
-/// provider key. [`SupportedProvider::Other`] keeps any catalog provider
-/// addressable so an overriding user is never boxed in.
+/// Providers LensLM surfaces by default. `Other` keeps any catalog provider addressable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SupportedProvider {
-    /// Anthropic (`anthropic`).
     Anthropic,
-    /// OpenAI (`openai`).
     OpenAI,
-    /// Google Gemini (`google`).
     Google,
-    /// Local Ollama runtime (`ollama`). Local models are user-pulled and NOT
-    /// necessarily in models.dev — see [`ModelCatalog::validate`].
+    /// Local runtime; models are user-pulled and NOT necessarily in models.dev.
     Ollama,
-    /// Ollama's hosted cloud (`ollama-cloud`).
     OllamaCloud,
-    /// Z.ai / GLM (`zai`).
     Zai,
-    /// Any other catalog provider, addressed by its raw models.dev key.
     Other(String),
 }
 
 impl SupportedProvider {
-    /// The models.dev provider key for this provider.
     pub fn catalog_key(&self) -> &str {
         match self {
             SupportedProvider::Anthropic => "anthropic",
@@ -379,8 +254,6 @@ impl SupportedProvider {
         }
     }
 
-    /// Maps a models.dev provider key onto a [`SupportedProvider`]. An
-    /// unrecognized key becomes [`SupportedProvider::Other`] so it stays usable.
     pub fn from_catalog_key(key: &str) -> Self {
         match key {
             "anthropic" => SupportedProvider::Anthropic,
@@ -393,14 +266,8 @@ impl SupportedProvider {
         }
     }
 
-    /// The SINGLE locality predicate: whether `key` denotes a local runtime that
-    /// is exempt from the cloud-consent gate AND from catalog validation (its
-    /// models are user-pulled and not in models.dev).
-    ///
-    /// This is the one source of truth shared by `model_catalog` (the validation
-    /// exemption) and `llm` (the consent-gate exemption) — they MUST agree, since
-    /// both guard the same consent/privacy bypass. `crate::llm` calls this rather
-    /// than re-hardcoding the `"ollama"` string.
+    /// Single locality predicate shared by the catalog-validation exemption here and the
+    /// consent-gate exemption in `crate::llm` — they MUST agree.
     pub(crate) fn is_local(key: &str) -> bool {
         key == SupportedProvider::Ollama.catalog_key()
     }
@@ -411,22 +278,13 @@ impl SupportedProvider {
 // ---------------------------------------------------------------------------
 
 impl ModelCatalog {
-    /// Parses a catalog from a JSON byte slice (tolerant of unknown providers,
-    /// extra fields, and unrecognized `reasoning_options` variants).
     pub fn from_json(bytes: &[u8]) -> Result<Self, LensError> {
         serde_json::from_slice(bytes).map_err(LensError::from)
     }
 
-    /// The bundled offline floor: the FULL models.dev catalog, decompressed from
-    /// the committed `bundled-catalog.json.gz`. Infallible in practice — the
-    /// bundle is a committed, valid fixture; a gunzip/parse failure here is a
-    /// build-time error caught by the unit tests.
-    ///
-    /// The gzipped bundle is gunzipped + parsed ONCE (memoized in a
-    /// [`std::sync::LazyLock`]) and cloned on each call. `bundled()` is hit on the
-    /// enrichment hot path (`provider_from_config` / `task_provider_from_config`),
-    /// so doing the work per call would be wasted; the `expect`s stay (a malformed
-    /// bundled catalog is a build-time catastrophe).
+    /// Decompresses and parses `bundled-catalog.json.gz`, memoized via [`LazyLock`].
+    /// Called on the enrichment hot path; the `expect`s stay (a malformed bundle is a
+    /// build-time catastrophe caught by tests).
     pub fn bundled() -> Self {
         static BUNDLED: std::sync::LazyLock<ModelCatalog> = std::sync::LazyLock::new(|| {
             use std::io::Read;
@@ -440,32 +298,18 @@ impl ModelCatalog {
         BUNDLED.clone()
     }
 
-    /// Looks up a provider entry by its models.dev key.
     pub fn provider(&self, provider_key: &str) -> Option<&ProviderEntry> {
         self.providers.get(provider_key)
     }
 
-    /// Validates `(provider_key, model_id)` against the catalog — the
-    /// anti-free-string guard.
-    ///
-    /// Returns the matched [`ModelInfo`] on success, or a
-    /// [`LensError::Validation`] when the provider or model is not in the
-    /// catalog.
-    ///
-    /// **Local Ollama exception:** for the local `ollama` provider, models are
-    /// user-pulled and NOT necessarily present in models.dev, so any non-empty id
-    /// is accepted (validated against the catalog only if it happens to be
-    /// listed). Live `/api/tags` validation is deferred:
+    /// Anti-free-string guard: validates `(provider_key, model_id)` against the catalog.
+    /// Local Ollama exception: any non-empty id is accepted (user-pulled models may not be listed).
     /// TODO(stage2): validate Ollama-local ids against the live `/api/tags`.
     pub fn validate(&self, provider_key: &str, model_id: &str) -> Result<&ModelInfo, LensError> {
         if model_id.is_empty() {
             return Err(LensError::Validation("model id must not be empty".into()));
         }
 
-        // Local Ollama: accept any non-empty id (return the catalog entry if it
-        // happens to be listed; otherwise a synthetic stand-in is not returned —
-        // callers that need the &ModelInfo for an unlisted local model must fall
-        // back to defaults until stage 2 wires live /api/tags validation).
         if SupportedProvider::is_local(provider_key) {
             if let Some(info) = self
                 .providers
@@ -474,7 +318,6 @@ impl ModelCatalog {
             {
                 return Ok(info);
             }
-            // Unlisted local model: the membership check is intentionally skipped.
             // TODO(stage2): validate against the live Ollama `/api/tags`.
             return Err(LensError::Validation(format!(
                 "ollama-local model '{model_id}' is not in the catalog; live /api/tags \
@@ -492,9 +335,7 @@ impl ModelCatalog {
         })
     }
 
-    /// Whether a `(provider_key, model_id)` pair is valid (a convenience over
-    /// [`validate`](Self::validate) that discards the matched info). For local
-    /// Ollama, ANY non-empty id is treated as valid (the user-pull exception).
+    /// Convenience over [`validate`](Self::validate). For local Ollama, any non-empty id is valid.
     pub fn is_valid(&self, provider_key: &str, model_id: &str) -> bool {
         if SupportedProvider::is_local(provider_key) {
             return !model_id.is_empty();
@@ -507,17 +348,12 @@ impl ModelCatalog {
 // Staleness policy
 // ---------------------------------------------------------------------------
 
-/// Whether a cache last modified at `mtime` is stale relative to `now`, given a
-/// refresh `interval`. A pure function so the policy is unit-testable without
-/// touching the filesystem or a clock.
-///
-/// A `mtime` in the future (clock skew) is treated as fresh. An `interval` of
-/// zero makes everything stale.
+/// Returns whether `mtime` is stale relative to `now`. A future `mtime` (clock skew) is
+/// treated as fresh. A zero `interval` makes everything stale.
 pub fn is_stale(mtime: SystemTime, now: SystemTime, interval: Duration) -> bool {
     match now.duration_since(mtime) {
         Ok(age) => age >= interval,
-        // `mtime` is in the future relative to `now` (clock skew): treat as fresh.
-        Err(_) => false,
+        Err(_) => false, // mtime in the future (clock skew): treat as fresh
     }
 }
 
@@ -525,17 +361,12 @@ pub fn is_stale(mtime: SystemTime, now: SystemTime, interval: Duration) -> bool 
 // Cache / fetch / refresh
 // ---------------------------------------------------------------------------
 
-/// Resolves the on-disk path of the cached catalog under `data_dir`.
 pub fn catalog_cache_path(data_dir: &Path) -> PathBuf {
     data_dir.join("models").join(MODELS_CATALOG_FILENAME)
 }
 
-/// Loads the model catalog, NEVER failing hard.
-///
-/// Reads the cached `models-catalog.json` under `{data_dir}/models/` when it is
-/// present and parses cleanly; otherwise (missing file, read error, or a parse
-/// error on a corrupt cache) it degrades to the bundled snapshot. The returned
-/// catalog is always usable for validation.
+/// Loads the model catalog, never failing hard. Falls back to the bundled snapshot on any
+/// read or parse error so the returned catalog is always usable for validation.
 pub fn load_catalog(data_dir: &Path) -> ModelCatalog {
     let path = catalog_cache_path(data_dir);
     match std::fs::read(&path) {
@@ -560,16 +391,9 @@ pub fn load_catalog(data_dir: &Path) -> ModelCatalog {
     }
 }
 
-/// Re-fetches the catalog from `url` and atomically replaces the cache when the
-/// cache is stale (older than [`MODELS_CATALOG_REFRESH_INTERVAL`]) or absent.
-///
-/// Best-effort by contract: a network/HTTP/parse error is logged and swallowed
-/// (the existing cache or the bundled snapshot keeps serving validation) so a
-/// caller on the startup path can fire-and-forget. Returns `Ok(true)` when the
-/// cache was refreshed, `Ok(false)` when it was still fresh and left untouched.
-///
-/// `client` is injected (rather than built here) so callers reuse a hardened
-/// client and tests can point `url` at a mock server.
+/// Re-fetches the catalog from `url` when stale or absent, atomically replacing the cache.
+/// Returns `Ok(true)` when refreshed, `Ok(false)` when still fresh. Best-effort: the caller
+/// can fire-and-forget; errors leave the existing cache (or bundled snapshot) in place.
 pub async fn refresh_if_stale(
     data_dir: &Path,
     url: &str,
@@ -577,7 +401,6 @@ pub async fn refresh_if_stale(
 ) -> Result<bool, LensError> {
     let path = catalog_cache_path(data_dir);
 
-    // Staleness gate: skip the fetch entirely when the cache is fresh.
     if let Ok(meta) = std::fs::metadata(&path)
         && let Ok(mtime) = meta.modified()
         && !is_stale(mtime, SystemTime::now(), MODELS_CATALOG_REFRESH_INTERVAL)
@@ -586,8 +409,7 @@ pub async fn refresh_if_stale(
     }
 
     let bytes = fetch_catalog_bytes(url, client).await?;
-    // Validate the freshly-fetched bytes parse before we overwrite a working
-    // cache — never replace a good cache with a corrupt body.
+    // Validate before overwriting — never replace a good cache with a corrupt body.
     ModelCatalog::from_json(&bytes)?;
     write_cache_atomic(&path, &bytes)?;
     tracing::info!(
@@ -598,17 +420,11 @@ pub async fn refresh_if_stale(
     Ok(true)
 }
 
-/// Builds the hardened HTTP client for catalog fetches via the one hardened
-/// builder ([`crate::http::hardened_client`]): bounded connect/read timeouts +
-/// the same no-redirect SSRF guard as the system-check probe (its fallback
-/// preserves the hardening rather than degrading to a redirect-following default).
 pub fn catalog_client() -> reqwest::Client {
     crate::http::hardened_client(CATALOG_CONNECT_TIMEOUT, CATALOG_FETCH_TIMEOUT)
 }
 
-/// Streams the catalog body from `url`, aborting if it would exceed
-/// [`MAX_CATALOG_BODY_BYTES`]. Rejects early on an advertised `Content-Length`
-/// over the cap. A non-success status → [`LensError::Network`].
+/// Streams the catalog body, aborting if it exceeds [`MAX_CATALOG_BODY_BYTES`].
 async fn fetch_catalog_bytes(url: &str, client: &reqwest::Client) -> Result<Vec<u8>, LensError> {
     let resp = client
         .get(url)
@@ -643,9 +459,8 @@ async fn fetch_catalog_bytes(url: &str, client: &reqwest::Client) -> Result<Vec<
     Ok(body)
 }
 
-/// Atomically writes `bytes` to `path` via a `.part` temp + rename, creating the
-/// parent dir, so a partial write never masquerades as a complete cache (mirrors
-/// the [`crate::tts`] download finalize).
+/// Atomically writes via `.part` + rename so a partial write never masquerades as a complete
+/// cache.
 fn write_cache_atomic(path: &Path, bytes: &[u8]) -> Result<(), LensError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -775,7 +590,6 @@ mod tests {
     #[test]
     fn parses_representative_schema_slice() {
         let catalog = fixture();
-        // Known providers parsed.
         let anthropic = catalog.provider("anthropic").expect("anthropic present");
         assert_eq!(anthropic.name, "Anthropic");
         assert_eq!(anthropic.env, vec!["ANTHROPIC_API_KEY"]);
@@ -796,7 +610,6 @@ mod tests {
         let cost = sonnet.cost.as_ref().expect("cost present");
         assert_eq!(cost.input, Some(3.0));
         assert_eq!(cost.cache_write, Some(3.75));
-        // Catalog dates parse when present (the picker sorts cloud options by them).
         assert_eq!(sonnet.last_updated.as_deref(), Some("2025-09-29"));
         assert_eq!(sonnet.release_date.as_deref(), Some("2025-09-29"));
     }
@@ -825,7 +638,6 @@ mod tests {
         let toggle = &catalog.providers["zai"].models["glm-4.6"].reasoning_options;
         assert_eq!(toggle, &vec![ReasoningOption::Toggle]);
 
-        // An unknown reasoning-option `type` degrades to `Other`, never an error.
         let unknown =
             &catalog.providers["mystery-provider-9000"].models["future-model"].reasoning_options;
         assert_eq!(unknown, &vec![ReasoningOption::Other]);
@@ -833,10 +645,8 @@ mod tests {
 
     #[test]
     fn tolerates_out_of_range_reasoning_budget_and_limits() {
-        // Schema-tolerance regression guard: the FULL models.dev catalog carries a
-        // sentinel negative `budget_tokens.min` (e.g. `-1` = "no minimum"). A
-        // negative/out-of-range integer in any tolerant-u32 field must degrade to
-        // `None`, NEVER fail the parse (which would poison the bundled() LazyLock).
+        // Regression guard: sentinel negatives must degrade to `None`, never fail the parse
+        // (which would poison the bundled() LazyLock).
         const SLICE: &str = r#"{
             "weird": {
                 "id": "weird",
@@ -857,8 +667,6 @@ mod tests {
         }"#;
         let catalog = ModelCatalog::from_json(SLICE.as_bytes()).expect("parses despite negatives");
         let m = &catalog.providers["weird"].models["m"];
-        // Negative budget min degraded to None; valid max preserved; the null
-        // effort value is dropped, leaving the real levels.
         assert_eq!(
             m.reasoning_options,
             vec![
@@ -871,7 +679,6 @@ mod tests {
                 }
             ]
         );
-        // Negative context degraded to None; valid output preserved.
         assert_eq!(m.context_limit, None);
         assert_eq!(m.output_limit, Some(64_000));
     }
@@ -879,7 +686,6 @@ mod tests {
     #[test]
     fn tolerates_unknown_providers_and_extra_fields() {
         let catalog = fixture();
-        // The unknown provider parsed (no allowlist gate at parse time).
         let mystery = catalog
             .provider("mystery-provider-9000")
             .expect("unknown provider tolerated");
@@ -889,10 +695,8 @@ mod tests {
 
     #[test]
     fn model_info_serializes_flat_numeric_limits() {
-        // Fix #2 regression guard: ModelInfo must serialize `context_limit` /
-        // `output_limit` as FLAT numbers (what the TS mirror + Svelte picker read,
-        // calling `.toLocaleString()`), NOT a nested `{ "context": N }` object that
-        // would render `[object Object]`, and NOT drop `output_limit`.
+        // Fix #2: must serialize as flat numbers (TS mirror calls `.toLocaleString()`),
+        // not a nested `{ "context": N }` object and not drop `output_limit`.
         let catalog = fixture();
         let sonnet = &catalog.providers["anthropic"].models["claude-sonnet-4-5"];
         let value = serde_json::to_value(sonnet).expect("serializes");
@@ -907,7 +711,6 @@ mod tests {
             Some(&serde_json::json!(64_000)),
             "output_limit must be a flat number, not dropped"
         );
-        // No nested `limit` object leaks into the IPC shape.
         assert!(
             value.get("limit").is_none(),
             "must not emit a nested `limit` object"
@@ -926,8 +729,6 @@ mod tests {
             "release_date must be a flat string"
         );
 
-        // A model with no limits serializes both as JSON null (the TS mirror types
-        // them `number | null`).
         let glm = &catalog.providers["zai"].models["glm-4.6"];
         let glm_value = serde_json::to_value(glm).expect("serializes");
         assert_eq!(
@@ -938,7 +739,6 @@ mod tests {
             glm_value.get("output_limit"),
             Some(&serde_json::Value::Null)
         );
-        // Absent dates serialize as JSON null (not dropped), matching the TS mirror.
         assert_eq!(
             glm_value.get("last_updated"),
             Some(&serde_json::Value::Null)
@@ -952,16 +752,14 @@ mod tests {
     #[test]
     fn handles_missing_optional_fields_with_defaults() {
         let catalog = fixture();
-        // GLM-4.6 omits modalities, limit, cost, family, temperature, open_weights.
         let glm = &catalog.providers["zai"].models["glm-4.6"];
         assert_eq!(glm.family, None);
-        assert!(!glm.temperature); // default false
-        assert!(!glm.open_weights); // default false
+        assert!(!glm.temperature);
+        assert!(!glm.open_weights);
         assert_eq!(glm.context_limit, None);
         assert_eq!(glm.output_limit, None);
         assert!(glm.cost.is_none());
         assert!(glm.modalities.input.is_empty());
-        // Absent catalog dates default to None rather than failing the parse.
         assert_eq!(glm.last_updated, None);
         assert_eq!(glm.release_date, None);
     }
@@ -990,27 +788,20 @@ mod tests {
         let err = catalog.validate("nope", "whatever").unwrap_err();
         assert!(matches!(err, LensError::Validation(_)), "got {err:?}");
 
-        // Empty model id is always rejected.
         assert!(catalog.validate("anthropic", "").is_err());
     }
 
     #[test]
     fn validate_ollama_local_accepts_any_nonempty_id() {
         let catalog = fixture();
-        // A listed local model resolves to its catalog entry.
         assert!(catalog.validate("ollama", "llama3.1").is_ok());
-        // An UNLISTED local model is treated as valid by `is_valid` (user-pull
-        // exception) even though `validate` can't return a &ModelInfo for it.
         assert!(catalog.is_valid("ollama", "my-custom-pull:latest"));
         assert!(!catalog.is_valid("ollama", ""));
     }
 
     #[test]
     fn is_local_is_the_single_locality_predicate() {
-        // Fix #3: the ONE shared locality predicate. Only the local ollama runtime
-        // is local; every cloud provider (including ollama-cloud, which is hosted)
-        // is not. `crate::llm::is_local_provider` delegates here, so the
-        // consent-gate exemption and the catalog-validation exemption agree.
+        // Fix #3: ollama-cloud is hosted, not local; `llm::is_local_provider` delegates here.
         assert!(SupportedProvider::is_local("ollama"));
         for key in [
             "anthropic",
@@ -1037,7 +828,6 @@ mod tests {
             assert_eq!(variant.catalog_key(), key);
             assert_eq!(SupportedProvider::from_catalog_key(key), variant);
         }
-        // An unknown key escapes to `Other` and round-trips.
         let other = SupportedProvider::from_catalog_key("cohere");
         assert_eq!(other, SupportedProvider::Other("cohere".into()));
         assert_eq!(other.catalog_key(), "cohere");
@@ -1045,10 +835,6 @@ mod tests {
 
     #[test]
     fn bundled_catalog_decompresses_parses_and_covers_supported_providers() {
-        // The bundled offline floor is the FULL models.dev catalog, gzipped +
-        // decompressed via flate2. It must gunzip, parse, and cover the CLOUD
-        // supported providers (models.dev has no plain `ollama` key — local
-        // models are user-pulled + validated live via /api/tags, never catalogued).
         let catalog = ModelCatalog::bundled();
         for key in ["anthropic", "openai", "google", "zai", "ollama-cloud"] {
             assert!(
@@ -1057,9 +843,7 @@ mod tests {
             );
         }
 
-        // Structural lower bounds (NOT a frozen list — the file refreshes per
-        // release, so specific model ids may be deprecated; we assert the bundle
-        // is the FULL catalog, not the old hand-curated handful of ~1 model each).
+        // Lower bounds only — not a frozen list (model ids change per release).
         assert!(
             catalog.providers.len() >= 50,
             "full catalog should carry many providers, got {}",
@@ -1086,11 +870,9 @@ mod tests {
         let now = SystemTime::now();
         let interval = MODELS_CATALOG_REFRESH_INTERVAL;
 
-        // Fresh: modified 1 hour ago, interval 8 hours.
         let fresh = now - Duration::from_secs(60 * 60);
         assert!(!is_stale(fresh, now, interval));
 
-        // Stale: modified 9 hours ago.
         let stale = now - Duration::from_secs(9 * 60 * 60);
         assert!(is_stale(stale, now, interval));
 
@@ -1098,7 +880,6 @@ mod tests {
         let boundary = now - interval;
         assert!(is_stale(boundary, now, interval));
 
-        // Future mtime (clock skew) is treated as fresh, never panics.
         let future = now + Duration::from_secs(60 * 60);
         assert!(!is_stale(future, now, interval));
     }
@@ -1108,7 +889,6 @@ mod tests {
     #[test]
     fn load_catalog_falls_back_to_bundled_when_cache_absent() {
         let dir = tempfile::tempdir().unwrap();
-        // No cache file written → bundled snapshot.
         let catalog = load_catalog(dir.path());
         assert!(catalog.provider("anthropic").is_some());
     }
@@ -1121,9 +901,7 @@ mod tests {
         std::fs::write(&path, FIXTURE).unwrap();
 
         let catalog = load_catalog(dir.path());
-        // The fixture has providers the bundled snapshot does not (the mystery
-        // provider), proving we read the cache rather than the bundle.
-        assert!(catalog.provider("mystery-provider-9000").is_some());
+        assert!(catalog.provider("mystery-provider-9000").is_some()); // fixture-only provider proves cache was read
     }
 
     #[test]
@@ -1133,7 +911,6 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"{ this is not valid json").unwrap();
 
-        // A corrupt cache must degrade to the bundled snapshot, never panic.
         let catalog = load_catalog(dir.path());
         assert!(catalog.provider("anthropic").is_some());
         assert!(catalog.provider("mystery-provider-9000").is_none());
@@ -1155,14 +932,12 @@ mod tests {
             .unwrap();
         assert!(refreshed, "absent cache must be fetched");
 
-        // The cache now exists and parses to the fetched fixture.
         let cached = load_catalog(dir.path());
         assert!(cached.provider("mystery-provider-9000").is_some());
     }
 
     #[tokio::test]
     async fn refresh_skips_when_cache_fresh() {
-        // A GET mock that PANICS the test if hit: a fresh cache must not fetch.
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .respond_with(ResponseTemplate::new(500))
@@ -1179,7 +954,6 @@ mod tests {
             .await
             .unwrap();
         assert!(!refreshed, "fresh cache must skip the fetch");
-        // The mock's expect(0) is verified on server drop.
     }
 
     #[tokio::test]
@@ -1191,9 +965,6 @@ mod tests {
             .await;
 
         let dir = tempfile::tempdir().unwrap();
-        // No cache present + a failing endpoint → an Err is returned (caller
-        // swallows it on the best-effort startup path) and the cache stays absent,
-        // so load_catalog still degrades to the bundled snapshot.
         let err = refresh_if_stale(dir.path(), &server.uri(), &catalog_client())
             .await
             .unwrap_err();
@@ -1205,9 +976,6 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_parse_guard_rejects_corrupt_body_before_cache_write() {
-        // A freshly-fetched corrupt body must fail the parse guard in
-        // `refresh_if_stale` BEFORE any cache write, so a working cache (or the
-        // bundled fallback) is never clobbered by garbage.
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .respond_with(ResponseTemplate::new(200).set_body_string("{ broken json"))
@@ -1215,8 +983,6 @@ mod tests {
             .await;
 
         let dir = tempfile::tempdir().unwrap();
-        // No cache present → the refresh is attempted; the corrupt body must
-        // surface as a parse error and leave NO cache file behind.
         let err = refresh_if_stale(dir.path(), &server.uri(), &catalog_client())
             .await
             .unwrap_err();
@@ -1225,7 +991,6 @@ mod tests {
             !catalog_cache_path(dir.path()).exists(),
             "corrupt body must not be written to the cache"
         );
-        // The app still has a usable catalog via the bundled fallback.
         assert!(load_catalog(dir.path()).provider("anthropic").is_some());
     }
 }

@@ -1,12 +1,4 @@
-// Typed IPC wrappers for the notebooks Tauri commands.
-//
-// Every function is guarded with `isTauri()` so callers work identically in
-// vitest (no native backend) and the real Tauri host. Pattern mirrors the
-// existing invoke<T> usage in `src/lib/config.ts` and `src/lib/onboarding/system-check.ts`.
-//
-// Command name convention: Tauri maps Rust snake_case fn names to camelCase JS
-// automatically for `#[tauri::command]`; args are also camelCase from the TS side
-// and Tauri deserialises them into snake_case Rust params.
+// Typed IPC wrappers for the notebooks Tauri commands. Guarded with `isTauri()`.
 
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import type { Notebook, NotebookSummary } from './types.js';
@@ -20,10 +12,7 @@ export async function listNotebooks(): Promise<NotebookSummary[]> {
   return invoke<NotebookSummary[]>('list_notebooks');
 }
 
-/**
- * Create a new notebook. Returns the created `Notebook` row (source_count is
- * implicitly 0 at creation — no join needed).
- */
+/** Create a new notebook. Returns the created `Notebook` row. */
 export async function createNotebook(
   title: string,
   description?: string | null,
@@ -37,27 +26,19 @@ export async function createNotebook(
   });
 }
 
-/**
- * Rename an existing notebook. Bumps `updated_at` on the backend.
- */
+/** Rename an existing notebook. */
 export async function renameNotebook(id: string, title: string): Promise<void> {
   if (!isTauri()) throw new Error('renameNotebook: not running under Tauri');
   return invoke<void>('rename_notebook', { id, title });
 }
 
-/**
- * Soft-delete a notebook (sets `trashed_at`). The notebook disappears from
- * `listNotebooks()` and appears in `listTrashed()`. Recoverable via `restoreNotebook`.
- */
+/** Soft-delete a notebook (sets `trashed_at`). Recoverable via `restoreNotebook`. */
 export async function trashNotebook(id: string): Promise<void> {
   if (!isTauri()) throw new Error('trashNotebook: not running under Tauri');
   return invoke<void>('trash_notebook', { id });
 }
 
-/**
- * Restore a trashed notebook (clears `trashed_at`). The notebook returns to
- * `listNotebooks()`.
- */
+/** Restore a trashed notebook (clears `trashed_at`). */
 export async function restoreNotebook(id: string): Promise<void> {
   if (!isTauri()) throw new Error('restoreNotebook: not running under Tauri');
   return invoke<void>('restore_notebook', { id });
@@ -72,19 +53,15 @@ export async function listTrashed(): Promise<NotebookSummary[]> {
   return invoke<NotebookSummary[]>('list_trashed');
 }
 
-/**
- * Permanently delete a notebook and cascade its sources. This is the ONLY hard
- * delete path — `trashNotebook` is the soft-delete. Used by "Delete forever".
- */
+/** Permanently delete a notebook and cascade its sources ("Delete forever"). */
 export async function purgeNotebook(id: string): Promise<void> {
   if (!isTauri()) throw new Error('purgeNotebook: not running under Tauri');
   return invoke<void>('purge_notebook', { id });
 }
 
 /**
- * Record that the user opened/interacted with a notebook. Fire-and-forget: a
- * failed DB write must not block the selection. Returns silently outside a
- * Tauri host (test isolation).
+ * Record that the user opened/interacted with a notebook. Fire-and-forget:
+ * a failed DB write must not block selection.
  */
 export async function touchNotebookActivity(notebookId: string): Promise<void> {
   if (!isTauri()) return;

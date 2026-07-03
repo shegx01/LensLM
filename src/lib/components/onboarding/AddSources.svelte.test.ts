@@ -10,8 +10,6 @@ import {
 import type { AppConfig } from '$lib/theme/types.js';
 import { baseAppConfig } from '$lib/test-fixtures.js';
 
-// ── Fixtures ─────────────────────────────────────────────────────────────────
-
 const SAMPLE_DOCS: RecentDocument[] = [
   { path: '/docs/report.pdf', name: 'report.pdf', ext: 'pdf', size: 512000, mtime: 0 },
   { path: '/docs/notes.md', name: 'notes.md', ext: 'md', size: 4096, mtime: 0 }
@@ -30,32 +28,20 @@ function baseConfig(onboarding_complete = false): AppConfig {
   return baseAppConfig({ onboarding_complete });
 }
 
-// ── Mock @tauri-apps/plugin-dialog ────────────────────────────────────────────
-// The dialog plugin is NOT proxied through invoke/mockIPC — it is a direct module
-// import. We vi.mock it at the module level so the component's `browse()` handler
-// receives a controllable stub.
-
+// The dialog plugin bypasses invoke/mockIPC — vi.mock so browse() gets a stub.
 vi.mock('@tauri-apps/plugin-dialog', () => ({
   open: vi.fn().mockResolvedValue(null)
 }));
 
-// ── Mock @tauri-apps/api/webview ──────────────────────────────────────────────
-// The component now registers a native drag-drop target on mount (issue #95).
-// Because these tests activate the Tauri path (globalThis.isTauri = true), the
-// drag-drop manager dynamically imports this module and calls
-// getCurrentWebview().onDragDropEvent. Stub it with a no-op listener that
-// resolves to a no-op unlisten fn so registration/teardown are inert in tests.
-
+// Tauri path is active (isTauri=true), so dragDrop.ts dynamically imports this
+// module. Stub with a no-op so registration/teardown are inert.
 vi.mock('@tauri-apps/api/webview', () => ({
   getCurrentWebview: () => ({
     onDragDropEvent: vi.fn().mockResolvedValue(() => {})
   })
 }));
 
-// ── Setup / teardown ─────────────────────────────────────────────────────────
-
 beforeEach(() => {
-  // Activate the Tauri path (isTauri() reads globalThis.isTauri).
   (globalThis as { isTauri?: boolean }).isTauri = true;
   // Always start with a clean draft so tests don't bleed state.
   resetDraft();
@@ -69,11 +55,7 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
 describe('AddSources', () => {
-  // ── Rendering ──────────────────────────────────────────────────────────────
-
   it('renders the "Add sources" title and subtitle', async () => {
     mockIPC((cmd) => {
       if (cmd === 'list_recent_documents') return [];
@@ -101,14 +83,11 @@ describe('AddSources', () => {
     expect(screen.getByRole('button', { name: /launch lens/i })).toBeInTheDocument();
   });
 
-  // ── Suggestions ────────────────────────────────────────────────────────────
-
   it('hides the suggestions section when list_recent_documents returns []', async () => {
     mockIPC((cmd) => {
       if (cmd === 'list_recent_documents') return [];
     });
     render(AddSources, { props: { oncomplete: vi.fn(), onback: vi.fn() } });
-    // Give mount a tick to resolve.
     await waitFor(() => {
       expect(screen.queryByText(/suggested from your library/i)).not.toBeInTheDocument();
     });
@@ -144,7 +123,6 @@ describe('AddSources', () => {
     await waitFor(() => {
       expect(screen.getByText(/suggested from your library/i)).toBeInTheDocument();
     });
-    // First 4 visible, 5th and 6th not rendered.
     expect(screen.getByText('a.pdf')).toBeInTheDocument();
     expect(screen.getByText('b.pdf')).toBeInTheDocument();
     expect(screen.getByText('c.pdf')).toBeInTheDocument();
@@ -153,8 +131,6 @@ describe('AddSources', () => {
     expect(screen.queryByText('f.pdf')).not.toBeInTheDocument();
   });
 
-  // ── Toggling suggestions ──────────────────────────────────────────────────
-
   it('toggling a suggestion adds it to selectedSources and shows ADDED FILES', async () => {
     mockIPC((cmd) => {
       if (cmd === 'list_recent_documents') return SAMPLE_DOCS;
@@ -162,14 +138,12 @@ describe('AddSources', () => {
     render(AddSources, { props: { oncomplete: vi.fn(), onback: vi.fn() } });
     await waitFor(() => screen.getByText('report.pdf'));
 
-    // Before any selection the count label is visible and ADDED FILES is hidden.
     expect(screen.getByText('No sources selected')).toBeInTheDocument();
     expect(screen.queryByText(/added files/i)).not.toBeInTheDocument();
 
     const reportRow = screen.getByRole('button', { name: /select report\.pdf/i });
     await fireEvent.click(reportRow);
 
-    // After selection: ADDED FILES section appears; count label is suppressed.
     await waitFor(() => expect(screen.getByText(/added files/i)).toBeInTheDocument());
     expect(draft.selectedSources).toHaveLength(1);
     expect(draft.selectedSources[0].path).toBe('/docs/report.pdf');
@@ -186,7 +160,6 @@ describe('AddSources', () => {
     await fireEvent.click(reportRow);
     expect(draft.selectedSources).toHaveLength(1);
 
-    // Row label flips to "Deselect" after selection.
     const deselect = screen.getByRole('button', { name: /deselect report\.pdf/i });
     await fireEvent.click(deselect);
     expect(draft.selectedSources).toHaveLength(0);
@@ -203,14 +176,10 @@ describe('AddSources', () => {
     await fireEvent.click(screen.getByRole('button', { name: /select report\.pdf/i }));
     await fireEvent.click(screen.getByRole('button', { name: /select notes\.md/i }));
 
-    // Both files appear in ADDED FILES; the count label text is suppressed.
     await waitFor(() => expect(screen.getByText(/added files/i)).toBeInTheDocument());
     expect(draft.selectedSources).toHaveLength(2);
-    // count label is gone while ADDED FILES is visible
     expect(screen.queryByText('2 sources selected')).not.toBeInTheDocument();
   });
-
-  // ── ADDED FILES section ───────────────────────────────────────────────────
 
   it('hides "ADDED FILES" section when selectedSources is empty', async () => {
     mockIPC((cmd) => {
@@ -234,8 +203,7 @@ describe('AddSources', () => {
     await waitFor(() => {
       expect(screen.getByText(/added files/i)).toBeInTheDocument();
     });
-    // The file name appears in ADDED FILES (multiple elements expected since it
-    // also appears in Suggested — getAllByText is appropriate here).
+    // The file also appears in Suggested, so getAllByText is appropriate.
     const instances = screen.getAllByText('report.pdf');
     expect(instances.length).toBeGreaterThanOrEqual(2);
   });
@@ -247,11 +215,9 @@ describe('AddSources', () => {
     render(AddSources, { props: { oncomplete: vi.fn(), onback: vi.fn() } });
     await waitFor(() => screen.getByText('report.pdf'));
 
-    // Add via toggle.
     await fireEvent.click(screen.getByRole('button', { name: /select report\.pdf/i }));
     await waitFor(() => expect(screen.getByText(/added files/i)).toBeInTheDocument());
 
-    // Remove via delete button in ADDED FILES.
     const removeBtn = screen.getByRole('button', { name: /remove report\.pdf/i });
     await fireEvent.click(removeBtn);
 
@@ -268,15 +234,11 @@ describe('AddSources', () => {
     render(AddSources, { props: { oncomplete: vi.fn(), onback: vi.fn() } });
     await waitFor(() => screen.getByText('report.pdf'));
 
-    // Select suggestion.
     await fireEvent.click(screen.getByRole('button', { name: /select report\.pdf/i }));
-    // Suggestion is now "Deselect" aria-label.
     expect(screen.getByRole('button', { name: /deselect report\.pdf/i })).toBeInTheDocument();
 
-    // Remove via ADDED FILES delete.
     await fireEvent.click(screen.getByRole('button', { name: /remove report\.pdf/i }));
 
-    // Suggestion row reverts to "Select".
     await waitFor(() => {
       expect(screen.getByRole('button', { name: /select report\.pdf/i })).toBeInTheDocument();
     });
@@ -287,7 +249,6 @@ describe('AddSources', () => {
       if (cmd === 'list_recent_documents') return [];
     });
 
-    // Pre-populate draft with 5 sources before rendering.
     draft.selectedSources = [
       { path: '/f/a.pdf', name: 'a.pdf', ext: 'pdf', size: 0, mtime: 0 },
       { path: '/f/b.pdf', name: 'b.pdf', ext: 'pdf', size: 0, mtime: 0 },
@@ -301,10 +262,8 @@ describe('AddSources', () => {
     await waitFor(() => {
       expect(screen.getByText(/added files/i)).toBeInTheDocument();
     });
-    // First 4 visible.
     expect(screen.getByText('a.pdf')).toBeInTheDocument();
     expect(screen.getByText('d.pdf')).toBeInTheDocument();
-    // 5th is hidden, overflow label shown.
     expect(screen.queryByText('e.pdf')).not.toBeInTheDocument();
     expect(screen.getByText('+1 more')).toBeInTheDocument();
   });
@@ -327,8 +286,6 @@ describe('AddSources', () => {
     });
     expect(screen.getByText('thesis.pdf')).toBeInTheDocument();
   });
-
-  // ── Skip for now ───────────────────────────────────────────────────────────
 
   it('"Skip for now" calls completeOnboarding (set_config) and oncomplete without add_source', async () => {
     const oncomplete = vi.fn();
@@ -372,8 +329,6 @@ describe('AddSources', () => {
     expect(draft.selectedSources).toHaveLength(0);
   });
 
-  // ── Launch Lens ────────────────────────────────────────────────────────────
-
   it('"Launch Lens" with selected sources calls add_source then completes', async () => {
     const oncomplete = vi.fn();
     const addSourceCalls: unknown[] = [];
@@ -395,7 +350,6 @@ describe('AddSources', () => {
     render(AddSources, { props: { oncomplete, onback: vi.fn() } });
     await waitFor(() => screen.getByText('report.pdf'));
 
-    // Select one suggestion.
     await fireEvent.click(screen.getByRole('button', { name: /select report\.pdf/i }));
 
     await fireEvent.click(screen.getByRole('button', { name: /launch lens/i }));
@@ -434,17 +388,14 @@ describe('AddSources', () => {
     render(AddSources, { props: { oncomplete, onback: vi.fn() } });
     await waitFor(() => screen.getByText('report.pdf'));
 
-    // Select BOTH suggestions; report.pdf is inserted first, notes.md second.
     await fireEvent.click(screen.getByRole('button', { name: /select report\.pdf/i }));
     await fireEvent.click(screen.getByRole('button', { name: /select notes\.md/i }));
 
-    // First attempt: report.pdf lands, notes.md throws → inline error, no oncomplete.
     await fireEvent.click(screen.getByRole('button', { name: /launch lens/i }));
     await waitFor(() => expect(screen.getByText(/could not save your setup/i)).toBeInTheDocument());
     expect(oncomplete).not.toHaveBeenCalled();
     expect(addSourceLocators).toEqual(['/docs/report.pdf']);
 
-    // Retry: report.pdf is already added → skipped; only notes.md is inserted.
     await fireEvent.click(screen.getByRole('button', { name: /launch lens/i }));
     await waitFor(() => expect(oncomplete).toHaveBeenCalledOnce());
     expect(addSourceLocators).toEqual(['/docs/report.pdf', '/docs/notes.md']);
@@ -503,8 +454,6 @@ describe('AddSources', () => {
     expect(oncomplete).not.toHaveBeenCalled();
   });
 
-  // ── Back button ────────────────────────────────────────────────────────────
-
   it('Back button fires onback', async () => {
     const onback = vi.fn();
     mockIPC((cmd) => {
@@ -514,8 +463,6 @@ describe('AddSources', () => {
     await fireEvent.click(screen.getByRole('button', { name: /back/i }));
     expect(onback).toHaveBeenCalledOnce();
   });
-
-  // ── Non-Tauri guard ────────────────────────────────────────────────────────
 
   it('does not call list_recent_documents and skips add_source when not in Tauri', async () => {
     delete (globalThis as { isTauri?: boolean }).isTauri;
@@ -528,18 +475,14 @@ describe('AddSources', () => {
     });
 
     render(AddSources, { props: { oncomplete, onback: vi.fn() } });
-    // No suggestions visible — list_recent_documents not called.
     await waitFor(() => {
       expect(screen.queryByText(/suggested from your library/i)).not.toBeInTheDocument();
     });
 
-    // Skip still resolves (no-op updateConfig).
     await fireEvent.click(screen.getByRole('button', { name: /skip for now/i }));
     await waitFor(() => expect(oncomplete).toHaveBeenCalledOnce());
     expect(ipcCalled).toBe(false);
   });
-
-  // ── macOS drag region (mirrors SourcesRail drag assertions) ─────────────────
 
   it('outer <main> is a data-tauri-drag-region with the Card marked no-drag', () => {
     mockIPC((cmd) => {
@@ -558,7 +501,6 @@ describe('AddSources', () => {
     });
     const { container } = render(AddSources, { props: { oncomplete: vi.fn(), onback: vi.fn() } });
     const dropzone = screen.getByRole('button', { name: /drop files here or click to browse/i });
-    // The dropzone must live within the no-drag content block (not the bare drag region).
     const noDragAncestor = dropzone.closest('[style*="-webkit-app-region: no-drag"]');
     expect(noDragAncestor).not.toBeNull();
     expect(container.querySelector('main[data-tauri-drag-region]')).not.toBeNull();

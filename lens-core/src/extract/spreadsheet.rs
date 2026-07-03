@@ -33,34 +33,25 @@ use crate::parse::{Block, BlockType};
 use super::tabular_utils::{MAX_COLUMNS, normalize_headers, render_table_markdown, verbalize_row};
 use super::{ExtractOutput, Extractor, SourceAnchor};
 
-/// Hard ceiling on the cumulative DECOMPRESSED cell-data size we will build into
-/// the verbalization (decompression-bomb guard, mirroring [`odt`](super::odt) and
-/// [`epub`](super::epub)). `calamine` decompresses the XLSX zip internally, so the
-/// 50 MB stage-1 raw-bytes cap in ingest only ever sees the COMPRESSED bytes; a
-/// high-ratio workbook could materialize gigabytes of cell data and OOM the
-/// backend. We sum each cell's byte length as we iterate and bail past this cap.
+/// Cumulative cell-data byte ceiling (decompression-bomb guard). `calamine`
+/// decompresses XLSX internally, so the 50 MB stage-1 compressed cap is not
+/// enough; a high-ratio workbook could OOM before stage-2. We sum cell byte
+/// lengths as we iterate and bail past this cap.
 ///
-/// Residual limitation: `calamine` fully materializes a sheet's range in memory
-/// (`worksheet_range`) BEFORE we can measure any cell, so this bounds the
-/// DOWNSTREAM amplification (the giant `extracted_text`/blocks we would otherwise
-/// build), not calamine's internal decode peak. calamine's peak is still bounded
-/// first-line by the 50 MB compressed stage-1 raw cap.
+/// Residual: `calamine` fully materialises a sheet's range before we can
+/// measure cells, so this bounds downstream amplification only.
 const MAX_DECOMPRESSED_BYTES: usize = 256 * 1024 * 1024;
 
-/// Converts a calamine [`Data`] cell into its verbalized string form.
+/// Converts a calamine [`Data`] cell to its verbalized string form.
 ///
-/// `Float` integers render WITHOUT a trailing `.0` (`30.0` → `"30"`) so the
-/// embedded text reads naturally; non-integer floats render via their `Display`.
-/// `DateTime` uses `ExcelDateTime`'s `Display` (the raw serial value);
-/// `DateTimeIso`/`DurationIso` are already ISO-8601 strings and clone directly.
+/// Float integers render without a trailing `.0` (`30.0` → `"30"`). The i64
+/// range guard prevents saturation on out-of-range values (e.g. `1e19`).
 pub(crate) fn cell_to_string(cell: &Data) -> String {
     match cell {
         Data::String(s) => s.clone(),
         Data::Float(f) => {
-            // Only take the integer-format path when the value is BOTH a whole
-            // number AND inside the i64 range; otherwise `*f as i64` saturates
-            // (e.g. 1e19 → i64::MAX) and silently corrupts the cell. Out-of-range
-            // (and non-finite) values fall through to `Display`.
+            // Only use integer formatting when the value is a whole number AND
+            // inside i64 range; otherwise `*f as i64` saturates silently.
             if f.fract() == 0.0 && f.is_finite() && *f >= i64::MIN as f64 && *f <= i64::MAX as f64 {
                 format!("{}", *f as i64)
             } else {
@@ -77,13 +68,8 @@ pub(crate) fn cell_to_string(cell: &Data) -> String {
     }
 }
 
-/// Cumulative byte cost of a sheet's cells for the decompression-bomb guard.
-///
-/// We charge each cell its verbalized byte length so the guard tracks the size of
-/// the `extracted_text`/blocks we are about to build (`Data::String(s) =>
-/// s.len()`, every other variant a flat `8` — a cheap upper-bound proxy for its
-/// short numeric/bool/date rendering). Used by [`SpreadsheetExtractor::extract`]
-/// to bail before materializing a giant verbalization.
+/// Byte cost proxy for a cell (used by the decompression-bomb guard).
+/// `String` charges its length; all other variants charge a flat `8`.
 fn cell_data_bytes(cell: &Data) -> usize {
     match cell {
         Data::String(s) => s.len(),
@@ -96,9 +82,7 @@ pub struct SpreadsheetExtractor;
 
 impl Extractor for SpreadsheetExtractor {
     fn extract(&self, raw: &[u8]) -> Result<ExtractOutput, LensError> {
-        // calamine's open_workbook_auto_from_rs needs Read+Seek+Clone, which
-        // &[u8] can't satisfy here; an owned Vec cursor does. Bounded by the
-        // Stage-1 max_source_bytes guard.
+        // `open_workbook_auto_from_rs` needs `Read+Seek+Clone`; owned Vec cursor.
         let cursor = Cursor::new(raw.to_vec());
         let mut workbook = open_workbook_auto_from_rs(cursor)
             .map_err(|e| LensError::Parse(format!("calamine failed to open workbook: {e}")))?;
@@ -106,12 +90,7 @@ impl Extractor for SpreadsheetExtractor {
         let mut extracted_text = String::new();
         let mut blocks: Vec<Block> = Vec::new();
         let mut anchors: Vec<SourceAnchor> = Vec::new();
-        // Running per-sheet markdown rendering (one `## {sheet}` section per sheet
-        // that has a header). Built INSIDE the sheet loop so a sheet's `data_rows`
-        // can be dropped before the next sheet, rather than holding ALL sheets'
-        // rows in memory alongside `extracted_text` until after the loop.
         let mut table_markdown = String::new();
-        // Running cumulative cell-data byte total (decompression-bomb guard).
         let mut total_cell_bytes: usize = 0;
 
         let sheet_names = workbook.sheet_names().to_vec();
@@ -127,8 +106,6 @@ impl Extractor for SpreadsheetExtractor {
                 None => continue, // empty sheet → no blocks
             };
 
-            // Incrementally charge cell-data bytes as we walk the range so we bail
-            // BEFORE building a giant verbalization (see MAX_DECOMPRESSED_BYTES).
             total_cell_bytes += header_row.iter().map(cell_data_bytes).sum::<usize>();
             if total_cell_bytes > MAX_DECOMPRESSED_BYTES {
                 return Err(LensError::Validation(format!(
@@ -140,10 +117,8 @@ impl Extractor for SpreadsheetExtractor {
             let first: Vec<String> = header_row.iter().map(cell_to_string).collect();
             let headers = normalize_headers(first);
 
-            // Column guard (memory/robustness): a pathological million-column
-            // sheet would over-allocate per-row `Vec<String>` + verbalized
-            // `String`. calamine fixes the range width at the header, so guarding
-            // the header column count bounds every data row too.
+            // Column guard: calamine fixes the range width at the header, so
+            // guarding the header count bounds every data row too.
             if headers.len() > MAX_COLUMNS {
                 return Err(LensError::Validation(format!(
                     "tabular source has {} columns, exceeding the {MAX_COLUMNS}-column limit",
@@ -182,18 +157,14 @@ impl Extractor for SpreadsheetExtractor {
                 });
             }
 
-            // Render this sheet's markdown section NOW (rows still in memory) so
-            // `data_rows` can be dropped before the next sheet. The byte output is
-            // identical to accumulating-then-rendering: same per-sheet section
-            // (`## {sheet}\n\n` + table + `\n`), same sheet order, same separators.
+            // Render now so `data_rows` can be dropped before the next sheet.
             table_markdown.push_str(&format!("## {sheet_name}\n\n"));
             table_markdown.push_str(&render_table_markdown(&headers, &data_rows));
             table_markdown.push('\n');
             drop(data_rows);
         }
 
-        // When every sheet was empty/skipped the rendering is empty; emit `None`
-        // (not `Some("")`) to match CsvExtractor's None-for-empty behavior.
+        // Emit None (not Some("")) for empty workbooks, matching CsvExtractor.
         let table_markdown = if table_markdown.is_empty() {
             None
         } else {
@@ -209,23 +180,12 @@ impl Extractor for SpreadsheetExtractor {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests (TDD)
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use calamine::{CellErrorType, ExcelDateTime, ExcelDateTimeType};
 
-    /// Generates the committed `tests/fixtures/sample.xlsx` fixture from scratch
-    /// using `rust_xlsxwriter` (calamine is READ-ONLY so it cannot author it).
-    /// Run via `cargo test -p lens-core regenerate_sample_xlsx -- --ignored`.
-    ///
-    /// Schema:
-    /// - Sheet1 "People": headers Name/Age; Alice/30 (Age written as a number →
-    ///   read back as `Data::Float(30.0)` → "30"), Bob/25.
-    /// - Sheet2 "Cities": headers City/Pop; NYC/8000000.
+    /// Regenerates `tests/fixtures/sample.xlsx`. Run with `--ignored`.
     #[test]
     #[ignore = "fixture generator; run with --ignored to regenerate sample.xlsx"]
     fn regenerate_sample_xlsx() {
@@ -272,9 +232,6 @@ mod tests {
         }
     }
 
-    /// Builds an in-memory `.xlsx` from `(sheet_name, rows)` specs for the
-    /// edge-case tests that need a custom workbook (calamine is read-only, so we
-    /// author via `rust_xlsxwriter` and feed the bytes back through the extractor).
     fn build_xlsx(sheets: &[(&str, &[&[&str]])]) -> Vec<u8> {
         use rust_xlsxwriter::Workbook;
         let mut wb = Workbook::new();
@@ -302,7 +259,6 @@ mod tests {
 
     #[test]
     fn xlsx_empty_sheet() {
-        // A sheet with zero rows produces 0 blocks for that sheet.
         let bytes = build_xlsx(&[("Empty", &[])]);
         let out = SpreadsheetExtractor.extract(&bytes).expect("extract");
         assert!(out.blocks.is_empty(), "empty sheet → no blocks");
@@ -310,7 +266,6 @@ mod tests {
 
     #[test]
     fn xlsx_header_only_sheet() {
-        // Header row only, no data rows: 0 blocks for that sheet.
         let bytes = build_xlsx(&[("H", &[&["Name", "Age"]])]);
         let out = SpreadsheetExtractor.extract(&bytes).expect("extract");
         assert!(out.blocks.is_empty(), "header-only → no data rows");
@@ -320,11 +275,9 @@ mod tests {
         assert!(md.contains("| Name | Age |"));
     }
 
-    // NOTE: an end-to-end "blank first row" fixture is intentionally NOT tested
-    // here: a written-but-empty cell is not stored in the XLSX part, so calamine
-    // collapses a fully-blank leading row and the next row becomes the header.
-    // The no-header synthetic-"Column N" fallback logic is covered deterministically
-    // by `xlsx_no_header_fallback` above (and `csv_no_header_fallback` for CSV).
+    // NOTE: "blank first row" is not tested end-to-end — calamine collapses a
+    // fully-blank written row, so the synthetic-header path is covered by
+    // `xlsx_no_header_fallback` instead.
 
     #[test]
     fn xlsx_simple_sheet() {
@@ -382,7 +335,6 @@ mod tests {
         assert!(md.contains("## Cities"), "Cities section: {md:?}");
         assert!(md.contains("| Name | Age |"));
         assert!(md.contains("| Alice | 30 |"));
-        // The pipe-delimited markdown must NOT be in the embedded extracted_text.
         assert!(
             !out.extracted_text.contains('|'),
             "markdown must not leak into extracted_text"
@@ -433,8 +385,6 @@ mod tests {
         assert!(matches!(err, LensError::Parse(_)), "got {err:?}");
     }
 
-    // --- cell_to_string: exhaustive Data-variant coverage (no fixture needed) ---
-
     #[test]
     fn xlsx_cell_string_variant() {
         assert_eq!(cell_to_string(&Data::String("hi".to_string())), "hi");
@@ -442,7 +392,6 @@ mod tests {
 
     #[test]
     fn xlsx_cell_float_integer_no_trailing_zero() {
-        // 30.0 must render as "30", not "30.0".
         assert_eq!(cell_to_string(&Data::Float(30.0)), "30");
     }
 
@@ -460,8 +409,7 @@ mod tests {
 
     #[test]
     fn xlsx_cell_float_out_of_i64_range_does_not_saturate() {
-        // 1e19 > i64::MAX: the integer path would saturate to i64::MAX
-        // (9223372036854775807); we must instead fall through to Display.
+        // 1e19 > i64::MAX; must fall through to Display rather than saturate.
         assert_eq!(cell_to_string(&Data::Float(1e19)), "10000000000000000000");
         assert_ne!(
             cell_to_string(&Data::Float(1e19)),
@@ -472,28 +420,19 @@ mod tests {
 
     #[test]
     fn xlsx_cell_float_non_finite_falls_through() {
-        // NaN/infinity are not finite → Display form, no panic.
         assert_eq!(cell_to_string(&Data::Float(f64::NAN)), "NaN");
         assert_eq!(cell_to_string(&Data::Float(f64::INFINITY)), "inf");
-        // NEG_INFINITY falls through the is_finite() guard like NaN/INFINITY.
         assert_eq!(cell_to_string(&Data::Float(f64::NEG_INFINITY)), "-inf");
     }
 
-    // --- FIX 1: decompression-bomb guard (deterministic, no giant fixture) ---
-
     #[test]
     fn xlsx_decompression_bomb_guard() {
-        // The guard sums `cell_data_bytes` and bails once the running total
-        // exceeds MAX_DECOMPRESSED_BYTES. We exercise the pure helper + threshold
-        // comparison directly so the test is fast and deterministic (a real
-        // 256 MB+ workbook is infeasible to build in-test).
+        // Exercise the helper directly; a real 256 MB+ workbook is infeasible in-test.
         assert_eq!(cell_data_bytes(&Data::String("x".repeat(100))), 100);
         assert_eq!(cell_data_bytes(&Data::Int(42)), 8);
         assert_eq!(cell_data_bytes(&Data::Float(30.0)), 8);
         assert_eq!(cell_data_bytes(&Data::Empty), 8);
 
-        // A synthetic per-cell byte total that crosses the cap must trip the
-        // threshold the extract loop checks.
         let big_cell = Data::String("a".repeat(MAX_DECOMPRESSED_BYTES + 1));
         let mut total = 0usize;
         total += cell_data_bytes(&big_cell);
@@ -502,7 +441,6 @@ mod tests {
             "synthetic cell-byte total must exceed the cap"
         );
 
-        // And a small total must NOT trip it.
         let small_total: usize = [&Data::Int(1), &Data::String("hi".to_string())]
             .iter()
             .map(|c| cell_data_bytes(c))
@@ -510,15 +448,9 @@ mod tests {
         assert!(small_total <= MAX_DECOMPRESSED_BYTES);
     }
 
-    // --- FIX 1: MAX_COLUMNS guard (threshold tested directly — a >16384-column
-    // workbook is infeasible to author in-test) ---
-
     #[test]
     fn xlsx_too_many_columns_rejected() {
-        // The extract loop rejects when `headers.len() > MAX_COLUMNS`. A
-        // >16384-column workbook is infeasible to author in-test, so we drive the
-        // exact guard predicate the loop uses over synthetic header widths to
-        // confirm the boundary and the error shape.
+        // >16384-column workbook is infeasible in-test; drive the guard predicate directly.
         let guard = |ncols: usize| -> Option<LensError> {
             (ncols > MAX_COLUMNS).then(|| {
                 LensError::Validation(format!(
@@ -527,10 +459,8 @@ mod tests {
             })
         };
 
-        // Boundary: exactly MAX_COLUMNS (XFD) must NOT trip the guard.
         assert!(guard(MAX_COLUMNS).is_none(), "exactly MAX_COLUMNS is valid");
 
-        // One past the cap is rejected with the expected Validation shape.
         match guard(MAX_COLUMNS + 1) {
             Some(LensError::Validation(msg)) => {
                 assert!(msg.contains("columns"), "msg: {msg}");
@@ -553,7 +483,6 @@ mod tests {
 
     #[test]
     fn xlsx_cell_datetime_uses_display() {
-        // ExcelDateTime's Display is the raw serial value.
         let dt = ExcelDateTime::new(44484.0, ExcelDateTimeType::DateTime, false);
         assert_eq!(cell_to_string(&Data::DateTime(dt)), format!("{dt}"));
     }
@@ -587,11 +516,8 @@ mod tests {
         assert_eq!(cell_to_string(&Data::Empty), "");
     }
 
-    // --- header semantics (verbalize_row is exercised through cell logic) ---
-
     #[test]
     fn xlsx_no_header_fallback() {
-        // First row all-blank → synthesize "Column N".
         let blank: Vec<String> = vec![String::new(), String::new()];
         let headers: Vec<String> = if blank.iter().all(|c| c.trim().is_empty()) {
             (0..blank.len())

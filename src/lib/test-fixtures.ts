@@ -1,10 +1,4 @@
 // Shared AppConfig test fixtures.
-//
-// `baseAppConfig` is the minimal valid AppConfig (all required fields, empty
-// collections) for tests that only care about a couple of fields.
-// `fullAppConfig` adds a populated model/endpoint/voices set for tests that
-// assert the WHOLE struct round-trips through a read-modify-write. Both accept
-// `overrides` so a test can pin just the fields it asserts on.
 
 import type { AppConfig } from '$lib/theme/types.js';
 
@@ -30,8 +24,7 @@ export function baseAppConfig(overrides?: Partial<AppConfig>): AppConfig {
   };
 }
 
-/** Fully-populated AppConfig (models/endpoints/voices/paths) for whole-struct
- *  round-trip assertions. */
+/** Fully-populated AppConfig for whole-struct round-trip assertions. */
 export function fullAppConfig(overrides?: Partial<AppConfig>): AppConfig {
   return baseAppConfig({
     models: [

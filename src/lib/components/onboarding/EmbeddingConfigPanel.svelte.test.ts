@@ -29,8 +29,6 @@ describe('EmbeddingConfigPanel — Step 9 rework (backend-aware)', () => {
     });
 
     expect(await screen.findByText(/select your local embeddings provider/i)).toBeInTheDocument();
-    // On-device provider (labeled "On-device"; "· Apple GPU" on Apple Silicon,
-    // issue #91). Tests run outside Tauri so the GPU signal is false.
     expect(screen.getByRole('radio', { name: 'On-device' })).toBeInTheDocument();
     expect(screen.getByRole('radio', { name: 'Ollama' })).toBeInTheDocument();
     expect(screen.getByText(/Ollama must be installed if chosen/i)).toBeInTheDocument();
@@ -99,8 +97,7 @@ describe('EmbeddingConfigPanel — Step 9 rework (backend-aware)', () => {
 
     await fireEvent.click(await screen.findByRole('radio', { name: 'Ollama' }));
 
-    // Detect-only affordances: a Refresh action + a pull hint (no Install button).
-    // After switching to ollama, the first ollama model (embeddinggemma) is auto-selected.
+    // Detect-only: Refresh + pull hint visible; no Install button (auto-selects embeddinggemma).
     expect(
       await screen.findByRole('button', { name: /refresh ollama models/i })
     ).toBeInTheDocument();

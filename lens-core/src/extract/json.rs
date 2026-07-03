@@ -23,40 +23,31 @@ use super::{ExtractOutput, Extractor, SourceAnchor};
 pub(crate) const MAX_NESTING_DEPTH: usize = 64;
 /// Maximum number of array elements emitted individually before truncation.
 pub(crate) const MAX_ARRAY_ELEMENTS: usize = 10_000;
-/// Maximum byte length of the single block produced when an over-deep subtree
-/// is collapsed via `Value::to_string()`. A deeply-nested subtree can serialize
-/// to an arbitrarily large string; cap it so one adversarial block cannot blow
-/// up the canonical buffer. Truncation is UTF-8-safe and marked with a suffix.
+/// Maximum byte length of a collapsed over-deep subtree. UTF-8-safe truncation,
+/// marked with a ` …[truncated]` suffix so no content is silently lost.
 pub(crate) const MAX_COLLAPSED_BLOCK_BYTES: usize = 8 * 1024;
 
-/// Strips a leading UTF-8 BOM, if present, so `serde_json` (which rejects a
-/// leading BOM per RFC 8259) and the other parsers see clean input.
+/// Strips a leading UTF-8 BOM so `serde_json` (which rejects BOM per RFC 8259)
+/// and the other parsers see clean input.
 pub(crate) fn strip_bom(s: &str) -> &str {
     s.strip_prefix('\u{FEFF}').unwrap_or(s)
 }
 
-/// Validates that `raw` is UTF-8, returning a clear validation error otherwise.
 pub(crate) fn validate_utf8(raw: &[u8]) -> Result<&str, LensError> {
     std::str::from_utf8(raw)
         .map_err(|_| LensError::Validation("source is not valid UTF-8".to_string()))
 }
 
-/// One path segment of the JSON-pointer-ish address: either an object key or an
-/// array index. Borrowing the key avoids cloning every key on the path stack.
+/// One path segment of the JSON-pointer-ish address.
 #[derive(Clone)]
 pub(crate) enum Segment<'a> {
-    /// An object key.
     Key(&'a str),
-    /// An array index.
     Index(usize),
-    /// A JSONL record / YAML document discriminant: renders `[N]` in the
-    /// ` > `-joined `section_path` trail but `N` in the `/`-joined anchor path.
+    /// JSONL/YAML discriminant: renders `[N]` in `section_path`, `/N` in the anchor path.
     Record(usize),
 }
 
 impl Segment<'_> {
-    /// The form joined by ` > ` for `section_path` (keys/indices verbatim;
-    /// record discriminants render as `[N]`).
     fn section_part(&self) -> String {
         match self {
             Segment::Key(k) => (*k).to_string(),
@@ -65,7 +56,6 @@ impl Segment<'_> {
         }
     }
 
-    /// The form appended (after `/`) for the JSON-pointer-ish anchor path.
     fn path_part(&self) -> String {
         match self {
             Segment::Key(k) => (*k).to_string(),
@@ -75,19 +65,13 @@ impl Segment<'_> {
     }
 }
 
-/// Accumulator passed through the recursive walk, owning the growing buffer and
-/// the index-aligned `blocks`/`anchors` vectors.
 pub(crate) struct Sink {
-    /// The canonical verbalization buffer (becomes `extracted_text`).
     pub buf: String,
-    /// One block per leaf value.
     pub blocks: Vec<Block>,
-    /// One anchor per block (index-aligned), all `Structured`.
     pub anchors: Vec<SourceAnchor>,
 }
 
 impl Sink {
-    /// Creates an empty sink.
     pub(crate) fn new() -> Self {
         Self {
             buf: String::new(),
@@ -96,7 +80,6 @@ impl Sink {
         }
     }
 
-    /// Consumes the sink into an [`ExtractOutput`].
     pub(crate) fn finish(self) -> ExtractOutput {
         ExtractOutput {
             extracted_text: self.buf,
@@ -106,10 +89,6 @@ impl Sink {
         }
     }
 
-    /// Emits one leaf block. The buffer line is `"{anchor_path}: {value}\n"`
-    /// (the JSON-pointer-ish `/`-path prefix, per the canonical-buffer spec),
-    /// while the block's `section_path` carries the ` > `-joined heading trail.
-    /// Byte offsets are recorded so `buf[char_start..char_end] == text` holds.
     fn emit_leaf(&mut self, section_path: &str, anchor_path: &str, value: &str) {
         let line = format!("{anchor_path}: {value}");
         let char_start = self.buf.len();
@@ -129,29 +108,20 @@ impl Sink {
     }
 }
 
-/// Renders a scalar [`Value`] to its verbalized string form. Strings render as
-/// their raw content (no surrounding quotes); numbers/bools/null render via
-/// their JSON text. Containers are never passed here.
 fn scalar_to_string(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
         Value::Null => "null".to_string(),
         Value::Bool(b) => b.to_string(),
         Value::Number(n) => n.to_string(),
-        // Containers are handled by the walker; defensively serialize.
         other => other.to_string(),
     }
 }
 
-/// Caps a collapsed-subtree serialization at [`MAX_COLLAPSED_BLOCK_BYTES`]
-/// using a UTF-8-safe truncation (never splitting a multibyte char) and an
-/// explicit ` …[truncated]` suffix. Strings within the cap pass through
-/// unchanged. Emits a `tracing::warn!` when truncation occurs.
 fn truncate_collapsed(s: &str) -> String {
     if s.len() <= MAX_COLLAPSED_BLOCK_BYTES {
         return s.to_string();
     }
-    // Back up to the nearest char boundary at or below the cap.
     let mut end = MAX_COLLAPSED_BLOCK_BYTES;
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
@@ -164,8 +134,6 @@ fn truncate_collapsed(s: &str) -> String {
     format!("{} …[truncated]", &s[..end])
 }
 
-/// Joins path segments into a ` > `-separated section path (the heading-trail
-/// convention shared with the Markdown/DOCX extractors).
 fn section_path_of(segments: &[Segment<'_>]) -> String {
     segments
         .iter()
@@ -174,8 +142,6 @@ fn section_path_of(segments: &[Segment<'_>]) -> String {
         .join(" > ")
 }
 
-/// Joins path segments into a `/`-separated JSON-pointer-ish anchor path.
-/// Empty segment list → `""` (the JSON-pointer root convention).
 fn anchor_path_of(segments: &[Segment<'_>]) -> String {
     if segments.is_empty() {
         return String::new();
@@ -188,14 +154,9 @@ fn anchor_path_of(segments: &[Segment<'_>]) -> String {
     p
 }
 
-/// Walks a `serde_json::Value` tree depth-first, appending one leaf block per
-/// scalar to `sink`. `segments` is the current path (object keys / array
-/// indices). `depth` enforces [`MAX_NESTING_DEPTH`]; deeper subtrees collapse to
-/// a single serialized block (logged). `format` names the format for warnings.
-///
-/// Shared `pub(crate)` so the JSONL and YAML extractors reuse the identical
-/// verbalization (they only differ in how they seed `segments` with a record /
-/// document prefix).
+/// Walks a `serde_json::Value` tree depth-first, appending one leaf block per scalar.
+/// Deeper than [`MAX_NESTING_DEPTH`]: collapse the subtree into one block. Shared
+/// with JSONL/YAML extractors, which seed `segments` with a record/document prefix.
 pub(crate) fn walk_value<'a>(
     value: &'a Value,
     segments: &mut Vec<Segment<'a>>,
@@ -204,8 +165,6 @@ pub(crate) fn walk_value<'a>(
     format: &str,
 ) {
     if depth > MAX_NESTING_DEPTH {
-        // Collapse the over-deep subtree into one block (never recurse past the
-        // cap — guards against stack overflow on adversarial input).
         let section_path = section_path_of(segments);
         let anchor_path = anchor_path_of(segments);
         tracing::warn!(
@@ -221,12 +180,9 @@ pub(crate) fn walk_value<'a>(
 
     match value {
         Value::Object(map) => {
-            // Without the `preserve_order` feature, `serde_json::Map` is backed
-            // by a `BTreeMap`, so its keys are ALREADY in alphabetical order.
-            // The explicit `keys.sort()` is a defensive determinism guard: if
-            // `preserve_order` is ever enabled upstream (switching the backing
-            // store to insertion-ordered `IndexMap`), the canonical buffer must
-            // STILL be deterministic regardless of source key order.
+            // Explicit sort is a defensive determinism guard: if `preserve_order`
+            // is ever enabled (switching BTreeMap → IndexMap), the canonical buffer
+            // stays deterministic regardless of source key order.
             let mut keys: Vec<&String> = map.keys().collect();
             keys.sort();
             for k in keys {
@@ -262,7 +218,6 @@ pub(crate) fn walk_value<'a>(
                 );
             }
         }
-        // A scalar leaf: emit one block at the current path.
         scalar => {
             let section_path = section_path_of(segments);
             let anchor_path = anchor_path_of(segments);
@@ -287,10 +242,6 @@ impl Extractor for JsonExtractor {
         Ok(sink.finish())
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests (TDD: RED first)
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -334,12 +285,10 @@ mod tests {
 
     #[test]
     fn json_multibyte_utf8_byte_identity() {
-        // 日本語 = 9 bytes, 🦀 = 4 bytes.
         let out = extract(r#"{"日本語":"🦀"}"#);
         assert_eq!(out.blocks.len(), 1);
         assert_byte_identity(&out);
         let b = &out.blocks[0];
-        // Offsets are BYTE offsets: end - start == byte length of the text.
         assert_eq!(b.char_end - b.char_start, b.text.len());
         assert!(b.text.contains("日本語"));
         assert!(b.text.contains("🦀"));
@@ -359,7 +308,6 @@ mod tests {
     #[test]
     fn json_key_order_is_alphabetical() {
         let out = extract(r#"{"z":1,"a":2}"#);
-        // `/a: 2` block precedes `/z: 1` block (BTreeMap/sorted traversal).
         let a_idx = out
             .blocks
             .iter()
@@ -409,7 +357,6 @@ mod tests {
 
     #[test]
     fn json_deeply_nested_capped() {
-        // Build a 100-level deep object: {"k":{"k":{...1...}}}.
         let mut s = String::new();
         for _ in 0..100 {
             s.push_str(r#"{"k":"#);
@@ -421,18 +368,14 @@ mod tests {
         let out = JsonExtractor
             .extract(s.as_bytes())
             .expect("no panic on deep nesting");
-        // Exactly one (collapsed) block, no stack overflow.
         assert_eq!(out.blocks.len(), 1);
         assert_byte_identity(&out);
     }
 
     #[test]
     fn json_over_deep_collapsed_block_truncated() {
-        // Build a nest deeper than MAX_NESTING_DEPTH whose collapsed subtree
-        // serializes to a large string (a big leaf value), so the single
-        // collapsed block must be capped at ~MAX_COLLAPSED_BLOCK_BYTES.
         let depth = MAX_NESTING_DEPTH + 5;
-        let big_value = "x".repeat(64 * 1024); // 64 KB, well over the 8 KB cap.
+        let big_value = "x".repeat(64 * 1024);
         let mut s = String::new();
         for _ in 0..depth {
             s.push_str(r#"{"k":"#);
@@ -448,8 +391,6 @@ mod tests {
             .expect("deep nesting collapses without panic");
         assert_eq!(out.blocks.len(), 1, "exactly one collapsed block");
         let block = &out.blocks[0];
-        // The block text is `"{anchor_path}: {value}"`; the serialized value is
-        // capped, so the whole line stays within a small margin of the cap.
         assert!(
             block.text.len() <= MAX_COLLAPSED_BLOCK_BYTES + 256,
             "collapsed block must be capped near {MAX_COLLAPSED_BLOCK_BYTES}; got {}",
@@ -476,7 +417,6 @@ mod tests {
         let out = JsonExtractor
             .extract(s.as_bytes())
             .expect("extract large array");
-        // 10,000 element blocks + 1 truncation summary block.
         assert_eq!(out.blocks.len(), MAX_ARRAY_ELEMENTS + 1);
         assert!(
             out.blocks
@@ -505,7 +445,6 @@ mod tests {
     #[test]
     fn json_root_null() {
         let out = extract("null");
-        // `null` at root is a scalar leaf with empty path → one block.
         assert_eq!(out.blocks.len(), 1);
         assert_eq!(out.blocks[0].text, ": null");
         assert_eq!(out.blocks[0].section_path, "");

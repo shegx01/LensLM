@@ -27,15 +27,12 @@ impl Extractor for JsonlExtractor {
         let s = strip_bom(s);
 
         let mut sink = Sink::new();
-        // 0-based record index, incremented ONLY for lines that parse — so the
-        // record discriminant matches the count of successfully-parsed records.
         let mut record_index: usize = 0;
 
         for (line_no, raw_line) in s.split('\n').enumerate() {
-            // Trim a trailing `\r` so Windows CRLF endings parse cleanly.
             let line = raw_line.trim_end_matches('\r');
             if line.trim().is_empty() {
-                continue; // skip blank lines (not an error)
+                continue;
             }
             match serde_json::from_str::<Value>(line) {
                 Ok(value) => {
@@ -56,10 +53,6 @@ impl Extractor for JsonlExtractor {
         Ok(sink.finish())
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests (TDD: RED first)
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -126,14 +119,12 @@ mod tests {
     fn jsonl_empty_lines_skipped() {
         let out = extract("{\"a\":1}\n\n\n{\"b\":2}\n");
         assert!(out.blocks.iter().any(|b| b.text == "/0/a: 1"));
-        // The second record is index 1 (blank lines do not bump the index).
         assert!(out.blocks.iter().any(|b| b.text == "/1/b: 2"));
     }
 
     #[test]
     fn jsonl_invalid_line_skipped_with_warning() {
         let out = extract("{\"a\":1}\nnot json at all\n{\"b\":2}\n");
-        // The valid records still extract; the bad line is skipped (not an error).
         assert!(out.blocks.iter().any(|b| b.text == "/0/a: 1"));
         assert!(out.blocks.iter().any(|b| b.text == "/1/b: 2"));
     }

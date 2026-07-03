@@ -52,7 +52,6 @@ describe('PreferencesShell', () => {
     render(PreferencesShell);
 
     expect(await screen.findByText('Preferences')).toBeInTheDocument();
-    // The full nav order is present.
     for (const label of [
       'General',
       'AI Model',
@@ -64,10 +63,8 @@ describe('PreferencesShell', () => {
     ]) {
       expect(screen.getByRole('button', { name: new RegExp(label, 'i') })).toBeInTheDocument();
     }
-    // General and Embeddings are live (stub: false); the rest carry "Soon" + aria-disabled.
     const general = screen.getByRole('button', { name: /general/i });
     expect(general).not.toHaveAttribute('aria-disabled', 'true');
-    // The live Embeddings section renders by default (default active = 'embeddings').
     expect(screen.getByRole('heading', { name: 'Embeddings' })).toBeInTheDocument();
   });
 
@@ -80,7 +77,6 @@ describe('PreferencesShell', () => {
 
 describe('NotebookSettingsSheet', () => {
   it('titles the sheet with the active notebook and mounts the Embeddings section', async () => {
-    // Seed an active notebook in the store via the real load path.
     notebookRows = [makeNotebook('nb-x', 'Quarterly Review')];
     await loadNotebooks();
     notebookStore.activeNotebookId = 'nb-x';

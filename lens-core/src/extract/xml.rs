@@ -21,27 +21,15 @@ use crate::parse::{Block, BlockType};
 use super::json::{MAX_NESTING_DEPTH, strip_bom, validate_utf8};
 use super::{ExtractOutput, Extractor, SourceAnchor};
 
-/// Safe ceiling on XML element nesting depth, enforced by a cheap single-pass
-/// scan BEFORE `roxmltree` parses (and recursively builds) the DOM. roxmltree
-/// 0.21.1 has no element-nesting limit of its own (its `LoopDetector` only
-/// bounds entity expansion), so an adversarial deeply-nested document — well
-/// under the configurable raw-bytes cap (`max_source_bytes`) — would overflow the stack during
-/// the parser's own recursive descent. This ceiling is comfortably above any
-/// real document yet far below the stack-overflow threshold; the pre-scan is
-/// intentionally conservative (it may over-count slightly) since its only job
-/// is to prevent unbounded recursion.
+/// Nesting ceiling enforced by a pre-scan BEFORE `roxmltree` builds the DOM.
+/// roxmltree 0.21.1 has no element-depth limit of its own, so adversarial
+/// deep nesting would overflow the stack inside its recursive descent.
 const XML_MAX_PARSE_DEPTH: usize = 256;
 
-/// Upper bound on the number of parsed nodes, passed to `roxmltree` to cap
-/// memory amplification on adversarial input (finding M2). One million nodes is
-/// far above any legitimate document while still bounding worst-case allocation.
+/// Node cap passed to `roxmltree` to bound memory on adversarial input.
 const XML_MAX_NODES: u32 = 1_000_000;
 
-/// Detects an XML prolog `encoding="..."` declaration that is NOT UTF-8
-/// (case-insensitive). Returns `true` when an unsupported encoding is declared.
-///
-/// Scans only the prolog (the first `<?xml ... ?>` processing instruction); a
-/// missing declaration or an explicit UTF-8 declaration is fine.
+/// Detects a prolog `encoding="..."` declaration that is NOT UTF-8.
 fn declares_non_utf8_encoding(s: &str) -> bool {
     let prolog = match s.find("?>") {
         Some(end) if s.trim_start().starts_with("<?xml") => &s[..end],
@@ -50,7 +38,6 @@ fn declares_non_utf8_encoding(s: &str) -> bool {
     let Some(enc_pos) = prolog.find("encoding") else {
         return false;
     };
-    // Find the quoted value after `encoding`.
     let after = &prolog[enc_pos + "encoding".len()..];
     let Some(q_rel) = after.find(['"', '\'']) else {
         return false;
@@ -64,16 +51,9 @@ fn declares_non_utf8_encoding(s: &str) -> bool {
     !enc.eq_ignore_ascii_case("utf-8")
 }
 
-/// Cheap single-pass scan of (BOM-stripped, UTF-8-validated) XML that tracks
-/// element nesting depth and returns the maximum depth observed.
-///
-/// It increments on a start tag (`<name ...>`), decrements on an end tag
-/// (`</name>`), and ignores self-closing tags (`<name ... />`), comments
-/// (`<!-- ... -->`), processing instructions / declarations (`<? ... ?>`,
-/// `<! ... >`), CDATA sections (`<![CDATA[ ... ]]>`), and any `<`/`>` that
-/// appear inside a quoted attribute value. It does NOT validate the XML — it is
-/// a conservative resource guard run BEFORE `roxmltree`'s own recursive parse,
-/// so over-counting slightly is acceptable (the ceiling is generous).
+/// Single-pass scan that returns the maximum element nesting depth observed.
+/// Ignores self-closing tags, comments, PIs, CDATA, and `<`/`>` inside quoted
+/// attributes. Does NOT validate XML — conservative guard, over-counting is fine.
 fn max_element_nesting_depth(s: &str) -> usize {
     let bytes = s.as_bytes();
     let mut i = 0;
@@ -86,28 +66,22 @@ fn max_element_nesting_depth(s: &str) -> usize {
             i += 1;
             continue;
         }
-        // We are at a `<`. Classify what follows.
         let next = bytes.get(i + 1).copied();
         match next {
-            // Comment, CDATA, or declaration: `<!...`. None of these change
-            // element depth. Skip past the appropriate terminator.
             Some(b'!') => {
                 if bytes[i..].starts_with(b"<!--") {
-                    // Comment: skip to `-->`.
                     if let Some(end) = find_subslice(&bytes[i + 4..], b"-->") {
                         i = i + 4 + end + 3;
                     } else {
                         break;
                     }
                 } else if bytes[i..].starts_with(b"<![CDATA[") {
-                    // CDATA: skip to `]]>`.
                     if let Some(end) = find_subslice(&bytes[i + 9..], b"]]>") {
                         i = i + 9 + end + 3;
                     } else {
                         break;
                     }
                 } else {
-                    // Other declaration (e.g. `<!DOCTYPE ...>`): skip to `>`.
                     if let Some(end) = find_byte(&bytes[i + 1..], b'>') {
                         i = i + 1 + end + 1;
                     } else {
@@ -115,7 +89,6 @@ fn max_element_nesting_depth(s: &str) -> usize {
                     }
                 }
             }
-            // Processing instruction / prolog: `<? ... ?>`. No depth change.
             Some(b'?') => {
                 if let Some(end) = find_subslice(&bytes[i + 2..], b"?>") {
                     i = i + 2 + end + 2;
@@ -123,7 +96,6 @@ fn max_element_nesting_depth(s: &str) -> usize {
                     break;
                 }
             }
-            // End tag: `</name>`. Decrement depth.
             Some(b'/') => {
                 if let Some(end) = scan_tag_end(bytes, i + 2) {
                     depth = depth.saturating_sub(1);
@@ -132,7 +104,6 @@ fn max_element_nesting_depth(s: &str) -> usize {
                     break;
                 }
             }
-            // Start tag (or self-closing): `<name ...>` / `<name ... />`.
             Some(_) => {
                 if let Some((end, self_closing)) = scan_start_tag(bytes, i + 1) {
                     if !self_closing {
@@ -146,7 +117,6 @@ fn max_element_nesting_depth(s: &str) -> usize {
                     break;
                 }
             }
-            // Trailing `<` at EOF: nothing to do.
             None => break,
         }
     }
@@ -154,15 +124,12 @@ fn max_element_nesting_depth(s: &str) -> usize {
     max_depth
 }
 
-/// Scans from `start` to the closing `>` of an end tag, returning the index of
-/// the `>` (quotes shouldn't appear in an end tag, but we skip them defensively).
 fn scan_tag_end(bytes: &[u8], start: usize) -> Option<usize> {
     find_byte(&bytes[start..], b'>').map(|off| start + off)
 }
 
-/// Scans a start tag beginning at `start` (the byte after `<`), honoring quoted
-/// attribute values so a `>` inside an attribute does not end the tag. Returns
-/// `(index_of_closing_gt, is_self_closing)`.
+/// Scans a start tag from `start`, honoring quoted attribute values so a `>` inside
+/// an attribute does not end the tag. Returns `(index_of_closing_gt, is_self_closing)`.
 fn scan_start_tag(bytes: &[u8], start: usize) -> Option<(usize, bool)> {
     let len = bytes.len();
     let mut i = start;
@@ -189,12 +156,10 @@ fn scan_start_tag(bytes: &[u8], start: usize) -> Option<(usize, bool)> {
     None
 }
 
-/// Finds the first occurrence of `byte` in `haystack`, returning its index.
 fn find_byte(haystack: &[u8], byte: u8) -> Option<usize> {
     haystack.iter().position(|&b| b == byte)
 }
 
-/// Finds the first occurrence of `needle` in `haystack`, returning its start index.
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
@@ -203,11 +168,8 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 /// Recursively walks `node`, appending one block per text-bearing element.
-///
-/// `segments` is the current element-name path. `depth` enforces
-/// [`MAX_NESTING_DEPTH`]. Each element's DIRECT text children (and CDATA) are
-/// concatenated; if non-empty, a block is emitted with the element's attributes
-/// prepended as `@name=value `.
+/// Direct text children (and CDATA) are concatenated; attributes are prepended
+/// as `@name=value `. Depth is bounded by [`MAX_NESTING_DEPTH`].
 fn walk_element(
     node: Node<'_, '_>,
     segments: &mut Vec<String>,
@@ -217,8 +179,6 @@ fn walk_element(
     anchors: &mut Vec<SourceAnchor>,
 ) {
     let tag = node.tag_name().name();
-    // Preserve a namespace prefix if the source used one (roxmltree exposes the
-    // resolved prefix separately from the local name).
     let qualified = match node.lookup_prefix(node.tag_name().namespace().unwrap_or("")) {
         Some(prefix) if !prefix.is_empty() => format!("{prefix}:{tag}"),
         _ => tag.to_string(),
@@ -235,7 +195,6 @@ fn walk_element(
         return;
     }
 
-    // Collect this element's DIRECT text + CDATA (not descendant element text).
     let mut text = String::new();
     for child in node.children() {
         if matches!(child.node_type(), NodeType::Text)
@@ -246,7 +205,6 @@ fn walk_element(
     }
     let text = text.trim().to_string();
 
-    // Prepend attributes (if any) so they are searchable in the canonical buffer.
     let mut rendered = String::new();
     for attr in node.attributes() {
         rendered.push('@');
@@ -275,7 +233,6 @@ fn walk_element(
         anchors.push(SourceAnchor::Structured { path: anchor_path });
     }
 
-    // Recurse into child elements.
     for child in node.children() {
         if child.is_element() {
             walk_element(child, segments, depth + 1, buf, blocks, anchors);
@@ -285,7 +242,6 @@ fn walk_element(
     segments.pop();
 }
 
-/// Joins element-name segments into a `/`-separated anchor path.
 fn anchor_path_of(segments: &[String]) -> String {
     let mut p = String::new();
     for s in segments {
@@ -309,18 +265,13 @@ impl Extractor for XmlExtractor {
             ));
         }
 
-        // Resource guard: bound element nesting BEFORE handing the input to
-        // `roxmltree`, whose own parse is a recursive descent that would
-        // overflow the stack on adversarial deep nesting (it has no element
-        // depth limit of its own).
         if max_element_nesting_depth(s) > XML_MAX_PARSE_DEPTH {
             return Err(LensError::Validation(
                 "XML nesting depth exceeds supported limit".to_string(),
             ));
         }
 
-        // `allow_dtd` stays at its `false` default to preserve XXE /
-        // billion-laughs protection; `nodes_limit` bounds memory amplification.
+        // `allow_dtd` keeps its `false` default (XXE / billion-laughs protection).
         let opts = ParsingOptions {
             nodes_limit: XML_MAX_NODES,
             ..ParsingOptions::default()
@@ -350,10 +301,6 @@ impl Extractor for XmlExtractor {
         })
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests (TDD: RED first)
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -446,7 +393,6 @@ mod tests {
     #[test]
     fn xml_empty_elements_skipped() {
         let out = extract("<root><empty/><name>Alice</name></root>");
-        // `<empty/>` produces no block.
         assert!(!out.blocks.iter().any(|b| b.section_path.ends_with("empty")));
         assert!(out.blocks.iter().any(|b| b.text == "Alice"));
     }
@@ -536,17 +482,13 @@ mod tests {
         let out = XmlExtractor
             .extract(s.as_bytes())
             .expect("no panic on deep nesting");
-        // The deepest text is past the cap, so it is skipped — but no panic and
-        // byte-identity still holds for whatever WAS emitted.
         assert_byte_identity(&out);
     }
 
     #[test]
     fn xml_extreme_nesting_rejected_without_crash() {
-        // ~50,000 nested `<a>` elements: well under MAX_SOURCE_BYTES, but far
-        // beyond what roxmltree's recursive parse could handle without
-        // overflowing the stack. The pre-scan guard must reject it as an Err
-        // (NOT panic / crash) WITHOUT invoking roxmltree.
+        // 50,000 nested elements: the pre-scan guard must reject as Err without
+        // invoking roxmltree (which would overflow the stack).
         let n = 50_000;
         let mut s = String::with_capacity(n * 7);
         for _ in 0..n {
@@ -567,9 +509,6 @@ mod tests {
 
     #[test]
     fn xml_normal_depth_still_ok() {
-        // A normal-depth document (50 levels) is below both the walk-time
-        // MAX_NESTING_DEPTH (64) and the new pre-scan ceiling
-        // XML_MAX_PARSE_DEPTH (256), so it must parse AND emit the deepest text.
         let n = 50;
         let mut s = String::new();
         for _ in 0..n {
@@ -590,14 +529,11 @@ mod tests {
 
     #[test]
     fn xml_self_closing_and_comments_not_counted_as_depth() {
-        // Self-closing tags, comments, PIs, and CDATA must not inflate the
-        // depth count. A flat document with many of these stays at depth 1.
         let mut s = String::from("<root>");
         for _ in 0..1000 {
             s.push_str("<empty/><!-- c --><![CDATA[x]]>");
         }
         s.push_str("</root>");
-        // Depth is 1 (root), so this must parse fine despite 1000 self-closers.
         assert_eq!(max_element_nesting_depth(&s), 1);
         let out = XmlExtractor.extract(s.as_bytes()).expect("flat XML parses");
         assert!(out.blocks.iter().any(|b| b.text.contains('x')));
@@ -605,8 +541,6 @@ mod tests {
 
     #[test]
     fn xml_gt_inside_attribute_not_a_tag_boundary() {
-        // A `>` inside a quoted attribute value must not be treated as the end
-        // of the start tag by the depth scanner.
         let src = r#"<root><item note="a > b">text</item></root>"#;
         assert_eq!(max_element_nesting_depth(src), 2);
     }

@@ -1,12 +1,6 @@
 <!--
-  IngestionSection — the "Ingestion" panel inside the global Preferences view
-  (issue #78: JS-render toggle). Mounted by PreferencesShell when the user
-  selects the Ingestion nav item.
-
-  Wires to the existing `get_config` / `set_config` commands via the shared
-  `updateConfig` read-modify-write helper — no new Rust command.
-
-  Tokens only — light + dark + every accent ([[theming-light-dark-accent]]).
+  IngestionSection — the "Ingestion" panel inside the global Preferences view.
+  Wires to `get_config` / `set_config` via `updateConfig` — no new Rust command.
 -->
 <script lang="ts">
   import { onMount } from 'svelte';
@@ -15,7 +9,6 @@
   import type { AppConfig } from '$lib/theme/types.js';
   import { updateConfig } from '$lib/config.js';
 
-  // ── State ──────────────────────────────────────────────────────────────────
   let jsRenderEnabled = $state(true);
   let saving = $state(false);
   let saveError = $state<string | null>(null);
@@ -49,13 +42,11 @@
 </script>
 
 <section class="flex flex-col" aria-label="Ingestion settings">
-  <!-- Title + subtitle -->
   <h2 class="text-xl font-extrabold tracking-[-0.4px] text-foreground">Ingestion</h2>
   <p class="mt-1 text-[0.8rem] text-muted-foreground">
     Controls how web pages and other sources are processed when added.
   </p>
 
-  <!-- ── JS render toggle ── -->
   <div class="mt-6">
     <p class="text-[0.65rem] font-bold uppercase tracking-[0.08em] text-muted-foreground/70">
       Web page rendering

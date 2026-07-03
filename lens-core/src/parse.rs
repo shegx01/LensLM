@@ -333,27 +333,17 @@ pub fn parse_blocks(src: &str, kind: SourceKind) -> Vec<Block> {
 fn parse_text(src: &str) -> Vec<Block> {
     let mut blocks = Vec::new();
 
-    // Walk the source byte-by-byte tracking paragraph boundaries.
-    // A paragraph starts at the first non-whitespace-line byte after either the
-    // beginning of the string or a blank line; it ends just before the blank line.
     let len = src.len();
     let mut pos = 0usize;
 
     while pos < len {
-        // Skip leading blank lines / whitespace-only lines.
         let para_start = skip_blank_lines(src, pos);
         if para_start >= len {
             break;
         }
 
-        // Advance until we hit a blank line (two consecutive newlines with only
-        // whitespace between) or the end of the string.
         let para_end = find_paragraph_end(src, para_start);
 
-        // Trim the segment to remove trailing newline/whitespace without losing
-        // the byte-start anchor.  The `text` field holds the trimmed content but
-        // `char_start` points to the un-trimmed start; we re-anchor char_start to
-        // the first non-whitespace byte so the invariant still holds.
         let raw = &src[para_start..para_end];
         let trimmed = raw.trim();
         if trimmed.is_empty() {
@@ -379,12 +369,9 @@ fn parse_text(src: &str) -> Vec<Block> {
     blocks
 }
 
-/// Returns the byte index of the first non-blank-line character at or after
-/// `pos` in `src`.
 fn skip_blank_lines(src: &str, mut pos: usize) -> usize {
     let len = src.len();
     while pos < len {
-        // Find the end of this line.
         let line_start = pos;
         let line_end = src[pos..].find('\n').map(|i| pos + i + 1).unwrap_or(len);
         let line = &src[line_start..line_end];
@@ -397,8 +384,6 @@ fn skip_blank_lines(src: &str, mut pos: usize) -> usize {
     pos
 }
 
-/// Returns the byte index of the end of the current paragraph starting at
-/// `start` (i.e. just before the first blank line, or `src.len()`).
 fn find_paragraph_end(src: &str, start: usize) -> usize {
     let len = src.len();
     let mut pos = start;
@@ -409,7 +394,6 @@ fn find_paragraph_end(src: &str, start: usize) -> usize {
         let line_end = src[pos..].find('\n').map(|i| pos + i + 1).unwrap_or(len);
         let line = &src[pos..line_end];
         if line.trim().is_empty() {
-            // This line is blank — the paragraph ended on the previous line.
             return pos;
         }
         pos = line_end;
@@ -423,7 +407,6 @@ fn find_paragraph_end(src: &str, start: usize) -> usize {
 // Markdown path
 // ---------------------------------------------------------------------------
 
-/// Heading level (H1=1 … H6=6) for [`SectionPathStack::push`].
 fn heading_level_u8(level: HeadingLevel) -> u8 {
     match level {
         HeadingLevel::H1 => 1,
@@ -633,20 +616,9 @@ fn parse_markdown(src: &str) -> Vec<Block> {
             Event::End(TagEnd::Heading(level)) => {
                 if let Some((BlockContext::Heading, byte_start, path)) = ctx_stack.pop() {
                     let byte_end = range.end;
-                    // Collect the raw heading bytes from src and extract the
-                    // inner text (strips Markdown syntax like `## `).
                     let raw = &src[byte_start..byte_end];
-                    // The heading *text* is the trimmed text content within the
-                    // tag.  We extract it by stripping leading `#` markers and
-                    // whitespace from the raw slice.
                     let heading_text = extract_heading_text(raw);
-
-                    // Update the heading stack: record this heading at its level
-                    // and clear all deeper levels (handled by `push`).
                     heading_stack.push(heading_level_u8(level), heading_text);
-
-                    // Emit a "heading" block. `text` is the trimmed heading
-                    // text; `char_start/char_end` anchor to that text inside src.
                     let (start, end) = locate_in_src(src, heading_text, byte_start, byte_end);
                     if end > start {
                         blocks.push(Block {
@@ -660,9 +632,8 @@ fn parse_markdown(src: &str) -> Vec<Block> {
                 }
             }
 
-            // All other events (text, soft breaks, hard breaks, …) are handled
-            // by the outer tag events above through the raw source slice — we do
-            // not reconstruct text from individual Event::Text nodes.
+            // Text/break events are subsumed by the enclosing tag's raw source
+            // slice — we never reconstruct text from individual Event::Text nodes.
             _ => {}
         }
     }
@@ -716,11 +687,9 @@ fn is_blank_or_marker(s: &str) -> bool {
     if s.is_empty() {
         return true;
     }
-    // Bullet markers.
     if matches!(s, "-" | "*" | "+") {
         return true;
     }
-    // Ordered markers: digits followed by a single `.` or `)`.
     let mut chars = s.chars();
     let mut saw_digit = false;
     for c in chars.by_ref() {
@@ -730,7 +699,6 @@ fn is_blank_or_marker(s: &str) -> bool {
             return saw_digit && (c == '.' || c == ')') && chars.next().is_none();
         }
     }
-    // All digits, no terminator → not a marker on its own.
     false
 }
 
@@ -748,7 +716,6 @@ fn emit_block(
     byte_end: usize,
     blocks: &mut Vec<Block>,
 ) {
-    // Guard against out-of-range or inverted ranges (defensive).
     if byte_start >= byte_end || byte_end > src.len() {
         return;
     }
@@ -785,8 +752,7 @@ fn locate_in_src(
         return (window_start, window_start);
     }
     let window = &src[window_start..window_end.min(src.len())];
-    // `needle` was derived from `window.trim()`, so its bytes must be a
-    // contiguous sub-slice of `window`.  We locate it by pointer arithmetic.
+    // `needle` is a sub-slice of `window`; locate it by pointer arithmetic.
     let needle_ptr = needle.as_ptr() as usize;
     let window_ptr = window.as_ptr() as usize;
     if needle_ptr >= window_ptr && needle_ptr + needle.len() <= window_ptr + window.len() {
@@ -828,15 +794,8 @@ fn extract_heading_text(raw: &str) -> &str {
         return title;
     }
 
-    // ATX headings start with one or more '#' characters followed by whitespace.
-    // Trim trailing whitespace first so any ATX closing `#` run sits at the very
-    // end of the slice (the raw range may carry a trailing newline).
     let stripped = raw.trim_start_matches('#').trim();
-    // Strip an ATX closing `#` run only when it is preceded by whitespace (or is
-    // the whole remainder) — a `#` glued to a word (e.g. `C#`) is part of the
-    // heading text, not a closing marker.
     let stripped = strip_atx_closing(stripped).trim_end();
-    // If nothing was stripped fall back to a plain trim (setext headings).
     if stripped.is_empty() {
         raw.trim()
     } else {
@@ -852,9 +811,7 @@ fn extract_heading_text(raw: &str) -> &str {
 /// the caller's `locate_in_src` recovers an exact byte span — preserving
 /// byte-identity for the narrowed heading block.
 fn setext_title(raw: &str) -> Option<&str> {
-    // Collect non-empty lines with their trimmed forms.
     let mut lines: Vec<&str> = raw.lines().filter(|l| !l.trim().is_empty()).collect();
-    // Need at least a title and an underline.
     if lines.len() < 2 {
         return None;
     }
@@ -867,8 +824,6 @@ fn setext_title(raw: &str) -> Option<&str> {
     if !is_setext_underline {
         return None;
     }
-    // The title is the first remaining content line, trimmed. A setext title is a
-    // single line in CommonMark; use the first non-empty line.
     let title = lines.first()?.trim();
     if title.is_empty() { None } else { Some(title) }
 }
@@ -880,15 +835,14 @@ fn setext_title(raw: &str) -> Option<&str> {
 fn strip_atx_closing(s: &str) -> &str {
     let without_hashes = s.trim_end_matches('#');
     if without_hashes.len() == s.len() {
-        // No trailing `#` at all.
         return s;
     }
-    // The closing marker is valid only when the char immediately before the `#`
-    // run is whitespace, or the whole remainder is `#` (e.g. `#` / `###`).
+    // Valid closing marker only when the char before the `#` run is whitespace
+    // (or the whole remainder is `#`s); a glued `#` (e.g. `C#`) stays intact.
     match without_hashes.chars().next_back() {
-        None => without_hashes, // entire remainder was `#`s
+        None => without_hashes,
         Some(c) if c.is_whitespace() => without_hashes,
-        Some(_) => s, // glued `#` — keep it
+        Some(_) => s,
     }
 }
 
@@ -900,7 +854,6 @@ fn strip_atx_closing(s: &str) -> &str {
 mod tests {
     use super::*;
 
-    /// Verify the byte-identity invariant for every block returned by the parser.
     fn assert_byte_identity(src: &str, blocks: &[Block]) {
         for (i, b) in blocks.iter().enumerate() {
             assert!(
@@ -961,7 +914,6 @@ mod tests {
         let blocks = parse_blocks(src, SourceKind::Markdown);
         assert_byte_identity(src, &blocks);
 
-        // Find the paragraph block under ### C
         let para_c = blocks
             .iter()
             .find(|b| b.block_type == "paragraph" && b.text == "Content under C.")
@@ -975,15 +927,12 @@ mod tests {
         let blocks = parse_blocks(src, SourceKind::Markdown);
         assert_byte_identity(src, &blocks);
 
-        // "Text under B." should have section_path "A > B".
         let under_b = blocks
             .iter()
             .find(|b| b.block_type == "paragraph" && b.text == "Text under B.")
             .expect("paragraph under ## B");
         assert_eq!(under_b.section_path, "A > B");
 
-        // "# New A" replaces H1 and clears H2+, so the paragraph beneath it
-        // has section_path "New A" (only H1 active, no H2).
         let under_new_a = blocks
             .iter()
             .find(|b| b.block_type == "paragraph" && b.text == "Text under New A.")
@@ -1019,7 +968,6 @@ mod tests {
     #[test]
     fn source_kind_roundtrip_and_wire_strings() {
         use std::str::FromStr;
-        // Lock the EXACT persisted wire strings (no DB migration).
         let cases = [
             (SourceKind::Text, "text"),
             (SourceKind::Markdown, "markdown"),
@@ -1143,7 +1091,6 @@ mod tests {
     #[test]
     fn block_type_roundtrip_and_wire_strings() {
         use std::str::FromStr;
-        // Lock the EXACT persisted `chunks.block_type` strings.
         let cases = [
             (BlockType::Heading, "heading"),
             (BlockType::Paragraph, "paragraph"),
@@ -1181,7 +1128,6 @@ mod tests {
             .find(|b| b.block_type == "heading")
             .expect("heading should exist");
         assert_eq!(heading.text, "C#");
-        // The propagated section_path on the body inherits the intact heading.
         let body = blocks
             .iter()
             .find(|b| b.block_type == "paragraph")
@@ -1236,10 +1182,7 @@ mod tests {
                 t.text
             );
         }
-        // section_path is the active heading trail.
         assert_eq!(t.section_path, "T");
-        // The table events must not pollute other arms: no cell text leaks into a
-        // paragraph/list_item block.
         for b in &blocks {
             if b.block_type != "table" {
                 for cell in ["Fruit", "Apple", "Lime", "Green"] {
@@ -1269,11 +1212,9 @@ mod tests {
             .collect();
         assert_eq!(items.len(), 2, "exactly two list_item blocks");
 
-        // "inner" appears in EXACTLY one block (the inner one).
         let inner_count = items.iter().filter(|b| b.text.contains("inner")).count();
         assert_eq!(inner_count, 1, "'inner' must appear in exactly one block");
 
-        // The outer block must NOT contain the inner text (no duplication).
         let outer = items
             .iter()
             .find(|b| b.text.contains("outer"))
@@ -1284,7 +1225,6 @@ mod tests {
             outer.text
         );
 
-        // Document order: the outer block precedes the inner block.
         let outer_idx = items.iter().position(|b| b.text.contains("outer")).unwrap();
         let inner_idx = items.iter().position(|b| b.text.contains("inner")).unwrap();
         assert!(
@@ -1333,7 +1273,6 @@ mod tests {
             blocks
         );
 
-        // No block may span both the item's own-text and the nested item text.
         for b in &blocks {
             assert!(
                 !(b.text.contains("a") && b.text.contains("b") && b.text.contains("trailing")),
@@ -1361,7 +1300,6 @@ mod tests {
             blocks
         );
 
-        // Cell content must live only in the table block, never in a list_item.
         for b in &blocks {
             if b.block_type != "table" {
                 for cell in ["A", "B", "1", "2"] {
@@ -1395,7 +1333,6 @@ mod tests {
                 blocks
             );
         }
-        // "x" (the only real content) must still be present exactly once.
         let x_count = blocks.iter().filter(|b| b.text.contains('x')).count();
         assert_eq!(x_count, 1, "nested 'x' should appear exactly once");
     }
@@ -1418,7 +1355,6 @@ mod tests {
             "setext heading text must exclude the underline"
         );
 
-        // No newline or '=' may appear in any heading text or section_path.
         for b in &blocks {
             if b.block_type == "heading" {
                 assert!(
@@ -1442,7 +1378,7 @@ mod tests {
         assert_eq!(body.section_path, "My Heading");
     }
 
-    /// Setext H2 (`---` underline) must be handled identically.
+    /// Setext H2 (`---` underline) must behave identically to H1.
     #[test]
     fn markdown_setext_h2_clean_text() {
         let src = "Subtitle\n--------\n\nbody\n";
@@ -1467,8 +1403,6 @@ mod tests {
             .filter(|b| b.block_type == "list_item")
             .collect();
         assert_eq!(items.len(), 3, "one block per item");
-        // Each item's own block ends with its marker letter and does NOT contain
-        // any deeper letter (no parent includes its children's text).
         let block_for = |letter: char| -> &Block {
             items
                 .iter()
@@ -1484,7 +1418,6 @@ mod tests {
             "a excludes b,c"
         );
         assert!(!b.text.contains('c'), "b excludes c");
-        // Document order a < b < c.
         let pos = |target: &Block| items.iter().position(|x| std::ptr::eq(*x, target)).unwrap();
         assert!(pos(a) < pos(b) && pos(b) < pos(c), "document order a<b<c");
     }

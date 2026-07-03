@@ -1,26 +1,9 @@
-// NotebookTopBar.svelte.test.ts
-//
-// Component tests for the center top-bar chrome.
-//
-// Covers:
-//   - Renders the active notebook title
-//   - Renders nothing when activeNotebook is null
-//   - Chat/Notes toggle reflects activeTab from the store
-//   - Clicking Chat/Notes buttons updates activeTab
-//   - Share button is disabled
-//   - Settings button is disabled
-//   - Tooltip text is present on the disabled buttons
-//
-// The `$lib/notebooks` barrel is mocked with a minimal fake store so no real
-// IPC or Tauri globals are needed. `activeTab` is exposed as a writable property.
-// `resetNotebookStore` is called in afterEach to prevent cross-test bleed.
+// NotebookTopBar component tests.
+// Covers: active title, Chat/Notes toggle, disabled Share/Settings, drag-region.
+// `$lib/notebooks` is mocked — no Tauri IPC required.
 
 import { render, screen, fireEvent } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-
-// ---------------------------------------------------------------------------
-// Hoisted mock refs — must be created before vi.mock factory runs
-// ---------------------------------------------------------------------------
 
 const { mockStore } = vi.hoisted(() => {
   let _activeNotebook: { id: string; title: string } | null = {
@@ -56,20 +39,13 @@ const { mockStore } = vi.hoisted(() => {
   };
 });
 
-// Mock the $lib/notebooks barrel — the component imports `notebookStore` from here.
 vi.mock('$lib/notebooks/index.js', () => ({
   notebookStore: mockStore
 }));
 
-// Import component after mocks are set up.
 import NotebookTopBar from './NotebookTopBar.svelte';
 
-// ---------------------------------------------------------------------------
-// Lifecycle
-// ---------------------------------------------------------------------------
-
 beforeEach(() => {
-  // Reset to default state before each test
   mockStore._setActiveNotebook({ id: 'nb-001', title: 'Alpha Research' });
   mockStore._setActiveTab('chat');
 });
@@ -77,10 +53,6 @@ beforeEach(() => {
 afterEach(() => {
   vi.clearAllMocks();
 });
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 describe('NotebookTopBar', () => {
   describe('when a notebook is active', () => {
@@ -158,7 +130,6 @@ describe('NotebookTopBar', () => {
     it('the outer bar row carries data-tauri-drag-region (the floating pill itself does not)', () => {
       render(NotebookTopBar);
       const toolbar = screen.getByRole('toolbar', { name: /notebook toolbar/i });
-      // The floating pill is interactive and is NOT a drag region; its parent row is.
       expect(toolbar).not.toHaveAttribute('data-tauri-drag-region');
       expect(toolbar.parentElement).toHaveAttribute('data-tauri-drag-region');
     });
@@ -168,9 +139,8 @@ describe('NotebookTopBar', () => {
     it('still renders the full header (pill + Chat/Notes tabs + share + settings) without a title', () => {
       mockStore._setActiveNotebook(null);
       render(NotebookTopBar);
-      // The header/pill is always present so the tabs + share/settings stay visible.
       expect(screen.getByRole('toolbar', { name: /notebook toolbar/i })).toBeInTheDocument();
-      expect(screen.getAllByRole('tab')).toHaveLength(2); // Chat | Notes always shown
+      expect(screen.getAllByRole('tab')).toHaveLength(2);
       expect(screen.getByRole('button', { name: /share/i })).toBeInTheDocument();
       expect(screen.getByRole('button', { name: /settings/i })).toBeInTheDocument();
     });

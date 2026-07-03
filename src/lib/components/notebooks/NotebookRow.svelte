@@ -31,10 +31,6 @@
     collapsed?: boolean;
   } = $props();
 
-  // ---------------------------------------------------------------------------
-  // Inline rename state
-  // ---------------------------------------------------------------------------
-
   let renaming = $state(false);
   let draft = $state('');
   let inputEl = $state<HTMLInputElement | null>(null);
@@ -83,10 +79,6 @@
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Derived display values
-  // ---------------------------------------------------------------------------
-
   const sourceLabel = $derived(formatSourceCount(notebook.source_count));
   const relTime = $derived(formatRelativeTime(notebook.updated_at));
   const accentClass = $derived(notebookColorClass(notebook.id));
@@ -108,7 +100,6 @@
     <BookOpen class="size-4" />
   </button>
 {:else}
-  <!-- Expanded: full row -->
   <div
     role="button"
     tabindex="0"
@@ -145,7 +136,6 @@
       <BookOpen class="size-4" />
     </div>
 
-    <!-- Title + subtitle -->
     <div class="min-w-0 flex-1">
       {#if renaming}
         <input
@@ -178,7 +168,6 @@
       </p>
     </div>
 
-    <!-- Trash icon: visible on hover or when row is active -->
     <button
       type="button"
       aria-label={`Delete ${notebook.title}`}

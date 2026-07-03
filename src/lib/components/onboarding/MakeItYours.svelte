@@ -1,8 +1,5 @@
 <!-- PROP CONTRACT (do not change without updating +layout.svelte):
-     onadvance: () => void  — advance to 'create-notebook' (after persisting user_name + accent)
-     onback:    () => void  — return to 'system-check'
-     Reads/writes the shared draft via $lib/components/onboarding/onboarding-state.svelte.ts
-     (draft.userName, draft.accent). -->
+     onadvance → 'create-notebook', onback → 'system-check'. Reads/writes draft.userName + draft.accent. -->
 <script lang="ts">
   import { onMount } from 'svelte';
   import ArrowRight from '@lucide/svelte/icons/arrow-right';
@@ -23,7 +20,6 @@
   let saving = $state(false);
   let continueError = $state<string | null>(null);
 
-  // Disabled while name is blank
   const canContinue = $derived(draft.userName.trim().length > 0);
 
   /** Apply the accent immediately to the DOM so the live preview retints. */
@@ -52,7 +48,6 @@
     }
   }
 
-  // On mount, sync the DOM data-accent attribute from the draft (handles Back-navigation).
   onMount(() => {
     document.documentElement.dataset.accent = draft.accent;
   });
@@ -64,19 +59,16 @@
 <main data-tauri-drag-region class="flex min-h-svh items-center justify-center p-6">
   <div class="w-full max-w-[520px]" style="-webkit-app-region: no-drag;">
     <Card class="w-full rounded-[14px] px-10 pt-9 pb-8 shadow-2xl ring-0">
-      <!-- Header row: Back button (left) + 3-dot progress indicator (right) -->
       <div class="mb-7 flex items-center justify-between">
         <OnboardingBackButton {onback} />
         <ProgressDots current={1} total={3} />
       </div>
 
-      <!-- Title + subtitle -->
       <h1 class="text-foreground mb-1.5 text-[20px] font-bold tracking-tight">Make it yours</h1>
       <p class="text-muted-foreground mb-[22px] text-[13px]">
         Tell us your name and pick an accent — both editable later in Settings.
       </p>
 
-      <!-- YOUR NAME field -->
       <div class="mb-[22px]">
         <div
           class="text-muted-foreground mb-2 text-[10px] font-bold tracking-[0.08em] uppercase"
@@ -93,13 +85,11 @@
         />
       </div>
 
-      <!-- Live preview card -->
       <div
         class="bg-muted/40 border-border mb-6 flex items-center gap-3 rounded-[10px] border p-4"
         aria-label="Accent colour preview"
         aria-live="polite"
       >
-        <!-- Search icon square -->
         <div
           class="bg-primary flex size-[38px] shrink-0 items-center justify-center rounded-[10px]"
           aria-hidden="true"
@@ -107,7 +97,6 @@
           <Search class="text-primary-foreground size-[18px]" />
         </div>
 
-        <!-- Middle: chip + sub-text -->
         <div class="min-w-0 flex-1">
           <span
             class="text-primary bg-primary/10 mb-[5px] inline-block rounded px-2 py-0.5 text-[10px] font-bold"
@@ -119,7 +108,6 @@
           </div>
         </div>
 
-        <!-- Ask button (static preview) -->
         <button
           type="button"
           tabindex="-1"
@@ -130,7 +118,6 @@
         </button>
       </div>
 
-      <!-- ACCENT label -->
       <div
         class="text-muted-foreground mb-3.5 text-[10px] font-bold tracking-[0.08em] uppercase"
         id="accent-label"
@@ -138,7 +125,6 @@
         Accent
       </div>
 
-      <!-- Swatch grid: 6 columns -->
       <div
         class="mb-[30px] grid grid-cols-6 gap-[10px]"
         role="radiogroup"
@@ -155,7 +141,6 @@
             class="flex cursor-pointer flex-col items-center gap-2 border-0 bg-transparent p-0 hover:opacity-85 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2"
             style="focus-visible:ring-color: {sw.solid}"
           >
-            <!-- Circle swatch with fixed solid color + selection ring -->
             <div
               class="flex size-[38px] items-center justify-center rounded-full transition-shadow duration-[140ms]"
               style:background={sw.solid}
@@ -166,7 +151,6 @@
                 <Check class="size-[15px] text-white" stroke-width={3} />
               {/if}
             </div>
-            <!-- Label below swatch -->
             <span
               class="text-[10px] font-semibold transition-colors"
               class:text-foreground={selected}
@@ -178,7 +162,6 @@
         {/each}
       </div>
 
-      <!-- Inline error (mirrors SystemCheck continueError pattern) -->
       {#if continueError}
         <p class="text-destructive mb-3 flex items-center gap-1.5 text-center text-sm" role="alert">
           <TriangleAlert class="size-4 shrink-0" />
@@ -186,7 +169,6 @@
         </p>
       {/if}
 
-      <!-- Continue button -->
       <Button
         class="h-[46px] w-full rounded-[10px] text-[15px] font-semibold"
         onclick={handleContinue}

@@ -40,7 +40,6 @@ describe('persistTheme (debounced read-modify-write)', () => {
     expect(written).not.toBeNull();
     const w = written as unknown as AppConfig;
     expect(w.theme).toBe('dark');
-    // Every other field is preserved verbatim (no stale-clobber).
     expect(w.models).toEqual(stored.models);
     expect(w.endpoints).toEqual(stored.endpoints);
     expect(w.voices).toEqual(stored.voices);

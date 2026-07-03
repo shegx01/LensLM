@@ -86,6 +86,8 @@ These are project conventions. Follow them; they override generic habits.
 
 **No superfluous comments.** Comments exist to (1) give directives to human readers and (2) explain _complicated or non-obvious_ code — invariants, ordering constraints, why a workaround exists, ABI/version locks. Otherwise, do not comment the code. Never narrate what the code plainly says (`// increment i`, `// return the result`). If a comment only restates the line below it, delete it and let the code speak.
 
+**Keep explanatory comments short and out of the way.** When a comment _is_ warranted, cap it at **1–3 lines** stating the essential "why" — not a paragraph. Do not write running, line-by-line narration that interleaves with the code and breaks up its flow; a reader should see the code, not a wall of prose around it. If explaining something needs more than three lines, the code (or its naming/structure) is the thing to fix, or the detail belongs in a doc/design note — not inline. This cap applies to `//` inline comments and `///` doc comments alike; keep doc comments to a tight summary.
+
 ### Rust
 
 - **Errors:** use `thiserror`; propagate with `?`. Library/engine code returns `Result<T, LensError>` — the canonical error type serializes across the IPC boundary as `{kind, message}` (locked by a snapshot test). Never leak raw source errors, paths, or internal details across IPC.

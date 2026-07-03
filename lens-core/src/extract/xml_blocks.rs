@@ -36,46 +36,33 @@ pub(crate) enum BlockKind {
     Paragraph,
 }
 
-/// Resolves a quick-xml `GeneralRef` (an `&name;` / `&#NN;` entity reference)
-/// into its textual replacement, appending it to `dst`.
-///
-/// Predefined XML entities (`amp`/`lt`/`gt`/`quot`/`apos`) and numeric character
-/// references are resolved; an unknown entity is preserved verbatim as
-/// `&name;` so no content is silently lost. Shared by the ODT and EPUB walkers.
+/// Resolves a `GeneralRef` entity into its text, appending to `dst`.
+/// Predefined XML entities and numeric character references are resolved;
+/// unknown entities are kept verbatim (`&name;`) so no content is silently lost.
 pub(crate) fn push_general_ref(dst: &mut String, raw: &str, resolved_char: Option<char>) {
     if let Some(c) = resolved_char {
-        // Numeric character reference (`&#NN;` / `&#xNN;`).
         dst.push(c);
     } else if let Some(replacement) = quick_xml::escape::resolve_predefined_entity(raw) {
         dst.push_str(replacement);
     } else {
-        // Unknown entity: keep it verbatim rather than dropping content.
         dst.push('&');
         dst.push_str(raw);
         dst.push(';');
     }
 }
 
-/// In-flight accumulation state for the currently-open block.
 struct OpenBlock {
-    /// Heading outline level (1–6); 0 for a paragraph.
+    /// Outline level (1–6); 0 for a paragraph.
     level: u8,
-    /// Element nesting depth at which this block was opened (relative to the
-    /// open event). A matching end tag finalizes the block only when this returns
-    /// to 0, so a NESTED block-level element (e.g. an ODF footnote `<text:p>`
-    /// inside `<text:note>`) cannot close the outer block early.
+    /// Nesting depth at which this block was opened. A nested block-level end tag
+    /// (e.g. ODF footnote `<text:p>`) cannot close the outer block until depth → 0.
     depth: u32,
     text: String,
 }
 
-/// Walks `xhtml`/`content.xml` text, appending one [`Block`] per block-level
-/// element to the shared buffers (build-as-you-go global byte offsets) and one
-/// anchor per block via `make_anchor`.
-///
-/// `format` is used only in error messages (e.g. `"ODT"`, `"EPUB"`). `classify`
-/// decides which start tags open a block; `inline_whitespace` maps EMPTY tags to
-/// literal whitespace; `make_anchor` builds the per-format anchor for each
-/// emitted block.
+/// Walks XML text appending one [`Block`] per block-level element (build-as-you-go
+/// byte offsets). `format` is for error messages; `classify`/`inline_whitespace`/
+/// `make_anchor` inject the per-format differences (ODT vs EPUB).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn walk_xml_blocks<C, W, A>(
     xml: &str,
@@ -95,16 +82,12 @@ where
 {
     let mut reader = Reader::from_str(xml);
     let mut buf = Vec::new();
-    // Only the OUTERMOST block-level element opens a block; nested inline (and
-    // nested block-level, via the depth counter) elements fold in.
     let mut current: Option<OpenBlock> = None;
 
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
                 if let Some(cur) = current.as_mut() {
-                    // Already inside a block: count nesting depth so a nested
-                    // block-level end tag does not close the outer block early.
                     cur.depth += 1;
                 } else if let Some(kind) = classify(&e) {
                     let level = match kind {
@@ -120,18 +103,12 @@ where
             }
             Ok(Event::Empty(e)) => {
                 if let Some(cur) = current.as_mut() {
-                    // Inside a block: an empty element (e.g. `<text:s/>`,
-                    // `<text:tab/>`, `<br/>`) contributes whitespace but no
-                    // open/close depth change.
                     if let Some(ws) = inline_whitespace(&e) {
                         cur.text.push_str(ws);
                     }
                 } else if let Some(kind) = classify(&e) {
-                    // A self-closing BLOCK element (e.g. `<text:p/>`): it is
-                    // definitionally empty so emits no block, but the per-element
-                    // counter must still advance so node_path positions stay
-                    // stable regardless of `<text:p/>` vs `<text:p></text:p>`
-                    // serialization (parity with the paired-empty case below).
+                    // Self-closing block element: counter must still advance so
+                    // node_path positions stay stable vs paired `<p></p>` form.
                     let is_heading = matches!(kind, BlockKind::Heading(_));
                     let _ = make_anchor(is_heading);
                 }
@@ -164,21 +141,17 @@ where
             Ok(Event::End(_)) => {
                 if let Some(cur) = current.as_mut() {
                     if cur.depth > 0 {
-                        // A nested element closed; the outer block stays open.
                         cur.depth -= 1;
                     } else {
-                        // The block-level element itself closed: finalize.
                         let cur = current.take().expect("current is Some");
                         let is_heading = cur.level > 0;
                         let text = cur.text.trim().to_string();
 
-                        // The anchor is built whether or not the block is empty
-                        // so per-element counters advance for stable positions
-                        // (ODT node_path); the caller decides what to do.
+                        // Anchor built even for empty blocks so ODT node_path counters stay stable.
                         let anchor = make_anchor(is_heading);
 
                         if text.is_empty() {
-                            continue; // skip empty elements
+                            continue;
                         }
 
                         let (btype, sp) = if is_heading {

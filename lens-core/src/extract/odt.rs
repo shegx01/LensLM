@@ -36,54 +36,42 @@ use super::{ExtractOutput, Extractor, SourceAnchor};
 const MAX_DECOMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
 
 /// ODT extractor — implements [`Extractor`].
-///
-/// Byte-identity offsets follow the DOCX build-as-you-go pattern (see docx.rs:204-207).
 pub struct OdtExtractor;
 
 impl Extractor for OdtExtractor {
     fn extract(&self, raw: &[u8]) -> Result<ExtractOutput, LensError> {
-        // 1. Open the ODF ZIP container.
         let mut archive = zip::ZipArchive::new(Cursor::new(raw))
             .map_err(|e| LensError::Parse(format!("ODT is not a valid ZIP container: {e}")))?;
 
-        // 2. Read the `content.xml` entry through a BOUNDED reader so a
-        //    decompression bomb cannot inflate past `MAX_DECOMPRESSED_BYTES`.
         let entry = archive
             .by_name("content.xml")
             .map_err(|e| LensError::Parse(format!("ODT missing content.xml: {e}")))?;
         let content = read_capped(entry, MAX_DECOMPRESSED_BYTES)?;
 
-        // 3. Walk content.xml emitting one block per <text:h> / <text:p> via the
-        //    shared XML block walker.
         let mut extracted_text = String::new();
         let mut blocks: Vec<Block> = Vec::new();
         let mut anchors: Vec<SourceAnchor> = Vec::new();
         let mut section_path = SectionPathStack::new();
 
-        // node_path counters advance per element type regardless of whether the
-        // element is empty (stable positions, mirroring DOCX `body/p[N]`).
+        // Counters advance even for empty elements to keep node_paths stable.
         let mut h_count: usize = 0;
         let mut p_count: usize = 0;
 
         walk_xml_blocks(
             &content,
             "ODT content.xml",
-            // classify: <text:h> is a heading (outline-level, default 1),
-            // <text:p> is a paragraph; everything else is not a block.
             |e: &BytesStart<'_>| match e.name().as_ref() {
                 b"text:h" => Some(BlockKind::Heading(outline_level(e).unwrap_or(1))),
                 b"text:p" => Some(BlockKind::Paragraph),
                 _ => None,
             },
-            // inline_whitespace: ODF inline whitespace elements LibreOffice/Google
-            // Docs emit, which would otherwise run text together.
+            // ODF inline whitespace elements (LibreOffice/Google Docs).
             |e: &BytesStart<'_>| match e.name().as_ref() {
                 b"text:s" => Some(text_s_spaces(e)),
                 b"text:tab" => Some("\t"),
                 b"text:line-break" => Some("\n"),
                 _ => None,
             },
-            // make_anchor: advance the per-kind counter and build the node_path.
             |is_heading: bool| {
                 let node_path = if is_heading {
                     let path = format!("body/text:h[{h_count}]");
@@ -115,11 +103,8 @@ impl Extractor for OdtExtractor {
     }
 }
 
-/// Reads `reader` into a `String` through a BOUNDED reader: at most `max + 1`
-/// bytes are pulled, so an entry whose decompressed length exceeds `max` is
-/// rejected as a [`LensError::Validation`] rather than allowed to inflate
-/// without limit (decompression-bomb guard). Returns the decoded UTF-8 content
-/// for an entry within the cap.
+/// Reads `reader` into a `String`, rejecting entries that decompress beyond
+/// `max` bytes (decompression-bomb guard).
 fn read_capped<R: Read>(reader: R, max: u64) -> Result<String, LensError> {
     let mut content = String::new();
     let read = reader
@@ -135,12 +120,9 @@ fn read_capped<R: Read>(reader: R, max: u64) -> Result<String, LensError> {
     Ok(content)
 }
 
-/// Maps a `<text:s text:c="n"/>` empty element to `n` spaces, per ODF 1.3
-/// §6.1.3. A MISSING `text:c` attribute defaults to 1 space; an explicit
-/// `text:c="0"` yields ZERO spaces (the spec permits it); an unparseable value
-/// falls back to 1. Large counts are clamped to 32 (`SPACES.len()`) — the
-/// in-flight text borrows from a `&'static str`, so we never allocate here and a
-/// pathological run cannot blow up memory.
+/// Maps `<text:s text:c="n"/>` to `n` spaces per ODF 1.3 §6.1.3. Missing
+/// `text:c` defaults to 1; `text:c="0"` yields zero; unparseable falls back
+/// to 1. Clamped to 32 to avoid allocation on pathological input.
 fn text_s_spaces(e: &BytesStart<'_>) -> &'static str {
     const SPACES: &str = "                                "; // 32 spaces
     let n = match e
@@ -148,10 +130,7 @@ fn text_s_spaces(e: &BytesStart<'_>) -> &'static str {
         .flatten()
         .find(|a| a.key.as_ref() == b"text:c")
     {
-        // No text:c → ODF default of a single space.
         None => 1,
-        // text:c present: honour its value (0 = zero spaces is valid); an
-        // unparseable value falls back to 1.
         Some(a) => std::str::from_utf8(a.value.as_ref())
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
@@ -161,8 +140,7 @@ fn text_s_spaces(e: &BytesStart<'_>) -> &'static str {
     &SPACES[..n]
 }
 
-/// Reads the `text:outline-level` attribute (1–6, clamped) from a `<text:h>`
-/// start tag. Returns `None` if absent or unparseable.
+/// Returns the `text:outline-level` attribute (1–6, clamped), or `None`.
 fn outline_level(e: &quick_xml::events::BytesStart<'_>) -> Option<u8> {
     for attr in e.attributes().flatten() {
         if attr.key.as_ref() == b"text:outline-level" {
@@ -181,14 +159,12 @@ mod tests {
     use super::*;
     use crate::parse::BlockType;
 
-    /// Builds a minimal ODT (a ZIP with a hand-crafted `content.xml`) in memory.
     fn build_odt(content_xml: &str) -> Vec<u8> {
         let mut buf = Vec::new();
         {
             let mut zip = zip::ZipWriter::new(Cursor::new(&mut buf));
             let opts: zip::write::FileOptions = zip::write::FileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated);
-            // mimetype first (ODF convention; not required for our reader).
             zip.start_file("mimetype", opts).expect("start mimetype");
             zip.write_all(b"application/vnd.oasis.opendocument.text")
                 .expect("write mimetype");
@@ -390,11 +366,8 @@ mod tests {
 
     #[test]
     fn odt_read_capped_rejects_overflow() {
-        // The decompression-bomb guard: an entry whose decompressed length exceeds
-        // `max` is rejected as a Validation error. We test the bounded-read helper
-        // directly with a small cap (the production const is 256 MB, impractical to
-        // materialise in a unit test, but the helper is the exact guard code path).
-        let data = vec![b'a'; 8192]; // 8 KB of "decompressed" bytes
+        // Test the bounded-read helper directly with a small cap.
+        let data = vec![b'a'; 8192];
         let err =
             read_capped(Cursor::new(&data), 1024).expect_err("entry over the cap must be rejected");
         assert!(
@@ -405,7 +378,6 @@ mod tests {
 
     #[test]
     fn odt_read_capped_accepts_at_limit() {
-        // An entry exactly AT the cap (not over) is accepted in full.
         let data = vec![b'x'; 1024];
         let s = read_capped(Cursor::new(&data), 1024).expect("at-limit entry accepted");
         assert_eq!(s.len(), 1024, "full content returned, not truncated");
@@ -413,11 +385,8 @@ mod tests {
 
     #[test]
     fn odt_bounded_reader_accepts_large_valid_doc() {
-        // A highly-compressible but legitimate body (~4 MB of repeated text in one
-        // paragraph) compresses to a tiny ZIP yet decompresses well under the
-        // 256 MB ceiling — it must extract cleanly through the bounded reader
-        // (proving the `take(MAX+1)` does not truncate valid content under cap).
-        let big = "lorem ipsum ".repeat(350_000); // ~4.1 MB
+        // ~4 MB of repeated text — well under the 256 MB ceiling.
+        let big = "lorem ipsum ".repeat(350_000);
         let content = format!(
             r#"<?xml version="1.0"?>
 <office:document-content xmlns:office="urn:o" xmlns:text="urn:t">
@@ -498,16 +467,12 @@ mod tests {
 
     #[test]
     fn odt_real_world_fixture_full_fidelity() {
-        // Regression coverage against a REAL ODT (generated by pandoc: full OASIS
-        // namespaces, headings carrying <text:bookmark-start/>, list items and
-        // table cells nesting <text:p>, inline <text:span>, smart quotes, and
-        // multi-byte content) — not the hand-crafted minimal content.xml the other
-        // tests use. Guards the extractor against real-generator structure.
+        // Real pandoc-generated ODT: full OASIS namespaces, bookmark start-tags,
+        // nested list/table <text:p>, inline spans, smart quotes, multi-byte content.
         let bytes = include_bytes!("../../tests/fixtures/real_pandoc.odt");
         let out = OdtExtractor.extract(bytes).expect("real ODT extraction");
         assert_byte_identity(&out);
 
-        // Headings are detected with the correct type and nested section trail.
         let h1 = out
             .blocks
             .iter()
@@ -524,7 +489,6 @@ mod tests {
             "heading trail must nest"
         );
 
-        // Body text survives inline spans + entity decoding (smart quotes/&).
         assert!(
             out.blocks
                 .iter()
@@ -532,7 +496,6 @@ mod tests {
             "inline-formatted paragraph with entities must be captured verbatim"
         );
 
-        // Table-cell text (each cell nests a <text:p>) is captured, not dropped.
         for cell in ["Alice", "Engineer", "Bob", "Designer"] {
             assert!(
                 out.blocks.iter().any(|b| b.text == cell),
@@ -540,7 +503,6 @@ mod tests {
             );
         }
 
-        // Multi-byte content is preserved byte-for-byte.
         assert!(
             out.blocks
                 .iter()
@@ -548,7 +510,6 @@ mod tests {
             "CJK + emoji must survive"
         );
 
-        // Every block carries an Odt node_path anchor (grounding).
         assert_eq!(out.anchors.len(), out.blocks.len());
         assert!(
             out.anchors

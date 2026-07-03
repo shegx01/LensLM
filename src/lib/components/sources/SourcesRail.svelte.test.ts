@@ -1,38 +1,9 @@
-// SourcesRail.svelte.test.ts
-//
-// Component tests for the redesigned M4 SourcesRail and AddSourcesModal.
-//
-// Covers:
-//   SourcesRail:
-//     - renders "Sources" heading
-//     - header has data-tauri-drag-region on outer row
-//     - renders empty state when no sources
-//     - renders source rows with title, type badge, and status dot
-//     - selected/total counter reflects selection state
-//     - source checkbox reflects selected=1 (aria-pressed)
-//     - "Add source" button opens the modal (aria-label check)
-//
-//   AddSourcesModal:
-//     - renders all three tabs: Upload, URL, Paste text
-//     - Upload tab shows drop zone and format list
-//     - URL tab shows the URL input; submit validates + calls addUrlSource then ingests
-//     - Paste text tab shows title + content fields
-//     - "Add to notebook →" button disabled on URL tab until a valid URL is entered
-//     - "Add to notebook →" button disabled when paste content is empty
-//     - "Add to notebook →" button enabled when paste content is filled
-//     - Cancel button calls onclose
-//     - X close button calls onclose
-//     - modal has role="dialog" + aria-modal
-//
+// SourcesRail.svelte.test.ts — Component tests for SourcesRail and AddSourcesModal.
 // All IPC and Tauri modules are mocked so tests run without a native host.
 
 import { render, screen, fireEvent } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Source } from '$lib/sources/types.js';
-
-// ---------------------------------------------------------------------------
-// Hoisted mocks
-// ---------------------------------------------------------------------------
 
 const { mockSourcesStore, mockNotebookStore } = vi.hoisted(() => {
   let _sources: Source[] = [];
@@ -125,7 +96,6 @@ vi.mock('@tauri-apps/plugin-dialog', () => ({
   open: vi.fn().mockResolvedValue(null)
 }));
 
-// Import components after mocks.
 import SourcesRail from './SourcesRail.svelte';
 import AddSourcesModal from './AddSourcesModal.svelte';
 import {
@@ -135,10 +105,6 @@ import {
   ingest
 } from '$lib/sources/sources-state.svelte.js';
 import { addUrlSource } from '$lib/sources/ipc.js';
-
-// ---------------------------------------------------------------------------
-// Fixtures
-// ---------------------------------------------------------------------------
 
 function makeSource(overrides?: Partial<Source>): Source {
   return {
@@ -162,10 +128,6 @@ function makeSource(overrides?: Partial<Source>): Source {
   };
 }
 
-// ---------------------------------------------------------------------------
-// Lifecycle
-// ---------------------------------------------------------------------------
-
 beforeEach(() => {
   vi.clearAllMocks();
   mockSourcesStore._setSources([]);
@@ -178,10 +140,6 @@ afterEach(() => {
   mockSourcesStore._setRecentlyTrashed(false);
   mockNotebookStore._setRightRailCollapsed(false);
 });
-
-// ---------------------------------------------------------------------------
-// SourcesRail tests
-// ---------------------------------------------------------------------------
 
 describe('SourcesRail', () => {
   it('renders the "Sources" heading', () => {
@@ -249,7 +207,6 @@ describe('SourcesRail', () => {
       makeSource({ id: 'src-003', selected: 0 })
     ]);
     render(SourcesRail);
-    // 2 selected out of 3 total
     expect(screen.getByText('2/3')).toBeInTheDocument();
   });
 
@@ -279,17 +236,14 @@ describe('SourcesRail', () => {
 
   it('"Add source" header button has correct aria-label', () => {
     render(SourcesRail);
-    // Header "+" button has aria-label="Add source" — distinct from empty-state
-    // button which has aria-label="Add first source"
+    // "Add source" is distinct from the empty-state "Add first source" button.
     expect(screen.getByRole('button', { name: 'Add source' })).toBeInTheDocument();
   });
 
   it('clicking header "Add source" button opens the modal', async () => {
     render(SourcesRail);
-    // Exact aria-label match — distinct from empty-state "Add first source"
     const addBtn = screen.getByRole('button', { name: 'Add source' });
     await fireEvent.click(addBtn);
-    // Modal should now be in the DOM with its dialog role
     expect(screen.getByRole('dialog', { name: /add sources/i })).toBeInTheDocument();
   });
 
@@ -302,7 +256,6 @@ describe('SourcesRail', () => {
   it('status dot is present for an indexed source', () => {
     mockSourcesStore._setSources([makeSource({ status: 'indexed' })]);
     const { container } = render(SourcesRail);
-    // Status dot is a span with bg-green-primary class
     const dot = container.querySelector('span.bg-green-primary') as HTMLElement;
     expect(dot).not.toBeNull();
   });
@@ -321,10 +274,6 @@ describe('SourcesRail', () => {
     expect(dot).not.toBeNull();
   });
 
-  // -------------------------------------------------------------------------
-  // Hidden-scroll container (Section A)
-  // -------------------------------------------------------------------------
-
   it('the source list lives in a hidden-scroll (no-scrollbar) container', () => {
     mockSourcesStore._setSources([makeSource()]);
     const { container } = render(SourcesRail);
@@ -335,10 +284,6 @@ describe('SourcesRail', () => {
     expect(scroll.className).toContain('flex-1');
   });
 });
-
-// ---------------------------------------------------------------------------
-// Delete button (Section A — inline delete)
-// ---------------------------------------------------------------------------
 
 describe('SourcesRail — delete button', () => {
   it('renders a delete button for each source row', () => {
@@ -379,10 +324,6 @@ describe('SourcesRail — delete button', () => {
     expect(screen.queryByRole('button', { name: /delete source/i })).not.toBeInTheDocument();
   });
 });
-
-// ---------------------------------------------------------------------------
-// Undo bar — shown after soft-delete while recentlyTrashed is true
-// ---------------------------------------------------------------------------
 
 describe('SourcesRail — Undo bar', () => {
   it('is not visible when recentlyTrashed is false', () => {
@@ -430,14 +371,9 @@ describe('SourcesRail — Undo bar', () => {
     mockSourcesStore._setRecentlyTrashed(true);
     mockNotebookStore._setRightRailCollapsed(true);
     render(SourcesRail);
-    // Collapsed strip has no source list section — Undo bar is in the expanded layout only.
     expect(screen.queryByText('Source moved to trash')).not.toBeInTheDocument();
   });
 });
-
-// ---------------------------------------------------------------------------
-// onDestroy — disposeTrashTimers wiring (fix #2)
-// ---------------------------------------------------------------------------
 
 describe('SourcesRail — onDestroy disposeTrashTimers wiring', () => {
   it('disposeTrashTimers is called when the component is unmounted', () => {
@@ -447,10 +383,6 @@ describe('SourcesRail — onDestroy disposeTrashTimers wiring', () => {
     expect(disposeTrashTimers).toHaveBeenCalledOnce();
   });
 });
-
-// ---------------------------------------------------------------------------
-// Right-rail collapse toggle (Section B)
-// ---------------------------------------------------------------------------
 
 describe('SourcesRail — collapse toggle', () => {
   it('renders the "Collapse sources" toggle in the expanded header', () => {
@@ -468,7 +400,6 @@ describe('SourcesRail — collapse toggle', () => {
   it('renders the collapsed icon strip (Expand affordance) when collapsed', () => {
     mockNotebookStore._setRightRailCollapsed(true);
     render(SourcesRail);
-    // Collapsed: the toggle now reads "Expand sources" and the expanded title is gone.
     expect(screen.getByRole('button', { name: /expand sources/i })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /collapse sources/i })).not.toBeInTheDocument();
   });
@@ -477,7 +408,6 @@ describe('SourcesRail — collapse toggle', () => {
     mockSourcesStore._setSources([makeSource({ id: 'src-001' }), makeSource({ id: 'src-002' })]);
     mockNotebookStore._setRightRailCollapsed(true);
     render(SourcesRail);
-    // Sources icon button is labelled with the count; Studio button is present.
     expect(screen.getByRole('button', { name: /sources \(2\)/i })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /^studio$/i })).toBeInTheDocument();
   });
@@ -499,10 +429,6 @@ describe('SourcesRail — collapse toggle', () => {
     }
   });
 });
-
-// ---------------------------------------------------------------------------
-// Studio shell (Section A — StudioPanel)
-// ---------------------------------------------------------------------------
 
 describe('SourcesRail — Studio shell', () => {
   it('renders the Studio header with a RESEARCH tag', () => {
@@ -538,14 +464,9 @@ describe('SourcesRail — Studio shell', () => {
   it('the Studio section is NOT rendered when the rail is collapsed', () => {
     mockNotebookStore._setRightRailCollapsed(true);
     render(SourcesRail);
-    // The full Studio card title only exists in the expanded layout.
     expect(screen.queryByText('Audio Overview')).not.toBeInTheDocument();
   });
 });
-
-// ---------------------------------------------------------------------------
-// AddSourcesModal tests
-// ---------------------------------------------------------------------------
 
 describe('AddSourcesModal', () => {
   it('does NOT render when open=false', () => {

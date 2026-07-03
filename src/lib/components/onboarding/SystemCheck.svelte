@@ -74,14 +74,11 @@
 </div>
 
 <main data-tauri-drag-region class="flex min-h-svh items-center justify-center p-6">
-  <!-- Per design: the whole onboarding sits inside ONE outer card (540px,
-       14px radius, soft shadow, 36/40/32 padding). The check rows are inner
-       surface cards; the footer stays plain (not its own card). -->
-  <!-- Width chosen so the rows inside (card width − 2×px-10 padding) land at the
-       previous `lg` (512px) and the long descriptions don't truncate. -->
+  <!-- Per design: outer card 540 px, 14 px radius, 36/40/32 padding; check rows
+       are inner surface cards; footer is plain (not its own card). Width 592 px
+       so rows land at the previous lg (512 px) without description truncation. -->
   <div class="w-full max-w-[592px]" style="-webkit-app-region: no-drag;">
     <Card class="w-full gap-4 rounded-[14px] px-10 pt-9 pb-8 shadow-2xl ring-0">
-      <!-- Header -->
       <div class="flex flex-col items-center text-center gap-3 pb-2">
         <div
           class="bg-primary flex size-14 items-center justify-center rounded-2xl text-primary-foreground shadow-lg"
@@ -97,7 +94,6 @@
         </div>
       </div>
 
-      <!-- Check rows -->
       <div class="flex flex-col gap-2">
         {#if loading}
           <div
@@ -122,7 +118,6 @@
         {/if}
       </div>
 
-      <!-- Footer: summary + Continue, NOT in a card (plain layout) -->
       <div class="flex flex-col gap-3 pt-1">
         {#if continueError}
           <p class="text-destructive w-full text-center text-sm" role="alert">{continueError}</p>

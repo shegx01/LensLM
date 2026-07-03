@@ -107,7 +107,6 @@ describe('validateModelInteractive — IPC wrapper', () => {
   it('returns valid when reason is undefined in IPC response', async () => {
     mockIPC((cmd) => {
       if (cmd === 'validate_model_interactive') {
-        // No reason field — valid path
         return { status: 'valid' };
       }
     });
@@ -123,7 +122,6 @@ describe('validateModelInteractive — IPC wrapper', () => {
   });
 
   it('returns { status: "valid" } when not in a Tauri context', async () => {
-    // Remove the isTauri flag set in beforeEach
     delete (globalThis as { isTauri?: boolean }).isTauri;
     const result = await validateModelInteractive('ollama', 'any-model', '', '');
     expect(result.status).toBe('valid');

@@ -1,19 +1,7 @@
 <!--
-  EmbeddingsInspector — dev/QA-only, read-only split-view overlay for the M4
-  extract→chunk→enrich→embed→LanceDB pipeline.
-
-  Mounted at shell root (DEV-gated dynamic import in AppShell), toggled by
-  `notebookStore.inspectorOpen`. Built as a shadcn <Dialog> so Escape /
-  focus-trap / portal / aria-modal come free — same pattern as TrashView.
-
-  LEFT pane: the active notebook's sources (SourceRow). RIGHT pane: the selected
-  source's chunks (ChunkCard) + per-model embedding stats. This component is the
-  layout shell + fetch orchestration; row/card rendering lives in the children.
-
-  Error affordances (#73):
-  - SourceRow gets an `onretry` prop so the row can trigger per-source retry.
-  - Right pane renders a destructive alert block for an errored selected source.
-  - "Retry all failed" button in the right-pane header retries every error source.
+  EmbeddingsInspector — dev/QA-only split-view overlay for the M4 pipeline.
+  DEV-gated; toggled by notebookStore.inspectorOpen. Error affordances added
+  in #73: per-source retry prop + "Retry all failed" header button.
 -->
 <script lang="ts">
   import Loader from '@lucide/svelte/icons/loader-circle';
@@ -42,13 +30,7 @@
   const selectedSource = $derived(sources.find((s) => s.id === selectedSourceId) ?? null);
   const hasFailedSources = $derived(sources.some((s) => s.status === 'error' && !s.trashed_at));
 
-  /**
-   * Load a source's chunks + stats into the right pane.
-   *
-   * Guards against a stale-response race: if the user clicks another source
-   * while this request is in flight, `selectedSourceId` has moved on by the time
-   * we resolve, so we drop the late result instead of overwriting the newer one.
-   */
+  // Guards against stale-response race: drop any result whose sourceId no longer matches.
   async function selectSource(sourceId: string): Promise<void> {
     selectedSourceId = sourceId;
     loading = true;
@@ -95,7 +77,6 @@
     aria-label="Embeddings Inspector"
     data-embeddings-inspector
   >
-    <!-- ── LEFT pane: sources ──────────────────────────────────────────────── -->
     <div class="flex w-[280px] shrink-0 flex-col border-r border-border bg-card">
       <div class="shrink-0 px-4 pt-5 pb-3">
         <p class="text-sm font-bold tracking-[-0.3px] text-foreground">Embeddings Inspector</p>
@@ -124,9 +105,7 @@
       </ScrollArea>
     </div>
 
-    <!-- ── RIGHT pane: chunks + stats ──────────────────────────────────────── -->
     <div class="flex min-w-0 flex-1 flex-col bg-background">
-      <!-- Header -->
       <div class="flex shrink-0 flex-wrap items-center gap-2 border-b border-border px-5 py-4">
         {#if selectedSource}
           <span class="text-sm font-semibold text-foreground">{selectedSource.title}</span>
@@ -163,7 +142,6 @@
         {/if}
       </div>
 
-      <!-- Body -->
       <ScrollArea class="min-h-0 flex-1">
         <div class="p-5">
           {#if loading}

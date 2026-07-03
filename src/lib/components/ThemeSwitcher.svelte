@@ -18,7 +18,6 @@
     { value: 'system', label: 'System', icon: Monitor }
   ];
 
-  // The user's explicit selection (light/dark/system) — drives the active state.
   const active = $derived(userPrefersMode.current);
 
   function select(mode: Mode): void {

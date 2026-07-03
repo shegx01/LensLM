@@ -1,28 +1,10 @@
-// EmbeddingsInspector component tests (dev/QA Embeddings Inspector).
-//
-// Covers:
-//   - renders the Dialog when notebookStore.inspectorOpen is true (and not otherwise)
-//   - lists sources from sourcesStore in the left pane
-//   - selecting a source calls listSourceChunks(sourceId, activeNotebookId)
-//   - renders chunk text / section_path / block_type in the right pane
-//   - header renders one badge per EmbeddingStats entry (incl. a 2-entry case)
-//   - empty chunks → "No chunks found"
-//   - empty stats → "Not yet embedded"
-//   - loading indicator while the IPC promise is pending
-//   - status dot reflects the source status
-//
-// Mocks the inspector ipc, the sources store, the notebooks store, and the
-// Tauri core module so tests run without a native host. Pattern mirrors
-// SourcesRail.svelte.test.ts.
+// EmbeddingsInspector — visibility, source list, chunk/stats rendering, loading state.
+// Mocks IPC, stores, and Tauri core; no native host required.
 
 import { render, screen, fireEvent, waitFor } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Source } from '$lib/sources/types.js';
 import type { InspectorResponse } from '$lib/inspector/types.js';
-
-// ---------------------------------------------------------------------------
-// Hoisted mocks
-// ---------------------------------------------------------------------------
 
 const { mockSourcesStore, mockNotebookStore } = vi.hoisted(() => {
   let _sources: Source[] = [];
@@ -85,10 +67,6 @@ vi.mock('@tauri-apps/api/core', () => ({
 import EmbeddingsInspector from './EmbeddingsInspector.svelte';
 import { listSourceChunks } from '$lib/inspector/ipc.js';
 
-// ---------------------------------------------------------------------------
-// Fixtures
-// ---------------------------------------------------------------------------
-
 function makeSource(overrides?: Partial<Source>): Source {
   return {
     id: 'src-001',
@@ -133,10 +111,6 @@ function makeResponse(overrides?: Partial<InspectorResponse>): InspectorResponse
   };
 }
 
-// ---------------------------------------------------------------------------
-// Lifecycle
-// ---------------------------------------------------------------------------
-
 beforeEach(() => {
   vi.clearAllMocks();
   mockSourcesStore._setSources([]);
@@ -150,10 +124,6 @@ afterEach(() => {
   mockNotebookStore._setInspectorOpen(true);
   mockNotebookStore._setActiveNotebookId('nb-001');
 });
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 describe('EmbeddingsInspector — visibility', () => {
   it('renders the Dialog when inspectorOpen is true', () => {

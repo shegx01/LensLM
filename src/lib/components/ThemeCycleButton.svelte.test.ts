@@ -95,18 +95,14 @@ describe('ThemeCycleButton', () => {
   it('accepts a class prop and forwards it to the button', () => {
     render(ThemeCycleButton, { props: { class: 'size-9 rounded-lg' } });
     const btn = screen.getByRole('button');
-    // class prop is merged via cn() onto the button element.
     expect(btn.className).toContain('size-9');
     expect(btn.className).toContain('rounded-lg');
   });
 
   it('works without a class prop (default rendering)', () => {
-    // Should not throw and should render a single button.
     render(ThemeCycleButton);
     expect(screen.getByRole('button')).toBeInTheDocument();
   });
-
-  // ── Variant rendering — must work in both placement contexts ────────────────
 
   it('outline variant renders the onboarding size-9 rounded-lg button', () => {
     render(ThemeCycleButton, { props: { variant: 'outline', class: 'size-9 rounded-lg' } });

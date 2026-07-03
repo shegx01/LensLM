@@ -1,22 +1,9 @@
 // TrashView component tests.
-//
-// Covers:
-//   - renders trashed notebook rows (title, source count, trashed-at time)
-//   - shows empty state when trashedNotebooks is empty
-//   - Restore button calls restoreNotebookAction with the correct id
-//   - "Delete forever" button opens a confirm dialog
-//   - confirming the dialog calls purgeNotebookAction with the correct id
-//   - canceling the dialog does NOT call purgeNotebookAction
-//   - the modal renders when trashOpen is true; the × close sets trashOpen=false
-//
-// Mocks the $lib/notebooks barrel so no Tauri IPC occurs.
-// The real bits-ui Dialog component is used for the confirm flow; its portal
-// renders in `document.body` so we query there as normal.
+// Covers: row rendering, empty state, Restore, Delete-forever confirm, modal visibility.
+// `$lib/notebooks` mocked — no Tauri IPC. bits-ui Dialog portal renders in document.body.
 
 import { render, screen, fireEvent, waitFor } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-
-// ── Hoisted mock refs ─────────────────────────────────────────────────────────
 
 const {
   storeProxy,
@@ -44,7 +31,6 @@ const {
   };
 });
 
-// Mock the entire notebooks barrel — no real IPC / store
 vi.mock('$lib/notebooks/index.js', () => ({
   get notebookStore() {
     return {
@@ -68,7 +54,6 @@ vi.mock('$lib/notebooks/index.js', () => ({
   restoreSourceFromTrash: mockRestoreSourceAction,
   purgeSourceAction: mockPurgeSourceAction,
   resetNotebookStore: mockResetStore,
-  // Passthrough utilities
   notebookAccentClass: (_id: string) => 'nb-purple',
   formatRelativeTime: (_iso: string) => '2d ago',
   formatSourceCount: (count: number) => (count === 1 ? '1 source' : `${count} sources`)
@@ -77,8 +62,6 @@ vi.mock('$lib/notebooks/index.js', () => ({
 import TrashView from './TrashView.svelte';
 import type { NotebookSummary } from '$lib/notebooks/types.js';
 import type { TrashedSource } from '$lib/sources/types.js';
-
-// ── Fixtures ──────────────────────────────────────────────────────────────────
 
 function makeNotebook(overrides?: Partial<NotebookSummary>): NotebookSummary {
   return {
@@ -120,8 +103,6 @@ function makeTrashedSource(overrides?: Partial<TrashedSource>): TrashedSource {
   };
 }
 
-// ── Setup / teardown ─────────────────────────────────────────────────────────
-
 beforeEach(() => {
   storeProxy.trashedNotebooks = [];
   storeProxy.trashedSources = [];
@@ -136,8 +117,6 @@ beforeEach(() => {
 afterEach(() => {
   vi.clearAllMocks();
 });
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 describe('TrashView — row rendering', () => {
   it('renders a trashed notebook title', () => {
@@ -161,7 +140,6 @@ describe('TrashView — row rendering', () => {
   it('renders trashed relative time in subtitle', () => {
     storeProxy.trashedNotebooks = [makeNotebook()];
     render(TrashView);
-    // formatRelativeTime is mocked to return '2d ago'
     expect(screen.getByText(/trashed 2d ago/i)).toBeInTheDocument();
   });
 
@@ -219,9 +197,6 @@ describe('TrashView — Restore action', () => {
 });
 
 describe('TrashView — Delete forever (confirm dialog)', () => {
-  // The Trash modal and the confirm dialog are BOTH shadcn Dialogs, so once the
-  // confirm opens there are two role="dialog" nodes in the DOM. We scope confirm
-  // assertions to `[data-confirm-dialog]` to disambiguate.
   it('clicking "Delete forever" opens the confirm dialog', async () => {
     storeProxy.trashedNotebooks = [makeNotebook({ title: 'Old Research Notes' })];
     render(TrashView);
@@ -323,8 +298,6 @@ describe('TrashView — modal visibility', () => {
   });
 });
 
-// ── Sources section tests ─────────────────────────────────────────────────────
-
 describe('TrashView — Sources section row rendering', () => {
   it('renders a trashed source title', () => {
     storeProxy.trashedSources = [makeTrashedSource({ title: 'My Report.pdf' })];
@@ -337,7 +310,6 @@ describe('TrashView — Sources section row rendering', () => {
       makeTrashedSource({ notebook_title: 'Old Research Notes', title: 'Doc.pdf' })
     ];
     render(TrashView);
-    // subtitle: "{notebook_title} · trashed {relTime}"
     expect(screen.getByText(/Old Research Notes/)).toBeInTheDocument();
   });
 

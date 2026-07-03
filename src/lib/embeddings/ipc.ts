@@ -1,20 +1,9 @@
-// Typed IPC wrappers for the M4 Phase 4b-B embedding-backend surfaces.
-//
-// Every function is guarded with `isTauri()` so callers (and component tests
-// without a native backend) share one code path. Pattern mirrors
-// `src/lib/notebooks/ipc.ts` and `src/lib/onboarding/system-check.ts`.
-//
-// Command-name convention: Tauri maps Rust snake_case fn names to camelCase JS
-// for `#[tauri::command]`; args are passed camelCase from TS and Tauri
-// deserialises them into the snake_case Rust params.
+// Typed IPC wrappers for the embedding-backend surfaces. Guarded with `isTauri()`.
 
 import { Channel, invoke, isTauri } from '@tauri-apps/api/core';
 import type { EmbeddingBackend } from './models.js';
 
 // SYNC-CHECK: must match src-tauri/src/commands/notebooks.rs ReembedProgress.
-//
-// One progress event streamed by `set_notebook_embedding_model` while re-embedding
-// a notebook's chunks under the new (notebook, backend, model, dim) coordinate.
 export interface ReembedProgress {
   /** Chunks processed so far. */
   done: number;
@@ -23,10 +12,6 @@ export interface ReembedProgress {
 }
 
 // SYNC-CHECK: must match src-tauri/src/stream.rs StreamEvent<T>.
-//
-// Adjacently-tagged (`{ type, data }`) streaming envelope. Data-carrying
-// variants (`chunk`, `failed`) carry `data`; unit variants (`started`,
-// `progress`, `done`) may omit it (progress carries its own fields under data).
 export type StreamEvent<T> =
   | { type: 'started' }
   | { type: 'chunk'; data: T }
@@ -35,10 +20,6 @@ export type StreamEvent<T> =
   | { type: 'failed'; data: { kind: string; message: string } };
 
 // SYNC-CHECK: must match src-tauri/src/commands/notebooks.rs EmbeddingModelInfo.
-//
-// The notebook's current embedding coordinate. `status` is backend-scoped:
-// `"active"` when a live `embedding_index` row exists for the FULL
-// (notebook, backend, model, dim) coordinate, `"none"` when not yet indexed.
 export interface EmbeddingModelInfo {
   /** Canonical model id (e.g. `"nomic-embed-text-v1.5"`). */
   model_id: string;
@@ -50,12 +31,7 @@ export interface EmbeddingModelInfo {
   status: 'active' | 'none';
 }
 
-/**
- * Read a notebook's current embedding model + backend + index status.
- *
- * Outside Tauri (component tests / `vite dev`) returns a benign default
- * (`status: "none"`) so the picker renders without a native backend.
- */
+/** Outside Tauri returns `{ status: "none" }` so the picker renders without a native backend. */
 export async function getNotebookEmbeddingModel(notebookId: string): Promise<EmbeddingModelInfo> {
   if (!isTauri()) {
     return { model_id: '', dim: 0, backend: 'fastembed', status: 'none' };
@@ -64,14 +40,9 @@ export async function getNotebookEmbeddingModel(notebookId: string): Promise<Emb
 }
 
 /**
- * Set a notebook's embedding model + backend and re-embed all of its sources
- * under the new coordinate, streaming {@link ReembedProgress} over a Channel.
- *
- * `onProgress(done, total)` is fed each batch's chunk counters; resolves when
- * the re-embed completes (the backend flips the active coordinate and retires
- * the old one). A `failed` event rejects the promise with its message.
- *
- * Outside Tauri this is a no-op that resolves immediately.
+ * Re-embed all sources under the new (model, backend) coordinate, streaming
+ * {@link ReembedProgress}. A `failed` event rejects with its message.
+ * No-op outside Tauri.
  */
 export async function setNotebookEmbeddingModel(
   notebookId: string,
@@ -96,12 +67,7 @@ export async function setNotebookEmbeddingModel(
   });
 }
 
-/**
- * The set of registry embedding-model ids whose fastembed weights are already
- * cached on disk (the fastembed-side counterpart to {@link listOllamaModels}).
- *
- * Outside Tauri returns `[]` (no local cache to probe).
- */
+/** Fastembed model ids already cached on disk. Returns `[]` outside Tauri. */
 export async function fastembedModelsCached(): Promise<string[]> {
   if (!isTauri()) return [];
   try {
@@ -112,11 +78,8 @@ export async function fastembedModelsCached(): Promise<string[]> {
 }
 
 /**
- * Warm (download + cache) a fastembed model's weights so a fastembed selection
- * can pass the readiness gate up-front. There is no byte progress (fastembed
- * init is opaque); callers show an indeterminate phase spinner and await this.
- *
- * Outside Tauri this is a no-op that resolves immediately.
+ * Download + cache a fastembed model's weights. No byte progress (fastembed init
+ * is opaque); callers show an indeterminate spinner. No-op outside Tauri.
  */
 export async function warmFastembedModel(model: string): Promise<void> {
   if (!isTauri()) return;
@@ -124,13 +87,8 @@ export async function warmFastembedModel(model: string): Promise<void> {
 }
 
 /**
- * The registry model ids that actually run on the Apple GPU (candle + Metal) on
- * this build — `["nomic-embed-text-v1.5"]` on Apple Silicon today, `[]` elsewhere
- * (issue #91). GPU acceleration is per-model: the UI badges exactly these models
- * "Apple GPU" and shows the "best performance" hint only when one is selected.
- *
- * Outside Tauri (component tests / `vite dev`) returns `[]` — no native backend to
- * query, so no model shows a GPU badge.
+ * Model ids running on Apple GPU (candle + Metal) — `["nomic-embed-text-v1.5"]`
+ * on Apple Silicon, `[]` elsewhere (issue #91). Returns `[]` outside Tauri.
  */
 export async function gpuAcceleratedModels(): Promise<string[]> {
   if (!isTauri()) return [];
@@ -141,12 +99,7 @@ export async function gpuAcceleratedModels(): Promise<string[]> {
   }
 }
 
-/**
- * The locally-pulled Ollama models at `baseUrl` via the live `/api/tags` probe.
- * Graceful by contract: an unreachable runtime yields `[]`, never an error.
- *
- * Outside Tauri returns `[]`.
- */
+/** Locally-pulled Ollama models at `baseUrl`. Unreachable runtime yields `[]`. */
 export async function listOllamaModels(baseUrl: string): Promise<string[]> {
   if (!isTauri()) return [];
   try {

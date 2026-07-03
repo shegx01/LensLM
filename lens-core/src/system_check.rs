@@ -23,34 +23,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::AppConfig;
 
-/// Connect timeout for a single runtime-detection HTTP request.
 const PROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
-/// Overall (read) timeout for a single runtime-detection HTTP request.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-/// Default Ollama base URL when none is configured.
 const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434";
-/// Default LM Studio OpenAI-compatible base URL.
 const DEFAULT_LMSTUDIO_BASE_URL: &str = "http://localhost:1234";
-/// Timeout for the cloud enrichment-model live probe (issue #90). A single
-/// `max_tokens:1` generate proves key + model + reachability; the timeout caps a
-/// hanging endpoint so a system check never stalls onboarding.
+/// Cloud enrichment-model live-probe timeout (issue #90). Caps a hanging
+/// endpoint so a system check never stalls onboarding.
 const CLOUD_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
-/// Allowlisted embedding model ids the embedding-model gate accepts.
-///
-/// DERIVED from [`crate::embedder::registry::REGISTRY`] at init time (NOT a
-/// hand-maintained parallel literal) so adding a model to the registry can never
-/// desync the allowlist — this was the 4b-B divergence: the old hardcoded slice
-/// listed the Ollama alias `"nomic-embed-text"` instead of the canonical registry
-/// id `"nomic-embed-text-v1.5"`, so the install path and the warm/probe path
-/// disagreed on what was allowed.
-///
-/// This holds the CANONICAL registry ids (e.g. `nomic-embed-text-v1.5`). The
-/// legacy Ollama alias `"nomic-embed-text"` is NOT in this list; it is accepted
-/// separately via the registry's alias bridge ([`is_allowlisted_embedding_id`],
-/// which delegates to [`crate::embedder::registry::resolve_opt`]) so callers that
-/// receive the Ollama-facing alias still validate. The Tauri install command and
-/// the UI's `EMBEDDING_MODELS` mirror these ids (see the SYNC-CHECK in the
-/// registry).
+/// Canonical embedding-model ids derived from the registry at init time (NOT a
+/// hand-maintained literal) so adding a model to the registry can never desync
+/// this list. The Ollama alias `"nomic-embed-text"` is accepted separately via
+/// the alias bridge in [`is_allowlisted_embedding_id`].
 pub static ALLOWED_EMBEDDING_MODELS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
     crate::embedder::registry::REGISTRY
         .iter()
@@ -58,105 +41,72 @@ pub static ALLOWED_EMBEDDING_MODELS: LazyLock<Vec<&'static str>> = LazyLock::new
         .collect()
 });
 
-/// Returns `true` when `id` is an accepted embedding-model id — either a
-/// canonical registry id OR the legacy Ollama alias `"nomic-embed-text"`, both
-/// recognized by the registry's [`resolve_opt`](crate::embedder::registry::resolve_opt)
-/// (which bridges the alias to the canonical nomic entry). Single source of truth
-/// for "is this a model we support", derived entirely from the registry — the same
-/// `REGISTRY` that [`ALLOWED_EMBEDDING_MODELS`] is derived from, so the two cover
-/// the identical canonical set (plus the alias bridge here) and cannot diverge.
+/// Returns `true` when `id` is an accepted embedding-model id — canonical
+/// registry id or the legacy Ollama alias `"nomic-embed-text"`, both resolved
+/// by the registry's `resolve_opt` alias bridge.
 pub fn is_allowlisted_embedding_id(id: &str) -> bool {
     crate::embedder::registry::resolve_opt(id).is_some()
 }
-/// Upper bound on a probe response body we will buffer + deserialize. A version
-/// string or a model list is tiny; this cap (1 MiB) is defense-in-depth so a
-/// malicious/misconfigured endpoint can't stream an unbounded body into memory.
+/// Defense-in-depth cap on buffered probe response bodies (1 MiB).
 const MAX_PROBE_BODY_BYTES: usize = 1024 * 1024;
 
-/// Status of a single system-check row.
-///
-/// Serializes lowercase: `pass` | `fail`.
+/// Status of a single system-check row. Serializes lowercase: `pass` | `fail`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckStatus {
-    /// The subsystem is present and healthy.
     Pass,
-    /// The subsystem is expected but absent / unhealthy.
     Fail,
 }
 
-/// Stable identifier for each system-check row. Drives UI row ordering/mapping.
+/// Stable identifier for each system-check row (drives UI row ordering/mapping).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckId {
-    /// Local LLM runtime (Ollama / LM Studio) or a configured cloud provider.
     LlmRuntime,
-    /// Embedding model availability (allowlisted model installed / configured).
     EmbeddingModel,
-    /// Text-to-speech: local Kokoro engine on disk or a configured cloud provider.
     TextToSpeech,
 }
 
-/// Optional UI affordance attached to a check row.
-///
-/// Absence of an action is expressed ONLY by `Option::None` on
-/// [`CheckResult::action`] — there is deliberately NO `None` variant here.
+/// Optional UI affordance attached to a check row. Absence is `None` on
+/// [`CheckResult::action`] — there is deliberately no `None` variant here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckAction {
-    /// Open configuration for this subsystem (e.g. set an LLM endpoint).
     Configure,
-    /// Choose among options (e.g. pick an embedding model).
     Choose,
 }
 
 /// One row in the system-check screen.
 ///
-/// THIS IS THE FROZEN IPC CONTRACT. It crosses the Tauri boundary verbatim and
-/// is mirrored in the Svelte client; field names and the serde shape are locked.
+/// FROZEN IPC CONTRACT — crosses the Tauri boundary verbatim; field names and
+/// serde shape are locked.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct CheckResult {
-    /// Stable row identifier.
     pub id: CheckId,
-    /// Human-readable row label, e.g. "LLM runtime".
     pub label: String,
-    /// Pass / fail.
     pub status: CheckStatus,
-    /// Product-facing detail copy. NO internal milestone vocabulary.
+    /// Product-facing detail copy; no internal milestone vocabulary.
     pub detail: String,
-    /// Optional UI affordance; absence is `None` (no `CheckAction::None`).
     pub action: Option<CheckAction>,
 }
 
 /// Result of probing a single LLM endpoint via [`detect_llm`].
 ///
-/// THIS IS THE FROZEN IPC CONTRACT for the "Configure → Auto-detect" flow.
-/// It crosses the Tauri boundary verbatim and is mirrored in the Svelte client;
-/// field names and the serde shape are locked.
+/// FROZEN IPC CONTRACT for the "Configure → Auto-detect" flow; field names
+/// and serde shape are locked.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct LlmDetection {
-    /// Whether the endpoint answered with a successful (2xx) response.
     pub reachable: bool,
-    /// Ollama version string, if the endpoint spoke the Ollama protocol.
+    /// Ollama version string when the endpoint spoke the Ollama protocol.
     pub version: Option<String>,
-    /// Model names/ids collected from the endpoint (Ollama + OpenAI-compatible).
     pub models: Vec<String>,
 }
 
-/// Probes `base_url` for both Ollama-style and OpenAI-compatible endpoints,
-/// returning a [`LlmDetection`] that merges both responses.
-///
-/// Uses the shared [`probe_client`] (rustls, no-redirect, connect 1s / total 2s).
-/// Both protocol probes run concurrently via [`tokio::join!`].
-///
-/// - Ollama style: `GET {base_url}/api/version` → version; `GET {base_url}/api/tags` → models.
-/// - OpenAI-compatible: `GET {base_url}/v1/models` → models from `data[].id`.
-/// - Any connect/timeout/non-200 response contributes nothing (not an error).
-/// - If neither probe responds: `reachable=false`, `version=None`, `models=[]`.
-/// - Never returns `Err` for "not reachable"; `LensError` is reserved for genuine
-///   internal faults (which cannot realistically occur here).
+/// Probes `base_url` for both Ollama-style and OpenAI-compatible endpoints
+/// concurrently, returning a merged [`LlmDetection`]. Unreachable endpoints
+/// contribute nothing; never returns `Err` for "not reachable".
 pub async fn detect_llm(base_url: &str) -> LlmDetection {
     let base_url = base_url.trim_end_matches('/');
 
@@ -185,7 +135,6 @@ pub async fn detect_llm(base_url: &str) -> LlmDetection {
 
     let (ollama_version, ollama_models) = ollama_result;
 
-    // Merge + deduplicate models from both protocols.
     let mut models = ollama_models;
     for id in openai_models {
         if !models.contains(&id) {
@@ -202,22 +151,11 @@ pub async fn detect_llm(base_url: &str) -> LlmDetection {
     }
 }
 
-/// Lists the LOCALLY-available Ollama models at `base_url` via `GET /api/tags`
-/// (M4 Phase 3, Stage 3 — the per-provider picker for local models).
-///
-/// models.dev only catalogs CLOUD providers; the user's pulled local models are
-/// known only to their running Ollama. This reuses the SAME hardened probe
-/// (`probe_ollama_endpoint`) the system-check + `detect_llm` use, so the picker and
-/// the readiness gate can never drift on how they speak Ollama.
-///
-/// **Graceful by contract:** when Ollama is unreachable (not running, wrong URL,
-/// non-Ollama endpoint) this returns an EMPTY `Vec` — never an `Err`. The picker
-/// surfaces that as a "no local models / Ollama not reachable" state rather than an
-/// error toast (the plan's never-error-toast requirement).
+/// Lists locally-pulled Ollama models via `GET /api/tags`. Returns an empty
+/// `Vec` (never `Err`) when Ollama is unreachable.
 pub async fn list_ollama_models(base_url: &str) -> Vec<String> {
     let base_url = base_url.trim_end_matches('/');
 
-    // Scheme allowlist (self-SSRF defense-in-depth), mirroring `detect_llm`.
     let scheme_ok = base_url.split_once("://").is_some_and(|(scheme, _)| {
         scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
     });
@@ -230,13 +168,8 @@ pub async fn list_ollama_models(base_url: &str) -> Vec<String> {
     models
 }
 
-/// GETs `url` and deserializes a successful (2xx) response as `T`, capping the
-/// buffered body at [`MAX_PROBE_BODY_BYTES`] before parsing. Returns `None` on a
-/// connect/timeout error, a non-2xx status, an over-cap body, or a parse miss.
-///
-/// Reading `bytes()` (vs `resp.json()`) lets us reject an oversized body without
-/// streaming it all into a `serde` deserializer — defense-in-depth against a
-/// malicious endpoint that answers a probe with an unbounded stream.
+/// GETs `url`, caps the buffered body at [`MAX_PROBE_BODY_BYTES`], and
+/// deserializes as `T`. Returns `None` on error, non-2xx, over-cap, or parse miss.
 async fn get_json_capped<T: serde::de::DeserializeOwned>(
     client: &reqwest::Client,
     url: &str,
@@ -252,8 +185,6 @@ async fn get_json_capped<T: serde::de::DeserializeOwned>(
     serde_json::from_slice::<T>(&body).ok()
 }
 
-/// Probes the Ollama protocol: `GET /api/version` then `GET /api/tags`.
-/// Returns `(version, model_names)`.
 async fn probe_ollama_endpoint(
     client: &reqwest::Client,
     base_url: &str,
@@ -276,8 +207,6 @@ async fn probe_ollama_endpoint(
     (version, models)
 }
 
-/// Probes the OpenAI-compatible protocol: `GET /v1/models`.
-/// Returns `data[].id` strings on success, empty vec otherwise.
 async fn probe_openai_endpoint(client: &reqwest::Client, base_url: &str) -> Vec<String> {
     let url = format!("{base_url}/v1/models");
     get_json_capped::<OpenAiModels>(client, &url)
@@ -286,74 +215,53 @@ async fn probe_openai_endpoint(client: &reqwest::Client, base_url: &str) -> Vec<
         .unwrap_or_default()
 }
 
-/// Shape of the OpenAI-compatible `GET /v1/models` response.
 #[derive(Debug, Deserialize)]
 struct OpenAiModels {
     #[serde(default)]
     data: Vec<OpenAiModelEntry>,
 }
 
-/// One entry from `GET /v1/models`.
 #[derive(Debug, Deserialize)]
 struct OpenAiModelEntry {
     id: String,
 }
 
-/// Shape of Ollama's `GET /api/version` response.
 #[derive(Debug, Deserialize)]
 struct OllamaVersion {
     version: String,
 }
 
-/// One model entry from Ollama's `GET /api/tags`.
 #[derive(Debug, Deserialize)]
 struct OllamaTagModel {
     #[serde(default)]
     name: String,
 }
 
-/// Shape of Ollama's `GET /api/tags` response.
 #[derive(Debug, Deserialize)]
 struct OllamaTags {
     #[serde(default)]
     models: Vec<OllamaTagModel>,
 }
 
-/// Outcome of probing the local LLM runtime, shared between the LLM-runtime gate
-/// and the embedding-model gate so the latter can reuse the Ollama tags fetch.
+/// LLM-runtime probe outcome shared with the embedding-model gate.
 struct LlmRuntimeProbe {
-    /// The completed LLM-runtime check row.
     result: CheckResult,
-    /// Whether a local Ollama runtime answered (gates the embedding probe).
     ollama_up: bool,
-    /// The Ollama base URL we probed (for the embedding tags fetch).
     ollama_base_url: String,
 }
 
-/// Builds a short-timeout HTTP client for runtime detection via the one hardened
-/// builder ([`crate::http::hardened_client`]): bounded connect/read timeouts plus
-/// SSRF hardening (never follow a redirect — a malicious / misconfigured endpoint
-/// could 30x a probe toward an internal host; a probe only ever inspects the
-/// directly-addressed service). Centralized so the primary build and its fallback
-/// can never drift apart, and so the fallback never degrades to a
-/// redirect-following default.
+/// Short-timeout HTTP client for runtime detection: bounded timeouts, no redirects
+/// (a redirect could 30x a probe toward an internal host — SSRF hardening).
 fn probe_client() -> reqwest::Client {
     crate::http::hardened_client(PROBE_CONNECT_TIMEOUT, PROBE_TIMEOUT)
 }
 
-/// Resolves the configured Ollama base URL, defaulting to localhost.
-///
-/// Public so the embedding-model install command can target the SAME runtime
-/// the system-check probe detected, rather than re-deriving the URL.
+/// Resolves the configured Ollama base URL (public so the install command uses
+/// the same URL the system-check probe detected).
 pub fn ollama_base_url(config: &AppConfig) -> String {
     provider_base_url(config, "ollama").unwrap_or_else(|| DEFAULT_OLLAMA_BASE_URL.to_string())
 }
 
-/// Resolves the configured LM Studio base URL, defaulting to localhost:1234.
-///
-/// Mirrors [`ollama_base_url`] so the LM Studio probe target is configurable
-/// rather than hard-coded, and so the aggregate fallback can be tested via the
-/// seam (point both seams at a mock server).
 fn lmstudio_base_url(config: &AppConfig) -> String {
     provider_base_url(config, "lmstudio")
         .or_else(|| provider_base_url(config, "lm_studio"))
@@ -361,8 +269,6 @@ fn lmstudio_base_url(config: &AppConfig) -> String {
         .unwrap_or_else(|| DEFAULT_LMSTUDIO_BASE_URL.to_string())
 }
 
-/// Finds the first configured model for `provider` with a non-empty base URL,
-/// returning its trailing-slash-trimmed URL.
 fn provider_base_url(config: &AppConfig, provider: &str) -> Option<String> {
     config
         .models
@@ -371,9 +277,7 @@ fn provider_base_url(config: &AppConfig, provider: &str) -> Option<String> {
         .map(|m| m.base_url.trim_end_matches('/').to_string())
 }
 
-/// Canonical cloud LLM provider ids (real models.dev keys) plus the legacy/custom
-/// `openai-compatible` endpoint id. Used by [`has_cloud_llm`] to recognize a
-/// configured cloud provider regardless of which first-class card the user picked.
+/// Recognized cloud provider ids (models.dev keys + the `openai-compatible` alias).
 const CLOUD_LLM_PROVIDERS: &[&str] = &[
     "openai",
     "anthropic",
@@ -388,11 +292,8 @@ const CLOUD_LLM_PROVIDERS: &[&str] = &[
     "openai-compatible",
 ];
 
-/// Returns `true` when `config.models` carries a usable cloud LLM entry: a
-/// recognized cloud provider (a real models.dev id `openai`/`anthropic`/`google`/
-/// `zai`, or a custom `openai-compatible` endpoint) with a non-empty `api_key` AND
-/// `model`. This is the cloud arm of the LLM-runtime gate (the local arm is
-/// runtime detection).
+/// Returns `true` when config carries a usable cloud LLM entry (recognized
+/// provider + non-empty `api_key` + non-empty `model`).
 fn has_cloud_llm(config: &AppConfig) -> bool {
     config.models.iter().any(|m| {
         CLOUD_LLM_PROVIDERS
@@ -403,56 +304,30 @@ fn has_cloud_llm(config: &AppConfig) -> bool {
     })
 }
 
-/// Detects Ollama via the shared [`probe_ollama_endpoint`] probe, taking just the
-/// version (discarding the model list). Returns the parsed version on a 200,
-/// `None` on a clean connect/timeout failure or a non-Ollama endpoint.
-///
-/// Delegates to the single Ollama probe implementation so the runtime-detection
-/// row and the `detect_llm` command can never drift in how they speak Ollama.
 async fn detect_ollama(client: &reqwest::Client, base_url: &str) -> Option<String> {
     let (version, _models) = probe_ollama_endpoint(client, base_url).await;
     version
 }
 
-/// Detects LM Studio via the shared [`probe_openai_endpoint`] probe. Returns
-/// `true` when the endpoint advertises at least one model on `/v1/models`.
-///
-/// Delegates to the single OpenAI-compatible probe implementation so detection
-/// behavior stays identical to the `detect_llm` command's OpenAI path.
 async fn detect_lmstudio(client: &reqwest::Client, base_url: &str) -> bool {
     !probe_openai_endpoint(client, base_url).await.is_empty()
 }
 
-/// Outcome of the enrichment-model validation (issue #90). NOT a [`CheckStatus`]
-/// variant — that enum is the frozen IPC contract and stays two-valued.
-///
-/// `Pass` means the resolved enrichment model is usable (or enrichment is opted
-/// out); `Invalid(reason)` carries a human-readable, actionable message that
-/// [`probe_llm_runtime`] folds into the `LlmRuntime` row's `detail`.
+/// Enrichment-model validation outcome (issue #90). Separate from [`CheckStatus`]
+/// so the frozen IPC enum stays two-valued; `Invalid(reason)` carries the
+/// actionable message that `probe_llm_runtime` folds into the row's `detail`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelValidation {
-    /// The resolved enrichment model is usable (or enrichment is disabled).
     Pass,
-    /// The resolved enrichment model is unusable; the string is an actionable reason.
     Invalid(String),
 }
 
-/// Returns a standardized "model not installed in Ollama" message.
-///
-/// The canonical wording is used at all three validation sites
-/// (system-check path, interactive-panel path, enrichment worker preflight)
-/// so the user always sees the same actionable message.
+/// Canonical "model not installed" message used at all three validation sites.
 pub fn ollama_model_missing_reason(model: &str) -> String {
     format!("Model '{model}' is not installed in Ollama. Run `ollama pull {model}` to install it.")
 }
 
-/// Runs a single `max_tokens:1` live probe against `provider`, wrapped in a
-/// [`CLOUD_PROBE_TIMEOUT`] timeout.  Returns [`ModelValidation::Pass`] on success
-/// or an [`ModelValidation::Invalid`] with a prefixed reason on failure.
-///
-/// `err_prefix` is prepended to "probe failed" / "probe timed out" messages so
-/// call-sites can distinguish enrichment-check failures from interactive-panel
-/// failures in logs and UI copy.
+/// Runs a `max_tokens:1` live probe against `provider` under `CLOUD_PROBE_TIMEOUT`.
 async fn cloud_probe(provider: &dyn crate::llm::LlmProvider, err_prefix: &str) -> ModelValidation {
     let req = crate::llm::LlmRequest {
         system: None,
@@ -473,31 +348,17 @@ async fn cloud_probe(provider: &dyn crate::llm::LlmProvider, err_prefix: &str) -
     }
 }
 
-/// Validates that the ENRICHMENT model the worker will actually use is available.
-///
-/// Resolves the provider through the SAME [`crate::llm::provider_from_config`]
-/// factory the engine startup uses (`lib.rs`), so validation targets exactly the
-/// model the worker will generate with (routing- and consent-aware). Asymmetric by
-/// design (issue #90 Principle 3):
-///
-/// - `enrichment.enabled == false` (informed opt-out) ⇒ [`ModelValidation::Pass`].
-/// - No provider resolves while enabled ⇒ [`ModelValidation::Invalid`] (config error).
-/// - Local Ollama ⇒ tags-membership check via [`list_ollama_models`] (free,
-///   deterministic; no token spend).
-/// - Cloud ⇒ a live `max_tokens:1` [`generate`](crate::llm::LlmProvider::generate)
-///   probe wrapped in a [`CLOUD_PROBE_TIMEOUT`] `tokio::time::timeout`.
-/// - Local non-Ollama (LM Studio) or a non-`GenaiProvider` ⇒ reachability is
-///   sufficient (no `/api/tags` equivalent), so [`ModelValidation::Pass`].
+/// Validates the enrichment model via the same provider factory the engine uses,
+/// so routing and consent are respected (issue #90 Principle 3). Disabled
+/// enrichment always returns `Pass`; Ollama uses a tags check; cloud uses a live
+/// probe; non-Ollama local falls through to `Pass` (reachability is sufficient).
 pub async fn validate_enrichment_model(config: &AppConfig) -> ModelValidation {
-    // 1. Opt-out short-circuit.
     if !config.enrichment.enabled {
         return ModelValidation::Pass;
     }
 
-    // 2. Resolve the provider via the SAME factory the worker/startup uses.
     let provider = match crate::llm::provider_from_config(config, config.enrichment.cloud_consent) {
         Some(p) => p,
-        // 3. No provider resolved while enrichment is enabled ⇒ Invalid.
         None => {
             return ModelValidation::Invalid(
                 "Enrichment is enabled but no LLM provider is configured for the current routing policy"
@@ -506,10 +367,6 @@ pub async fn validate_enrichment_model(config: &AppConfig) -> ModelValidation {
         }
     };
 
-    // 4. Inspect the resolved provider. Only a local Ollama `GenaiProvider` gets a
-    // tags-membership check; a cloud `GenaiProvider` gets a live probe; anything
-    // else (local non-Ollama, or a non-`GenaiProvider` mock) is reachability-
-    // sufficient.
     let genai = provider
         .as_any()
         .downcast_ref::<crate::llm::GenaiProvider>();
@@ -526,34 +383,19 @@ pub async fn validate_enrichment_model(config: &AppConfig) -> ModelValidation {
                 ))
             }
         }
-        // Cloud provider (a `GenaiProvider` whose adapter is not Ollama): live probe.
         Some(_) => cloud_probe(provider.as_ref(), "Cloud enrichment model").await,
-        // Non-`GenaiProvider` (e.g. a test mock) or a local non-Ollama runtime:
-        // reachability (already confirmed by the runtime probe) is sufficient.
         None => ModelValidation::Pass,
     }
 }
 
-/// Validates an enrichment model from RAW, not-yet-persisted params (issue #90
-/// interactive path — the `LlmConfigPanel` Save/Test Connection pre-save probe).
-///
-/// Unlike [`validate_enrichment_model`] (which reads the persisted [`AppConfig`] via
-/// `provider_from_config`), this validates exactly the values the user typed BEFORE
-/// they are saved, so the panel can block a bad model without persisting it:
-///
-/// - `provider == "ollama"` ⇒ tags-membership of `model` in `list_ollama_models(base_url)`.
-/// - Otherwise (cloud) ⇒ build a temporary provider from the raw params and run a
-///   `max_tokens:1` live probe wrapped in a [`CLOUD_PROBE_TIMEOUT`] timeout.
-///
-/// The `provider` id is derived by the frontend from the active tab (local → `"ollama"`,
-/// cloud → the selected cloud provider id).
+/// Validates raw (not-yet-persisted) params for the interactive `LlmConfigPanel`
+/// pre-save probe (issue #90). Ollama: tags-membership check; cloud: live probe.
 pub async fn validate_model_interactive(
     provider: &str,
     model: &str,
     base_url: &str,
     api_key: &str,
 ) -> ModelValidation {
-    // Local Ollama: free, deterministic tags-membership check.
     if provider.eq_ignore_ascii_case("ollama") {
         let installed = list_ollama_models(base_url).await;
         return if installed.iter().any(|m| m == model) {
@@ -563,7 +405,6 @@ pub async fn validate_model_interactive(
         };
     }
 
-    // Cloud: build a temp provider from the raw params and run a live probe.
     let Some(provider) = crate::llm::build_provider_raw(provider, model, base_url, api_key) else {
         return ModelValidation::Invalid(
             "Unrecognized provider or missing endpoint for the selected model".to_string(),
@@ -572,17 +413,8 @@ pub async fn validate_model_interactive(
     cloud_probe(provider.as_ref(), "Cloud model").await
 }
 
-/// Probe 1 — LLM runtime readiness gate.
-///
-/// PASSES when EITHER a local runtime is reachable OR a cloud provider is
-/// configured:
-///
-/// - local: Ollama (`/api/version`) or LM Studio (`/v1/models`), probed
-///   CONCURRENTLY via [`tokio::join!`] so the wall-clock is one timeout window
-///   (connect 1s + read 2s), NOT the ~4s of two sequential probes; OR
-/// - cloud: a usable `openai-compatible` entry (see [`has_cloud_llm`]).
-///
-/// Otherwise `Fail`. A clean connect/timeout failure is not a [`crate::LensError`].
+/// LLM-runtime readiness gate: passes when a local runtime (Ollama / LM Studio,
+/// probed concurrently) or a configured cloud provider is reachable.
 async fn probe_llm_runtime(config: &AppConfig) -> LlmRuntimeProbe {
     let client = probe_client();
     let ollama_base = ollama_base_url(config);
@@ -620,11 +452,8 @@ async fn probe_llm_runtime(config: &AppConfig) -> LlmRuntimeProbe {
         },
     };
 
-    // Enrichment-model validation (issue #90): only when the preliminary
-    // reachability check PASSED does an invalid enrichment model override the row to
-    // Fail. A preliminary Fail (no runtime at all) stays Fail — the enrichment check
-    // is moot without a runtime. Opt-out (enrichment disabled) is handled inside
-    // `validate_enrichment_model` (returns Pass).
+    // Only override to Fail when the preliminary reachability check passed — a
+    // pre-existing Fail (no runtime) is moot to augment with enrichment detail.
     if result.status == CheckStatus::Pass
         && let ModelValidation::Invalid(reason) = validate_enrichment_model(config).await
     {
@@ -640,65 +469,33 @@ async fn probe_llm_runtime(config: &AppConfig) -> LlmRuntimeProbe {
     }
 }
 
-/// Returns `true` when an installed Ollama model name matches an allowlisted
-/// embedding model OR the user's configured `embedding_model`.
+/// Returns `true` when `installed_name` matches an allowlisted embedding model
+/// or the user's configured `embedding_model`.
 ///
-/// EXACT-TAG rule (issue #80, symmetric with the TS `ollamaMatches` D3 rule): a
-/// registry id may itself contain a colon (`qwen3-embedding:4b`). Blindly
-/// stripping the `:tag` suffix would turn that into `qwen3-embedding`, which is
-/// NOT a registry id — so `qwen3-embedding:4b` would fail the readiness gate while
-/// `qwen3-embedding:0.6b` (a DIFFERENT, unlisted model) would spuriously pass.
-///
-/// Resolution order, case-insensitive:
-/// 1. Match the FULL installed name against the registry first — this accepts
-///    colon-bearing ids (`qwen3-embedding:4b`) EXACTLY, and rejects sibling tags.
-/// 2. Only if that misses, fall back to tag-stripping so an untagged registry id
-///    served with a default tag (`nomic-embed-text:latest`) still matches.
-/// 3. The configured-id escape hatch lets a user's chosen model pass even if it
-///    is not (yet) in the registry (matched against both full and bare names).
+/// EXACT-TAG rule (issue #80): try the full name first (accepts colon-bearing ids
+/// like `qwen3-embedding:4b` exactly), then fall back to tag-stripping for the
+/// `nomic-embed-text:latest` case. Configured-id escape hatch handles models not
+/// yet in the registry.
 fn is_allowlisted_embedding(installed_name: &str, configured: &str) -> bool {
     let full = installed_name.to_ascii_lowercase();
     let bare = installed_name
         .split_once(':')
         .map_or(installed_name, |(name, _tag)| name)
         .to_ascii_lowercase();
-    // `is_allowlisted_embedding_id` is the single registry-derived check (accepts
-    // every canonical id + bridges the Ollama alias `"nomic-embed-text"` via
-    // `resolve_opt`). Try the FULL name first (exact colon-bearing match), then
-    // the tag-stripped bare name (untagged-id-with-`:latest` case).
     is_allowlisted_embedding_id(&full)
         || is_allowlisted_embedding_id(&bare)
         || (!configured.is_empty()
             && (configured.eq_ignore_ascii_case(&full) || configured.eq_ignore_ascii_case(&bare)))
 }
 
-/// Returns `true` when the SPECIFIC `model_id`'s fastembed weights are already
-/// cached on disk under `{data_dir}/models/fastembed/`.
-///
-/// R6 (M4 Phase 4b-B, verify-then-implement): the per-model hf-hub cache
-/// subdirectory shape was OBSERVED empirically by constructing a real
-/// `FastembedEmbedder::new_with_spec` for `all-minilm` into a temp data_dir and
-/// walking the tree — it produced
-/// `{data_dir}/models/fastembed/models--Qdrant--all-MiniLM-L6-v2-onnx/`
-/// (standard `hf-hub` repo cache: `models--{org}--{model}` with `snapshots/`,
-/// `blobs/`, `refs/` underneath). The per-model subdir is derived from the
-/// registry spec ([`EmbeddingModelSpec::fastembed_cache_subdir`]), so the check
-/// is PER-MODEL: a notebook on `mxbai-embed-large` does NOT pass merely because
-/// `nomic`'s weights happen to be present.
-///
-/// Treats the model as "cached" when ITS subdir exists AND contains at least one
-/// entry (a non-empty repo dir means the download completed or is in progress —
-/// either way construction, not this probe, is the final arbiter). An unknown /
-/// empty `model_id` resolves to the default via the registry.
-///
-/// `pub` (re-exported from `lib.rs`) so the per-model cache state can be surfaced
-/// to the frontend (the `fastembed_models_cached` Tauri command) without forcing a
-/// duplicate path-derivation that could drift from the gate's own definition of
-/// "cached".
+/// Returns `true` when `model_id`'s fastembed weights are cached under
+/// `{data_dir}/models/fastembed/`. The per-model subdir shape
+/// (`models--{org}--{model}`) was observed empirically (R6, M4 Phase 4b-B).
+/// A non-empty subdir is treated as cached; construction is the final arbiter.
+/// Public so the `fastembed_models_cached` Tauri command can surface cache state.
 pub fn fastembed_weights_cached(data_dir: &Path, model_id: &str) -> bool {
     let spec = crate::embedder::resolve(model_id);
-    // An Ollama-only model (issue #80) has no fastembed cache directory at all —
-    // fastembed never downloads it — so it can never be "fastembed-cached".
+    // Ollama-only models (issue #80) have no fastembed cache dir.
     let Some(subdir) = spec.fastembed_cache_subdir() else {
         return false;
     };
@@ -706,23 +503,15 @@ pub fn fastembed_weights_cached(data_dir: &Path, model_id: &str) -> bool {
     if !model_dir.is_dir() {
         return false;
     }
-    // Non-empty repo dir → weights present (or mid-download) for THIS model.
     std::fs::read_dir(&model_dir)
         .ok()
         .and_then(|mut d| d.next())
         .is_some()
 }
 
-/// Whether the LOCAL (non-Ollama) embedding engine's weights for `model_id` are on
-/// disk. This is what the onboarding readiness gate's fastembed arm actually means:
-/// "the on-device embedding model is installed."
-///
-/// On the `native-ml-metal` build (Apple Silicon), a candle-supported model is
-/// served by candle — whose weights live under `{data_dir}/models/candle/`, NOT the
-/// fastembed ONNX cache — so accept EITHER engine's cache (issue #91). This makes
-/// the gate pass whether onboarding warmed candle (the Apple-Silicon default) or
-/// fell back to fastembed, and keeps every non-Apple-Silicon build on the exact
-/// fastembed-only check it had before.
+/// Whether the local (non-Ollama) embedding engine's weights are on disk.
+/// On `native-ml-metal` (Apple Silicon), accepts EITHER candle or fastembed cache
+/// (issue #91); other builds use the fastembed-only check.
 fn local_embedding_weights_cached(data_dir: &Path, model_id: &str) -> bool {
     #[cfg(feature = "native-ml-metal")]
     {
@@ -741,18 +530,9 @@ fn local_embedding_weights_cached(data_dir: &Path, model_id: &str) -> bool {
     fastembed_weights_cached(data_dir, model_id)
 }
 
-/// Per-backend embedding-readiness gate predicate (M4 Phase 4b-B, R6 / D2).
-///
-/// PASSES iff the SELECTED backend's own arm is satisfied:
-/// `(backend == Fastembed && fastembed_cached) || (backend == Ollama &&
-/// ollama_detected)`.
-///
-/// Pure (no I/O) so the truth table is exhaustively unit-testable. The
-/// per-backend shape is the D2 showstopper guard: it NEVER requires Ollama for a
-/// fastembed selection (a fresh fastembed-only machine with cached weights passes
-/// even when Ollama is unreachable), and NEVER passes a fastembed selection on
-/// the strength of an unrelated Ollama tag (or vice-versa). The two facts
-/// (`fastembed_cached`, `ollama_detected`) are computed by the caller and fed in.
+/// Embedding-readiness gate predicate (M4 4b-B D2): each backend passes only on
+/// its own arm — fastembed on cached weights, Ollama on a detected tag.
+/// Pure (no I/O) so the truth table is exhaustively unit-testable.
 fn embedding_gate_passes(
     backend: crate::embedder::EmbeddingBackend,
     fastembed_cached: bool,
@@ -764,21 +544,9 @@ fn embedding_gate_passes(
     }
 }
 
-/// Probe 2 — embedding-model readiness gate (M4 Phase 4b-B: per-backend OR-gate).
-///
-/// Resolves the configured backend ([`AppConfig::embedding_backend`], empty →
-/// the `fastembed` default) and PASSES iff that backend's own readiness arm is
-/// satisfied ([`embedding_gate_passes`]):
-/// - [`Fastembed`](crate::embedder::EmbeddingBackend::Fastembed): the SELECTED
-///   model's weights are cached on disk under `{data_dir}/models/fastembed/`
-///   ([`fastembed_weights_cached`], per-model). Ollama is NOT probed for a
-///   fastembed selection — a fresh fastembed-only install passes with Ollama
-///   unreachable (D2).
-/// - [`Ollama`](crate::embedder::EmbeddingBackend::Ollama): Ollama is up and an
-///   allowlisted/selected model is installed via `GET /api/tags`.
-///
-/// `Fail`s only when the selected backend's arm is unsatisfied, with a `Choose`
-/// affordance.
+/// Embedding-model readiness gate (M4 4b-B): resolves the configured backend and
+/// passes iff its own arm is satisfied (fastembed → weights on disk; Ollama →
+/// allowlisted tag detected). Ollama is never probed for a fastembed selection.
 async fn probe_embedding_model(
     client: &reqwest::Client,
     runtime: &LlmRuntimeProbe,
@@ -803,13 +571,9 @@ async fn probe_embedding_model(
 
     let backend = crate::embedder::EmbeddingBackend::from_opt_str(Some(&config.embedding_backend));
 
-    // The local (non-Ollama) engine's weights: candle's on Apple Silicon (issue
-    // #91), else fastembed's ONNX. Named `fastembed_cached` for the gate predicate,
-    // which treats it as the on-device arm.
     let fastembed_cached = local_embedding_weights_cached(data_dir, &config.embedding_model);
 
-    // Only probe Ollama when the selected backend is Ollama AND the runtime is up
-    // — a fastembed selection must NEVER depend on (or wait on) Ollama (D2).
+    // Only probe Ollama for an Ollama-backend selection (D2: fastembed must never wait on Ollama).
     let ollama_detected =
         if matches!(backend, crate::embedder::EmbeddingBackend::Ollama) && runtime.ollama_up {
             let url = format!("{}/api/tags", runtime.ollama_base_url);
@@ -830,26 +594,12 @@ async fn probe_embedding_model(
     if found { pass() } else { fail() }
 }
 
-/// Returns `true` when a usable cloud TTS provider is configured: ElevenLabs
-/// with a non-empty `api_key`. This is the cloud arm of the TTS gate (the local
-/// arm is the Kokoro-model-on-disk check).
 fn has_cloud_tts(config: &AppConfig) -> bool {
     config.tts.provider.eq_ignore_ascii_case("elevenlabs") && !config.tts.api_key.is_empty()
 }
 
-/// Probe 3 — text-to-speech readiness gate.
-///
-/// PASSES when the user has genuinely COMPLETED TTS setup, via EITHER arm:
-///
-/// - local: the Kokoro ONNX model is on disk at
-///   `{data_dir}/models/kokoro/model_q8f16.onnx` (the exact path the downloader
-///   writes) AND the user has saved both a host and a guest voice
-///   (`config.voices.host` / `config.voices.guest` non-empty). The model file
-///   alone is NOT enough — downloading the engine without choosing voices leaves
-///   TTS unconfigured, so the gate must still `Fail`; OR
-/// - cloud: a cloud TTS provider is configured (see [`has_cloud_tts`]).
-///
-/// Otherwise `Fail` with a `Choose` affordance.
+/// TTS readiness gate: passes when the Kokoro ONNX model is on disk AND both
+/// voices are saved, OR a cloud TTS provider is configured.
 fn probe_text_to_speech(config: &AppConfig) -> CheckResult {
     let model_path = crate::tts::kokoro_model_path(Path::new(&config.paths.data_dir));
     let kokoro_on_disk = model_path.is_file();
@@ -875,26 +625,12 @@ fn probe_text_to_speech(config: &AppConfig) -> CheckResult {
     }
 }
 
-/// Runs the three system-check probes and returns them in the fixed row order:
-/// LlmRuntime, EmbeddingModel, TextToSpeech.
-///
-/// The probes run SEQUENTIALLY here: the LLM-runtime probe first (it concurrently
-/// probes Ollama + LM Studio internally), then the embedding-model probe — which
-/// REUSES the LLM probe's Ollama outcome (`ollama_up` + base URL), so it must run
-/// after it — and finally the synchronous text-to-speech probe (a filesystem +
-/// config check, no I/O). The dominant cost is the single bounded LLM timeout
-/// window.
-///
-/// Takes a `&AppConfig` and `data_dir` — the caller clones the config cheaply
-/// under the engine read guard and DROPS the guard before calling here, so the
-/// multi-second HTTP probes never hold the engine lock (which would block
-/// concurrent `get_config`/`set_config`). `data_dir` is used by the
-/// fastembed-cache arm of the embedding-model gate (R6).
+/// Runs the three system-check probes in fixed order: LlmRuntime, EmbeddingModel,
+/// TextToSpeech. The embedding probe reuses the LLM-runtime Ollama outcome, so it
+/// runs after. The caller drops the engine lock before calling so the HTTP probes
+/// never block concurrent config reads/writes.
 pub(crate) async fn run_system_check(config: &AppConfig, data_dir: &Path) -> Vec<CheckResult> {
     let embed_client = probe_client();
-
-    // The embedding probe reuses the LLM-runtime outcome, so it is awaited after
-    // the LLM probe within this future.
     let runtime = probe_llm_runtime(config).await;
     let embedding_model = probe_embedding_model(&embed_client, &runtime, config, data_dir).await;
 
@@ -925,8 +661,6 @@ mod tests {
         }
     }
 
-    /// Builds a config carrying both an Ollama and an LM Studio model entry so
-    /// both probe seams can be pointed at mock servers (or dead URLs).
     fn config_with_runtimes(ollama_url: &str, lmstudio_url: &str) -> AppConfig {
         AppConfig {
             models: vec![
@@ -947,23 +681,17 @@ mod tests {
 
     #[test]
     fn lmstudio_base_url_defaults_then_reads_config() {
-        // No lmstudio entry ⇒ the default seam.
         assert_eq!(
             lmstudio_base_url(&AppConfig::default()),
             DEFAULT_LMSTUDIO_BASE_URL
         );
-        // A configured entry wins, trailing slash trimmed.
         let cfg = config_with_runtimes("", "http://127.0.0.1:9999/");
         assert_eq!(lmstudio_base_url(&cfg), "http://127.0.0.1:9999");
     }
 
     #[tokio::test]
     async fn aggregate_falls_back_to_lmstudio_via_seam() {
-        // Ollama is down, but a configured LM Studio seam answers 200 on
-        // /v1/models ⇒ the aggregate LLM probe reports Pass via the fallback.
-        // Use a fixed always-refused port (1) rather than a dropped MockServer's
-        // port — the freed port can be rebound by a parallel test's Ollama mock
-        // and serve /api/version, flaking the `!ollama_up` assertion on CI.
+        // Fixed always-refused port avoids the parallel-test port-reuse race.
         let dead_ollama = "http://127.0.0.1:1".to_string();
 
         let lmstudio = MockServer::start().await;
@@ -1005,12 +733,7 @@ mod tests {
 
     #[tokio::test]
     async fn llm_runtime_fail_when_nothing_responds() {
-        // Both runtimes pointed at a fixed, always-refused localhost port (1).
-        // A dropped-MockServer port is NOT safe: cargo runs tests in parallel, so
-        // the freed ephemeral port can be re-bound by a concurrent test's mock
-        // server, which then answers 200 and flips this to Pass (observed in CI).
-        // Nothing binds 127.0.0.1:1, so the connection is deterministically
-        // refused → both runtimes absent + no cloud configured → Fail.
+        // Port 1 is always refused — avoids the parallel-test port-reuse race.
         let dead_url = "http://127.0.0.1:1";
         let config = config_with_runtimes(dead_url, dead_url);
         let probe = probe_llm_runtime(&config).await;
@@ -1023,8 +746,6 @@ mod tests {
 
     #[tokio::test]
     async fn llm_runtime_pass_when_cloud_provider_configured() {
-        // No local runtime reachable, but a usable openai-compatible cloud entry
-        // (provider + api_key + model) satisfies the gate.
         let dead_url = "http://127.0.0.1:1";
         let mut config = config_with_runtimes(dead_url, dead_url);
         config.models.push(ModelConfig {
@@ -1042,7 +763,6 @@ mod tests {
 
     #[test]
     fn has_cloud_llm_requires_key_and_model() {
-        // Missing api_key ⇒ not usable.
         let mut config = AppConfig::default();
         config.models.push(ModelConfig {
             provider: "openai-compatible".to_string(),
@@ -1051,22 +771,16 @@ mod tests {
         });
         assert!(!has_cloud_llm(&config));
 
-        // Missing model ⇒ not usable.
         config.models[0].model = String::new();
         config.models[0].api_key = "sk-cloud".to_string();
         assert!(!has_cloud_llm(&config));
 
-        // Both present ⇒ usable.
         config.models[0].model = "gpt-4o".to_string();
         assert!(has_cloud_llm(&config));
     }
 
     #[test]
     fn has_cloud_llm_recognizes_first_class_cloud_providers() {
-        // Fix #1: a first-class cloud entry now carries its REAL provider id, not a
-        // blanket 'openai-compatible'. The LLM-runtime cloud arm must still
-        // recognize it (else a configured Anthropic/Google cloud provider would
-        // fail the readiness gate).
         for provider in ["anthropic", "google", "openai", "zai"] {
             let mut config = AppConfig::default();
             config.models.push(ModelConfig {
@@ -1084,7 +798,6 @@ mod tests {
 
     #[test]
     fn has_cloud_tts_requires_elevenlabs_and_key() {
-        // Empty api_key ⇒ not usable, even with the right provider.
         let mut config = AppConfig::default();
         config.tts = crate::config::TtsConfig {
             provider: "elevenlabs".to_string(),
@@ -1092,31 +805,24 @@ mod tests {
         };
         assert!(!has_cloud_tts(&config));
 
-        // Wrong provider + a valid key ⇒ not usable.
         config.tts = crate::config::TtsConfig {
             provider: "openai".to_string(),
             api_key: "sk-key".to_string(),
         };
         assert!(!has_cloud_tts(&config));
 
-        // Mixed-case "ElevenLabs" + key ⇒ usable (provider match is case-insensitive).
         config.tts = crate::config::TtsConfig {
             provider: "ElevenLabs".to_string(),
             api_key: "sk-key".to_string(),
         };
         assert!(has_cloud_tts(&config));
 
-        // Canonical "elevenlabs" + key ⇒ usable.
         config.tts.provider = "elevenlabs".to_string();
         assert!(has_cloud_tts(&config));
     }
 
     #[tokio::test]
     async fn llm_runtime_falls_back_to_lmstudio() {
-        // Ollama path 404s (present server, wrong endpoint ⇒ no version), but the
-        // LM Studio endpoint answers 200. Because the LM Studio probe targets a
-        // fixed default port, this asserts the fallback branch via the server
-        // responding 200 on /v1/models while /api/version is absent.
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v1/models"))
@@ -1125,11 +831,7 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        // No /api/version mock ⇒ wiremock returns 404 ⇒ Ollama treated as absent.
 
-        // Point the (fixed-port) LM Studio detector at this server by detecting
-        // directly; the aggregate probe uses the default port, so we assert the
-        // building blocks compose into the fallback Pass.
         let client = probe_client();
         let ollama = detect_ollama(&client, &server.uri()).await;
         let lmstudio = detect_lmstudio(&client, &server.uri()).await;
@@ -1140,20 +842,14 @@ mod tests {
 
     #[tokio::test]
     async fn llm_probe_stays_within_time_budget_when_offline() {
-        // Fixed always-refused port (avoids the parallel-test port-reuse race; see
-        // llm_runtime_fail_when_nothing_responds). Genuinely offline; never reaches
-        // a real LM Studio on :1234.
         let dead_url = "http://127.0.0.1:1";
         let config = config_with_runtimes(dead_url, dead_url);
         let start = Instant::now();
         let _ = probe_llm_runtime(&config).await;
         let elapsed = start.elapsed();
 
-        // Concurrent (not sequential) probing keeps the wall-clock to roughly
-        // ONE timeout window: PROBE_CONNECT_TIMEOUT (1s) + PROBE_TIMEOUT (2s) =
-        // 3s for the slowest single probe, NOT the ~6s of two sequential ones.
-        // The 3500ms budget is that 3s window plus 500ms of slack for CI
-        // scheduling jitter; bump it only if those two constants change.
+        // Concurrent probing = one timeout window (1s connect + 2s read = 3s max);
+        // 3500ms budget adds 500ms CI jitter slack.
         assert!(
             elapsed < Duration::from_millis(3_500),
             "llm probe took {elapsed:?}, exceeding the concurrent budget"
@@ -1178,7 +874,6 @@ mod tests {
             ollama_up: true,
             ollama_base_url: server.uri(),
         };
-        // Ollama-backend selection + an allowlisted Ollama model present → Pass.
         let config = AppConfig {
             embedding_backend: "ollama".to_string(),
             ..AppConfig::default()
@@ -1192,8 +887,6 @@ mod tests {
 
     #[tokio::test]
     async fn embedding_fail_when_no_allowlisted_model() {
-        // An installed-but-not-allowlisted model (e.g. a chat model) does NOT
-        // satisfy the gate.
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/tags"))
@@ -1210,7 +903,6 @@ mod tests {
             ollama_up: true,
             ollama_base_url: server.uri(),
         };
-        // Ollama-backend selection but only a non-allowlisted (chat) model → Fail.
         let config = AppConfig {
             embedding_backend: "ollama".to_string(),
             ..AppConfig::default()
@@ -1231,15 +923,12 @@ mod tests {
             ollama_up: false,
             ollama_base_url: DEFAULT_OLLAMA_BASE_URL.to_string(),
         };
-        // No fastembed cache + Ollama down → Fail.
         let result =
             probe_embedding_model(&client, &runtime, &AppConfig::default(), dir.path()).await;
 
         assert_eq!(result.status, CheckStatus::Fail);
     }
 
-    /// Creates a non-empty per-model fastembed cache subdir for `model_id`
-    /// (OBSERVED hf-hub shape `models/fastembed/models--{org}--{model}/…`).
     fn seed_fastembed_cache(data_dir: &Path, model_id: &str) {
         let subdir = crate::embedder::resolve(model_id)
             .fastembed_cache_subdir()
@@ -1251,8 +940,6 @@ mod tests {
 
     #[tokio::test]
     async fn embedding_pass_when_fastembed_weights_cached_ollama_down() {
-        // R6: the SELECTED model's fastembed weights present + Ollama unreachable
-        // → PASS (fastembed-backend default).
         let dir = tempfile::tempdir().unwrap();
         seed_fastembed_cache(dir.path(), "nomic-embed-text-v1.5");
 
@@ -1271,7 +958,6 @@ mod tests {
 
     #[tokio::test]
     async fn embedding_fail_when_no_cache_and_ollama_down() {
-        // No fastembed cache AND Ollama down → Fail.
         let dir = tempfile::tempdir().unwrap();
         let client = probe_client();
         let runtime = LlmRuntimeProbe {
@@ -1285,25 +971,18 @@ mod tests {
         assert_eq!(result.status, CheckStatus::Fail);
     }
 
-    // --- Step 5 (4b-B): per-model fastembed cache check (R6) ---
-
-    /// `fastembed_weights_cached` is PER-MODEL: caching nomic's weights does NOT
-    /// make the mxbai model report cached, and vice-versa.
+    /// `fastembed_weights_cached` is per-model: seeding nomic must not satisfy mxbai.
     #[test]
     fn fastembed_weights_cached_is_per_model() {
         let dir = tempfile::tempdir().unwrap();
-        // Only the nomic subdir is present.
         seed_fastembed_cache(dir.path(), "nomic-embed-text-v1.5");
 
-        // The SAME model that was seeded → cached.
         assert!(fastembed_weights_cached(
             dir.path(),
             "nomic-embed-text-v1.5"
         ));
-        // A DIFFERENT model whose subdir is absent → NOT cached.
         assert!(!fastembed_weights_cached(dir.path(), "mxbai-embed-large"));
 
-        // Now seed mxbai too → both report cached.
         seed_fastembed_cache(dir.path(), "mxbai-embed-large");
         assert!(fastembed_weights_cached(dir.path(), "mxbai-embed-large"));
         assert!(fastembed_weights_cached(
@@ -1312,7 +991,6 @@ mod tests {
         ));
     }
 
-    /// An empty model subdir (created but no files) is NOT cached.
     #[test]
     fn fastembed_weights_cached_false_for_empty_dir() {
         let dir = tempfile::tempdir().unwrap();
@@ -1326,8 +1004,6 @@ mod tests {
         ));
     }
 
-    /// The OBSERVED hf-hub subdir literal is the `models--{org}--{model}` form,
-    /// pinning the empirically-observed shape (Step 5 R6 protocol).
     #[test]
     fn fastembed_cache_subdir_matches_observed_shape() {
         assert_eq!(
@@ -1342,20 +1018,15 @@ mod tests {
                 .as_deref(),
             Some("models--nomic-ai--nomic-embed-text-v1.5")
         );
-        // An Ollama-only model (issue #80) has NO fastembed cache subdir.
         assert_eq!(
             crate::embedder::resolve("qwen3-embedding:4b").fastembed_cache_subdir(),
             None
         );
     }
 
-    // --- Step 5 (4b-B): per-backend OR-gate predicate truth table ---
-
     #[test]
     fn gate_predicate_truth_table() {
         use crate::embedder::EmbeddingBackend::{Fastembed, Ollama};
-        // Fastembed selection: passes IFF fastembed weights are cached; the
-        // ollama_detected flag is irrelevant (never required for fastembed).
         assert!(embedding_gate_passes(Fastembed, true, false));
         assert!(embedding_gate_passes(Fastembed, true, true));
         assert!(!embedding_gate_passes(Fastembed, false, false));
@@ -1363,8 +1034,6 @@ mod tests {
             !embedding_gate_passes(Fastembed, false, true),
             "a fastembed selection must NEVER pass on the strength of an Ollama tag"
         );
-        // Ollama selection: passes IFF an Ollama tag is detected; fastembed cache
-        // is irrelevant.
         assert!(embedding_gate_passes(Ollama, false, true));
         assert!(embedding_gate_passes(Ollama, true, true));
         assert!(!embedding_gate_passes(Ollama, false, false));
@@ -1374,23 +1043,18 @@ mod tests {
         );
     }
 
-    /// THE D2 showstopper guard: a fresh fastembed-only install — fastembed
-    /// selected (default config), the selected model's weights cached, Ollama
-    /// UNREACHABLE — PASSES the gate. A wrong fix that ANDs Ollama or probes it
-    /// for a fastembed selection would dead-end onboarding here.
+    /// D2 showstopper guard: fastembed weights cached + Ollama unreachable must pass.
     #[tokio::test]
     async fn fresh_install_fastembed_only_passes_gate() {
         let dir = tempfile::tempdir().unwrap();
         seed_fastembed_cache(dir.path(), "nomic-embed-text-v1.5");
 
         let client = probe_client();
-        // Ollama is DOWN and points at a dead loopback port.
         let runtime = LlmRuntimeProbe {
             result: llm_runtime_placeholder(),
             ollama_up: false,
             ollama_base_url: "http://127.0.0.1:1".to_string(),
         };
-        // Default config: empty embedding_backend → resolves to Fastembed.
         let result =
             probe_embedding_model(&client, &runtime, &AppConfig::default(), dir.path()).await;
         assert_eq!(
@@ -1402,46 +1066,31 @@ mod tests {
 
     #[test]
     fn allowlisted_embedding_matches_bare_name_and_config() {
-        // Tagged Ollama ALIAS name matches via the registry alias bridge.
         assert!(is_allowlisted_embedding("nomic-embed-text:latest", ""));
-        // The CANONICAL registry id is ALSO accepted (4b-B desync fix: the old
-        // hardcoded list only had the alias, so the canonical id slipped through).
         assert!(is_allowlisted_embedding("nomic-embed-text-v1.5", ""));
         assert!(is_allowlisted_embedding("nomic-embed-text-v1.5:latest", ""));
         assert!(is_allowlisted_embedding("BGE-M3", ""));
-        // A non-allowlisted name only matches when it equals the configured id.
         assert!(!is_allowlisted_embedding("my-custom-embed:latest", ""));
         assert!(is_allowlisted_embedding(
             "my-custom-embed:latest",
             "my-custom-embed"
         ));
-        // A non-embed chat model never matches.
         assert!(!is_allowlisted_embedding("llama3:latest", ""));
     }
 
-    /// Step 6 (issue #80): a colon-bearing registry id (`qwen3-embedding:4b`) must
-    /// be allowlisted for its EXACT tag only, mirroring the TS D3 rule. A sibling
-    /// tag of the same base (`:0.6b`, `:8b`) is a DIFFERENT, unlisted model and
-    /// must NOT pass — the old blind tag-strip would have wrongly accepted them all.
     #[test]
     fn allowlisted_embedding_exact_tag_for_colon_bearing_ids() {
-        // Exact colon-bearing id → allowlisted.
         assert!(is_allowlisted_embedding("qwen3-embedding:4b", ""));
-        // Sibling tags of the same base are NOT the registered model → rejected.
         assert!(!is_allowlisted_embedding("qwen3-embedding:0.6b", ""));
         assert!(!is_allowlisted_embedding("qwen3-embedding:8b", ""));
-        // The bare base alone (no tag) is not a registry id → rejected.
         assert!(!is_allowlisted_embedding("qwen3-embedding", ""));
-        // The other curated Ollama ids (no colon) still match.
         assert!(is_allowlisted_embedding("embeddinggemma", ""));
         assert!(is_allowlisted_embedding("embeddinggemma:latest", ""));
         assert!(is_allowlisted_embedding("nomic-embed-text-v2-moe", ""));
         assert!(is_allowlisted_embedding("snowflake-arctic-embed2", ""));
-        // The untagged alias-with-default-tag case still works (regression guard).
         assert!(is_allowlisted_embedding("nomic-embed-text:latest", ""));
     }
 
-    /// Step 6 (issue #80): every curated Ollama id is in the derived allowlist.
     #[test]
     fn new_ollama_ids_are_in_allowlist() {
         for id in [
@@ -1459,7 +1108,6 @@ mod tests {
 
     #[test]
     fn allowlist_is_derived_from_registry_and_accepts_canonical_and_alias() {
-        // The derived allowlist holds the CANONICAL registry ids (NOT the alias).
         assert!(ALLOWED_EMBEDDING_MODELS.contains(&"nomic-embed-text-v1.5"));
         assert!(!ALLOWED_EMBEDDING_MODELS.contains(&"nomic-embed-text"));
         assert_eq!(
@@ -1467,9 +1115,8 @@ mod tests {
             crate::embedder::registry::REGISTRY.len(),
             "allowlist must not drift from the registry"
         );
-        // The id-level allowlist accepts canonical ids AND the Ollama alias.
         assert!(is_allowlisted_embedding_id("nomic-embed-text-v1.5"));
-        assert!(is_allowlisted_embedding_id("nomic-embed-text")); // alias bridge
+        assert!(is_allowlisted_embedding_id("nomic-embed-text"));
         assert!(is_allowlisted_embedding_id("bge-m3"));
         assert!(!is_allowlisted_embedding_id("totally-made-up-model"));
     }
@@ -1484,7 +1131,6 @@ mod tests {
 
     #[test]
     fn text_to_speech_fail_when_nothing_configured() {
-        // A fresh data dir has no Kokoro model on disk + no cloud TTS ⇒ Fail.
         let dir = tempfile::tempdir().unwrap();
         let mut config = AppConfig::default();
         config.paths.data_dir = dir.path().display().to_string();
@@ -1501,15 +1147,11 @@ mod tests {
 
     #[test]
     fn text_to_speech_fail_when_model_present_but_voices_empty() {
-        // The engine file alone does NOT satisfy the gate: without host/guest
-        // voices the user hasn't completed TTS setup, so it must Fail. This is
-        // the readiness-gate tightening — downloading without choosing voices.
         let dir = tempfile::tempdir().unwrap();
         write_kokoro_model(dir.path());
 
         let mut config = AppConfig::default();
         config.paths.data_dir = dir.path().display().to_string();
-        // config.voices is empty by default.
 
         let result = probe_text_to_speech(&config);
         assert_eq!(result.status, CheckStatus::Fail);
@@ -1521,7 +1163,6 @@ mod tests {
 
     #[test]
     fn text_to_speech_pass_when_model_present_and_voices_set() {
-        // Engine on disk AND both voices saved ⇒ local TTS is genuinely ready.
         let dir = tempfile::tempdir().unwrap();
         write_kokoro_model(dir.path());
 
@@ -1539,8 +1180,6 @@ mod tests {
 
     #[test]
     fn text_to_speech_fail_when_only_one_voice_set() {
-        // Engine on disk but only the host voice saved (guest empty) ⇒ Fail.
-        // Guards the AND-conjunction: a single voice must NOT satisfy the gate.
         let dir = tempfile::tempdir().unwrap();
         write_kokoro_model(dir.path());
 
@@ -1557,7 +1196,6 @@ mod tests {
 
     #[test]
     fn text_to_speech_fail_when_voices_set_but_model_absent() {
-        // Voices saved but the engine was never downloaded ⇒ still Fail.
         let dir = tempfile::tempdir().unwrap();
         let mut config = AppConfig::default();
         config.paths.data_dir = dir.path().display().to_string();
@@ -1572,7 +1210,6 @@ mod tests {
 
     #[test]
     fn text_to_speech_pass_when_cloud_configured() {
-        // No local model on disk, but an ElevenLabs cloud key satisfies the gate.
         let dir = tempfile::tempdir().unwrap();
         let mut config = AppConfig::default();
         config.paths.data_dir = dir.path().display().to_string();
@@ -1663,8 +1300,6 @@ mod tests {
         }
     }
 
-    // --- detect_llm tests ---
-
     #[tokio::test]
     async fn detect_llm_ollama_responds_version_and_tags() {
         let server = MockServer::start().await;
@@ -1699,7 +1334,6 @@ mod tests {
     #[tokio::test]
     async fn detect_llm_openai_compatible_only() {
         let server = MockServer::start().await;
-        // No /api/version or /api/tags — only OpenAI-compatible /v1/models.
         Mock::given(method("GET"))
             .and(path("/v1/models"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -1720,8 +1354,6 @@ mod tests {
 
     #[tokio::test]
     async fn detect_llm_nothing_responds_returns_unreachable() {
-        // Fixed always-refused port — avoids the parallel-test port-reuse race
-        // (see llm_runtime_fail_when_nothing_responds for the full rationale).
         let result = detect_llm("http://127.0.0.1:1").await;
 
         assert!(!result.reachable);
@@ -1731,9 +1363,6 @@ mod tests {
 
     #[tokio::test]
     async fn detect_llm_dedupes_overlapping_models_across_protocols() {
-        // The same server speaks BOTH Ollama (/api/version + /api/tags) and the
-        // OpenAI-compatible protocol (/v1/models), advertising an OVERLAPPING
-        // model name. The merged `models` must dedupe it to a single entry.
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/version"))
@@ -1767,13 +1396,10 @@ mod tests {
 
         assert!(result.reachable);
         assert_eq!(result.version, Some("0.4.1".to_string()));
-        // "shared-model" appears in BOTH protocols but only once in the merge,
-        // and the Ollama-first ordering is preserved.
         assert_eq!(
             result.models,
             vec!["llama3:latest", "shared-model", "mistral-7b"]
         );
-        // Defensively assert the dedupe: the overlapping name occurs exactly once.
         assert_eq!(
             result
                 .models
@@ -1786,15 +1412,11 @@ mod tests {
 
     #[tokio::test]
     async fn detect_llm_rejects_non_http_scheme() {
-        // A non-http(s) scheme must short-circuit to unreachable WITHOUT probing
-        // (SSRF defense-in-depth — see detect_llm's scheme allowlist).
         let result = detect_llm("file:///etc/passwd").await;
         assert!(!result.reachable);
         assert_eq!(result.version, None);
         assert!(result.models.is_empty());
     }
-
-    // --- list_ollama_models tests (Stage 3 — live local picker) ------------
 
     #[tokio::test]
     async fn list_ollama_models_returns_pulled_models() {
@@ -1823,21 +1445,18 @@ mod tests {
 
     #[tokio::test]
     async fn list_ollama_models_empty_when_unreachable() {
-        // Ollama not running (always-refused port) ⇒ empty list, NEVER an error.
         let models = list_ollama_models("http://127.0.0.1:1").await;
         assert!(models.is_empty());
     }
 
     #[tokio::test]
     async fn list_ollama_models_empty_for_non_http_scheme() {
-        // A non-http(s) scheme short-circuits to empty (no probe), no panic/error.
         let models = list_ollama_models("file:///etc/passwd").await;
         assert!(models.is_empty());
     }
 
     #[tokio::test]
     async fn list_ollama_models_empty_when_not_ollama_endpoint() {
-        // An endpoint with no /api/version (not Ollama) ⇒ empty list, never errors.
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v1/models"))
@@ -1849,13 +1468,6 @@ mod tests {
         let models = list_ollama_models(&server.uri()).await;
         assert!(models.is_empty(), "no /api/version ⇒ Ollama absent ⇒ empty");
     }
-
-    // --- enrichment model validation (issue #90) ---------------------------
-    //
-    // These tests exercise `validate_enrichment_model` and its integration into
-    // `probe_llm_runtime`. The Ollama tags path is mocked via wiremock; the cloud
-    // path is mocked by pointing an `openai-compatible` provider at a wiremock
-    // server that answers `/v1/chat/completions` — NO real network in CI.
 
     use crate::config::EnrichmentConfig;
     use crate::llm::LlmRouting;
@@ -1919,8 +1531,6 @@ mod tests {
 
     #[tokio::test]
     async fn enrichment_validation_opt_out() {
-        // enrichment.enabled == false ⇒ Pass regardless of model state (no provider
-        // resolution, no probe).
         let config = config_enrichment_ollama("http://127.0.0.1:1", "llama3.2:3b", false);
         assert!(matches!(
             validate_enrichment_model(&config).await,
@@ -1930,7 +1540,6 @@ mod tests {
 
     #[tokio::test]
     async fn enrichment_validation_no_provider_but_enabled() {
-        // enabled but NO models configured ⇒ no provider resolves ⇒ Invalid.
         let config = AppConfig {
             enrichment: EnrichmentConfig {
                 enabled: true,
@@ -2043,9 +1652,6 @@ mod tests {
 
     #[tokio::test]
     async fn enrichment_validation_cloud_probe_timeout() {
-        // A cloud endpoint that hangs beyond the 10s probe timeout ⇒ Invalid. The
-        // wiremock delay (11s) exceeds `CLOUD_PROBE_TIMEOUT` (10s), so the
-        // `tokio::time::timeout` fires first.
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
@@ -2072,10 +1678,6 @@ mod tests {
 
     #[tokio::test]
     async fn enrichment_validation_routing_resolves_correct_model() {
-        // Two local Ollama entries; Explicit routing pins the SECOND (mistral:7b).
-        // Validation must check mistral:7b (the pinned model), which IS in tags,
-        // even though the first entry (llama3.2:3b) is NOT — proving validation
-        // targets the routing-resolved model, not just any config entry.
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/version"))
@@ -2128,8 +1730,6 @@ mod tests {
 
     #[tokio::test]
     async fn probe_llm_runtime_fails_enrichment_model_missing() {
-        // Ollama reachable, but the enrichment model is not in tags ⇒ the LlmRuntime
-        // row is overridden to Fail with the enrichment detail + Configure action.
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/version"))
@@ -2159,8 +1759,6 @@ mod tests {
 
     #[tokio::test]
     async fn probe_llm_runtime_passes_enrichment_disabled() {
-        // Ollama reachable + enrichment disabled ⇒ Pass (opt-out), regardless of the
-        // configured model not being installed.
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/version"))
@@ -2184,7 +1782,6 @@ mod tests {
 
     #[tokio::test]
     async fn probe_llm_runtime_passes_enrichment_model_valid() {
-        // Ollama reachable + enrichment model present in tags ⇒ Pass.
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/version"))

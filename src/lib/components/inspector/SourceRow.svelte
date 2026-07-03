@@ -1,10 +1,6 @@
 <!--
-  SourceRow — one row in the EmbeddingsInspector left pane: doc icon, title,
-  kind badge, and a status dot (shared statusDotClass, semantic tokens only).
-  Presentational: all state lives in the parent.
-
-  For error sources, the row renders a retry affordance (small icon button)
-  visible on hover so the inspector can trigger a retry in place.
+  SourceRow — left-pane row: doc icon, title, kind badge, status dot.
+  Presentational; all state in parent. Error sources get a hover retry button.
 -->
 <script lang="ts">
   import FileText from '@lucide/svelte/icons/file-text';

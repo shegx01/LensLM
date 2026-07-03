@@ -1,8 +1,5 @@
-// Canonical accent definitions — single source of truth for the accent id set
-// and the rich swatch list. The [data-accent] token layer (app.css) keys off
-// these ids; +layout.svelte validates persisted config against ACCENT_IDS and
-// MakeItYours renders the swatch grid from ACCENTS. Keep order/labels in sync
-// with the design spec.
+// Canonical accent definitions. The [data-accent] token layer (app.css) keys off these ids.
+// +layout.svelte validates against ACCENT_IDS; MakeItYours renders from ACCENTS.
 
 export const ACCENT_IDS = ['purple', 'green', 'blue', 'amber', 'rose', 'graphite'] as const;
 

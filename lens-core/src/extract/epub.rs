@@ -46,20 +46,12 @@ use super::{ExtractOutput, Extractor, SourceAnchor};
 const MAX_DECOMPRESSED_BYTES: usize = 256 * 1024 * 1024;
 
 /// EPUB extractor — implements [`Extractor`] via `rbook` + `quick-xml`.
-///
-/// Byte-identity offsets follow the DOCX build-as-you-go pattern (see docx.rs:204-207).
-///
-/// No extra separators between spine entries — each block gets its trailing '\n'
-/// from the build-as-you-go pattern. Empty spine entries contribute nothing.
 pub struct EpubExtractor;
 
 impl Extractor for EpubExtractor {
     fn extract(&self, raw: &[u8]) -> Result<ExtractOutput, LensError> {
-        // `rbook` needs an owned, Seek-able source; copy the slice into a Cursor.
-        // NOTE: rbook 0.7.9's `Epub::read` requires `Read + Seek + 'static`, so a
-        // borrowed `&[u8]` cursor does not satisfy the bound — the owned copy is
-        // unavoidable here. The decompression-bomb risk is instead bounded by the
-        // per-spine early-exit ceiling below (and the upstream 50 MB raw cap).
+        // rbook 0.7.9 requires `Read + Seek + 'static`; an owned copy is
+        // unavoidable. Bomb risk bounded by per-spine ceiling + upstream 50 MB cap.
         let epub = Epub::read(Cursor::new(raw.to_vec()))
             .map_err(|e| LensError::Parse(format!("rbook failed to read EPUB: {e}")))?;
 
@@ -74,12 +66,8 @@ impl Extractor for EpubExtractor {
             let href = content.manifest_entry().href().as_str().to_string();
             let xhtml = content.content();
 
-            // Decompression-bomb guard (pre-walk): rbook fully inflates the spine
-            // entry into `xhtml` before we get here, so reject an oversized single
-            // entry BEFORE parsing it — this bounds peak memory more tightly than
-            // the cumulative post-walk check below. (rbook owns decompression, so
-            // a detect-after-inflate guard is the best available without its
-            // lower-level zip API.)
+            // Pre-walk bomb guard: rbook fully inflates before we get here; reject
+            // oversized entries before parsing (best available without rbook's zip API).
             if xhtml.len() > MAX_DECOMPRESSED_BYTES {
                 return Err(LensError::Validation(format!(
                     "EPUB spine entry decompresses to more than the \
@@ -87,16 +75,14 @@ impl Extractor for EpubExtractor {
                 )));
             }
 
-            // Each spine entry is its own XHTML document with its own heading
-            // hierarchy: reset the section-path stack per entry.
+            // Each spine entry has its own heading hierarchy; reset per entry.
             let mut section_path = SectionPathStack::new();
 
             walk_xml_blocks(
                 xhtml,
                 "EPUB XHTML",
-                // classify: <h1>..<h6> are headings, <p> a paragraph. Match on the
-                // LOCAL name so namespace-prefixed XHTML (e.g. `<html:p>`) is still
-                // recognised rather than silently dropping the whole chapter.
+                // Match on local name so namespace-prefixed XHTML (e.g. `<html:p>`)
+                // is recognised rather than silently dropping the chapter.
                 |e: &BytesStart<'_>| {
                     let local = e.local_name();
                     match heading_level(local.as_ref()) {
@@ -105,7 +91,6 @@ impl Extractor for EpubExtractor {
                         None => None,
                     }
                 },
-                // inline_whitespace: XHTML `<br/>` is a hard line break.
                 |e: &BytesStart<'_>| {
                     if e.local_name().as_ref() == b"br" {
                         Some("\n")
@@ -113,7 +98,6 @@ impl Extractor for EpubExtractor {
                         None
                     }
                 },
-                // make_anchor: the spine index + href identify the block.
                 |_is_heading: bool| SourceAnchor::Epub {
                     spine_index,
                     href: href.clone(),
@@ -124,8 +108,7 @@ impl Extractor for EpubExtractor {
                 &mut anchors,
             )?;
 
-            // Decompression-bomb / runaway-content early exit: bound the in-memory
-            // buffer per spine entry BEFORE the stage-2 guard runs.
+            // Cumulative buffer bomb guard (before stage-2 runs).
             if extracted_text.len() > MAX_DECOMPRESSED_BYTES {
                 return Err(LensError::Validation(format!(
                     "EPUB extracted text exceeds the {MAX_DECOMPRESSED_BYTES}-byte \
@@ -147,7 +130,7 @@ impl Extractor for EpubExtractor {
     }
 }
 
-/// Returns the heading level (1–6) for an `<h1>`..`<h6>` tag name, else `None`.
+/// Returns the heading level (1–6) for `h1`..`h6`, or `None`.
 fn heading_level(name: &[u8]) -> Option<u8> {
     match name {
         b"h1" => Some(1),
@@ -176,9 +159,7 @@ mod tests {
         )
     }
 
-    /// Builds a minimal, valid EPUB 3 in memory (mimetype + container + OPF +
-    /// the given chapters). Hand-crafted (format structure only — no licensed
-    /// content). `chapters` is `(href, xhtml_body)`.
+    /// Builds a minimal valid EPUB 3 in memory. `chapters` is `(href, xhtml_body)`.
     fn build_epub(chapters: &[(&str, &str)]) -> Vec<u8> {
         let mut manifest = String::new();
         let mut spine = String::new();
@@ -320,7 +301,6 @@ mod tests {
                 "anchor[{i}] must be SourceAnchor::Epub"
             );
         }
-        // The first block comes from spine_index 0; a later block from index 1.
         let SourceAnchor::Epub { spine_index, href } = &out.anchors[0] else {
             panic!("epub anchor");
         };
@@ -375,10 +355,8 @@ mod tests {
 
     #[test]
     fn epub_large_valid_doc_extracts() {
-        // A legitimate large body (~2 MB in one paragraph) is well under the
-        // 256 MB ceiling and must extract cleanly (proving the early-exit guard
-        // does not reject valid content under cap).
-        let big = "word ".repeat(400_000); // ~2 MB
+        // ~2 MB — well under the 256 MB ceiling.
+        let big = "word ".repeat(400_000);
         let out = extract(&[("c.xhtml", &format!("<p>{big}</p>"))]);
         assert_byte_identity(&out);
         assert_eq!(out.blocks.len(), 1);
@@ -387,9 +365,7 @@ mod tests {
 
     #[test]
     fn epub_namespaced_block_elements_extracted() {
-        // XHTML that prefixes its block elements (valid XML: `<x:h1>`, `<x:p>`
-        // bound to the XHTML namespace) must still be recognised via local-name
-        // matching — otherwise an entire chapter would be silently dropped.
+        // Namespace-prefixed block elements must be recognised via local-name matching.
         let body = r#"<x:h1 xmlns:x="http://www.w3.org/1999/xhtml">Prefixed Heading</x:h1><x:p xmlns:x="http://www.w3.org/1999/xhtml">Prefixed paragraph.</x:p>"#;
         let out = extract(&[("c.xhtml", body)]);
         assert_byte_identity(&out);

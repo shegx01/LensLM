@@ -92,80 +92,43 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokenizers::Tokenizer;
 
-// ---------------------------------------------------------------------------
-// Recall gates
-// ---------------------------------------------------------------------------
-
-/// Measured raw recall@5 on the MAIN corpus (`queries.json`, 4 docs). Each query
-/// retrieves its gold chunk in the top-5 → 5/5 = 1.00. Used only as a sanity floor
-/// on the raw path; the A/B gate (`prefix-only >= raw`) is what guards the main
-/// corpus under `--enriched`.
+/// Measured raw recall@5 on the main corpus (`queries.json`, 4 docs). Used as a
+/// sanity floor; the A/B gate (`prefix-only >= raw`) guards the corpus under `--enriched`.
 const MAIN_BASELINE_RECALL: f32 = 1.00;
 
-/// Margin subtracted from the main-corpus baseline to set the raw pass floor. A
-/// single query regressing out of the top-5 on this 4-doc / ~12-chunk corpus drops
-/// recall by 0.20, so a 0.25 margin tolerates exactly one such regression.
+/// Margin from baseline to set the raw pass floor (0.25 tolerates one regression out
+/// of the top-5 on this ~12-chunk corpus, which drops recall by 0.20).
 const MAIN_MARGIN: f32 = 0.25;
 
 /// The raw pass floor on the main corpus.
 const MAIN_RECALL_FLOOR: f32 = MAIN_BASELINE_RECALL - MAIN_MARGIN;
 
-/// **Measured** raw recall@5 on the pronoun/coref fixture (`pronoun_context.md` +
-/// `pronoun_queries.json`). This MUST be `< 1.00`: the fixture is authored so the
-/// gold chunks name their subject only in the document title, while the chunk
-/// bodies use bare pronouns ("It used …"). Embedding the raw body alone genuinely
-/// misses at least one gold chunk against an entity-named query, so raw recall sits
-/// below 1.00 — which is exactly what makes the prefix enrichment improvement
-/// measurable.
-///
-/// Last measured 2026-06-26 via `cargo run -p lens-core --bin eval -- --enriched`:
-/// raw recall@5 on the 3-query pronoun fixture = 0.6667 (2/3 — one pronoun query
-/// misses its gold child because the body never names "Antikythera mechanism").
-/// The prefix-only path recovers it (3/3 = 1.0000). Recorded here so the gate is a
-/// MEASURED baseline, not a hand-picked constant; if the chunker or embedder
-/// changes this number, re-measure and update it (it must stay `< 1.00`).
+/// Measured raw recall@5 on the pronoun fixture. MUST be `< 1.00`: gold chunks name
+/// their subject only in the title; raw body embedding misses an entity-named query.
+/// Last measured 2026-06-26: 0.6667 (2/3 — pronoun body never names "Antikythera
+/// mechanism"; prefix-only recovers to 1.0000). Re-measure and update if chunker/
+/// embedder changes; it must stay `< 1.00`.
 const RAW_RECALL_PRONOUN_FIXTURE: f32 = 0.6667;
 
-/// **Measured** PREFIX-ONLY recall@5 on the coref fixture (`golden_record.md` +
-/// `coref_queries.json`). This MUST be `< 1.00`: the fixture is authored so the gold
-/// chunk's ONLY link to the query is a definite description ("The disc") whose
-/// antecedent ("Voyager Golden Record") is named in the document body but NOT in the
-/// title ("A Message to the Stars") or the lead sentence the context prefix is
-/// derived from. So the prefix cannot supply the missing entity and prefix-only
-/// still misses — only resolving the mention to its antecedent (the prefix+coref
-/// path, which runs the production `apply_substitutions`) recovers it.
-///
-/// Last measured 2026-06-26 via `cargo run -p lens-core --bin eval -- --enriched`:
-/// prefix-only recall@5 on the 2-query coref fixture = 0.5000 (1/2 — the
-/// "Who chose the recordings and contents of the Voyager Golden Record?" query misses
-/// its gold "Who chose what it carried" chunk because that chunk names the record only
-/// as "The disc" and the prefix's title is "A Message to the Stars"; five OTHER
-/// golden_record chunks that DO name the record fill the top-5 and crowd it out). The
-/// raw path misses it too (raw = 0.5000). The prefix+coref path recovers it (2/2 =
-/// 1.0000): the production `apply_substitutions` rewrites "The disc" → "The Voyager
-/// Golden Record" in the gold body, which jumps it to rank 1. Recorded here so the
-/// coref gate is a MEASURED baseline; if the chunker/embedder/fixture changes this
-/// number, re-measure and update it (it must stay `< 1.00` AND `<` the coref recall).
+/// Measured prefix-only recall@5 on the coref fixture. MUST be `< 1.00`: the gold
+/// chunk's only link to the query is "The disc" — whose antecedent "Voyager Golden
+/// Record" is not in the title/prefix. Prefix alone cannot supply it; only
+/// `apply_substitutions` (prefix+coref) recovers it (2/2 = 1.0000).
+/// Last measured 2026-06-26: 0.5000 (1/2). Re-measure if chunker/embedder changes;
+/// must stay `< 1.00` AND less than the coref recall.
 const PREFIX_ONLY_RECALL_COREF_FIXTURE: f32 = 0.5000;
 
-/// k is pinned at 5 for recall@5.
 const K: usize = 5;
 
-/// Title for the eval-corpus notebook (a REAL notebook row is created at runtime
-/// because `embedding_index.notebook_id` has a FK to `notebooks(id)`).
+/// A real notebook row is created at runtime because `embedding_index.notebook_id`
+/// has a FK to `notebooks(id)`.
 const EVAL_NOTEBOOK_TITLE: &str = "eval-corpus";
 
-// ---------------------------------------------------------------------------
-// queries.json schema
-// ---------------------------------------------------------------------------
-
-/// One canned query plus the gold chunk ids it should retrieve.
+/// One canned query plus the gold chunk ids it should retrieve (a hit if ANY appears
+/// in the top-5 results).
 #[derive(Debug, Deserialize)]
 struct Query {
-    /// The natural-language query string.
     query: String,
-    /// The deterministic `chunk_id`(s) that answer this query. recall@5 counts a
-    /// query as a hit if ANY of these appears in the top-5 search results.
     gold_chunk_ids: Vec<String>,
 }
 
@@ -184,7 +147,6 @@ async fn run() -> Result<ExitCode, LensError> {
     let fixtures_dir = eval_fixtures_dir();
     let enriched_mode = std::env::args().any(|a| a == "--enriched");
 
-    // Parse --model <id> (default: DEFAULT_EMBED_MODEL_ID = nomic-embed-text-v1.5).
     let model_id: String = {
         let args: Vec<String> = std::env::args().collect();
         args.windows(2)
@@ -192,9 +154,6 @@ async fn run() -> Result<ExitCode, LensError> {
             .map(|w| w[1].clone())
             .unwrap_or_else(|| DEFAULT_EMBED_MODEL_ID.to_string())
     };
-    // Parse --backend <fastembed|ollama> (default: fastembed — the hard-gate path).
-    // An unknown/absent value resolves to the default via the enum, same lenient
-    // resolution as the rest of the app.
     let backend: EmbeddingBackend = {
         let args: Vec<String> = std::env::args().collect();
         let raw = args
@@ -203,15 +162,11 @@ async fn run() -> Result<ExitCode, LensError> {
             .map(|w| w[1].clone());
         EmbeddingBackend::from_opt_str(raw.as_deref())
     };
-    // Resolve the spec, REJECTING an unknown id (mirrors the
-    // `set_notebook_embedding_model` command) so a typo'd `--model` fails loudly
-    // instead of silently measuring nomic. The legacy alias is accepted.
+    // Rejects unknown ids so a typo'd `--model` fails loudly (mirrors
+    // `set_notebook_embedding_model`). The legacy alias is accepted.
     let spec: &'static EmbeddingModelSpec = match lens_core::resolve_opt(&model_id) {
         Some(spec) => spec,
         None => {
-            // Derive the known-id list from the registry (issue #80) so it never
-            // drifts as models are added/removed. Each id is annotated with its
-            // backend(s) so a `--backend`/`--model` mismatch is easy to diagnose.
             let known: Vec<String> = lens_core::REGISTRY
                 .iter()
                 .map(|s| {
@@ -228,7 +183,6 @@ async fn run() -> Result<ExitCode, LensError> {
         }
     };
 
-    // Authoring aid: dump deterministic ids and exit (no embedding/search).
     if std::env::args().any(|a| a == "--print-ids") {
         let dir = tempfile::tempdir().map_err(|e| LensError::Io(e.to_string()))?;
         let engine = LensEngine::init(dir.path()).await?;
@@ -242,7 +196,6 @@ async fn run() -> Result<ExitCode, LensError> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    // ── Shared infra: one temp engine + embedder + tokenizer for the whole run.
     let dir = tempfile::tempdir().map_err(|e| LensError::Io(e.to_string()))?;
     let engine = LensEngine::init(dir.path()).await?;
     let data_dir = dir.path();
@@ -253,10 +206,6 @@ async fn run() -> Result<ExitCode, LensError> {
         spec.id,
         backend.as_str()
     );
-    // Construct the embedder for the selected backend. fastembed is the default +
-    // the hard-gate path (recall@5 == 1.0); ollama targets the loopback-only daemon
-    // (availability-gated — a missing daemon surfaces as a construction/embed error
-    // the harness reports rather than silently passing).
     let embedder: Box<dyn Embedder> = match backend {
         EmbeddingBackend::Fastembed => Box::new(FastembedEmbedder::new_with_spec(data_dir, spec)?),
         EmbeddingBackend::Ollama => {
@@ -274,13 +223,10 @@ async fn run() -> Result<ExitCode, LensError> {
         backend.as_str()
     );
 
-    // ── Main corpus: raw path always; enriched paths only under --enriched. ──
     let main_docs = load_corpus(&fixtures_dir, MAIN_DOCS)?;
     let main_queries = load_queries(&fixtures_dir, "queries.json")?;
 
     if !enriched_mode {
-        // Default mode: raw recall on the main corpus with the floor gate (the
-        // historical CI guard).
         println!("\n############ MAIN CORPUS — RAW ############");
         let raw = measure(
             &engine,
@@ -314,10 +260,6 @@ async fn run() -> Result<ExitCode, LensError> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    // ── A/B/C mode (--enriched): raw vs prefix-only vs prefix+coref + the AC15
-    // gates. The main corpus only needs raw vs prefix-only (no-regression); the
-    // pronoun fixture proves the PREFIX lift; the coref fixture proves the COREF
-    // lift beyond the prefix. ──
     println!("\n############ MAIN CORPUS (no-regression gate) ############");
     println!("\n--- raw ---");
     let main_raw = measure(
@@ -439,7 +381,6 @@ async fn run() -> Result<ExitCode, LensError> {
     .await?;
     report_recall("prefix+coref", coref_full.hits, coref_full.total);
 
-    // ── AC15 gates ──────────────────────────────────────────────────────────
     println!("\n=================== AC15 GATES ===================");
     println!(
         "main   : raw {:.4}  prefix-only {:.4}",
@@ -460,7 +401,6 @@ async fn run() -> Result<ExitCode, LensError> {
 
     let mut failed = false;
 
-    // Gate 1 — no regression on the main corpus: prefix-only >= raw.
     if main_prefix.recall() + 1e-6 < main_raw.recall() {
         eprintln!(
             "\nFAIL [no-regression]: main prefix-only recall@{K} {:.4} < raw {:.4}",
@@ -476,8 +416,6 @@ async fn run() -> Result<ExitCode, LensError> {
         );
     }
 
-    // Sanity: the recorded pronoun const must honestly match the measured raw recall
-    // of the pronoun fixture AND be < 1.00 (else the fixture proves nothing).
     if (pron_raw.recall() - RAW_RECALL_PRONOUN_FIXTURE).abs() > 1e-3 {
         eprintln!(
             "\nFAIL [fixture drift]: measured pronoun raw recall {:.4} != recorded RAW_RECALL_PRONOUN_FIXTURE {RAW_RECALL_PRONOUN_FIXTURE:.4}; re-measure and update the const",
@@ -492,7 +430,6 @@ async fn run() -> Result<ExitCode, LensError> {
         failed = true;
     }
 
-    // Gate 2 — strict prefix lift on the pronoun fixture: prefix-only > recorded raw.
     if pron_prefix.recall() <= RAW_RECALL_PRONOUN_FIXTURE + 1e-6 {
         eprintln!(
             "\nFAIL [prefix-lift]: pronoun prefix-only recall@{K} {:.4} does NOT exceed RAW_RECALL_PRONOUN_FIXTURE {RAW_RECALL_PRONOUN_FIXTURE:.4}",
@@ -506,8 +443,6 @@ async fn run() -> Result<ExitCode, LensError> {
         );
     }
 
-    // Sanity: the recorded coref const must honestly match the measured prefix-only
-    // recall of the coref fixture AND be < 1.00 (else coref has nothing to recover).
     if (coref_prefix.recall() - PREFIX_ONLY_RECALL_COREF_FIXTURE).abs() > 1e-3 {
         eprintln!(
             "\nFAIL [fixture drift]: measured coref prefix-only recall {:.4} != recorded PREFIX_ONLY_RECALL_COREF_FIXTURE {PREFIX_ONLY_RECALL_COREF_FIXTURE:.4}; re-measure and update the const",
@@ -522,9 +457,7 @@ async fn run() -> Result<ExitCode, LensError> {
         failed = true;
     }
 
-    // Gate 3 — strict COREF lift BEYOND the prefix: prefix+coref > prefix-only on the
-    // coref fixture. This is the load-bearing AC15 honesty gate: coref must recover a
-    // gold chunk that the context prefix alone does NOT.
+    // Coref must recover a gold chunk the prefix alone does NOT — the AC15 honesty gate.
     if coref_full.recall() <= PREFIX_ONLY_RECALL_COREF_FIXTURE + 1e-6 {
         eprintln!(
             "\nFAIL [coref-lift]: coref prefix+coref recall@{K} {:.4} does NOT exceed prefix-only {PREFIX_ONLY_RECALL_COREF_FIXTURE:.4}; coref adds no value beyond the prefix on this fixture",
@@ -545,26 +478,18 @@ async fn run() -> Result<ExitCode, LensError> {
     Ok(ExitCode::SUCCESS)
 }
 
-// ---------------------------------------------------------------------------
-// Measurement core
-// ---------------------------------------------------------------------------
-
 /// Which text each chunk contributes to its embedding.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EmbedMode {
-    /// Embed the canonical `chunk.text` (the Phase-1/2 raw floor).
+    /// Embed raw `chunk.text`.
     Raw,
-    /// Embed `prefix + chunk.text` — the context-prefix enrichment WITHOUT coref —
-    /// plus a synthesized doc-summary node per doc.
+    /// Embed `prefix + chunk.text` (context prefix, no coref) + synthesized summary node.
     PrefixOnly,
-    /// Embed `prefix + apply_substitutions(chunk.text, …)` — the FULL production
-    /// re-embed input: the body is coref-resolved by the production
-    /// [`apply_substitutions`] before the prefix is prepended.
+    /// Embed `prefix + apply_substitutions(chunk.text)` — the full production re-embed input.
     PrefixCoref,
 }
 
 impl EmbedMode {
-    /// Whether this mode prepends the context prefix + synthesizes the summary node.
     fn is_enriched(self) -> bool {
         matches!(self, EmbedMode::PrefixOnly | EmbedMode::PrefixCoref)
     }
@@ -586,9 +511,8 @@ impl Recall {
     }
 }
 
-/// Ingests `docs` under `mode` into a FRESH per-pass notebook + Lance table, runs
-/// `queries`, prints the result table, and returns recall@5. Each pass uses its own
-/// notebook so the passes never share vectors.
+/// Ingests `docs` under `mode` into a fresh per-pass notebook + Lance table, runs
+/// `queries`, prints the result table, and returns recall@5.
 #[allow(clippy::too_many_arguments)]
 async fn measure(
     engine: &LensEngine,
@@ -621,14 +545,7 @@ async fn measure(
         let blocks = parse_blocks(&doc.text, SourceKind::Markdown);
         let chunks = chunk_blocks_deterministic(&doc.text, &blocks, tokenizer)?;
 
-        // The deterministic per-doc "summary" stand-in for the structural map: the
-        // document title + lead sentence. Carries the document's named entity/topic
-        // — exactly the contextual signal the LLM structural map provides — so the
-        // composed `[Document: …]` prefix anchors pronoun/coref queries.
         let doc_summary = derive_doc_summary(&chunks);
-
-        // The authored coref allow-list (doc entities) + the production-shape
-        // substitutions per chunk. Only consulted in `PrefixCoref` mode.
         let allowed_antecedents = fixture_entities(&doc.name);
 
         let mut rows: Vec<VectorRow> = Vec::with_capacity(chunks.len() + 1);
@@ -641,15 +558,10 @@ async fn measure(
             let embed_text = match mode {
                 EmbedMode::Raw => chunk.text.clone(),
                 EmbedMode::PrefixOnly => {
-                    // EXACT production composition: compose_prefix → compose_embedding_text,
-                    // with the canonical body (NO coref).
                     let prefix = compose_prefix(&doc_summary, &chunk.section_path);
                     compose_embedding_text(&prefix, &chunk.text, Some(tokenizer))
                 }
                 EmbedMode::PrefixCoref => {
-                    // FULL production re-embed input: resolve the body with the
-                    // PRODUCTION `apply_substitutions` (the exact code the worker
-                    // calls), then compose the prefix over the resolved body.
                     let subs = fixture_coref_subs(&doc.name, &chunk.text);
                     let resolved_body =
                         apply_substitutions(&chunk.text, &subs, &allowed_antecedents);
@@ -662,8 +574,7 @@ async fn measure(
             texts.push(embed_text);
         }
 
-        // The synthesized doc-summary RAPTOR node (AC6): enriched modes only, and
-        // only when a non-empty summary exists (mirrors reembed.rs:54).
+        // Synthesized doc-summary RAPTOR node (AC6): enriched modes only.
         if mode.is_enriched() && !doc_summary.trim().is_empty() {
             let sid = summary_node_id(&doc.name, &doc_summary);
             chunk_text.insert(sid.clone(), snippet(&doc_summary));
@@ -673,9 +584,8 @@ async fn measure(
         }
 
         let text_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
-        // `block_in_place` so the Ollama backend's internal `Handle::block_on`
-        // (driving the HTTP request) does not panic when invoked from this async
-        // worker thread; a no-op cost for the CPU-bound fastembed backend.
+        // `block_in_place` so the Ollama backend's `Handle::block_on` doesn't panic on
+        // this async thread; a no-op for the CPU-bound fastembed backend.
         let vectors = tokio::task::block_in_place(|| embedder.embed_documents(&text_refs))?;
         for ((id, level), vector) in ids.into_iter().zip(levels).zip(vectors.into_iter()) {
             rows.push(VectorRow {
@@ -736,7 +646,6 @@ async fn measure(
     })
 }
 
-/// Prints a recall@k summary line block.
 fn report_recall(label: &str, hits: usize, total: usize) {
     let recall = if total == 0 {
         0.0
@@ -748,29 +657,20 @@ fn report_recall(label: &str, hits: usize, total: usize) {
     println!("recall@{K}    : {recall:.4}");
 }
 
-/// Derives the deterministic per-doc "summary" stand-in for the LLM structural map.
-///
-/// The production worker composes `embedding_text` from the structural map's
-/// `summary` (an LLM-authored sentence naming the document's entities/topic). The
-/// eval is deterministic (no LLM), so it derives the same KIND of signal from the
-/// document itself: the H1 title (first level-0 parent's `section_path`) plus the
-/// lead sentence of the first parent body. This carries the named entity ("The
-/// Antikythera Mechanism") that the pronoun-bearing chunk bodies omit — the exact
-/// context the structural-map-derived prefix supplies in production. For the coref
-/// fixture this title + lead sentence DELIBERATELY omits the query entity ("Voyager
-/// Golden Record"), so the prefix cannot supply it and only coref can.
+/// Derives the deterministic doc summary stand-in for the LLM structural map: the H1
+/// title + lead sentence of the first parent body. Carries the named entity the pronoun
+/// fixture bodies omit. For the coref fixture the title/lead deliberately omit the query
+/// entity so only coref can supply it.
 fn derive_doc_summary(chunks: &[Chunk]) -> String {
     let Some(first_parent) = chunks.iter().find(|c| c.level == 0) else {
         return String::new();
     };
-    // The H1 / top heading is the leading segment of the section path.
     let title = first_parent
         .section_path
         .split('>')
         .next()
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    // The lead sentence of the first parent body (up to the first period).
     let lead = first_parent
         .text
         .split(['.', '\n'])
@@ -778,8 +678,7 @@ fn derive_doc_summary(chunks: &[Chunk]) -> String {
         .find(|s| !s.is_empty());
 
     match (title, lead) {
-        // Lead already names the title's subject → the lead sentence alone carries
-        // the entity. Otherwise prepend the title so the entity is always present.
+        // Lead already names the subject → omit the title to avoid redundancy.
         (Some(t), Some(l)) if l.starts_with(t) => format!("{l}."),
         (Some(t), Some(l)) => format!("{t}. {l}."),
         (Some(t), None) => t.to_string(),
@@ -788,9 +687,8 @@ fn derive_doc_summary(chunks: &[Chunk]) -> String {
     }
 }
 
-/// Content-derived id for the synthesized doc-summary node, mirroring the
-/// `chunk_blocks_deterministic` scheme (level=2, empty section_path, summary text,
-/// ordinal 0) so the id is stable run-to-run and unique per document.
+/// Content-derived id for the synthesized doc-summary node (mirrors
+/// `chunk_blocks_deterministic`: level=2, empty section_path, ordinal 0).
 fn summary_node_id(doc_name: &str, summary: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(2i32.to_le_bytes());
@@ -802,14 +700,8 @@ fn summary_node_id(doc_name: &str, summary: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-// ---------------------------------------------------------------------------
-// Authored coref map (the deterministic LLM stand-in for the substitution pass)
-// ---------------------------------------------------------------------------
-
-/// The doc entities passed as `allowed_antecedents` to the production
-/// [`apply_substitutions`] — the same hallucination allow-list the structural map's
-/// `entities` field supplies in production. Authored per fixture; empty for docs
-/// that need no coref resolution.
+/// Doc entities for `allowed_antecedents` — the same allow-list the structural map's
+/// `entities` field supplies in production. Authored per fixture.
 fn fixture_entities(doc_name: &str) -> Vec<String> {
     COREF_MAP
         .iter()
@@ -826,15 +718,9 @@ fn fixture_entities(doc_name: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Builds the production-shape [`CorefSub`] list for `chunk_text` from the authored
-/// per-doc `(mention → antecedent)` edits. For each authored edit, EVERY
-/// non-overlapping occurrence of `mention` in this chunk's text becomes a
-/// substitution at its real CHARACTER (Unicode codepoint) offsets — i.e. the exact
-/// `{mention, char_start, char_end, antecedent}` records a perfect coref model would
-/// emit for this chunk, matching the real `CorefSub` codepoint-offset contract that
-/// [`apply_substitutions`] converts to bytes internally. The byte position from
-/// `str::find` is converted to a codepoint index so the eval exercises the true
-/// production contract; the eval never re-implements the substitution itself.
+/// Builds production-shape [`CorefSub`]s for `chunk_text` from the authored edits.
+/// Byte positions from `str::find` are converted to codepoint indices to match the
+/// real `CorefSub` contract that [`apply_substitutions`] converts to bytes internally.
 fn fixture_coref_subs(doc_name: &str, chunk_text: &str) -> Vec<CorefSub> {
     let Some((_, edits)) = COREF_MAP.iter().find(|(name, _)| *name == doc_name) else {
         return Vec::new();
@@ -845,9 +731,6 @@ fn fixture_coref_subs(doc_name: &str, chunk_text: &str) -> Vec<CorefSub> {
         while let Some(rel) = chunk_text[from..].find(mention) {
             let byte_start = from + rel;
             let byte_end = byte_start + mention.len();
-            // Convert the byte positions to CODEPOINT indices (the production
-            // `CorefSub` contract). `[..byte_start]` is on a char boundary because
-            // `find` returns one, so its char count is the codepoint index.
             let char_start = chunk_text[..byte_start].chars().count();
             let char_end = chunk_text[..byte_end].chars().count();
             subs.push(CorefSub {
@@ -862,21 +745,12 @@ fn fixture_coref_subs(doc_name: &str, chunk_text: &str) -> Vec<CorefSub> {
     subs
 }
 
-/// The authored coref map: per fixture-doc, the `(mention, antecedent)` edits a
-/// perfect coref model would emit. `apply_substitutions` validates each against the
-/// real chunk text (offset/boundary/mention/allow-list) before applying, so a
-/// mention that does not actually occur in a chunk is simply a no-op there.
-///
-/// `golden_record` is the coref-lift fixture: its gold "Its custodian" chunk refers
-/// to the record only as "The disc"; resolving that to "Voyager Golden Record" is the
-/// ONLY thing that links the chunk to the "Who chose the contents of the Voyager
-/// Golden Record?" query (the prefix never names the record — its title is "A Message
-/// to the Stars"). Content distractors in the corpus describe OTHER committees that
-/// "selected and arranged the contents" of OTHER objects, so the gold chunk's raw
-/// body — which says the same thing but omits the record name — cannot out-rank them
-/// without the resolved entity. The other entries resolve the obliquely-named subject
-/// across the rest of the doc so the resolution is a realistic whole-doc pass, not a
-/// single rigged edit.
+/// Authored coref map: `(mention, antecedent)` edits per fixture-doc. `apply_substitutions`
+/// validates each against the real chunk text before applying; a mention absent from a
+/// chunk is a no-op. `golden_record`: resolving "The disc" → "Voyager Golden Record" is
+/// the only thing that links the gold chunk to the query — the prefix title "A Message
+/// to the Stars" never names the record. Other entries make the pass a realistic
+/// whole-doc resolution, not a single rigged edit.
 const COREF_MAP: &[(&str, &[(&str, &str)])] = &[(
     "golden_record",
     &[
@@ -888,18 +762,11 @@ const COREF_MAP: &[(&str, &[(&str, &str)])] = &[(
     ],
 )];
 
-// ---------------------------------------------------------------------------
-// Corpus / query loading
-// ---------------------------------------------------------------------------
-
-/// The MAIN corpus doc stems (the saturated 4-doc set; `queries.json`).
+/// Main corpus doc stems (saturated 4-doc set; `queries.json`).
 const MAIN_DOCS: &[&str] = &["espresso", "photosynthesis", "rust_ownership", "tides"];
 
-/// The pronoun fixture corpus (`pronoun_queries.json`). The 4 main docs are
-/// included as DISTRACTORS so the top-5 is genuinely contested: with a single
-/// short doc (≤5 chunks) every chunk would trivially land in the top-5 and recall
-/// would be a meaningless 1.00. The distractors force the pronoun-bearing gold
-/// chunk to actually out-rank unrelated chunks, so a raw miss is real.
+/// Pronoun fixture corpus. Main docs are distractors so the gold chunk must genuinely
+/// out-rank unrelated chunks — without them, every chunk trivially lands in the top-5.
 const PRONOUN_DOCS: &[&str] = &[
     "pronoun_context",
     "tide_prediction",
@@ -909,16 +776,11 @@ const PRONOUN_DOCS: &[&str] = &[
     "tides",
 ];
 
-/// The coref fixture corpus (`coref_queries.json`). Like the pronoun fixture, the
-/// main docs ride along as DISTRACTORS so the gold chunk has to genuinely out-rank
-/// unrelated chunks for a hit. `golden_record` is the coref-dependent doc.
+/// Coref fixture corpus. `golden_record` is the coref-dependent doc; the rest are
+/// distractors that also describe things "selected and arranged" — so the gold chunk's
+/// raw body (same phrase, no record name) cannot win without coref resolution.
 const COREF_DOCS: &[&str] = &[
     "golden_record",
-    // Content distractors: each names a DIFFERENT entity whose committee/author
-    // "selected and arranged the contents" — so the gold chunk's raw body (which
-    // says the same thing but never names the record) cannot out-rank them on a
-    // query that pins "Voyager Golden Record". Only coref, which injects the record
-    // name into the gold body, lets it win.
     "arecibo",
     "time_capsule",
     "westinghouse",
@@ -929,13 +791,11 @@ const COREF_DOCS: &[&str] = &[
     "tides",
 ];
 
-/// A loaded fixture document (file stem + verbatim text).
 struct Doc {
     name: String,
     text: String,
 }
 
-/// Resolves `tests/fixtures/eval/` relative to the crate manifest dir.
 fn eval_fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -943,8 +803,6 @@ fn eval_fixtures_dir() -> PathBuf {
         .join("eval")
 }
 
-/// Loads the named `*.md` fixtures (by stem) from `dir`, in the order given so the
-/// corpus is deterministic.
 fn load_corpus(dir: &Path, stems: &[&str]) -> Result<Vec<Doc>, LensError> {
     let mut docs = Vec::with_capacity(stems.len());
     for stem in stems {
@@ -965,7 +823,6 @@ fn load_corpus(dir: &Path, stems: &[&str]) -> Result<Vec<Doc>, LensError> {
     Ok(docs)
 }
 
-/// Loads and parses a queries JSON file by name.
 fn load_queries(dir: &Path, file: &str) -> Result<Vec<Query>, LensError> {
     let path = dir.join(file);
     let raw = std::fs::read_to_string(&path)
@@ -974,21 +831,14 @@ fn load_queries(dir: &Path, file: &str) -> Result<Vec<Query>, LensError> {
     Ok(queries)
 }
 
-/// Loads the nomic tokenizer via the engine's data dir, reusing the ingest
-/// pipeline's shared resolver.
 async fn load_tokenizer(engine: &LensEngine) -> Result<Tokenizer, LensError> {
     let data_dir = PathBuf::from(engine.config().await.paths.data_dir);
     lens_core::resolve_nomic_tokenizer(&data_dir).await
 }
 
-// ---------------------------------------------------------------------------
-// --print-ids authoring aid
-// ---------------------------------------------------------------------------
-
-/// Prints every chunk's deterministic id + section path + snippet, plus the
-/// synthesized summary-node id, so gold sets can be authored against stable ids. For
-/// docs with an authored coref map, also prints each chunk's resolved body so the
-/// `(mention → antecedent)` edits can be eyeballed.
+/// Prints each chunk's deterministic id + section path + snippet plus the summary-node
+/// id, so gold sets can be authored against stable ids. For coref-mapped docs also
+/// prints each chunk's resolved body for eyeballing the `(mention → antecedent)` edits.
 fn print_ids(docs: &[Doc], tokenizer: &Tokenizer, corpus: &str) -> Result<(), LensError> {
     println!("\n######## corpus: {corpus} ########");
     for doc in docs {
@@ -1028,11 +878,7 @@ fn print_chunk_line(c: &Chunk) {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Small helpers
-// ---------------------------------------------------------------------------
-
-/// First ~70 chars of `text`, single-lined, for readable output.
+/// First ~70 chars of `text`, single-lined.
 fn snippet(text: &str) -> String {
     let one_line: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if one_line.chars().count() > 70 {
@@ -1043,7 +889,6 @@ fn snippet(text: &str) -> String {
     }
 }
 
-/// First 12 chars of a chunk id (the deterministic ids are 64-hex).
 fn short_id(id: &str) -> String {
     id.chars().take(12).collect()
 }

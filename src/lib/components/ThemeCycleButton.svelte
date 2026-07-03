@@ -8,18 +8,9 @@
   import { cn } from '$lib/utils.js';
 
   /**
-   * Single cycling theme button: click advances light → dark → system → light.
-   * Renders in two visual contexts via the `variant` prop:
-   *
-   *   - `outline` (default): the shadcn outline icon button. Used by onboarding
-   *     (SystemCheck, `class="size-9 rounded-lg"`) and the account-footer menu row
-   *     (which passes a ghost-style class override).
-   *   - `bare`: a borderless 26px `bg-muted` circle with a 14px glyph, matching
-   *     the sidebar brand-row collapse button. No shadcn Button wrapper — a plain
-   *     <button> so the circle chrome is exact.
-   *
-   * `class` is merged onto the trigger in both variants. `iconClass` overrides the
-   * glyph size (defaults: 16px outline, 14px bare).
+   * Cycling theme button: click advances light → dark → system → light.
+   * `variant="bare"` renders a plain 26px circle (sidebar brand row); `"outline"` uses the shadcn outline button.
+   * `class` merges onto the trigger; `iconClass` overrides glyph size (default: 16px outline / 14px bare).
    */
   let {
     class: className = '',

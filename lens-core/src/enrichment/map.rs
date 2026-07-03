@@ -1,19 +1,9 @@
-//! The structural-map LLM map-reduce (AC4) — pure orchestration over an
-//! [`LlmProvider`] trait object so it is unit-testable against a mock with a
-//! call-counter, with NO DB / embedder / network in the loop.
+//! Structural-map LLM map-reduce (AC4) over an [`LlmProvider`] trait object.
 //!
-//! The worker maps over a source's `level=0` parent chunks, batching their text
-//! to the LLM window; for over-window docs it hierarchically reduces (map each
-//! batch to a partial map, then reduce the partial summaries into a final map).
-//! The LLM response is validated against the strict [`StructuralMap`] serde
-//! schema with up to [`ENRICHMENT_MAX_RETRIES`] reprompts; on persistent
-//! malformed output it DEGRADES to context-prefix-only (the caller keeps the
-//! source `enriching`/`enriched` with `map_quality="fallback"` — never failed).
-//!
-//! Budget + circuit-break (AC11) is enforced HERE, before every `generate()`:
-//! the shared [`Budget`] is checked and a breach short-circuits WITHOUT
-//! dispatching the call, surfacing [`MapError::BudgetExceeded`] so the worker
-//! flips the source to `failed` + `budget_exceeded`.
+//! Maps over level-0 parent chunks; for over-window docs reduces batches hierarchically.
+//! Persistent malformed output degrades to context-prefix-only (never fails the source).
+//! Budget (AC11) is checked before every `generate()`; a breach surfaces
+//! `MapError::BudgetExceeded` so the worker flips to `failed + budget_exceeded`.
 
 use crate::error::LensError;
 use crate::llm::{LlmProvider, LlmRequest};
@@ -24,42 +14,30 @@ use super::meta::{
     ENRICHMENT_MAX_RETRIES, StructuralMap,
 };
 
-/// Soft input-byte budget for a single map batch (the shared enrichment batch
-/// budget). Sized well under a typical local-model context so several parents batch
-/// together but a huge doc splits into multiple map calls (triggering the
-/// hierarchical reduce). Shared with the coref pass via
-/// [`ENRICHMENT_BATCH_BYTE_BUDGET`] so the two batchers stay in sync.
+/// Shared input-byte budget per map batch (synced with the coref pass).
 const MAP_BATCH_BYTE_BUDGET: usize = ENRICHMENT_BATCH_BYTE_BUDGET;
 
-/// The byte length of the `"\n\n"` separator joining batched parent texts. Shared
-/// with the batch-cost accounting so the budget reflects the rendered prompt size.
 const PARENT_SEPARATOR_LEN: usize = 2;
 
-/// The system prompt that pins the LLM to emit STRICT JSON matching
-/// [`StructuralMap`]. Kept terse; the strict serde validation is the real guard.
 const MAP_SYSTEM_PROMPT: &str = "You extract a structural map from a document. \
 Respond with ONLY a JSON object, no prose, no markdown fences, with EXACTLY these \
 keys: \"entities\" (array of strings), \"definitions\" (array of {\"term\",\"definition\"}), \
 \"dates\" (array of strings), \"summary\" (string). Do not add any other keys.";
 
-/// The outcome of a structural-map attempt over a source's parents (AC4).
+/// Outcome of a structural-map attempt (AC4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MapOutcome {
-    /// A validated structural map (`map_quality="ok"`).
     Ok(StructuralMap),
-    /// Every reprompt produced malformed JSON → degrade to context-prefix-only
-    /// (`map_quality="fallback"`, status stays enriching/enriched per AC4).
+    /// All reprompts returned malformed JSON — degrade to context-prefix-only.
     Fallback,
 }
 
-/// A non-degrade failure of the structural-map pass.
+/// Non-degrade failure of the structural-map pass.
 #[derive(Debug)]
 pub enum MapError {
-    /// A budget/circuit-break short-circuit BEFORE a dispatch (AC11): the source
-    /// must flip to `failed` with `budget_exceeded` in `enrichment_meta`.
+    /// Pre-dispatch budget breach (AC11) — source flips to `failed + budget_exceeded`.
     BudgetExceeded,
-    /// A transport/provider error (LLM down/429): accumulate nothing, `failed`,
-    /// raw vectors untouched (AC13 d).
+    /// Transport/provider error — source flips to `failed`, raw vectors untouched.
     Llm(LensError),
 }
 
@@ -69,11 +47,6 @@ impl From<LensError> for MapError {
     }
 }
 
-/// Splits parent texts into batches whose concatenated length stays under
-/// [`MAP_BATCH_BYTE_BUDGET`], then renders each batch as its `"\n\n"`-joined text.
-/// A single parent that alone exceeds the budget forms its own batch (the provider
-/// truncates if needed; never a panic). Delegates the accumulate-until-budget
-/// grouping to the shared [`batch_by_char_budget`] (DRY with the coref pass).
 fn batch_parents(parent_texts: &[String]) -> Vec<String> {
     batch_by_char_budget(
         parent_texts.iter(),
@@ -92,17 +65,10 @@ fn batch_parents(parent_texts: &[String]) -> Vec<String> {
     .collect()
 }
 
-/// Shared LLM retry/budget/parse loop for the enrichment passes (DRY across the
-/// structural map and coref). Calls `provider.generate` with up to
-/// [`ENRICHMENT_MAX_RETRIES`] reprompts, parsing each reply with `parse`. Returns:
-/// * `Ok(Some(value))` — `parse` succeeded;
-/// * `Ok(None)` — exhausted retries with malformed output (caller degrades);
-/// * `Err(BudgetExceeded)` — a pre-dispatch budget breach (caller fails);
-/// * `Err(Llm(_))` — a transport/provider error (caller fails).
-///
-/// Budget is checked BEFORE every `generate()` (AC11) using `max_tokens` as the
-/// projected per-call cost: on a breach the call is NEVER dispatched. Every call
-/// pins `temperature: 0.0, json: true` for deterministic, machine-parseable output.
+/// Shared LLM retry/budget/parse loop (DRY for structural-map and coref passes).
+/// Returns `Ok(Some)` on success, `Ok(None)` on exhausted retries (caller degrades),
+/// `Err(BudgetExceeded)` on pre-dispatch breach, `Err(Llm)` on transport failure.
+/// Budget is checked before every `generate()`; calls pin `temperature=0, json=true`.
 pub(super) async fn run_llm_with_retries<T>(
     provider: &dyn LlmProvider,
     budget: &mut Budget,
@@ -111,16 +77,13 @@ pub(super) async fn run_llm_with_retries<T>(
     max_tokens: u32,
     parse: impl Fn(&str) -> Result<T, LensError>,
 ) -> Result<Option<T>, MapError> {
-    // 1 initial attempt + ENRICHMENT_MAX_RETRIES reprompts.
     let total_attempts = ENRICHMENT_MAX_RETRIES + 1;
     let mut last_body = String::new();
     for attempt in 0..total_attempts {
-        // AC11: check the budget BEFORE dispatching. A breach short-circuits.
         if budget.check_before_dispatch(max_tokens) == BudgetCheck::Exceeded {
             return Err(MapError::BudgetExceeded);
         }
 
-        // On a reprompt, append the prior malformed body so the model can correct.
         let prompt = if attempt == 0 {
             user_prompt.to_string()
         } else {
@@ -134,13 +97,8 @@ pub(super) async fn run_llm_with_retries<T>(
             system: Some(system_prompt.to_string()),
             prompt,
             max_tokens,
-            // Determinism: greedy decode + JSON mode. The system prompt already
-            // demands strict JSON; pinning temperature 0.0 + json maximizes
-            // reproducible, machine-parseable output.
             temperature: 0.0,
             json: true,
-            // Enrichment NEVER uses thinking — reasoning tokens are non-deterministic
-            // and unnecessary for the structured-extraction contract.
             thinking: false,
             reasoning_effort: None,
         };
@@ -151,15 +109,12 @@ pub(super) async fn run_llm_with_retries<T>(
             Ok(value) => return Ok(Some(value)),
             Err(_) => {
                 last_body = resp.text;
-                // loop to reprompt (if any attempts remain)
             }
         }
     }
     Ok(None)
 }
 
-/// Calls the LLM for one batch's map (thin wrapper over [`run_llm_with_retries`]
-/// pinned to the [`StructuralMap`] schema + the map system prompt + token budget).
 async fn map_one_batch(
     provider: &dyn LlmProvider,
     budget: &mut Budget,
@@ -176,16 +131,9 @@ async fn map_one_batch(
     .await
 }
 
-/// Runs the full structural-map pass over `parent_texts` (the source's level-0
-/// parent chunk bodies), with hierarchical reduce for over-window docs (AC4).
-///
-/// * Single batch → one map call (with reprompts).
-/// * Multiple batches → map each to a partial map, then reduce the partials'
-///   summaries into one final map call (reduce-of-reduces).
-///
-/// Returns [`MapOutcome::Fallback`] when validation never succeeds (the source
-/// stays enriched-with-fallback, NOT failed — AC4); returns [`MapError`] only for
-/// a budget breach or a provider/transport failure (AC11/AC13).
+/// Builds the structural map over `parent_texts` with hierarchical reduce for
+/// over-window docs (AC4). Returns `Fallback` when validation never succeeds (not
+/// a failure); returns `MapError` only on budget breach or provider failure.
 pub async fn build_structural_map(
     provider: &dyn LlmProvider,
     budget: &mut Budget,
@@ -197,7 +145,6 @@ pub async fn build_structural_map(
 
     let batches = batch_parents(parent_texts);
 
-    // Single-batch fast path: one map call.
     if batches.len() == 1 {
         let prompt = format!("Document:\n{}", batches[0]);
         return Ok(match map_one_batch(provider, budget, &prompt).await? {
@@ -206,23 +153,18 @@ pub async fn build_structural_map(
         });
     }
 
-    // Hierarchical reduce: map each batch, collect the partial maps, then reduce.
     let mut partials: Vec<StructuralMap> = Vec::with_capacity(batches.len());
     for batch in &batches {
         let prompt = format!("Document section:\n{batch}");
         match map_one_batch(provider, budget, &prompt).await? {
             Some(map) => partials.push(map),
-            // A malformed partial does not fail the whole doc — skip it; if ALL
-            // partials are malformed the reduce input is empty → fallback.
-            None => continue,
+            None => continue, // malformed partial — skip; all-malformed → fallback
         }
     }
     if partials.is_empty() {
         return Ok(MapOutcome::Fallback);
     }
 
-    // Reduce: feed the partial summaries (+ merged entities/dates) into one final
-    // map call so the result is a single coherent doc map.
     let reduce_input = render_partials_for_reduce(&partials);
     let reduce_prompt = format!(
         "These are partial structural maps of different sections of ONE document. \
@@ -231,15 +173,12 @@ pub async fn build_structural_map(
     Ok(
         match map_one_batch(provider, budget, &reduce_prompt).await? {
             Some(map) => MapOutcome::Ok(map),
-            // Reduce failed validation but we DO have partials → degrade to a merged
-            // best-effort map rather than throwing away the work (still `ok` quality
-            // is not claimed — the caller treats a merged map as a real map).
+            // Reduce failed but partials exist → best-effort merge (not `fallback`).
             None => MapOutcome::Ok(merge_partials(partials)),
         },
     )
 }
 
-/// Renders partial maps as compact text for the reduce prompt.
 fn render_partials_for_reduce(partials: &[StructuralMap]) -> String {
     partials
         .iter()
@@ -257,10 +196,8 @@ fn render_partials_for_reduce(partials: &[StructuralMap]) -> String {
         .join("\n")
 }
 
-/// Deterministically merges partial maps (the reduce-call fallback): unions
-/// entities/dates/definitions (dedup, order-preserving) and concatenates
-/// summaries. Used only when the final reduce call's JSON failed to validate but
-/// we already hold valid partials.
+/// Merges partial maps (reduce-call fallback): unions entities/dates/definitions
+/// (dedup, order-preserving) and concatenates summaries.
 fn merge_partials(partials: Vec<StructuralMap>) -> StructuralMap {
     let mut entities: Vec<String> = Vec::new();
     let mut dates: Vec<String> = Vec::new();
@@ -326,7 +263,6 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_thrice_degrades_to_fallback_not_failed() {
-        // 1 initial + 2 reprompts = 3 malformed → fallback (AC4).
         let (provider, calls) = ScriptedProvider::new(vec!["nope", "still nope", "garbage"]);
         let mut budget = Budget::new(SessionBudget::new());
         let out = build_structural_map(&provider, &mut budget, &["doc".to_string()])
@@ -342,9 +278,6 @@ mod tests {
 
     #[tokio::test]
     async fn budget_short_circuits_before_second_dispatch() {
-        // AC11 seam: a per-job budget admitting exactly 1 call. The mock must see
-        // EXACTLY 1 generate() even though the first reply is malformed (which
-        // would otherwise reprompt).
         let (provider, calls) = ScriptedProvider::new(vec!["bad json", valid_map()]);
         let mut budget = Budget::with_caps(SessionBudget::new(), 1_000_000, 1);
         let err = build_structural_map(&provider, &mut budget, &["doc".to_string()])
@@ -382,10 +315,9 @@ mod tests {
 
     #[tokio::test]
     async fn over_window_doc_hierarchically_reduces() {
-        // Two huge parents force two map batches + one reduce = 3 calls.
         let big = "x ".repeat(MAP_BATCH_BYTE_BUDGET);
         let parents = vec![big.clone(), big];
-        let (provider, calls) = ScriptedProvider::new(vec![valid_map()]); // cycles valid_map
+        let (provider, calls) = ScriptedProvider::new(vec![valid_map()]);
         let mut budget = Budget::new(SessionBudget::new());
         let out = build_structural_map(&provider, &mut budget, &parents)
             .await

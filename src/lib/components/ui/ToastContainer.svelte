@@ -1,15 +1,11 @@
 <script lang="ts">
   import { toastStore, dismissToast } from '$lib/sources/toast.svelte.js';
 
-  /** Local alias for the reactive toasts array. */
   let toasts = $derived(toastStore.toasts);
 </script>
 
-<!--
-  ToastContainer — fixed overlay, bottom-right, always above modals (z-index > 50).
-  Mount once at the app-shell level in +layout.svelte (outside the booting/onboarding
-  conditional) so toasts are visible on every surface.
--->
+<!-- Fixed overlay, bottom-right. Mount outside the booting/onboarding conditional
+     so toasts are visible on every surface. z-[100] clears the modal overlay (z-50). -->
 <div
   class="pointer-events-none fixed right-4 bottom-4 z-[100] flex flex-col items-end gap-2"
   role="status"

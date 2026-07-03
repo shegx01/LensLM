@@ -1,19 +1,5 @@
-// LLM provider persistence helper (M1 onboarding — Configure panel).
-//
-// Read-modify-write over the EXISTING M0 IPC (get_config / set_config).
-// set_config replaces the WHOLE AppConfig struct, so we re-fetch the current
-// config, upsert the matching ModelConfig entry in `models[]`, and write the
-// rest back verbatim — mirroring the RMW pattern in completeOnboarding.ts.
-//
-// Provider mapping (per spec):
-//   Local tab  → provider: 'ollama'
-//   Cloud API tab → the REAL provider id matching the models.dev catalog key
-//     ('openai' | 'anthropic' | 'google'), so a claude-*/gemini-* model validates
-//     against its OWN catalog namespace on the Rust side. 'openai-compatible' is
-//     reserved for a genuinely custom/self-hosted endpoint (exempt from catalog
-//     validation) — the cloud cards are all first-class providers.
-//
-// No new Rust command, no main.rs touch.
+// LLM provider persistence helpers — read-modify-write over get_config/set_config.
+// Provider id is the models.dev catalog key; 'openai-compatible' is the custom endpoint escape hatch.
 
 import type {
   ModelConfig,
@@ -27,13 +13,7 @@ import { updateConfig } from '$lib/config.js';
 export type LlmProviderTab = 'local' | 'cloud';
 
 export interface LlmProviderInput {
-  /** The canonical provider id (= models.dev catalog key for first-class cloud
-   * providers). `'ollama'` for the Local tab; a real cloud provider id
-   * (`'openai' | 'anthropic' | 'google' | 'groq' | 'deepseek' | 'xai' |
-   * 'cohere' | 'zai' | 'ollama-cloud'`) for the Cloud combobox; or
-   * `'openai-compatible'` for a genuinely custom/self-hosted endpoint. Kept as a
-   * plain `string` so the single {@link CLOUD_PROVIDERS} source drives the set
-   * without a divergent union to maintain. */
+  /** Canonical provider id (= models.dev catalog key). `'ollama'` for local; cloud provider id or `'openai-compatible'` for custom. */
   provider: string;
   base_url: string;
   model: string;
@@ -42,15 +22,8 @@ export interface LlmProviderInput {
   context: number;
 }
 
-/**
- * Read-modify-write `models[]` while preserving every other AppConfig field.
- * Upserts the first entry whose `provider` matches; appends if none exists.
- * Guarded for non-Tauri contexts: a no-op outside Tauri (so tests can call it
- * without the IPC stub if they don't need the write assertion).
- */
+/** Upserts `models[]` by provider, preserving all other AppConfig fields. No-op outside Tauri. */
 export async function saveLlmProvider(input: LlmProviderInput): Promise<void> {
-  // Build the upserted ModelConfig entry. The context window comes from the UI
-  // picker; temperature carries a sensible default (Settings owns it in M2+).
   const entry: ModelConfig = {
     provider: input.provider,
     base_url: input.base_url,
@@ -61,7 +34,6 @@ export async function saveLlmProvider(input: LlmProviderInput): Promise<void> {
   };
 
   await updateConfig((cfg) => {
-    // Upsert: replace the first model with matching provider, or append.
     const existing = cfg.models ?? [];
     const idx = existing.findIndex((m) => m.provider === input.provider);
     const models: ModelConfig[] =
@@ -76,38 +48,19 @@ export interface EnrichmentPrefsInput {
   coref_strategy: CorefStrategy;
   /** Cloud-LLM consent. Ignored (and forced false) for local-only setups. */
   cloud_consent: boolean;
-  /** Typed routing policy (Stage 2). Optional — omit to leave the existing value
-   * (or the Rust `cloud_first` default) untouched. */
+  /** `undefined` ⇒ keep prior routing; Rust defaults to `cloud_first`. */
   routing?: LlmRouting;
-  /** Per-task coref model override (Stage 3). `null` clears it (use the routing
-   * default); `undefined` leaves the existing value untouched. */
+  /** `null` clears to routing default; `undefined` leaves prior value. */
   coref_model?: TaskModel | null;
-  /** Per-task structural-map model override (Stage 3). Same null/undefined
-   * semantics as {@link coref_model}. */
+  /** Same null/undefined semantics as `coref_model`. */
   map_model?: TaskModel | null;
-  /** Studio & Chat model (non-blocking). Persisted into `enrichment.chat_model`.
-   * `undefined` leaves the prior value untouched; `null` clears it; a
-   * {@link TaskModel} pins it. Configured during onboarding; used when chat /
-   * Studio ships. NEVER gates save. */
+  /** Studio & Chat model; `null` clears, `undefined` leaves prior value. Non-blocking — never gates save. */
   chat_model?: TaskModel | null;
 }
 
 /**
- * Read-modify-write `enrichment` while preserving every other AppConfig field
- * (mirrors {@link saveLlmProvider}). MERGES onto the existing `enrichment` section
- * rather than replacing it wholesale: the Stage-2 `routing` and Stage-3 per-task
- * overrides (`coref_model`/`map_model`/`chat_model`) co-exist with the three core
- * fields, so a partial save must never drop a field the caller didn't set.
- *
- * `routing`/`coref_model`/`map_model`/`chat_model` are applied ONLY when the
- * caller provides them (`undefined` ⇒ keep the prior value); passing `null` for a
- * per-task model explicitly clears the override (back to the routing default).
- * `chat_model` holds the Studio & Chat model configured in onboarding (used when
- * chat / Studio ships); it merges without clobbering `coref_model`/`map_model`.
- *
- * A no-op outside Tauri (the `updateConfig` guard), so onboarding stays
- * non-blocking: a skipped step simply never calls this and the Rust-side
- * `#[serde(default)]` keeps the conservative defaults.
+ * Merges `enrichment` onto the existing config section; `undefined` fields are left untouched.
+ * No-op outside Tauri — a skipped onboarding step never writes, Rust defaults apply.
  */
 export async function saveEnrichmentPrefs(input: EnrichmentPrefsInput): Promise<void> {
   await updateConfig((cfg) => {

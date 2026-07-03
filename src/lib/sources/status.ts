@@ -1,18 +1,11 @@
-// Shared source-status presentation helpers.
-//
-// Extracted so SourcesRail (the product sources list) and the dev/QA
-// EmbeddingsInspector render identical status dots from one source of truth.
+// Shared source-status presentation helpers (single source of truth for status dots).
 
 import type { SourceStatus } from './types.js';
 
 /**
- * Map a {@link SourceStatus} to its dot color class (semantic tokens only).
- *
- * indexed → green, error → destructive/red,
- * queued/pending/parsing/embedding → amber (pulsing),
- * needs_js → amber (static, no pulse — terminal-pending awaiting JS render),
- * render_failed → destructive/60 (dimmed red — terminal render failure),
- * unknown → muted.
+ * Map a `SourceStatus` to its dot color class.
+ * indexed→green, error→destructive, queued/pending/parsing/embedding→amber pulse,
+ * needs_js→amber static, render_failed→destructive/60, unknown→muted.
  */
 export function statusDotClass(status: SourceStatus): string {
   switch (status) {

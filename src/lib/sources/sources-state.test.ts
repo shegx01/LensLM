@@ -54,7 +54,6 @@ vi.mock('$lib/notebooks/notebooks-state.svelte.js', () => ({
   refreshTrashedSources: vi.fn()
 }));
 
-// Import the mocked functions so we can configure return values per test.
 import {
   listSources,
   ingestSource,
@@ -164,8 +163,6 @@ describe('loadSources', () => {
 describe('addSourceLocal', () => {
   it('inserts a source into the store immediately (row exists before ingest events)', () => {
     const source = makeSource({ id: 'src-new', status: 'queued' });
-
-    // Store starts empty — no loadSources round-trip
     expect(sourcesStore.sources).toHaveLength(0);
 
     addSourceLocal(source);
@@ -186,8 +183,6 @@ describe('addSourceLocal', () => {
     // Simulate the race: addSourceLocal is called, then ingest fires events immediately.
     const source = makeSource({ id: 'src-new', status: 'queued' });
     addSourceLocal(source);
-
-    // At this point the store has the row — ingest events must update it.
     let capturedHandler: ((e: unknown) => void) | null = null;
     vi.mocked(ingestSource).mockImplementation(async (_id, onProgress) => {
       capturedHandler = onProgress as (e: unknown) => void;
@@ -199,7 +194,6 @@ describe('addSourceLocal', () => {
     }
     await ingestPromise;
 
-    // Status must be updated — if the row was missing the update would be silently dropped.
     expect(sourcesStore.sources[0].status).toBe('indexed');
   });
 
@@ -220,7 +214,6 @@ describe('addSourceLocal', () => {
     }
     await ingestPromise;
 
-    // The row never existed — store is still empty, event was silently dropped.
     expect(sourcesStore.sources).toHaveLength(0);
   });
 });
@@ -272,7 +265,6 @@ describe('toggleSelected', () => {
 
     await toggleSelected('src-001');
 
-    // Reverted back to original value
     expect(sourcesStore.sources[0].selected).toBe(1);
     expect(sourcesStore.error).toBeTruthy();
     consoleSpy.mockRestore();
@@ -326,7 +318,6 @@ describe('ingest', () => {
 
     const ingestPromise = ingest('src-001');
     if (capturedHandler) {
-      // 'progress' has no phase — status must stay unchanged
       (capturedHandler as (e: unknown) => void)({ type: 'progress', data: { done: 1, total: 5 } });
     }
     await ingestPromise;
@@ -338,7 +329,6 @@ describe('ingest', () => {
     vi.mocked(listSources).mockResolvedValue([makeSource({ id: 'src-001', status: 'queued' })]);
     await loadSources('nb-001');
 
-    // Capture the onProgress handler and drive it manually
     let capturedHandler: ((e: unknown) => void) | null = null;
     vi.mocked(ingestSource).mockImplementation(async (_id, onProgress) => {
       capturedHandler = onProgress as (e: unknown) => void;
@@ -406,8 +396,6 @@ describe('ingest', () => {
   });
 
   it('mutates by index — does not replace the whole array reference on status update', async () => {
-    // Fix #2: verify index-mutation path rather than whole-array replace.
-    // After a single event the list length must be unchanged and the OTHER row untouched.
     vi.mocked(listSources).mockResolvedValue([
       makeSource({ id: 'src-001', status: 'queued' }),
       makeSource({ id: 'src-002', status: 'indexed' })
@@ -425,7 +413,6 @@ describe('ingest', () => {
     }
     await ingestPromise;
 
-    // Only src-001 changed — src-002 must be untouched
     expect(sourcesStore.sources).toHaveLength(2);
     expect(sourcesStore.sources[0].status).toBe('indexed');
     expect(sourcesStore.sources[1].status).toBe('indexed');
@@ -561,15 +548,10 @@ describe('retrySource', () => {
     vi.mocked(listSources).mockResolvedValue([makeSource({ id: 'src-001', status: 'error' })]);
     await loadSources('nb-001');
 
-    vi.mocked(retryIngestSource).mockImplementation(async () => {
-      // Resolve immediately without firing any events.
-    });
+    vi.mocked(retryIngestSource).mockImplementation(async () => {});
 
     await retrySource('src-001');
 
-    // After the retry resolves without events the status should remain parsing
-    // (it was set optimistically at the start of retrySource).
-    // No 'done' event fired, so indexed transition did not happen.
     expect(sourcesStore.sources[0].status).toBe('parsing');
   });
 
@@ -685,7 +667,6 @@ describe('retryAllFailed', () => {
     vi.mocked(listSources).mockResolvedValue([makeSource({ id: 'src-001', status: 'error' })]);
     await loadSources('nb-001');
     vi.mocked(retryAllFailedSources).mockResolvedValue(undefined);
-    // loadSources is called again in finally — return the same list
     vi.mocked(listSources).mockResolvedValue([makeSource({ id: 'src-001', status: 'indexed' })]);
 
     await retryAllFailed('nb-001');
@@ -729,7 +710,6 @@ describe('retryAllFailed', () => {
     await retryAllFailed('nb-001');
 
     expect(sourcesStore.sources[0].status).toBe('indexed');
-    // listSources should have been called again (once for initial load, once for reload)
     expect(listSources).toHaveBeenCalledTimes(2);
   });
 
@@ -742,10 +722,7 @@ describe('retryAllFailed', () => {
 
     await retryAllFailed('nb-001');
 
-    // sources should have been reconciled from the backend even after a failure.
-    // Note: loadSources in the finally block resets `error` to null at its start,
-    // so we check that sources were reloaded (listSources called twice) rather than
-    // checking the error field (which the reload clears).
+    // loadSources in finally resets `error` to null; check reload count instead.
     expect(listSources).toHaveBeenCalledTimes(2);
     expect(consoleSpy).toHaveBeenCalled();
     consoleSpy.mockRestore();
@@ -762,11 +739,6 @@ describe('retryAllFailed', () => {
 
     await retryAllFailed('nb-001');
 
-    // src-001 is trashed — it must not have been set to parsing optimistically.
-    // We can verify via the captured call — this relies on the beforeEach snapshot.
-    // The optimistic loop filters trashed_at. src-001 stays untouched.
-    // (The final loadSources returns [] but we check the optimistic path above
-    //  by checking retryAllFailedSources was called with correct notebookId.)
     expect(retryAllFailedSources).toHaveBeenCalledWith('nb-001', expect.any(Function));
   });
 });
@@ -840,7 +812,6 @@ describe('removeSource', () => {
 
     await removeSource('src-001');
 
-    // Row should be restored after failure
     expect(sourcesStore.sources).toHaveLength(1);
     expect(sourcesStore.sources[0].id).toBe('src-001');
     expect(sourcesStore.error).toBeTruthy();
@@ -869,7 +840,6 @@ describe('removeSource', () => {
     expect(sourcesStore.sources).toHaveLength(1);
   });
 
-  // Undo-queue: second delete in window must NOT strand the first
   it('two in-window deletes both set recentlyTrashed (queue not overwritten)', async () => {
     vi.mocked(listSources).mockResolvedValue([
       makeSource({ id: 'src-001' }),
@@ -882,9 +852,7 @@ describe('removeSource', () => {
     await removeSource('src-001');
     await removeSource('src-002');
 
-    // Both are in the queue — recentlyTrashed still true
     expect(sourcesStore.recentlyTrashed).toBe(true);
-    // Only src-003 remains visible
     expect(sourcesStore.sources).toHaveLength(1);
     expect(sourcesStore.sources[0].id).toBe('src-003');
   });
@@ -903,14 +871,11 @@ describe('removeSource', () => {
     await removeSource('src-A');
     await removeSource('src-B');
 
-    // With the queue fix, we can undo src-B first (LIFO), then src-A.
-    await undoRemove(); // restores src-B
+    await undoRemove();
     expect(sourcesStore.sources.some((s) => s.id === 'src-B')).toBe(true);
 
-    await undoRemove(); // restores src-A
+    await undoRemove();
     expect(sourcesStore.sources.some((s) => s.id === 'src-A')).toBe(true);
-
-    // Both sources are back
     expect(sourcesStore.sources).toHaveLength(2);
   });
 });
@@ -938,11 +903,9 @@ describe('undoRemove', () => {
     vi.mocked(trashSource).mockResolvedValue(undefined);
     vi.mocked(restoreSource).mockResolvedValue(undefined);
 
-    // Remove the middle item (index 1, prevSiblingId = src-001)
     await removeSource('src-002');
     expect(sourcesStore.sources).toHaveLength(2);
 
-    // Undo — should re-insert src-002 after src-001
     await undoRemove();
 
     expect(sourcesStore.sources).toHaveLength(3);
@@ -987,7 +950,6 @@ describe('undoRemove', () => {
     await removeSource('src-001');
     await undoRemove();
 
-    // Re-insert was reverted — list should be empty again
     expect(sourcesStore.sources).toHaveLength(0);
     expect(sourcesStore.error).toBeTruthy();
     consoleSpy.mockRestore();
@@ -1022,14 +984,11 @@ describe('undoRemove', () => {
     await removeSource('src-001'); // first delete
     await removeSource('src-002'); // second delete
 
-    // First undo must restore src-002 (most recent)
     await undoRemove();
     expect(restoreSource).toHaveBeenLastCalledWith('src-002');
     expect(sourcesStore.sources.some((s) => s.id === 'src-002')).toBe(true);
-    // src-001 is still trashed — recentlyTrashed still true
     expect(sourcesStore.recentlyTrashed).toBe(true);
 
-    // Second undo must restore src-001
     await undoRemove();
     expect(restoreSource).toHaveBeenLastCalledWith('src-001');
     expect(sourcesStore.sources.some((s) => s.id === 'src-001')).toBe(true);
@@ -1046,17 +1005,12 @@ describe('undoRemove', () => {
     vi.mocked(trashSource).mockResolvedValue(undefined);
     vi.mocked(restoreSource).mockResolvedValue(undefined);
 
-    // Trash src-002 (prevSiblingId = src-001)
     await removeSource('src-002');
-    // Also trash src-001 so the sibling is gone at undo time
     await removeSource('src-001');
 
-    // Undo src-001 first (LIFO)
-    await undoRemove();
-    // Then undo src-002 — prev sibling src-001 may or may not be present
-    await undoRemove();
+    await undoRemove(); // LIFO: src-001 first
+    await undoRemove(); // then src-002 (prev sibling src-001 may be gone)
 
-    // Both should be back regardless of sibling existence
     expect(sourcesStore.sources.some((s) => s.id === 'src-002')).toBe(true);
     expect(sourcesStore.sources.some((s) => s.id === 'src-001')).toBe(true);
   });
@@ -1099,11 +1053,7 @@ describe('addSourceLocal — prepend ordering', () => {
     // Seed store with two existing sources (newest-first: A then B)
     addSourceLocal(a);
     addSourceLocal(b);
-    // A is already at index 0, B is prepended — wait, this seeds in prepend order
-    // so after two prepends the order is [B, A]. Reset and load directly.
     resetSourcesStore();
-
-    // Simulate existing store state [A, B] loaded via loadSources (newest-first)
     vi.mocked(listSources).mockResolvedValue([a, b]);
   });
 
@@ -1118,7 +1068,6 @@ describe('addSourceLocal — prepend ordering', () => {
     const c = makeSource({ id: 'src-C', status: 'queued' });
     addSourceLocal(c);
 
-    // C must be at index 0 (newest-first), A and B follow
     expect(sourcesStore.sources[0].id).toBe('src-C');
     expect(sourcesStore.sources[1].id).toBe('src-A');
     expect(sourcesStore.sources[2].id).toBe('src-B');
@@ -1133,9 +1082,7 @@ describe('addSourceLocal — prepend ordering', () => {
     const c = makeSource({ id: 'src-C', status: 'queued' });
     addSourceLocal(c);
 
-    // With prepend: C is at index 0, NOT at the last position
     expect(sourcesStore.sources[0].id).toBe('src-C');
-    // C must NOT be at the tail — prepend puts it at index 0, not the end
     expect(sourcesStore.sources[sourcesStore.sources.length - 1].id).not.toBe('src-C');
   });
 
@@ -1144,17 +1091,12 @@ describe('addSourceLocal — prepend ordering', () => {
     vi.mocked(listSources).mockResolvedValue([a]);
     await loadSources('nb-001');
 
-    // Calling addSourceLocal with an already-present id must not duplicate the row
     addSourceLocal(a);
     expect(sourcesStore.sources).toHaveLength(1);
     expect(sourcesStore.sources[0].id).toBe('src-A');
   });
 
   it('addSourceLocal + concurrent loadSources race: backend snapshot (without new row) replaces optimistic row', async () => {
-    // After addSourceLocal(C), if loadSources fires and the backend happens
-    // to return a snapshot WITHOUT C (e.g. ingest not committed yet), the
-    // optimistic row is replaced. This is intentional — the real backend
-    // will include C once committed. This test documents + asserts that behavior.
     const a = makeSource({ id: 'src-A' });
     vi.mocked(listSources).mockResolvedValue([a]);
     await loadSources('nb-001');
@@ -1163,12 +1105,9 @@ describe('addSourceLocal — prepend ordering', () => {
     addSourceLocal(c);
     expect(sourcesStore.sources[0].id).toBe('src-C');
 
-    // Simulate a concurrent loadSources that returns only [A] (backend hasn't committed C yet)
     vi.mocked(listSources).mockResolvedValue([a]);
     await loadSources('nb-001');
 
-    // The optimistic row is gone — replaced by the backend snapshot.
-    // This is acceptable: the real backend will return C once ingest commits.
     expect(sourcesStore.sources).toHaveLength(1);
     expect(sourcesStore.sources[0].id).toBe('src-A');
   });
@@ -1242,12 +1181,10 @@ describe('disposeTrashTimers + TTL auto-expiry', () => {
     await removeSource('src-002');
     expect(sourcesStore.recentlyTrashed).toBe(true);
 
-    // Before TTL fires, dispose clears everything
     disposeTrashTimers();
 
     expect(sourcesStore.recentlyTrashed).toBe(false);
 
-    // Advancing past TTL must NOT cause any further mutation (timers were cancelled)
     vi.advanceTimersByTime(TRASH_UNDO_TTL_MS + 1);
     expect(sourcesStore.recentlyTrashed).toBe(false);
   });

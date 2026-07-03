@@ -1,9 +1,5 @@
-<!-- SourcesRail fills the 320px right <aside> in AppShell.
-     Header: accent rounded-square icon · "Sources" · selected/total counter · secondary icon · "+" add.
-     Source rows: accent checkbox · doc icon · truncated title · type badge · metadata · status dot.
-     "Add sources" opens the tabbed AddSourcesModal.
-     macOS drag region: header row = data-tauri-drag-region; every interactive child has
-     style="-webkit-app-region: no-drag;" so window-drag and button-click don't conflict.
+<!-- SourcesRail — 320px right panel. Header is a drag region; all interactive children
+     carry -webkit-app-region: no-drag so clicks don't conflict with window drag.
      All colours are CSS-variable tokens — no hardcoded hex. -->
 <script lang="ts">
   import File from '@lucide/svelte/icons/file';
@@ -31,18 +27,7 @@
   import AddSourcesModal from './AddSourcesModal.svelte';
   import StudioPanel from './StudioPanel.svelte';
 
-  // ---------------------------------------------------------------------------
-  // Local state
-  // ---------------------------------------------------------------------------
-
-  /** Controls the "Add sources" modal */
   let modalOpen = $state(false);
-
-  // ---------------------------------------------------------------------------
-  // Collapse — mirrors the left rail's sidebarCollapsed (store field
-  // rightRailCollapsed). The AppShell grid's THIRD column width follows this
-  // value (320px expanded / 104px collapsed icon strip, matching the left rail) and animates.
-  // ---------------------------------------------------------------------------
 
   const collapsed = $derived(notebookStore.rightRailCollapsed);
 
@@ -55,27 +40,14 @@
     notebookStore.rightRailCollapsed = !notebookStore.rightRailCollapsed;
   }
 
-  // ---------------------------------------------------------------------------
-  // Derived
-  // ---------------------------------------------------------------------------
-
   const sources = $derived(sourcesStore.sources);
   const totalCount = $derived(sources.length);
   const selectedCount = $derived(sources.filter((s) => s.selected === 1).length);
 
-  // ---------------------------------------------------------------------------
-  // Type badge helpers
-  // ---------------------------------------------------------------------------
-
-  /**
-   * Derive a short type badge from the source's kind + locator/title.
-   * This is display-only — purely informational.
-   */
+  /** Short display badge derived from the source's kind + locator/title. */
   function typeBadge(kind: string, locator: string, title: string): string {
-    // kind 'url' → 'URL'
     if (kind === 'url') return 'URL';
 
-    // Derive from locator extension first, then fall back to title
     const path = locator || title || '';
     const ext = path.split('.').pop()?.toLowerCase() ?? '';
 
@@ -127,21 +99,15 @@
       case 'webm':
         return 'VIDEO';
       default:
-        // For text/paste sources with no extension
         if (kind === 'text') return 'TXT';
         return 'FILE';
     }
   }
 
-  /**
-   * Derive a human-readable metadata line.
-   * Phase 1: for text/md sources we typically only have token_count.
-   * Show token count if available; otherwise gracefully omit.
-   */
+  /** Human-readable metadata line (approximate word count from token_count). */
   // TODO(M6): extract typeBadge + metaLine to src/lib/sources/format.ts when Studio reuses badges.
   function metaLine(tokenCount: number | null): string {
     if (tokenCount !== null && tokenCount > 0) {
-      // Approximate word count from tokens (~0.75 words/token)
       const approxWords = Math.round(tokenCount * 0.75);
       if (approxWords >= 1000) {
         return `~${(approxWords / 1000).toFixed(1)}k words`;
@@ -151,12 +117,7 @@
     return '';
   }
 
-  // ---------------------------------------------------------------------------
-  // Status dot helpers
-  // ---------------------------------------------------------------------------
-
   // statusDotClass is shared with EmbeddingsInspector — see $lib/sources/status.ts.
-
   function statusDotLabel(status: SourceStatus): string {
     switch (status) {
       case 'indexed':
@@ -184,16 +145,9 @@
 </script>
 
 {#if collapsed}
-  <!-- ──────────────────────────────────────────────────────────────────────
-       COLLAPSED ICON STRIP — mirrors the left rail's minimized vibe (shot5).
-       Sources icon + count badge near the top; Studio/headphones icon near the
-       bottom. The top drag bar stays a drag region; every button is no-drag.
-  ────────────────────────────────────────────────────────────────────────── -->
-  <!-- Top drag bar — h-14 matches the left rail's traffic-lights spacer -->
   <div data-tauri-drag-region class="flex h-14 shrink-0 items-center justify-center"></div>
 
   <div class="flex flex-1 flex-col items-center gap-1.5 px-1.5 pt-1.5">
-    <!-- Expand button — no-drag -->
     <button
       type="button"
       data-right-rail-collapse-btn
@@ -208,7 +162,6 @@
 
     <div class="my-1 h-px w-6 bg-border"></div>
 
-    <!-- Sources icon with count badge — no-drag -->
     <button
       type="button"
       aria-label="Sources ({totalCount})"
@@ -228,7 +181,6 @@
       {/if}
     </button>
 
-    <!-- Add source — no-drag -->
     <button
       type="button"
       aria-label="Add source"
@@ -242,7 +194,6 @@
 
     <div class="flex-1"></div>
 
-    <!-- Studio / headphones icon near the bottom — no-drag -->
     <button
       type="button"
       aria-label="Studio"
@@ -255,15 +206,7 @@
     </button>
   </div>
 {:else}
-  <!-- ──────────────────────────────────────────────────────────────────────
-       EXPANDED LAYOUT — Sources (flex-1) on top, Studio (capped) on the bottom.
-  ────────────────────────────────────────────────────────────────────────── -->
-
-  <!-- Rail header — h-14 matches the left rail's traffic-lights spacer height (56px),
-       giving equal vertical breathing room top and bottom. data-tauri-drag-region on the
-       outer wrapper; all interactive children carry -webkit-app-region: no-drag. -->
   <div data-tauri-drag-region class="flex h-14 shrink-0 items-center gap-2 px-3">
-    <!-- Collapse toggle (mirrors the left rail) — no-drag -->
     <button
       type="button"
       data-right-rail-collapse-btn
@@ -281,7 +224,6 @@
          label, not a competing app/page title. -->
     <span class="flex-1 text-sm font-semibold text-foreground">Sources</span>
 
-    <!-- selected/total counter -->
     {#if totalCount > 0}
       <span
         class="inline-flex h-[18px] min-w-[30px] items-center justify-center rounded-full bg-muted px-1.5 text-xs font-semibold tabular-nums text-muted-foreground"
@@ -292,7 +234,6 @@
       </span>
     {/if}
 
-    <!-- Add source button — no-drag -->
     <button
       class="flex size-[26px] shrink-0 items-center justify-center rounded-full bg-muted text-foreground transition-colors hover:opacity-80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
       type="button"
@@ -304,13 +245,10 @@
     </button>
   </div>
 
-  <!-- Hairline divider -->
   <div class="shrink-0 border-t border-border"></div>
 
-  <!-- Scrollable source list — flex-1, hidden scrollbar (no-scrollbar utility). -->
   <div data-sources-scroll class="no-scrollbar flex min-h-0 flex-1 flex-col overflow-y-auto">
     {#if sources.length === 0}
-      <!-- Empty state -->
       <div class="flex flex-1 flex-col items-center justify-center gap-2 px-4 py-12">
         <div
           class="flex size-10 items-center justify-center rounded-xl bg-muted"
@@ -341,7 +279,6 @@
           <li
             class="group flex items-start gap-2.5 rounded-lg px-2.5 py-2.5 transition-colors duration-100 hover:bg-muted/50"
           >
-            <!-- Accent checkbox — no-drag -->
             <button
               class={cn(
                 'mt-0.5 flex size-[16px] shrink-0 cursor-pointer items-center justify-center rounded-[4px] transition-all duration-[130ms] border',
@@ -361,7 +298,6 @@
               {/if}
             </button>
 
-            <!-- Document icon tile -->
             <div
               class="flex size-[28px] shrink-0 items-center justify-center rounded-[6px] bg-muted"
               aria-hidden="true"
@@ -369,32 +305,25 @@
               <File class="size-[13px] text-muted-foreground" strokeWidth={1.75} />
             </div>
 
-            <!-- Content: title + badge + meta — type scale matches left rail notebook rows -->
             <div class="min-w-0 flex-1">
               <div class="truncate text-sm font-medium leading-tight text-foreground">
                 {source.title}
               </div>
               <div class="mt-0.5 flex items-center gap-1.5 flex-wrap">
-                <!-- Type badge -->
                 <span
                   class="inline-flex items-center rounded-[4px] bg-muted px-[5px] py-px text-[0.6875rem] font-semibold uppercase tracking-wide text-muted-foreground"
                 >
                   {badge}
                 </span>
-                <!-- Metadata line (word/page count) -->
                 {#if meta}
                   <span class="text-xs text-muted-foreground/50">{meta}</span>
                 {/if}
               </div>
             </div>
 
-            <!-- Right-side affordance: fixed-width reserved slot.
-                 For non-error sources: 20px slot — status dot fades out on hover,
-                 trash button fades in (same layout as before).
-                 For error sources: wider slot — dot + tooltip on hover + retry button
-                 beside trash. The retry button only appears on hover/focus on error rows.
-                 -webkit-app-region: no-drag on all buttons prevents titlebar drag
-                 region from swallowing clicks. -->
+            <!-- Fixed-width slot: status dot fades out on hover, action buttons fade in.
+                 Error sources get a wider slot with a tooltip + retry button.
+                 All buttons are no-drag so the titlebar region doesn't swallow clicks. -->
             <div
               class={cn(
                 'relative mt-1 flex shrink-0 items-center justify-end gap-0.5',
@@ -402,11 +331,8 @@
               )}
               aria-label="Status: {statusDotLabel(status)}"
             >
-              <!-- Status dot — fades out on group-hover. For error dots, shows a
-                   tooltip with the short failure reason on hover.
-                   group-hover:animate-none stops animate-pulse from bleeding through. -->
+              <!-- group-hover:animate-none prevents animate-pulse from bleeding through on hover. -->
               {#if status === 'error'}
-                <!-- Error dot with tooltip wrapper -->
                 <div class="relative flex items-center">
                   <span
                     class={cn(
@@ -415,8 +341,6 @@
                     )}
                     aria-hidden="true"
                   ></span>
-                  <!-- Error reason tooltip — visible on group-hover, positioned above the dot.
-                       Hidden when the dot fades (group-hover:opacity-0 above keeps space clean). -->
                   <div
                     class={cn(
                       'pointer-events-none absolute bottom-full right-0 z-10 mb-1.5',
@@ -442,7 +366,6 @@
                   </div>
                 </div>
 
-                <!-- Retry button — appears on hover for error sources only. -->
                 <button
                   type="button"
                   aria-label="Retry ingesting {source.title}"
@@ -464,7 +387,6 @@
                   <RotateCcw class="size-3" strokeWidth={2} />
                 </button>
               {:else}
-                <!-- Non-error: status dot -->
                 <span
                   class={cn(
                     'pointer-events-none absolute block size-[7px] rounded-full transition-opacity duration-150 group-hover:animate-none group-hover:opacity-0',
@@ -474,9 +396,6 @@
                 ></span>
               {/if}
 
-              <!-- Delete button — invisible by default, fades in on hover/focus.
-                   Sized to fill the same 20px reserved slot as the dot wrapper
-                   so there is zero layout collision. -->
               <button
                 type="button"
                 aria-label="Delete source"
@@ -528,9 +447,7 @@
     </div>
   {/if}
 
-  <!-- Studio (bottom) — visual shell, own capped scroll. -->
   <StudioPanel {selectedCount} {totalCount} />
 {/if}
 
-<!-- Add sources modal (tabbed) -->
 <AddSourcesModal open={modalOpen} onclose={() => (modalOpen = false)} />

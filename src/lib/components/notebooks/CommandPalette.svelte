@@ -1,28 +1,7 @@
 <!--
-  CommandPalette.svelte — ⌘K notebook search modal (M3).
-
-  NOTEBOOKS-ONLY IN M3: This palette searches notebooks only. SOURCES and CHATS
-  sections are deferred to M4/M5 respectively. The placeholder text intentionally
-  reads "Search notebooks" (not "Search notebooks, sources, chats...") to avoid
-  implying cross-type search that doesn't exist yet.
-
-  GLOBAL ⌘K HANDLER: The keydown listener that sets `notebookStore.paletteOpen = true`
-  is registered in AppShell.svelte (Step 4.10). This component only reacts to
-  `notebookStore.paletteOpen` — it does NOT register its own ⌘K listener.
-
-  OVERLAY CHOICE: Custom overlay (not shadcn Dialog) — the palette has a distinct
-  two-region layout (search input + keyboard-hint footer) that doesn't fit the
-  Dialog's grid-gap content model, and direct DOM access is needed for focus trap
-  management. bits-ui Dialog wraps in a Portal which makes sentinel-based trapping
-  harder to reason about. A custom overlay with manual focus trapping is simpler and
-  more explicit here.
-
-  FOCUS TRAP: Manual implementation. On open: cache `document.activeElement`, move
-  focus to the search input. Tab/Shift+Tab cycles through focusable children of the
-  palette panel. On close: restore focus to the cached element.
-
-  Z-INDEX SCALE (defined here for cross-component consistency):
-    Backdrop + panel: z-[60]  (above Dialog z-50, below Tooltip z-70)
+  ⌘K palette — notebooks-only (M3). SOURCES/CHATS deferred to M4/M5.
+  Custom overlay (not bits-ui Dialog) for manual focus-trap + two-region layout.
+  z-[60]: above Dialog z-50, below Tooltip z-70. ⌘K listener lives in AppShell.
 -->
 <script lang="ts">
   import SearchIcon from '@lucide/svelte/icons/search';
@@ -36,38 +15,18 @@
     formatSourceCount
   } from '$lib/notebooks/index.js';
 
-  // ---------------------------------------------------------------------------
-  // Local state
-  // ---------------------------------------------------------------------------
-
-  /** Index of the keyboard-highlighted result row. Resets to 0 when query changes. */
   let highlightedIndex = $state(0);
-
-  /** The element that had focus when the palette opened — restored on close. */
   let previouslyFocusedEl: Element | null = null;
-
-  /** Ref to the search input — used for autofocus on open. */
   let searchInput: HTMLInputElement | null = $state(null);
-
-  /** Ref to the palette panel — used as the focus-trap boundary. */
   let panelEl: HTMLDivElement | null = $state(null);
-
-  // ---------------------------------------------------------------------------
-  // Derived helpers
-  // ---------------------------------------------------------------------------
 
   const results = $derived(notebookStore.paletteResults);
 
-  /** Reset highlight whenever results change (query changed). */
   $effect(() => {
     // Touch `results` to subscribe; reset highlight on any change.
     void results;
     highlightedIndex = 0;
   });
-
-  // ---------------------------------------------------------------------------
-  // Open/close side-effects
-  // ---------------------------------------------------------------------------
 
   $effect(() => {
     // $effect is deferred (microtask); if it flushes after the component/jsdom is
@@ -89,16 +48,10 @@
     }
   });
 
-  // ---------------------------------------------------------------------------
-  // Keyboard handlers
-  // ---------------------------------------------------------------------------
-
-  /** Close the palette (resets query via the store setter). */
   function close() {
     notebookStore.paletteOpen = false;
   }
 
-  /** Select the notebook at `index` and close. */
   function selectAt(index: number) {
     const result = results[index];
     if (!result) return;
@@ -106,7 +59,6 @@
     close();
   }
 
-  /** Handle keydown on the palette panel for navigation. */
   function handlePanelKeydown(e: KeyboardEvent) {
     switch (e.key) {
       case 'Escape':
@@ -136,17 +88,12 @@
     }
   }
 
-  /** Scroll the highlighted result row into view inside the results container. */
   function scrollHighlightedIntoView() {
     requestAnimationFrame(() => {
       const row = panelEl?.querySelector<HTMLElement>(`[data-result-index="${highlightedIndex}"]`);
       row?.scrollIntoView({ block: 'nearest' });
     });
   }
-
-  // ---------------------------------------------------------------------------
-  // Focus trap
-  // ---------------------------------------------------------------------------
 
   /** Returns all keyboard-focusable elements within the palette panel. */
   function getFocusable(): HTMLElement[] {
@@ -179,10 +126,6 @@
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Backdrop click
-  // ---------------------------------------------------------------------------
-
   function handleBackdropClick(e: MouseEvent) {
     // Only close if the click was on the backdrop itself, not the panel.
     if (e.target === e.currentTarget) {
@@ -192,10 +135,6 @@
 </script>
 
 {#if notebookStore.paletteOpen}
-  <!--
-    Backdrop — covers the full viewport, dims the UI, closes on click-outside.
-    z-[60]: above shadcn Dialog (z-50), below Tooltip (z-70).
-  -->
   <!-- svelte-ignore a11y_click_events_have_key_events -->
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div
@@ -203,11 +142,6 @@
     role="presentation"
     onclick={handleBackdropClick}
   >
-    <!--
-      Palette panel — centered modal.
-      role="dialog" + aria-modal="true" declare it as a dialog to AT.
-      aria-label provides an accessible name.
-    -->
     <div
       bind:this={panelEl}
       role="dialog"
@@ -218,9 +152,6 @@
       style="max-height: min(560px, calc(100vh - 30vh - 2rem));"
       onkeydown={handlePanelKeydown}
     >
-      <!-- ------------------------------------------------------------------ -->
-      <!-- Search header                                                        -->
-      <!-- ------------------------------------------------------------------ -->
       <div class="flex items-center gap-3 px-4 py-3">
         <SearchIcon class="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
 
@@ -243,7 +174,6 @@
           }}
         />
 
-        <!-- Esc affordance / close button -->
         <button
           type="button"
           aria-label="Close search (Escape)"
@@ -254,17 +184,12 @@
         </button>
       </div>
 
-      <!-- ------------------------------------------------------------------ -->
-      <!-- Results body                                                         -->
-      <!-- ------------------------------------------------------------------ -->
       <div class="flex-1 overflow-y-auto min-h-0 border-t border-border">
         {#if results.length === 0}
-          <!-- Empty state -->
           <div class="px-4 py-8 text-center text-[13px] text-muted-foreground">
             No notebooks found
           </div>
         {:else}
-          <!-- NOTEBOOKS section -->
           <div class="px-4 pt-3 pb-1">
             <div
               class="text-[10px] font-bold tracking-[0.1em] uppercase text-muted-foreground mb-1"
@@ -273,11 +198,6 @@
             </div>
           </div>
 
-          <!--
-            Results list.
-            role="listbox" + each row role="option" satisfies the combobox ARIA pattern.
-            aria-selected marks the keyboard-highlighted item.
-          -->
           <ul id="palette-results" role="listbox" aria-label="Notebook results" class="px-2 pb-2">
             {#each results as notebook, i (notebook.id)}
               {@const isHighlighted = i === highlightedIndex}
@@ -297,9 +217,6 @@
                 }}
                 tabindex="-1"
               >
-                <!-- Deterministic color icon — self-applying `nb-{accent}` class
-                     drives the tinted background (--nb-bg) and glyph color (--nb-fg),
-                     matching NotebooksSidebar / NotebookRow / TrashView. -->
                 <div
                   class={[
                     'size-8 shrink-0 rounded-[7px] flex items-center justify-center',
@@ -310,7 +227,6 @@
                   <BookOpen class="size-4" />
                 </div>
 
-                <!-- Title + subtitle -->
                 <div class="min-w-0 flex-1">
                   <div class="truncate text-[14px] font-bold leading-snug">
                     {notebook.title}
@@ -322,7 +238,6 @@
                   </div>
                 </div>
 
-                <!-- Chevron -->
                 <ChevronRight
                   class={[
                     'size-4 shrink-0 transition-colors',
@@ -336,9 +251,6 @@
         {/if}
       </div>
 
-      <!-- ------------------------------------------------------------------ -->
-      <!-- Footer hint bar                                                      -->
-      <!-- ------------------------------------------------------------------ -->
       <div
         class="flex items-center gap-4 border-t border-border px-4 py-2 text-[11px] text-muted-foreground"
         aria-hidden="true"

@@ -19,41 +19,17 @@
   import PreferencesShell from '$lib/components/embeddings/PreferencesShell.svelte';
   import NotebookSettingsSheet from '$lib/components/embeddings/NotebookSettingsSheet.svelte';
 
-  // ---------------------------------------------------------------------------
-  // Local state
-  // ---------------------------------------------------------------------------
-
-  /** Controls NotebookCreateDialog visibility; opened by the sidebar's New button. */
   let createOpen = $state(false);
-
-  /** User display name (AppConfig.user_name) for the sidebar account footer. */
   let userName = $state('');
-
-  // ---------------------------------------------------------------------------
-  // Reactive reads from the shared store
-  // ---------------------------------------------------------------------------
 
   const activeNotebook = $derived(notebookStore.activeNotebook);
 
-  // When the global Preferences view is open it renders IN-PLACE: the left
-  // notebook sidebar stays, but the center workspace + right sources rail are
-  // replaced by the Preferences view (it spans those two grid columns). It is a
-  // route/view swap, NOT a floating overlay.
+  // Preferences renders IN-PLACE (col-span-2), not as a floating overlay.
   const settingsOpen = $derived(notebookStore.settingsOpen);
 
-  // Left grid column width is driven by the persisted collapse state: expanded =
-  // 256px, collapsed icon rail = 104px. The collapsed width must comfortably fit
-  // the native macOS traffic-light cluster (~62px wide): 104px column − 2×8px
-  // (m-2) gutter = 88px panel (window-x 8→96), so the cluster (positioned at x:20,
-  // i.e. a 12px left inset) clears both walls with ~14px right margin.
-  // Both rails are independently collapsible: the LEFT column (sidebar) is
-  // 256px → 104px; the RIGHT column (sources rail) is 320px → 104px icon strip
-  // (collapsed width matches the left rail's 104px for visual symmetry).
-  // Both transitions animate via the grid-template-columns transition below.
-  //
-  // The four combinations are spelled out as STATIC class literals (not built by
-  // interpolation) so Tailwind v4's static extractor emits each grid-cols rule —
-  // a templated `grid-cols-[${l}_1fr_${r}]` would never be generated.
+  // Four combinations spelled out as STATIC class literals (not interpolated) so
+  // Tailwind v4's static extractor emits each grid-cols rule. Collapsed = 104px
+  // (fits the macOS traffic-light cluster with margin); expanded = 256px / 320px.
   const gridCols = $derived.by(() => {
     const left = notebookStore.sidebarCollapsed;
     const right = notebookStore.rightRailCollapsed;
@@ -63,9 +39,7 @@
     return 'grid-cols-[256px_1fr_320px]';
   });
 
-  // ---------------------------------------------------------------------------
-  // Global ⌘K handler (Step 4.10) — macOS-first / metaKey only for M3.
-  // ---------------------------------------------------------------------------
+  // ⌘K handler — macOS-first / metaKey only for M3.
 
   function isTypingTarget(el: Element | null): boolean {
     if (!el) return false;
@@ -122,43 +96,22 @@
   });
 </script>
 
-<!-- Full-viewport app shell on a canvas ("container wall", bg-background). The
-     LEFT rail is a floating panel inset from the window edges (subtle border +
-     tiny shadow for a crisp elevation); the macOS native traffic lights
-     (titleBarStyle "Overlay") sit on its top row. Each region has a top drag bar
-     (data-tauri-drag-region) so the window can be moved by its top edge.
-     The left column WIDTH is reactive to sidebarCollapsed and animates. -->
 <div
   class={[
     'grid h-svh w-full bg-background transition-[grid-template-columns] duration-200 ease-out',
     gridCols
   ].join(' ')}
 >
-  <!-- LEFT: floating sidebar rail — a normal-flow panel in the left grid column.
-       Collapse / expand is driven by the toggle button only (no hover/flyout):
-       the grid column width above follows sidebarCollapsed (104 / 256px) and
-       animates. Native traffic lights overlay the panel's top drag row. -->
   <SidebarRail onnewnotebook={() => (createOpen = true)} {userName} />
 
   {#if settingsOpen}
-    <!-- IN-PLACE Preferences view — occupies the center + right grid columns
-         (col-span-2) right of the left notebook sidebar, replacing the
-         workspace + sources rail. No backdrop / no floating card. "← Back"
-         inside it sets settingsOpen=false to return to the notebook view. -->
     <div class="col-span-2 flex min-w-0 overflow-hidden">
       <PreferencesShell />
     </div>
   {:else}
-    <!-- CENTER: workspace on the canvas — top drag bar, then state-driven content.
-         The floating pill header (NotebookTopBar) sits within the top area; Trash
-         is a centered modal (mounted at shell root), not a center-pane view. -->
     <main class="flex flex-col overflow-hidden">
-      <!-- Floating pill header — always present (its full-width outer row is the
-           window drag region); the pill shows the title + Chat/Notes only when a
-           notebook is active, and always exposes share + settings. -->
       <NotebookTopBar />
       {#if activeNotebook}
-        <!-- Empty content region — chat/notes fill this in M5/M6. -->
         <div class="flex flex-1 flex-col overflow-hidden"></div>
       {:else if !notebookStore.loading}
         <!-- Gate on !loading to prevent an empty-state flash before auto-select fires. -->
@@ -170,7 +123,6 @@
       {/if}
     </main>
 
-    <!-- RIGHT: sources rail — flush panel with a hairline divider; filled by M4 SourcesRail -->
     <aside
       class="flex flex-col overflow-hidden border-l border-border bg-card text-card-foreground"
     >
@@ -179,18 +131,13 @@
   {/if}
 </div>
 
-<!-- Overlays mounted at shell root -->
 <CommandPalette />
 <TrashView />
 <NotebookCreateDialog open={createOpen} onOpenChange={(v) => (createOpen = v)} />
 
-<!-- Per-notebook settings sheet (M4 4b-B) — stays a sheet. The global
-     Preferences view is rendered in-place above, not here. -->
 <NotebookSettingsSheet />
 
-<!-- Dev/QA Embeddings Inspector — DEV-gated dynamic import so the component is
-     tree-shaken out of release bundles (the backend command is also
-     debug_assertions-gated). -->
+<!-- DEV-gated dynamic import: tree-shaken out of release bundles. -->
 {#if import.meta.env.DEV}
   {#await import('$lib/components/inspector/EmbeddingsInspector.svelte') then { default: Inspector }}
     <Inspector />
