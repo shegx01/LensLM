@@ -85,6 +85,22 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # resolved version so no second copy is added. MIT OR Apache-2.0 (deny.toml).
 flate2 = "=1.1.9"
 
+# --- M12 issue #41: audio decode + resample to 16kHz mono PCM ---
+# Pure-Rust, in-RAM media decode (no C toolchain, no sidecar, no temp files).
+# `features = ["all"]` enables the codec/container decoders that are OFF by
+# Symphonia's cargo defaults — mp3/aac/isomp4/alac/caf/aiff — alongside the
+# always-on wav/flac/ogg/vorbis. Opus is NOT decodable in 0.5.5 (roadmap only)
+# and maps to `UnsupportedMediaCodec`. MPL-2.0 — in deny.toml allowlist.
+symphonia = { version = "=0.5.5", features = ["all"] }
+# High-quality sinc resampler (arbitrary-rate → 16kHz). Pinned to the 0.16.x
+# line for the stable `SincFixedIn` + planar `Vec<Vec<f32>>` API (rubato 3.0.0
+# REMOVED `SincFixedIn` in favour of an `audioadapter` surface that has since
+# drifted to 4.0.0; the spec explicitly sanctions this 0.16 fallback to avoid
+# the moving-target adapter API). The sinc filter retains state across blocks,
+# so windowed output equals whole-buffer output (issue #41 D2/D8).
+# MIT — in deny.toml allowlist.
+rubato = "=0.16.2"
+
 # --- M4 Phase 3 (Stage 2): unified LLM client behind the `LlmProvider` trait ---
 # `genai` is the multi-provider LLM client (Anthropic/OpenAI/Gemini/Ollama/GLM/
 # Ollama-Cloud/LM Studio) that replaces the three hand-rolled HTTP backends.
