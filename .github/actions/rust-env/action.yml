@@ -1,0 +1,57 @@
+name: Rust CI environment
+description: >-
+  Shared setup for the Rust jobs: cached apt system deps, the pinned toolchain,
+  an (optionally shared/writable) cargo cache, and an optional cargo-nextest.
+  Centralised here so build/clippy/test jobs stay in lockstep on the same deps.
+
+inputs:
+  cache:
+    description: Restore the shared cargo registry + target cache.
+    default: 'true'
+  save-cache:
+    description: >-
+      Whether THIS job writes the shared cache. Exactly one job (the archive
+      build) should set this so parallel jobs don't race on the same key.
+    default: 'false'
+  shared-key:
+    description: Swatinem/rust-cache shared-key — jobs sharing this key share a cache.
+    default: rust-ci
+  install-nextest:
+    description: Install cargo-nextest (needed to archive/run the test binaries).
+    default: 'false'
+
+runs:
+  using: composite
+  steps:
+    # Tauri v2 needs the WebKitGTK stack to compile src-tauri (and the workspace
+    # test build) and to LOAD the resulting test binaries at runtime, so shards
+    # need these too. protobuf-compiler (protoc) is required by lance-encoding's
+    # build script. cache-apt-pkgs caches the .debs so repeat installs drop from
+    # ~30s to a few seconds.
+    - name: Cache + install apt system deps
+      uses: awalsh128/cache-apt-pkgs-action@v1
+      with:
+        packages: >-
+          libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
+          libgtk-3-dev libxdo-dev libssl-dev patchelf build-essential
+          protobuf-compiler curl wget file
+        version: '1.0'
+
+    # rust-toolchain.toml pins 1.94.1 + clippy + rustfmt; `rustup show`
+    # materializes it up front so later steps don't pay the install cost mid-run.
+    - name: Install pinned Rust toolchain
+      shell: bash
+      run: rustup show
+
+    - name: Cache cargo registry + target
+      if: inputs.cache != 'false'
+      uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: ${{ inputs.shared-key }}
+        save-if: ${{ inputs.save-cache }}
+
+    - name: Install cargo-nextest
+      if: inputs.install-nextest == 'true'
+      uses: taiki-e/install-action@v2
+      with:
+        tool: nextest

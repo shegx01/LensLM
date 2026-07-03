@@ -17,66 +17,111 @@ permissions:
   contents: read
 
 jobs:
-  rust:
-    name: Rust (fmt + clippy + test)
+  # ─────────────────────────── Rust ───────────────────────────
+  # The old single `rust` job ran fmt → clippy → test serially, paying the
+  # workspace compile twice (clippy + test use different profiles) and running
+  # all ~880 tests in one lane. It is now a fan-out DAG that shares one warm
+  # cache: fmt / clippy / archive run in parallel, then the test binaries built
+  # once by `rust-archive` are downloaded and run across 3 partitioned shards
+  # with cargo-nextest (no recompilation in the shards).
+
+  rust-fmt:
+    name: Rust (fmt)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      # fmt needs only rustfmt from the pinned toolchain — no system deps, no
+      # compile, no cache. Kept as its own tiny job for near-instant feedback.
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+  rust-clippy:
+    name: Rust (clippy)
     runs-on: ubuntu-latest
     env:
-      # Scoped to the Rust job so it can't leak into (or invalidate caches for)
-      # the frontend/e2e jobs. Also gates `cargo test`'s compile on rustc warnings.
       CARGO_TERM_COLOR: always
+      # Gates clippy's compile on rustc warnings too. Scoped to this job so it
+      # can't invalidate the frontend/e2e caches.
       RUSTFLAGS: '-D warnings'
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-
-      # Tauri v2 needs the WebKitGTK stack to compile src-tauri (and thus the
-      # workspace test build, which includes the bridge crate).
-      # `protobuf-compiler` (protoc) is required by `lance-encoding` (transitive
-      # via lancedb, M4) whose build script compiles .proto files with prost.
-      - name: Install Tauri Linux system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            libgtk-3-dev \
-            libxdo-dev \
-            libssl-dev \
-            patchelf \
-            build-essential \
-            protobuf-compiler \
-            curl wget file
-
-      # The toolchain (1.94.1 + clippy + rustfmt) is pinned by rust-toolchain.toml;
-      # `rustup show` materializes it so later steps don't pay the install cost mid-run.
-      - name: Install pinned Rust toolchain
-        run: rustup show
-
-      - name: Cache cargo registry + target
-        uses: Swatinem/rust-cache@v2
-
-      # Vendor + verify the pinned libpdfium dylib (M4 Phase 2 PDF extractor).
-      # The dylib is gitignored and fetched here; scripts/fetch-pdfium.sh re-runs
-      # in --verify mode so the downloaded binary's SHA-256 is checked against the
-      # committed src-tauri/frameworks/CHECKSUMS (supply-chain integrity) BEFORE
-      # the build/test steps. NOTE: the pinned asset is the macOS universal dylib;
-      # on this Linux runner it is fetched + checksum-verified but cannot be loaded
-      # at runtime, so the PDF *binding* tests are #[cfg(target_os = "macos")]-gated
-      # (verified on macOS dev / release). This step still guards the checksum so a
-      # tampered/unpinned binary fails CI regardless of platform.
+      - name: Set up Rust environment
+        uses: ./.github/actions/rust-env
+      # Supply-chain gate: fetch the pinned libpdfium dylib and verify its
+      # SHA-256 against the committed CHECKSUMS before any build runs. (Runtime
+      # loading is macOS-only; on Linux this is purely the integrity check.)
       - name: Fetch + verify pinned libpdfium dylib
         run: scripts/fetch-pdfium.sh --verify
-
-      - name: Format check
-        run: cargo fmt --all -- --check
-
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Test
-        run: cargo test --workspace
+  rust-archive:
+    name: Rust (build + archive tests)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+      # Gates the test-binary compile on rustc warnings (was `cargo test`'s job).
+      RUSTFLAGS: '-D warnings'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      # The one job that writes the shared cache, so parallel jobs don't race.
+      - name: Set up Rust environment
+        uses: ./.github/actions/rust-env
+        with:
+          save-cache: 'true'
+          install-nextest: 'true'
+      - name: Fetch + verify pinned libpdfium dylib
+        run: scripts/fetch-pdfium.sh --verify
+      # Compile every test binary in the workspace exactly once and pack them
+      # (plus the metadata nextest needs) into a self-contained archive.
+      - name: Build + archive test binaries
+        run: cargo nextest archive --workspace --archive-file target/nextest-archive.tar.zst
+      - name: Upload nextest archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextest-archive
+          path: target/nextest-archive.tar.zst
+          retention-days: 1
 
+  rust-test:
+    name: Rust (test shard ${{ matrix.shard }}/3)
+    needs: rust-archive
+    runs-on: ubuntu-latest
+    strategy:
+      # One shard failing shouldn't cancel the others — we want the full picture.
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      # No compile here, so skip the cargo cache; we still need the apt runtime
+      # libs (to load the binaries) and nextest (to run the archive).
+      - name: Set up Rust environment
+        uses: ./.github/actions/rust-env
+        with:
+          cache: 'false'
+          install-nextest: 'true'
+      - name: Download nextest archive
+        uses: actions/download-artifact@v4
+        with:
+          name: nextest-archive
+          path: target
+      # Run this shard's slice of the suite straight from the prebuilt binaries.
+      - name: Run test shard
+        run: >-
+          cargo nextest run
+          --archive-file target/nextest-archive.tar.zst
+          --partition count:${{ matrix.shard }}/3
+
+  # ───────────────────────── Frontend ─────────────────────────
   frontend:
     name: Frontend (format + check + unit tests)
     runs-on: ubuntu-latest
