@@ -347,16 +347,10 @@ impl WindowIter {
                 }
             };
 
-            // Extract spec scalars BEFORE consuming `decoded` — `decoded`
-            // borrows `self.decoder` mutably; `check_and_init_spec` takes
-            // `&mut self`, which the borrow checker would reject while
-            // `decoded` still lives. Copying the two scalars is zero-cost.
+            // Read spec scalars before `push_decoded_to_mono` consumes `decoded`
+            // (it borrows `self.decoder`), so the later `&mut self` call is legal.
             let pkt_rate = decoded.spec().rate;
             let pkt_ch = decoded.spec().channels.count();
-
-            // `push_decoded_to_mono` allocates a fresh SampleBuffer per
-            // packet (C1 fix) and consumes `decoded`, ending the borrow on
-            // `self.decoder` so the subsequent `&mut self` call is legal.
             push_decoded_to_mono(decoded, pkt_ch, &mut self.src_pending);
 
             self.check_and_init_spec(pkt_rate, pkt_ch)?;
@@ -434,8 +428,6 @@ impl Iterator for WindowIter {
             }
 
             if self.eof {
-                // No more packets. Flush the resampler tail once, then emit
-                // whatever remains (may be a short final window or empty).
                 if let Err(e) = self.flush_resampler() {
                     self.done = true;
                     return Some(Err(e));
@@ -451,7 +443,6 @@ impl Iterator for WindowIter {
             match self.decode_next_packet() {
                 Ok(false) => {
                     self.eof = true;
-                    // Loop again to trigger the flush path.
                 }
                 Ok(true) => {
                     if let Err(e) = self.pump_resampler() {
@@ -702,7 +693,7 @@ mod tests {
     #[test]
     fn downmixes_stereo_to_mono() {
         let pcm = decode_and_resample_audio(&fixture("tone_44100_stereo.wav")).unwrap();
-        assert_valid_16k_mono(&pcm); // ~16000 NOT ~32000 → 1 channel
+        assert_valid_16k_mono(&pcm);
         let hz = dominant_frequency(&pcm, TARGET_SAMPLE_RATE as f32);
         assert!(
             (hz - 440.0).abs() <= 8.0,
@@ -767,7 +758,6 @@ mod tests {
             "expected ≥2 windows for a 35s file, got {}",
             windows.len()
         );
-        // First window must be exactly window_frames (480000 at 16 kHz × 30s).
         assert_eq!(
             windows[0].len(),
             WindowConfig::DEFAULT_WINDOW_FRAMES,
@@ -871,7 +861,6 @@ mod tests {
     fn growing_frame_capacity_no_panic() {
         use symphonia::core::audio::{AsAudioBufferRef, AudioBuffer, Layout, Signal, SignalSpec};
 
-        // Mono spec at an arbitrary rate — channel count determines interleave.
         let spec = SignalSpec::new_with_layout(44100, Layout::Mono);
         let frame_sizes = [256usize, 1024, 4096];
         let mut total_mono = Vec::new();
@@ -986,6 +975,79 @@ mod tests {
         assert!(
             (hz - 440.0).abs() <= 8.0,
             "dominant freq {hz} Hz after 8kHz→16kHz upsample, want ~440"
+        );
+    }
+
+    /// Cross-validates our rubato resample output against an ffmpeg swr reference.
+    ///
+    /// Different resamplers are never bit-identical, so we use **Pearson correlation**
+    /// on the aligned prefix (truncated to min length, as rubato's sinc tail makes
+    /// ours slightly longer). Empirically measured: correlation = 0.9939 on
+    /// `tone_44100_stereo.wav` (rubato SincFixedIn vs ffmpeg swr). Threshold ≥ 0.98
+    /// gives a 1.4% margin while catching gross errors (wrong ratio, gain, channel
+    /// swap, garbage output). The reference file was generated with:
+    ///   `ffmpeg -y -v error -i tone_44100_stereo.wav -ar 16000 -ac 1 -f f32le tone_44100_stereo.ref16k.f32le`
+    #[test]
+    fn cross_validates_against_ffmpeg_reference() {
+        use std::io::Read as _;
+
+        let ref_path = fixture("tone_44100_stereo.ref16k.f32le");
+        let mut f = std::fs::File::open(&ref_path)
+            .expect("reference fixture missing — regenerate with generate.sh");
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf).unwrap();
+        let ref_pcm: Vec<f32> = buf
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+
+        let our_pcm = decode_and_resample_audio(&fixture("tone_44100_stereo.wav")).unwrap();
+
+        let n = ref_pcm.len().min(our_pcm.len());
+        assert!(n >= 15_000, "too few aligned samples: {n}");
+
+        let (r, o) = (&ref_pcm[..n], &our_pcm[..n]);
+        let mr: f32 = r.iter().sum::<f32>() / n as f32;
+        let mo: f32 = o.iter().sum::<f32>() / n as f32;
+        let num: f32 = r
+            .iter()
+            .zip(o.iter())
+            .map(|(a, b)| (a - mr) * (b - mo))
+            .sum();
+        let dr: f32 = r.iter().map(|a| (a - mr).powi(2)).sum::<f32>().sqrt();
+        let do_: f32 = o.iter().map(|b| (b - mo).powi(2)).sum::<f32>().sqrt();
+        let corr = num / (dr * do_);
+
+        assert!(
+            corr >= 0.98,
+            "Pearson correlation {corr:.4} < 0.98 (measured 0.9939 on rubato vs ffmpeg swr); \
+             possible wrong ratio, gain, channel swap, or garbage output"
+        );
+    }
+
+    /// Validates the sinc anti-aliasing filter rejects a 12 kHz tone (above the
+    /// 8 kHz Nyquist for a 16 kHz output rate). If anti-aliasing were broken, the
+    /// 12 kHz component would alias to |16000 − 12000| = 4000 Hz. We measure the
+    /// Goertzel power at 4 kHz in the 12 kHz output and compare it to the 4 kHz
+    /// Goertzel power of the 440 Hz reference signal (noise floor). Empirically:
+    /// alias@4kHz = 3.94e−4, reference inband@440Hz = 499754 → ratio ≈ 1.27 billion.
+    /// Threshold ≥ 1_000_000× gives enormous margin; a broken anti-alias filter
+    /// would collapse the ratio to near 1× (the alias would be as loud as a real tone).
+    #[test]
+    fn sinc_filter_rejects_above_nyquist_alias() {
+        let pcm12k = decode_and_resample_audio(&fixture("tone_12k_44100_mono.wav")).unwrap();
+        let pcm440 = decode_and_resample_audio(&fixture("tone_44100_stereo.wav")).unwrap();
+
+        let alias_power = goertzel_power(&pcm12k, TARGET_SAMPLE_RATE as f32, 4000.0);
+        let n440 = pcm440.len().min(16_000);
+        let inband_power = goertzel_power(&pcm440[..n440], TARGET_SAMPLE_RATE as f32, 440.0);
+
+        let rejection_ratio = inband_power / alias_power.max(1e-9);
+        assert!(
+            rejection_ratio >= 1_000_000.0,
+            "alias rejection ratio {rejection_ratio:.0}x < 1_000_000× \
+             (measured 1.27 billion on rubato SincFixedIn BlackmanHarris2); \
+             anti-aliasing filter may be broken — 12 kHz leaking as alias @4 kHz"
         );
     }
 }
