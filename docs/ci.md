@@ -12,12 +12,12 @@ Runs on every pull request and on pushes to `main`. Linux-only (`ubuntu-latest`)
 cross-platform bundling is verified later at release time.
 
 | Job               | What it runs                                            | Blocks merge? |
-| ----------------- | ------------------------------------------------------ | ------------- |
-| **Rust (fmt)**    | `cargo fmt --all -- --check`                           | Yes           |
+| ----------------- | ------------------------------------------------------- | ------------- |
+| **Rust (fmt)**    | `cargo fmt --all -- --check`                            | Yes           |
 | **Rust (clippy)** | `cargo clippy --workspace --all-targets -- -D warnings` | Yes           |
 | **Frontend**      | `bun run format:check`, `bun run check`, `bun run test` | Yes           |
-| **E2E**           | Playwright against the SvelteKit dev server            | Yes           |
-| **`signoff`**     | The Rust test suite, run locally — see below           | Yes           |
+| **E2E**           | Playwright against the SvelteKit dev server             | Yes           |
+| **`signoff`**     | The Rust test suite, run locally — see below            | Yes           |
 
 CI runs fmt + clippy (the Linux compile/lint canary; `clippy --all-targets` also
 compiles the test code) plus the frontend and E2E suites. The **Rust test suite
