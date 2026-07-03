@@ -1,23 +1,26 @@
 name: Rust CI environment
 description: >-
   Shared setup for the Rust jobs: cached apt system deps, the pinned toolchain,
-  an (optionally shared/writable) cargo cache, and an optional cargo-nextest.
-  Centralised here so build/clippy/test jobs stay in lockstep on the same deps.
+  an (optionally shared/writable) cargo cache, the pinned libpdfium supply-chain
+  gate, and an optional cargo-nextest. Centralised here so the build/clippy/test
+  jobs stay in lockstep on the same deps.
 
 inputs:
   cache:
-    description: Restore the shared cargo registry + target cache.
+    description: Restore the shared cargo registry + target cache ('true'/'false').
     default: 'true'
   save-cache:
     description: >-
-      Whether THIS job writes the shared cache. Exactly one job (the archive
-      build) should set this so parallel jobs don't race on the same key.
+      Whether THIS job writes the shared cache ('true'/'false'). Exactly one job
+      (the archive build) should set this so parallel jobs don't race on the key.
     default: 'false'
-  shared-key:
-    description: Swatinem/rust-cache shared-key — jobs sharing this key share a cache.
-    default: rust-ci
+  fetch-pdfium:
+    description: >-
+      Fetch + SHA-256-verify the pinned libpdfium dylib ('true'/'false'). Needed
+      by every job that compiles the workspace (the checksum is the gate).
+    default: 'false'
   install-nextest:
-    description: Install cargo-nextest (needed to archive/run the test binaries).
+    description: Install cargo-nextest ('true'/'false') — to archive/run test binaries.
     default: 'false'
 
 runs:
@@ -27,9 +30,9 @@ runs:
     # test build) and to LOAD the resulting test binaries at runtime, so shards
     # need these too. protobuf-compiler (protoc) is required by lance-encoding's
     # build script. cache-apt-pkgs caches the .debs so repeat installs drop from
-    # ~30s to a few seconds.
+    # ~30s to a few seconds. SHA-pinned (this action installs system packages).
     - name: Cache + install apt system deps
-      uses: awalsh128/cache-apt-pkgs-action@v1
+      uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
       with:
         packages: >-
           libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
@@ -44,14 +47,24 @@ runs:
       run: rustup show
 
     - name: Cache cargo registry + target
-      if: inputs.cache != 'false'
+      if: ${{ inputs.cache != 'false' }}
       uses: Swatinem/rust-cache@v2
       with:
-        shared-key: ${{ inputs.shared-key }}
+        # Fixed key so all Rust jobs share one cache; only the archive job writes.
+        shared-key: rust-ci
         save-if: ${{ inputs.save-cache }}
 
+    # Supply-chain gate: fetch the pinned libpdfium dylib and verify its SHA-256
+    # against the committed CHECKSUMS before any build runs. (Runtime loading is
+    # macOS-only; on Linux this is purely the integrity check.)
+    - name: Fetch + verify pinned libpdfium dylib
+      if: ${{ inputs.fetch-pdfium == 'true' }}
+      shell: bash
+      run: scripts/fetch-pdfium.sh --verify
+
+    # SHA-pinned: this action downloads + executes a prebuilt nextest binary.
     - name: Install cargo-nextest
-      if: inputs.install-nextest == 'true'
-      uses: taiki-e/install-action@v2
+      if: ${{ inputs.install-nextest == 'true' }}
+      uses: taiki-e/install-action@c93ccc03e00cd0e08e494f5fd058a6c55a6a1907 # v2.82.8
       with:
         tool: nextest

@@ -16,18 +16,27 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # Coloured cargo output everywhere; harmless for the non-Rust jobs.
+  CARGO_TERM_COLOR: always
+
 jobs:
   # ─────────────────────────── Rust ───────────────────────────
   # The old single `rust` job ran fmt → clippy → test serially, paying the
   # workspace compile twice (clippy + test use different profiles) and running
-  # all ~880 tests in one lane. It is now a fan-out DAG that shares one warm
-  # cache: fmt / clippy / archive run in parallel, then the test binaries built
-  # once by `rust-archive` are downloaded and run across 3 partitioned shards
-  # with cargo-nextest (no recompilation in the shards).
+  # the whole suite (~880 tests as of 2026-07) in one lane. It is now a fan-out
+  # DAG that shares one warm cache: fmt / clippy / archive run in parallel, then
+  # the test binaries built once by `rust-archive` are downloaded and run across
+  # 3 partitioned shards with cargo-nextest (no recompilation in the shards).
+  #
+  # NOTE (required checks): these four job display names replace the old
+  # "Rust (fmt + clippy + test)" check. Update the branch-protection ruleset to
+  # require the new names — see docs/ci.md.
 
   rust-fmt:
     name: Rust (fmt)
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -41,8 +50,8 @@ jobs:
   rust-clippy:
     name: Rust (clippy)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
-      CARGO_TERM_COLOR: always
       # Gates clippy's compile on rustc warnings too. Scoped to this job so it
       # can't invalidate the frontend/e2e caches.
       RUSTFLAGS: '-D warnings'
@@ -51,19 +60,16 @@ jobs:
         uses: actions/checkout@v7
       - name: Set up Rust environment
         uses: ./.github/actions/rust-env
-      # Supply-chain gate: fetch the pinned libpdfium dylib and verify its
-      # SHA-256 against the committed CHECKSUMS before any build runs. (Runtime
-      # loading is macOS-only; on Linux this is purely the integrity check.)
-      - name: Fetch + verify pinned libpdfium dylib
-        run: scripts/fetch-pdfium.sh --verify
+        with:
+          fetch-pdfium: 'true'
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
   rust-archive:
     name: Rust (build + archive tests)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
-      CARGO_TERM_COLOR: always
       # Gates the test-binary compile on rustc warnings (was `cargo test`'s job).
       RUSTFLAGS: '-D warnings'
     steps:
@@ -74,31 +80,36 @@ jobs:
         uses: ./.github/actions/rust-env
         with:
           save-cache: 'true'
+          fetch-pdfium: 'true'
           install-nextest: 'true'
-      - name: Fetch + verify pinned libpdfium dylib
-        run: scripts/fetch-pdfium.sh --verify
       # Compile every test binary in the workspace exactly once and pack them
       # (plus the metadata nextest needs) into a self-contained archive.
       - name: Build + archive test binaries
         run: cargo nextest archive --workspace --archive-file target/nextest-archive.tar.zst
       - name: Upload nextest archive
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: nextest-archive
           path: target/nextest-archive.tar.zst
-          retention-days: 1
+          # Short-lived, but long enough that "Re-run failed jobs" works over a
+          # weekend without rebuilding the archive.
+          retention-days: 3
 
   rust-test:
+    # SHARD COUNT lives in two places that MUST stay in sync: the `shard` matrix
+    # below and env.SHARD_TOTAL (used for the nextest partition denominator).
+    # The `/3` in the display name is cosmetic — update it too when scaling.
     name: Rust (test shard ${{ matrix.shard }}/3)
     needs: rust-archive
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       # One shard failing shouldn't cancel the others — we want the full picture.
       fail-fast: false
       matrix:
         shard: [1, 2, 3]
     env:
-      CARGO_TERM_COLOR: always
+      SHARD_TOTAL: '3'
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -110,7 +121,7 @@ jobs:
           cache: 'false'
           install-nextest: 'true'
       - name: Download nextest archive
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: nextest-archive
           path: target
@@ -119,7 +130,7 @@ jobs:
         run: >-
           cargo nextest run
           --archive-file target/nextest-archive.tar.zst
-          --partition count:${{ matrix.shard }}/3
+          --partition count:${{ matrix.shard }}/${{ env.SHARD_TOTAL }}
 
   # ───────────────────────── Frontend ─────────────────────────
   frontend:
@@ -140,7 +151,7 @@ jobs:
           node-version: 22.16.0
 
       - name: Cache Bun dependencies
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.bun/install/cache
           key: ${{ runner.os }}-bun-${{ hashFiles('bun.lock') }}
@@ -180,7 +191,7 @@ jobs:
           node-version: 22.16.0
 
       - name: Cache Bun dependencies
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.bun/install/cache
           key: ${{ runner.os }}-bun-${{ hashFiles('bun.lock') }}

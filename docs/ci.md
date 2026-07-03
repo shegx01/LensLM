@@ -11,16 +11,27 @@ app is ready to distribute.
 Runs on every pull request and on pushes to `main`. Linux-only (`ubuntu-latest`);
 cross-platform bundling is verified later at release time.
 
-| Job          | What it runs                                                                                                    | Blocks merge?            |
-| ------------ | --------------------------------------------------------------------------------------------------------------- | ------------------------ |
-| **Rust**     | `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` | Yes                      |
-| **Frontend** | `bun run format:check`, `bun run check`, `bun run test`                                                         | Yes                      |
-| **E2E**      | Playwright against the SvelteKit dev server (`bun run test:e2e`)                                                | No (`continue-on-error`) |
+| Job                             | What it runs                                                                    | Blocks merge?            |
+| ------------------------------- | ------------------------------------------------------------------------------ | ------------------------ |
+| **Rust (fmt)**                  | `cargo fmt --all -- --check`                                                    | Yes                      |
+| **Rust (clippy)**               | `cargo clippy --workspace --all-targets -- -D warnings`                         | Yes                      |
+| **Rust (build + archive tests)**| Compiles every test binary once (`cargo nextest archive`), uploads the archive | Yes                      |
+| **Rust (test shard 1–3/3)**     | Runs the archived binaries partitioned across 3 shards (`cargo nextest run`)    | Yes                      |
+| **Frontend**                    | `bun run format:check`, `bun run check`, `bun run test`                         | Yes                      |
+| **E2E**                         | Playwright against the SvelteKit dev server (`bun run test:e2e`)               | No (`continue-on-error`) |
 
-The Rust job installs the Tauri v2 WebKitGTK system libraries so `src-tauri`
-compiles. Toolchains are pinned: Rust `1.94.1` (`rust-toolchain.toml`), Bun
+The Rust pipeline is a fan-out DAG: `fmt`, `clippy`, and the archive build run
+in parallel sharing one warm cargo cache (only the archive job writes it); the
+`test` shards then run the prebuilt binaries with no recompilation. The shared
+`.github/actions/rust-env` composite installs the Tauri v2 WebKitGTK system
+libraries (cached) so `src-tauri` compiles and the test binaries can load at
+runtime. Toolchains are pinned: Rust `1.94.1` (`rust-toolchain.toml`), Bun
 `1.2.15` and Node `22.16.0` (pinned in the workflow files, mirroring
 `.tool-versions`).
+
+> **Scaling shards:** the shard count is duplicated in `ci.yml` — the `shard`
+> matrix, `env.SHARD_TOTAL`, and the `/3` in the job's display name. Update all
+> three together, and update the required-check names below to match.
 
 ### `Audit` — `.github/workflows/audit.yml`
 
@@ -43,10 +54,18 @@ required:
    protection rules_) targeting `main`.
 2. Enable **Require status checks to pass before merging**.
 3. Add these checks (they appear after the first CI run):
-   - `Rust (fmt + clippy + test)`
+   - `Rust (fmt)`
+   - `Rust (clippy)`
+   - `Rust (build + archive tests)`
+   - `Rust (test shard 1/3)`, `Rust (test shard 2/3)`, `Rust (test shard 3/3)`
    - `Frontend (format + check + unit tests)`
    - Leave **E2E** unselected — it is intentionally non-blocking.
 4. Optionally enable **Require branches to be up to date before merging**.
+
+> **Migrating an existing ruleset:** the Rust pipeline used to be a single
+> `Rust (fmt + clippy + test)` check. That name no longer exists — remove it
+> from the branch-protection ruleset and add the six Rust checks above, or
+> merges will block on a check that never reports.
 
 ## Dependency updates
 
