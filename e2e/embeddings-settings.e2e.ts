@@ -116,6 +116,9 @@ test('per-notebook settings change → confirm → re-embed streams progress', a
   await installTauriStub(page, {
     onboardingComplete: true,
     notebooks: [{ id: 'nb-1', title: 'Q3 Earnings' }],
+    // Suppress cold-launch auto-open so this test keeps its empty-state →
+    // manual-select flow (auto-open is covered separately in home.e2e.ts).
+    reopenLastNotebook: false,
     // The notebook is indexed on nomic/fastembed; switching to all-minilm needs
     // a re-embed (the confirm dialog).
     notebookEmbedding: {
