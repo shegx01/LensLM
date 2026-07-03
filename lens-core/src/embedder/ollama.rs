@@ -215,24 +215,11 @@ impl OllamaEmbedder {
         Ok(resp.embeddings)
     }
 
-    /// L2-normalizes `v` in place (Ollama does NOT normalize; fastembed does, so
-    /// we normalize here to keep both backends' vectors directly comparable by
-    /// cosine distance).
-    fn normalize(v: &mut [f32]) {
-        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-        // Zero-norm guard in f32 space: a near-zero vector (all components ~0)
-        // would divide by ~0 and produce NaNs/Inf; `1e-9` is comfortably above
-        // f32 rounding noise yet far below any real unit-vector norm, so a genuine
-        // embedding always normalizes while a degenerate zero vector is left as-is.
-        if norm > 1e-9 {
-            for x in v.iter_mut() {
-                *x /= norm;
-            }
-        }
-    }
-
-    /// Validates each returned vector has the expected dimension, then normalizes
-    /// it. A wrong-dim response (the wrong Ollama model tag) is an error.
+    /// Validates each returned vector has the expected dimension, then
+    /// L2-normalizes it via the shared [`crate::embedder::l2_normalize`] (Ollama
+    /// does NOT normalize; fastembed does, so we normalize here to keep both
+    /// backends' vectors directly comparable by cosine distance). A wrong-dim
+    /// response (the wrong Ollama model tag) is an error.
     fn finalize(&self, mut vecs: Vec<Vec<f32>>) -> Result<Vec<Vec<f32>>, LensError> {
         for (i, v) in vecs.iter_mut().enumerate() {
             if v.len() != self.dim {
@@ -242,7 +229,7 @@ impl OllamaEmbedder {
                     self.dim
                 )));
             }
-            Self::normalize(v);
+            crate::embedder::l2_normalize(v);
         }
         Ok(vecs)
     }

@@ -47,6 +47,24 @@ pub use registry::{
     resolve, resolve_opt,
 };
 
+/// L2-normalizes `v` in place. The single normalization primitive shared by the
+/// backends that must normalize themselves ([`OllamaEmbedder`], which talks to a
+/// server that does NOT normalize) and by [`CountingEmbedder`]'s deterministic
+/// test vectors — so the zero-norm guard and epsilon live in exactly one place.
+///
+/// Zero-norm guard in f32 space: a near-zero vector would divide by ~0 and
+/// produce NaN/Inf; `1e-9` is comfortably above f32 rounding noise yet far below
+/// any real unit-vector norm, so a genuine embedding always normalizes while a
+/// degenerate zero vector is left untouched.
+pub(crate) fn l2_normalize(v: &mut [f32]) {
+    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 1e-9 {
+        for x in v.iter_mut() {
+            *x /= norm;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public constants
 // ---------------------------------------------------------------------------
@@ -419,13 +437,7 @@ impl CountingEmbedder {
             // Map to [-1, 1] range before normalizing.
             *val = ((h & 0xFFFF) as f32 / 32767.5) - 1.0;
         }
-        // L2-normalize.
-        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if norm > 1e-9 {
-            for x in v.iter_mut() {
-                *x /= norm;
-            }
-        }
+        l2_normalize(&mut v);
         v
     }
 }
