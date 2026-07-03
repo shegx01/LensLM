@@ -1388,12 +1388,21 @@ impl LensEngine {
     /// readiness gate ([`crate::fastembed_weights_cached`]) for a fastembed
     /// selection on a fresh, Ollama-less machine. Always `Fastembed` (Ollama is
     /// detect-only — the app never pulls).
+    ///
+    /// Warms with [`WorkloadKind::Interactive`](crate::embedder::WorkloadKind) so it
+    /// builds the CPU **fastembed** engine specifically (issue #91). The readiness
+    /// gate checks the fastembed ONNX cache (`{data_dir}/models/fastembed/`) and the
+    /// retrieval/query path is CPU-only, so THAT is the engine onboarding must warm.
+    /// Warming with `Bulk` on an Apple-Silicon `native-ml-metal` build would instead
+    /// download the candle-Metal safetensors (a DIFFERENT artifact, under
+    /// `models/candle/`), leaving the readiness gate unsatisfied and the query path
+    /// cold. The candle-Metal bulk weights download lazily on the first ingest
+    /// (surfaced by the ingest `model_download` progress phase).
     pub async fn warm_fastembed_model(&self, model_id: &str) -> Result<(), LensError> {
-        // Warming targets the ingest path, which is a Bulk workload.
         self.embedder_for(
             model_id,
             crate::embedder::EmbeddingBackend::Fastembed,
-            crate::embedder::WorkloadKind::Bulk,
+            crate::embedder::WorkloadKind::Interactive,
         )
         .await
         .map(|_| ())
