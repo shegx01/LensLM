@@ -3,16 +3,7 @@
 // Extracted so SourcesRail (the product sources list) and the dev/QA
 // EmbeddingsInspector render identical status dots from one source of truth.
 
-import type { Source, SourceStatus } from './types.js';
-
-/**
- * Returns true when a source has a structured error reason stored.
- * Use this to decide whether to show the full `error_meta` detail block;
- * always gate the retry affordance on `source.status === 'error'` instead.
- */
-export function hasErrorDetail(source: Source): boolean {
-  return source.status === 'error' && source.error_meta !== null;
-}
+import type { SourceStatus } from './types.js';
 
 /**
  * Map a {@link SourceStatus} to its dot color class (semantic tokens only).

@@ -626,6 +626,42 @@ describe('retrySource', () => {
     expect(src.error_meta?.message).toBe('retry also failed');
   });
 
+  it('increments attempt_count from the prior error_meta on a repeated failure', async () => {
+    // Source already failed once (attempt_count: 1), delivered as a JSON string.
+    vi.mocked(listSources).mockResolvedValue([
+      makeSource({
+        id: 'src-001',
+        status: 'error',
+        error_meta: JSON.stringify({
+          kind: 'Internal',
+          message: 'first failure',
+          timestamp: '2026-07-03T00:00:00.000Z',
+          attempt_count: 1
+        }) as unknown as import('./types.js').ErrorMeta
+      })
+    ]);
+    await loadSources('nb-001');
+    expect(sourcesStore.sources[0].error_meta?.attempt_count).toBe(1);
+
+    let capturedHandler: ((e: unknown) => void) | null = null;
+    vi.mocked(retryIngestSource).mockImplementation(async (_id, onProgress) => {
+      capturedHandler = onProgress as (e: unknown) => void;
+    });
+
+    const retryPromise = retrySource('src-001');
+    if (capturedHandler) {
+      (capturedHandler as (e: unknown) => void)({
+        type: 'failed',
+        data: { kind: 'Internal', message: 'second failure' }
+      });
+    }
+    await retryPromise;
+
+    // Mirrors the backend read-prior-then-+1: 1 ⇒ 2.
+    expect(sourcesStore.sources[0].error_meta?.attempt_count).toBe(2);
+    expect(sourcesStore.sources[0].error_meta?.message).toBe('second failure');
+  });
+
   it('sets status to error and sets store error when retryIngestSource throws', async () => {
     vi.mocked(listSources).mockResolvedValue([makeSource({ id: 'src-001', status: 'error' })]);
     await loadSources('nb-001');

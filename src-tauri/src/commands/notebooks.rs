@@ -318,12 +318,12 @@ pub async fn retry_all_failed_sources(
     engine: tauri::State<'_, LensEngine>,
 ) -> Result<(), LensError> {
     // Snapshot the failed set up front. `list_sources` already excludes trashed
-    // rows; filter to `status == "error"`.
+    // rows; filter to the error status (enum, not a magic string).
     let failed: Vec<String> = engine
         .list_sources(&NotebookId::from(notebook_id))
         .await?
         .into_iter()
-        .filter(|s| s.status == "error")
+        .filter(|s| s.status == lens_core::notebooks::SourceStatus::Error.as_str())
         .map(|s| s.id)
         .collect();
 

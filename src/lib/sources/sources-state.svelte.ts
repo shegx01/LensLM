@@ -117,17 +117,31 @@ export function drainTrashQueueEntry(sourceId: string): void {
  * deserialise it as a string (if the column is TEXT) or as a nested object
  * depending on the sqlx mapping. We normalise both shapes here.
  */
+function isErrorMetaShape(v: unknown): v is ErrorMeta {
+  return (
+    typeof v === 'object' &&
+    v !== null &&
+    'kind' in v &&
+    'message' in v &&
+    typeof (v as ErrorMeta).message === 'string'
+  );
+}
+
 function parseErrorMeta(raw: unknown): ErrorMeta | null {
   if (raw === null || raw === undefined) return null;
-  if (typeof raw === 'object') return raw as ErrorMeta;
-  if (typeof raw === 'string') {
-    try {
-      return JSON.parse(raw) as ErrorMeta;
-    } catch {
-      return null;
-    }
-  }
-  return null;
+  const obj =
+    typeof raw === 'string'
+      ? (() => {
+          try {
+            return JSON.parse(raw) as unknown;
+          } catch {
+            return null;
+          }
+        })()
+      : raw;
+  // Validate the shape so a malformed row falls back to the null-meta UI path
+  // ("Ingest failed (no details captured)") rather than rendering `undefined`.
+  return isErrorMetaShape(obj) ? obj : null;
 }
 
 /** Fetch all sources for the given notebook and populate the store. */
@@ -217,14 +231,16 @@ function makeIngestHandler(sourceId: string): (e: StreamEvent<IngestProgress>) =
       updateSourceStatus(sourceId, 'indexed', null);
     } else if (e.type === 'failed') {
       // Capture the {kind, message} payload and merge it as error_meta.
-      // `attempt_count` and `timestamp` are authoritative from the backend DB;
-      // here we only know kind+message from the stream event, so we store a
-      // partial object. A subsequent loadSources will reconcile the full record.
+      // The stream event doesn't carry attempt_count, so derive it by
+      // incrementing the prior in-memory value (null ⇒ 0). This mirrors the
+      // backend's read-prior-then-+1 and stays accurate across repeated retries
+      // without a DB round-trip; a later loadSources reconciles the timestamp.
+      const prior = sources.find((s) => s.id === sourceId)?.error_meta?.attempt_count ?? 0;
       const partialMeta: ErrorMeta = {
         kind: e.data.kind,
         message: e.data.message,
         timestamp: new Date().toISOString(),
-        attempt_count: 1
+        attempt_count: prior + 1
       };
       updateSourceStatus(sourceId, 'error', partialMeta);
     } else if (e.type === 'started') {
@@ -250,6 +266,8 @@ export async function ingest(sourceId: string): Promise<void> {
  */
 export async function retrySource(sourceId: string): Promise<void> {
   // Optimistic transition: error → parsing so the dot starts animating immediately.
+  // Note: error_meta is intentionally left intact so the failed handler can
+  // increment attempt_count from the prior value (matching the backend).
   updateSourceStatus(sourceId, 'parsing');
   try {
     await retryIngestSource(sourceId, makeIngestHandler(sourceId));
