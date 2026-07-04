@@ -37,7 +37,7 @@ runs:
         packages: >-
           libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
           libgtk-3-dev libxdo-dev libssl-dev patchelf build-essential
-          protobuf-compiler curl wget file
+          protobuf-compiler curl wget file cmake clang libclang-dev
         version: '1.0'
 
     # rust-toolchain.toml pins 1.94.1 + clippy + rustfmt; `rustup show`

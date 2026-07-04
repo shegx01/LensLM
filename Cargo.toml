@@ -43,6 +43,11 @@ rstest = "0.26"
 insta = { version = "1", features = ["json"] }
 tempfile = "3"
 
+# issue #42: local Whisper ASR via whisper.cpp (whisper-rs). Pinned; the -sys
+# crate builds whisper.cpp with cmake + a C/C++ compiler, so CI needs cmake/clang
+# (added to .github/actions/rust-env). CPU by default; Metal is an opt-in feature.
+whisper-rs = { version = "=0.16.0", default-features = false }
+
 # Shared lint policy across the workspace.
 [workspace.lints.clippy]
 all = "warn"

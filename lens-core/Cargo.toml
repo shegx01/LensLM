@@ -54,6 +54,11 @@ native-ml-metal = [
 # `native-ml-metal` (different platforms).
 native-ml-cuda = []
 
+# issue #42: local Whisper ASR backend (whisper.cpp via whisper-rs). Default-ON
+# so the Linux `rust-clippy --all-targets` compile canary proves the C++/cmake
+# build stays green cross-platform. Metal stays OFF pending the Unit-0 spike.
+local-whisper = ["dep:whisper-rs"]
+
 [dependencies]
 serde = { workspace = true }
 thiserror = { workspace = true }
@@ -100,6 +105,10 @@ symphonia = { version = "=0.5.5", features = ["all"] }
 # so windowed output equals whole-buffer output (issue #41 D2/D8).
 # MIT — in deny.toml allowlist.
 rubato = "=0.16.2"
+
+# issue #42: local Whisper ASR (whisper.cpp). Optional — pulled in only by the
+# `local-whisper` feature. Not target-gated: it builds cross-platform (CPU).
+whisper-rs = { workspace = true, optional = true }
 
 # --- M4 Phase 3 (Stage 2): unified LLM client behind the `LlmProvider` trait ---
 # `genai` is the multi-provider LLM client (Anthropic/OpenAI/Gemini/Ollama/GLM/
