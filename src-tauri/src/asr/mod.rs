@@ -332,29 +332,74 @@ mod tests {
         let _default = AppleSpeechEngine;
     }
 
+    /// Canonical public-domain JFK sample shipped with whisper.cpp (16 kHz mono WAV);
+    /// same fixture the lens-core gated whisper test uses.
+    const JFK_SAMPLE_URL: &str =
+        "https://raw.githubusercontent.com/ggerganov/whisper.cpp/master/samples/jfk.wav";
+
     // Gated on-device smoke test (Unit 6 gate): drives the real SpeechAnalyzer
-    // bridge end-to-end. Requires a macOS-26 aarch64 host with an installed model.
+    // bridge end-to-end on a spoken sample. Requires a macOS-26 aarch64 host.
     // Run: `LENS_RUN_MODEL_TESTS=1 cargo test -p lenslm --features apple-native-asr
-    //       -- --ignored apple_speech`
+    //       -- --ignored apple_speech --nocapture`
+    //
+    // MUST NOT SIGTRAP. Two outcomes are acceptable, per the "no platform without
+    // transcription" principle: either it transcribes (non-empty, time-ordered
+    // segments), OR — when the OS cannot install the on-device asset here — it
+    // returns a CLEAN typed error (asserted below, never a panic-on-unwrap).
     #[tokio::test]
-    #[ignore = "requires macOS 26 + LENS_RUN_MODEL_TESTS + an on-device speech model"]
-    async fn apple_speech_transcribes_fixture() {
+    #[ignore = "requires macOS 26 + LENS_RUN_MODEL_TESTS; fetches the jfk.wav sample"]
+    async fn apple_speech_transcribes_jfk_sample() {
         if std::env::var("LENS_RUN_MODEL_TESTS").is_err() {
+            eprintln!("skipping apple_speech_transcribes_jfk_sample (set LENS_RUN_MODEL_TESTS=1)");
             return;
         }
-        // 1 s of silence at 16 kHz. A real fixture would carry speech; silence
-        // exercises the full pipeline without asserting specific transcript text.
-        let pcm = vec![0.0_f32; 16_000];
-        let engine = AppleSpeechEngine::new();
-        let out = engine
-            .transcribe_pcm(&pcm, &TranscribeConfig::default(), None)
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sample_path = dir.path().join("jfk.wav");
+        let bytes = reqwest::get(JFK_SAMPLE_URL)
             .await
-            .expect("apple transcription");
-        for seg in &out {
-            assert!(
-                seg.start_second <= seg.end_second,
-                "segment timestamps must be ordered"
-            );
+            .expect("fetch jfk sample")
+            .error_for_status()
+            .expect("jfk sample http status")
+            .bytes()
+            .await
+            .expect("read jfk sample bytes");
+        std::fs::write(&sample_path, &bytes).expect("write jfk sample");
+
+        let pcm =
+            lens_core::decode_and_resample_audio(&sample_path).expect("decode+resample jfk sample");
+        assert!(!pcm.is_empty(), "decoded PCM must be non-empty");
+
+        let engine = AppleSpeechEngine::new();
+        let config = TranscribeConfig {
+            language: Some(Lang::En),
+            translate: false,
+        };
+        match engine.transcribe_pcm(&pcm, &config, None).await {
+            Ok(segments) => {
+                eprintln!("apple transcription produced {} segment(s)", segments.len());
+                assert!(!segments.is_empty(), "expected non-empty segments");
+                for seg in &segments {
+                    eprintln!(
+                        "  [{:.2}..{:.2}] {:?}",
+                        seg.start_second, seg.end_second, seg.text
+                    );
+                    assert!(
+                        seg.start_second <= seg.end_second,
+                        "segment timestamps must be ordered: {seg:?}"
+                    );
+                    assert!(
+                        !seg.text.trim().is_empty(),
+                        "segment text must be non-empty"
+                    );
+                }
+            }
+            // A clean typed error (e.g. the OS will not install the asset here) is an
+            // accepted outcome — the point of the fix is that this NEVER SIGTRAPs.
+            Err(LensError::Transcription(msg)) => {
+                eprintln!("apple transcription returned a clean typed error (no crash): {msg}");
+            }
+            Err(other) => panic!("unexpected non-Transcription error: {other:?}"),
         }
     }
 }

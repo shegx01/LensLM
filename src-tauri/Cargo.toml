@@ -84,3 +84,6 @@ tempfile = { workspace = true }
 # non-dev dependency now, used by the render-window labels).
 sqlx = { workspace = true }
 chrono = { workspace = true }
+# Apple-ASR smoke test fetches the public-domain jfk.wav sample (mirrors
+# lens-core's gated whisper test); rustls only, no OpenSSL. Same pin as lens-core.
+reqwest = { version = "=0.13.4", default-features = false, features = ["rustls"] }

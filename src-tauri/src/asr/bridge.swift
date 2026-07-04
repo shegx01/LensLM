@@ -61,11 +61,15 @@ private struct Segment {
     let end: Double
 }
 
-private enum BridgeError: Error, CustomStringConvertible {
+// `LocalizedError` so our rich `description` survives when marshalled via
+// `error.localizedDescription` at the `@_cdecl` boundary (a plain `Error` would
+// otherwise stringify to an opaque "BridgeError error N").
+private enum BridgeError: Error, CustomStringConvertible, LocalizedError {
     case unsupportedOS
     case bufferAllocationFailed
     case noSupportedLocale
     case assetInstallFailed(String)
+    case assetUnavailable(String)
     case analysisFailed(String)
 
     var description: String {
@@ -74,9 +78,25 @@ private enum BridgeError: Error, CustomStringConvertible {
         case .bufferAllocationFailed: return "failed to build AVAudioPCMBuffer from PCM"
         case .noSupportedLocale: return "no supported speech locale is available"
         case .assetInstallFailed(let m): return "speech asset install failed: \(m)"
+        case .assetUnavailable(let x):
+            return "on-device speech model for locale \(x) is not installed"
         case .analysisFailed(let m): return "speech analysis failed: \(m)"
         }
     }
+
+    var errorDescription: String? { description }
+}
+
+// MARK: - Locale / asset gating (macOS 26)
+
+/// Returns whether `locale` is present in `list`, matched on BCP-47 identifier so
+/// region variants ("en_US") compare correctly. Generic over the sequence element
+/// type since the macOS-26 `supportedLocales`/`installedLocales` collection type is
+/// version-sensitive (Set vs Array); this compiles against either.
+private func containsLocale<S: Sequence>(_ list: S, _ locale: Locale) -> Bool
+where S.Element == Locale {
+    let target = locale.identifier(.bcp47)
+    return list.contains { $0.identifier(.bcp47) == target }
 }
 
 // MARK: - Audio
@@ -107,11 +127,12 @@ private func makeBuffer(pcm: UnsafePointer<Float>, count: Int, sampleRate: Doubl
 
 /// Runs SpeechAnalyzer/SpeechTranscriber to completion and returns timed segments.
 ///
-/// NOTE — BEST-EFFORT CALL SITE pending the Unit 8 macOS-26 smoke test. The exact
-/// SpeechAnalyzer/SpeechTranscriber surface is macOS-26-new; this function is the
-/// ONLY place that touches it, is fully `do/catch`-guarded, and returns typed
-/// errors, so any post-smoke-test symbol tweak is localized here. Verified against
-/// developer.apple.com/documentation/speech/{speechanalyzer,speechtranscriber}.
+/// The ONLY site that touches the macOS-26 SpeechAnalyzer surface; fully
+/// `do/catch`-guarded and returns typed errors. It gates strictly on
+/// `installedLocales` before starting the analyzer — a locale whose asset is not
+/// installed traps inside Speech.framework, so an unready asset returns a typed
+/// `.assetUnavailable` instead. Verified against
+/// developer.apple.com/documentation/speech/{speechtranscriber,assetinventory}.
 @available(macOS 26.0, *)
 private func transcribe(
     buffer: AVAudioPCMBuffer,
@@ -120,20 +141,31 @@ private func transcribe(
     // translation is routed to Whisper in lib.rs. Kept for signature stability.
     translate: Bool
 ) async throws -> [Segment] {
-    // Resolve the locale: explicit code, else the first supported locale (auto).
-    let supported = await SpeechTranscriber.supportedLocales
+    // `supportedLocales` may be downloadable-but-not-present; `installedLocales`
+    // is what actually has an on-device asset. Reaching the analyzer with a locale
+    // whose asset is NOT installed makes Speech.framework TRAP (an uncatchable
+    // precondition in preRunRecognition), so gate strictly on `installedLocales`.
+    // Materialize as arrays: the underlying collection type (Set vs Array) is
+    // macOS-version-sensitive, and `.first` needs an ordered collection for auto.
+    let supported = Array(await SpeechTranscriber.supportedLocales)
+    let installed = Array(await SpeechTranscriber.installedLocales)
+
+    // Resolve the target locale: an explicit code wins; auto prefers a locale
+    // whose asset is ALREADY installed (avoids a needless download), falling back
+    // to a supported one only to attempt an install.
     let locale: Locale
     if let code = langCode, !code.isEmpty {
         locale = Locale(identifier: code)
-    } else if let first = supported.first {
-        locale = first
+    } else if let firstInstalled = installed.first {
+        locale = firstInstalled
+    } else if let firstSupported = supported.first {
+        locale = firstSupported
     } else {
         throw BridgeError.noSupportedLocale
     }
 
-    // `.offlineTranscription` keeps this fully on-device; `attributeOptions`
-    // includes `.audioTimeRange` so each result run carries a CMTimeRange we can
-    // turn into segment start/end seconds.
+    // `attributeOptions` includes `.audioTimeRange` so each result run carries a
+    // CMTimeRange we can turn into segment start/end seconds.
     let transcriber = SpeechTranscriber(
         locale: locale,
         transcriptionOptions: [],
@@ -141,14 +173,27 @@ private func transcribe(
         attributeOptions: [.audioTimeRange]
     )
 
-    // Ensure the on-device model asset for this locale is installed (no-op when
-    // already present). A missing/failed asset is a typed error, not a trap.
-    do {
-        if let request = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
-            try await request.downloadAndInstall()
+    // Install the on-device asset only when this locale isn't already present;
+    // await the request to completion. A failed install is a typed error, never a
+    // trap. (`reserve` is intentionally NOT called: it caps how many locales stay
+    // resident, not whether analysis may run — the gate below is what matters.)
+    if !containsLocale(installed, locale) {
+        do {
+            if let request = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
+                try await request.downloadAndInstall()
+            }
+        } catch {
+            throw BridgeError.assetInstallFailed(error.localizedDescription)
         }
-    } catch {
-        throw BridgeError.assetInstallFailed(error.localizedDescription)
+    }
+
+    // RE-VERIFY after the install attempt: if the asset is STILL not installed,
+    // return a typed error rather than starting the analyzer. Feeding audio with
+    // an unready asset is precisely what reaches preRunRecognition and traps —
+    // a clean error lets Rust fall back to Whisper (clause c).
+    let installedAfter = await SpeechTranscriber.installedLocales
+    guard containsLocale(installedAfter, locale) else {
+        throw BridgeError.assetUnavailable(locale.identifier(.bcp47))
     }
 
     let analyzer = SpeechAnalyzer(modules: [transcriber])
