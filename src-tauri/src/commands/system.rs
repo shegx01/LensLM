@@ -2,6 +2,7 @@
 
 use lens_core::{
     CheckResult, DownloadProgress, InstallProgress, LensEngine, LensError, LlmDetection, TtsVoice,
+    WHISPER_REGISTRY,
 };
 use serde::Serialize;
 use tauri::Manager;
@@ -141,6 +142,111 @@ pub async fn kokoro_downloaded(app: tauri::AppHandle) -> Result<bool, LensError>
         .app_data_dir()
         .map_err(|e| LensError::Io(e.to_string()))?;
     Ok(data_dir.join(lens_core::KOKORO_MODEL_RELPATH).is_file())
+}
+
+/// UI representation of a Whisper model entry from the registry.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WhisperModelInfo {
+    /// Short id (`"tiny"` | `"base"` | `"small"`).
+    pub id: String,
+    /// Approximate size in MiB for the onboarding size label.
+    pub approx_mb: u32,
+    /// Whether this is the default recommended model.
+    pub is_default: bool,
+}
+
+/// Returns the Whisper model registry (tiny / base / small) with size labels,
+/// matching the onboarding UI convention of `list_tts_voices`.
+#[tracing::instrument(skip_all)]
+#[tauri::command]
+pub async fn list_whisper_models() -> Result<Vec<WhisperModelInfo>, LensError> {
+    Ok(WHISPER_REGISTRY
+        .iter()
+        .map(|spec| WhisperModelInfo {
+            id: spec.id.to_string(),
+            approx_mb: spec.approx_mb,
+            is_default: spec.id == lens_core::DEFAULT_WHISPER_MODEL_ID,
+        })
+        .collect())
+}
+
+/// Downloads the requested Whisper ggml model to `{app_data_dir}/models/whisper/`.
+/// Idempotent: a complete file on disk emits a single `done` event without re-downloading.
+/// Mirrors `download_tts_engine` exactly: same channel type, same progress reporting.
+#[tracing::instrument(skip_all, fields(model = %model))]
+#[tauri::command(rename_all = "snake_case")]
+pub async fn download_whisper_model(
+    model: String,
+    on_progress: Channel<DownloadProgress>,
+    app: tauri::AppHandle,
+) -> Result<(), LensError> {
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| LensError::Io(e.to_string()))?;
+    lens_core::download_whisper_model(&data_dir, &model, |progress| {
+        if let Err(e) = on_progress.send(progress) {
+            tracing::warn!("download_whisper_model: progress channel send failed: {e}");
+        }
+    })
+    .await
+    .map(|_| ())
+}
+
+/// Returns whether the given Whisper model is already on disk, so the
+/// onboarding UI can skip the download step. Mirrors `kokoro_downloaded`.
+#[tracing::instrument(skip_all, fields(model = %model))]
+#[tauri::command(rename_all = "snake_case")]
+pub async fn whisper_model_downloaded(
+    model: String,
+    app: tauri::AppHandle,
+) -> Result<bool, LensError> {
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| LensError::Io(e.to_string()))?;
+    Ok(lens_core::whisper_model_downloaded(&data_dir, &model))
+}
+
+/// Returns `true` when Apple-native ASR is available on this device:
+/// compiled with the `apple-native-asr` feature AND running on macOS >= 26.
+/// Used by the onboarding UI to skip the Whisper download step — this is a
+/// UI signal only, NOT a router input (backend selection is `select_asr_backend`).
+#[tracing::instrument(skip_all)]
+#[tauri::command]
+pub async fn asr_apple_native_available() -> Result<bool, LensError> {
+    // Compile-time gate: the feature must be present and the target must be
+    // aarch64-apple-darwin; this is false on every other platform/feature.
+    if !cfg!(all(
+        target_os = "macos",
+        target_arch = "aarch64",
+        feature = "apple-native-asr"
+    )) {
+        return Ok(false);
+    }
+    // Runtime gate: macOS >= 26 is required for SpeechAnalyzer/SpeechTranscriber.
+    Ok(macos_major_version()? >= lens_core::MIN_MACOS_FOR_APPLE_ASR)
+}
+
+/// Parses the macOS major version from `sw_vers -productVersion`.
+/// Returns `LensError::Internal` on parse failure (never panics).
+/// `pub` so the `main.rs` `.setup` block can use the same runtime gate.
+pub fn macos_major_version() -> Result<u32, LensError> {
+    let out = std::process::Command::new("sw_vers")
+        .arg("-productVersion")
+        .output()
+        .map_err(|e| LensError::Internal(format!("sw_vers failed: {e}")))?;
+    let version = String::from_utf8_lossy(&out.stdout);
+    version
+        .trim()
+        .split('.')
+        .next()
+        .and_then(|major| major.parse::<u32>().ok())
+        .ok_or_else(|| {
+            LensError::Internal(format!(
+                "could not parse macOS major version from: {version:?}"
+            ))
+        })
 }
 
 /// Returns registry model ids whose fastembed weights are cached under

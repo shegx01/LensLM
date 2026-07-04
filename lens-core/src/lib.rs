@@ -36,8 +36,9 @@ pub use asr::MockAsrEngine;
 pub use asr::WhisperEngine;
 pub use asr::{
     AsrBackend, AsrEngine, DEFAULT_WHISPER_MODEL_ID, Lang, MIN_MACOS_FOR_APPLE_ASR, Platform,
-    TranscribeConfig, TranscriptSegment, WhisperModelSpec, download_whisper_model, resolve_whisper,
-    select_asr_backend, whisper_model_downloaded, whisper_model_path,
+    TranscribeConfig, TranscriptSegment, WHISPER_REGISTRY, WhisperModelSpec,
+    download_whisper_model, resolve_whisper, select_asr_backend, whisper_model_downloaded,
+    whisper_model_path,
 };
 pub use config::{AppConfig, EnrichmentConfig, TaskModel};
 pub use embedder::{
@@ -805,25 +806,34 @@ impl LensEngine {
         // TODO(#42 Unit 6): replace with the real Apple locale-support predicate.
         let apple_supports_locale = true;
 
-        let backend = asr::select_asr_backend(
+        let mut backend = asr::select_asr_backend(
             config_backend,
             platform,
             apple_available,
             apple_supports_locale,
         );
 
+        // SpeechTranscriber has no translate task (translation is Whisper-only).
+        // If the caller requests translation and the router picked Apple, fall back
+        // to LocalWhisper so the translate request can be fulfilled.
+        if config.translate && backend == asr::AsrBackend::AppleNative {
+            backend = asr::AsrBackend::LocalWhisper;
+        }
+
         // The injected engine is the only externally-supplied seam (Apple in prod,
         // a mock in tests); delegate to it whenever it is present. Otherwise build
         // and cache the internal LocalWhisper engine for the configured model.
         match (backend, injected) {
-            (_, Some(engine)) => engine.transcribe_pcm(pcm, config, progress_tx).await,
-            (asr::AsrBackend::AppleNative, None) => Err(LensError::Transcription(
-                "apple-native backend selected but no engine is injected".into(),
-            )),
-            (asr::AsrBackend::LocalWhisper, None) => {
+            (asr::AsrBackend::AppleNative, Some(engine)) => {
+                engine.transcribe_pcm(pcm, config, progress_tx).await
+            }
+            (asr::AsrBackend::LocalWhisper, Some(_)) | (asr::AsrBackend::LocalWhisper, None) => {
                 self.transcribe_local_whisper(pcm, config, progress_tx, &asr_cfg)
                     .await
             }
+            (asr::AsrBackend::AppleNative, None) => Err(LensError::Transcription(
+                "apple-native backend selected but no engine is injected".into(),
+            )),
         }
     }
 
@@ -1461,5 +1471,51 @@ fn remove_file_best_effort(path: &Path) {
             path = %path.display(),
             "failed to remove managed source file: {e}"
         ),
+    }
+}
+
+#[cfg(test)]
+mod transcribe_tests {
+    use super::*;
+
+    /// When translate=true the Apple engine cannot fulfil the request. The router
+    /// normally picks Apple (engine injected + capable platform assumed), but the
+    /// translate guard must redirect to LocalWhisper, which surfaces as a typed
+    /// Transcription error (model not downloaded) rather than an Apple dispatch.
+    #[tokio::test]
+    async fn translate_forces_whisper_over_apple() {
+        let engine = LensEngine::for_test().await;
+
+        // Inject a mock Apple engine so the router would otherwise pick AppleNative.
+        let canned = vec![asr::TranscriptSegment {
+            text: "apple".to_string(),
+            start_second: 0.0,
+            end_second: 1.0,
+        }];
+        engine
+            .set_asr_engine(Some(Arc::new(asr::MockAsrEngine::new(canned))))
+            .await;
+
+        // Request translation. The guard must redirect to LocalWhisper.
+        let config = TranscribeConfig {
+            language: None,
+            translate: true,
+        };
+        let pcm = vec![0.0_f32; 16];
+        let result = engine.transcribe(&pcm, &config, None).await;
+
+        // LocalWhisper is routed but the model is not downloaded, so we get a
+        // typed Transcription error — confirming the Apple mock was NOT called.
+        match result {
+            Err(LensError::Transcription(msg)) => {
+                assert!(
+                    msg.contains("local whisper")
+                        || msg.contains("not downloaded")
+                        || msg.contains("local-whisper"),
+                    "expected a LocalWhisper error, got: {msg}"
+                );
+            }
+            other => panic!("expected Transcription error from LocalWhisper path, got: {other:?}"),
+        }
     }
 }

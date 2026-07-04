@@ -121,8 +121,8 @@ fn swift_static_lib_dir() -> Option<String> {
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())?;
-    let candidate = PathBuf::from(dev_dir)
-        .join("Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/macosx");
+    let candidate =
+        PathBuf::from(dev_dir).join("Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/macosx");
     candidate
         .is_dir()
         .then(|| candidate.to_string_lossy().into_owned())

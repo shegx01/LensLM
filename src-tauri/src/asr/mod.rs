@@ -63,6 +63,8 @@ unsafe extern "C" {
     fn lens_asr_free_error(error: *mut CError);
 
     /// Non-zero if the Apple transcriber supports `lang_code`. Never traps.
+    /// Called by `apple_supports_locale`; wired into transcribe locale gate in #43.
+    #[allow(dead_code)]
     fn lens_asr_supports_locale(lang_code: *const c_char) -> i32;
 }
 
@@ -149,13 +151,13 @@ fn run_bridge(
 ) -> Result<Vec<TranscriptSegment>, LensError> {
     // Borrowed, NUL-terminated lang code (clause a: Rust owns it; Swift borrows).
     // A NUL-containing code is invalid BCP-47 → typed error rather than a panic.
-    let lang_c = match lang_code {
-        Some(code) => Some(
-            CString::new(code)
-                .map_err(|_| LensError::Transcription("language code contains a NUL byte".into()))?,
-        ),
-        None => None,
-    };
+    let lang_c =
+        match lang_code {
+            Some(code) => Some(CString::new(code).map_err(|_| {
+                LensError::Transcription("language code contains a NUL byte".into())
+            })?),
+            None => None,
+        };
     let lang_ptr = lang_c
         .as_ref()
         .map(|c| c.as_ptr())
@@ -257,16 +259,20 @@ impl AsrEngine for AppleSpeechEngine {
         // async work on a semaphore), so the whole FFI call must run OFF the async
         // runtime — mirror the WhisperEngine's `spawn_blocking` shape.
         let pcm = pcm.to_vec();
-        let lang_code = config.language.as_ref().map(|l| lang_to_bcp47(l).to_string());
+        let lang_code = config
+            .language
+            .as_ref()
+            .map(|l| lang_to_bcp47(l).to_string());
         let translate = config.translate;
 
         // The bridge reports no incremental progress; emit a terminal 1.0 (the
         // trait's `0.0..=1.0` convention) so a listening onboarding bar completes.
-        let out = tokio::task::spawn_blocking(move || {
-            run_bridge(&pcm, lang_code.as_deref(), translate)
-        })
-        .await
-        .map_err(|e| LensError::Transcription(format!("apple transcription task failed: {e}")))??;
+        let out =
+            tokio::task::spawn_blocking(move || run_bridge(&pcm, lang_code.as_deref(), translate))
+                .await
+                .map_err(|e| {
+                    LensError::Transcription(format!("apple transcription task failed: {e}"))
+                })??;
 
         if let Some(tx) = progress_tx {
             let _ = tx.send(1.0);
@@ -279,6 +285,8 @@ impl AsrEngine for AppleSpeechEngine {
 /// router's `apple_supports_locale` gate. Delegates to the Swift bridge, which
 /// queries `SpeechTranscriber.supportedLocales`; a NUL-containing code or any
 /// bridge error is treated as unsupported (returns `false`, never panics).
+/// Wired into the per-call locale gate in #43.
+#[allow(dead_code)]
 pub fn apple_supports_locale(lang: &Lang) -> bool {
     let code = lang_to_bcp47(lang);
     let Ok(c_code) = CString::new(code) else {
