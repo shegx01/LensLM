@@ -11,6 +11,7 @@ pub mod asr;
 pub mod chunk;
 pub mod config;
 pub(crate) mod db;
+pub(crate) mod download;
 pub mod embedder;
 pub mod embedding;
 pub mod enrichment;
@@ -32,8 +33,9 @@ pub mod vector_store;
 #[cfg(feature = "test-util")]
 pub use asr::MockAsrEngine;
 pub use asr::{
-    AsrBackend, AsrEngine, Lang, MIN_MACOS_FOR_APPLE_ASR, Platform, TranscribeConfig,
-    TranscriptSegment, select_asr_backend,
+    AsrBackend, AsrEngine, DEFAULT_WHISPER_MODEL_ID, Lang, MIN_MACOS_FOR_APPLE_ASR, Platform,
+    TranscribeConfig, TranscriptSegment, WhisperModelSpec, download_whisper_model, resolve_whisper,
+    select_asr_backend, whisper_model_downloaded, whisper_model_path,
 };
 pub use config::{AppConfig, EnrichmentConfig, TaskModel};
 pub use embedder::{
