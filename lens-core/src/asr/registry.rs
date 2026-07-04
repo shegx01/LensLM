@@ -64,9 +64,15 @@ pub fn whisper_model_path(data_dir: &Path, model_id: &str) -> PathBuf {
         .join(format!("ggml-{model_id}.bin"))
 }
 
-/// Returns `true` when `{data_dir}/models/whisper/ggml-{model_id}.bin` exists on disk.
+/// Returns `true` when the resolved model's file exists on disk. The id is validated
+/// through the registry allowlist first (unknown/`..`-containing ids resolve to `None`
+/// → `false`), so the probed path is always built from an allowlisted `spec.id` and
+/// can never escape `models/whisper/`.
 pub fn whisper_model_downloaded(data_dir: &Path, model_id: &str) -> bool {
-    whisper_model_path(data_dir, model_id).is_file()
+    match resolve_whisper(model_id) {
+        Some(spec) => whisper_model_path(data_dir, spec.id).is_file(),
+        None => false,
+    }
 }
 
 /// Downloads the requested Whisper model with streaming progress and SHA256 verification.
@@ -175,6 +181,23 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"fake").unwrap();
         assert!(whisper_model_downloaded(dir.path(), "base"));
+    }
+
+    #[test]
+    fn whisper_model_path_rejects_traversal_id() {
+        let dir = tempfile::tempdir().unwrap();
+        // A crafted id must never resolve, so `whisper_model_downloaded` can never
+        // probe (nor a caller build a path) outside `models/whisper/`.
+        for bad in ["../../etc/passwd", "..", "base/../../secret", ""] {
+            assert!(
+                resolve_whisper(bad).is_none(),
+                "traversal id {bad:?} must not resolve to a spec"
+            );
+            assert!(
+                !whisper_model_downloaded(dir.path(), bad),
+                "traversal id {bad:?} must report not-downloaded (no path escape)"
+            );
+        }
     }
 
     // ── download tests (wiremock — offline) ──────────────────────────────────

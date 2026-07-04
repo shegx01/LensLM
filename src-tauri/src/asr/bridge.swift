@@ -85,16 +85,19 @@ private enum BridgeError: Error, CustomStringConvertible {
 /// Returns nil (never traps) if the format/buffer cannot be constructed. Samples
 /// are COPIED in, so the borrowed `pcm` is not retained past this call.
 private func makeBuffer(pcm: UnsafePointer<Float>, count: Int, sampleRate: Double) -> AVAudioPCMBuffer? {
-    guard count > 0,
-          let format = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+    // Bound `count` before narrowing to UInt32: `AVAudioFrameCount(count)` traps for
+    // count > UInt32.max, and copying `count` against a truncated capacity would OOB.
+    guard count > 0, count <= Int(AVAudioFrameCount.max) else { return nil }
+    let frames = AVAudioFrameCount(count)
+    guard let format = AVAudioFormat(commonFormat: .pcmFormatFloat32,
                                      sampleRate: sampleRate,
                                      channels: 1,
                                      interleaved: false),
-          let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(count))
+          let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames)
     else {
         return nil
     }
-    buffer.frameLength = AVAudioFrameCount(count)
+    buffer.frameLength = frames
     guard let dst = buffer.floatChannelData?[0] else { return nil }
     dst.update(from: pcm, count: count)
     return buffer
@@ -113,6 +116,8 @@ private func makeBuffer(pcm: UnsafePointer<Float>, count: Int, sampleRate: Doubl
 private func transcribe(
     buffer: AVAudioPCMBuffer,
     langCode: String?,
+    // `translate` is a reserved ABI slot: SpeechTranscriber has no translate task;
+    // translation is routed to Whisper in lib.rs. Kept for signature stability.
     translate: Bool
 ) async throws -> [Segment] {
     // Resolve the locale: explicit code, else the first supported locale (auto).
@@ -205,6 +210,7 @@ private func transcribe(
 private func transcribeBlocking(
     buffer: AVAudioPCMBuffer,
     langCode: String?,
+    // Reserved ABI slot — see `transcribe`; translation is Whisper-only in lib.rs.
     translate: Bool
 ) -> Result<[Segment], Error> {
     let semaphore = DispatchSemaphore(value: 0)
@@ -233,6 +239,8 @@ func lens_asr_transcribe(
     _ pcm_len: Int,
     _ sample_rate: Int32,
     _ lang_code: UnsafePointer<CChar>?,
+    // Reserved ABI slot — SpeechTranscriber has no translate task; translation is
+    // routed to Whisper in lib.rs. Kept in the C ABI for signature stability.
     _ translate: Int32,
     _ out_error: UnsafeMutablePointer<UnsafeMutablePointer<LensAsrError>?>?
 ) -> UnsafeMutablePointer<LensAsrResult>? {

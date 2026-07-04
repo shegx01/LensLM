@@ -803,7 +803,7 @@ impl LensEngine {
             is_apple_silicon_macos: apple_available,
             macos_major: apple_available.then_some(asr::MIN_MACOS_FOR_APPLE_ASR),
         };
-        // TODO(#42 Unit 6): replace with the real Apple locale-support predicate.
+        // TODO(#43): replace with the real Apple locale-support predicate.
         let apple_supports_locale = true;
 
         let mut backend = asr::select_asr_backend(
@@ -820,9 +820,9 @@ impl LensEngine {
             backend = asr::AsrBackend::LocalWhisper;
         }
 
-        // The injected engine is the only externally-supplied seam (Apple in prod,
-        // a mock in tests); delegate to it whenever it is present. Otherwise build
-        // and cache the internal LocalWhisper engine for the configured model.
+        // The injected engine is the Apple-native seam (Apple in prod, a mock in
+        // tests); it is used ONLY when the router selects AppleNative. LocalWhisper
+        // always uses the internal WhisperEngine, never the injected engine.
         match (backend, injected) {
             (asr::AsrBackend::AppleNative, Some(engine)) => {
                 engine.transcribe_pcm(pcm, config, progress_tx).await
@@ -876,14 +876,20 @@ impl LensEngine {
         &self,
         asr_cfg: &config::AsrConfig,
     ) -> Result<Arc<asr::WhisperEngine>, LensError> {
-        let model_id = if asr_cfg.whisper_model.is_empty() {
-            DEFAULT_WHISPER_MODEL_ID.to_string()
-        } else {
-            asr_cfg.whisper_model.clone()
-        };
+        // Validate the config-supplied id through the registry allowlist BEFORE it
+        // touches the filesystem: build the path from the resolved `spec.id` (a
+        // &'static allowlisted token), never the raw config string, so a crafted id
+        // (e.g. `../..`) cannot escape `models/whisper/`. Unknown/empty → default.
+        let spec = asr::resolve_whisper(&asr_cfg.whisper_model)
+            .or_else(|| asr::resolve_whisper(DEFAULT_WHISPER_MODEL_ID))
+            .ok_or_else(|| LensError::Validation("no resolvable whisper model id".to_string()))?;
+        let model_id = spec.id.to_string();
         let data_dir = self.data_dir().await;
-        let model_path = asr::whisper_model_path(&data_dir, &model_id);
+        let model_path = asr::whisper_model_path(&data_dir, spec.id);
 
+        // Intentionally hold this `tokio::sync::Mutex` across the spawn_blocking load
+        // so init runs exactly once per model id (mirrors the embedder cache). An
+        // async Mutex is safe to hold across `.await` — no clippy await_holding_lock.
         let mut cache = self.whisper_engines.lock().await;
         if let Some(existing) = cache.get(&model_id) {
             return Ok(Arc::clone(existing));

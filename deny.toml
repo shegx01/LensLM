@@ -46,6 +46,8 @@ allow = [
   "CC0-1.0",
   "BSL-1.0",
   "CDLA-Permissive-2.0",
+  # Unlicense — pulled by whisper-rs + whisper-rs-sys (#42); OSI/public-domain-equivalent.
+  "Unlicense",
   # NCSA (Univ. of Illinois/NCSA Open Source License) — OSI-approved, FSF
   # Free/Libre, BSD/MIT-family permissive. Pulled transitively via
   # `libfuzzer-sys` (a fuzzing harness, `(MIT OR Apache-2.0) AND NCSA`) in the

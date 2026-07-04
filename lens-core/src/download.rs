@@ -30,6 +30,10 @@ fn content_length_header(headers: &reqwest::header::HeaderMap) -> Option<u64> {
 /// arrive → verify digest (mismatch deletes `.part`, returns `Err`) → atomic rename
 /// to `dest` → emit final `done` progress event. `expected_sha256 = None` skips
 /// verification (use only in tests).
+///
+/// Integrity (SHA256) is enforced only on FRESH downloads; the size-match skip path
+/// does NOT re-hash a pre-existing file (matches prior Kokoro behavior — atomic rename
+/// means a landed file was previously verified before it took the final name).
 pub(crate) async fn download_verified<F>(
     url: &str,
     dest: &Path,
