@@ -7,6 +7,7 @@
 //! No Tauri, windowing, or UI dependencies. [`LensEngine`] is a thin handle
 //! that delegates to per-domain repositories over the shared connection pool.
 
+pub mod asr;
 pub mod chunk;
 pub mod config;
 pub(crate) mod db;
@@ -28,6 +29,9 @@ pub mod tts;
 pub mod url_normalize;
 pub mod vector_store;
 
+pub use asr::{AsrBackend, AsrEngine, Lang, TranscribeConfig, TranscriptSegment};
+#[cfg(feature = "test-util")]
+pub use asr::MockAsrEngine;
 pub use config::{AppConfig, EnrichmentConfig, TaskModel};
 pub use embedder::{
     CountingEmbedder, DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, Embedder, EmbeddingBackend,
