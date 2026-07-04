@@ -7,12 +7,16 @@
 
 pub mod registry;
 mod router;
+#[cfg(feature = "local-whisper")]
+pub mod whisper;
 
 pub use registry::{
     DEFAULT_WHISPER_MODEL_ID, WHISPER_REGISTRY, WhisperModelSpec, download_whisper_model,
     resolve_whisper, whisper_model_downloaded, whisper_model_path,
 };
 pub use router::{MIN_MACOS_FOR_APPLE_ASR, Platform, select_asr_backend};
+#[cfg(feature = "local-whisper")]
+pub use whisper::WhisperEngine;
 
 use serde::{Deserialize, Serialize};
 

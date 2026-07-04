@@ -24,6 +24,12 @@ name = "eval"
 path = "src/bin/eval.rs"
 
 [features]
+# `local-whisper` is DEFAULT-ON: whisper is the cross-platform ASR baseline and
+# every CI `clippy --all-targets` compile must prove the whisper.cpp C++/cmake
+# build stays green. Downstream consumers without a C++ toolchain can opt out via
+# `default-features = false`.
+default = ["local-whisper"]
+
 # Exposes test-only seams on the public API (e.g. `LensEngine::set_embedder_for_test`,
 # which pre-fills the embedder `OnceCell` with a caller-supplied `Arc<dyn Embedder>`
 # so integration tests can inject a `CountingEmbedder` and avoid the ~130 MB model
@@ -56,7 +62,8 @@ native-ml-cuda = []
 
 # issue #42: local Whisper ASR backend (whisper.cpp via whisper-rs). Default-ON
 # so the Linux `rust-clippy --all-targets` compile canary proves the C++/cmake
-# build stays green cross-platform. Metal stays OFF pending the Unit-0 spike.
+# build stays green cross-platform. Metal is enabled only on aarch64-apple-darwin
+# via the target table below (CPU + Accelerate everywhere else).
 local-whisper = ["dep:whisper-rs"]
 
 [dependencies]
@@ -247,6 +254,11 @@ candle-transformers = { version = "=0.11.0", features = ["metal"], optional = tr
 # resolved in the lock tree (transitive via fastembed), so this pulls NO new copy —
 # it just promotes it to a direct, feature-gated dependency for the download path.
 hf-hub = { version = "=0.5.0", optional = true }
+# issue #42: enable whisper.cpp's Metal (Apple GPU) backend on the shipping macOS
+# target only. Elsewhere the base `whisper-rs` dep (CPU + Accelerate) stays the
+# default. `optional` mirrors the base declaration so it is still pulled in only
+# by `local-whisper`; the target table just unions the `metal` feature here.
+whisper-rs = { workspace = true, optional = true, features = ["metal"] }
 
 [dev-dependencies]
 # Self-edge: enables the `test-util` feature for this crate's own test/bench

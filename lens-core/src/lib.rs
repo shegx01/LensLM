@@ -32,6 +32,8 @@ pub mod vector_store;
 
 #[cfg(feature = "test-util")]
 pub use asr::MockAsrEngine;
+#[cfg(feature = "local-whisper")]
+pub use asr::WhisperEngine;
 pub use asr::{
     AsrBackend, AsrEngine, DEFAULT_WHISPER_MODEL_ID, Lang, MIN_MACOS_FOR_APPLE_ASR, Platform,
     TranscribeConfig, TranscriptSegment, WhisperModelSpec, download_whisper_model, resolve_whisper,
@@ -234,6 +236,11 @@ pub struct LensEngine {
     /// `apple_available` signal: src-tauri pre-gates platform/version before
     /// injecting, so the router treats mere presence as authoritative.
     asr_engine: Arc<RwLock<Option<Arc<dyn asr::AsrEngine>>>>,
+    /// Lazily-built internal LocalWhisper engines, keyed by model id (#42). Mirrors
+    /// the embedder cache but lighter — whisper has one active model at a time. The
+    /// single `Mutex` over the map ensures the ggml load runs exactly once per key.
+    #[cfg(feature = "local-whisper")]
+    whisper_engines: Arc<Mutex<HashMap<String, Arc<asr::WhisperEngine>>>>,
     /// In-memory catalog cache (fix #5). Populated lazily via `spawn_blocking`;
     /// invalidated by `refresh_model_catalog`. Outside the inner `RwLock` so a
     /// catalog load never serializes DB reads.
@@ -330,6 +337,8 @@ impl LensEngine {
             llm_provider: Arc::new(RwLock::new(None)),
             js_renderer: Arc::new(RwLock::new(None)),
             asr_engine: Arc::new(RwLock::new(None)),
+            #[cfg(feature = "local-whisper")]
+            whisper_engines: Arc::new(Mutex::new(HashMap::new())),
             catalog_cache: Arc::new(RwLock::new(None)),
             #[cfg(feature = "test-util")]
             enrichment_gate: Arc::new(RwLock::new(None)),
@@ -405,6 +414,8 @@ impl LensEngine {
             llm_provider: Arc::new(RwLock::new(None)),
             js_renderer: Arc::new(RwLock::new(None)),
             asr_engine: Arc::new(RwLock::new(None)),
+            #[cfg(feature = "local-whisper")]
+            whisper_engines: Arc::new(Mutex::new(HashMap::new())),
             catalog_cache: Arc::new(RwLock::new(None)),
             #[cfg(feature = "test-util")]
             enrichment_gate: Arc::new(RwLock::new(None)),
@@ -802,18 +813,86 @@ impl LensEngine {
         );
 
         // The injected engine is the only externally-supplied seam (Apple in prod,
-        // a mock in tests); delegate to it whenever it is present. Only the
-        // internal LocalWhisper path with no injected engine is still unwired.
+        // a mock in tests); delegate to it whenever it is present. Otherwise build
+        // and cache the internal LocalWhisper engine for the configured model.
         match (backend, injected) {
             (_, Some(engine)) => engine.transcribe_pcm(pcm, config, progress_tx).await,
             (asr::AsrBackend::AppleNative, None) => Err(LensError::Transcription(
                 "apple-native backend selected but no engine is injected".into(),
             )),
-            // TODO(#42 Unit 5): build/cache the internal WhisperEngine here.
-            (asr::AsrBackend::LocalWhisper, None) => Err(LensError::Transcription(
-                "local whisper backend not yet wired (Unit 5)".into(),
-            )),
+            (asr::AsrBackend::LocalWhisper, None) => {
+                self.transcribe_local_whisper(pcm, config, progress_tx, &asr_cfg)
+                    .await
+            }
         }
+    }
+
+    /// Transcribes via the internal LocalWhisper engine. Resolves the model id
+    /// from [`AsrConfig`] (fallback [`DEFAULT_WHISPER_MODEL_ID`]); the model must
+    /// already be downloaded (transcribe never auto-downloads — that is the
+    /// onboarding command's job). Behind `local-whisper`; feature-off returns a
+    /// typed error so lens-core still compiles without whisper.cpp.
+    #[cfg(feature = "local-whisper")]
+    async fn transcribe_local_whisper(
+        &self,
+        pcm: &[f32],
+        config: &TranscribeConfig,
+        progress_tx: Option<mpsc::UnboundedSender<f32>>,
+        asr_cfg: &config::AsrConfig,
+    ) -> Result<Vec<TranscriptSegment>, LensError> {
+        let engine = self.whisper_engine_for(asr_cfg).await?;
+        engine.transcribe_pcm(pcm, config, progress_tx).await
+    }
+
+    #[cfg(not(feature = "local-whisper"))]
+    async fn transcribe_local_whisper(
+        &self,
+        _pcm: &[f32],
+        _config: &TranscribeConfig,
+        _progress_tx: Option<mpsc::UnboundedSender<f32>>,
+        _asr_cfg: &config::AsrConfig,
+    ) -> Result<Vec<TranscriptSegment>, LensError> {
+        Err(LensError::Transcription(
+            "local whisper feature not built (build lens-core with the `local-whisper` feature)"
+                .into(),
+        ))
+    }
+
+    /// Lazily builds and caches the [`asr::WhisperEngine`] for the configured
+    /// model id (R8-style cache keyed by model id). Errors with a clear typed
+    /// [`LensError::Transcription`] when the model is not yet downloaded.
+    #[cfg(feature = "local-whisper")]
+    async fn whisper_engine_for(
+        &self,
+        asr_cfg: &config::AsrConfig,
+    ) -> Result<Arc<asr::WhisperEngine>, LensError> {
+        let model_id = if asr_cfg.whisper_model.is_empty() {
+            DEFAULT_WHISPER_MODEL_ID.to_string()
+        } else {
+            asr_cfg.whisper_model.clone()
+        };
+        let data_dir = self.data_dir().await;
+        let model_path = asr::whisper_model_path(&data_dir, &model_id);
+
+        let mut cache = self.whisper_engines.lock().await;
+        if let Some(existing) = cache.get(&model_id) {
+            return Ok(Arc::clone(existing));
+        }
+        if !model_path.is_file() {
+            return Err(LensError::Transcription(format!(
+                "whisper model {model_id:?} is not downloaded; \
+                 fetch it via the onboarding download step first"
+            )));
+        }
+        // Model load is CPU-blocking (mmaps + parses the ggml weights).
+        let engine = tokio::task::spawn_blocking(move || asr::WhisperEngine::load(&model_path))
+            .await
+            .map_err(|e| {
+                LensError::Transcription(format!("whisper model load task failed: {e}"))
+            })??;
+        let engine = Arc::new(engine);
+        cache.insert(model_id, Arc::clone(&engine));
+        Ok(engine)
     }
 
     /// Non-blocking enqueue for background enrichment (AC3). Uses `try_send` so

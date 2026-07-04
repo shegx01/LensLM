@@ -45,12 +45,10 @@ async fn transcribe_dispatches_to_injected_engine() {
 }
 
 /// With no injected engine and LocalWhisper selected, the internal Whisper path
-/// is not yet wired → a typed `Transcription` error.
-///
-/// TODO(#42 Unit 5): REPLACE this test once `WhisperEngine` lands — it should
-/// then transcribe rather than error.
+/// resolves the configured model but errors clearly when it is not downloaded —
+/// `transcribe` never auto-downloads (that is the onboarding step's job).
 #[tokio::test]
-async fn transcribe_local_whisper_not_yet_wired_errors() {
+async fn transcribe_local_whisper_missing_model_errors() {
     let engine = LensEngine::for_test().await;
     let mut config = engine.config().await;
     config.asr.backend = "local_whisper".to_string();
@@ -59,12 +57,14 @@ async fn transcribe_local_whisper_not_yet_wired_errors() {
     let err = engine
         .transcribe(&[0.0_f32; 16], &TranscribeConfig::default(), None)
         .await
-        .expect_err("local whisper is not wired until Unit 5");
+        .expect_err("no downloaded whisper model → typed error");
 
     assert_eq!(err.kind(), "Transcription");
+    // Feature-on: "not downloaded"; feature-off: "feature not built". Both are a
+    // clear typed Transcription error the caller can surface.
+    let msg = err.message();
     assert!(
-        err.message().contains("Unit 5"),
-        "message: {}",
-        err.message()
+        msg.contains("not downloaded") || msg.contains("feature not built"),
+        "message: {msg}"
     );
 }
