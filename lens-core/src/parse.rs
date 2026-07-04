@@ -58,10 +58,7 @@ pub enum SourceKind {
     Xls,
     /// A CSV file (csv crate, comma-delimited, RFC-4180 — issue #76).
     Csv,
-    /// An audio file (mp3/m4a/aac/wav/flac). DERIVED via decode+transcribe: its
-    /// canonical buffer is the concatenated transcript persisted as the
-    /// `.extracted.txt` sibling. Dispatched by the audio ingest branch, not an
-    /// `Extractor` (issue #43).
+    /// An audio file (mp3/m4a/aac/wav/flac). DERIVED via decode+transcribe (issue #43).
     Audio,
 }
 

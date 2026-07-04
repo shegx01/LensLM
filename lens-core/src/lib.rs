@@ -794,9 +794,11 @@ impl LensEngine {
     /// any prior token for the same id (a retry supersedes the stale one).
     pub fn register_media_cancel(&self, source_id: &str) -> tokio_util::sync::CancellationToken {
         let token = tokio_util::sync::CancellationToken::new();
-        if let Ok(mut map) = self.media_cancel_tokens.lock() {
-            map.insert(source_id.to_string(), token.clone());
-        }
+        let mut map = self
+            .media_cancel_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        map.insert(source_id.to_string(), token.clone());
         token
     }
 
@@ -804,9 +806,10 @@ impl LensEngine {
     /// Returns `true` if a token was found and cancelled, `false` if no audio
     /// ingest is in flight for that id (issue #43).
     pub fn cancel_media_ingest(&self, source_id: &str) -> bool {
-        let Ok(map) = self.media_cancel_tokens.lock() else {
-            return false;
-        };
+        let map = self
+            .media_cancel_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         match map.get(source_id) {
             Some(token) => {
                 token.cancel();
@@ -820,9 +823,11 @@ impl LensEngine {
     /// audio-ingest completion/error/cancel via a drop guard so the registry
     /// never retains a stale entry.
     pub fn remove_media_cancel(&self, source_id: &str) {
-        if let Ok(mut map) = self.media_cancel_tokens.lock() {
-            map.remove(source_id);
-        }
+        let mut map = self
+            .media_cancel_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        map.remove(source_id);
     }
 
     /// Transcribes 16 kHz mono f32 PCM (#41 output), selecting the backend via

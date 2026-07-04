@@ -435,11 +435,8 @@ impl Drop for MediaCancelGuard<'_> {
 
 /// Audio ingest branch (issue #43): decode+resample (#41) → transcribe (#42) →
 /// concatenate transcript → chunk/embed/index via the shared tail. Cancellation
-/// is cooperative: the token is checked at every decode-window boundary and once
-/// more before transcription; on cancel this returns `Err(LensError::Cancelled)`
-/// so the outer `ingest_source` error handler sets `status = "error"` with
-/// `ErrorMeta { kind: "Cancelled" }` and skips enrichment (never sets error
-/// status here — that would double-write).
+/// is cooperative (checked at every decode-window boundary and before transcription).
+/// Never sets error status here — the outer `ingest_source` handler does.
 #[allow(clippy::too_many_arguments)]
 async fn run_audio_ingest(
     engine: &LensEngine,
@@ -465,6 +462,8 @@ async fn run_audio_ingest(
     let path = PathBuf::from(&source.locator);
     let decode_token = token.clone();
     let decode_handle = tokio::task::spawn_blocking(move || -> Result<Vec<f32>, LensError> {
+        // 16 kHz mono; cap decoded audio at ~4h so a pathological compressed file cannot exhaust memory.
+        const MAX_PCM_SAMPLES: usize = 16_000 * 60 * 60 * 4;
         let mut pcm: Vec<f32> = Vec::new();
         let mut window_index: u64 = 0;
         for window in crate::transcription::decode_resample_windows(&path, Default::default())? {
@@ -474,9 +473,12 @@ async fn run_audio_ingest(
                 ));
             }
             pcm.extend(window?);
+            if pcm.len() > MAX_PCM_SAMPLES {
+                return Err(LensError::Validation(
+                    "audio exceeds the maximum supported duration (~4 hours)".into(),
+                ));
+            }
             window_index += 1;
-            // Bounded-channel back-pressure: blocks here when the forwarder has
-            // not drained yet. A closed receiver (async side gone) ends decode.
             if decode_tx
                 .blocking_send(IngestProgress::new(
                     ingest_phase::DECODING,
@@ -541,7 +543,6 @@ async fn run_audio_ingest(
             result = &mut transcribe_fut => break result?,
         }
     };
-    // Drain any progress values buffered after the future resolved.
     while let Ok(p) = asr_rx.try_recv() {
         on_progress(IngestProgress::new(
             ingest_phase::TRANSCRIBING,

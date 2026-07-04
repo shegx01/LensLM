@@ -149,15 +149,11 @@ async fn audio_ingest_end_to_end_indexed_and_searchable() {
     );
 }
 
-/// AC6: cancelling mid-decode returns `Err(Cancelled)`, flowing through the
-/// existing error handler — status `error` with `error_meta.kind = "Cancelled"`,
-/// no chunks persisted, and the registry entry removed.
-///
-/// Determinism: the bounded decode-progress channel (capacity 1) pauses the
-/// decode thread on its second `blocking_send`. The test awaits the first
-/// decoding event (proving decode started and is now blocked), cancels, then
-/// resumes draining — the closure observes the cancellation on its next window.
-/// A ≥ 61 s fixture guarantees ≥ 3 decode windows so this branch is reached.
+/// AC6: cancelling mid-decode returns `Err(Cancelled)` — status `error`,
+/// `error_meta.kind = "Cancelled"`, no chunks persisted, registry entry removed.
+/// Determinism: the bounded channel (capacity 1) blocks the decode thread after
+/// window 1; the test cancels while the thread is blocked, guaranteeing the
+/// cancel path is reached. The ≥ 61 s fixture ensures ≥ 3 windows.
 #[tokio::test]
 async fn audio_ingest_cancel_is_deterministic() {
     let (dir, engine) = inject_counting_engine().await;
