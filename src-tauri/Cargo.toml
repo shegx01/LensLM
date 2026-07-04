@@ -14,6 +14,13 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[features]
+# issue #42: the Apple-native ASR backend (SpeechAnalyzer via a Swift @_cdecl
+# C-ABI bridge). Pulls NO cross-platform deps — it only activates the Swift build
+# in build.rs and the cfg-gated `asr` module (both aarch64-apple-darwin only). Made
+# default-on for the shipping macOS target below so it compiles under signoff.
+apple-native-asr = []
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -51,8 +58,20 @@ objc2 = "0.6"
 # the default embedding engine for supported models — Metal for bulk, candle-CPU
 # for queries), while every other target keeps the feature-less fastembed build.
 # The feature is target-gated in lens-core too, so it can ONLY activate here.
+#
+# issue #42: also union `local-whisper` (the cross-platform ASR baseline, which
+# lens-core has default-on anyway) so lens-core's Whisper path is present in the
+# Mac build. resolver = "2" honours this per-target feature union (the
+# `native-ml-metal` precedent above).
+#
+# NOTE: `apple-native-asr` CANNOT be auto-activated via a self-`path` dep here — a
+# binary crate depending on itself is a Cargo cycle error. Cargo has no per-target
+# `default` toggle either. So the Swift bridge's compile proof under signoff is via
+# `scripts/signoff.sh` passing `-p lenslm --features apple-native-asr` on Mac (see
+# that script's ASR note). Building without the feature keeps the bridge compiled
+# out and the router on Whisper — the accepted fallback in the #42 plan (§3).
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
-lens-core = { path = "../lens-core", features = ["native-ml-metal"] }
+lens-core = { path = "../lens-core", features = ["native-ml-metal", "local-whisper"] }
 
 [dev-dependencies]
 # The `test` feature (mock runtime) is unioned in only for test builds.
@@ -65,3 +84,6 @@ tempfile = { workspace = true }
 # non-dev dependency now, used by the render-window labels).
 sqlx = { workspace = true }
 chrono = { workspace = true }
+# Apple-ASR smoke test fetches the public-domain jfk.wav sample (mirrors
+# lens-core's gated whisper test); rustls only, no OpenSSL. Same pin as lens-core.
+reqwest = { version = "=0.13.4", default-features = false, features = ["rustls"] }

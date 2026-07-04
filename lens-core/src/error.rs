@@ -58,6 +58,11 @@ pub enum LensError {
     /// all-silent PCM) — there is nothing to transcribe (issue #41).
     #[error("empty audio: {0}")]
     EmptyAudio(String),
+
+    /// Speech-to-text (ASR) failed — model load, inference, or the Apple/Swift
+    /// bridge (issue #42). Distinct from the #41 media-decode errors.
+    #[error("transcription failed: {0}")]
+    Transcription(String),
 }
 
 // Manual `From` mappings (NOT `#[from]`): source error types are not `Serialize`
@@ -123,6 +128,7 @@ impl LensError {
             LensError::UnsupportedMediaCodec(_) => "UnsupportedMediaCodec",
             LensError::MediaDecodeFailed(_) => "MediaDecodeFailed",
             LensError::EmptyAudio(_) => "EmptyAudio",
+            LensError::Transcription(_) => "Transcription",
         }
     }
 
@@ -140,7 +146,8 @@ impl LensError {
             | LensError::Vector(m)
             | LensError::UnsupportedMediaCodec(m)
             | LensError::MediaDecodeFailed(m)
-            | LensError::EmptyAudio(m) => m,
+            | LensError::EmptyAudio(m)
+            | LensError::Transcription(m) => m,
         }
     }
 }
@@ -210,6 +217,11 @@ mod tests {
             (LensError::Model("onnx".into()), "Model", "onnx"),
             (LensError::Network("dns".into()), "Network", "dns"),
             (LensError::Vector("lance".into()), "Vector", "lance"),
+            (
+                LensError::Transcription("asr".into()),
+                "Transcription",
+                "asr",
+            ),
         ];
         for (err, kind, message) in cases {
             let meta = ErrorMeta::from_error(&err, 1);

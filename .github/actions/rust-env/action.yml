@@ -26,19 +26,29 @@ inputs:
 runs:
   using: composite
   steps:
+    # Refresh the apt index BEFORE cache-apt-pkgs installs. On a cold cache the
+    # action fetches exact-pinned versions; a stale runner index makes that fail
+    # with "Unable to fetch some archives", aborting the whole install. `update`
+    # keeps the pinned .deb URLs resolvable (needed after cmake/clang were added).
+    - name: Refresh apt index
+      shell: bash
+      run: sudo apt-get update
+
     # Tauri v2 needs the WebKitGTK stack to compile src-tauri (and the workspace
     # test build) and to LOAD the resulting test binaries at runtime, so shards
     # need these too. protobuf-compiler (protoc) is required by lance-encoding's
-    # build script. cache-apt-pkgs caches the .debs so repeat installs drop from
-    # ~30s to a few seconds. SHA-pinned (this action installs system packages).
+    # build script. cmake + clang/libclang build whisper.cpp (whisper-rs-sys, #42).
+    # cache-apt-pkgs caches the .debs so repeat installs drop from ~30s to a few
+    # seconds. SHA-pinned (this action installs system packages). Bump `version`
+    # when the package list changes to force a clean cache rebuild.
     - name: Cache + install apt system deps
       uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
       with:
         packages: >-
           libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
           libgtk-3-dev libxdo-dev libssl-dev patchelf build-essential
-          protobuf-compiler curl wget file
-        version: '1.0'
+          protobuf-compiler curl wget file cmake clang libclang-dev
+        version: '1.1'
 
     # rust-toolchain.toml pins 1.94.1 + clippy + rustfmt; `rustup show`
     # materializes it up front so later steps don't pay the install cost mid-run.

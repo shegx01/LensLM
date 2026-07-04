@@ -7,6 +7,16 @@
 // zero-runtime-cost fix (it only affects type-checking depth).
 #![recursion_limit = "256"]
 
+// The Apple-native ASR bridge (issue #42): `AppleSpeechEngine` (SpeechAnalyzer via
+// a Swift @_cdecl C ABI). aarch64-apple-darwin + `apple-native-asr` only; elsewhere
+// it compiles out and the router picks Whisper.
+#[cfg(all(
+    target_os = "macos",
+    target_arch = "aarch64",
+    feature = "apple-native-asr"
+))]
+mod asr;
+
 mod commands;
 // The offscreen SPA-render impl (issue #78). Its `TauriJsRenderer` is injected
 // into the engine in the `.setup` block below (Layer f), so its items are live.
@@ -49,6 +59,29 @@ fn main() {
             let renderer = TauriJsRenderer::new(app.handle().clone());
             let engine_state = app.state::<LensEngine>();
             tauri::async_runtime::block_on(engine_state.set_js_renderer(Some(Arc::new(renderer))));
+
+            // Inject the Apple-native ASR engine (issue #42, Unit 7) when the
+            // platform and runtime OS version are both capable. Mirrors
+            // `set_js_renderer` above. The runtime macOS>=26 gate lives here (not
+            // in lens-core) because OS probing is an src-tauri responsibility;
+            // lens-core treats a present engine as authoritative.
+            #[cfg(all(
+                target_os = "macos",
+                target_arch = "aarch64",
+                feature = "apple-native-asr"
+            ))]
+            {
+                let macos_ok = commands::system::macos_major_version()
+                    .map(|v| v >= lens_core::MIN_MACOS_FOR_APPLE_ASR)
+                    .unwrap_or(false);
+                if macos_ok {
+                    let apple = asr::AppleSpeechEngine::new();
+                    tauri::async_runtime::block_on(
+                        engine_state.set_asr_engine(Some(Arc::new(apple))),
+                    );
+                }
+            }
+
             Ok(())
         })
         // Register typed per-feature commands; the deprecated shim is kept so
@@ -90,6 +123,10 @@ fn main() {
             commands::system::install_embedding_model,
             commands::system::download_tts_engine,
             commands::system::kokoro_downloaded,
+            commands::system::list_whisper_models,
+            commands::system::download_whisper_model,
+            commands::system::whisper_model_downloaded,
+            commands::system::asr_apple_native_available,
             commands::system::fastembed_models_cached,
             commands::system::warm_fastembed_model,
             commands::system::gpu_accelerated_models,

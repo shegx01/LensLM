@@ -7,9 +7,11 @@
 //! No Tauri, windowing, or UI dependencies. [`LensEngine`] is a thin handle
 //! that delegates to per-domain repositories over the shared connection pool.
 
+pub mod asr;
 pub mod chunk;
 pub mod config;
 pub(crate) mod db;
+pub(crate) mod download;
 pub mod embedder;
 pub mod embedding;
 pub mod enrichment;
@@ -28,6 +30,16 @@ pub mod tts;
 pub mod url_normalize;
 pub mod vector_store;
 
+#[cfg(feature = "test-util")]
+pub use asr::MockAsrEngine;
+#[cfg(feature = "local-whisper")]
+pub use asr::WhisperEngine;
+pub use asr::{
+    AsrBackend, AsrEngine, DEFAULT_WHISPER_MODEL_ID, Lang, MIN_MACOS_FOR_APPLE_ASR, Platform,
+    TranscribeConfig, TranscriptSegment, WHISPER_REGISTRY, WhisperModelSpec,
+    download_whisper_model, resolve_whisper, select_asr_backend, whisper_model_downloaded,
+    whisper_model_path,
+};
 pub use config::{AppConfig, EnrichmentConfig, TaskModel};
 pub use embedder::{
     CountingEmbedder, DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, Embedder, EmbeddingBackend,
@@ -220,6 +232,16 @@ pub struct LensEngine {
     /// headless tests or before `src-tauri` wires `TauriJsRenderer`; degrades to
     /// `needs_js` when absent.
     js_renderer: Arc<RwLock<Option<Arc<dyn render::JsRenderer>>>>,
+    /// Injected Apple-native ASR engine (#42). `None` on non-Apple targets or
+    /// before src-tauri wires `AppleSpeechEngine`. Presence is the committed
+    /// `apple_available` signal: src-tauri pre-gates platform/version before
+    /// injecting, so the router treats mere presence as authoritative.
+    asr_engine: Arc<RwLock<Option<Arc<dyn asr::AsrEngine>>>>,
+    /// Lazily-built internal LocalWhisper engines, keyed by model id (#42). Mirrors
+    /// the embedder cache but lighter — whisper has one active model at a time. The
+    /// single `Mutex` over the map ensures the ggml load runs exactly once per key.
+    #[cfg(feature = "local-whisper")]
+    whisper_engines: Arc<Mutex<HashMap<String, Arc<asr::WhisperEngine>>>>,
     /// In-memory catalog cache (fix #5). Populated lazily via `spawn_blocking`;
     /// invalidated by `refresh_model_catalog`. Outside the inner `RwLock` so a
     /// catalog load never serializes DB reads.
@@ -315,6 +337,9 @@ impl LensEngine {
             enrichment_tx,
             llm_provider: Arc::new(RwLock::new(None)),
             js_renderer: Arc::new(RwLock::new(None)),
+            asr_engine: Arc::new(RwLock::new(None)),
+            #[cfg(feature = "local-whisper")]
+            whisper_engines: Arc::new(Mutex::new(HashMap::new())),
             catalog_cache: Arc::new(RwLock::new(None)),
             #[cfg(feature = "test-util")]
             enrichment_gate: Arc::new(RwLock::new(None)),
@@ -389,6 +414,9 @@ impl LensEngine {
             enrichment_tx,
             llm_provider: Arc::new(RwLock::new(None)),
             js_renderer: Arc::new(RwLock::new(None)),
+            asr_engine: Arc::new(RwLock::new(None)),
+            #[cfg(feature = "local-whisper")]
+            whisper_engines: Arc::new(Mutex::new(HashMap::new())),
             catalog_cache: Arc::new(RwLock::new(None)),
             #[cfg(feature = "test-util")]
             enrichment_gate: Arc::new(RwLock::new(None)),
@@ -735,6 +763,188 @@ impl LensEngine {
     /// behavior).
     pub async fn js_renderer(&self) -> Option<Arc<dyn render::JsRenderer>> {
         self.js_renderer.read().await.clone()
+    }
+
+    /// Installs (or replaces) the Apple-native ASR engine (#42). `None` leaves the
+    /// engine absent, so [`transcribe`](Self::transcribe) routes to LocalWhisper.
+    /// The concrete `AppleSpeechEngine` is injected here because `lens-core` cannot
+    /// depend on `tauri`/Speech.framework; src-tauri pre-gates platform/version
+    /// before calling this, so presence is the authoritative `apple_available` signal.
+    pub async fn set_asr_engine(&self, engine: Option<Arc<dyn asr::AsrEngine>>) {
+        *self.asr_engine.write().await = engine;
+    }
+
+    /// Returns a clone of the injected Apple-native ASR engine, or `None` when
+    /// none is installed (LocalWhisper is then the routed backend).
+    pub async fn asr_engine(&self) -> Option<Arc<dyn asr::AsrEngine>> {
+        self.asr_engine.read().await.clone()
+    }
+
+    /// Transcribes 16 kHz mono f32 PCM (#41 output), selecting the backend via
+    /// [`select_asr_backend`](asr::select_asr_backend): an explicit `AsrConfig`
+    /// override wins, else the injected Apple engine when present, else LocalWhisper.
+    pub async fn transcribe(
+        &self,
+        pcm: &[f32],
+        config: &TranscribeConfig,
+        progress_tx: Option<mpsc::UnboundedSender<f32>>,
+    ) -> Result<Vec<TranscriptSegment>, LensError> {
+        let asr_cfg = self.read().await.config.asr.clone();
+        let config_backend = asr::AsrBackend::from_opt_str(Some(asr_cfg.backend.as_str()));
+
+        let injected = self.asr_engine().await;
+        let apple_available = injected.is_some();
+
+        // lens-core stays OS-probe-free: authoritative platform/version facts are
+        // enforced in src-tauri BEFORE injecting the engine, so a present engine
+        // implies a capable Apple platform. Derive Platform consistently with that
+        // seam rather than probing the OS here (no OS-probe crate in lens-core).
+        let platform = asr::Platform {
+            is_apple_silicon_macos: apple_available,
+            macos_major: apple_available.then_some(asr::MIN_MACOS_FOR_APPLE_ASR),
+        };
+        // TODO(#43): replace with the real Apple locale-support predicate.
+        let apple_supports_locale = true;
+
+        let mut backend = asr::select_asr_backend(
+            config_backend,
+            platform,
+            apple_available,
+            apple_supports_locale,
+        );
+
+        // SpeechTranscriber has no translate task (translation is Whisper-only).
+        // If the caller requests translation and the router picked Apple, fall back
+        // to LocalWhisper so the translate request can be fulfilled.
+        if config.translate && backend == asr::AsrBackend::AppleNative {
+            backend = asr::AsrBackend::LocalWhisper;
+        }
+
+        // The injected engine is the Apple-native seam (Apple in prod, a mock in
+        // tests); it is used ONLY when the router selects AppleNative. LocalWhisper
+        // always uses the internal WhisperEngine, never the injected engine.
+        match (backend, injected) {
+            (asr::AsrBackend::AppleNative, Some(engine)) => {
+                match engine.transcribe_pcm(pcm, config, progress_tx).await {
+                    Ok(segments) => Ok(segments),
+                    // Apple runtime failure (e.g. a missing on-device asset) must not
+                    // leave the user with no transcription — fall back to Whisper when
+                    // a local model is available. Skip the fallback on a genuine
+                    // user-cancel or when whisper is unavailable, returning the
+                    // original Apple error in those cases.
+                    Err(apple_err) => {
+                        if !is_user_cancel(&apple_err)
+                            && self.local_whisper_available(&asr_cfg).await
+                        {
+                            self.transcribe_local_whisper(pcm, config, None, &asr_cfg)
+                                .await
+                        } else {
+                            Err(apple_err)
+                        }
+                    }
+                }
+            }
+            (asr::AsrBackend::LocalWhisper, Some(_)) | (asr::AsrBackend::LocalWhisper, None) => {
+                self.transcribe_local_whisper(pcm, config, progress_tx, &asr_cfg)
+                    .await
+            }
+            (asr::AsrBackend::AppleNative, None) => Err(LensError::Transcription(
+                "apple-native backend selected but no engine is injected".into(),
+            )),
+        }
+    }
+
+    /// Whether a local Whisper model is present on disk for the configured id, so
+    /// the Apple→Whisper fallback has something to route to. Behind `local-whisper`;
+    /// feature-off is always `false` (no Whisper path compiled in).
+    #[cfg(feature = "local-whisper")]
+    async fn local_whisper_available(&self, asr_cfg: &config::AsrConfig) -> bool {
+        let Some(spec) = asr::resolve_whisper(&asr_cfg.whisper_model)
+            .or_else(|| asr::resolve_whisper(DEFAULT_WHISPER_MODEL_ID))
+        else {
+            return false;
+        };
+        let data_dir = self.data_dir().await;
+        asr::whisper_model_path(&data_dir, spec.id).is_file()
+    }
+
+    #[cfg(not(feature = "local-whisper"))]
+    async fn local_whisper_available(&self, _asr_cfg: &config::AsrConfig) -> bool {
+        false
+    }
+
+    /// Transcribes via the internal LocalWhisper engine. Resolves the model id
+    /// from [`AsrConfig`] (fallback [`DEFAULT_WHISPER_MODEL_ID`]); the model must
+    /// already be downloaded (transcribe never auto-downloads — that is the
+    /// onboarding command's job). Behind `local-whisper`; feature-off returns a
+    /// typed error so lens-core still compiles without whisper.cpp.
+    #[cfg(feature = "local-whisper")]
+    async fn transcribe_local_whisper(
+        &self,
+        pcm: &[f32],
+        config: &TranscribeConfig,
+        progress_tx: Option<mpsc::UnboundedSender<f32>>,
+        asr_cfg: &config::AsrConfig,
+    ) -> Result<Vec<TranscriptSegment>, LensError> {
+        let engine = self.whisper_engine_for(asr_cfg).await?;
+        engine.transcribe_pcm(pcm, config, progress_tx).await
+    }
+
+    #[cfg(not(feature = "local-whisper"))]
+    async fn transcribe_local_whisper(
+        &self,
+        _pcm: &[f32],
+        _config: &TranscribeConfig,
+        _progress_tx: Option<mpsc::UnboundedSender<f32>>,
+        _asr_cfg: &config::AsrConfig,
+    ) -> Result<Vec<TranscriptSegment>, LensError> {
+        Err(LensError::Transcription(
+            "local whisper feature not built (build lens-core with the `local-whisper` feature)"
+                .into(),
+        ))
+    }
+
+    /// Lazily builds and caches the [`asr::WhisperEngine`] for the configured
+    /// model id (R8-style cache keyed by model id). Errors with a clear typed
+    /// [`LensError::Transcription`] when the model is not yet downloaded.
+    #[cfg(feature = "local-whisper")]
+    async fn whisper_engine_for(
+        &self,
+        asr_cfg: &config::AsrConfig,
+    ) -> Result<Arc<asr::WhisperEngine>, LensError> {
+        // Validate the config-supplied id through the registry allowlist BEFORE it
+        // touches the filesystem: build the path from the resolved `spec.id` (a
+        // &'static allowlisted token), never the raw config string, so a crafted id
+        // (e.g. `../..`) cannot escape `models/whisper/`. Unknown/empty → default.
+        let spec = asr::resolve_whisper(&asr_cfg.whisper_model)
+            .or_else(|| asr::resolve_whisper(DEFAULT_WHISPER_MODEL_ID))
+            .ok_or_else(|| LensError::Validation("no resolvable whisper model id".to_string()))?;
+        let model_id = spec.id.to_string();
+        let data_dir = self.data_dir().await;
+        let model_path = asr::whisper_model_path(&data_dir, spec.id);
+
+        // Intentionally hold this `tokio::sync::Mutex` across the spawn_blocking load
+        // so init runs exactly once per model id (mirrors the embedder cache). An
+        // async Mutex is safe to hold across `.await` — no clippy await_holding_lock.
+        let mut cache = self.whisper_engines.lock().await;
+        if let Some(existing) = cache.get(&model_id) {
+            return Ok(Arc::clone(existing));
+        }
+        if !model_path.is_file() {
+            return Err(LensError::Transcription(format!(
+                "whisper model {model_id:?} is not downloaded; \
+                 fetch it via the onboarding download step first"
+            )));
+        }
+        // Model load is CPU-blocking (mmaps + parses the ggml weights).
+        let engine = tokio::task::spawn_blocking(move || asr::WhisperEngine::load(&model_path))
+            .await
+            .map_err(|e| {
+                LensError::Transcription(format!("whisper model load task failed: {e}"))
+            })??;
+        let engine = Arc::new(engine);
+        cache.insert(model_id, Arc::clone(&engine));
+        Ok(engine)
     }
 
     /// Non-blocking enqueue for background enrichment (AC3). Uses `try_send` so
@@ -1303,5 +1513,192 @@ fn remove_file_best_effort(path: &Path) {
             path = %path.display(),
             "failed to remove managed source file: {e}"
         ),
+    }
+}
+
+/// Whether an Apple transcription error represents a genuine user-cancel (which
+/// must NOT trigger the Whisper fallback — the user chose to stop). Apple errors
+/// cross the bridge as [`LensError::Transcription`] strings, so this matches on
+/// the cancel wording rather than a distinct variant.
+fn is_user_cancel(err: &LensError) -> bool {
+    matches!(err, LensError::Transcription(msg)
+        if msg.to_ascii_lowercase().contains("cancel"))
+}
+
+#[cfg(test)]
+mod transcribe_tests {
+    use super::*;
+
+    /// A mock Apple engine whose `transcribe_pcm` always errors — used to prove the
+    /// Apple→Whisper fallback path runs (the router picks AppleNative, the error
+    /// triggers the fallback, and the whisper branch surfaces its own typed error).
+    struct ErroringAppleEngine {
+        message: String,
+    }
+
+    #[async_trait::async_trait]
+    impl asr::AsrEngine for ErroringAppleEngine {
+        async fn transcribe_pcm(
+            &self,
+            _pcm: &[f32],
+            _config: &TranscribeConfig,
+            _progress_tx: Option<mpsc::UnboundedSender<f32>>,
+        ) -> Result<Vec<TranscriptSegment>, LensError> {
+            Err(LensError::Transcription(self.message.clone()))
+        }
+    }
+
+    /// Points the engine's `data_dir` at `dir` and drops a stub whisper model file
+    /// there so [`local_whisper_available`](LensEngine::local_whisper_available)
+    /// reports the fallback is possible (the stub is not a valid ggml file, so the
+    /// subsequent load fails — which is exactly what proves the whisper branch ran).
+    #[cfg(feature = "local-whisper")]
+    async fn seed_stub_whisper_model(engine: &LensEngine, dir: &std::path::Path) {
+        engine.inner.write().await.config.paths.data_dir = dir.to_string_lossy().into_owned();
+        let spec = asr::resolve_whisper(DEFAULT_WHISPER_MODEL_ID).expect("default whisper spec");
+        let model_path = asr::whisper_model_path(dir, spec.id);
+        std::fs::create_dir_all(model_path.parent().expect("model parent"))
+            .expect("create model dir");
+        std::fs::write(&model_path, b"not a real ggml model").expect("write stub model");
+    }
+
+    /// A runtime Apple failure (missing on-device asset) must fall back to Whisper
+    /// when a local model is present. A stub model is seeded so the fallback path
+    /// runs; the stub is not a valid ggml file, so the whisper load surfaces its own
+    /// typed error — proving the whisper branch ran rather than the Apple error
+    /// propagating unchanged.
+    #[cfg(feature = "local-whisper")]
+    #[tokio::test]
+    async fn apple_runtime_error_falls_back_to_whisper() {
+        let engine = LensEngine::for_test().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_stub_whisper_model(&engine, dir.path()).await;
+        engine
+            .set_asr_engine(Some(Arc::new(ErroringAppleEngine {
+                message: "on-device speech model for locale en-US is not installed".into(),
+            })))
+            .await;
+
+        let config = TranscribeConfig {
+            language: None,
+            translate: false,
+        };
+        let pcm = vec![0.0_f32; 16];
+        let result = engine.transcribe(&pcm, &config, None).await;
+
+        // The whisper branch ran: the stub is not a valid model, so we get a
+        // whisper-path error, NOT the original "not installed" Apple message.
+        match result {
+            Err(LensError::Transcription(msg)) => {
+                assert!(
+                    !msg.contains("not installed"),
+                    "fallback did not run: got the Apple error unchanged: {msg}"
+                );
+            }
+            other => panic!("expected a whisper-path Transcription error, got: {other:?}"),
+        }
+    }
+
+    /// When whisper is NOT available, an Apple runtime error propagates unchanged
+    /// (no fallback target exists). The data_dir points at an empty tempdir so the
+    /// probe deterministically finds no model regardless of the test cwd.
+    #[tokio::test]
+    async fn apple_runtime_error_without_whisper_returns_apple_error() {
+        let engine = LensEngine::for_test().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        engine.inner.write().await.config.paths.data_dir =
+            dir.path().to_string_lossy().into_owned();
+        engine
+            .set_asr_engine(Some(Arc::new(ErroringAppleEngine {
+                message: "on-device speech model for locale en-US is not installed".into(),
+            })))
+            .await;
+
+        let config = TranscribeConfig {
+            language: None,
+            translate: false,
+        };
+        let pcm = vec![0.0_f32; 16];
+        let result = engine.transcribe(&pcm, &config, None).await;
+
+        match result {
+            Err(LensError::Transcription(msg)) => {
+                assert!(
+                    msg.contains("not installed"),
+                    "expected the original Apple error, got: {msg}"
+                );
+            }
+            other => panic!("expected the original Apple error, got: {other:?}"),
+        }
+    }
+
+    /// A genuine user-cancel must NOT trigger the whisper fallback: the original
+    /// Apple cancel error propagates unchanged.
+    #[tokio::test]
+    async fn apple_user_cancel_does_not_fall_back() {
+        let engine = LensEngine::for_test().await;
+        engine
+            .set_asr_engine(Some(Arc::new(ErroringAppleEngine {
+                message: "transcription cancelled by user".into(),
+            })))
+            .await;
+
+        let config = TranscribeConfig {
+            language: None,
+            translate: false,
+        };
+        let pcm = vec![0.0_f32; 16];
+        let result = engine.transcribe(&pcm, &config, None).await;
+
+        match result {
+            Err(LensError::Transcription(msg)) => {
+                assert!(
+                    msg.contains("cancelled"),
+                    "expected the original Apple cancel error, got: {msg}"
+                );
+            }
+            other => panic!("expected the original Apple cancel error, got: {other:?}"),
+        }
+    }
+
+    /// When translate=true the Apple engine cannot fulfil the request. The router
+    /// normally picks Apple (engine injected + capable platform assumed), but the
+    /// translate guard must redirect to LocalWhisper, which surfaces as a typed
+    /// Transcription error (model not downloaded) rather than an Apple dispatch.
+    #[tokio::test]
+    async fn translate_forces_whisper_over_apple() {
+        let engine = LensEngine::for_test().await;
+
+        // Inject a mock Apple engine so the router would otherwise pick AppleNative.
+        let canned = vec![asr::TranscriptSegment {
+            text: "apple".to_string(),
+            start_second: 0.0,
+            end_second: 1.0,
+        }];
+        engine
+            .set_asr_engine(Some(Arc::new(asr::MockAsrEngine::new(canned))))
+            .await;
+
+        // Request translation. The guard must redirect to LocalWhisper.
+        let config = TranscribeConfig {
+            language: None,
+            translate: true,
+        };
+        let pcm = vec![0.0_f32; 16];
+        let result = engine.transcribe(&pcm, &config, None).await;
+
+        // LocalWhisper is routed but the model is not downloaded, so we get a
+        // typed Transcription error — confirming the Apple mock was NOT called.
+        match result {
+            Err(LensError::Transcription(msg)) => {
+                assert!(
+                    msg.contains("local whisper")
+                        || msg.contains("not downloaded")
+                        || msg.contains("local-whisper"),
+                    "expected a LocalWhisper error, got: {msg}"
+                );
+            }
+            other => panic!("expected Transcription error from LocalWhisper path, got: {other:?}"),
+        }
     }
 }
