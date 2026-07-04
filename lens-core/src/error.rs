@@ -63,6 +63,12 @@ pub enum LensError {
     /// bridge (issue #42). Distinct from the #41 media-decode errors.
     #[error("transcription failed: {0}")]
     Transcription(String),
+
+    /// An operation was cooperatively cancelled by the user (e.g. audio ingest
+    /// cancel, issue #43). The payload is a generic description — no path or
+    /// internal detail leaks across the IPC boundary.
+    #[error("cancelled: {0}")]
+    Cancelled(String),
 }
 
 // Manual `From` mappings (NOT `#[from]`): source error types are not `Serialize`
@@ -129,6 +135,7 @@ impl LensError {
             LensError::MediaDecodeFailed(_) => "MediaDecodeFailed",
             LensError::EmptyAudio(_) => "EmptyAudio",
             LensError::Transcription(_) => "Transcription",
+            LensError::Cancelled(_) => "Cancelled",
         }
     }
 
@@ -147,7 +154,8 @@ impl LensError {
             | LensError::UnsupportedMediaCodec(m)
             | LensError::MediaDecodeFailed(m)
             | LensError::EmptyAudio(m)
-            | LensError::Transcription(m) => m,
+            | LensError::Transcription(m)
+            | LensError::Cancelled(m) => m,
         }
     }
 }
@@ -165,8 +173,9 @@ pub struct ErrorMeta {
     /// The `LensError` discriminant — the stable variant name as a string (e.g.
     /// `"Validation"`, `"Internal"`, `"Io"`, `"Parse"`, `"Model"`, `"Network"`,
     /// `"Vector"`, `"UnsupportedMediaCodec"`, `"MediaDecodeFailed"`,
-    /// `"EmptyAudio"`). Matches the `kind` field of the `{kind, message}` IPC
-    /// wire shape. New variants are additive and do not change existing names.
+    /// `"EmptyAudio"`, `"Cancelled"`). Matches the `kind` field of the
+    /// `{kind, message}` IPC wire shape. New variants are additive and do not
+    /// change existing names.
     pub kind: String,
     /// The human-readable failure message (the `LensError` inner payload).
     pub message: String,
@@ -221,6 +230,11 @@ mod tests {
                 LensError::Transcription("asr".into()),
                 "Transcription",
                 "asr",
+            ),
+            (
+                LensError::Cancelled("audio ingest cancelled".into()),
+                "Cancelled",
+                "audio ingest cancelled",
             ),
         ];
         for (err, kind, message) in cases {

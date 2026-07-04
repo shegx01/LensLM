@@ -89,6 +89,10 @@ pub fn resolve_max_source_bytes(cfg_value: &str) -> usize {
 /// `fetching → parsing → chunking → [model_download] → embedding → indexing → done`.
 pub(crate) mod ingest_phase {
     pub const FETCHING: &str = "fetching";
+    /// Audio decode+resample phase (issue #43), before transcription.
+    pub const DECODING: &str = "decoding";
+    /// Audio transcription (ASR) phase (issue #43), after decode.
+    pub const TRANSCRIBING: &str = "transcribing";
     pub const PARSING: &str = "parsing";
     pub const CHUNKING: &str = "chunking";
     pub const MODEL_DOWNLOAD: &str = "model_download";
@@ -333,6 +337,25 @@ async fn run_ingest(
         }
     }
 
+    // Audio takes the decode+transcribe path instead of an `Extractor` (issue #43).
+    // Placed AFTER the Stage-1 size guard and the DERIVED no-op short-circuit (which
+    // both run above) and BEFORE `extractor_for`, which has no audio extractor.
+    if kind == Some(crate::parse::SourceKind::Audio) {
+        let pool = pool.clone();
+        return run_audio_ingest(
+            engine,
+            &pool,
+            &data_dir,
+            source_id,
+            &source,
+            status,
+            max_source_bytes,
+            &raw,
+            on_progress,
+        )
+        .await;
+    }
+
     // Sniff `.json` files for JSON Lines: if ≥2 newline-delimited JSON values, use the jsonl extractor.
     let effective_kind: String = if kind == Some(crate::parse::SourceKind::Json)
         && sniff_is_jsonl(&raw)
@@ -395,6 +418,167 @@ async fn run_ingest(
     }
 
     ctx.index_extract_output(&raw, out, &mut on_progress).await
+}
+
+/// Removes an audio-ingest cancellation token from the engine registry on drop,
+/// so completion/error/cancel all clean up exactly once (issue #43).
+struct MediaCancelGuard<'a> {
+    engine: &'a LensEngine,
+    source_id: &'a str,
+}
+
+impl Drop for MediaCancelGuard<'_> {
+    fn drop(&mut self) {
+        self.engine.remove_media_cancel(self.source_id);
+    }
+}
+
+/// Audio ingest branch (issue #43): decode+resample (#41) → transcribe (#42) →
+/// concatenate transcript → chunk/embed/index via the shared tail. Cancellation
+/// is cooperative: the token is checked at every decode-window boundary and once
+/// more before transcription; on cancel this returns `Err(LensError::Cancelled)`
+/// so the outer `ingest_source` error handler sets `status = "error"` with
+/// `ErrorMeta { kind: "Cancelled" }` and skips enrichment (never sets error
+/// status here — that would double-write).
+#[allow(clippy::too_many_arguments)]
+async fn run_audio_ingest(
+    engine: &LensEngine,
+    pool: &sqlx::SqlitePool,
+    data_dir: &Path,
+    source_id: &str,
+    source: &crate::notebooks::Source,
+    status: crate::notebooks::SourceStatus,
+    max_source_bytes: usize,
+    raw: &[u8],
+    mut on_progress: impl FnMut(IngestProgress),
+) -> Result<(), LensError> {
+    let token = engine.register_media_cancel(source_id);
+    let _cancel_guard = MediaCancelGuard { engine, source_id };
+
+    // ── Decode phase ──────────────────────────────────────────────────────
+    // Heavy CPU work runs in `spawn_blocking`. Progress rides a BOUNDED channel
+    // (capacity 1): `blocking_send` blocks the decode thread once the buffer is
+    // full, so the async forwarder's drain rate paces decode — the rendezvous the
+    // cancel test relies on. `on_progress` is NOT `Send`, so it is only ever called
+    // on the async side, never inside the closure.
+    let (decode_tx, mut decode_rx) = tokio::sync::mpsc::channel::<IngestProgress>(1);
+    let path = PathBuf::from(&source.locator);
+    let decode_token = token.clone();
+    let decode_handle = tokio::task::spawn_blocking(move || -> Result<Vec<f32>, LensError> {
+        let mut pcm: Vec<f32> = Vec::new();
+        let mut window_index: u64 = 0;
+        for window in crate::transcription::decode_resample_windows(&path, Default::default())? {
+            if decode_token.is_cancelled() {
+                return Err(LensError::Cancelled(
+                    "audio ingest cancelled during decode".into(),
+                ));
+            }
+            pcm.extend(window?);
+            window_index += 1;
+            // Bounded-channel back-pressure: blocks here when the forwarder has
+            // not drained yet. A closed receiver (async side gone) ends decode.
+            if decode_tx
+                .blocking_send(IngestProgress::new(
+                    ingest_phase::DECODING,
+                    window_index,
+                    None,
+                ))
+                .is_err()
+            {
+                return Err(LensError::Cancelled(
+                    "audio ingest cancelled during decode".into(),
+                ));
+            }
+        }
+        // Replicate the empty/silence guards that `decode_and_resample_audio`
+        // enforces but the streaming windows path does not (transcription.rs).
+        if pcm.is_empty() {
+            return Err(LensError::EmptyAudio("audio decoded to no samples".into()));
+        }
+        if pcm.iter().all(|s| *s == 0.0) {
+            return Err(LensError::EmptyAudio(
+                "audio is empty or entirely silent".into(),
+            ));
+        }
+        Ok(pcm)
+    });
+
+    while let Some(ev) = decode_rx.recv().await {
+        on_progress(ev);
+    }
+    let pcm = decode_handle
+        .await
+        .map_err(|e| LensError::Internal(format!("audio decode task panicked: {e}")))??;
+
+    // ── Cancel checkpoint before the (uninterruptible) transcribe call ──────
+    if token.is_cancelled() {
+        return Err(LensError::Cancelled(
+            "audio ingest cancelled before transcription".into(),
+        ));
+    }
+
+    // ── Transcribe phase ───────────────────────────────────────────────────
+    // A SEPARATE unbounded f32 channel — the exact type `transcribe` expects.
+    // A forwarder maps ASR progress (0..1) into the `transcribing` phase.
+    on_progress(IngestProgress::new(
+        ingest_phase::TRANSCRIBING,
+        0,
+        Some(100),
+    ));
+    let (asr_tx, mut asr_rx) = tokio::sync::mpsc::unbounded_channel::<f32>();
+    let asr_config = crate::asr::TranscribeConfig::default();
+    let mut transcribe_fut = std::pin::pin!(engine.transcribe(&pcm, &asr_config, Some(asr_tx)));
+    let segments = loop {
+        tokio::select! {
+            biased;
+            Some(p) = asr_rx.recv() => {
+                on_progress(IngestProgress::new(
+                    ingest_phase::TRANSCRIBING,
+                    (p * 100.0) as u64,
+                    Some(100),
+                ));
+            }
+            result = &mut transcribe_fut => break result?,
+        }
+    };
+    // Drain any progress values buffered after the future resolved.
+    while let Ok(p) = asr_rx.try_recv() {
+        on_progress(IngestProgress::new(
+            ingest_phase::TRANSCRIBING,
+            (p * 100.0) as u64,
+            Some(100),
+        ));
+    }
+
+    // ── Build blocks and route through the shared index tail ────────────────
+    // `parse_blocks(.., Text)` preserves the byte-identity invariant (never
+    // hand-construct a Block); anchors are index-aligned per block.
+    let transcript = segments
+        .iter()
+        .map(|s| s.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let blocks = crate::parse::parse_blocks(&transcript, crate::parse::SourceKind::Text);
+    let anchors = vec![crate::extract::SourceAnchor::Text; blocks.len()];
+    let out = crate::extract::ExtractOutput {
+        extracted_text: transcript,
+        blocks,
+        anchors,
+        table_markdown: None,
+    };
+
+    let ctx = IngestContext {
+        engine,
+        pool,
+        data_dir,
+        source_id,
+        source,
+        status,
+        is_pdf: false,
+        text_like: false,
+        max_source_bytes,
+    };
+    ctx.index_extract_output(raw, out, &mut on_progress).await
 }
 
 /// Outcome of the URL JS-render gate. `Handled` means a terminal status was set and the

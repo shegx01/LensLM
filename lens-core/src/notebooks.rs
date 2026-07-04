@@ -952,12 +952,18 @@ impl<'a> NotebookRepo<'a> {
             Some("xlsx") => (SourceKind::Xlsx.as_str(), "xlsx"),
             Some("xls") => (SourceKind::Xls.as_str(), "xls"),
             Some("csv") => (SourceKind::Csv.as_str(), "csv"),
+            Some("mp3") => (SourceKind::Audio.as_str(), "mp3"),
+            Some("m4a") => (SourceKind::Audio.as_str(), "m4a"),
+            Some("aac") => (SourceKind::Audio.as_str(), "aac"),
+            Some("wav") => (SourceKind::Audio.as_str(), "wav"),
+            Some("flac") => (SourceKind::Audio.as_str(), "flac"),
             other => {
                 return Err(LensError::Validation(format!(
                     "unsupported file extension {other:?} for {}; expected one of \
                      \".pdf\", \".docx\", \".txt\", \".md\", \".markdown\", \".mdx\", \".json\", \
                      \".jsonl\", \".ndjson\", \".yaml\", \".yml\", \".xml\", \".rtf\", \".odt\", \
-                     \".epub\", \".xlsx\", \".xls\", \".csv\"",
+                     \".epub\", \".xlsx\", \".xls\", \".csv\", \".mp3\", \".m4a\", \".aac\", \
+                     \".wav\", \".flac\"",
                     src_path.display()
                 )));
             }

@@ -123,6 +123,11 @@ pub fn extractor_for(kind: &str) -> Result<Box<dyn Extractor>, LensError> {
         SourceKind::Epub => Ok(Box::new(epub::EpubExtractor)),
         SourceKind::Xlsx | SourceKind::Xls => Ok(Box::new(spreadsheet::SpreadsheetExtractor)),
         SourceKind::Csv => Ok(Box::new(csv::CsvExtractor)),
+        // Audio uses the decode+transcribe path (the audio ingest branch returns
+        // before reaching here); this arm is a defensive backstop only (issue #43).
+        SourceKind::Audio => Err(LensError::Internal(
+            "audio sources use the decode+transcribe path, not an extractor".into(),
+        )),
     }
 }
 

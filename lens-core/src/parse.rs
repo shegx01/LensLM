@@ -58,6 +58,11 @@ pub enum SourceKind {
     Xls,
     /// A CSV file (csv crate, comma-delimited, RFC-4180 — issue #76).
     Csv,
+    /// An audio file (mp3/m4a/aac/wav/flac). DERIVED via decode+transcribe: its
+    /// canonical buffer is the concatenated transcript persisted as the
+    /// `.extracted.txt` sibling. Dispatched by the audio ingest branch, not an
+    /// `Extractor` (issue #43).
+    Audio,
 }
 
 impl SourceKind {
@@ -82,6 +87,7 @@ impl SourceKind {
             Self::Xlsx => "xlsx",
             Self::Xls => "xls",
             Self::Csv => "csv",
+            Self::Audio => "audio",
         }
     }
 
@@ -104,8 +110,9 @@ impl SourceKind {
             "xlsx" => Ok(Self::Xlsx),
             "xls" => Ok(Self::Xls),
             "csv" => Ok(Self::Csv),
+            "audio" => Ok(Self::Audio),
             other => Err(LensError::Validation(format!(
-                "unknown source kind: {other:?}; expected one of \"text\", \"markdown\", \"pdf\", \"docx\", \"url\", \"json\", \"jsonl\", \"yaml\", \"xml\", \"rtf\", \"odt\", \"epub\", \"xlsx\", \"xls\", \"csv\""
+                "unknown source kind: {other:?}; expected one of \"text\", \"markdown\", \"pdf\", \"docx\", \"url\", \"json\", \"jsonl\", \"yaml\", \"xml\", \"rtf\", \"odt\", \"epub\", \"xlsx\", \"xls\", \"csv\", \"audio\""
             ))),
         }
     }
@@ -128,6 +135,9 @@ impl SourceKind {
             // Tabular formats (XLSX/XLS/CSV) are DERIVED: their canonical buffer
             // is a row-verbalization produced by a dedicated Extractor (issue #76).
             Self::Xlsx | Self::Xls | Self::Csv => false,
+            // Audio is DERIVED: its canonical buffer is the concatenated
+            // transcript produced by decode+transcribe (issue #43).
+            Self::Audio => false,
         }
     }
 }
@@ -313,7 +323,11 @@ pub fn parse_blocks(src: &str, kind: SourceKind) -> Vec<Block> {
         | SourceKind::Epub
         | SourceKind::Xlsx
         | SourceKind::Xls
-        | SourceKind::Csv => {
+        | SourceKind::Csv
+        // Audio is DERIVED and never reaches here at runtime: the audio ingest
+        // branch calls `parse_blocks(&transcript, SourceKind::Text)`, so this arm
+        // is a compile-safety backstop only (issue #43).
+        | SourceKind::Audio => {
             debug_assert!(
                 false,
                 "parse_blocks called with derived kind {kind:?} — use an Extractor"
@@ -1078,6 +1092,21 @@ mod tests {
         assert!(!SourceKind::Xlsx.is_text_like());
         assert!(!SourceKind::Xls.is_text_like());
         assert!(!SourceKind::Csv.is_text_like());
+    }
+
+    #[test]
+    fn source_kind_audio_roundtrip() {
+        assert_eq!(
+            SourceKind::from_kind_str("audio").unwrap(),
+            SourceKind::Audio
+        );
+        assert_eq!(SourceKind::Audio.as_str(), "audio");
+    }
+
+    #[test]
+    fn source_kind_audio_not_text_like() {
+        // Audio is DERIVED (decode+transcribe) — issue #43.
+        assert!(!SourceKind::Audio.is_text_like());
     }
 
     #[test]
