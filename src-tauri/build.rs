@@ -1,6 +1,7 @@
-use std::env;
-use std::path::PathBuf;
-use std::process::Command;
+// Used only by the aarch64-apple-darwin Swift-bridge build below; gated so the
+// Linux fmt/clippy jobs (which never compile that path) don't see unused imports.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use std::{env, path::PathBuf, process::Command};
 
 fn main() {
     tauri_build::build();
