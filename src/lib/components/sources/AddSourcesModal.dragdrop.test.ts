@@ -286,7 +286,7 @@ describe('AddSourcesModal — native drag-drop registration ($effect fix)', () =
     capturedHandler!({
       payload: {
         type: 'drop',
-        paths: ['/tmp/a.mp3']
+        paths: ['/tmp/a.opus']
       }
     });
 

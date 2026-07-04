@@ -85,16 +85,16 @@ describe('partitionPaths — accepted extensions', () => {
 describe('partitionPaths — rejected extensions', () => {
   it('classifies unsupported extensions as rejected with the correct ext', () => {
     const paths = [
-      '/a/song.mp3',
       '/a/clip.mp4',
       '/a/deck.pptx',
       '/a/note.key',
       '/a/doc.pages',
+      '/a/audio.opus',
       '/a/blob.unknown'
     ];
     const { accepted, rejected } = partitionPaths(paths);
     expect(accepted).toHaveLength(0);
-    expect(rejected.map((r) => r.ext)).toEqual(['mp3', 'mp4', 'pptx', 'key', 'pages', 'unknown']);
+    expect(rejected.map((r) => r.ext)).toEqual(['mp4', 'pptx', 'key', 'pages', 'opus', 'unknown']);
   });
 });
 
@@ -110,9 +110,9 @@ describe('partitionPaths — mixed batch', () => {
       '/c/doc.md',
       '/d/video.mov'
     ]);
-    expect(accepted).toEqual(['/a/file.pdf', '/c/doc.md']);
-    expect(rejected).toHaveLength(2);
-    expect(rejected.map((r) => r.ext)).toEqual(['mp3', 'mov']);
+    expect(accepted).toEqual(['/a/file.pdf', '/b/song.mp3', '/c/doc.md']);
+    expect(rejected).toHaveLength(1);
+    expect(rejected.map((r) => r.ext)).toEqual(['mov']);
   });
 });
 
@@ -133,8 +133,8 @@ describe('partitionPaths — no-extension file', () => {
 // ---------------------------------------------------------------------------
 
 describe('ACCEPTED_EXTENSIONS', () => {
-  it('contains exactly the 18 backend-accepted extensions', () => {
-    expect(ACCEPTED_EXTENSIONS.size).toBe(18);
+  it('contains exactly the 23 backend-accepted extensions', () => {
+    expect(ACCEPTED_EXTENSIONS.size).toBe(23);
     const expected = [
       'pdf',
       'docx',
@@ -153,7 +153,12 @@ describe('ACCEPTED_EXTENSIONS', () => {
       'epub',
       'xlsx',
       'xls',
-      'csv'
+      'csv',
+      'mp3',
+      'm4a',
+      'aac',
+      'wav',
+      'flac'
     ];
     for (const ext of expected) {
       expect(ACCEPTED_EXTENSIONS.has(ext)).toBe(true);
@@ -166,10 +171,10 @@ describe('ACCEPTED_EXTENSIONS', () => {
 // ---------------------------------------------------------------------------
 
 describe('PICKER_FILTERS', () => {
-  it('has three groups (Documents + Tabular + Structured) covering all accepted extensions', () => {
-    expect(PICKER_FILTERS).toHaveLength(3);
+  it('has four groups (Documents + Tabular + Structured + Audio) covering all accepted extensions', () => {
+    expect(PICKER_FILTERS).toHaveLength(4);
     const names = PICKER_FILTERS.map((g) => g.name);
-    expect(names).toEqual(['Documents', 'Tabular', 'Structured']);
+    expect(names).toEqual(['Documents', 'Tabular', 'Structured', 'Audio']);
     const all = new Set(PICKER_FILTERS.flatMap((g) => g.extensions));
     expect(all).toEqual(new Set([...ACCEPTED_EXTENSIONS]));
   });
@@ -245,10 +250,10 @@ describe('event-handler branching (Tauri)', () => {
   });
 
   it("'drop' with only unsupported paths: does NOT call onDrop and fires a toast", () => {
-    capturedHandler!({ payload: { type: 'drop', paths: ['/x/a.mp3'] } });
+    capturedHandler!({ payload: { type: 'drop', paths: ['/x/a.opus'] } });
     expect(target.onDrop).not.toHaveBeenCalled();
     expect(showToastMock).toHaveBeenCalledTimes(1);
-    expect(showToastMock.mock.calls[0][0]).toContain('.mp3');
+    expect(showToastMock.mock.calls[0][0]).toContain('.opus');
   });
 
   it("'drop' with no registered target: ignored entirely (no onDrop, no throw)", async () => {

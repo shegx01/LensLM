@@ -29,17 +29,23 @@ export const ACCEPTED_EXTENSIONS: ReadonlySet<string> = new Set([
   'epub',
   'xlsx',
   'xls',
-  'csv'
+  'csv',
+  'mp3',
+  'm4a',
+  'aac',
+  'wav',
+  'flac'
 ]);
 
-/** Picker filter groups for `@tauri-apps/plugin-dialog` — three groups: Documents, Tabular, Structured. */
+/** Picker filter groups for `@tauri-apps/plugin-dialog` — four groups: Documents, Tabular, Structured, Audio. */
 export const PICKER_FILTERS: Array<{ name: string; extensions: string[] }> = [
   {
     name: 'Documents',
     extensions: ['pdf', 'docx', 'txt', 'md', 'markdown', 'mdx', 'rtf', 'odt', 'epub']
   },
   { name: 'Tabular', extensions: ['xlsx', 'xls', 'csv'] },
-  { name: 'Structured', extensions: ['json', 'jsonl', 'ndjson', 'yaml', 'yml', 'xml'] }
+  { name: 'Structured', extensions: ['json', 'jsonl', 'ndjson', 'yaml', 'yml', 'xml'] },
+  { name: 'Audio', extensions: ['mp3', 'm4a', 'aac', 'wav', 'flac'] }
 ];
 
 // ---------------------------------------------------------------------------
