@@ -10,6 +10,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::LensError;
+use crate::asr::Lang;
 
 /// File name for the on-disk config, relative to the engine data directory.
 const CONFIG_FILE_NAME: &str = "config.json";
@@ -65,6 +66,45 @@ impl std::fmt::Debug for TtsConfig {
             .field("provider", &self.provider)
             .field("api_key", &api_key)
             .finish()
+    }
+}
+
+/// Default Whisper model id for a fresh [`AsrConfig`] — the multilingual base
+/// model (mirrors the registry default; #42).
+fn default_whisper_model() -> String {
+    "base".to_string()
+}
+
+/// Optional additive ASR configuration (#42). Absent from older `config.json`
+/// files reads back as [`AsrConfig::default`]. `backend` is a `String` — not the
+/// [`AsrBackend`](crate::asr::AsrBackend) enum — intentionally mirroring
+/// `AppConfig::embedding_backend`: an empty string means router-decided, and a
+/// non-empty token (`"apple_native"` | `"local_whisper"`) is resolved at the
+/// engine boundary via `AsrBackend::from_opt_str`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AsrConfig {
+    /// `""` → router-decided; `"apple_native"` | `"local_whisper"` → explicit override.
+    #[serde(default)]
+    pub backend: String,
+    /// Whisper model id (`"tiny"` | `"base"` | `"small"`); defaults to `"base"`.
+    #[serde(default = "default_whisper_model")]
+    pub whisper_model: String,
+    /// Forced source language; `None` ⇒ auto-detect.
+    #[serde(default)]
+    pub language: Option<Lang>,
+    /// `true` ⇒ translate to English (the Whisper translate task).
+    #[serde(default)]
+    pub translate: bool,
+}
+
+impl Default for AsrConfig {
+    fn default() -> Self {
+        Self {
+            backend: String::default(),
+            whisper_model: default_whisper_model(),
+            language: None,
+            translate: false,
+        }
     }
 }
 
@@ -231,6 +271,9 @@ pub struct AppConfig {
     pub tts: TtsConfig,
     #[serde(default)]
     pub enrichment: EnrichmentConfig,
+    /// Speech-to-text configuration (#42). Absent key reads as [`AsrConfig::default`].
+    #[serde(default)]
+    pub asr: AsrConfig,
     /// SPA JS-render fallback (#78). Defaults to `true`; absent key reads as `true`.
     #[serde(default = "default_js_render_enabled")]
     pub js_render_enabled: bool,
@@ -256,6 +299,7 @@ impl Default for AppConfig {
             voices: VoiceConfig::default(),
             tts: TtsConfig::default(),
             enrichment: EnrichmentConfig::default(),
+            asr: AsrConfig::default(),
             js_render_enabled: default_js_render_enabled(),
             reopen_last_notebook: default_reopen_last_notebook(),
             paths: PathConfig::default(),
@@ -547,6 +591,61 @@ mod tests {
         assert_eq!(AppConfig::default().tts, TtsConfig::default());
         assert_eq!(AppConfig::default().tts.provider, "");
         assert_eq!(AppConfig::default().tts.api_key, "");
+    }
+
+    #[test]
+    fn default_asr_is_router_decided() {
+        let asr = AppConfig::default().asr;
+        assert_eq!(asr.backend, "");
+        assert_eq!(asr.whisper_model, "base");
+        assert_eq!(asr.language, None);
+        assert!(!asr.translate);
+        assert_eq!(asr, AsrConfig::default());
+    }
+
+    #[test]
+    fn missing_asr_deserializes_to_default() {
+        let json = r#"{
+            "theme": "dark",
+            "accent": "purple",
+            "embedding_model": "",
+            "models": [],
+            "endpoints": {},
+            "voices": { "host": "", "guest": "" },
+            "paths": { "data_dir": "" },
+            "tier_thresholds": { "tier1_token_cap": 4000, "tier2_token_cap": 16000 },
+            "onboarding_complete": true
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.asr, AsrConfig::default());
+        assert_eq!(config.asr.whisper_model, "base");
+    }
+
+    #[test]
+    fn partial_asr_fills_whisper_model_default() {
+        let json = r#"{ "backend": "local_whisper" }"#;
+        let asr: AsrConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(asr.backend, "local_whisper");
+        assert_eq!(asr.whisper_model, "base");
+        assert_eq!(asr.language, None);
+        assert!(!asr.translate);
+    }
+
+    #[test]
+    fn explicit_asr_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = AppConfig {
+            asr: AsrConfig {
+                backend: "apple_native".to_string(),
+                whisper_model: "small".to_string(),
+                language: Some(Lang::De),
+                translate: true,
+            },
+            ..AppConfig::default()
+        };
+        config.save(dir.path()).unwrap();
+        let loaded = AppConfig::load(dir.path()).unwrap();
+        assert_eq!(loaded.asr, config.asr);
     }
 
     #[test]

@@ -29,9 +29,12 @@ pub mod tts;
 pub mod url_normalize;
 pub mod vector_store;
 
-pub use asr::{AsrBackend, AsrEngine, Lang, TranscribeConfig, TranscriptSegment};
 #[cfg(feature = "test-util")]
 pub use asr::MockAsrEngine;
+pub use asr::{
+    AsrBackend, AsrEngine, Lang, MIN_MACOS_FOR_APPLE_ASR, Platform, TranscribeConfig,
+    TranscriptSegment, select_asr_backend,
+};
 pub use config::{AppConfig, EnrichmentConfig, TaskModel};
 pub use embedder::{
     CountingEmbedder, DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, Embedder, EmbeddingBackend,
@@ -224,6 +227,11 @@ pub struct LensEngine {
     /// headless tests or before `src-tauri` wires `TauriJsRenderer`; degrades to
     /// `needs_js` when absent.
     js_renderer: Arc<RwLock<Option<Arc<dyn render::JsRenderer>>>>,
+    /// Injected Apple-native ASR engine (#42). `None` on non-Apple targets or
+    /// before src-tauri wires `AppleSpeechEngine`. Presence is the committed
+    /// `apple_available` signal: src-tauri pre-gates platform/version before
+    /// injecting, so the router treats mere presence as authoritative.
+    asr_engine: Arc<RwLock<Option<Arc<dyn asr::AsrEngine>>>>,
     /// In-memory catalog cache (fix #5). Populated lazily via `spawn_blocking`;
     /// invalidated by `refresh_model_catalog`. Outside the inner `RwLock` so a
     /// catalog load never serializes DB reads.
@@ -319,6 +327,7 @@ impl LensEngine {
             enrichment_tx,
             llm_provider: Arc::new(RwLock::new(None)),
             js_renderer: Arc::new(RwLock::new(None)),
+            asr_engine: Arc::new(RwLock::new(None)),
             catalog_cache: Arc::new(RwLock::new(None)),
             #[cfg(feature = "test-util")]
             enrichment_gate: Arc::new(RwLock::new(None)),
@@ -393,6 +402,7 @@ impl LensEngine {
             enrichment_tx,
             llm_provider: Arc::new(RwLock::new(None)),
             js_renderer: Arc::new(RwLock::new(None)),
+            asr_engine: Arc::new(RwLock::new(None)),
             catalog_cache: Arc::new(RwLock::new(None)),
             #[cfg(feature = "test-util")]
             enrichment_gate: Arc::new(RwLock::new(None)),
@@ -739,6 +749,69 @@ impl LensEngine {
     /// behavior).
     pub async fn js_renderer(&self) -> Option<Arc<dyn render::JsRenderer>> {
         self.js_renderer.read().await.clone()
+    }
+
+    /// Installs (or replaces) the Apple-native ASR engine (#42). `None` leaves the
+    /// engine absent, so [`transcribe`](Self::transcribe) routes to LocalWhisper.
+    /// The concrete `AppleSpeechEngine` is injected here because `lens-core` cannot
+    /// depend on `tauri`/Speech.framework; src-tauri pre-gates platform/version
+    /// before calling this, so presence is the authoritative `apple_available` signal.
+    pub async fn set_asr_engine(&self, engine: Option<Arc<dyn asr::AsrEngine>>) {
+        *self.asr_engine.write().await = engine;
+    }
+
+    /// Returns a clone of the injected Apple-native ASR engine, or `None` when
+    /// none is installed (LocalWhisper is then the routed backend).
+    pub async fn asr_engine(&self) -> Option<Arc<dyn asr::AsrEngine>> {
+        self.asr_engine.read().await.clone()
+    }
+
+    /// Transcribes 16 kHz mono f32 PCM (#41 output), selecting the backend via
+    /// [`select_asr_backend`](asr::select_asr_backend): an explicit `AsrConfig`
+    /// override wins, else the injected Apple engine when present, else LocalWhisper.
+    pub async fn transcribe(
+        &self,
+        pcm: &[f32],
+        config: &TranscribeConfig,
+        progress_tx: Option<mpsc::UnboundedSender<f32>>,
+    ) -> Result<Vec<TranscriptSegment>, LensError> {
+        let asr_cfg = self.read().await.config.asr.clone();
+        let config_backend = asr::AsrBackend::from_opt_str(Some(asr_cfg.backend.as_str()));
+
+        let injected = self.asr_engine().await;
+        let apple_available = injected.is_some();
+
+        // lens-core stays OS-probe-free: authoritative platform/version facts are
+        // enforced in src-tauri BEFORE injecting the engine, so a present engine
+        // implies a capable Apple platform. Derive Platform consistently with that
+        // seam rather than probing the OS here (no OS-probe crate in lens-core).
+        let platform = asr::Platform {
+            is_apple_silicon_macos: apple_available,
+            macos_major: apple_available.then_some(asr::MIN_MACOS_FOR_APPLE_ASR),
+        };
+        // TODO(#42 Unit 6): replace with the real Apple locale-support predicate.
+        let apple_supports_locale = true;
+
+        let backend = asr::select_asr_backend(
+            config_backend,
+            platform,
+            apple_available,
+            apple_supports_locale,
+        );
+
+        // The injected engine is the only externally-supplied seam (Apple in prod,
+        // a mock in tests); delegate to it whenever it is present. Only the
+        // internal LocalWhisper path with no injected engine is still unwired.
+        match (backend, injected) {
+            (_, Some(engine)) => engine.transcribe_pcm(pcm, config, progress_tx).await,
+            (asr::AsrBackend::AppleNative, None) => Err(LensError::Transcription(
+                "apple-native backend selected but no engine is injected".into(),
+            )),
+            // TODO(#42 Unit 5): build/cache the internal WhisperEngine here.
+            (asr::AsrBackend::LocalWhisper, None) => Err(LensError::Transcription(
+                "local whisper backend not yet wired (Unit 5)".into(),
+            )),
+        }
     }
 
     /// Non-blocking enqueue for background enrichment (AC3). Uses `try_send` so

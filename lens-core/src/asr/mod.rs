@@ -5,6 +5,10 @@
 //! Headless: no tauri/UI/OS-window deps. Input PCM is #41's 16 kHz mono f32.
 //! The Whisper engine, router, and registry arrive in later units.
 
+mod router;
+
+pub use router::{MIN_MACOS_FOR_APPLE_ASR, Platform, select_asr_backend};
+
 use serde::{Deserialize, Serialize};
 
 use crate::LensError;
