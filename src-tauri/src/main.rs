@@ -7,6 +7,15 @@
 // zero-runtime-cost fix (it only affects type-checking depth).
 #![recursion_limit = "256"]
 
+// The Apple-native ASR bridge (issue #42): `AppleSpeechEngine` (SpeechAnalyzer via
+// a Swift @_cdecl C ABI). aarch64-apple-darwin + `apple-native-asr` only; elsewhere
+// it compiles out and the router picks Whisper. `allow(dead_code)`: the DI wiring in
+// `main.rs` `.setup` lands in Unit 7, so its items are constructed-but-unused until
+// then (the gated `#[ignore]` bridge test exercises them under `cargo test`).
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "apple-native-asr"))]
+#[allow(dead_code)]
+mod asr;
+
 mod commands;
 // The offscreen SPA-render impl (issue #78). Its `TauriJsRenderer` is injected
 // into the engine in the `.setup` block below (Layer f), so its items are live.
