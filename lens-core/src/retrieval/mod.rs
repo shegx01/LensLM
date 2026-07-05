@@ -26,6 +26,11 @@ pub use rrf::RRF_K;
 /// to the caller's requested `pool` (k).
 pub const OVERFETCH: usize = 50;
 
+/// Upper bound on the per-path fetch, so a large caller `pool` can't drive an
+/// unbounded dense fetch + per-candidate hydrate (defensive; the router #21 caller
+/// is expected to pass a small k).
+pub const MAX_OVERFETCH: usize = 500;
+
 /// Which retrieval path(s) surfaced a fused hit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HitSource {
@@ -71,7 +76,7 @@ pub async fn hybrid_search(
     pool: usize,
     config: &RetrievalConfig,
 ) -> Result<Vec<RetrievalHit>, LensError> {
-    let overfetch = pool.max(OVERFETCH);
+    let overfetch = pool.clamp(OVERFETCH, MAX_OVERFETCH);
 
     // DENSE: search then post-filter out trashed sources (search scopes only by
     // notebook_id). Optional source_id/level narrowing is applied here too.
