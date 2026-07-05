@@ -89,9 +89,7 @@ pub fn resolve_max_source_bytes(cfg_value: &str) -> usize {
 /// `fetching → parsing → chunking → [model_download] → embedding → indexing → done`.
 pub(crate) mod ingest_phase {
     pub const FETCHING: &str = "fetching";
-    /// Audio decode+resample phase (issue #43), before transcription.
     pub const DECODING: &str = "decoding";
-    /// Audio transcription (ASR) phase (issue #43), after decode.
     pub const TRANSCRIBING: &str = "transcribing";
     pub const PARSING: &str = "parsing";
     pub const CHUNKING: &str = "chunking";
@@ -452,12 +450,10 @@ async fn run_audio_ingest(
     let token = engine.register_media_cancel(source_id);
     let _cancel_guard = MediaCancelGuard { engine, source_id };
 
-    // ── Decode phase ──────────────────────────────────────────────────────
-    // Heavy CPU work runs in `spawn_blocking`. Progress rides a BOUNDED channel
-    // (capacity 1): `blocking_send` blocks the decode thread once the buffer is
-    // full, so the async forwarder's drain rate paces decode — the rendezvous the
-    // cancel test relies on. `on_progress` is NOT `Send`, so it is only ever called
-    // on the async side, never inside the closure.
+    // Decode runs in `spawn_blocking`; progress rides a BOUNDED channel (capacity 1)
+    // so `blocking_send` back-pressures decode to the async drain rate — the rendezvous
+    // the cancel test relies on. `on_progress` is not `Send`, so it is called only on the
+    // async side, never inside the closure.
     let (decode_tx, mut decode_rx) = tokio::sync::mpsc::channel::<IngestProgress>(1);
     let path = PathBuf::from(&source.locator);
     let decode_token = token.clone();
@@ -512,16 +508,14 @@ async fn run_audio_ingest(
         .await
         .map_err(|e| LensError::Internal(format!("audio decode task panicked: {e}")))??;
 
-    // ── Cancel checkpoint before the (uninterruptible) transcribe call ──────
+    // Last cancel checkpoint — transcription itself is uninterruptible.
     if token.is_cancelled() {
         return Err(LensError::Cancelled(
             "audio ingest cancelled before transcription".into(),
         ));
     }
 
-    // ── Transcribe phase ───────────────────────────────────────────────────
-    // A SEPARATE unbounded f32 channel — the exact type `transcribe` expects.
-    // A forwarder maps ASR progress (0..1) into the `transcribing` phase.
+    // Separate unbounded f32 channel; a forwarder maps ASR progress into the transcribing phase.
     on_progress(IngestProgress::new(
         ingest_phase::TRANSCRIBING,
         0,
@@ -551,7 +545,6 @@ async fn run_audio_ingest(
         ));
     }
 
-    // ── Build blocks and route through the shared index tail ────────────────
     // `parse_blocks(.., Text)` preserves the byte-identity invariant (never
     // hand-construct a Block); anchors are index-aligned per block.
     let transcript = segments
