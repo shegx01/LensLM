@@ -149,33 +149,50 @@ pub async fn ingest_source(
 
         let result = run_ingest(engine, source_id, on_progress).await;
 
-        // On failure, flip to `error` and persist a structured `error_meta` snapshot (#73)
-        // with incremented attempt_count. A missing/cascade-deleted row is a no-op (R10).
         if let Err(err) = &result {
             let pool = engine.pool().await;
             let repo = crate::notebooks::NotebookRepo::new(&pool);
-            let prior_attempts = repo
-                .get_source(source_id)
-                .await
-                .ok()
-                .flatten()
-                .and_then(|s| s.error_meta)
-                .and_then(|json| serde_json::from_str::<crate::error::ErrorMeta>(&json).ok())
-                .map(|m| m.attempt_count)
-                .unwrap_or(0);
-            let meta = crate::error::ErrorMeta::from_error(err, prior_attempts.saturating_add(1));
-            tracing::error!(
-                source_id,
-                kind = %meta.kind,
-                attempt_count = meta.attempt_count,
-                "ingest failed: {}",
-                meta.message
-            );
-            if let Err(e) = repo.set_source_error(source_id, &meta).await {
-                tracing::warn!(
+            if matches!(err, LensError::Cancelled(_)) {
+                if let Err(e) = repo
+                    .update_source_status(
+                        source_id,
+                        crate::notebooks::SourceStatus::Queued.as_str(),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        source_id,
+                        "failed to reset source to queued after cancel: {e}"
+                    );
+                }
+                if let Err(e) = repo.clear_source_error_meta(source_id).await {
+                    tracing::warn!(source_id, "failed to clear error_meta after cancel: {e}");
+                }
+            } else {
+                let prior_attempts = repo
+                    .get_source(source_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|s| s.error_meta)
+                    .and_then(|json| serde_json::from_str::<crate::error::ErrorMeta>(&json).ok())
+                    .map(|m| m.attempt_count)
+                    .unwrap_or(0);
+                let meta =
+                    crate::error::ErrorMeta::from_error(err, prior_attempts.saturating_add(1));
+                tracing::error!(
                     source_id,
-                    "failed to mark source as error after ingest failure: {e}"
+                    kind = %meta.kind,
+                    attempt_count = meta.attempt_count,
+                    "ingest failed: {}",
+                    meta.message
                 );
+                if let Err(e) = repo.set_source_error(source_id, &meta).await {
+                    tracing::warn!(
+                        source_id,
+                        "failed to mark source as error after ingest failure: {e}"
+                    );
+                }
             }
         }
 
@@ -749,7 +766,22 @@ impl IngestContext<'_> {
             // Feed rendered HTML through the same extractor. The ratio arm is NOT reused
             // (no faithful raw-bytes denominator for a JS-rendered SPA outerHTML).
             if let Some(html) = rendered {
-                // Render-branch extract failure also maps to render_failed (not `error`).
+                if html.len() > self.max_source_bytes {
+                    let _guard = span.enter();
+                    tracing::warn!(
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        outcome = "render_failed",
+                        rendered_len = html.len(),
+                        max_source_bytes = self.max_source_bytes,
+                        "rendered HTML exceeds byte cap; setting render_failed"
+                    );
+                    drop(_guard);
+                    self.set_terminal_pending(
+                        crate::notebooks::SourceStatus::RenderFailed.as_str(),
+                    )
+                    .await?;
+                    return Ok(JsRenderOutcome::Handled);
+                }
                 let rendered_out = match crate::extract::url::UrlExtractor.extract(html.as_bytes())
                 {
                     Ok(o) => o,

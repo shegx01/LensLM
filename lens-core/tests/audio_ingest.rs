@@ -103,11 +103,6 @@ async fn audio_ingest_end_to_end_indexed_and_searchable() {
     );
 }
 
-/// AC6: cancelling mid-decode returns `Err(Cancelled)` — status `error`,
-/// `error_meta.kind = "Cancelled"`, no chunks persisted, registry entry removed.
-/// Determinism: the bounded channel (capacity 1) blocks the decode thread after
-/// window 1; the test cancels while the thread is blocked, guaranteeing the
-/// cancel path is reached. The ≥ 61 s fixture ensures ≥ 3 windows.
 #[tokio::test]
 async fn audio_ingest_cancel_is_deterministic() {
     let (dir, engine) = inject_counting_engine().await;
@@ -128,6 +123,16 @@ async fn audio_ingest_cancel_is_deterministic() {
         .source;
     let source_id = src.id.clone();
 
+    {
+        let pool = engine.pool().await;
+        sqlx::query("UPDATE sources SET error_meta = ? WHERE id = ?")
+            .bind(r#"{"kind":"Network","message":"prior failure","attempt_count":1}"#)
+            .bind(&source_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
     let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
     let mut started_tx = Some(started_tx);
 
@@ -145,8 +150,6 @@ async fn audio_ingest_cancel_is_deterministic() {
             .await
     });
 
-    // Wait until decode has emitted its first window (closure now blocked on the
-    // next bounded `blocking_send`), then flip the cancellation token.
     started_rx.await.expect("decode should emit a first window");
     assert!(
         engine.cancel_media_ingest(&source_id),
@@ -163,13 +166,14 @@ async fn audio_ingest_cancel_is_deterministic() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(row.get::<String, _>("status"), "error");
-    let meta_json: String = row
-        .get::<Option<String>, _>("error_meta")
-        .expect("error_meta set");
+    assert_eq!(
+        row.get::<String, _>("status"),
+        "queued",
+        "a cancelled ingest must reset status to queued, not error"
+    );
     assert!(
-        meta_json.contains("\"kind\":\"Cancelled\""),
-        "error_meta.kind must be Cancelled: {meta_json}"
+        row.get::<Option<String>, _>("error_meta").is_none(),
+        "a cancel must clear error_meta, even one left by a prior failed attempt"
     );
 
     let chunk_count: i64 = sqlx::query("SELECT COUNT(*) AS c FROM chunks WHERE source_id = ?")

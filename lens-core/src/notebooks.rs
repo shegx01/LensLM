@@ -1182,57 +1182,46 @@ impl<'a> NotebookRepo<'a> {
         Ok(())
     }
 
-    /// Restores a trashed source. Rejects the restore if another live source in
-    /// the same notebook already has the same `raw_content_hash` (#100), giving a
-    /// clear validation error instead of a raw UNIQUE-constraint failure.
     pub async fn restore_source(&self, id: &str) -> Result<(), LensError> {
-        if let Some(row) = sqlx::query_as::<_, (Option<String>, String)>(
-            "SELECT raw_content_hash, notebook_id FROM sources \
-             WHERE id = ? AND trashed_at IS NOT NULL",
-        )
-        .bind(id)
-        .fetch_optional(self.pool)
-        .await?
-        {
-            let (raw_content_hash, notebook_id) = row;
-            if let Some(hash) = raw_content_hash {
-                let collision = sqlx::query_scalar::<_, String>(
-                    "SELECT id FROM sources \
-                     WHERE notebook_id = ? AND raw_content_hash = ? \
-                       AND trashed_at IS NULL AND id != ? LIMIT 1",
-                )
-                .bind(&notebook_id)
-                .bind(&hash)
-                .bind(id)
-                .fetch_optional(self.pool)
-                .await?;
-                if let Some(existing_id) = collision {
-                    tracing::warn!(
-                        notebook_id = %notebook_id,
-                        raw_content_hash = %hash,
-                        restoring_id = %id,
-                        existing_id = %existing_id,
-                        "restore blocked — a live source with identical content already exists"
-                    );
-                    return Err(LensError::Validation(
-                        "a source with this content already exists in the notebook".into(),
-                    ));
-                }
-            }
-        }
-
         let result = sqlx::query(
-            "UPDATE sources SET trashed_at = NULL WHERE id = ? AND trashed_at IS NOT NULL",
+            "UPDATE sources SET trashed_at = NULL \
+             WHERE id = ? AND trashed_at IS NOT NULL \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM sources live \
+                 WHERE live.notebook_id = sources.notebook_id \
+                   AND live.raw_content_hash = sources.raw_content_hash \
+                   AND live.trashed_at IS NULL \
+                   AND live.id != sources.id \
+               )",
         )
         .bind(id)
         .execute(self.pool)
         .await?;
-        if result.rows_affected() == 0 {
-            return Err(LensError::Validation(format!(
-                "no trashed source with id {id}"
-            )));
+
+        if result.rows_affected() > 0 {
+            return Ok(());
         }
-        Ok(())
+
+        let still_trashed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sources WHERE id = ? AND trashed_at IS NOT NULL",
+        )
+        .bind(id)
+        .fetch_one(self.pool)
+        .await?;
+
+        if still_trashed > 0 {
+            tracing::warn!(
+                restoring_id = %id,
+                "restore blocked — a live source with identical content already exists"
+            );
+            return Err(LensError::Validation(
+                "a source with this content already exists in the notebook".into(),
+            ));
+        }
+
+        Err(LensError::Validation(format!(
+            "no trashed source with id {id}"
+        )))
     }
 
     /// Permanently deletes a trashed source. Child `chunks` cascade via

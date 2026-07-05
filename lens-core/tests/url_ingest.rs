@@ -1488,3 +1488,62 @@ async fn js_render_provenance_blocked_render_failed_writes_nothing() {
         "provenance-blocked render must write zero vectors"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn js_render_over_cap_html_maps_to_render_failed() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/spa"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(js_shell_html())
+                .insert_header("content-type", "text/html; charset=utf-8"),
+        )
+        .mount(&mock)
+        .await;
+
+    let (_dir, engine) = file_engine().await;
+    inject_fake_embedder(&engine);
+
+    let mut cfg = engine.config().await;
+    cfg.max_source_mb = "1".to_string();
+    engine.set_config(cfg).await;
+
+    let over_cap_html = "x".repeat(1024 * 1024 + 1);
+    inject_fake_renderer(&engine, Some(over_cap_html));
+
+    let nb = engine
+        .create_notebook("NB-render-cap", None, None)
+        .await
+        .expect("notebook");
+    let source = engine
+        .add_url_source(&nb.id, "spa-cap", &format!("{}/spa", mock.uri()), false)
+        .await
+        .expect("add_url_source")
+        .source;
+
+    let (result, _events) = ingest_collecting_progress(&engine, &source.id).await;
+    assert!(
+        result.is_ok(),
+        "over-cap rendered HTML must map to render_failed (Ok), not Err: {result:?}"
+    );
+
+    let pool = engine.pool().await;
+    let repo = lens_core::notebooks::NotebookRepo::new(&pool);
+    let updated = repo.get_source(&source.id).await.unwrap().unwrap();
+    assert_eq!(
+        updated.status, "render_failed",
+        "rendered HTML over the byte cap must set render_failed (got {:?})",
+        updated.status
+    );
+
+    let chunk_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE source_id = ?")
+        .bind(&source.id)
+        .fetch_one(&pool)
+        .await
+        .expect("count chunks");
+    assert_eq!(
+        chunk_count, 0,
+        "over-cap rendered HTML must produce zero chunks"
+    );
+}
