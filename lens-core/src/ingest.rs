@@ -545,21 +545,7 @@ async fn run_audio_ingest(
         ));
     }
 
-    // `parse_blocks(.., Text)` preserves the byte-identity invariant (never
-    // hand-construct a Block); anchors are index-aligned per block.
-    let transcript = segments
-        .iter()
-        .map(|s| s.text.as_str())
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    let blocks = crate::parse::parse_blocks(&transcript, crate::parse::SourceKind::Text);
-    let anchors = vec![crate::extract::SourceAnchor::Text; blocks.len()];
-    let out = crate::extract::ExtractOutput {
-        extracted_text: transcript,
-        blocks,
-        anchors,
-        table_markdown: None,
-    };
+    let out = transcript_extract_output(&segments)?;
 
     let ctx = IngestContext {
         engine,
@@ -573,6 +559,58 @@ async fn run_audio_ingest(
         max_source_bytes,
     };
     ctx.index_extract_output(raw, out, &mut on_progress).await
+}
+
+/// Builds a canonical [`ExtractOutput`] directly from transcript segments (issue
+/// #44): one [`Block`] per [`TranscriptSegment`] with an index-aligned
+/// [`SourceAnchor::Audio`], never routed through `parse_blocks`.
+///
+/// The canonical buffer is the segment texts joined with `SEG_SEP`; each block's
+/// `char_start..char_end` indexes into it byte-identically. Empty input yields an
+/// empty output (zero blocks/chunks). Non-finite timestamps are rejected so a
+/// poisoned value never reaches the `[min,max]` aggregation in
+/// `attach_anchors_to_chunks`.
+fn transcript_extract_output(
+    segments: &[crate::asr::TranscriptSegment],
+) -> Result<crate::extract::ExtractOutput, LensError> {
+    const SEG_SEP: &str = "\n\n";
+
+    let mut extracted_text = String::new();
+    let mut blocks: Vec<crate::parse::Block> = Vec::with_capacity(segments.len());
+    let mut anchors: Vec<crate::extract::SourceAnchor> = Vec::with_capacity(segments.len());
+
+    for (i, seg) in segments.iter().enumerate() {
+        if !seg.start_second.is_finite() || !seg.end_second.is_finite() {
+            return Err(LensError::Parse(format!(
+                "transcript segment {i} has a non-finite timestamp"
+            )));
+        }
+        if i > 0 {
+            extracted_text.push_str(SEG_SEP);
+        }
+        let char_start = extracted_text.len();
+        extracted_text.push_str(&seg.text);
+        let char_end = extracted_text.len();
+
+        blocks.push(crate::parse::Block {
+            block_type: crate::parse::BlockType::Paragraph.as_str().to_string(),
+            section_path: String::new(),
+            text: seg.text.clone(),
+            char_start,
+            char_end,
+        });
+        anchors.push(crate::extract::SourceAnchor::Audio {
+            start_second: seg.start_second,
+            end_second: seg.end_second,
+        });
+    }
+
+    Ok(crate::extract::ExtractOutput {
+        extracted_text,
+        blocks,
+        anchors,
+        table_markdown: None,
+    })
 }
 
 /// Outcome of the URL JS-render gate. `Handled` means a terminal status was set and the
@@ -857,7 +895,7 @@ impl IngestContext<'_> {
             .map(|c| c.token_end - c.token_start)
             .sum();
 
-        attach_anchors_to_chunks(&mut chunks, blocks, &out.anchors);
+        attach_anchors_to_chunks(&mut chunks, blocks, &out.anchors)?;
 
         on_progress(IngestProgress::new(
             ingest_phase::CHUNKING,
@@ -1581,38 +1619,73 @@ async fn insert_chunk_batch(
     Ok(())
 }
 
-/// Assigns a JSON-serialized [`SourceAnchor`] to each chunk: the anchor of the last block
-/// whose `char_start ≤ chunk.char_start` (same dominance rule as `block_type`/`section_path`).
-/// `blocks` and `anchors` must be index-aligned; unmatched chunks keep `source_anchor = None`.
+/// Assigns a JSON-serialized [`SourceAnchor`] to each chunk. `blocks` and `anchors`
+/// are index-aligned; unmatched chunks keep `source_anchor = None`.
+///
+/// - **Audio** (issue #44): a chunk collects every block whose `char_start` falls in
+///   `[chunk.char_start, chunk.char_end)` and derives `Audio { min(start), max(end) }`
+///   over them, so a multi-segment chunk covers all its segments.
+/// - **All other kinds:** the anchor of the last block whose `char_start ≤
+///   chunk.char_start` (same dominance rule as `block_type`/`section_path`).
+///
+/// A `blocks.len() != anchors.len()` mismatch is silent data loss (dropped audio
+/// timestamps), so it is a hard error rather than a skip.
 fn attach_anchors_to_chunks(
     chunks: &mut [crate::chunk::Chunk],
     blocks: &[crate::parse::Block],
     anchors: &[crate::extract::SourceAnchor],
-) {
+) -> Result<(), LensError> {
     if anchors.is_empty() || blocks.is_empty() {
-        return;
+        return Ok(());
     }
-    // Guard: mis-aligned slice would produce wrong anchors — skip silently.
     if anchors.len() != blocks.len() {
-        tracing::warn!(
-            "attach_anchors_to_chunks: anchors.len()={} != blocks.len()={}; skipping anchor attachment",
+        return Err(LensError::Internal(format!(
+            "attach_anchors_to_chunks: anchors.len()={} != blocks.len()={}",
             anchors.len(),
             blocks.len()
-        );
-        return;
+        )));
     }
     for chunk in chunks.iter_mut() {
         let cs = chunk.char_start as usize;
-        let anchor = blocks
-            .iter()
-            .zip(anchors.iter())
-            .rev()
-            .find(|(b, _)| b.char_start <= cs)
-            .map(|(_, a)| a);
+        let ce = chunk.char_end as usize;
+
+        // Aggregate the Audio timestamps of every block the chunk textually covers.
+        let mut audio_range: Option<(f32, f32)> = None;
+        for (b, a) in blocks.iter().zip(anchors.iter()) {
+            if b.char_start >= cs
+                && b.char_start < ce
+                && let crate::extract::SourceAnchor::Audio {
+                    start_second,
+                    end_second,
+                } = a
+            {
+                audio_range = Some(match audio_range {
+                    Some((lo, hi)) => (lo.min(*start_second), hi.max(*end_second)),
+                    None => (*start_second, *end_second),
+                });
+            }
+        }
+
+        let anchor = if let Some((start_second, end_second)) = audio_range {
+            Some(crate::extract::SourceAnchor::Audio {
+                start_second,
+                end_second,
+            })
+        } else {
+            // Non-Audio: last block whose char_start ≤ chunk.char_start wins.
+            blocks
+                .iter()
+                .zip(anchors.iter())
+                .rev()
+                .find(|(b, _)| b.char_start <= cs)
+                .map(|(_, a)| a.clone())
+        };
+
         if let Some(a) = anchor {
-            chunk.source_anchor = serde_json::to_string(a).ok();
+            chunk.source_anchor = serde_json::to_string(&a).ok();
         }
     }
+    Ok(())
 }
 
 /// Emits a `model_download` progress event when the tokenizer is absent from disk

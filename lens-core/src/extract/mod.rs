@@ -46,6 +46,9 @@ pub enum SourceAnchor {
     Odt { node_path: String },
     /// EPUB spine index and content-document href. `u64` for target-independent wire shape.
     Epub { spine_index: u64, href: String },
+    /// Transcript timestamps (seconds) for an audio/video source (issue #44). A
+    /// chunk spanning multiple segments carries `[min start, max end]` over them.
+    Audio { start_second: f32, end_second: f32 },
 }
 
 /// Canonical extraction result for a single source.
@@ -451,6 +454,29 @@ mod tests {
             })
             .unwrap(),
             r#"{"kind":"Epub","spine_index":2,"href":"OEBPS/chapter1.xhtml"}"#
+        );
+    }
+
+    #[test]
+    fn source_anchor_audio_roundtrips_through_serde_json() {
+        let a = SourceAnchor::Audio {
+            start_second: 12.5,
+            end_second: 47.25,
+        };
+        let json = serde_json::to_string(&a).expect("serialize audio anchor");
+        let back: SourceAnchor = serde_json::from_str(&json).expect("deserialize audio anchor");
+        assert_eq!(a, back, "Audio anchor must round-trip through serde_json");
+    }
+
+    #[test]
+    fn source_anchor_audio_wire_shape() {
+        assert_eq!(
+            serde_json::to_string(&SourceAnchor::Audio {
+                start_second: 1.5,
+                end_second: 2.25,
+            })
+            .unwrap(),
+            r#"{"kind":"Audio","start_second":1.5,"end_second":2.25}"#
         );
     }
 
