@@ -24,6 +24,7 @@ pub mod model_catalog;
 pub mod notebooks;
 pub mod parse;
 pub mod render;
+pub mod retrieval;
 pub mod system_check;
 pub mod transcription;
 pub mod tts;
@@ -41,7 +42,10 @@ pub use asr::{
     download_whisper_model, resolve_whisper, select_asr_backend, whisper_model_downloaded,
     whisper_model_path,
 };
-pub use config::{AppConfig, CloudAsrProvider, EnrichmentConfig, TaskModel};
+pub use config::{
+    AppConfig, CloudAsrProvider, EnrichmentConfig, RerankerConfig, RerankerModel, RetrievalConfig,
+    TaskModel,
+};
 pub use embedder::{
     CountingEmbedder, DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, Embedder, EmbeddingBackend,
     EmbeddingModelSpec, FastembedEmbedder, OllamaEmbedder, REGISTRY, resolve, resolve_opt,
@@ -68,6 +72,7 @@ pub use notebooks::{
     Source, TrashedSource,
 };
 pub use render::JsRenderer;
+pub use retrieval::{HitSource, Reranker, RetrievalHit, hybrid_search};
 pub use system_check::{
     ALLOWED_EMBEDDING_MODELS, CheckAction, CheckId, CheckResult, CheckStatus, LlmDetection,
     ModelValidation, detect_llm, fastembed_weights_cached, is_allowlisted_embedding_id,

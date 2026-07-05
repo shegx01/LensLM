@@ -1237,16 +1237,29 @@ impl<'a> NotebookRepo<'a> {
 
     /// Permanently deletes a trashed source. Child `chunks` cascade via
     /// `ON DELETE CASCADE`. Callers must remove Lance vectors first.
+    ///
+    /// FTS hygiene (#39): explicitly delete the source's `chunks_fts` rows in the
+    /// SAME txn (FK-cascade won't fire the AFTER DELETE trigger; see migration 0013).
     pub async fn purge_source(&self, id: &str) -> Result<(), LensError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "DELETE FROM chunks_fts \
+             WHERE chunk_id IN (SELECT id FROM chunks WHERE source_id = ?)",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
         let result = sqlx::query("DELETE FROM sources WHERE id = ? AND trashed_at IS NOT NULL")
             .bind(id)
-            .execute(self.pool)
+            .execute(&mut *tx)
             .await?;
         if result.rows_affected() == 0 {
+            tx.rollback().await?;
             return Err(LensError::Validation(format!(
                 "no trashed source with id {id}"
             )));
         }
+        tx.commit().await?;
         Ok(())
     }
 

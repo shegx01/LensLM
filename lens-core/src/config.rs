@@ -274,6 +274,71 @@ impl Default for TierThresholds {
     }
 }
 
+/// Cross-encoder reranker model (issue #39). An ENUM, not a magic string —
+/// following the workspace "enums over strings" rule. Only the MIT-licensed
+/// `BgeRerankerBase` is surfaced for the MVP (the v2-m3 mirror is out of scope).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RerankerModel {
+    /// BGE reranker base (MIT). The default and only surfaced model.
+    #[default]
+    BgeRerankerBase,
+}
+
+/// Serde default for [`RerankerConfig::timeout_ms`] (3s).
+fn default_reranker_timeout_ms() -> u64 {
+    3_000
+}
+
+/// Opt-in cross-encoder reranker (issue #39). `enabled=false` by default — the
+/// reranker is a strictly optional accelerator; the RRF query path is correct
+/// and fast without it. Every field is `#[serde(default)]` so an old `config.json`
+/// lacking the key (or a sub-field) deserializes to defaults.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RerankerConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub model: RerankerModel,
+    #[serde(default = "default_reranker_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+impl Default for RerankerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: RerankerModel::default(),
+            timeout_ms: default_reranker_timeout_ms(),
+        }
+    }
+}
+
+/// Serde default for [`RetrievalConfig::hybrid_enabled`] (`true`).
+fn default_hybrid_enabled() -> bool {
+    true
+}
+
+/// Hybrid-retrieval configuration (issue #39). Additive `#[serde(default)]` struct;
+/// an absent `retrieval` key in an old `config.json` reads back as this default.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RetrievalConfig {
+    /// Fuse dense + BM25 via RRF. `false` degrades to dense-only. Defaults `true`.
+    #[serde(default = "default_hybrid_enabled")]
+    pub hybrid_enabled: bool,
+    #[serde(default)]
+    pub reranker: RerankerConfig,
+}
+
+impl Default for RetrievalConfig {
+    fn default() -> Self {
+        Self {
+            hybrid_enabled: default_hybrid_enabled(),
+            reranker: RerankerConfig::default(),
+        }
+    }
+}
+
 const DEFAULT_ACCENT: &str = "purple";
 
 /// Serde default: configs without an `accent` key read back as `"purple"`.
@@ -321,6 +386,10 @@ pub struct AppConfig {
     /// Speech-to-text configuration (#42). Absent key reads as [`AsrConfig::default`].
     #[serde(default)]
     pub asr: AsrConfig,
+    /// Hybrid-retrieval configuration (#39). Absent key reads as
+    /// [`RetrievalConfig::default`] (hybrid on, reranker off).
+    #[serde(default)]
+    pub retrieval: RetrievalConfig,
     /// Explicit consent to upload raw audio to a cloud ASR provider (#45). A NEW
     /// flag, SEPARATE from `EnrichmentConfig::cloud_consent` (audio is more
     /// sensitive than text). Cloud ASR is refused (falls back to local) unless true.
@@ -352,6 +421,7 @@ impl Default for AppConfig {
             tts: TtsConfig::default(),
             enrichment: EnrichmentConfig::default(),
             asr: AsrConfig::default(),
+            retrieval: RetrievalConfig::default(),
             audio_cloud_consent: false,
             js_render_enabled: default_js_render_enabled(),
             reopen_last_notebook: default_reopen_last_notebook(),
@@ -1011,6 +1081,82 @@ mod tests {
             config.js_render_enabled,
             "absent js_render_enabled key must read back as true"
         );
+    }
+
+    #[test]
+    fn default_retrieval_is_hybrid_on_reranker_off() {
+        let r = AppConfig::default().retrieval;
+        assert!(r.hybrid_enabled, "hybrid retrieval defaults ON");
+        assert!(!r.reranker.enabled, "reranker defaults OFF (opt-in)");
+        assert_eq!(r.reranker.model, RerankerModel::BgeRerankerBase);
+        assert_eq!(r.reranker.timeout_ms, 3_000);
+        assert_eq!(r, RetrievalConfig::default());
+    }
+
+    #[test]
+    fn missing_retrieval_deserializes_to_default() {
+        let json = r#"{
+            "theme": "dark",
+            "accent": "purple",
+            "embedding_model": "",
+            "models": [],
+            "endpoints": {},
+            "voices": { "host": "", "guest": "" },
+            "paths": { "data_dir": "" },
+            "tier_thresholds": { "tier1_token_cap": 4000, "tier2_token_cap": 16000 },
+            "onboarding_complete": true
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.retrieval, RetrievalConfig::default());
+        assert!(config.retrieval.hybrid_enabled);
+        assert!(!config.retrieval.reranker.enabled);
+    }
+
+    #[test]
+    fn partial_retrieval_fills_sub_field_defaults() {
+        // An old config with `reranker.enabled` set but no `timeout_ms`/`model`
+        // fills the missing sub-fields from defaults.
+        let json = r#"{ "reranker": { "enabled": true } }"#;
+        let r: RetrievalConfig = serde_json::from_str(json).unwrap();
+        assert!(r.hybrid_enabled, "absent hybrid_enabled reads back true");
+        assert!(r.reranker.enabled);
+        assert_eq!(r.reranker.model, RerankerModel::BgeRerankerBase);
+        assert_eq!(r.reranker.timeout_ms, 3_000);
+    }
+
+    #[test]
+    fn reranker_model_serializes_to_stable_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&RerankerModel::BgeRerankerBase).unwrap(),
+            "\"bge_reranker_base\""
+        );
+        let m: RerankerModel = serde_json::from_str("\"bge_reranker_base\"").unwrap();
+        assert_eq!(m, RerankerModel::BgeRerankerBase);
+    }
+
+    #[test]
+    fn explicit_retrieval_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = AppConfig {
+            retrieval: RetrievalConfig {
+                hybrid_enabled: false,
+                reranker: RerankerConfig {
+                    enabled: true,
+                    model: RerankerModel::BgeRerankerBase,
+                    timeout_ms: 1_500,
+                },
+            },
+            ..AppConfig::default()
+        };
+        config.save(dir.path()).unwrap();
+        let loaded = AppConfig::load(dir.path()).unwrap();
+        assert_eq!(loaded.retrieval, config.retrieval);
+        assert!(!loaded.retrieval.hybrid_enabled);
+        assert!(loaded.retrieval.reranker.enabled);
+        assert_eq!(loaded.retrieval.reranker.timeout_ms, 1_500);
+
+        let on_disk = std::fs::read_to_string(dir.path().join(CONFIG_FILE_NAME)).unwrap();
+        assert!(on_disk.contains("\"model\": \"bge_reranker_base\""));
     }
 
     #[test]

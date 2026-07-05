@@ -72,6 +72,7 @@
 //! cargo run -p lens-core --bin eval               # raw recall@5 on the main corpus, exit 0/1
 //! cargo run -p lens-core --bin eval -- --enriched # three-way A/B/C on all corpora + gates
 //! cargo run -p lens-core --bin eval -- --print-ids  # dump deterministic ids per doc
+//! cargo run -p lens-core --bin eval -- --hybrid    # AC1: hybrid vs vector-only recall@5 (#39)
 //! ```
 
 use std::collections::HashMap;
@@ -79,6 +80,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use lens_core::chunk::{Chunk, chunk_blocks_deterministic};
+use lens_core::config::RetrievalConfig;
 use lens_core::embedder::{
     DEFAULT_EMBED_MODEL_ID, Embedder, EmbeddingBackend, FastembedEmbedder, OllamaEmbedder,
 };
@@ -86,6 +88,7 @@ use lens_core::enrichment::{
     CorefSub, apply_substitutions, compose_embedding_text, compose_prefix,
 };
 use lens_core::parse::{SourceKind, parse_blocks};
+use lens_core::retrieval::{Reranker, hybrid_search};
 use lens_core::vector_store::{LanceVectorStore, VectorRow, VectorStore};
 use lens_core::{EmbeddingModelSpec, LensEngine, LensError};
 use serde::Deserialize;
@@ -146,6 +149,7 @@ async fn main() -> ExitCode {
 async fn run() -> Result<ExitCode, LensError> {
     let fixtures_dir = eval_fixtures_dir();
     let enriched_mode = std::env::args().any(|a| a == "--enriched");
+    let hybrid_mode = std::env::args().any(|a| a == "--hybrid");
 
     let model_id: String = {
         let args: Vec<String> = std::env::args().collect();
@@ -190,9 +194,11 @@ async fn run() -> Result<ExitCode, LensError> {
         let main = load_corpus(&fixtures_dir, MAIN_DOCS)?;
         let pronoun = load_corpus(&fixtures_dir, PRONOUN_DOCS)?;
         let coref = load_corpus(&fixtures_dir, COREF_DOCS)?;
+        let lexical = load_corpus(&fixtures_dir, LEXICAL_DOCS)?;
         print_ids(&main, &tokenizer, "main")?;
         print_ids(&pronoun, &tokenizer, "pronoun")?;
         print_ids(&coref, &tokenizer, "coref")?;
+        print_ids(&lexical, &tokenizer, "lexical")?;
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -225,6 +231,19 @@ async fn run() -> Result<ExitCode, LensError> {
 
     let main_docs = load_corpus(&fixtures_dir, MAIN_DOCS)?;
     let main_queries = load_queries(&fixtures_dir, "queries.json")?;
+
+    if hybrid_mode {
+        return run_hybrid_gate(
+            embedder,
+            backend,
+            &tokenizer,
+            &fixtures_dir,
+            spec,
+            &main_docs,
+            &main_queries,
+        )
+        .await;
+    }
 
     if !enriched_mode {
         println!("\n############ MAIN CORPUS — RAW ############");
@@ -657,6 +676,214 @@ fn report_recall(label: &str, hits: usize, total: usize) {
     println!("recall@{K}    : {recall:.4}");
 }
 
+/// AC1 hybrid gate (#39): asserts hybrid (dense+BM25/RRF) recall@5 STRICTLY exceeds
+/// vector-only recall@5 on the lexical fixture, and does not regress on the main
+/// corpus. Uses the raw-text embedding path (the retrieval floor #21 builds on).
+#[allow(clippy::too_many_arguments)]
+async fn run_hybrid_gate(
+    embedder: &dyn Embedder,
+    backend: EmbeddingBackend,
+    tokenizer: &Tokenizer,
+    fixtures_dir: &Path,
+    spec: &'static EmbeddingModelSpec,
+    main_docs: &[Doc],
+    main_queries: &[Query],
+) -> Result<ExitCode, LensError> {
+    let lexical_docs = load_corpus(fixtures_dir, LEXICAL_DOCS)?;
+    let lexical_queries = load_queries(fixtures_dir, "lexical_queries.json")?;
+
+    // Each corpus runs on its OWN engine/db: deterministic chunk ids are
+    // content-derived (notebook-independent), so docs shared as distractors would
+    // collide on the global `chunks` PK if two passes shared one database.
+    println!("\n############ LEXICAL FIXTURE (hybrid-lift gate) ############");
+    let (lex_dense, lex_hybrid) = measure_hybrid(
+        embedder,
+        backend,
+        tokenizer,
+        &lexical_docs,
+        &lexical_queries,
+        spec,
+    )
+    .await?;
+    report_recall("vector-only", lex_dense.hits, lex_dense.total);
+    report_recall("hybrid", lex_hybrid.hits, lex_hybrid.total);
+
+    println!("\n############ MAIN CORPUS (no-regression gate) ############");
+    let (main_dense, main_hybrid) =
+        measure_hybrid(embedder, backend, tokenizer, main_docs, main_queries, spec).await?;
+    report_recall("vector-only", main_dense.hits, main_dense.total);
+    report_recall("hybrid", main_hybrid.hits, main_hybrid.total);
+
+    println!("\n=================== AC1 GATES ===================");
+    println!(
+        "lexical: vector-only {:.4}  hybrid {:.4}",
+        lex_dense.recall(),
+        lex_hybrid.recall()
+    );
+    println!(
+        "main   : vector-only {:.4}  hybrid {:.4}",
+        main_dense.recall(),
+        main_hybrid.recall()
+    );
+
+    let mut failed = false;
+    if lex_hybrid.recall() <= lex_dense.recall() + 1e-6 {
+        eprintln!(
+            "\nFAIL [hybrid-lift]: lexical hybrid recall@{K} {:.4} does NOT exceed vector-only {:.4}",
+            lex_hybrid.recall(),
+            lex_dense.recall()
+        );
+        failed = true;
+    } else {
+        println!(
+            "PASS [hybrid-lift]: lexical hybrid {:.4} > vector-only {:.4}",
+            lex_hybrid.recall(),
+            lex_dense.recall()
+        );
+    }
+    if main_hybrid.recall() + 1e-6 < main_dense.recall() {
+        eprintln!(
+            "\nFAIL [no-regression]: main hybrid recall@{K} {:.4} < vector-only {:.4}",
+            main_hybrid.recall(),
+            main_dense.recall()
+        );
+        failed = true;
+    } else {
+        println!(
+            "PASS [no-regression]: main hybrid {:.4} >= vector-only {:.4}",
+            main_hybrid.recall(),
+            main_dense.recall()
+        );
+    }
+
+    if failed {
+        return Ok(ExitCode::FAILURE);
+    }
+    println!("\nPASS: all AC1 hybrid gates green.");
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Ingests `docs` (raw text) into a fresh notebook: real `sources`+`chunks` SQLite
+/// rows (so the FTS triggers populate `chunks_fts`) plus Lance vectors. Returns
+/// `(vector_only_recall, hybrid_recall)` measured over `queries`.
+async fn measure_hybrid(
+    embedder: &dyn Embedder,
+    backend: EmbeddingBackend,
+    tokenizer: &Tokenizer,
+    docs: &[Doc],
+    queries: &[Query],
+    spec: &'static EmbeddingModelSpec,
+) -> Result<(Recall, Recall), LensError> {
+    let dir = tempfile::tempdir().map_err(|e| LensError::Io(e.to_string()))?;
+    let data_dir = dir.path();
+    let engine = LensEngine::init(data_dir).await?;
+    let pool = engine.pool().await;
+    let store = LanceVectorStore::new(data_dir, pool.clone());
+    let notebook = engine
+        .create_notebook(EVAL_NOTEBOOK_TITLE, None, None)
+        .await?;
+    let notebook_id = notebook.id.as_str();
+    let coord = lens_core::vector_store::Coordinate::new(
+        notebook_id.to_string(),
+        backend,
+        spec.id.to_string(),
+        spec.dim,
+    );
+
+    for doc in docs {
+        let blocks = parse_blocks(&doc.text, SourceKind::Markdown);
+        let chunks = chunk_blocks_deterministic(&doc.text, &blocks, tokenizer)?;
+
+        // Namespace ids by notebook so a doc reused across corpora (distractors)
+        // never collides on the source id / content_hash across measurement passes.
+        let source_id = format!("src-{notebook_id}-{}", doc.name);
+        sqlx::query(
+            "INSERT INTO sources (id, notebook_id, kind, title, status, locator, selected, \
+             content_hash, created_at) \
+             VALUES (?, ?, 'text', ?, 'indexed', ?, 1, ?, ?)",
+        )
+        .bind(&source_id)
+        .bind(notebook_id)
+        .bind(&doc.name)
+        .bind(format!("/tmp/{}.md", doc.name))
+        .bind(format!("hash-{source_id}"))
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&pool)
+        .await?;
+
+        let mut rows: Vec<VectorRow> = Vec::with_capacity(chunks.len());
+        let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
+        let vectors = tokio::task::block_in_place(|| embedder.embed_documents(&texts))?;
+        for (chunk, vector) in chunks.iter().zip(vectors.into_iter()) {
+            sqlx::query(
+                "INSERT INTO chunks \
+                 (id, source_id, parent_id, kind, level, section_path, text, \
+                  token_start, token_end, char_start, char_end, block_type, created_at) \
+                 VALUES (?, ?, NULL, ?, ?, ?, ?, 0, 1, 0, ?, 'paragraph', ?)",
+            )
+            .bind(&chunk.id)
+            .bind(&source_id)
+            .bind(if chunk.level == 0 { "parent" } else { "child" })
+            .bind(chunk.level)
+            .bind(&chunk.section_path)
+            .bind(&chunk.text)
+            .bind(chunk.text.len() as i64)
+            .bind(chrono::Utc::now().to_rfc3339())
+            .execute(&pool)
+            .await?;
+            rows.push(VectorRow {
+                chunk_id: chunk.id.clone(),
+                source_id: source_id.clone(),
+                notebook_id: notebook_id.to_string(),
+                level: chunk.level,
+                vector,
+            });
+        }
+        store.add(&coord, rows).await?;
+        println!("ingested {} ({} chunks)", doc.name, chunks.len());
+    }
+
+    let reranker = Reranker::new(data_dir);
+    let config = RetrievalConfig::default();
+    let mut dense_hits = 0usize;
+    let mut hybrid_hits = 0usize;
+    for q in queries {
+        let qvec = tokio::task::block_in_place(|| embedder.embed_query(&q.query))?;
+
+        let dense = store.search(&coord, &qvec, K).await?;
+        let dense_ids: Vec<&str> = dense.iter().map(|h| h.chunk_id.as_str()).collect();
+        if q.gold_chunk_ids
+            .iter()
+            .any(|g| dense_ids.contains(&g.as_str()))
+        {
+            dense_hits += 1;
+        }
+
+        let fused = hybrid_search(
+            &pool, &store, &reranker, &coord, &q.query, &qvec, None, None, K, &config,
+        )
+        .await?;
+        let fused_ids: Vec<&str> = fused.iter().map(|h| h.chunk_id.as_str()).collect();
+        if q.gold_chunk_ids
+            .iter()
+            .any(|g| fused_ids.contains(&g.as_str()))
+        {
+            hybrid_hits += 1;
+        }
+    }
+
+    Ok((
+        Recall {
+            hits: dense_hits,
+            total: queries.len(),
+        },
+        Recall {
+            hits: hybrid_hits,
+            total: queries.len(),
+        },
+    ))
+}
+
 /// Derives the deterministic doc summary stand-in for the LLM structural map: the H1
 /// title + lead sentence of the first parent body. Carries the named entity the pronoun
 /// fixture bodies omit. For the coref fixture the title/lead deliberately omit the query
@@ -764,6 +991,17 @@ const COREF_MAP: &[(&str, &[(&str, &str)])] = &[(
 
 /// Main corpus doc stems (saturated 4-doc set; `queries.json`).
 const MAIN_DOCS: &[&str] = &["espresso", "photosynthesis", "rust_ownership", "tides"];
+
+/// Lexical fixture corpus (#39). `lexical_codes` carries exact alphanumeric tokens
+/// (fault codes, part numbers, firmware build ids) that dense embedding blurs; the
+/// distractors ensure the gold chunk must genuinely out-rank unrelated content.
+const LEXICAL_DOCS: &[&str] = &[
+    "lexical_codes",
+    "espresso",
+    "photosynthesis",
+    "rust_ownership",
+    "tides",
+];
 
 /// Pronoun fixture corpus. Main docs are distractors so the gold chunk must genuinely
 /// out-rank unrelated chunks — without them, every chunk trivially lands in the top-5.
