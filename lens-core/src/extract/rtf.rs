@@ -67,6 +67,87 @@ fn par_to_line(s: &str) -> String {
     out
 }
 
+fn decode_unicode_escapes(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    let mut uc: usize = 1;
+    while i < b.len() {
+        if b[i] == b'\\' {
+            if b[i + 1..].starts_with(b"uc") && b.get(i + 3).is_some_and(u8::is_ascii_digit) {
+                let mut j = i + 3;
+                let mut n = 0usize;
+                while j < b.len() && b[j].is_ascii_digit() {
+                    n = n.saturating_mul(10).saturating_add((b[j] - b'0') as usize);
+                    j += 1;
+                }
+                uc = n;
+                if b.get(j) == Some(&b' ') {
+                    j += 1;
+                }
+                i = j;
+                continue;
+            }
+            if b.get(i + 1) == Some(&b'u')
+                && b.get(i + 2)
+                    .is_some_and(|c| c.is_ascii_digit() || *c == b'-')
+            {
+                let mut j = i + 2;
+                let neg = b[j] == b'-';
+                if neg {
+                    j += 1;
+                }
+                let mut n: i64 = 0;
+                let digits_start = j;
+                while j < b.len() && b[j].is_ascii_digit() {
+                    n = n.saturating_mul(10).saturating_add((b[j] - b'0') as i64);
+                    j += 1;
+                }
+                if j > digits_start {
+                    let code = if neg { 65536 - n } else { n };
+                    if let Some(ch) = u32::try_from(code).ok().and_then(char::from_u32) {
+                        match ch {
+                            '\\' => out.push_str("\\\\"),
+                            '{' => out.push_str("\\{"),
+                            '}' => out.push_str("\\}"),
+                            _ => out.push(ch),
+                        }
+                    }
+                }
+                if b.get(j) == Some(&b' ') {
+                    j += 1;
+                }
+                let mut skipped = 0;
+                while skipped < uc && j < b.len() {
+                    if b[j] == b'\\'
+                        && b.get(j + 1) == Some(&b'\'')
+                        && j + 3 < b.len()
+                        && b[j + 2].is_ascii_hexdigit()
+                        && b[j + 3].is_ascii_hexdigit()
+                    {
+                        j += 4;
+                    } else {
+                        match s[j..].chars().next() {
+                            Some(c) => j += c.len_utf8(),
+                            None => break,
+                        }
+                    }
+                    skipped += 1;
+                }
+                i = j;
+                continue;
+            }
+        }
+        let ch = match s[i..].chars().next() {
+            Some(c) => c,
+            None => break,
+        };
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 /// RTF extractor — implements [`Extractor`] via `rtf-parser`.
 pub struct RtfExtractor;
 
@@ -75,7 +156,7 @@ impl Extractor for RtfExtractor {
         let s = std::str::from_utf8(raw)
             .map_err(|_| LensError::Validation("source is not valid UTF-8".to_string()))?;
 
-        let prepared = par_to_line(s);
+        let prepared = par_to_line(&decode_unicode_escapes(s));
 
         let doc = RtfDocument::try_from(prepared.as_str())
             .map_err(|e| LensError::Parse(format!("rtf-parser failed to parse RTF: {e:?}")))?;
@@ -250,23 +331,99 @@ mod tests {
     }
 
     #[test]
-    fn rtf_unicode_escape_documented_behavior() {
-        // DOCUMENTED LIBRARY BEHAVIOR (rtf-parser 0.4.3): the `\uNNN?` Unicode
-        // escape is NOT decoded — the parser DROPS it entirely (it does not emit
-        // the substitute char `?` nor the U+NNNN code point). So `Caf\u233? au`
-        // yields "Cafau" (note: the escape AND the space following the `?`
-        // fallback are both consumed). This test pins that real behavior; if a
-        // future rtf-parser upgrade decodes `\u233?` to 'é', this assertion will
-        // fail and force a deliberate re-evaluation.
+    fn rtf_unicode_escape_is_decoded() {
         let out = extract(r"{\rtf1\ansi\deff0 Caf\u233? au lait.\par}");
         assert!(
-            !out.extracted_text.contains('\u{00E9}'),
-            "rtf-parser 0.4.3 does NOT decode \\u233? to é; got {:?}",
+            out.extracted_text.contains("Café au lait."),
+            "\\u233? must decode to é with its single fallback char skipped; got {:?}",
             out.extracted_text
         );
+    }
+
+    #[test]
+    fn rtf_unicode_escape_decodes_cjk() {
+        let bs = '\\';
+        let rtf = format!("{{{bs}rtf1{bs}ansi{bs}deff0 {bs}u26085?{bs}u26412?{bs}u35486?{bs}par}}");
+        let out = extract(&rtf);
         assert!(
-            out.extracted_text.contains("Caf"),
-            "the literal text around the dropped escape survives; got {:?}",
+            out.extracted_text.contains("日本語"),
+            "consecutive unicode escapes must decode to CJK; got {:?}",
+            out.extracted_text
+        );
+    }
+
+    #[test]
+    fn rtf_unicode_escape_consumes_delimiter_space() {
+        let out = extract(r"{\rtf1\ansi\deff0 A\u233 ?B\par}");
+        assert!(
+            out.extracted_text.contains("AéB"),
+            "the RTF delimiter space after the numeric arg must not leak into output; got {:?}",
+            out.extracted_text
+        );
+    }
+
+    #[test]
+    fn rtf_unicode_escape_honors_uc_count() {
+        let out = extract(r"{\rtf1\ansi\deff0 \uc2 A\u233 xxB\par}");
+        assert!(
+            out.extracted_text.contains("AéB"),
+            "\\uc2 must skip two fallback chars after the escape; got {:?}",
+            out.extracted_text
+        );
+    }
+
+    #[test]
+    fn rtf_unicode_escape_negative_bmp_codepoint() {
+        let out = extract(r"{\rtf1\ansi\deff0 \u-3585?\par}");
+        assert!(
+            out.extracted_text.contains('\u{F1FF}'),
+            "a negative \\u value must decode as its codepoint + 65536; got {:?}",
+            out.extracted_text
+        );
+    }
+
+    #[test]
+    fn rtf_unicode_escape_uc0_skips_no_fallback() {
+        let out = extract(r"{\rtf1\ansi\deff0 \uc0 A\u233 B\par}");
+        assert!(
+            out.extracted_text.contains("AéB"),
+            "\\uc0 must skip zero fallback chars; got {:?}",
+            out.extracted_text
+        );
+    }
+
+    #[test]
+    fn rtf_unicode_escape_hex_fallback_char() {
+        let bs = '\\';
+        let rtf = format!("{{{bs}rtf1{bs}ansi{bs}deff0 A{bs}u233 {bs}'e9B{bs}par}}");
+        let out = extract(&rtf);
+        assert!(
+            out.extracted_text.contains("AéB"),
+            "a \\'hh hex fallback char must count as one skip; got {:?}",
+            out.extracted_text
+        );
+    }
+
+    #[test]
+    fn rtf_unicode_escape_non_ascii_after_hex_marker_does_not_panic() {
+        let bs = '\\';
+        let rtf = format!("{{{bs}rtf1{bs}ansi{bs}deff0 A{bs}u233 {bs}'€B{bs}par}}");
+        let out = extract(&rtf);
+        assert!(
+            out.extracted_text.contains('é'),
+            "malformed non-ASCII after \\' must not panic and still decode the escape; got {:?}",
+            out.extracted_text
+        );
+    }
+
+    #[test]
+    fn rtf_unicode_escape_decoded_backslash_survives_as_literal() {
+        let bs = '\\';
+        let rtf = format!("{{{bs}rtf1{bs}ansi{bs}deff0 A{bs}u92?B{bs}par}}");
+        let out = extract(&rtf);
+        assert!(
+            out.extracted_text.contains("A\\B"),
+            "a decoded backslash must survive as literal text, not corrupt parsing; got {:?}",
             out.extracted_text
         );
     }
