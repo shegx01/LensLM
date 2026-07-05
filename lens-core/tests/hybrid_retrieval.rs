@@ -200,6 +200,35 @@ async fn purge_source_cleans_fts_rows() {
     );
 }
 
+#[tokio::test]
+async fn bm25_excludes_deselected_sources() {
+    let engine = LensEngine::for_test().await;
+    let pool = engine.pool().await;
+    let nb = engine.create_notebook("nb", None, None).await.unwrap().id;
+    insert_source(&pool, &nb, "s1").await;
+    insert_chunk(&pool, "s1", "c1", 1, "acronym NASA JPL rare token").await;
+
+    let before = bm25::bm25_search(&pool, &nb, None, None, "NASA JPL", 10)
+        .await
+        .unwrap();
+    assert_eq!(before, vec!["c1".to_string()]);
+
+    engine.set_source_selected("s1", false).await.unwrap();
+    let hidden = bm25::bm25_search(&pool, &nb, None, None, "NASA JPL", 10)
+        .await
+        .unwrap();
+    assert!(
+        hidden.is_empty(),
+        "deselected source must not appear in BM25"
+    );
+
+    engine.set_source_selected("s1", true).await.unwrap();
+    let shown = bm25::bm25_search(&pool, &nb, None, None, "NASA JPL", 10)
+        .await
+        .unwrap();
+    assert_eq!(shown, vec!["c1".to_string()]);
+}
+
 /// A hand-built unit vector aligned to a one-hot axis so cosine distance is
 /// deterministic; the query vector picks out the intended chunk.
 fn axis_vec(axis: usize) -> Vec<f32> {
@@ -272,6 +301,64 @@ async fn hybrid_search_excludes_trashed_via_both_paths() {
     .unwrap();
     assert_eq!(
         restored
+            .iter()
+            .map(|h| h.chunk_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["c1"]
+    );
+}
+
+#[tokio::test]
+async fn hybrid_search_excludes_deselected_via_both_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = LensEngine::init(dir.path()).await.unwrap();
+    let pool = engine.pool().await;
+    let data_dir = dir.path().to_path_buf();
+    let nb = engine.create_notebook("nb", None, None).await.unwrap().id;
+    insert_source(&pool, &nb, "s1").await;
+    insert_chunk(&pool, "s1", "c1", 1, "quokka rare lexical token").await;
+
+    let store = LanceVectorStore::new(&data_dir, pool.clone());
+    let coord = Coordinate::new(nb.to_string(), EmbeddingBackend::Fastembed, "m", DIM);
+    store
+        .add(
+            &coord,
+            vec![VectorRow {
+                chunk_id: "c1".to_string(),
+                source_id: "s1".to_string(),
+                notebook_id: nb.to_string(),
+                level: 1,
+                vector: axis_vec(0),
+            }],
+        )
+        .await
+        .unwrap();
+
+    let reranker = Reranker::new(&data_dir);
+    let cfg = RetrievalConfig::default();
+    let qvec = axis_vec(0);
+
+    // Deselect: BOTH paths must exclude it (dense post-filter + bm25 JOIN).
+    engine.set_source_selected("s1", false).await.unwrap();
+    let hidden = hybrid_search(
+        &pool, &store, &reranker, &coord, "quokka", &qvec, None, None, 10, &cfg,
+    )
+    .await
+    .unwrap();
+    assert!(
+        hidden.is_empty(),
+        "deselected source must vanish from hybrid_search via both paths, got {hidden:?}"
+    );
+
+    // Reselect: reachable again.
+    engine.set_source_selected("s1", true).await.unwrap();
+    let shown = hybrid_search(
+        &pool, &store, &reranker, &coord, "quokka", &qvec, None, None, 10, &cfg,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        shown
             .iter()
             .map(|h| h.chunk_id.as_str())
             .collect::<Vec<_>>(),

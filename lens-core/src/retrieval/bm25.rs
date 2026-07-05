@@ -84,11 +84,12 @@ pub async fn bm25_search(
     };
 
     // bm25() is more-negative = better, so ORDER BY ascending puts best first.
+    // `s.selected = 1` enforces the "retrieval only from selected sources" contract.
     let mut sql = String::from(
         "SELECT f.chunk_id FROM chunks_fts f \
          JOIN chunks c ON c.id = f.chunk_id \
          JOIN sources s ON s.id = c.source_id \
-         WHERE chunks_fts MATCH ? AND s.notebook_id = ? AND s.trashed_at IS NULL",
+         WHERE chunks_fts MATCH ? AND s.notebook_id = ? AND s.trashed_at IS NULL AND s.selected = 1",
     );
     sql.push_str(&scope_filter_sql(source_id, level));
     sql.push_str(" ORDER BY bm25(chunks_fts) LIMIT ?");

@@ -4,8 +4,9 @@
 //! seam the Tiered Context Router (#21) consumes — it does NOT embed the query
 //! (that is #21's job) and does not do router/chat/LLM work.
 //!
-//! Both retrieval paths exclude trashed sources (invariant `lib.rs`): BM25 via a
-//! `sources.trashed_at IS NULL` JOIN; DENSE via a SQLite post-filter because
+//! Both retrieval paths restrict to live, SELECTED sources (`trashed_at IS NULL
+//! AND selected = 1` — the "retrieval only from selected sources" contract): BM25
+//! via its `sources` JOIN; DENSE via a SQLite post-filter, because
 //! `LanceVectorStore::search` scopes only by `notebook_id`.
 
 pub mod bm25;
@@ -122,9 +123,10 @@ pub async fn hybrid_search(
     Ok(reranked)
 }
 
-/// Filters `chunk_ids` down to those whose source is live (`trashed_at IS NULL`),
-/// preserving the input order, optionally narrowing by `source_id`/`level`. This
-/// is the dense-path trashed exclusion (the vector store does not filter it).
+/// Filters `chunk_ids` down to those whose source is live (`trashed_at IS NULL`)
+/// AND selected (`selected = 1`), preserving the input order, optionally narrowing
+/// by `source_id`/`level`. This is the dense-path scope filter (the vector store
+/// scopes only by `notebook_id`, so trashed/deselected exclusion happens here).
 async fn live_chunk_ids(
     pool: &SqlitePool,
     chunk_ids: &[String],
@@ -139,7 +141,7 @@ async fn live_chunk_ids(
         .join(",");
     let mut sql = format!(
         "SELECT c.id FROM chunks c JOIN sources s ON s.id = c.source_id \
-         WHERE c.id IN ({placeholders}) AND s.trashed_at IS NULL"
+         WHERE c.id IN ({placeholders}) AND s.trashed_at IS NULL AND s.selected = 1"
     );
     sql.push_str(&bm25::scope_filter_sql(source_id, level));
 
