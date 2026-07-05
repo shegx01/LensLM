@@ -69,10 +69,16 @@
     // notebook only after BOTH have resolved, so there is no race between the
     // notebook list and the reopen_last_notebook flag.
     void (async () => {
-      const [, cfg] = await Promise.all([
-        loadNotebooks(),
-        isTauri() ? invoke<AppConfig>('get_config') : Promise.resolve(null)
-      ]);
+      // Fetch notebooks and config in parallel; isolate get_config so a failure
+      // does not abort auto-select — loadNotebooks() never rejects (it catches
+      // internally), so notebooks are always populated regardless.
+      const cfgPromise = isTauri()
+        ? invoke<AppConfig>('get_config').catch((err) => {
+            console.error('AppShell: get_config failed, defaulting reopen to true', err);
+            return null;
+          })
+        : Promise.resolve(null);
+      const [, cfg] = await Promise.all([loadNotebooks(), cfgPromise]);
       if (cfg) userName = (cfg as AppConfig).user_name ?? '';
       // default-on: null/undefined ⇒ open; only explicit `false` suppresses it.
       if (

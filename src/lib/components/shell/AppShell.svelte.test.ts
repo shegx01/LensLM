@@ -200,4 +200,17 @@ describe('AppShell.svelte', () => {
       expect(screen.getByText(/select or create a notebook/i)).toBeInTheDocument();
     });
   });
+
+  it('auto-selects despite get_config rejection — falls back to default-on behavior', async () => {
+    mockIsTauri.mockReturnValue(true);
+    const { listNotebooks } = await import('$lib/notebooks/ipc.js');
+    vi.mocked(listNotebooks).mockResolvedValue([makeNotebook('nb-1'), makeNotebook('nb-2')]);
+    vi.mocked(invoke).mockRejectedValue(new Error('config read failed'));
+
+    render(AppShell);
+
+    await vi.waitFor(() => {
+      expect(notebookStore.activeNotebookId).toBe('nb-1');
+    });
+  });
 });
