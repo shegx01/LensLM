@@ -24,6 +24,7 @@ pub mod model_catalog;
 pub mod notebooks;
 pub mod parse;
 pub mod render;
+pub mod retrieval;
 pub mod system_check;
 pub mod transcription;
 pub mod tts;
@@ -69,6 +70,7 @@ pub use notebooks::{
     Source, TrashedSource,
 };
 pub use render::JsRenderer;
+pub use retrieval::{HitSource, Reranker, RetrievalHit, hybrid_search};
 pub use system_check::{
     ALLOWED_EMBEDDING_MODELS, CheckAction, CheckId, CheckResult, CheckStatus, LlmDetection,
     ModelValidation, detect_llm, fastembed_weights_cached, is_allowlisted_embedding_id,
