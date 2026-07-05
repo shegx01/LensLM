@@ -35,6 +35,7 @@ pub mod vector_store;
 pub use asr::MockAsrEngine;
 #[cfg(feature = "local-whisper")]
 pub use asr::WhisperEngine;
+pub use asr::cloud::CloudAsrEngine;
 pub use asr::{
     AsrBackend, AsrEngine, DEFAULT_WHISPER_MODEL_ID, Lang, MIN_MACOS_FOR_APPLE_ASR, Platform,
     TranscribeConfig, TranscriptSegment, WHISPER_REGISTRY, WhisperModelSpec,
@@ -42,7 +43,8 @@ pub use asr::{
     whisper_model_path,
 };
 pub use config::{
-    AppConfig, EnrichmentConfig, RerankerConfig, RerankerModel, RetrievalConfig, TaskModel,
+    AppConfig, CloudAsrProvider, EnrichmentConfig, RerankerConfig, RerankerModel, RetrievalConfig,
+    TaskModel,
 };
 pub use embedder::{
     CountingEmbedder, DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, Embedder, EmbeddingBackend,
@@ -837,13 +839,20 @@ impl LensEngine {
     /// Transcribes 16 kHz mono f32 PCM (#41 output), selecting the backend via
     /// [`select_asr_backend`](asr::select_asr_backend): an explicit `AsrConfig`
     /// override wins, else the injected Apple engine when present, else LocalWhisper.
+    ///
+    /// Returns the segments plus a `&'static str` label of the backend actually
+    /// used (`"cloud"`, `"apple_native"`, `"local_whisper"`, or a `"…(fallback)"`
+    /// variant) so ingest can surface it to the UI (#45).
     pub async fn transcribe(
         &self,
         pcm: &[f32],
         config: &TranscribeConfig,
         progress_tx: Option<mpsc::UnboundedSender<f32>>,
-    ) -> Result<Vec<TranscriptSegment>, LensError> {
-        let asr_cfg = self.read().await.config.asr.clone();
+    ) -> Result<(Vec<TranscriptSegment>, &'static str), LensError> {
+        let asr_cfg = {
+            let guard = self.read().await;
+            guard.config.asr.clone()
+        };
         let config_backend = asr::AsrBackend::from_opt_str(Some(asr_cfg.backend.as_str()));
 
         let injected = self.asr_engine().await;
@@ -880,7 +889,7 @@ impl LensEngine {
         match (backend, injected) {
             (asr::AsrBackend::AppleNative, Some(engine)) => {
                 match engine.transcribe_pcm(pcm, config, progress_tx).await {
-                    Ok(segments) => Ok(segments),
+                    Ok(segments) => Ok((segments, "apple_native")),
                     // Apple runtime failure (e.g. a missing on-device asset) must not
                     // leave the user with no transcription — fall back to Whisper when
                     // a local model is available. Skip the fallback on a genuine
@@ -890,8 +899,10 @@ impl LensEngine {
                         if !is_user_cancel(&apple_err)
                             && self.local_whisper_available(&asr_cfg).await
                         {
-                            self.transcribe_local_whisper(pcm, config, None, &asr_cfg)
-                                .await
+                            let segs = self
+                                .transcribe_local_whisper(pcm, config, None, &asr_cfg)
+                                .await?;
+                            Ok((segs, "local_whisper (fallback)"))
                         } else {
                             Err(apple_err)
                         }
@@ -899,12 +910,100 @@ impl LensEngine {
                 }
             }
             (asr::AsrBackend::LocalWhisper, Some(_)) | (asr::AsrBackend::LocalWhisper, None) => {
-                self.transcribe_local_whisper(pcm, config, progress_tx, &asr_cfg)
-                    .await
+                let segs = self
+                    .transcribe_local_whisper(pcm, config, progress_tx, &asr_cfg)
+                    .await?;
+                Ok((segs, "local_whisper"))
             }
             (asr::AsrBackend::AppleNative, None) => Err(LensError::Transcription(
                 "apple-native backend selected but no engine is injected".into(),
             )),
+            // Cloud (#45): pre-flight (consent/key/provider) + request; any failure
+            // that is not a user-cancel transparently degrades to the local cascade
+            // (Apple-if-injected → Whisper), mirroring the Apple→Whisper symmetry.
+            (asr::AsrBackend::Cloud, injected_local) => {
+                let app_config = self.read().await.config.clone();
+                match self
+                    .cloud_transcribe(pcm, config, &app_config, progress_tx.clone())
+                    .await
+                {
+                    Ok(segments) => Ok((segments, "cloud")),
+                    Err(cloud_err) => {
+                        if is_user_cancel(&cloud_err) {
+                            return Err(cloud_err);
+                        }
+                        tracing::warn!(error = %cloud_err, "cloud ASR failed, falling back to local");
+                        self.cloud_fallback_to_local(
+                            pcm,
+                            config,
+                            &asr_cfg,
+                            injected_local,
+                            progress_tx,
+                            cloud_err,
+                        )
+                        .await
+                    }
+                }
+            }
+        }
+    }
+
+    /// Runs the cloud pre-flight then a [`CloudAsrEngine`] transcription. Pre-flight
+    /// failure returns before any request, so the fallback path issues zero cloud
+    /// requests when consent/key/provider are missing (#45).
+    async fn cloud_transcribe(
+        &self,
+        pcm: &[f32],
+        config: &TranscribeConfig,
+        app_config: &config::AppConfig,
+        progress_tx: Option<mpsc::UnboundedSender<f32>>,
+    ) -> Result<Vec<TranscriptSegment>, LensError> {
+        asr::cloud::preflight_check(app_config)?;
+        let asr_cfg = &app_config.asr;
+        let provider = asr_cfg
+            .cloud_provider
+            .ok_or_else(|| LensError::Validation("no cloud ASR provider configured".into()))?;
+        let engine = asr::cloud::CloudAsrEngine::new(
+            provider,
+            asr_cfg.cloud_base_url.clone(),
+            asr_cfg.cloud_model.clone(),
+            asr_cfg.cloud_api_key.clone(),
+        );
+        engine.transcribe_pcm(pcm, config, progress_tx).await
+    }
+
+    /// Cloud→local degradation cascade: Apple-if-injected, else Whisper. Returns
+    /// the original `cloud_err` only when no local path can produce segments.
+    async fn cloud_fallback_to_local(
+        &self,
+        pcm: &[f32],
+        config: &TranscribeConfig,
+        asr_cfg: &config::AsrConfig,
+        injected: Option<Arc<dyn asr::AsrEngine>>,
+        progress_tx: Option<mpsc::UnboundedSender<f32>>,
+        cloud_err: LensError,
+    ) -> Result<(Vec<TranscriptSegment>, &'static str), LensError> {
+        if let Some(engine) = injected {
+            match engine.transcribe_pcm(pcm, config, progress_tx).await {
+                Ok(segs) => Ok((segs, "apple_native (fallback)")),
+                Err(apple_err) => {
+                    if !is_user_cancel(&apple_err) && self.local_whisper_available(asr_cfg).await {
+                        let segs = self
+                            .transcribe_local_whisper(pcm, config, None, asr_cfg)
+                            .await?;
+                        Ok((segs, "local_whisper (fallback)"))
+                    } else {
+                        Err(apple_err)
+                    }
+                }
+            }
+        } else if self.local_whisper_available(asr_cfg).await {
+            let segs = self
+                .transcribe_local_whisper(pcm, config, progress_tx, asr_cfg)
+                .await?;
+            Ok((segs, "local_whisper (fallback)"))
+        } else {
+            Err(cloud_err)
         }
     }
 
@@ -1575,8 +1674,13 @@ fn remove_file_best_effort(path: &Path) {
 /// cross the bridge as [`LensError::Transcription`] strings, so this matches on
 /// the cancel wording rather than a distinct variant.
 fn is_user_cancel(err: &LensError) -> bool {
-    matches!(err, LensError::Transcription(msg)
-        if msg.to_ascii_lowercase().contains("cancel"))
+    match err {
+        // The cloud/chunking path emits a typed cancel (#45); the Apple bridge
+        // crosses as a Transcription string containing "cancel".
+        LensError::Cancelled(_) => true,
+        LensError::Transcription(msg) => msg.to_ascii_lowercase().contains("cancel"),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
