@@ -319,6 +319,17 @@ pub async fn retry_all_failed_sources(
     Ok(())
 }
 
+/// Cooperatively cancels an in-flight audio ingest (#43). Returns `true` if a
+/// token was found and cancelled, `false` if no ingest is in-flight for that source.
+#[tracing::instrument(skip(engine))]
+#[tauri::command]
+pub async fn cancel_media_ingest(
+    source_id: String,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<bool, LensError> {
+    Ok(engine.cancel_media_ingest(&source_id))
+}
+
 /// Renames a notebook.
 #[tracing::instrument(skip_all)]
 #[tauri::command]

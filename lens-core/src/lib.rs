@@ -237,6 +237,12 @@ pub struct LensEngine {
     /// `apple_available` signal: src-tauri pre-gates platform/version before
     /// injecting, so the router treats mere presence as authoritative.
     asr_engine: Arc<RwLock<Option<Arc<dyn asr::AsrEngine>>>>,
+    /// In-flight audio-ingest cancellation tokens, keyed by `source_id` (#43).
+    /// A token is inserted before audio decode starts and removed on
+    /// completion/error/cancel. `std::sync::Mutex` (not tokio) since operations
+    /// are fast HashMap lookups never held across an await point.
+    media_cancel_tokens:
+        Arc<std::sync::Mutex<HashMap<String, tokio_util::sync::CancellationToken>>>,
     /// Lazily-built internal LocalWhisper engines, keyed by model id (#42). Mirrors
     /// the embedder cache but lighter — whisper has one active model at a time. The
     /// single `Mutex` over the map ensures the ggml load runs exactly once per key.
@@ -338,6 +344,7 @@ impl LensEngine {
             llm_provider: Arc::new(RwLock::new(None)),
             js_renderer: Arc::new(RwLock::new(None)),
             asr_engine: Arc::new(RwLock::new(None)),
+            media_cancel_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
             #[cfg(feature = "local-whisper")]
             whisper_engines: Arc::new(Mutex::new(HashMap::new())),
             catalog_cache: Arc::new(RwLock::new(None)),
@@ -415,6 +422,7 @@ impl LensEngine {
             llm_provider: Arc::new(RwLock::new(None)),
             js_renderer: Arc::new(RwLock::new(None)),
             asr_engine: Arc::new(RwLock::new(None)),
+            media_cancel_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
             #[cfg(feature = "local-whisper")]
             whisper_engines: Arc::new(Mutex::new(HashMap::new())),
             catalog_cache: Arc::new(RwLock::new(None)),
@@ -778,6 +786,48 @@ impl LensEngine {
     /// none is installed (LocalWhisper is then the routed backend).
     pub async fn asr_engine(&self) -> Option<Arc<dyn asr::AsrEngine>> {
         self.asr_engine.read().await.clone()
+    }
+
+    /// Registers a fresh cancellation token for an in-flight audio ingest,
+    /// keyed by `source_id`, and returns a clone the ingest branch checks at
+    /// decode-window boundaries and before transcription (issue #43). Replaces
+    /// any prior token for the same id (a retry supersedes the stale one).
+    pub fn register_media_cancel(&self, source_id: &str) -> tokio_util::sync::CancellationToken {
+        let token = tokio_util::sync::CancellationToken::new();
+        let mut map = self
+            .media_cancel_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        map.insert(source_id.to_string(), token.clone());
+        token
+    }
+
+    /// Cancels the in-flight audio ingest for `source_id` by flipping its token.
+    /// Returns `true` if a token was found and cancelled, `false` if no audio
+    /// ingest is in flight for that id (issue #43).
+    pub fn cancel_media_ingest(&self, source_id: &str) -> bool {
+        let map = self
+            .media_cancel_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match map.get(source_id) {
+            Some(token) => {
+                token.cancel();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Removes the cancellation token for `source_id` (issue #43). Called on
+    /// audio-ingest completion/error/cancel via a drop guard so the registry
+    /// never retains a stale entry.
+    pub fn remove_media_cancel(&self, source_id: &str) {
+        let mut map = self
+            .media_cancel_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        map.remove(source_id);
     }
 
     /// Transcribes 16 kHz mono f32 PCM (#41 output), selecting the backend via
@@ -1700,5 +1750,40 @@ mod transcribe_tests {
             }
             other => panic!("expected Transcription error from LocalWhisper path, got: {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod media_cancel_tests {
+    use super::*;
+
+    /// Registry lifecycle (#43): register yields a live (non-cancelled) token;
+    /// `cancel_media_ingest` flips it and reports found; `remove_media_cancel`
+    /// clears the entry so a later cancel reports not-found.
+    #[tokio::test]
+    async fn register_cancel_remove_lifecycle() {
+        let engine = LensEngine::for_test().await;
+        let sid = "src-cancel-1";
+
+        let token = engine.register_media_cancel(sid);
+        assert!(!token.is_cancelled(), "freshly registered token is live");
+
+        assert!(
+            engine.cancel_media_ingest(sid),
+            "cancel finds the registered token"
+        );
+        assert!(token.is_cancelled(), "the returned token is now cancelled");
+
+        engine.remove_media_cancel(sid);
+        assert!(
+            !engine.cancel_media_ingest(sid),
+            "cancel after remove finds nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_unknown_source_is_false() {
+        let engine = LensEngine::for_test().await;
+        assert!(!engine.cancel_media_ingest("never-registered"));
     }
 }

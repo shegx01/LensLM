@@ -70,6 +70,8 @@ local-whisper = ["dep:whisper-rs"]
 serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+# `CancellationToken` for the audio-ingest cancellation registry (issue #43).
+tokio-util = { workspace = true }
 sqlx = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }

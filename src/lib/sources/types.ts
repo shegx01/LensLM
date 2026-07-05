@@ -30,6 +30,7 @@ export type SourceKind =
   | 'xlsx'
   | 'xls'
   | 'csv'
+  | 'audio'
   | 'file';
 
 /**

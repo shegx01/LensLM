@@ -19,6 +19,8 @@ thiserror = "2"
 # `rt`/`macros` enable the async runtime + `#[tokio::test]`; `sync` for RwLock;
 # `time` for the timeout APIs used by the system-check HTTP probes.
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+# `CancellationToken` for the audio-ingest cancellation registry (issue #43).
+tokio-util = { version = "0.7" }
 # Async SQLite via bundled libsqlite3-sys. `macros` is for `migrate!`/`FromRow`
 # only (we use runtime-checked `query`/`query_as`, NOT `query!`, so no
 # DATABASE_URL / offline cache is needed). `uuid` feature deliberately omitted —
