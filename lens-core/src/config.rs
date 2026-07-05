@@ -75,15 +75,25 @@ fn default_whisper_model() -> String {
     "base".to_string()
 }
 
+/// Cloud ASR provider wire format (#45). Strong-typed, not a magic string:
+/// `OpenAiCompatible` covers OpenAI/Groq/self-hosted (WAV multipart), `Deepgram`
+/// is the raw-PCM `linear32` path. Serialized snake_case in `config.json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudAsrProvider {
+    OpenAiCompatible,
+    Deepgram,
+}
+
 /// Optional additive ASR configuration (#42). Absent from older `config.json`
 /// files reads back as [`AsrConfig::default`]. `backend` is a `String` — not the
 /// [`AsrBackend`](crate::asr::AsrBackend) enum — intentionally mirroring
 /// `AppConfig::embedding_backend`: an empty string means router-decided, and a
 /// non-empty token (`"apple_native"` | `"local_whisper"`) is resolved at the
 /// engine boundary via `AsrBackend::from_opt_str`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct AsrConfig {
-    /// `""` → router-decided; `"apple_native"` | `"local_whisper"` → explicit override.
+    /// `""` → router-decided; `"apple_native"` | `"local_whisper"` | `"cloud"` → explicit override.
     #[serde(default)]
     pub backend: String,
     /// Whisper model id (`"tiny"` | `"base"` | `"small"`); defaults to `"base"`.
@@ -95,6 +105,39 @@ pub struct AsrConfig {
     /// `true` ⇒ translate to English (the Whisper translate task).
     #[serde(default)]
     pub translate: bool,
+    /// Cloud ASR provider (#45); `None` ⇒ not configured. Gated by
+    /// `AppConfig::audio_cloud_consent` at the engine boundary.
+    #[serde(default)]
+    pub cloud_provider: Option<CloudAsrProvider>,
+    /// Cloud ASR endpoint base URL (e.g. `https://api.openai.com`).
+    #[serde(default)]
+    pub cloud_base_url: String,
+    /// Cloud ASR model id (e.g. `whisper-1`, `nova-3`).
+    #[serde(default)]
+    pub cloud_model: String,
+    /// Cloud ASR API key. Stored in PLAINTEXT — see [`ModelConfig::api_key`].
+    #[serde(default)]
+    pub cloud_api_key: String,
+}
+
+impl std::fmt::Debug for AsrConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let cloud_api_key = if self.cloud_api_key.is_empty() {
+            ""
+        } else {
+            "***"
+        };
+        f.debug_struct("AsrConfig")
+            .field("backend", &self.backend)
+            .field("whisper_model", &self.whisper_model)
+            .field("language", &self.language)
+            .field("translate", &self.translate)
+            .field("cloud_provider", &self.cloud_provider)
+            .field("cloud_base_url", &self.cloud_base_url)
+            .field("cloud_model", &self.cloud_model)
+            .field("cloud_api_key", &cloud_api_key)
+            .finish()
+    }
 }
 
 impl Default for AsrConfig {
@@ -104,6 +147,10 @@ impl Default for AsrConfig {
             whisper_model: default_whisper_model(),
             language: None,
             translate: false,
+            cloud_provider: None,
+            cloud_base_url: String::default(),
+            cloud_model: String::default(),
+            cloud_api_key: String::default(),
         }
     }
 }
@@ -274,6 +321,11 @@ pub struct AppConfig {
     /// Speech-to-text configuration (#42). Absent key reads as [`AsrConfig::default`].
     #[serde(default)]
     pub asr: AsrConfig,
+    /// Explicit consent to upload raw audio to a cloud ASR provider (#45). A NEW
+    /// flag, SEPARATE from `EnrichmentConfig::cloud_consent` (audio is more
+    /// sensitive than text). Cloud ASR is refused (falls back to local) unless true.
+    #[serde(default)]
+    pub audio_cloud_consent: bool,
     /// SPA JS-render fallback (#78). Defaults to `true`; absent key reads as `true`.
     #[serde(default = "default_js_render_enabled")]
     pub js_render_enabled: bool,
@@ -300,6 +352,7 @@ impl Default for AppConfig {
             tts: TtsConfig::default(),
             enrichment: EnrichmentConfig::default(),
             asr: AsrConfig::default(),
+            audio_cloud_consent: false,
             js_render_enabled: default_js_render_enabled(),
             reopen_last_notebook: default_reopen_last_notebook(),
             paths: PathConfig::default(),
@@ -640,6 +693,7 @@ mod tests {
                 whisper_model: "small".to_string(),
                 language: Some(Lang::De),
                 translate: true,
+                ..AsrConfig::default()
             },
             ..AppConfig::default()
         };

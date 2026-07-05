@@ -5,6 +5,7 @@
 //! Headless: no tauri/UI/OS-window deps. Input PCM is #41's 16 kHz mono f32.
 //! The Whisper engine, router, and registry arrive in later units.
 
+pub mod cloud;
 pub mod registry;
 mod router;
 #[cfg(feature = "local-whisper")]
@@ -64,6 +65,8 @@ pub struct TranscribeConfig {
 pub enum AsrBackend {
     AppleNative,
     LocalWhisper,
+    /// Opt-in cloud provider (#45); gated by `audio_cloud_consent`, degrades to local.
+    Cloud,
 }
 
 impl AsrBackend {
@@ -72,6 +75,7 @@ impl AsrBackend {
         match self {
             AsrBackend::AppleNative => "apple_native",
             AsrBackend::LocalWhisper => "local_whisper",
+            AsrBackend::Cloud => "cloud",
         }
     }
 
@@ -82,6 +86,7 @@ impl AsrBackend {
         match s {
             Some("apple_native") => Some(AsrBackend::AppleNative),
             Some("local_whisper") => Some(AsrBackend::LocalWhisper),
+            Some("cloud") => Some(AsrBackend::Cloud),
             _ => None,
         }
     }
@@ -145,11 +150,19 @@ mod tests {
             AsrBackend::from_opt_str(Some("local_whisper")),
             Some(AsrBackend::LocalWhisper)
         );
+        assert_eq!(
+            AsrBackend::from_opt_str(Some("cloud")),
+            Some(AsrBackend::Cloud)
+        );
         assert_eq!(AsrBackend::from_opt_str(None), None);
         assert_eq!(AsrBackend::from_opt_str(Some("")), None);
         assert_eq!(AsrBackend::from_opt_str(Some("bogus")), None);
         // as_str round-trips through from_opt_str.
-        for b in [AsrBackend::AppleNative, AsrBackend::LocalWhisper] {
+        for b in [
+            AsrBackend::AppleNative,
+            AsrBackend::LocalWhisper,
+            AsrBackend::Cloud,
+        ] {
             assert_eq!(AsrBackend::from_opt_str(Some(b.as_str())), Some(b));
         }
     }
