@@ -585,6 +585,13 @@ fn transcript_extract_output(
                 "transcript segment {i} has a non-finite timestamp"
             )));
         }
+        if seg.start_second < 0.0 || seg.start_second > seg.end_second {
+            return Err(LensError::Parse(format!(
+                "transcript segment {i} has an invalid timestamp range \
+                 [{}, {}]: start must be >= 0 and <= end",
+                seg.start_second, seg.end_second
+            )));
+        }
         if i > 0 {
             extracted_text.push_str(SEG_SEP);
         }

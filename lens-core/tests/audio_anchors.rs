@@ -10,43 +10,10 @@
 
 #![recursion_limit = "256"]
 
-use std::path::Path;
-use std::sync::Arc;
-
-use lens_core::{LensEngine, MockAsrEngine, SourceAnchor, TranscriptSegment};
+use lens_core::{LensEngine, SourceAnchor, TranscriptSegment};
 
 mod support;
-use support::{inject_counting_engine, tokenizer_available};
-
-/// Mono 16 kHz PCM16 WAV carrying a 440 Hz tone (nonzero, survives the all-silent
-/// guard). The mock ignores the PCM, so the exact duration is irrelevant to the
-/// canned segments — only that decode yields nonzero samples.
-fn write_tone_wav(path: &Path, seconds: u32) {
-    const SAMPLE_RATE: u32 = 16_000;
-    let n_samples = SAMPLE_RATE * seconds;
-    let data_len = n_samples * 2;
-    let mut buf: Vec<u8> = Vec::with_capacity(44 + data_len as usize);
-    buf.extend_from_slice(b"RIFF");
-    buf.extend_from_slice(&(36 + data_len).to_le_bytes());
-    buf.extend_from_slice(b"WAVE");
-    buf.extend_from_slice(b"fmt ");
-    buf.extend_from_slice(&16u32.to_le_bytes());
-    buf.extend_from_slice(&1u16.to_le_bytes());
-    buf.extend_from_slice(&1u16.to_le_bytes());
-    buf.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
-    buf.extend_from_slice(&(SAMPLE_RATE * 2).to_le_bytes());
-    buf.extend_from_slice(&2u16.to_le_bytes());
-    buf.extend_from_slice(&16u16.to_le_bytes());
-    buf.extend_from_slice(b"data");
-    buf.extend_from_slice(&data_len.to_le_bytes());
-    for i in 0..n_samples {
-        let t = i as f32 / SAMPLE_RATE as f32;
-        let s = (t * 440.0 * 2.0 * std::f32::consts::PI).sin() * 0.5;
-        let v = (s * i16::MAX as f32) as i16;
-        buf.extend_from_slice(&v.to_le_bytes());
-    }
-    std::fs::write(path, &buf).expect("write tone wav");
-}
+use support::{inject_counting_engine, tokenizer_available, use_mock_asr, write_tone_wav};
 
 fn seg(text: &str, start: f32, end: f32) -> TranscriptSegment {
     TranscriptSegment {
@@ -73,15 +40,6 @@ fn many_segments() -> Vec<TranscriptSegment> {
             )
         })
         .collect()
-}
-
-async fn use_mock_asr(engine: &LensEngine, segments: Vec<TranscriptSegment>) {
-    let mut config = engine.config().await;
-    config.asr.backend = "apple_native".to_string();
-    engine.set_config(config).await;
-    engine
-        .set_asr_engine(Some(Arc::new(MockAsrEngine::new(segments))))
-        .await;
 }
 
 /// Ingests a fresh audio source with the given canned segments; returns the
@@ -377,35 +335,50 @@ async fn empty_transcript_yields_zero_chunks() {
     );
 }
 
-/// A non-finite (NaN) segment timestamp is rejected before it can poison the
-/// min/max aggregation.
+/// Invalid segment timestamps (NaN/Inf or start > end) are rejected before they
+/// can poison the min/max aggregation or violate AC (a) start ≤ end.
 #[tokio::test]
-async fn non_finite_timestamp_is_rejected() {
+async fn invalid_timestamp_is_rejected() {
+    async fn assert_parse_err(bad_segments: Vec<TranscriptSegment>, label: &str) {
+        let (dir, engine) = inject_counting_engine().await;
+        use_mock_asr(&engine, bad_segments).await;
+        let wav = dir.path().join("clip.wav");
+        write_tone_wav(&wav, 2);
+        let nb = engine
+            .create_notebook(&format!("audio-bad-{label}"), None, None)
+            .await
+            .unwrap();
+        let src = engine
+            .add_file_source(&nb.id, &wav, None)
+            .await
+            .unwrap()
+            .source;
+        let err = engine.ingest_source(&src.id, |_p| {}).await.unwrap_err();
+        assert_eq!(
+            err.kind(),
+            "Parse",
+            "{label}: expected Parse error, got {err:?}"
+        );
+    }
+
     if !tokenizer_available().await {
-        eprintln!("skipping non_finite_timestamp_is_rejected: no tokenizer (offline)");
+        eprintln!("skipping invalid_timestamp_is_rejected: no tokenizer (offline)");
         return;
     }
-    let (dir, engine) = inject_counting_engine().await;
-    use_mock_asr(
-        &engine,
-        vec![seg("first", 0.0, 1.0), seg("nan", f32::NAN, 2.0)],
+    // NaN start
+    assert_parse_err(
+        vec![seg("first", 0.0, 1.0), seg("nan-start", f32::NAN, 2.0)],
+        "nan-start",
     )
     .await;
-
-    let wav = dir.path().join("clip.wav");
-    write_tone_wav(&wav, 2);
-    let nb = engine
-        .create_notebook("audio-nan-nb", None, None)
-        .await
-        .unwrap();
-    let src = engine
-        .add_file_source(&nb.id, &wav, None)
-        .await
-        .unwrap()
-        .source;
-    let err = engine
-        .ingest_source(&src.id, |_p| {})
-        .await
-        .expect_err("non-finite timestamp must error");
-    assert_eq!(err.kind(), "Parse", "expected a Parse error, got {err:?}");
+    // Infinity end
+    assert_parse_err(vec![seg("inf-end", 0.0, f32::INFINITY)], "inf-end").await;
+    // Inverted: start > end
+    assert_parse_err(
+        vec![seg("good", 0.0, 1.0), seg("inverted", 5.0, 2.0)],
+        "inverted",
+    )
+    .await;
+    // Negative start
+    assert_parse_err(vec![seg("neg-start", -1.0, 1.0)], "neg-start").await;
 }

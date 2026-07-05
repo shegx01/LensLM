@@ -124,6 +124,58 @@ pub fn seed_tokenizer_from_env(data_dir: &Path) {
 }
 
 // ---------------------------------------------------------------------------
+// Audio test helpers (shared by audio_ingest.rs and audio_anchors.rs)
+// ---------------------------------------------------------------------------
+
+/// Writes a mono 16 kHz PCM16 WAV of `seconds` seconds carrying a 440 Hz tone
+/// (nonzero, so it survives the all-silent guard) to `path`. At the default
+/// ~30 s window this yields `ceil(seconds / 30)` decode windows — pass ≥ 61 s
+/// for the ≥ 3 windows the deterministic cancel test needs.
+pub fn write_tone_wav(path: &std::path::Path, seconds: u32) {
+    const SAMPLE_RATE: u32 = 16_000;
+    let n_samples = SAMPLE_RATE * seconds;
+    let data_len = n_samples * 2; // 16-bit mono
+    let mut buf: Vec<u8> = Vec::with_capacity(44 + data_len as usize);
+
+    buf.extend_from_slice(b"RIFF");
+    buf.extend_from_slice(&(36 + data_len).to_le_bytes());
+    buf.extend_from_slice(b"WAVE");
+    buf.extend_from_slice(b"fmt ");
+    buf.extend_from_slice(&16u32.to_le_bytes()); // PCM fmt chunk size
+    buf.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    buf.extend_from_slice(&1u16.to_le_bytes()); // mono
+    buf.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
+    buf.extend_from_slice(&(SAMPLE_RATE * 2).to_le_bytes()); // byte rate
+    buf.extend_from_slice(&2u16.to_le_bytes()); // block align
+    buf.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+    buf.extend_from_slice(b"data");
+    buf.extend_from_slice(&data_len.to_le_bytes());
+
+    for i in 0..n_samples {
+        let t = i as f32 / SAMPLE_RATE as f32;
+        let s = (t * 440.0 * 2.0 * std::f32::consts::PI).sin() * 0.5;
+        let v = (s * i16::MAX as f32) as i16;
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+
+    std::fs::write(path, &buf).expect("write tone wav");
+}
+
+/// Routes `LensEngine::transcribe` to the injected mock: the `apple_native`
+/// backend with an injected engine hits the `(AppleNative, Some)` arm (the mock
+/// is the Apple-native seam in tests).
+pub async fn use_mock_asr(engine: &LensEngine, segments: Vec<lens_core::TranscriptSegment>) {
+    let mut config = engine.config().await;
+    config.asr.backend = "apple_native".to_string();
+    engine.set_config(config).await;
+    engine
+        .set_asr_engine(Some(std::sync::Arc::new(lens_core::MockAsrEngine::new(
+            segments,
+        ))))
+        .await;
+}
+
+// ---------------------------------------------------------------------------
 // Lance vector-store readers
 // ---------------------------------------------------------------------------
 
