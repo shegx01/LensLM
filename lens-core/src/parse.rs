@@ -321,9 +321,8 @@ pub fn parse_blocks(src: &str, kind: SourceKind) -> Vec<Block> {
         | SourceKind::Xlsx
         | SourceKind::Xls
         | SourceKind::Csv
-        // Audio is DERIVED and never reaches here at runtime: the audio ingest
-        // branch calls `parse_blocks(&transcript, SourceKind::Text)`, so this arm
-        // is a compile-safety backstop only (issue #43).
+        // Audio is DERIVED and never reaches here: `transcript_extract_output`
+        // (issue #44) builds blocks directly; this arm is a dead-code backstop.
         | SourceKind::Audio => {
             debug_assert!(
                 false,
