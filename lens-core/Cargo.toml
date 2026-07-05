@@ -160,7 +160,7 @@ rtf-parser = { version = "=0.4.3", default-features = false }
 # ODF/EPUB ZIP container reader (ODT `content.xml`, EPUB structure). zip 0.6.6 is
 # ALREADY resolved transitively via docx-rs, so pinning to that version pulls NO
 # new copy. MIT — deny.toml allowlist.
-zip = { version = "=0.6.6", default-features = false, features = ["deflate"] }
+zip = { version = "=8.6.0", default-features = false, features = ["deflate"] }
 # XHTML/XML streaming parser for ODT `content.xml` and EPUB XHTML spine entries.
 # A NEW direct dep (existing transitive versions resolve independently). MIT —
 # deny.toml allowlist. Pinned exactly per repo convention.

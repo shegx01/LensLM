@@ -5310,7 +5310,7 @@ dependencies = [
  "uuid",
  "whisper-rs",
  "wiremock",
- "zip 0.6.6",
+ "zip 8.6.0",
 ]
 
 [[package]]
@@ -11811,6 +11811,7 @@ dependencies = [
  "indexmap 2.14.0",
  "memchr",
  "typed-path",
+ "zopfli",
 ]
 
 [[package]]
