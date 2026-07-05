@@ -12,8 +12,7 @@
 /// valid spreadsheet, while still bounding the per-row `Vec<String>` +
 /// verbalized `String` allocation a pathological million-column input would
 /// otherwise force BEFORE any byte-size cap can trigger. Enforced by both the
-/// CSV and spreadsheet extractors against the header (and, for CSV's flexible
-/// parsing, any data row that exceeds it).
+/// CSV and spreadsheet extractors against the header column count.
 pub(crate) const MAX_COLUMNS: usize = 16_384;
 
 /// Normalizes a tabular source's first row into headers: if every cell is

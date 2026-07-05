@@ -91,7 +91,13 @@ fn para_text(p: &docx_rs::Paragraph) -> String {
 /// `TableChild`/`TableRowChild` are single-variant today, but if an additive
 /// upstream variant is added the `else { continue }` degrades gracefully instead
 /// of failing to compile.
+const MAX_TABLE_DEPTH: usize = 16;
+
 fn table_text(tbl: &Table) -> String {
+    table_text_depth(tbl, 0)
+}
+
+fn table_text_depth(tbl: &Table, depth: usize) -> String {
     let mut rows: Vec<String> = Vec::new();
     for row_child in &tbl.rows {
         #[allow(irrefutable_let_patterns)]
@@ -106,14 +112,18 @@ fn table_text(tbl: &Table) -> String {
             };
             let mut cell_buf = String::new();
             for cc in &tc.children {
-                if let TableCellContent::Paragraph(p) = cc {
-                    let t = para_text(p);
-                    if !t.is_empty() {
-                        if !cell_buf.is_empty() {
-                            cell_buf.push(' ');
-                        }
-                        cell_buf.push_str(&t);
+                let t = match cc {
+                    TableCellContent::Paragraph(p) => para_text(p),
+                    TableCellContent::Table(nested) if depth < MAX_TABLE_DEPTH => {
+                        table_text_depth(nested, depth + 1)
                     }
+                    _ => continue,
+                };
+                if !t.is_empty() {
+                    if !cell_buf.is_empty() {
+                        cell_buf.push(' ');
+                    }
+                    cell_buf.push_str(&t);
                 }
             }
             cells.push(cell_buf);
@@ -430,6 +440,32 @@ mod tests {
             tbl.text.contains("Cell A1"),
             "table block text must include cell content; got {:?}",
             tbl.text
+        );
+    }
+
+    #[test]
+    fn docx_nested_table_cell_text_present() {
+        use docx_rs::{Docx, Paragraph, Run, Table, TableCell, TableRow};
+        let inner_table =
+            Table::new(vec![TableRow::new(vec![TableCell::new().add_paragraph(
+                Paragraph::new().add_run(Run::new().add_text("NestedCell")),
+            )])]);
+        let outer_table = Table::new(vec![TableRow::new(vec![
+            TableCell::new().add_paragraph(Paragraph::new().add_run(Run::new().add_text("Outer"))),
+            TableCell::new().add_table(inner_table),
+        ])]);
+        let docx = Docx::new().add_table(outer_table);
+        let mut buf = Vec::new();
+        docx.build()
+            .pack(Cursor::new(&mut buf))
+            .expect("build nested-table DOCX");
+        let out = DocxExtractor
+            .extract(&buf)
+            .expect("extract nested-table DOCX");
+        assert!(
+            out.extracted_text.contains("NestedCell"),
+            "nested cell text must appear in extracted_text; got: {:?}",
+            out.extracted_text
         );
     }
 

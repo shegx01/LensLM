@@ -66,13 +66,10 @@ impl Extractor for CsvExtractor {
         let first = records.remove(0);
         let headers = normalize_headers(first);
 
-        // Guard the widest record seen; `flexible(true)` means a data row can exceed the header width.
-        let max_cols = headers
-            .len()
-            .max(records.iter().map(Vec::len).max().unwrap_or(0));
-        if max_cols > MAX_COLUMNS {
+        if headers.len() > MAX_COLUMNS {
             return Err(LensError::Validation(format!(
-                "tabular source has {max_cols} columns, exceeding the {MAX_COLUMNS}-column limit"
+                "tabular source has {} columns, exceeding the {MAX_COLUMNS}-column limit",
+                headers.len()
             )));
         }
 
@@ -287,6 +284,28 @@ mod tests {
         CsvExtractor
             .extract(format!("{ok_header}\n").as_bytes())
             .expect("exactly MAX_COLUMNS columns must be accepted");
+    }
+
+    #[test]
+    fn csv_column_guard_fires_on_header_before_data_rows() {
+        let wide_header: String = (0..=MAX_COLUMNS)
+            .map(|i| format!("H{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let data_row: String = (0..=MAX_COLUMNS)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let src = format!("{wide_header}\n{data_row}\n{data_row}\n{data_row}\n");
+        let err = CsvExtractor
+            .extract(src.as_bytes())
+            .expect_err("over-wide header must be rejected");
+        match err {
+            LensError::Validation(msg) => {
+                assert!(msg.contains("columns"), "msg: {msg}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
     }
 
     #[test]

@@ -493,12 +493,13 @@ async fn run_audio_ingest(
                     "audio ingest cancelled during decode".into(),
                 ));
             }
-            pcm.extend(window?);
-            if pcm.len() > MAX_PCM_SAMPLES {
+            let window = window?;
+            if pcm.len() + window.len() > MAX_PCM_SAMPLES {
                 return Err(LensError::Validation(
                     "audio exceeds the maximum supported duration (~4 hours)".into(),
                 ));
             }
+            pcm.extend(window);
             window_index += 1;
             if decode_tx
                 .blocking_send(IngestProgress::new(
