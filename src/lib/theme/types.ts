@@ -54,6 +54,22 @@ export interface EnrichmentConfig {
   chat_model?: TaskModel | null;
 }
 
+// SYNC-CHECK: must match lens-core/src/config.rs CloudAsrProvider — snake_case serde.
+export type CloudAsrProvider = 'open_ai_compatible' | 'deepgram';
+
+// SYNC-CHECK: must match lens-core/src/config.rs AsrConfig — update both together.
+// Older configs have no `asr` key; Rust defaults via `#[serde(default)]`.
+export interface AsrConfig {
+  backend: string;
+  whisper_model: string;
+  language?: string | { Other: string } | null;
+  translate: boolean;
+  cloud_provider?: CloudAsrProvider | null;
+  cloud_base_url: string;
+  cloud_model: string;
+  cloud_api_key: string;
+}
+
 export interface PathConfig {
   data_dir: string;
 }
@@ -82,6 +98,12 @@ export interface AppConfig {
   embedding_model: string;
   // SYNC-CHECK: must match lens-core/src/config.rs AppConfig.embedding_backend (default "").
   embedding_backend: string;
+  // SYNC-CHECK: must match lens-core/src/config.rs AppConfig.max_source_mb (default "").
+  max_source_mb: string;
+  // SYNC-CHECK: must match lens-core/src/config.rs AppConfig.asr (default AsrConfig::default).
+  asr: AsrConfig;
+  // SYNC-CHECK: must match lens-core/src/config.rs AppConfig.audio_cloud_consent (default false).
+  audio_cloud_consent: boolean;
   // SYNC-CHECK: must match lens-core/src/config.rs AppConfig.js_render_enabled (default true).
   js_render_enabled: boolean;
   // SYNC-CHECK: must match lens-core/src/config.rs AppConfig.reopen_last_notebook (default true).

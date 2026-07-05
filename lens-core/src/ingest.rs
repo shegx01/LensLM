@@ -110,6 +110,11 @@ pub struct IngestProgress {
     pub done: u64,
     /// `None` when the upper bound is unknown.
     pub total: Option<u64>,
+    /// The ASR backend actually used, surfaced on the terminal transcription event
+    /// only (#45): `"cloud"`, `"local_whisper"`, a `"…(fallback)"` variant, etc.
+    /// Omitted from the wire when absent (backward-compatible).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub effective_backend: Option<String>,
 }
 
 impl IngestProgress {
@@ -118,6 +123,7 @@ impl IngestProgress {
             phase: phase.to_string(),
             done,
             total,
+            effective_backend: None,
         }
     }
 }
@@ -524,7 +530,7 @@ async fn run_audio_ingest(
     let (asr_tx, mut asr_rx) = tokio::sync::mpsc::unbounded_channel::<f32>();
     let asr_config = crate::asr::TranscribeConfig::default();
     let mut transcribe_fut = std::pin::pin!(engine.transcribe(&pcm, &asr_config, Some(asr_tx)));
-    let segments = loop {
+    let (segments, effective_backend) = loop {
         tokio::select! {
             biased;
             Some(p) = asr_rx.recv() => {
@@ -544,6 +550,10 @@ async fn run_audio_ingest(
             Some(100),
         ));
     }
+    // Terminal transcription event carries the effective backend for UI transparency (#45).
+    let mut done_event = IngestProgress::new(ingest_phase::TRANSCRIBING, 100, Some(100));
+    done_event.effective_backend = Some(effective_backend.to_string());
+    on_progress(done_event);
 
     let out = transcript_extract_output(&segments)?;
 

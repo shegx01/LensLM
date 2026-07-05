@@ -18,6 +18,18 @@ export function baseAppConfig(overrides?: Partial<AppConfig>): AppConfig {
     onboarding_complete: false,
     embedding_model: '',
     embedding_backend: '',
+    max_source_mb: '',
+    asr: {
+      backend: '',
+      whisper_model: 'base',
+      language: null,
+      translate: false,
+      cloud_provider: null,
+      cloud_base_url: '',
+      cloud_model: '',
+      cloud_api_key: ''
+    },
+    audio_cloud_consent: false,
     js_render_enabled: true,
     reopen_last_notebook: true,
     ...overrides

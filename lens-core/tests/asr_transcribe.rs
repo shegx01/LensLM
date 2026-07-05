@@ -38,12 +38,13 @@ async fn transcribe_dispatches_to_injected_apple_engine() {
         .set_asr_engine(Some(Arc::new(MockAsrEngine::new(expected.clone()))))
         .await;
 
-    let out = engine
+    let (out, backend) = engine
         .transcribe(&[0.0_f32; 16], &TranscribeConfig::default(), None)
         .await
         .expect("apple-native seam transcribe should succeed");
 
     assert_eq!(out, expected);
+    assert_eq!(backend, "apple_native");
 }
 
 /// The injected engine is Apple-only: even with a mock injected, forcing
