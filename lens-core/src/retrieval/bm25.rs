@@ -8,28 +8,27 @@ use sqlx::SqlitePool;
 
 use crate::LensError;
 
-/// FTS5 operators and special characters that must not reach a bare `MATCH`
-/// expression. We strip these rather than phrase-quote the whole query: quoting
-/// turns a multi-word query into a single FTS5 *phrase* and destroys recall.
-const FTS5_SPECIALS: &[char] = &['*', '^', '"', '(', ')', '+', '-', ':', '.', ',', '/', '\\'];
-
 /// FTS5 bareword operators (case-sensitive in FTS5: only uppercase are operators).
 const FTS5_OPERATORS: &[&str] = &["AND", "OR", "NOT", "NEAR"];
 
-/// Sanitizes a user query into a safe FTS5 `MATCH` expression: strips FTS5 special
-/// characters, drops bareword operators (`AND`/`OR`/`NOT`/`NEAR`), and returns the
-/// remaining tokens joined by spaces (implicit-OR matching). Returns `None` when
-/// nothing survives — the caller then returns zero BM25 hits (not an error).
+/// Sanitizes a user query into a safe FTS5 `MATCH` expression. Any character that
+/// is not a Unicode alphanumeric is mapped to a SPACE (not deleted) — this both
+/// neutralizes every FTS5 operator/special char (`* ^ " ( ) + - : ? .` …) AND
+/// mirrors the default unicode61 tokenizer, which splits indexed text on the same
+/// boundaries (so a query `ZX9-4471Q` becomes bare tokens `zx9 4471q` that match
+/// the indexed tokens). Uppercase bareword operators (`AND`/`OR`/`NOT`/`NEAR`) are
+/// dropped. Remaining tokens are joined by spaces (implicit-OR matching). We do NOT
+/// phrase-quote the whole query — that would be a single FTS5 phrase and gut recall.
+/// Returns `None` when nothing survives; the caller then yields zero BM25 hits.
 pub fn sanitize_fts_query(query: &str) -> Option<String> {
-    let tokens: Vec<String> = query
+    let mapped: String = query
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect();
+
+    let tokens: Vec<&str> = mapped
         .split_whitespace()
-        .map(|tok| {
-            tok.chars()
-                .filter(|c| !FTS5_SPECIALS.contains(c))
-                .collect::<String>()
-        })
-        .filter(|t| !t.is_empty())
-        .filter(|t| !FTS5_OPERATORS.contains(&t.as_str()))
+        .filter(|t| !FTS5_OPERATORS.contains(t))
         .collect();
 
     if tokens.is_empty() {
@@ -99,11 +98,29 @@ mod tests {
     }
 
     #[test]
-    fn strips_fts5_special_chars_without_erroring() {
-        // The special chars are removed; the alphanumeric payload survives.
+    fn maps_fts5_special_chars_to_spaces_without_erroring() {
+        // Each special char becomes a token boundary; the alphanumeric payload survives.
         assert_eq!(
-            sanitize_fts_query(r#"foo* "bar" (baz) +qux -quux ^rank"#),
-            Some("foo bar baz qux quux rank".to_string())
+            sanitize_fts_query(r#"foo* "bar" (baz) +qux ^rank"#),
+            Some("foo bar baz qux rank".to_string())
+        );
+    }
+
+    #[test]
+    fn question_mark_and_punctuation_do_not_error() {
+        assert_eq!(
+            sanitize_fts_query("How do plants turn sunlight into sugar?"),
+            Some("How do plants turn sunlight into sugar".to_string())
+        );
+    }
+
+    #[test]
+    fn hyphenated_code_splits_to_match_tokenizer() {
+        // The default unicode61 tokenizer indexes "ZX9-4471Q" as tokens zx9/4471q;
+        // the query must split identically to match.
+        assert_eq!(
+            sanitize_fts_query("ZX9-4471Q"),
+            Some("ZX9 4471Q".to_string())
         );
     }
 
@@ -133,11 +150,12 @@ mod tests {
     }
 
     #[test]
-    fn strips_colon_so_no_column_filter_syntax_leaks() {
-        // A leading "col:" would be an FTS5 column filter; stripping ':' neutralizes it.
+    fn colon_splits_so_no_column_filter_syntax_leaks() {
+        // A leading "col:" would be an FTS5 column filter; mapping ':' to a space
+        // splits it into two harmless tokens.
         assert_eq!(
             sanitize_fts_query("text:secret"),
-            Some("textsecret".to_string())
+            Some("text secret".to_string())
         );
     }
 }
