@@ -79,6 +79,7 @@ fn run_inference(
     language: Option<&str>,
     translate: bool,
     progress_tx: Option<tokio::sync::mpsc::UnboundedSender<f32>>,
+    cancel: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<Vec<TranscriptSegment>, LensError> {
     let ctx = ctx
         .lock()
@@ -102,8 +103,17 @@ fn run_inference(
         });
     }
 
-    state
-        .full(params, pcm)
+    if let Some(token) = cancel.clone() {
+        params.set_abort_callback_safe(move || token.is_cancelled());
+    }
+
+    let full_result = state.full(params, pcm);
+    if cancel.is_some_and(|t| t.is_cancelled()) {
+        return Err(LensError::Cancelled(
+            "whisper transcription cancelled".into(),
+        ));
+    }
+    full_result
         .map_err(|e| LensError::Transcription(format!("whisper transcription failed: {e}")))?;
 
     let n: usize = state
@@ -129,13 +139,13 @@ fn run_inference(
     Ok(segments)
 }
 
-#[async_trait]
-impl AsrEngine for WhisperEngine {
-    async fn transcribe_pcm(
+impl WhisperEngine {
+    pub async fn transcribe_pcm_cancellable(
         &self,
         pcm: &[f32],
         config: &TranscribeConfig,
         progress_tx: Option<tokio::sync::mpsc::UnboundedSender<f32>>,
+        cancel: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<Vec<TranscriptSegment>, LensError> {
         // Move owned copies of the inputs into the blocking task; whisper.full is
         // CPU-blocking and must not run on the async runtime.
@@ -148,9 +158,29 @@ impl AsrEngine for WhisperEngine {
         let ctx = Arc::clone(&self.ctx);
 
         tokio::task::spawn_blocking(move || {
-            run_inference(&ctx, &pcm, language.as_deref(), translate, progress_tx)
+            run_inference(
+                &ctx,
+                &pcm,
+                language.as_deref(),
+                translate,
+                progress_tx,
+                cancel,
+            )
         })
         .await
         .map_err(|e| LensError::Transcription(format!("whisper inference task failed: {e}")))?
+    }
+}
+
+#[async_trait]
+impl AsrEngine for WhisperEngine {
+    async fn transcribe_pcm(
+        &self,
+        pcm: &[f32],
+        config: &TranscribeConfig,
+        progress_tx: Option<tokio::sync::mpsc::UnboundedSender<f32>>,
+    ) -> Result<Vec<TranscriptSegment>, LensError> {
+        self.transcribe_pcm_cancellable(pcm, config, progress_tx, None)
+            .await
     }
 }

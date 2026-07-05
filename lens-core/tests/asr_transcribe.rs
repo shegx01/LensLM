@@ -39,7 +39,7 @@ async fn transcribe_dispatches_to_injected_apple_engine() {
         .await;
 
     let (out, backend) = engine
-        .transcribe(&[0.0_f32; 16], &TranscribeConfig::default(), None)
+        .transcribe(&[0.0_f32; 16], &TranscribeConfig::default(), None, None)
         .await
         .expect("apple-native seam transcribe should succeed");
 
@@ -62,7 +62,7 @@ async fn transcribe_local_whisper_ignores_injected_engine() {
         .await;
 
     let err = engine
-        .transcribe(&[0.0_f32; 16], &TranscribeConfig::default(), None)
+        .transcribe(&[0.0_f32; 16], &TranscribeConfig::default(), None, None)
         .await
         .expect_err("local_whisper must not fall through to the injected Apple mock");
 
@@ -84,7 +84,7 @@ async fn transcribe_apple_forced_without_engine_errors() {
     engine.set_config(config).await;
 
     let err = engine
-        .transcribe(&[0.0_f32; 16], &TranscribeConfig::default(), None)
+        .transcribe(&[0.0_f32; 16], &TranscribeConfig::default(), None, None)
         .await
         .expect_err("apple_native with no injected engine → typed error");
 
@@ -107,7 +107,7 @@ async fn transcribe_local_whisper_missing_model_errors() {
     engine.set_config(config).await;
 
     let err = engine
-        .transcribe(&[0.0_f32; 16], &TranscribeConfig::default(), None)
+        .transcribe(&[0.0_f32; 16], &TranscribeConfig::default(), None, None)
         .await
         .expect_err("no downloaded whisper model → typed error");
 

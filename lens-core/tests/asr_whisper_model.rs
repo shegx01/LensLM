@@ -88,3 +88,44 @@ async fn whisper_transcribes_fixture() {
     }
     assert!(got_progress, "expected forwarded progress values");
 }
+
+#[tokio::test]
+#[ignore = "downloads the base ggml model + a spoken sample; run with LENS_RUN_MODEL_TESTS=1 --ignored"]
+async fn whisper_precancelled_token_aborts_transcription() {
+    if !model_tests_enabled() {
+        eprintln!(
+            "skipping whisper_precancelled_token_aborts_transcription (set LENS_RUN_MODEL_TESTS=1)"
+        );
+        return;
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    download_whisper_model(dir.path(), DEFAULT_WHISPER_MODEL_ID, |_| {})
+        .await
+        .expect("download base whisper model");
+    let model_path = whisper_model_path(dir.path(), DEFAULT_WHISPER_MODEL_ID);
+    let engine = WhisperEngine::load(&model_path).expect("load whisper engine");
+
+    let sample_path = dir.path().join("jfk.wav");
+    fetch_to(&sample_path, JFK_SAMPLE_URL).await;
+    let pcm = decode_and_resample_audio(&sample_path).expect("decode sample");
+
+    let token = tokio_util::sync::CancellationToken::new();
+    token.cancel();
+
+    let started = std::time::Instant::now();
+    let err = engine
+        .transcribe_pcm_cancellable(&pcm, &TranscribeConfig::default(), None, Some(token))
+        .await
+        .expect_err("a pre-cancelled token must abort transcription");
+    assert_eq!(
+        err.kind(),
+        "Cancelled",
+        "an aborted transcription must surface as Cancelled, got {err:?}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "the abort must fire promptly, took {:?}",
+        started.elapsed()
+    );
+}
