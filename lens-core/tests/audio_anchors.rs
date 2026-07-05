@@ -168,7 +168,11 @@ async fn every_chunk_has_audio_anchor_covering_its_segments() {
         let (start, end) = parse_audio(json);
 
         assert!(start.is_finite() && end.is_finite(), "finite timestamps");
-        assert!(start <= end, "start {start} <= end {end} for chunk {}", c.id);
+        assert!(
+            start <= end,
+            "start {start} <= end {end} for chunk {}",
+            c.id
+        );
         assert!(
             (0.0..=duration).contains(&start) && (0.0..=duration).contains(&end),
             "anchor [{start},{end}] within [0,{duration}] for chunk {}",
