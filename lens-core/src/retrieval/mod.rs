@@ -78,13 +78,12 @@ pub async fn hybrid_search(
 ) -> Result<Vec<RetrievalHit>, LensError> {
     let overfetch = pool.clamp(OVERFETCH, MAX_OVERFETCH);
 
-    // DENSE: search then post-filter out trashed sources (search scopes only by
-    // notebook_id). Optional source_id/level narrowing is applied here too.
+    // DENSE: search, then post-filter trashed + apply source_id/level.
     let dense_hits = store.search(coord, query_vec, overfetch).await?;
     let dense_ids: Vec<String> = dense_hits.into_iter().map(|h| h.chunk_id).collect();
     let dense_ids = live_chunk_ids(pool_db, &dense_ids, source_id, level).await?;
 
-    // BM25: notebook-scoped, trashed-excluded via the sources JOIN.
+    // BM25: lexical path.
     let bm25_ids = if config.hybrid_enabled {
         bm25::bm25_search(
             pool_db,
@@ -114,8 +113,7 @@ pub async fn hybrid_search(
         return Ok(out);
     }
 
-    // Hydrate candidate text from chunks in the SAME order as the fused list, then
-    // rerank; any failure falls back to the RRF order inside the reranker.
+    // Hydrate text in the SAME order as the fused list (reranker maps by index).
     let texts = hydrate_texts(pool_db, &fused).await?;
     let reranked = reranker
         .rerank_with_fallback(query_text, fused, texts, &config.reranker, pool)

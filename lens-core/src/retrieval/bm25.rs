@@ -54,10 +54,7 @@ pub async fn bm25_search(
         return Ok(Vec::new());
     };
 
-    // bm25() returns a score where more-negative is a better match, so ORDER BY
-    // ascending puts the best hits first. The INNER JOIN on chunks makes orphan
-    // FTS rows invisible and supplies source_id/level; the sources JOIN enforces
-    // notebook scope + the live trashed_at exclusion.
+    // bm25() is more-negative = better, so ORDER BY ascending puts best first.
     let mut sql = String::from(
         "SELECT f.chunk_id FROM chunks_fts f \
          JOIN chunks c ON c.id = f.chunk_id \
