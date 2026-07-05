@@ -141,23 +141,13 @@ async fn live_chunk_ids(
         "SELECT c.id FROM chunks c JOIN sources s ON s.id = c.source_id \
          WHERE c.id IN ({placeholders}) AND s.trashed_at IS NULL"
     );
-    if source_id.is_some() {
-        sql.push_str(" AND c.source_id = ?");
-    }
-    if level.is_some() {
-        sql.push_str(" AND c.level = ?");
-    }
+    sql.push_str(&bm25::scope_filter_sql(source_id, level));
 
     let mut q = sqlx::query_scalar::<_, String>(&sql);
     for id in chunk_ids {
         q = q.bind(id);
     }
-    if let Some(sid) = source_id {
-        q = q.bind(sid);
-    }
-    if let Some(lvl) = level {
-        q = q.bind(lvl);
-    }
+    let q = bm25::bind_scope_filters(q, source_id, level);
     let live: std::collections::HashSet<String> = q.fetch_all(pool).await?.into_iter().collect();
 
     Ok(chunk_ids

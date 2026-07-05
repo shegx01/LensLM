@@ -1,8 +1,7 @@
 //! BM25 lexical retrieval over `chunks_fts` (issue #39). Notebook scope and the
 //! trashed-source exclusion require a JOIN through `sources` — `chunks` carries no
 //! `notebook_id`, and `trashed_at` is mutable so it must be checked live. The
-//! INNER JOIN on `chunks` also neutralizes orphan `chunks_fts` rows left by a
-//! FK-cascade delete (which does not fire the AFTER DELETE trigger).
+//! INNER JOIN on `chunks` also hides orphan `chunks_fts` rows (see migration 0013).
 
 use sqlx::SqlitePool;
 
@@ -10,6 +9,36 @@ use crate::LensError;
 
 /// FTS5 bareword operators (case-sensitive in FTS5: only uppercase are operators).
 const FTS5_OPERATORS: &[&str] = &["AND", "OR", "NOT", "NEAR"];
+
+/// SQL fragment for the optional `source_id`/`level` scope filters over the `c`
+/// (chunks) alias. Its binds MUST be applied in the same order via
+/// [`bind_scope_filters`] — the two are a matched pair; edit them together.
+pub(super) fn scope_filter_sql(source_id: Option<&str>, level: Option<i32>) -> String {
+    let mut s = String::new();
+    if source_id.is_some() {
+        s.push_str(" AND c.source_id = ?");
+    }
+    if level.is_some() {
+        s.push_str(" AND c.level = ?");
+    }
+    s
+}
+
+/// Binds the `source_id`/`level` values in the exact order [`scope_filter_sql`]
+/// emits their placeholders. Call after the query's leading binds, before any trailing ones.
+pub(super) fn bind_scope_filters<'q>(
+    mut q: sqlx::query::QueryScalar<'q, sqlx::Sqlite, String, sqlx::sqlite::SqliteArguments<'q>>,
+    source_id: Option<&'q str>,
+    level: Option<i32>,
+) -> sqlx::query::QueryScalar<'q, sqlx::Sqlite, String, sqlx::sqlite::SqliteArguments<'q>> {
+    if let Some(sid) = source_id {
+        q = q.bind(sid);
+    }
+    if let Some(lvl) = level {
+        q = q.bind(lvl);
+    }
+    q
+}
 
 /// Sanitizes a user query into a safe FTS5 `MATCH` expression. Any character that
 /// is not a Unicode alphanumeric is mapped to a SPACE (not deleted) — this both
@@ -61,23 +90,13 @@ pub async fn bm25_search(
          JOIN sources s ON s.id = c.source_id \
          WHERE chunks_fts MATCH ? AND s.notebook_id = ? AND s.trashed_at IS NULL",
     );
-    if source_id.is_some() {
-        sql.push_str(" AND c.source_id = ?");
-    }
-    if level.is_some() {
-        sql.push_str(" AND c.level = ?");
-    }
+    sql.push_str(&scope_filter_sql(source_id, level));
     sql.push_str(" ORDER BY bm25(chunks_fts) LIMIT ?");
 
-    let mut q = sqlx::query_scalar::<_, String>(&sql)
+    let q = sqlx::query_scalar::<_, String>(&sql)
         .bind(match_expr)
         .bind(notebook_id);
-    if let Some(sid) = source_id {
-        q = q.bind(sid);
-    }
-    if let Some(lvl) = level {
-        q = q.bind(lvl);
-    }
+    let q = bind_scope_filters(q, source_id, level);
     let ids = q.bind(limit as i64).fetch_all(pool).await?;
     Ok(ids)
 }
