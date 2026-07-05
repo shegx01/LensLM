@@ -3605,6 +3605,68 @@ async fn restore_source_collision_guard_end_to_end() {
     );
 }
 
+#[tokio::test]
+async fn restore_source_collision_leaves_only_one_live_row() {
+    let (_dir, engine) = file_engine().await;
+    let nb = engine
+        .create_notebook("restore-live-count-nb", None, None)
+        .await
+        .unwrap();
+
+    let src_dir = tempfile::tempdir().unwrap();
+    let path_a = src_dir.path().join("a.txt");
+    std::fs::write(&path_a, "shared body").unwrap();
+    let a = engine
+        .add_file_source(&nb.id, &path_a, None)
+        .await
+        .unwrap()
+        .source;
+    engine.trash_source(&a.id).await.unwrap();
+
+    let path_b = src_dir.path().join("b.txt");
+    std::fs::write(&path_b, "shared body").unwrap();
+    let b = engine
+        .add_file_source(&nb.id, &path_b, None)
+        .await
+        .unwrap()
+        .source;
+
+    let err = engine.restore_source(&a.id).await;
+    assert!(
+        matches!(err, Err(lens_core::LensError::Validation(ref m)) if m.contains("already exists")),
+        "collision restore must error, got {err:?}"
+    );
+
+    let pool = engine.pool().await;
+    let live_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sources WHERE notebook_id = ? AND raw_content_hash = ? AND trashed_at IS NULL",
+    )
+    .bind(&nb.id)
+    .bind(b.raw_content_hash.as_deref().unwrap_or(""))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        live_count, 1,
+        "exactly one live row must remain after a blocked restore"
+    );
+}
+
+#[tokio::test]
+async fn restore_source_nonexistent_id_returns_no_trashed_error() {
+    let (_dir, engine) = file_engine().await;
+    let err = engine.restore_source("nonexistent-id-00000000").await;
+    match err {
+        Err(lens_core::LensError::Validation(msg)) => {
+            assert!(
+                msg.contains("no trashed source"),
+                "error must mention no trashed source, got {msg:?}"
+            );
+        }
+        other => panic!("expected Validation error for nonexistent id, got {other:?}"),
+    }
+}
+
 // ===========================================================================
 // M4 issue #77 — RTF / ODT / EPUB extractor integration & snapshot tests
 // ===========================================================================
