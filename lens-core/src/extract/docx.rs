@@ -14,6 +14,8 @@
 //!   where `node_path` is a compact XPath-ish string like `"body/p[0]"` or
 //!   `"body/tbl[1]"`, 0-indexed among **all** `DocumentChild` elements.
 
+use std::io::{Cursor, Read};
+
 use docx_rs::{
     DocumentChild, ParagraphChild, RunChild, Table, TableCellContent, TableChild, read_docx,
 };
@@ -22,6 +24,30 @@ use crate::LensError;
 use crate::parse::{Block, BlockType, SectionPathStack};
 
 use super::{ExtractOutput, Extractor, SourceAnchor};
+
+const MAX_DECOMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
+
+fn guard_docx_inflation(raw: &[u8], max: u64) -> Result<(), LensError> {
+    let mut archive = zip::ZipArchive::new(Cursor::new(raw))
+        .map_err(|e| LensError::Parse(format!("DOCX is not a valid ZIP container: {e}")))?;
+    let mut total: u64 = 0;
+    for i in 0..archive.len() {
+        let entry = archive
+            .by_index(i)
+            .map_err(|e| LensError::Parse(format!("DOCX ZIP entry {i} unreadable: {e}")))?;
+        let budget = max - total;
+        let read = std::io::copy(&mut entry.take(budget + 1), &mut std::io::sink())
+            .map_err(|e| LensError::Parse(format!("DOCX ZIP entry decompression failed: {e}")))?;
+        total += read;
+        if total > max {
+            return Err(LensError::Validation(format!(
+                "DOCX decompresses to more than the {max}-byte limit \
+                 (possible decompression bomb)"
+            )));
+        }
+    }
+    Ok(())
+}
 
 /// Returns the heading level (1–6) for a Word heading style id
 /// (`Heading1`…`Heading6`, case-insensitive, optional space/dash separator),
@@ -102,11 +128,7 @@ pub struct DocxExtractor;
 
 impl Extractor for DocxExtractor {
     fn extract(&self, raw: &[u8]) -> Result<ExtractOutput, LensError> {
-        // ZIP-BOMB RISK: `read_docx` decompresses with no intermediate inflation
-        // limit. Stage-1 (max_source_bytes) bounds the compressed input; Stage-2
-        // bounds the resulting extracted_text. Only the transient in-read_docx
-        // inflation is unbounded.
-        // TODO(phase-3): bound intermediate inflation (zip backend swap / size-checked reader).
+        guard_docx_inflation(raw, MAX_DECOMPRESSED_BYTES)?;
         let docx = read_docx(raw)
             .map_err(|e| LensError::Parse(format!("docx-rs failed to parse DOCX: {e:?}")))?;
 
@@ -260,6 +282,34 @@ mod tests {
         DocxExtractor
             .extract(&raw)
             .expect("fixture DOCX extraction must succeed")
+    }
+
+    #[test]
+    fn inflation_guard_passes_legit_docx_under_ceiling() {
+        let raw = build_fixture_docx();
+        guard_docx_inflation(&raw, MAX_DECOMPRESSED_BYTES)
+            .expect("a legitimate DOCX must pass the inflation guard");
+    }
+
+    #[test]
+    fn inflation_guard_rejects_decompression_beyond_cap() {
+        let raw = build_fixture_docx();
+        let err = guard_docx_inflation(&raw, 16)
+            .expect_err("decompression past the cap must be rejected");
+        assert!(
+            matches!(err, LensError::Validation(_)),
+            "an over-inflation is a Validation error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn inflation_guard_rejects_non_zip_input() {
+        let err = guard_docx_inflation(b"not a zip at all", MAX_DECOMPRESSED_BYTES)
+            .expect_err("non-ZIP bytes must not reach read_docx");
+        assert!(
+            matches!(err, LensError::Parse(_)),
+            "a non-ZIP container is a Parse error, got {err:?}"
+        );
     }
 
     #[test]

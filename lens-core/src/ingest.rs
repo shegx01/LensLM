@@ -28,6 +28,8 @@ const NOMIC_TOKENIZER_URL: &str =
 /// Connect timeout for the tokenizer download (the file is small).
 const TOKENIZER_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+const TOKENIZER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Connect + read timeout for URL source fetches.
 ///
 /// The ingest permit is held for the fetch duration; an unbounded hung fetch stalls all
@@ -1765,12 +1767,22 @@ fn find_tokenizer_json(dir: &Path) -> Option<PathBuf> {
 
 /// Downloads `url` to `dest` atomically via a `.part` temp file.
 async fn download_tokenizer(url: &str, dest: &Path) -> Result<(), LensError> {
+    download_tokenizer_inner(url, dest, TOKENIZER_CONNECT_TIMEOUT, TOKENIZER_TIMEOUT).await
+}
+
+async fn download_tokenizer_inner(
+    url: &str,
+    dest: &Path,
+    connect_timeout: std::time::Duration,
+    timeout: std::time::Duration,
+) -> Result<(), LensError> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| LensError::Io(format!("create {}: {e}", parent.display())))?;
     }
     let client = reqwest::Client::builder()
-        .connect_timeout(TOKENIZER_CONNECT_TIMEOUT)
+        .connect_timeout(connect_timeout)
+        .timeout(timeout)
         .build()
         .map_err(|e| LensError::Network(format!("tokenizer download client init failed: {e}")))?;
     let resp = client
@@ -2251,6 +2263,48 @@ mod tests {
         assert!(
             matches!(err, LensError::Network(_)),
             "a timeout is surfaced as a Network error, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tokenizer_download_timeout_fires_on_slow_response() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/tokenizer.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("{}")
+                    .set_delay(std::time::Duration::from_secs(10)),
+            )
+            .mount(&mock)
+            .await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("tokenizer.json");
+        let started = std::time::Instant::now();
+        let err = download_tokenizer_inner(
+            &format!("{}/tokenizer.json", mock.uri()),
+            &dest,
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_millis(300),
+        )
+        .await
+        .expect_err("a slow body must trip the short total timeout");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "timeout must fire fast (took {:?})",
+            started.elapsed()
+        );
+        assert!(
+            matches!(err, LensError::Network(_)),
+            "a timeout is surfaced as a Network error, got {err:?}"
+        );
+        assert!(
+            !dest.exists(),
+            "a timed-out download must not leave a finalized tokenizer file"
+        );
+        assert!(
+            !dest.with_extension("json.part").exists(),
+            "a timed-out download must not leave a .part temp file"
         );
     }
 
