@@ -51,9 +51,3 @@ pub fn pcm_to_wav(pcm: &[f32], sample_rate: u32) -> Result<Vec<u8>, LensError> {
     }
     Ok(out)
 }
-
-/// Encoded WAV size (header + 16-bit samples) for `n` f32 samples, without
-/// allocating — used by the chunker to size windows against a provider byte cap.
-pub fn wav_encoded_len(sample_count: usize) -> usize {
-    WAV_HEADER_BYTES + sample_count * (BITS_PER_SAMPLE as usize / 8)
-}

@@ -25,15 +25,6 @@ fn max_payload_bytes(provider: CloudAsrProvider) -> usize {
     }
 }
 
-/// Encoded byte size of `sample_count` samples for `provider` (WAV for OpenAI,
-/// raw 4-byte f32 for Deepgram).
-fn encoded_len(provider: CloudAsrProvider, sample_count: usize) -> usize {
-    match provider {
-        CloudAsrProvider::OpenAiCompatible => wav::wav_encoded_len(sample_count),
-        CloudAsrProvider::Deepgram => sample_count * std::mem::size_of::<f32>(),
-    }
-}
-
 /// Splits `pcm` into windows whose encoded payload stays under the provider cap.
 /// Under-limit input passes through as a single chunk. Window boundaries are
 /// refined toward the nearest zero crossing within a small search radius.
@@ -42,14 +33,14 @@ pub fn split_if_needed(
     provider: CloudAsrProvider,
     sample_rate: u32,
 ) -> Vec<PcmChunk<'_>> {
-    if pcm.is_empty() || encoded_len(provider, pcm.len()) <= max_payload_bytes(provider) {
+    let max_samples = max_samples_per_chunk(provider, sample_rate);
+    if pcm.is_empty() || pcm.len() <= max_samples {
         return vec![PcmChunk {
             data: pcm,
             start_second: 0.0,
         }];
     }
 
-    let max_samples = max_samples_per_chunk(provider);
     let radius = (sample_rate as usize / 100).max(1); // ±10 ms zero-crossing search
     let mut chunks = Vec::new();
     let mut start = 0usize;
@@ -58,7 +49,7 @@ pub fn split_if_needed(
         let end = if ideal_end >= pcm.len() {
             pcm.len()
         } else {
-            nearest_zero_crossing(pcm, ideal_end, radius)
+            nearest_zero_crossing(pcm, ideal_end, radius).max(start + 1)
         };
         chunks.push(PcmChunk {
             data: &pcm[start..end],
@@ -69,13 +60,17 @@ pub fn split_if_needed(
     chunks
 }
 
-/// Largest sample count whose encoded payload fits the provider cap, with a small
-/// safety margin for the WAV header / multipart framing.
-fn max_samples_per_chunk(provider: CloudAsrProvider) -> usize {
+const DEEPGRAM_MAX_CHUNK_SECONDS: usize = 480;
+
+fn max_samples_per_chunk(provider: CloudAsrProvider, sample_rate: u32) -> usize {
     let budget = max_payload_bytes(provider).saturating_sub(wav::WAV_HEADER_BYTES + 4096);
     match provider {
-        CloudAsrProvider::OpenAiCompatible => budget / 2, // 16-bit samples
-        CloudAsrProvider::Deepgram => budget / std::mem::size_of::<f32>(),
+        CloudAsrProvider::OpenAiCompatible => budget / 2,
+        CloudAsrProvider::Deepgram => {
+            let by_bytes = budget / std::mem::size_of::<f32>();
+            let by_duration = DEEPGRAM_MAX_CHUNK_SECONDS * sample_rate as usize;
+            by_bytes.min(by_duration)
+        }
     }
 }
 

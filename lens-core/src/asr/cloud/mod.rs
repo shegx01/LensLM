@@ -46,6 +46,9 @@ const ASR_CLOUD_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// server-side inference (and per-chunk retries on long files) are slow.
 const ASR_CLOUD_TIMEOUT: Duration = Duration::from_secs(120);
 
+const ASR_CLOUD_MAX_RETRIES: u32 = 3;
+const ASR_CLOUD_RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
+
 /// The 16 kHz mono f32 PCM sample rate produced by #41 decode/resample.
 const SAMPLE_RATE: u32 = 16_000;
 
@@ -57,6 +60,8 @@ pub struct CloudAsrEngine {
     model: String,
     api_key: String,
     client: reqwest::Client,
+    max_retries: u32,
+    retry_base_delay: Duration,
 }
 
 impl CloudAsrEngine {
@@ -87,6 +92,45 @@ impl CloudAsrEngine {
             model: model.into(),
             api_key: api_key.into(),
             client,
+            max_retries: ASR_CLOUD_MAX_RETRIES,
+            retry_base_delay: ASR_CLOUD_RETRY_BASE_DELAY,
+        }
+    }
+
+    pub fn with_retry_policy(mut self, max_retries: u32, base_delay: Duration) -> Self {
+        self.max_retries = max_retries;
+        self.retry_base_delay = base_delay;
+        self
+    }
+
+    async fn transcribe_chunk_with_retry(
+        &self,
+        pcm: &[f32],
+        config: &TranscribeConfig,
+    ) -> Result<Vec<TranscriptSegment>, LensError> {
+        let mut attempt = 0u32;
+        loop {
+            match self.transcribe_chunk(pcm, config).await {
+                Ok(segments) => return Ok(segments),
+                Err(err) => {
+                    let retryable = matches!(err, LensError::Network(_));
+                    if !retryable || attempt >= self.max_retries {
+                        return Err(err);
+                    }
+                    let backoff = self
+                        .retry_base_delay
+                        .saturating_mul(2u32.saturating_pow(attempt));
+                    tracing::warn!(
+                        provider = ?self.provider,
+                        attempt = attempt + 1,
+                        max_retries = self.max_retries,
+                        backoff_ms = backoff.as_millis() as u64,
+                        "cloud ASR chunk transient failure; retrying"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    attempt += 1;
+                }
+            }
         }
     }
 
@@ -140,7 +184,7 @@ impl AsrEngine for CloudAsrEngine {
         let mut stitched_input: Vec<(f32, Vec<TranscriptSegment>)> = Vec::with_capacity(total);
 
         for (idx, c) in chunks.iter().enumerate() {
-            let segments = self.transcribe_chunk(c.data, config).await?;
+            let segments = self.transcribe_chunk_with_retry(c.data, config).await?;
             stitched_input.push((c.start_second, segments));
             if let Some(tx) = &progress_tx {
                 let fraction = (idx + 1) as f32 / total as f32;
