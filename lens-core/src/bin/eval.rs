@@ -72,6 +72,7 @@
 //! cargo run -p lens-core --bin eval               # raw recall@5 on the main corpus, exit 0/1
 //! cargo run -p lens-core --bin eval -- --enriched # three-way A/B/C on all corpora + gates
 //! cargo run -p lens-core --bin eval -- --print-ids  # dump deterministic ids per doc
+//! cargo run -p lens-core --bin eval -- --hybrid    # AC1: hybrid vs vector-only recall@5 (#39)
 //! ```
 
 use std::collections::HashMap;
@@ -79,13 +80,13 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use lens_core::chunk::{Chunk, chunk_blocks_deterministic};
+use lens_core::config::RetrievalConfig;
 use lens_core::embedder::{
     DEFAULT_EMBED_MODEL_ID, Embedder, EmbeddingBackend, FastembedEmbedder, OllamaEmbedder,
 };
 use lens_core::enrichment::{
     CorefSub, apply_substitutions, compose_embedding_text, compose_prefix,
 };
-use lens_core::config::RetrievalConfig;
 use lens_core::parse::{SourceKind, parse_blocks};
 use lens_core::retrieval::{Reranker, hybrid_search};
 use lens_core::vector_store::{LanceVectorStore, VectorRow, VectorStore};
@@ -695,8 +696,15 @@ async fn run_hybrid_gate(
     // content-derived (notebook-independent), so docs shared as distractors would
     // collide on the global `chunks` PK if two passes shared one database.
     println!("\n############ LEXICAL FIXTURE (hybrid-lift gate) ############");
-    let (lex_dense, lex_hybrid) =
-        measure_hybrid(embedder, backend, tokenizer, &lexical_docs, &lexical_queries, spec).await?;
+    let (lex_dense, lex_hybrid) = measure_hybrid(
+        embedder,
+        backend,
+        tokenizer,
+        &lexical_docs,
+        &lexical_queries,
+        spec,
+    )
+    .await?;
     report_recall("vector-only", lex_dense.hits, lex_dense.total);
     report_recall("hybrid", lex_hybrid.hits, lex_hybrid.total);
 
@@ -844,8 +852,7 @@ async fn measure_hybrid(
 
         let dense = store.search(&coord, &qvec, K).await?;
         let dense_ids: Vec<&str> = dense.iter().map(|h| h.chunk_id.as_str()).collect();
-        if q
-            .gold_chunk_ids
+        if q.gold_chunk_ids
             .iter()
             .any(|g| dense_ids.contains(&g.as_str()))
         {
@@ -857,8 +864,7 @@ async fn measure_hybrid(
         )
         .await?;
         let fused_ids: Vec<&str> = fused.iter().map(|h| h.chunk_id.as_str()).collect();
-        if q
-            .gold_chunk_ids
+        if q.gold_chunk_ids
             .iter()
             .any(|g| fused_ids.contains(&g.as_str()))
         {

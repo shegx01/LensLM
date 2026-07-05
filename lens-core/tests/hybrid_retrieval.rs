@@ -3,11 +3,11 @@
 //! exclusion through BOTH retrieval paths of `hybrid_search`. Offline — hand-built
 //! vectors, no model downloads, reranker left disabled.
 
+use lens_core::LensEngine;
 use lens_core::config::RetrievalConfig;
 use lens_core::embedder::EmbeddingBackend;
 use lens_core::retrieval::{Reranker, bm25, hybrid_search};
 use lens_core::vector_store::{Coordinate, LanceVectorStore, VectorRow, VectorStore};
-use lens_core::LensEngine;
 use sqlx::SqlitePool;
 
 const DIM: usize = 4;
@@ -27,13 +27,7 @@ async fn insert_source(pool: &SqlitePool, notebook_id: &str, source_id: &str) {
     .expect("insert source");
 }
 
-async fn insert_chunk(
-    pool: &SqlitePool,
-    source_id: &str,
-    chunk_id: &str,
-    level: i32,
-    text: &str,
-) {
+async fn insert_chunk(pool: &SqlitePool, source_id: &str, chunk_id: &str, level: i32, text: &str) {
     sqlx::query(
         "INSERT INTO chunks \
          (id, source_id, parent_id, kind, level, section_path, text, \
@@ -277,7 +271,10 @@ async fn hybrid_search_excludes_trashed_via_both_paths() {
     .await
     .unwrap();
     assert_eq!(
-        restored.iter().map(|h| h.chunk_id.as_str()).collect::<Vec<_>>(),
+        restored
+            .iter()
+            .map(|h| h.chunk_id.as_str())
+            .collect::<Vec<_>>(),
         vec!["c1"]
     );
 }

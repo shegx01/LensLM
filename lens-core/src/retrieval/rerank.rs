@@ -256,8 +256,13 @@ mod tests {
             enabled: true,
             ..RerankerConfig::default()
         };
-        let out = r.rerank_with_fallback("q", Vec::new(), Vec::new(), &cfg, 5).await;
+        let out = r
+            .rerank_with_fallback("q", Vec::new(), Vec::new(), &cfg, 5)
+            .await;
         assert!(out.is_empty());
-        assert!(!r.cell.initialized(), "no candidates must NOT init the model");
+        assert!(
+            !r.cell.initialized(),
+            "no candidates must NOT init the model"
+        );
     }
 }
