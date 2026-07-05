@@ -1005,7 +1005,7 @@ async fn assert_preflight_blocks_with_zero_requests(
 
     let pcm = tiny_pcm();
     let (out, _backend) = engine
-        .transcribe(&pcm, &TranscribeConfig::default(), None)
+        .transcribe(&pcm, &TranscribeConfig::default(), None, None)
         .await
         .expect("pre-flight blocked → local fallback should succeed");
 
@@ -1101,7 +1101,7 @@ async fn assert_cloud_error_falls_back_to_mock(
         .await;
 
     let (out, label) = engine
-        .transcribe(&tiny_pcm(), &TranscribeConfig::default(), None)
+        .transcribe(&tiny_pcm(), &TranscribeConfig::default(), None, None)
         .await
         .unwrap_or_else(|e| panic!("status {status} must fallback, not hard-fail: {e:?}"));
 
@@ -1195,7 +1195,7 @@ async fn transcribe_cloud_success_returns_cloud_label() {
     engine.set_config(config).await;
 
     let (_segs, label) = engine
-        .transcribe(&tiny_pcm(), &TranscribeConfig::default(), None)
+        .transcribe(&tiny_pcm(), &TranscribeConfig::default(), None, None)
         .await
         .expect("cloud success");
     assert_eq!(label, "cloud");
@@ -1230,7 +1230,7 @@ async fn transcribe_cloud_fallback_returns_fallback_label() {
         .await;
 
     let (_segs, label) = engine
-        .transcribe(&tiny_pcm(), &TranscribeConfig::default(), None)
+        .transcribe(&tiny_pcm(), &TranscribeConfig::default(), None, None)
         .await
         .expect("500 → fallback");
     assert!(
@@ -1331,7 +1331,7 @@ async fn consent_isolation_audio_consent_true_enrichment_false_allows_cloud() {
     engine.set_config(config).await;
 
     let (_segs, label) = engine
-        .transcribe(&tiny_pcm(), &TranscribeConfig::default(), None)
+        .transcribe(&tiny_pcm(), &TranscribeConfig::default(), None, None)
         .await
         .expect(
             "audio_cloud_consent=true must allow cloud even when enrichment.cloud_consent=false",
@@ -1374,7 +1374,7 @@ async fn consent_isolation_audio_consent_false_enrichment_true_blocks_cloud() {
         .await;
 
     let (out, _label) = engine
-        .transcribe(&tiny_pcm(), &TranscribeConfig::default(), None)
+        .transcribe(&tiny_pcm(), &TranscribeConfig::default(), None, None)
         .await
         .expect("audio_cloud_consent=false must fallback, not hard-fail");
     assert_eq!(out, canned, "must use local fallback");
@@ -1416,7 +1416,7 @@ async fn unreachable_cloud_triggers_local_fallback() {
         .await;
 
     let (out, label) = engine
-        .transcribe(&tiny_pcm(), &TranscribeConfig::default(), None)
+        .transcribe(&tiny_pcm(), &TranscribeConfig::default(), None, None)
         .await
         .expect("dead port must degrade gracefully to local fallback");
 

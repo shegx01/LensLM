@@ -533,7 +533,6 @@ async fn run_audio_ingest(
         .await
         .map_err(|e| LensError::Internal(format!("audio decode task panicked: {e}")))??;
 
-    // Last cancel checkpoint — transcription itself is uninterruptible.
     if token.is_cancelled() {
         return Err(LensError::Cancelled(
             "audio ingest cancelled before transcription".into(),
@@ -548,7 +547,8 @@ async fn run_audio_ingest(
     ));
     let (asr_tx, mut asr_rx) = tokio::sync::mpsc::unbounded_channel::<f32>();
     let asr_config = crate::asr::TranscribeConfig::default();
-    let mut transcribe_fut = std::pin::pin!(engine.transcribe(&pcm, &asr_config, Some(asr_tx)));
+    let mut transcribe_fut =
+        std::pin::pin!(engine.transcribe(&pcm, &asr_config, Some(asr_tx), Some(token.clone())));
     let (segments, effective_backend) = loop {
         tokio::select! {
             biased;

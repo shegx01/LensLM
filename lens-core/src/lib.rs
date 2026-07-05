@@ -848,6 +848,7 @@ impl LensEngine {
         pcm: &[f32],
         config: &TranscribeConfig,
         progress_tx: Option<mpsc::UnboundedSender<f32>>,
+        cancel: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<(Vec<TranscriptSegment>, &'static str), LensError> {
         let asr_cfg = {
             let guard = self.read().await;
@@ -900,7 +901,7 @@ impl LensEngine {
                             && self.local_whisper_available(&asr_cfg).await
                         {
                             let segs = self
-                                .transcribe_local_whisper(pcm, config, None, &asr_cfg)
+                                .transcribe_local_whisper(pcm, config, None, &asr_cfg, cancel)
                                 .await?;
                             Ok((segs, "local_whisper (fallback)"))
                         } else {
@@ -911,7 +912,7 @@ impl LensEngine {
             }
             (asr::AsrBackend::LocalWhisper, Some(_)) | (asr::AsrBackend::LocalWhisper, None) => {
                 let segs = self
-                    .transcribe_local_whisper(pcm, config, progress_tx, &asr_cfg)
+                    .transcribe_local_whisper(pcm, config, progress_tx, &asr_cfg, cancel)
                     .await?;
                 Ok((segs, "local_whisper"))
             }
@@ -940,6 +941,7 @@ impl LensEngine {
                             injected_local,
                             progress_tx,
                             cloud_err,
+                            cancel,
                         )
                         .await
                     }
@@ -974,6 +976,7 @@ impl LensEngine {
 
     /// Cloud→local degradation cascade: Apple-if-injected, else Whisper. Returns
     /// the original `cloud_err` only when no local path can produce segments.
+    #[allow(clippy::too_many_arguments)]
     async fn cloud_fallback_to_local(
         &self,
         pcm: &[f32],
@@ -982,6 +985,7 @@ impl LensEngine {
         injected: Option<Arc<dyn asr::AsrEngine>>,
         progress_tx: Option<mpsc::UnboundedSender<f32>>,
         cloud_err: LensError,
+        cancel: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<(Vec<TranscriptSegment>, &'static str), LensError> {
         if let Some(engine) = injected {
             match engine.transcribe_pcm(pcm, config, progress_tx).await {
@@ -989,7 +993,7 @@ impl LensEngine {
                 Err(apple_err) => {
                     if !is_user_cancel(&apple_err) && self.local_whisper_available(asr_cfg).await {
                         let segs = self
-                            .transcribe_local_whisper(pcm, config, None, asr_cfg)
+                            .transcribe_local_whisper(pcm, config, None, asr_cfg, cancel)
                             .await?;
                         Ok((segs, "local_whisper (fallback)"))
                     } else {
@@ -999,7 +1003,7 @@ impl LensEngine {
             }
         } else if self.local_whisper_available(asr_cfg).await {
             let segs = self
-                .transcribe_local_whisper(pcm, config, progress_tx, asr_cfg)
+                .transcribe_local_whisper(pcm, config, progress_tx, asr_cfg, cancel)
                 .await?;
             Ok((segs, "local_whisper (fallback)"))
         } else {
@@ -1038,9 +1042,12 @@ impl LensEngine {
         config: &TranscribeConfig,
         progress_tx: Option<mpsc::UnboundedSender<f32>>,
         asr_cfg: &config::AsrConfig,
+        cancel: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<Vec<TranscriptSegment>, LensError> {
         let engine = self.whisper_engine_for(asr_cfg).await?;
-        engine.transcribe_pcm(pcm, config, progress_tx).await
+        engine
+            .transcribe_pcm_cancellable(pcm, config, progress_tx, cancel)
+            .await
     }
 
     #[cfg(not(feature = "local-whisper"))]
@@ -1050,6 +1057,7 @@ impl LensEngine {
         _config: &TranscribeConfig,
         _progress_tx: Option<mpsc::UnboundedSender<f32>>,
         _asr_cfg: &config::AsrConfig,
+        _cancel: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<Vec<TranscriptSegment>, LensError> {
         Err(LensError::Transcription(
             "local whisper feature not built (build lens-core with the `local-whisper` feature)"
@@ -1742,7 +1750,7 @@ mod transcribe_tests {
             translate: false,
         };
         let pcm = vec![0.0_f32; 16];
-        let result = engine.transcribe(&pcm, &config, None).await;
+        let result = engine.transcribe(&pcm, &config, None, None).await;
 
         // The whisper branch ran: the stub is not a valid model, so we get a
         // whisper-path error, NOT the original "not installed" Apple message.
@@ -1777,7 +1785,7 @@ mod transcribe_tests {
             translate: false,
         };
         let pcm = vec![0.0_f32; 16];
-        let result = engine.transcribe(&pcm, &config, None).await;
+        let result = engine.transcribe(&pcm, &config, None, None).await;
 
         match result {
             Err(LensError::Transcription(msg)) => {
@@ -1806,7 +1814,7 @@ mod transcribe_tests {
             translate: false,
         };
         let pcm = vec![0.0_f32; 16];
-        let result = engine.transcribe(&pcm, &config, None).await;
+        let result = engine.transcribe(&pcm, &config, None, None).await;
 
         match result {
             Err(LensError::Transcription(msg)) => {
@@ -1843,7 +1851,7 @@ mod transcribe_tests {
             translate: true,
         };
         let pcm = vec![0.0_f32; 16];
-        let result = engine.transcribe(&pcm, &config, None).await;
+        let result = engine.transcribe(&pcm, &config, None, None).await;
 
         // LocalWhisper is routed but the model is not downloaded, so we get a
         // typed Transcription error — confirming the Apple mock was NOT called.
