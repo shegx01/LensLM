@@ -147,7 +147,7 @@ url = "=2.5.8"
 # --- M4 Phase 2.5c: structured-format extractors (JSON/JSONL/YAML/XML) ---
 # YAML → serde_json::Value deserialization for the YAML extractor. Pinned
 # exactly per repo convention. MIT OR Apache-2.0 — both in deny.toml allowlist.
-serde-saphyr = "=0.0.28"
+serde-saphyr = "=0.0.29"
 # Zero-copy XML DOM parser for the XML extractor. MIT OR Apache-2.0 — both in
 # deny.toml allowlist. Pinned exactly per repo convention.
 roxmltree = "=0.21.1"
