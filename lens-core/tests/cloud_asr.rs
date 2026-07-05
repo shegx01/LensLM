@@ -127,11 +127,53 @@ fn split_if_needed_under_limit_returns_single_chunk() {
 }
 
 #[test]
-fn split_if_needed_deepgram_always_single_chunk_for_normal_audio() {
-    // Deepgram cap is 2 GB — any normal audio is a single chunk
-    let pcm: Vec<f32> = vec![0.1_f32; 16_000 * 60]; // 60 seconds
+fn split_if_needed_deepgram_short_audio_single_chunk() {
+    let pcm: Vec<f32> = vec![0.1_f32; 16_000 * 60];
     let chunks = split_if_needed(&pcm, CloudAsrProvider::Deepgram, 16_000);
     assert_eq!(chunks.len(), 1);
+}
+
+#[test]
+fn split_if_needed_deepgram_over_duration_cap_produces_multiple_chunks() {
+    let sample_rate = 16_000usize;
+    let n = sample_rate * 60 * 20;
+    let pcm: Vec<f32> = vec![0.1_f32; n];
+    let chunks = split_if_needed(&pcm, CloudAsrProvider::Deepgram, sample_rate as u32);
+    assert!(
+        chunks.len() >= 2,
+        "20 minutes of Deepgram audio must split on the duration cap, got {}",
+        chunks.len()
+    );
+    let max_chunk_samples = 480 * sample_rate;
+    for (i, c) in chunks.iter().enumerate() {
+        assert!(
+            c.data.len() <= max_chunk_samples,
+            "chunk {i} of {} samples exceeds the ~8-minute duration cap ({max_chunk_samples})",
+            c.data.len()
+        );
+    }
+    let total: usize = chunks.iter().map(|c| c.data.len()).sum();
+    assert_eq!(total, n, "all samples must be covered across chunks");
+    let mut prev = -1.0f32;
+    for c in &chunks {
+        assert!(
+            c.start_second > prev,
+            "chunk starts must be strictly increasing"
+        );
+        prev = c.start_second;
+    }
+}
+
+#[test]
+fn split_if_needed_zero_sample_rate_terminates() {
+    let pcm: Vec<f32> = vec![0.1_f32; 10];
+    let chunks = split_if_needed(&pcm, CloudAsrProvider::Deepgram, 0);
+    let total: usize = chunks.iter().map(|c| c.data.len()).sum();
+    assert_eq!(
+        total,
+        pcm.len(),
+        "a zero sample rate must not lose or loop over samples"
+    );
 }
 
 #[test]
@@ -621,6 +663,72 @@ async fn openai_request_carries_bearer_auth_and_multipart_fields() {
     );
 }
 
+#[tokio::test]
+async fn cloud_chunk_retries_then_succeeds_on_transient_5xx() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/audio/transcriptions"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(2)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/audio/transcriptions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_segments_response()))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    let engine = CloudAsrEngine::with_client(
+        CloudAsrProvider::OpenAiCompatible,
+        server.uri(),
+        "whisper-1",
+        "sk-test",
+        reqwest::Client::new(),
+    )
+    .with_retry_policy(3, std::time::Duration::from_millis(1));
+
+    engine
+        .transcribe_pcm(&tiny_pcm(), &TranscribeConfig::default(), None)
+        .await
+        .expect("two transient 5xx then success must recover via retry");
+
+    let calls = server.received_requests().await.unwrap();
+    assert_eq!(calls.len(), 3, "expected 2 failed attempts + 1 success");
+}
+
+#[tokio::test]
+async fn cloud_chunk_gives_up_after_max_retries() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/audio/transcriptions"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    let engine = CloudAsrEngine::with_client(
+        CloudAsrProvider::OpenAiCompatible,
+        server.uri(),
+        "whisper-1",
+        "sk-test",
+        reqwest::Client::new(),
+    )
+    .with_retry_policy(2, std::time::Duration::from_millis(1));
+
+    let err = engine
+        .transcribe_pcm(&tiny_pcm(), &TranscribeConfig::default(), None)
+        .await
+        .expect_err("persistent 5xx must propagate after retries are exhausted");
+    assert!(
+        matches!(err, lens_core::LensError::Network(_)),
+        "a retried-out 5xx surfaces as Network, got {err:?}"
+    );
+
+    let calls = server.received_requests().await.unwrap();
+    assert_eq!(calls.len(), 3, "expected 1 initial attempt + 2 retries");
+}
+
 // ===========================================================================
 // Integration: Deepgram happy path
 // ===========================================================================
@@ -728,7 +836,8 @@ async fn assert_status_maps_to(
         "model",
         "key",
         reqwest::Client::new(),
-    );
+    )
+    .with_retry_policy(0, std::time::Duration::ZERO);
 
     let err = engine
         .transcribe_pcm(&tiny_pcm(), &TranscribeConfig::default(), None)
