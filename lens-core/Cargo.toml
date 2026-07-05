@@ -103,7 +103,7 @@ flate2 = "=1.1.9"
 # Symphonia's cargo defaults — mp3/aac/isomp4/alac/caf/aiff — alongside the
 # always-on wav/flac/ogg/vorbis. Opus is NOT decodable in 0.5.5 (roadmap only)
 # and maps to `UnsupportedMediaCodec`. MPL-2.0 — in deny.toml allowlist.
-symphonia = { version = "=0.5.5", features = ["all"] }
+symphonia = { version = "=0.6.0", features = ["all"] }
 # High-quality sinc resampler (arbitrary-rate → 16kHz). Pinned to the 0.16.x
 # line for the stable `SincFixedIn` + planar `Vec<Vec<f32>>` API (rubato 3.0.0
 # REMOVED `SincFixedIn` in favour of an `audioadapter` surface that has since
