@@ -40,7 +40,9 @@ pub use asr::{
     download_whisper_model, resolve_whisper, select_asr_backend, whisper_model_downloaded,
     whisper_model_path,
 };
-pub use config::{AppConfig, EnrichmentConfig, TaskModel};
+pub use config::{
+    AppConfig, EnrichmentConfig, RerankerConfig, RerankerModel, RetrievalConfig, TaskModel,
+};
 pub use embedder::{
     CountingEmbedder, DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, Embedder, EmbeddingBackend,
     EmbeddingModelSpec, FastembedEmbedder, OllamaEmbedder, REGISTRY, resolve, resolve_opt,
