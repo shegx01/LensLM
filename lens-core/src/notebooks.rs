@@ -464,24 +464,16 @@ async fn write_chunk_enrichment_tx(
     Ok(())
 }
 
-/// Persists the M13 entity-graph rows (nodes → edges → mentions), each `INSERT OR
-/// IGNORE` against its UNIQUE constraint so re-enrichment (incl. the #154
-/// prompt-version storm) never accumulates rows on any table.
-///
-/// Each insert runs in SQLite autocommit (its own implicit statement transaction),
-/// NOT a shared explicit transaction: batching multiple `INSERT OR IGNORE`
-/// conflict-resolutions into one deferred sqlx `BEGIN` deadlocks/errors the SQLite
-/// connection on a re-enrichment (the prior job's re-embed advances the WAL, and the
-/// deferred transaction cannot escalate its read snapshot to a write). Autocommit
-/// sidesteps it. The graph is unread until #158's opt-in gate, so the loss of joint
-/// atomicity with the chunk-enrichment write is benign: a crash mid-loop leaves a
-/// partial graph that the next (idempotent) re-enrichment completes.
+/// Persists the M13 entity-graph rows (nodes → edges → mentions) on `conn` inside an
+/// in-progress transaction, each `INSERT OR IGNORE` against its UNIQUE constraint so
+/// re-enrichment (incl. the #154 prompt-version storm) never accumulates rows on any
+/// table. Insert order is nodes-before-edges/mentions so the FK references resolve.
 ///
 /// Teardown scope: #157 adds the explicit `DELETE FROM entity_nodes WHERE
 /// source_id=?`; until then source-keyed nodes may accumulate on content-changing
 /// re-ingest — harmless, as the graph is unread until #158's opt-in gate.
-async fn write_entity_graph_autocommit(
-    pool: &SqlitePool,
+async fn write_entity_graph_tx(
+    conn: &mut SqliteConnection,
     graph: &EntityGraphRows,
 ) -> Result<(), LensError> {
     for node in &graph.nodes {
@@ -500,7 +492,7 @@ async fn write_entity_graph_autocommit(
         .bind(&node.definition)
         .bind(node.resolution_conf)
         .bind(&node.created_at)
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
     }
     for edge in &graph.edges {
@@ -520,7 +512,7 @@ async fn write_entity_graph_autocommit(
         .bind(edge.weight)
         .bind(edge.confidence)
         .bind(&edge.created_at)
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
     }
     for mention in &graph.mentions {
@@ -536,7 +528,7 @@ async fn write_entity_graph_autocommit(
         .bind(mention.char_start)
         .bind(mention.char_end)
         .bind(&mention.created_at)
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
     }
     Ok(())
@@ -1500,17 +1492,21 @@ impl<'a> NotebookRepo<'a> {
         Ok(())
     }
 
-    /// Writes chunk enrichment (TEXT columns) then the M13 entity-graph rows. The
-    /// chunk write is one transaction; the graph rows are then persisted via
-    /// `INSERT OR IGNORE` (idempotent) in autocommit — see
-    /// [`write_entity_graph_autocommit`] for why they cannot share one transaction.
+    /// Writes chunk enrichment (TEXT columns) and the M13 entity-graph rows in ONE
+    /// transaction (AC7): begin → chunk enrichment → graph → commit. Either both land
+    /// or neither does, so a mid-write failure never leaves enriched chunks with a
+    /// partial graph. The graph inserts are `INSERT OR IGNORE` (idempotent), so a
+    /// re-enrichment re-running this write does not accumulate rows.
     pub async fn write_enrichment_and_graph(
         &self,
         updates: &[ChunkEnrichmentUpdate],
         graph: &EntityGraphRows,
     ) -> Result<(), LensError> {
-        self.write_chunk_enrichment(updates).await?;
-        write_entity_graph_autocommit(self.pool, graph).await
+        let mut tx = self.pool.begin().await?;
+        write_chunk_enrichment_tx(&mut tx, updates).await?;
+        write_entity_graph_tx(&mut tx, graph).await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Lists chunks for the Step-5 re-embed flip: `(id, level,

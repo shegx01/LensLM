@@ -228,6 +228,56 @@ async fn graph_atomicity() {
 }
 
 // ---------------------------------------------------------------------------
+// AC7 (rollback) — a failing graph write rolls back the chunk-enrichment write in
+// the SAME transaction: nothing partial persists.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn graph_write_failure_rolls_back_chunk_enrichment() {
+    let (_dir, engine) = file_engine().await;
+    let (nb, source_id, chunk_id) = seed_source_with_chunk(&engine).await;
+
+    // Poison the graph: an edge whose `from_node` references a node that is never
+    // inserted → FK violation on the edge INSERT (foreign_keys=ON), aborting the txn.
+    let mut rows = sample_rows(&nb, &source_id, &chunk_id);
+    rows.edges[0].from_node = "does-not-exist".to_string();
+
+    let updates = vec![ChunkEnrichmentUpdate {
+        chunk_id: chunk_id.clone(),
+        embedding_text: "SHOULD NOT PERSIST".to_string(),
+        enrichment_json: None,
+    }];
+    let pool = engine.pool().await;
+    let repo = NotebookRepo::new(&pool);
+
+    // The combined write must fail (the poisoned edge aborts the transaction).
+    let res = repo.write_enrichment_and_graph(&updates, &rows).await;
+    assert!(res.is_err(), "poisoned graph write must return an error");
+
+    // Rollback proof: the chunk-enrichment write in the SAME txn did NOT persist.
+    let et: Option<String> = sqlx::query("SELECT embedding_text FROM chunks WHERE id = ?")
+        .bind(&chunk_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get("embedding_text");
+    assert_eq!(
+        et, None,
+        "chunk enrichment must be rolled back with the graph"
+    );
+
+    // And no partial graph rows leaked (the two nodes inserted before the bad edge
+    // must roll back too).
+    assert_eq!(count(&engine, "entity_nodes").await, 0, "nodes rolled back");
+    assert_eq!(count(&engine, "entity_edges").await, 0, "edges rolled back");
+    assert_eq!(
+        count(&engine, "entity_mentions").await,
+        0,
+        "mentions rolled back"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // AC8 — ON DELETE CASCADE
 // ---------------------------------------------------------------------------
 
