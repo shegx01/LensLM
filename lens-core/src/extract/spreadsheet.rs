@@ -82,6 +82,7 @@ pub struct SpreadsheetExtractor;
 
 impl Extractor for SpreadsheetExtractor {
     fn extract(&self, raw: &[u8]) -> Result<ExtractOutput, LensError> {
+        super::guard_zip_entry_count(raw)?;
         // `open_workbook_auto_from_rs` needs `Read+Seek+Clone`; owned Vec cursor.
         let cursor = Cursor::new(raw.to_vec());
         let mut workbook = open_workbook_auto_from_rs(cursor)

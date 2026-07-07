@@ -50,6 +50,7 @@ pub struct EpubExtractor;
 
 impl Extractor for EpubExtractor {
     fn extract(&self, raw: &[u8]) -> Result<ExtractOutput, LensError> {
+        super::guard_zip_entry_count(raw)?;
         // rbook 0.7.9 requires `Read + Seek + 'static`; an owned copy is
         // unavoidable. Bomb risk bounded by per-spine ceiling + upstream 50 MB cap.
         let epub = Epub::read(Cursor::new(raw.to_vec()))

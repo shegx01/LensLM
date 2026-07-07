@@ -138,6 +138,7 @@ pub struct DocxExtractor;
 
 impl Extractor for DocxExtractor {
     fn extract(&self, raw: &[u8]) -> Result<ExtractOutput, LensError> {
+        super::guard_zip_entry_count(raw)?;
         guard_docx_inflation(raw, MAX_DECOMPRESSED_BYTES)?;
         let docx = read_docx(raw)
             .map_err(|e| LensError::Parse(format!("docx-rs failed to parse DOCX: {e:?}")))?;

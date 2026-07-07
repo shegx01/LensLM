@@ -134,6 +134,25 @@ pub fn extractor_for(kind: &str) -> Result<Box<dyn Extractor>, LensError> {
     }
 }
 
+pub(crate) const MAX_ZIP_ENTRIES: usize = 10_000;
+
+/// Rejects a ZIP container whose entry count exceeds [`MAX_ZIP_ENTRIES`] (a
+/// many-small-entries bomb the uncompressed-size ceiling does not catch). Input
+/// that is not a ZIP passes through: the caller's own open validates the format.
+pub(crate) fn guard_zip_entry_count(raw: &[u8]) -> Result<(), LensError> {
+    let Ok(archive) = zip::ZipArchive::new(std::io::Cursor::new(raw)) else {
+        return Ok(());
+    };
+    if archive.len() > MAX_ZIP_ENTRIES {
+        return Err(LensError::Validation(format!(
+            "ZIP container has {} entries, exceeding the {MAX_ZIP_ENTRIES}-entry \
+             limit (possible zip bomb)",
+            archive.len()
+        )));
+    }
+    Ok(())
+}
+
 /// Test-only injection seam: lets integration tests register a fake [`Extractor`]
 /// for an arbitrary kind to drive the ingest pipeline end-to-end.
 ///
@@ -216,6 +235,38 @@ pub mod test_seam {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guard_zip_entry_count_rejects_excessive_entries() {
+        use std::io::Cursor;
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let opts: zip::write::FileOptions = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for i in 0..(MAX_ZIP_ENTRIES + 1) {
+                zip.start_file(format!("e{i}.txt"), opts).expect("start entry");
+            }
+            zip.finish().expect("finish zip");
+        }
+        let err = guard_zip_entry_count(&buf).expect_err("excess entries must be rejected");
+        assert!(matches!(err, LensError::Validation(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn guard_zip_entry_count_allows_small_zip_and_passes_non_zip() {
+        use std::io::Cursor;
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let opts: zip::write::FileOptions = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("only.txt", opts).expect("start entry");
+            zip.finish().expect("finish zip");
+        }
+        guard_zip_entry_count(&buf).expect("small zip allowed");
+        guard_zip_entry_count(b"not a zip at all").expect("non-zip passes through");
+    }
 
     fn assert_text_kind_matches_parse_blocks(kind_str: &str, source_kind: SourceKind, src: &str) {
         let extractor = extractor_for(kind_str).expect("extractor for known kind");
