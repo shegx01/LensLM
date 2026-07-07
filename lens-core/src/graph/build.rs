@@ -140,9 +140,12 @@ pub fn build_entity_graph_rows(
             if name_lower.is_empty() {
                 continue;
             }
-            let mut found_in_chunk = false;
-            for (cp_start, cp_end) in find_word_boundary_occurrences(&lower_text, name_lower) {
-                found_in_chunk = true;
+            let occurrences = find_word_boundary_occurrences(&lower_text, name_lower);
+            // A node joins the chunk's co-occurrence set iff its name literally occurs here.
+            if !occurrences.is_empty() {
+                present.push(node_i);
+            }
+            for (cp_start, cp_end) in occurrences {
                 mentions.push(EntityMention {
                     id: ids(),
                     notebook_id: notebook_id.to_string(),
@@ -152,9 +155,6 @@ pub fn build_entity_graph_rows(
                     char_end: cp_end as i64,
                     created_at: created_at.to_string(),
                 });
-            }
-            if found_in_chunk {
-                present.push(node_i);
             }
         }
 
