@@ -10,10 +10,11 @@ use std::str::FromStr;
 use sha2::{Digest, Sha256};
 
 use serde::{Deserialize, Serialize};
-use sqlx::SqlitePool;
+use sqlx::{SqliteConnection, SqlitePool};
 use uuid::Uuid;
 
 use crate::LensError;
+use crate::graph::EntityGraphRows;
 use crate::parse::SourceKind;
 use crate::url_normalize::normalize_url;
 
@@ -434,6 +435,104 @@ const SOURCE_DEDUP_SELECT: &str = "SELECT id, notebook_id, kind, title, status, 
      selected, token_count, content_hash, raw_content_hash, created_at, trashed_at, \
      enrichment_status, enrichment_meta, force_js_render, error_meta \
      FROM sources WHERE notebook_id = ? AND raw_content_hash = ? AND trashed_at IS NULL LIMIT 1";
+
+/// Applies `updates` (composed `embedding_text`, plus `enrichment` JSON on parent
+/// rows) on `conn` inside an in-progress transaction. `chunks.text` is never modified.
+async fn write_chunk_enrichment_tx(
+    conn: &mut SqliteConnection,
+    updates: &[ChunkEnrichmentUpdate],
+) -> Result<(), LensError> {
+    for u in updates {
+        match &u.enrichment_json {
+            Some(json) => {
+                sqlx::query("UPDATE chunks SET embedding_text = ?, enrichment = ? WHERE id = ?")
+                    .bind(&u.embedding_text)
+                    .bind(json)
+                    .bind(&u.chunk_id)
+                    .execute(&mut *conn)
+                    .await?;
+            }
+            None => {
+                sqlx::query("UPDATE chunks SET embedding_text = ? WHERE id = ?")
+                    .bind(&u.embedding_text)
+                    .bind(&u.chunk_id)
+                    .execute(&mut *conn)
+                    .await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Persists the M13 entity-graph rows (nodes → edges → mentions) on `conn` inside an
+/// in-progress transaction, each `INSERT OR IGNORE` against its UNIQUE constraint so
+/// re-enrichment (incl. the #154 prompt-version storm) never accumulates rows on any
+/// table. Insert order is nodes-before-edges/mentions so the FK references resolve.
+///
+/// Teardown scope: #157 adds the explicit `DELETE FROM entity_nodes WHERE
+/// source_id=?`; until then source-keyed nodes may accumulate on content-changing
+/// re-ingest — harmless, as the graph is unread until #158's opt-in gate.
+async fn write_entity_graph_tx(
+    conn: &mut SqliteConnection,
+    graph: &EntityGraphRows,
+) -> Result<(), LensError> {
+    for node in &graph.nodes {
+        sqlx::query(
+            "INSERT OR IGNORE INTO entity_nodes \
+                 (id, notebook_id, source_id, kind, name, canonical_name, definition, \
+                  resolution_conf, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&node.id)
+        .bind(&node.notebook_id)
+        .bind(&node.source_id)
+        .bind(node.kind.as_str())
+        .bind(&node.name)
+        .bind(&node.canonical_name)
+        .bind(&node.definition)
+        .bind(node.resolution_conf)
+        .bind(&node.created_at)
+        .execute(&mut *conn)
+        .await?;
+    }
+    for edge in &graph.edges {
+        sqlx::query(
+            "INSERT OR IGNORE INTO entity_edges \
+                 (id, notebook_id, source_id, chunk_id, from_node, to_node, relation, \
+                  weight, confidence, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&edge.id)
+        .bind(&edge.notebook_id)
+        .bind(&edge.source_id)
+        .bind(&edge.chunk_id)
+        .bind(&edge.from_node)
+        .bind(&edge.to_node)
+        .bind(edge.relation.as_str())
+        .bind(edge.weight)
+        .bind(edge.confidence)
+        .bind(&edge.created_at)
+        .execute(&mut *conn)
+        .await?;
+    }
+    for mention in &graph.mentions {
+        sqlx::query(
+            "INSERT OR IGNORE INTO entity_mentions \
+                 (id, notebook_id, entity_node_id, chunk_id, char_start, char_end, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&mention.id)
+        .bind(&mention.notebook_id)
+        .bind(&mention.entity_node_id)
+        .bind(&mention.chunk_id)
+        .bind(mention.char_start)
+        .bind(mention.char_end)
+        .bind(&mention.created_at)
+        .execute(&mut *conn)
+        .await?;
+    }
+    Ok(())
+}
 
 /// Repository over the `notebooks` table. Zero-cost borrowed handle; holds no state.
 pub struct NotebookRepo<'a> {
@@ -1381,33 +1480,31 @@ impl<'a> NotebookRepo<'a> {
     }
 
     /// Writes `embedding_text` (and, for parent rows, `enrichment` JSON) in one
-    /// transaction. `chunks.text` is never modified.
+    /// transaction. `chunks.text` is never modified. Retained for the prefix-only
+    /// fallback path (`worker.rs`), which has no graph rows.
     pub async fn write_chunk_enrichment(
         &self,
         updates: &[ChunkEnrichmentUpdate],
     ) -> Result<(), LensError> {
         let mut tx = self.pool.begin().await?;
-        for u in updates {
-            match &u.enrichment_json {
-                Some(json) => {
-                    sqlx::query(
-                        "UPDATE chunks SET embedding_text = ?, enrichment = ? WHERE id = ?",
-                    )
-                    .bind(&u.embedding_text)
-                    .bind(json)
-                    .bind(&u.chunk_id)
-                    .execute(&mut *tx)
-                    .await?;
-                }
-                None => {
-                    sqlx::query("UPDATE chunks SET embedding_text = ? WHERE id = ?")
-                        .bind(&u.embedding_text)
-                        .bind(&u.chunk_id)
-                        .execute(&mut *tx)
-                        .await?;
-                }
-            }
-        }
+        write_chunk_enrichment_tx(&mut tx, updates).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Writes chunk enrichment (TEXT columns) and the M13 entity-graph rows in ONE
+    /// transaction (AC7): begin → chunk enrichment → graph → commit. Either both land
+    /// or neither does, so a mid-write failure never leaves enriched chunks with a
+    /// partial graph. The graph inserts are `INSERT OR IGNORE` (idempotent), so a
+    /// re-enrichment re-running this write does not accumulate rows.
+    pub async fn write_enrichment_and_graph(
+        &self,
+        updates: &[ChunkEnrichmentUpdate],
+        graph: &EntityGraphRows,
+    ) -> Result<(), LensError> {
+        let mut tx = self.pool.begin().await?;
+        write_chunk_enrichment_tx(&mut tx, updates).await?;
+        write_entity_graph_tx(&mut tx, graph).await?;
         tx.commit().await?;
         Ok(())
     }

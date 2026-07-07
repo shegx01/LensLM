@@ -63,7 +63,7 @@ async fn migration_is_idempotent_second_run_is_noop() {
         .unwrap();
 
     assert_eq!(count_before, count_after);
-    assert_eq!(count_after, 13, "all migration files applied (0001..0013)");
+    assert_eq!(count_after, 14, "all migration files applied (0001..0014)");
 }
 
 #[tokio::test]
@@ -601,7 +601,7 @@ async fn cold_init_under_budget_on_empty_temp_db() {
     let engine = LensEngine::init(dir.path()).await.unwrap();
     let elapsed = start.elapsed();
     // Sanity: the engine works.
-    assert_eq!(engine.migration_count().await.unwrap(), 13);
+    assert_eq!(engine.migration_count().await.unwrap(), 14);
     // Generous smoke guard against accidentally-expensive migrations (e.g. a
     // future migration that scans/rewrites large tables on cold start). This is
     // NOT a tight perf benchmark — the wide 2s budget keeps it non-flaky on
@@ -749,8 +749,8 @@ async fn migration_0009_renames_file_hash_to_raw_content_hash() {
         "old idx_sources_notebook_file_hash must be gone after 0009"
     );
 
-    // Migration count reflects all thirteen migrations.
-    assert_eq!(engine.migration_count().await.unwrap(), 13);
+    // Migration count reflects all fourteen migrations.
+    assert_eq!(engine.migration_count().await.unwrap(), 14);
 }
 
 #[tokio::test]
@@ -801,4 +801,74 @@ async fn migration_0011_adds_last_activity_at_and_backfills_to_created_at() {
         Some(created_at.as_str()),
         "backfill must set last_activity_at = created_at for pre-migration rows"
     );
+}
+
+/// AC1/AC8: migration 0014 creates the 3 entity-graph tables, the 8 explicit named
+/// indexes, one UNIQUE backing index per table (`origin='u'`), and `ON DELETE
+/// CASCADE` FKs. Asserts index NAMES via `.contains()` — never a hard-coded total.
+#[tokio::test]
+async fn schema_entity_graph_tables_and_indexes() {
+    let engine = LensEngine::for_test().await;
+    let pool = engine.pool().await;
+
+    let tables = table_names(&engine).await;
+    for expected in ["entity_nodes", "entity_edges", "entity_mentions"] {
+        assert!(tables.contains(expected), "missing table: {expected}");
+    }
+
+    // (a) all 8 explicit CREATE INDEX names exist by name.
+    let all_indexes: HashSet<String> =
+        sqlx::query("SELECT name FROM sqlite_master WHERE type = 'index'")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.get::<String, _>("name"))
+            .collect();
+    for idx in [
+        "idx_gnodes_nb",
+        "idx_gnodes_source",
+        "idx_gedges_src",
+        "idx_gedges_tgt",
+        "idx_gedges_rel",
+        "idx_gedges_chunk",
+        "idx_gmentions_entity",
+        "idx_gmentions_chunk",
+    ] {
+        assert!(
+            all_indexes.contains(idx),
+            "missing explicit index {idx}, found: {all_indexes:?}"
+        );
+    }
+
+    // (b) exactly one UNIQUE backing index per table (`origin='u'`).
+    for table in ["entity_nodes", "entity_edges", "entity_mentions"] {
+        let unique_count = sqlx::query(&format!("PRAGMA index_list({table})"))
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.get::<String, _>("origin") == "u")
+            .count();
+        assert_eq!(
+            unique_count, 1,
+            "{table} must have exactly one UNIQUE backing index"
+        );
+    }
+
+    // (c) ON DELETE CASCADE FKs on all three tables.
+    for table in ["entity_nodes", "entity_edges", "entity_mentions"] {
+        let fks = sqlx::query(&format!("PRAGMA foreign_key_list({table})"))
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert!(!fks.is_empty(), "{table} must declare foreign keys");
+        for fk in fks {
+            assert_eq!(
+                fk.get::<String, _>("on_delete"),
+                "CASCADE",
+                "{table} FK must be ON DELETE CASCADE"
+            );
+        }
+    }
 }
