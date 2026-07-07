@@ -159,6 +159,27 @@ impl FromStr for SourceStatus {
     }
 }
 
+impl TryFrom<String> for SourceStatus {
+    type Error = LensError;
+
+    fn try_from(s: String) -> Result<Self, LensError> {
+        s.parse()
+    }
+}
+
+impl Serialize for SourceStatus {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for SourceStatus {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 /// Enrichment lifecycle, persisted in `sources.enrichment_status`. SEPARATE from
 /// [`SourceStatus`] so enrichment never touches the crash-recovery invariant.
 /// NULL in the column is read as [`None`](EnrichmentStatus::None). Wire strings
@@ -222,9 +243,11 @@ impl EnrichmentStatus {
 pub struct Source {
     pub id: String,
     pub notebook_id: String,
-    pub kind: String,
+    #[sqlx(try_from = "String")]
+    pub kind: crate::parse::SourceKind,
     pub title: String,
-    pub status: String,
+    #[sqlx(try_from = "String")]
+    pub status: SourceStatus,
     pub locator: String,
     /// `1` = selected for retrieval.
     pub selected: i64,
@@ -491,26 +514,36 @@ impl<'a> NotebookRepo<'a> {
         let trashed = rows
             .into_iter()
             .map(|row| {
+                let kind_str: String = row.try_get("kind").map_err(LensError::from)?;
+                let status_str: String = row.try_get("status").map_err(LensError::from)?;
                 Ok(TrashedSource {
                     source: Source {
-                        id: row.try_get("id")?,
-                        notebook_id: row.try_get("notebook_id")?,
-                        kind: row.try_get("kind")?,
-                        title: row.try_get("title")?,
-                        status: row.try_get("status")?,
-                        locator: row.try_get("locator")?,
-                        selected: row.try_get("selected")?,
-                        token_count: row.try_get("token_count")?,
-                        content_hash: row.try_get("content_hash")?,
-                        raw_content_hash: row.try_get("raw_content_hash")?,
-                        created_at: row.try_get("created_at")?,
-                        trashed_at: row.try_get("trashed_at")?,
-                        enrichment_status: row.try_get("enrichment_status")?,
-                        enrichment_meta: row.try_get("enrichment_meta")?,
-                        force_js_render: row.try_get("force_js_render")?,
-                        error_meta: row.try_get("error_meta")?,
+                        id: row.try_get("id").map_err(LensError::from)?,
+                        notebook_id: row.try_get("notebook_id").map_err(LensError::from)?,
+                        kind: crate::parse::SourceKind::from_kind_str(&kind_str)?,
+                        title: row.try_get("title").map_err(LensError::from)?,
+                        status: status_str.parse::<SourceStatus>()?,
+                        locator: row.try_get("locator").map_err(LensError::from)?,
+                        selected: row.try_get("selected").map_err(LensError::from)?,
+                        token_count: row.try_get("token_count").map_err(LensError::from)?,
+                        content_hash: row.try_get("content_hash").map_err(LensError::from)?,
+                        raw_content_hash: row
+                            .try_get("raw_content_hash")
+                            .map_err(LensError::from)?,
+                        created_at: row.try_get("created_at").map_err(LensError::from)?,
+                        trashed_at: row.try_get("trashed_at").map_err(LensError::from)?,
+                        enrichment_status: row
+                            .try_get("enrichment_status")
+                            .map_err(LensError::from)?,
+                        enrichment_meta: row
+                            .try_get("enrichment_meta")
+                            .map_err(LensError::from)?,
+                        force_js_render: row
+                            .try_get("force_js_render")
+                            .map_err(LensError::from)?,
+                        error_meta: row.try_get("error_meta").map_err(LensError::from)?,
                     },
-                    notebook_title: row.try_get("notebook_title")?,
+                    notebook_title: row.try_get("notebook_title").map_err(LensError::from)?,
                 })
             })
             .collect::<Result<Vec<_>, LensError>>()?;
@@ -778,9 +811,9 @@ impl<'a> NotebookRepo<'a> {
             source: Source {
                 id,
                 notebook_id: notebook_id.to_string(),
-                kind: "file".to_string(),
+                kind: crate::parse::SourceKind::File,
                 title: title.to_string(),
-                status: SourceStatus::Pending.as_str().to_string(),
+                status: SourceStatus::Pending,
                 locator: locator.to_string(),
                 selected: 1,
                 token_count: None,
@@ -900,9 +933,9 @@ impl<'a> NotebookRepo<'a> {
             source: Source {
                 id,
                 notebook_id: notebook_id.to_string(),
-                kind: kind.to_string(),
+                kind: SourceKind::from_kind_str(kind)?,
                 title: title.to_string(),
-                status: SourceStatus::Queued.as_str().to_string(),
+                status: SourceStatus::Queued,
                 locator,
                 selected: 1,
                 token_count: None,
@@ -936,27 +969,27 @@ impl<'a> NotebookRepo<'a> {
             .and_then(|e| e.to_str())
             .map(str::to_ascii_lowercase);
         let (kind, ext) = match ext_lower.as_deref() {
-            Some("pdf") => (SourceKind::Pdf.as_str(), "pdf"),
-            Some("docx") => (SourceKind::Docx.as_str(), "docx"),
-            Some("txt") => (SourceKind::Text.as_str(), "txt"),
-            Some("md") | Some("markdown") | Some("mdx") => (SourceKind::Markdown.as_str(), "md"),
-            Some("json") => (SourceKind::Json.as_str(), "json"),
-            Some("jsonl") => (SourceKind::Jsonl.as_str(), "jsonl"),
-            Some("ndjson") => (SourceKind::Jsonl.as_str(), "ndjson"),
-            Some("yaml") => (SourceKind::Yaml.as_str(), "yaml"),
-            Some("yml") => (SourceKind::Yaml.as_str(), "yml"),
-            Some("xml") => (SourceKind::Xml.as_str(), "xml"),
-            Some("rtf") => (SourceKind::Rtf.as_str(), "rtf"),
-            Some("odt") => (SourceKind::Odt.as_str(), "odt"),
-            Some("epub") => (SourceKind::Epub.as_str(), "epub"),
-            Some("xlsx") => (SourceKind::Xlsx.as_str(), "xlsx"),
-            Some("xls") => (SourceKind::Xls.as_str(), "xls"),
-            Some("csv") => (SourceKind::Csv.as_str(), "csv"),
-            Some("mp3") => (SourceKind::Audio.as_str(), "mp3"),
-            Some("m4a") => (SourceKind::Audio.as_str(), "m4a"),
-            Some("aac") => (SourceKind::Audio.as_str(), "aac"),
-            Some("wav") => (SourceKind::Audio.as_str(), "wav"),
-            Some("flac") => (SourceKind::Audio.as_str(), "flac"),
+            Some("pdf") => (SourceKind::Pdf, "pdf"),
+            Some("docx") => (SourceKind::Docx, "docx"),
+            Some("txt") => (SourceKind::Text, "txt"),
+            Some("md") | Some("markdown") | Some("mdx") => (SourceKind::Markdown, "md"),
+            Some("json") => (SourceKind::Json, "json"),
+            Some("jsonl") => (SourceKind::Jsonl, "jsonl"),
+            Some("ndjson") => (SourceKind::Jsonl, "ndjson"),
+            Some("yaml") => (SourceKind::Yaml, "yaml"),
+            Some("yml") => (SourceKind::Yaml, "yml"),
+            Some("xml") => (SourceKind::Xml, "xml"),
+            Some("rtf") => (SourceKind::Rtf, "rtf"),
+            Some("odt") => (SourceKind::Odt, "odt"),
+            Some("epub") => (SourceKind::Epub, "epub"),
+            Some("xlsx") => (SourceKind::Xlsx, "xlsx"),
+            Some("xls") => (SourceKind::Xls, "xls"),
+            Some("csv") => (SourceKind::Csv, "csv"),
+            Some("mp3") => (SourceKind::Audio, "mp3"),
+            Some("m4a") => (SourceKind::Audio, "m4a"),
+            Some("aac") => (SourceKind::Audio, "aac"),
+            Some("wav") => (SourceKind::Audio, "wav"),
+            Some("flac") => (SourceKind::Audio, "flac"),
             other => {
                 return Err(LensError::Validation(format!(
                     "unsupported file extension {other:?} for {}; expected one of \
@@ -1018,7 +1051,7 @@ impl<'a> NotebookRepo<'a> {
         )
         .bind(&id)
         .bind(notebook_id)
-        .bind(kind)
+        .bind(kind.as_str())
         .bind(&title)
         .bind(SourceStatus::Queued.as_str())
         .bind(&locator)
@@ -1053,9 +1086,9 @@ impl<'a> NotebookRepo<'a> {
             source: Source {
                 id,
                 notebook_id: notebook_id.to_string(),
-                kind: kind.to_string(),
+                kind,
                 title,
-                status: SourceStatus::Queued.as_str().to_string(),
+                status: SourceStatus::Queued,
                 locator,
                 selected: 1,
                 token_count: None,
@@ -1146,9 +1179,9 @@ impl<'a> NotebookRepo<'a> {
             source: Source {
                 id,
                 notebook_id: notebook_id.to_string(),
-                kind: SourceKind::Url.as_str().to_string(),
+                kind: SourceKind::Url,
                 title: title.to_string(),
-                status: SourceStatus::Queued.as_str().to_string(),
+                status: SourceStatus::Queued,
                 locator: url.to_string(),
                 selected: 1,
                 token_count: None,
@@ -2370,9 +2403,7 @@ mod tests {
         assert_eq!(back, summary);
     }
 
-    /// Writes a tiny source file with the given extension into `dir` and runs
-    /// `add_file_source`, returning the inserted source's persisted `kind`.
-    async fn kind_for_extension(ext: &str) -> String {
+    async fn kind_for_extension(ext: &str) -> SourceKind {
         let pool = test_pool().await;
         let repo = NotebookRepo::new(&pool);
         let nb = repo
@@ -2391,71 +2422,61 @@ mod tests {
         let src_path = data_dir.join(format!("input.{ext}"));
         std::fs::write(&src_path, b"placeholder content").expect("write source file");
 
-        let source = repo
-            .add_file_source(data_dir, &nb.id, &src_path, None)
+        repo.add_file_source(data_dir, &nb.id, &src_path, None)
             .await
             .expect("add_file_source must accept the extension")
-            .source;
-        source.kind
+            .source
+            .kind
     }
 
     #[tokio::test]
     async fn add_file_source_json_extension() {
-        assert_eq!(kind_for_extension("json").await, SourceKind::Json.as_str());
+        assert_eq!(kind_for_extension("json").await, SourceKind::Json);
     }
 
     #[tokio::test]
     async fn add_file_source_jsonl_extension() {
-        assert_eq!(
-            kind_for_extension("jsonl").await,
-            SourceKind::Jsonl.as_str()
-        );
+        assert_eq!(kind_for_extension("jsonl").await, SourceKind::Jsonl);
     }
 
     #[tokio::test]
     async fn add_file_source_ndjson_extension() {
-        assert_eq!(
-            kind_for_extension("ndjson").await,
-            SourceKind::Jsonl.as_str()
-        );
+        assert_eq!(kind_for_extension("ndjson").await, SourceKind::Jsonl);
     }
 
     #[tokio::test]
     async fn add_file_source_yaml_extension() {
-        assert_eq!(kind_for_extension("yaml").await, SourceKind::Yaml.as_str());
+        assert_eq!(kind_for_extension("yaml").await, SourceKind::Yaml);
     }
 
     #[tokio::test]
     async fn add_file_source_yml_extension() {
-        assert_eq!(kind_for_extension("yml").await, SourceKind::Yaml.as_str());
+        assert_eq!(kind_for_extension("yml").await, SourceKind::Yaml);
     }
 
     #[tokio::test]
     async fn add_file_source_xml_extension() {
-        assert_eq!(kind_for_extension("xml").await, SourceKind::Xml.as_str());
+        assert_eq!(kind_for_extension("xml").await, SourceKind::Xml);
     }
 
     #[tokio::test]
     async fn add_file_source_mdx_extension() {
-        assert_eq!(
-            kind_for_extension("mdx").await,
-            SourceKind::Markdown.as_str()
-        );
+        assert_eq!(kind_for_extension("mdx").await, SourceKind::Markdown);
     }
 
     #[tokio::test]
     async fn add_file_source_rtf_extension() {
-        assert_eq!(kind_for_extension("rtf").await, SourceKind::Rtf.as_str());
+        assert_eq!(kind_for_extension("rtf").await, SourceKind::Rtf);
     }
 
     #[tokio::test]
     async fn add_file_source_odt_extension() {
-        assert_eq!(kind_for_extension("odt").await, SourceKind::Odt.as_str());
+        assert_eq!(kind_for_extension("odt").await, SourceKind::Odt);
     }
 
     #[tokio::test]
     async fn add_file_source_epub_extension() {
-        assert_eq!(kind_for_extension("epub").await, SourceKind::Epub.as_str());
+        assert_eq!(kind_for_extension("epub").await, SourceKind::Epub);
     }
 
     /// Inserts a `chunks` row directly via raw SQL (bypasses full ingest).

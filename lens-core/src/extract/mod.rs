@@ -131,6 +131,9 @@ pub fn extractor_for(kind: &str) -> Result<Box<dyn Extractor>, LensError> {
         SourceKind::Audio => Err(LensError::Internal(
             "audio sources use the decode+transcribe path, not an extractor".into(),
         )),
+        SourceKind::File => Err(LensError::Validation(
+            "file sources are M1 legacy placeholders and have no extractor".into(),
+        )),
     }
 }
 

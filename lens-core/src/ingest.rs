@@ -228,10 +228,10 @@ pub async fn retry_source(
                 "cannot retry a trashed source; restore it first".into(),
             ));
         }
-        if source.status != crate::notebooks::SourceStatus::Error.as_str() {
+        if source.status != crate::notebooks::SourceStatus::Error {
             return Err(LensError::Validation(format!(
                 "cannot retry source in status {:?}; only errored sources can be retried",
-                source.status
+                source.status.as_str()
             )));
         }
         // Transition to `parsing` (transient/crash-recoverable) before the permit window.
@@ -294,17 +294,15 @@ async fn run_ingest(
         .await?
         .ok_or_else(|| LensError::Validation(format!("no source with id {source_id}")))?;
 
-    // `kind` parsed leniently (.ok()): unknown kinds (test-util seam) fall through as
-    // DERIVED. `status` parsed strictly: an out-of-vocabulary status is a fail-loud breach.
-    let kind = crate::parse::SourceKind::from_kind_str(&source.kind).ok();
-    let status = source.status.parse::<crate::notebooks::SourceStatus>()?;
-    let text_like = kind.is_some_and(|k| k.is_text_like());
+    let kind = source.kind;
+    let status = source.status;
+    let text_like = kind.is_text_like();
     // PDF: streams into a building table, exempt from raw-bytes / extracted-text caps.
-    let is_pdf = kind == Some(crate::parse::SourceKind::Pdf);
+    let is_pdf = kind == crate::parse::SourceKind::Pdf;
 
     let max_source_bytes = resolve_max_source_bytes(&engine.config().await.max_source_mb);
 
-    let raw: Vec<u8> = if kind == Some(crate::parse::SourceKind::Url) {
+    let raw: Vec<u8> = if kind == crate::parse::SourceKind::Url {
         on_progress(IngestProgress::new(ingest_phase::FETCHING, 0, Some(1)));
 
         let url = source.locator.clone();
@@ -363,7 +361,7 @@ async fn run_ingest(
     // Audio takes the decode+transcribe path instead of an `Extractor` (issue #43).
     // Placed AFTER the Stage-1 size guard and the DERIVED no-op short-circuit (which
     // both run above) and BEFORE `extractor_for`, which has no audio extractor.
-    if kind == Some(crate::parse::SourceKind::Audio) {
+    if kind == crate::parse::SourceKind::Audio {
         let pool = pool.clone();
         return run_audio_ingest(
             engine,
@@ -380,7 +378,7 @@ async fn run_ingest(
     }
 
     // Sniff `.json` files for JSON Lines: if ≥2 newline-delimited JSON values, use the jsonl extractor.
-    let effective_kind: String = if kind == Some(crate::parse::SourceKind::Json)
+    let effective_kind: String = if kind == crate::parse::SourceKind::Json
         && sniff_is_jsonl(&raw)
     {
         tracing::info!(
@@ -389,7 +387,7 @@ async fn run_ingest(
         );
         crate::parse::SourceKind::Jsonl.as_str().to_string()
     } else {
-        source.kind.clone()
+        kind.as_str().to_string()
     };
 
     let extractor = crate::extract::extractor_for(&effective_kind)?;
@@ -423,7 +421,7 @@ async fn run_ingest(
     // INVARIANT: needs_ocr/needs_js are terminal-pending statuses returned as Ok(()) — NOT Err —
     // so the error-flip in `ingest_source` never fires. PdfExtractor signals no text layer
     // by returning empty output (no Err); we set needs_ocr and return Ok early.
-    if kind == Some(crate::parse::SourceKind::Pdf) && out.extracted_text.trim().is_empty() {
+    if kind == crate::parse::SourceKind::Pdf && out.extracted_text.trim().is_empty() {
         tracing::info!(
             source_id,
             "PDF source produced no text layer — likely scanned/image-only; setting needs_ocr"
@@ -433,7 +431,7 @@ async fn run_ingest(
         return Ok(()); // Ok so the Err→error flip in ingest_source never fires.
     }
 
-    if kind == Some(crate::parse::SourceKind::Url) {
+    if kind == crate::parse::SourceKind::Url {
         match ctx.try_js_render(&raw, &out, &mut on_progress).await? {
             JsRenderOutcome::Handled => return Ok(()),
             JsRenderOutcome::NotNeeded => {}

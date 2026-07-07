@@ -2916,8 +2916,8 @@ async fn docx_file_source_indexed_with_anchors_end_to_end() {
         .await
         .expect("add_file_source for a .docx must succeed")
         .source;
-    assert_eq!(source.kind, "docx", "extension .docx → kind docx");
-    assert_eq!(source.status, "queued", "new file source is queued");
+    assert_eq!(source.kind, lens_core::parse::SourceKind::Docx, "extension .docx → kind docx");
+    assert_eq!(source.status, lens_core::notebooks::SourceStatus::Queued, "new file source is queued");
     assert_eq!(
         source.title, "report.docx",
         "title defaults to the file name"
@@ -3042,8 +3042,8 @@ async fn pdf_file_source_indexed_with_anchors_end_to_end() {
         .await
         .expect("add_file_source for a .pdf must succeed")
         .source;
-    assert_eq!(source.kind, "pdf", "extension .pdf → kind pdf");
-    assert_eq!(source.status, "queued");
+    assert_eq!(source.kind, lens_core::parse::SourceKind::Pdf, "extension .pdf → kind pdf");
+    assert_eq!(source.status, lens_core::notebooks::SourceStatus::Queued);
     assert_eq!(source.title, "Custom Title", "supplied title is honored");
 
     engine.ingest_source(&source.id, |_p| {}).await.unwrap();

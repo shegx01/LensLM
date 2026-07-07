@@ -15,6 +15,7 @@
 use std::str::FromStr;
 
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::LensError;
 
@@ -23,9 +24,9 @@ use crate::LensError;
 /// Serialized to / parsed from the EXACT legacy `sources.kind` strings stored in
 /// SQLite (`"text"`/`"markdown"`/`"pdf"`/`"docx"`/`"url"`) via [`as_str`](Self::as_str)
 /// and [`from_kind_str`](Self::from_kind_str) — the wire/DB format is unchanged.
-/// The DB-row / IPC boundary keeps a raw `String`; logic converts to this enum
-/// immediately and dispatches via exhaustive `match` so adding a variant is a
-/// compile error everywhere it matters.
+/// The `Source` IPC struct carries this enum directly (decoded via sqlx `try_from`,
+/// serialized via `as_str`); dispatches via exhaustive `match` so adding a variant
+/// is a compile error everywhere it matters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceKind {
     /// Plain text (no markup). Blocks are paragraphs split on blank lines.
@@ -60,6 +61,8 @@ pub enum SourceKind {
     Csv,
     /// An audio file (mp3/m4a/aac/wav/flac). DERIVED via decode+transcribe (issue #43).
     Audio,
+    /// M1 legacy onboarding placeholder (kind not yet resolved from extension).
+    File,
 }
 
 impl SourceKind {
@@ -85,6 +88,7 @@ impl SourceKind {
             Self::Xls => "xls",
             Self::Csv => "csv",
             Self::Audio => "audio",
+            Self::File => "file",
         }
     }
 
@@ -108,8 +112,9 @@ impl SourceKind {
             "xls" => Ok(Self::Xls),
             "csv" => Ok(Self::Csv),
             "audio" => Ok(Self::Audio),
+            "file" => Ok(Self::File),
             other => Err(LensError::Validation(format!(
-                "unknown source kind: {other:?}; expected one of \"text\", \"markdown\", \"pdf\", \"docx\", \"url\", \"json\", \"jsonl\", \"yaml\", \"xml\", \"rtf\", \"odt\", \"epub\", \"xlsx\", \"xls\", \"csv\", \"audio\""
+                "unknown source kind: {other:?}; expected one of \"text\", \"markdown\", \"pdf\", \"docx\", \"url\", \"json\", \"jsonl\", \"yaml\", \"xml\", \"rtf\", \"odt\", \"epub\", \"xlsx\", \"xls\", \"csv\", \"audio\", \"file\""
             ))),
         }
     }
@@ -135,6 +140,8 @@ impl SourceKind {
             // Audio is DERIVED: its canonical buffer is the concatenated
             // transcript produced by decode+transcribe (issue #43).
             Self::Audio => false,
+            // File is the M1 legacy placeholder — treat as DERIVED (unknown).
+            Self::File => false,
         }
     }
 }
@@ -144,6 +151,27 @@ impl FromStr for SourceKind {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Self::from_kind_str(s)
+    }
+}
+
+impl TryFrom<String> for SourceKind {
+    type Error = LensError;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        Self::from_kind_str(&s)
+    }
+}
+
+impl Serialize for SourceKind {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for SourceKind {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Self::from_kind_str(&s).map_err(serde::de::Error::custom)
     }
 }
 
@@ -323,7 +351,9 @@ pub fn parse_blocks(src: &str, kind: SourceKind) -> Vec<Block> {
         | SourceKind::Csv
         // Audio is DERIVED and never reaches here: `transcript_extract_output`
         // (issue #44) builds blocks directly; this arm is a dead-code backstop.
-        | SourceKind::Audio => {
+        | SourceKind::Audio
+        // File is the M1 legacy placeholder; it has no extractor and never reaches here.
+        | SourceKind::File => {
             debug_assert!(
                 false,
                 "parse_blocks called with derived kind {kind:?} — use an Extractor"
