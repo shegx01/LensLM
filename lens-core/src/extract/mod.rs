@@ -245,7 +245,8 @@ mod tests {
             let opts: zip::write::FileOptions = zip::write::FileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
             for i in 0..(MAX_ZIP_ENTRIES + 1) {
-                zip.start_file(format!("e{i}.txt"), opts).expect("start entry");
+                zip.start_file(format!("e{i}.txt"), opts)
+                    .expect("start entry");
             }
             zip.finish().expect("finish zip");
         }

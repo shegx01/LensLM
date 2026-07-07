@@ -139,7 +139,11 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].text, "hello world");
         assert_eq!(out[0].start_second, 0.0);
-        assert!((out[0].end_second - 3.0).abs() < 1e-3, "end {}", out[0].end_second);
+        assert!(
+            (out[0].end_second - 3.0).abs() < 1e-3,
+            "end {}",
+            out[0].end_second
+        );
     }
 
     #[tokio::test]

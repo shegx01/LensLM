@@ -2015,7 +2015,10 @@ mod tests {
             nat64_metadata,
             teredo_loopback,
         ] {
-            assert!(is_blocked_ip(ip), "expected transition form {ip} to be blocked");
+            assert!(
+                is_blocked_ip(ip),
+                "expected transition form {ip} to be blocked"
+            );
         }
     }
 
@@ -2024,7 +2027,10 @@ mod tests {
         let sixtofour_public = IpAddr::V6(Ipv6Addr::new(0x2002, 0x0808, 0x0808, 0, 0, 0, 0, 0));
         let nat64_public = IpAddr::V6(Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, 0x0808, 0x0808));
         for ip in [sixtofour_public, nat64_public] {
-            assert!(!is_blocked_ip(ip), "public-embedding transition form {ip} must be allowed");
+            assert!(
+                !is_blocked_ip(ip),
+                "public-embedding transition form {ip} must be allowed"
+            );
         }
     }
 
@@ -2041,7 +2047,10 @@ mod tests {
             IpAddr::V4(Ipv4Addr::new(198, 19, 255, 255)),
         ];
         for ip in blocked {
-            assert!(is_blocked_ip(*ip), "expected reserved range {ip} to be blocked");
+            assert!(
+                is_blocked_ip(*ip),
+                "expected reserved range {ip} to be blocked"
+            );
         }
     }
 
