@@ -138,6 +138,7 @@ pub struct DocxExtractor;
 
 impl Extractor for DocxExtractor {
     fn extract(&self, raw: &[u8]) -> Result<ExtractOutput, LensError> {
+        super::guard_zip_entry_count(raw)?;
         guard_docx_inflation(raw, MAX_DECOMPRESSED_BYTES)?;
         let docx = read_docx(raw)
             .map_err(|e| LensError::Parse(format!("docx-rs failed to parse DOCX: {e:?}")))?;
@@ -319,6 +320,28 @@ mod tests {
         assert!(
             matches!(err, LensError::Parse(_)),
             "a non-ZIP container is a Parse error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn docx_extractor_rejects_excessive_zip_entries() {
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let opts: zip::write::FileOptions = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for i in 0..(crate::extract::MAX_ZIP_ENTRIES + 1) {
+                zip.start_file(format!("e{i}.xml"), opts)
+                    .expect("start entry");
+            }
+            zip.finish().expect("finish zip");
+        }
+        let err = DocxExtractor
+            .extract(&buf)
+            .expect_err("a DOCX with excessive ZIP entries must be rejected");
+        assert!(
+            matches!(err, LensError::Validation(_)),
+            "excessive entry count is a Validation error, got {err:?}"
         );
     }
 

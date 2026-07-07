@@ -40,6 +40,7 @@ pub struct OdtExtractor;
 
 impl Extractor for OdtExtractor {
     fn extract(&self, raw: &[u8]) -> Result<ExtractOutput, LensError> {
+        super::guard_zip_entry_count(raw)?;
         let mut archive = zip::ZipArchive::new(Cursor::new(raw))
             .map_err(|e| LensError::Parse(format!("ODT is not a valid ZIP container: {e}")))?;
 

@@ -208,17 +208,26 @@ fn token_count(tokenizer: &Tokenizer, text: &str) -> Result<usize, LensError> {
 
 /// Shared implementation backing both [`chunk_blocks`] and
 /// [`chunk_blocks_deterministic`].
+fn non_blank_blocks(blocks: &[Block]) -> Vec<Block> {
+    blocks
+        .iter()
+        .filter(|b| !b.text.trim().is_empty())
+        .cloned()
+        .collect()
+}
+
 fn chunk_blocks_inner(
     src: &str,
     blocks: &[Block],
     tokenizer: &Tokenizer,
     strategy: IdStrategy,
 ) -> Result<Vec<Chunk>, LensError> {
+    let blocks = non_blank_blocks(blocks);
     if blocks.is_empty() {
         return Ok(Vec::new());
     }
 
-    let parent_windows = build_parent_windows(src, blocks, tokenizer)?;
+    let parent_windows = build_parent_windows(src, &blocks, tokenizer)?;
 
     let mut result: Vec<Chunk> = Vec::new();
     let mut running_token_offset: i64 = 0;
@@ -981,6 +990,77 @@ mod tests {
         if let Some(tok) = load_tokenizer() {
             let result = chunk_blocks("", &[], &tok).unwrap();
             assert!(result.is_empty());
+        }
+    }
+
+    #[test]
+    fn non_blank_blocks_drops_whitespace_only() {
+        let paragraph = crate::parse::BlockType::Paragraph.as_str().to_string();
+        let mk = |t: &str, s: usize, e: usize| Block {
+            block_type: paragraph.clone(),
+            section_path: String::new(),
+            text: t.to_string(),
+            char_start: s,
+            char_end: e,
+        };
+        let blocks = vec![
+            mk("real", 0, 4),
+            mk("   ", 6, 9),
+            mk("\n\t ", 11, 14),
+            mk("more", 16, 20),
+        ];
+        let kept = non_blank_blocks(&blocks);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].text, "real");
+        assert_eq!(kept[1].text, "more");
+    }
+
+    #[test]
+    fn chunk_skips_whitespace_only_blocks() {
+        let tok = match load_tokenizer() {
+            Some(t) => t,
+            None => return,
+        };
+        let p1 = "Real content here.";
+        let ws = "   ";
+        let p2 = "More real content.";
+        let src = format!("{p1}\n\n{ws}\n\n{p2}");
+        let ws_start = p1.len() + 2;
+        let ws_end = ws_start + ws.len();
+        let p2_start = ws_end + 2;
+        let paragraph = crate::parse::BlockType::Paragraph.as_str().to_string();
+        let blocks = vec![
+            Block {
+                block_type: paragraph.clone(),
+                section_path: String::new(),
+                text: p1.to_string(),
+                char_start: 0,
+                char_end: p1.len(),
+            },
+            Block {
+                block_type: paragraph.clone(),
+                section_path: String::new(),
+                text: ws.to_string(),
+                char_start: ws_start,
+                char_end: ws_end,
+            },
+            Block {
+                block_type: paragraph,
+                section_path: String::new(),
+                text: p2.to_string(),
+                char_start: p2_start,
+                char_end: p2_start + p2.len(),
+            },
+        ];
+        let chunks = chunk_blocks(&src, &blocks, &tok).unwrap();
+        assert!(!chunks.is_empty());
+        assert_byte_identity(&src, &chunks);
+        for c in &chunks {
+            assert!(
+                !c.text.trim().is_empty(),
+                "no chunk may be whitespace-only, got {:?}",
+                c.text
+            );
         }
     }
 

@@ -1162,7 +1162,60 @@ const URL_ALLOWED_CONTENT_TYPES: &[&str] = &["text/html", "application/xhtml+xml
 /// Cloud-metadata IMDS IP — blocked explicitly as defense-in-depth (also covered by link-local).
 const CLOUD_METADATA_IP: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(169, 254, 169, 254));
 
-/// SSRF guard: `true` if `ip` must NOT be fetched (loopback, link-local, RFC1918, ULA, unspecified).
+const SIXTOFOUR_PREFIX: u16 = 0x2002;
+const TEREDO_PREFIX_HIGH: u16 = 0x2001;
+const TEREDO_PREFIX_LOW: u16 = 0x0000;
+const NAT64_WELL_KNOWN_HIGH: u16 = 0x0064;
+const NAT64_WELL_KNOWN_LOW: u16 = 0xff9b;
+
+fn embedded_transition_ipv4(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    let s = v6.segments();
+    if s[0] == SIXTOFOUR_PREFIX {
+        return Some(std::net::Ipv4Addr::new(
+            (s[1] >> 8) as u8,
+            s[1] as u8,
+            (s[2] >> 8) as u8,
+            s[2] as u8,
+        ));
+    }
+    if s[0] == NAT64_WELL_KNOWN_HIGH
+        && s[1] == NAT64_WELL_KNOWN_LOW
+        && s[2] == 0
+        && s[3] == 0
+        && s[4] == 0
+        && s[5] == 0
+    {
+        return Some(std::net::Ipv4Addr::new(
+            (s[6] >> 8) as u8,
+            s[6] as u8,
+            (s[7] >> 8) as u8,
+            s[7] as u8,
+        ));
+    }
+    if s[0] == TEREDO_PREFIX_HIGH && s[1] == TEREDO_PREFIX_LOW {
+        let client_high = !s[6];
+        let client_low = !s[7];
+        return Some(std::net::Ipv4Addr::new(
+            (client_high >> 8) as u8,
+            client_high as u8,
+            (client_low >> 8) as u8,
+            client_low as u8,
+        ));
+    }
+    None
+}
+
+fn is_benchmarking_ipv4(v4: std::net::Ipv4Addr) -> bool {
+    let o = v4.octets();
+    o[0] == 198 && (o[1] & 0xfe) == 18
+}
+
+fn is_iana_reserved_ipv4(v4: std::net::Ipv4Addr) -> bool {
+    v4.octets()[0] >= 240
+}
+
+/// SSRF guard: `true` if `ip` must NOT be fetched (loopback, link-local, RFC1918,
+/// ULA, unspecified, IANA-reserved, or an IPv6 transition form embedding any of these).
 fn is_blocked_ip(ip: IpAddr) -> bool {
     if ip == CLOUD_METADATA_IP {
         return true;
@@ -1174,12 +1227,20 @@ fn is_blocked_ip(ip: IpAddr) -> bool {
                 || v4.is_link_local()
                 || v4.is_unspecified()
                 || v4.is_broadcast()
+                || v4.is_multicast()
+                || v4.is_documentation()
+                || is_benchmarking_ipv4(v4)
+                || is_iana_reserved_ipv4(v4)
+                || v4.octets()[0] == 0
                 // 100.64.0.0/10 (CGNAT) — not covered by is_private().
                 || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 0x40)
         }
         IpAddr::V6(v6) => {
             if let Some(mapped) = v6.to_ipv4_mapped() {
                 return is_blocked_ip(IpAddr::V4(mapped));
+            }
+            if let Some(embedded) = embedded_transition_ipv4(v6) {
+                return is_blocked_ip(IpAddr::V4(embedded));
             }
             is_loopback_ip(ip)
                 || v6.is_unspecified()
@@ -1936,6 +1997,70 @@ mod tests {
         ];
         for ip in allowed {
             assert!(!is_blocked_ip(*ip), "expected {ip} to be allowed");
+        }
+    }
+
+    #[test]
+    fn is_blocked_ip_rejects_ipv6_transition_forms_embedding_blocked_ipv4() {
+        let sixtofour_loopback = IpAddr::V6(Ipv6Addr::new(0x2002, 0x7f00, 0x0001, 0, 0, 0, 0, 0));
+        let sixtofour_metadata = IpAddr::V6(Ipv6Addr::new(0x2002, 0xa9fe, 0xa9fe, 0, 0, 0, 0, 0));
+        let sixtofour_rfc1918 = IpAddr::V6(Ipv6Addr::new(0x2002, 0x0a00, 0x0001, 0, 0, 0, 0, 0));
+        let nat64_loopback = IpAddr::V6(Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, 0x7f00, 0x0001));
+        let nat64_metadata = IpAddr::V6(Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, 0xa9fe, 0xa9fe));
+        let nat64_rfc1918 = IpAddr::V6(Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, 0x0a00, 0x0001));
+        let teredo_loopback = IpAddr::V6(Ipv6Addr::new(0x2001, 0x0000, 0, 0, 0, 0, 0x80ff, 0xfffe));
+        let teredo_metadata = IpAddr::V6(Ipv6Addr::new(0x2001, 0x0000, 0, 0, 0, 0, 0x5601, 0x5601));
+        let teredo_rfc1918 = IpAddr::V6(Ipv6Addr::new(0x2001, 0x0000, 0, 0, 0, 0, 0xf5ff, 0xfffe));
+        for ip in [
+            sixtofour_loopback,
+            sixtofour_metadata,
+            sixtofour_rfc1918,
+            nat64_loopback,
+            nat64_metadata,
+            nat64_rfc1918,
+            teredo_loopback,
+            teredo_metadata,
+            teredo_rfc1918,
+        ] {
+            assert!(
+                is_blocked_ip(ip),
+                "expected transition form {ip} to be blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn is_blocked_ip_allows_public_ipv6_transition_forms() {
+        let sixtofour_public = IpAddr::V6(Ipv6Addr::new(0x2002, 0x0808, 0x0808, 0, 0, 0, 0, 0));
+        let nat64_public = IpAddr::V6(Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, 0x0808, 0x0808));
+        let teredo_public = IpAddr::V6(Ipv6Addr::new(0x2001, 0x0000, 0, 0, 0, 0, 0xf7f7, 0xf7f7));
+        for ip in [sixtofour_public, nat64_public, teredo_public] {
+            assert!(
+                !is_blocked_ip(ip),
+                "public-embedding transition form {ip} must be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn is_blocked_ip_rejects_reserved_ipv4_ranges() {
+        let blocked: &[IpAddr] = &[
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),
+            IpAddr::V4(Ipv4Addr::new(240, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(255, 254, 253, 252)),
+            IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(239, 255, 255, 255)),
+            IpAddr::V4(Ipv4Addr::new(0, 1, 2, 3)),
+            IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(198, 19, 255, 255)),
+        ];
+        for ip in blocked {
+            assert!(
+                is_blocked_ip(*ip),
+                "expected reserved range {ip} to be blocked"
+            );
         }
     }
 
