@@ -694,8 +694,8 @@ async fn add_source_inserts_pending_file_record_and_lists_scoped() {
         .await
         .unwrap()
         .source;
-    assert_eq!(src.kind, "file");
-    assert_eq!(src.status, "pending");
+    assert_eq!(src.kind, lens_core::parse::SourceKind::File);
+    assert_eq!(src.status, lens_core::notebooks::SourceStatus::Pending);
     assert_eq!(src.title, "report.pdf");
     assert_eq!(src.locator, "/abs/report.pdf");
     assert_eq!(src.selected, 1);

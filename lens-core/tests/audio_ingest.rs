@@ -59,7 +59,11 @@ async fn audio_ingest_end_to_end_indexed_and_searchable() {
         .await
         .unwrap()
         .source;
-    assert_eq!(src.kind, "audio", "wav maps to the audio kind");
+    assert_eq!(
+        src.kind,
+        lens_core::parse::SourceKind::Audio,
+        "wav maps to the audio kind"
+    );
 
     let mut phases: Vec<String> = Vec::new();
     engine

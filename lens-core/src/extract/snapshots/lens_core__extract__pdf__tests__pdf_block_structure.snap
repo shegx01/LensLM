@@ -1,0 +1,11 @@
+---
+source: lens-core/src/extract/pdf.rs
+expression: snaps
+---
+[
+  {
+    "block_type": "paragraph",
+    "section_path": "",
+    "text": "The quick brown fox jumps over the lazy dog."
+  }
+]

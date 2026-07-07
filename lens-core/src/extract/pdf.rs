@@ -306,6 +306,30 @@ mod tests {
     }
 
     #[test]
+    fn pdf_snapshot_block_structure() {
+        let raw = build_text_layer_pdf();
+        let Some(out) = try_extract(&raw) else {
+            return;
+        };
+        #[derive(serde::Serialize)]
+        struct BlockSnapshot<'a> {
+            block_type: &'a str,
+            section_path: &'a str,
+            text: &'a str,
+        }
+        let snaps: Vec<BlockSnapshot<'_>> = out
+            .blocks
+            .iter()
+            .map(|b| BlockSnapshot {
+                block_type: &b.block_type,
+                section_path: &b.section_path,
+                text: &b.text,
+            })
+            .collect();
+        insta::assert_json_snapshot!("pdf_block_structure", snaps);
+    }
+
+    #[test]
     fn pdf_sentinel_text_present() {
         let raw = build_text_layer_pdf();
         let Some(out) = try_extract(&raw) else {

@@ -62,7 +62,7 @@ async fn ingest_fail_persists_error_meta_survives_list_sources() {
     // A FRESH read (list_sources) returns the persisted error_meta — proving it
     // survives past the in-memory ingest call (would survive an app restart too).
     let src = source_by_id(&engine, &nb.id, &id).await;
-    assert_eq!(src.status, "error");
+    assert_eq!(src.status, lens_core::notebooks::SourceStatus::Error);
     let json = src.error_meta.expect("error_meta persisted on failure");
     let meta: lens_core::ErrorMeta = serde_json::from_str(&json).expect("error_meta parses");
     assert_eq!(meta.kind, "Io", "deleted-locator failure maps to Io");
@@ -84,7 +84,7 @@ async fn retry_guard_rejects_non_error_source() {
         .await
         .unwrap()
         .source;
-    assert_ne!(src.status, "error");
+    assert_ne!(src.status, lens_core::notebooks::SourceStatus::Error);
 
     let result = engine.retry_source(&src.id, |_p: IngestProgress| {}).await;
     assert!(
@@ -140,7 +140,11 @@ async fn fail_then_retry_fail_increments_attempt_count_to_2() {
     );
 
     let after = source_by_id(&engine, &nb.id, &id).await;
-    assert_eq!(after.status, "error", "still errored after failed retry");
+    assert_eq!(
+        after.status,
+        lens_core::notebooks::SourceStatus::Error,
+        "still errored after failed retry"
+    );
     let meta2 = parse_meta(&after);
     assert_eq!(meta2.attempt_count, 2, "failed retry increments to 2");
 }
@@ -194,7 +198,7 @@ async fn retry_success_clears_error_meta_and_indexes() {
 
     expect_ingest_fail(&engine, &src.id).await;
     let errored = source_by_id(&engine, &nb.id, &src.id).await;
-    assert_eq!(errored.status, "error");
+    assert_eq!(errored.status, lens_core::notebooks::SourceStatus::Error);
     assert!(errored.error_meta.is_some());
 
     // Restore the locator file so the retry can succeed.
@@ -206,7 +210,11 @@ async fn retry_success_clears_error_meta_and_indexes() {
         .expect("retry should succeed once the locator is restored");
 
     let recovered = source_by_id(&engine, &nb.id, &src.id).await;
-    assert_eq!(recovered.status, "indexed", "successful retry ⇒ indexed");
+    assert_eq!(
+        recovered.status,
+        lens_core::notebooks::SourceStatus::Indexed,
+        "successful retry ⇒ indexed"
+    );
     assert!(
         recovered.error_meta.is_none(),
         "successful retry clears error_meta"

@@ -13,7 +13,7 @@ export type SourceStatus =
   | 'render_failed';
 
 // SYNC-CHECK: must match lens-core/src/parse.rs SourceKind enum
-// `'file'` is a legacy M1 placeholder (not a Rust SourceKind variant) but is a real persisted value.
+// `'file'` is the M1 legacy placeholder kind (SourceKind::File).
 export type SourceKind =
   | 'text'
   | 'markdown'

@@ -1952,7 +1952,7 @@ use lens_core::extract::test_seam::{
 /// A test-only DERIVED kind whose `Extractor` is injected via the `test-util`
 /// seam. The ingest pipeline treats it as binary (raw-bytes hash, `.extracted.txt`
 /// sibling, Stage-1 guard) because it is NOT `SourceKind::is_text_like`.
-const FAKE_KIND: &str = "faketest";
+const DERIVED_KIND: &str = "docx";
 
 /// Writes a raw binary file under `{data_dir}/sources/{id}.bin` and returns its
 /// path string (the source locator for a fake-binary source).
@@ -2085,7 +2085,7 @@ async fn seam_stage1_guard_rejects_oversized_binary_before_extract() {
     engine.set_config(cfg).await;
 
     // Inject a fake extractor that PANICS if `extract` is ever called.
-    set_test_extractor_factory(FAKE_KIND, || {
+    set_test_extractor_factory(DERIVED_KIND, || {
         Box::new(FakeBinaryExtractor {
             calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             extracted_text: String::new(),
@@ -2105,7 +2105,7 @@ async fn seam_stage1_guard_rejects_oversized_binary_before_extract() {
     )
     .bind(&id)
     .bind(nb.id.to_string())
-    .bind(FAKE_KIND)
+    .bind(DERIVED_KIND)
     .bind("oversize")
     .bind("queued")
     .bind(&locator)
@@ -2115,7 +2115,7 @@ async fn seam_stage1_guard_rejects_oversized_binary_before_extract() {
     .unwrap();
 
     let result = engine.ingest_source(&id, |_p| {}).await;
-    clear_test_extractor_factory(FAKE_KIND);
+    clear_test_extractor_factory(DERIVED_KIND);
     assert!(
         matches!(result, Err(lens_core::LensError::Validation(_))),
         "oversized binary must be rejected with Validation before extraction, got {result:?}"
@@ -2137,7 +2137,7 @@ async fn seam_stage2_guard_rejects_oversized_extracted_text() {
 
     // Tiny raw bytes, but the extractor returns over-cap text.
     let huge_text = "z".repeat(1024 * 1024 + 1);
-    set_test_extractor_factory(FAKE_KIND, {
+    set_test_extractor_factory(DERIVED_KIND, {
         let t = huge_text.clone();
         move || {
             Box::new(FakeBinaryExtractor {
@@ -2150,10 +2150,10 @@ async fn seam_stage2_guard_rejects_oversized_extracted_text() {
 
     let id = uuid::Uuid::now_v7().to_string();
     let locator = write_raw_source_file(&data_dir, &id, b"tiny");
-    insert_raw_source_locator(&engine, &nb.id.to_string(), FAKE_KIND, &locator, &id).await;
+    insert_raw_source_locator(&engine, &nb.id.to_string(), DERIVED_KIND, &locator, &id).await;
 
     let result = engine.ingest_source(&id, |_p| {}).await;
-    clear_test_extractor_factory(FAKE_KIND);
+    clear_test_extractor_factory(DERIVED_KIND);
     assert!(
         matches!(result, Err(lens_core::LensError::Validation(_))),
         "over-cap extracted_text must be rejected with Validation, got {result:?}"
@@ -2247,7 +2247,7 @@ async fn test_non_pdf_still_capped_at_stage1() {
     engine.set_config(cfg).await;
 
     // Extractor PANICS if called — proving Stage-1 fired before extraction.
-    set_test_extractor_factory(FAKE_KIND, || {
+    set_test_extractor_factory(DERIVED_KIND, || {
         Box::new(FakeBinaryExtractor {
             calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             extracted_text: String::new(),
@@ -2259,10 +2259,10 @@ async fn test_non_pdf_still_capped_at_stage1() {
     // 1 MB + 1 byte: over the configured 1 MB cap.
     let oversized = vec![0u8; 1024 * 1024 + 1];
     let locator = write_raw_source_file(&data_dir, &id, &oversized);
-    insert_raw_source_locator(&engine, &nb.id.to_string(), FAKE_KIND, &locator, &id).await;
+    insert_raw_source_locator(&engine, &nb.id.to_string(), DERIVED_KIND, &locator, &id).await;
 
     let result = engine.ingest_source(&id, |_p| {}).await;
-    clear_test_extractor_factory(FAKE_KIND);
+    clear_test_extractor_factory(DERIVED_KIND);
     assert!(
         matches!(result, Err(lens_core::LensError::Validation(_))),
         "a non-PDF over the configured cap must be rejected at Stage-1, got {result:?}"
@@ -2354,7 +2354,7 @@ async fn seam_derived_reingest_noop_without_reextract_and_sibling_lifecycle() {
     let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let fake_text =
         "# Fake Binary\n\nDecoded canonical text for the fake binary source.\n".to_string();
-    set_test_extractor_factory(FAKE_KIND, {
+    set_test_extractor_factory(DERIVED_KIND, {
         let calls = std::sync::Arc::clone(&calls);
         let t = fake_text.clone();
         move || {
@@ -2368,7 +2368,7 @@ async fn seam_derived_reingest_noop_without_reextract_and_sibling_lifecycle() {
 
     let id = uuid::Uuid::now_v7().to_string();
     let locator = write_raw_source_file(&data_dir, &id, b"\x00\x01\x02 fake binary bytes \xff");
-    insert_raw_source_locator(&engine, &nb.id.to_string(), FAKE_KIND, &locator, &id).await;
+    insert_raw_source_locator(&engine, &nb.id.to_string(), DERIVED_KIND, &locator, &id).await;
 
     // First ingest → indexed, extractor called once, sibling written.
     engine.ingest_source(&id, |_p| {}).await.unwrap();
@@ -2400,7 +2400,7 @@ async fn seam_derived_reingest_noop_without_reextract_and_sibling_lifecycle() {
     // Purge removes BOTH the locator AND the `.extracted.txt` sibling.
     engine.trash_source(&id).await.unwrap();
     engine.purge_source(&id).await.unwrap();
-    clear_test_extractor_factory(FAKE_KIND);
+    clear_test_extractor_factory(DERIVED_KIND);
     assert!(
         !std::path::Path::new(&locator).exists(),
         "purge must remove the original locator file"
@@ -2600,7 +2600,7 @@ async fn source_anchor_pdf_maps_page_to_chunk_page_column() {
         }
     }
 
-    const PDF_KIND: &str = "fakepdf";
+    const PDF_KIND: &str = "pdf";
     set_test_extractor_factory(PDF_KIND, || Box::new(FakePdfExtractor));
 
     let (_dir, engine) = inject_counting_engine().await;
@@ -2916,8 +2916,16 @@ async fn docx_file_source_indexed_with_anchors_end_to_end() {
         .await
         .expect("add_file_source for a .docx must succeed")
         .source;
-    assert_eq!(source.kind, "docx", "extension .docx → kind docx");
-    assert_eq!(source.status, "queued", "new file source is queued");
+    assert_eq!(
+        source.kind,
+        lens_core::parse::SourceKind::Docx,
+        "extension .docx → kind docx"
+    );
+    assert_eq!(
+        source.status,
+        lens_core::notebooks::SourceStatus::Queued,
+        "new file source is queued"
+    );
     assert_eq!(
         source.title, "report.docx",
         "title defaults to the file name"
@@ -3042,8 +3050,12 @@ async fn pdf_file_source_indexed_with_anchors_end_to_end() {
         .await
         .expect("add_file_source for a .pdf must succeed")
         .source;
-    assert_eq!(source.kind, "pdf", "extension .pdf → kind pdf");
-    assert_eq!(source.status, "queued");
+    assert_eq!(
+        source.kind,
+        lens_core::parse::SourceKind::Pdf,
+        "extension .pdf → kind pdf"
+    );
+    assert_eq!(source.status, lens_core::notebooks::SourceStatus::Queued);
     assert_eq!(source.title, "Custom Title", "supplied title is honored");
 
     engine.ingest_source(&source.id, |_p| {}).await.unwrap();

@@ -198,4 +198,27 @@ mod tests {
             "empty page should produce no anchors"
         );
     }
+
+    #[test]
+    fn url_snapshot_block_structure() {
+        let out = UrlExtractor
+            .extract(ARTICLE_HTML)
+            .expect("extraction should succeed");
+        #[derive(serde::Serialize)]
+        struct BlockSnapshot<'a> {
+            block_type: &'a str,
+            section_path: &'a str,
+            text: &'a str,
+        }
+        let snaps: Vec<BlockSnapshot<'_>> = out
+            .blocks
+            .iter()
+            .map(|b| BlockSnapshot {
+                block_type: &b.block_type,
+                section_path: &b.section_path,
+                text: &b.text,
+            })
+            .collect();
+        insta::assert_json_snapshot!("url_block_structure", snaps);
+    }
 }

@@ -1,0 +1,22 @@
+---
+source: lens-core/src/extract/url.rs
+assertion_line: 222
+expression: snaps
+---
+[
+  {
+    "block_type": "paragraph",
+    "section_path": "",
+    "text": "Test Article Title"
+  },
+  {
+    "block_type": "paragraph",
+    "section_path": "",
+    "text": "This is the first paragraph of the article. It contains enough text to be extracted properly by trafilatura. The content is meaningful and represents real prose text."
+  },
+  {
+    "block_type": "paragraph",
+    "section_path": "",
+    "text": "This is the second paragraph. It also has substantial content that the extractor can work with. More text here to make it longer and more realistic as web content."
+  }
+]
