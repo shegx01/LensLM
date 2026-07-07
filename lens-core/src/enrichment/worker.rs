@@ -231,16 +231,32 @@ async fn process_job(
         .map(|c| c.text.clone())
         .collect();
 
-    let (map_json, doc_summary, map_entities, map_quality) =
+    let (map_json, doc_summary, map_entities, map_definitions, map_dates, map_quality) =
         match build_structural_map(map_provider.as_ref(), &mut budget, &parent_texts).await {
             Ok(MapOutcome::Ok(map)) => {
                 let summary = map.summary.clone();
                 let entities = map.entities.clone();
+                let definitions = map.definitions.clone();
+                let dates = map.dates.clone();
                 let json = serde_json::to_string(&map)?;
-                (Some(json), summary, entities, MAP_QUALITY_OK)
+                (
+                    Some(json),
+                    summary,
+                    entities,
+                    definitions,
+                    dates,
+                    MAP_QUALITY_OK,
+                )
             }
             // AC4: persistent malformed output ⇒ degrade to context-prefix-only.
-            Ok(MapOutcome::Fallback) => (None, String::new(), Vec::new(), MAP_QUALITY_FALLBACK),
+            Ok(MapOutcome::Fallback) => (
+                None,
+                String::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                MAP_QUALITY_FALLBACK,
+            ),
             // AC11: budget circuit-break ⇒ `failed` + `budget_exceeded`.
             Err(MapError::BudgetExceeded) => {
                 let meta = EnrichmentMeta {
@@ -352,7 +368,29 @@ async fn process_job(
             enrichment_json,
         });
     }
-    repo.write_chunk_enrichment(&updates).await?;
+    // M13: build the entity graph from in-memory enrichment outputs (ZERO new LLM
+    // calls) and persist it in the SAME transaction as the chunk-enrichment writes.
+    let graph_rows = crate::graph::build_entity_graph_rows(
+        &source.notebook_id,
+        &job.source_id,
+        &chunks,
+        &map_entities,
+        &map_definitions,
+        &map_dates,
+        &coref_subs,
+        &mut || uuid::Uuid::now_v7().to_string(),
+        &chrono::Utc::now().to_rfc3339(),
+        crate::enrichment::meta::CO_OCCURRENCE_MAX_ENTITIES,
+    );
+    if graph_rows.dropped_cooccurrence > 0 {
+        tracing::debug!(
+            source_id = %job.source_id,
+            dropped = graph_rows.dropped_cooccurrence,
+            "entity graph: co-occurrence entities dropped over per-chunk cap"
+        );
+    }
+    repo.write_enrichment_and_graph(&updates, &graph_rows)
+        .await?;
 
     // Status stays `enriching` (Step-4→Step-5 handoff): text columns written,
     // re-embed flip (below) advances it to `enriched`.
