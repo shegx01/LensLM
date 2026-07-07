@@ -283,7 +283,7 @@ pub async fn retry_all_failed_sources(
         .list_sources(&NotebookId::from(notebook_id))
         .await?
         .into_iter()
-        .filter(|s| s.status == lens_core::notebooks::SourceStatus::Error.as_str())
+        .filter(|s| s.status == lens_core::notebooks::SourceStatus::Error)
         .map(|s| s.id)
         .collect();
 
@@ -554,8 +554,8 @@ mod tests {
         .await
         .unwrap()
         .source;
-        assert_eq!(src.kind, "file");
-        assert_eq!(src.status, "pending");
+        assert_eq!(src.kind, lens_core::parse::SourceKind::File);
+        assert_eq!(src.status, lens_core::notebooks::SourceStatus::Pending);
         assert_eq!(src.locator, "/abs/path/report.pdf");
         assert_eq!(src.selected, 1);
 

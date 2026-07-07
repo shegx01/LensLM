@@ -255,7 +255,8 @@ async fn url_fetch_http_error_flips_to_error() {
         .expect("get_source ok")
         .expect("source exists");
     assert_eq!(
-        updated.status, lens_core::notebooks::SourceStatus::Error,
+        updated.status,
+        lens_core::notebooks::SourceStatus::Error,
         "HTTP error should set status=error"
     );
 
@@ -328,7 +329,11 @@ async fn url_uses_configurable_cap() {
     let pool = engine.pool().await;
     let repo = lens_core::notebooks::NotebookRepo::new(&pool);
     let updated = repo.get_source(&source.id).await.unwrap().unwrap();
-    assert_eq!(updated.status, lens_core::notebooks::SourceStatus::Error, "over-cap URL body flips to error");
+    assert_eq!(
+        updated.status,
+        lens_core::notebooks::SourceStatus::Error,
+        "over-cap URL body flips to error"
+    );
 }
 
 // ===========================================================================
@@ -378,7 +383,8 @@ async fn url_needs_js_on_js_shell() {
         .expect("get_source ok")
         .expect("source exists");
     assert_eq!(
-        updated.status, lens_core::notebooks::SourceStatus::NeedsJs,
+        updated.status,
+        lens_core::notebooks::SourceStatus::NeedsJs,
         "JS shell must set status=needs_js (got {:?})",
         updated.status.as_str()
     );
@@ -452,7 +458,8 @@ async fn url_indexes_real_article() {
             .expect("get_source ok")
             .expect("source exists");
         assert_ne!(
-            updated.status, lens_core::notebooks::SourceStatus::NeedsJs,
+            updated.status,
+            lens_core::notebooks::SourceStatus::NeedsJs,
             "real article must NOT trigger needs_js (status={:?})",
             updated.status.as_str()
         );
@@ -469,7 +476,8 @@ async fn url_indexes_real_article() {
         .expect("get_source ok")
         .expect("source exists");
     assert_eq!(
-        updated.status, lens_core::notebooks::SourceStatus::Indexed,
+        updated.status,
+        lens_core::notebooks::SourceStatus::Indexed,
         "real article must be indexed (got {:?})",
         updated.status.as_str()
     );
@@ -526,7 +534,8 @@ async fn url_indexes_content_rich_page_despite_low_ratio() {
 
     // The key invariant regardless of tokenizer availability: NOT needs_js.
     assert_ne!(
-        updated.status, lens_core::notebooks::SourceStatus::NeedsJs,
+        updated.status,
+        lens_core::notebooks::SourceStatus::NeedsJs,
         "content-rich low-ratio page must NOT be flagged needs_js (status={:?})",
         updated.status.as_str()
     );
@@ -534,7 +543,8 @@ async fn url_indexes_content_rich_page_despite_low_ratio() {
     // ingest errors at the tokenizer step (not a needs_js false positive).
     if result.is_ok() {
         assert_eq!(
-            updated.status, lens_core::notebooks::SourceStatus::Indexed,
+            updated.status,
+            lens_core::notebooks::SourceStatus::Indexed,
             "content-rich low-ratio page must be indexed (got {:?})",
             updated.status.as_str()
         );
@@ -592,7 +602,8 @@ async fn url_force_js_render_diverts_content_rich_page_to_render() {
         .expect("get_source ok")
         .expect("source exists");
     assert_eq!(
-        updated.status, lens_core::notebooks::SourceStatus::NeedsJs,
+        updated.status,
+        lens_core::notebooks::SourceStatus::NeedsJs,
         "force_js_render must divert a content-rich page to the render branch; with no \
          renderer injected it lands in needs_js (got {:?})",
         updated.status.as_str()
@@ -670,7 +681,8 @@ async fn crash_recovery_skips_needs_js_and_needs_ocr() {
         .expect("get needs_js source")
         .expect("exists");
     assert_eq!(
-        js.status, lens_core::notebooks::SourceStatus::NeedsJs,
+        js.status,
+        lens_core::notebooks::SourceStatus::NeedsJs,
         "needs_js must survive crash-recovery reset (got {:?})",
         js.status.as_str()
     );
@@ -681,7 +693,8 @@ async fn crash_recovery_skips_needs_js_and_needs_ocr() {
         .expect("get needs_ocr source")
         .expect("exists");
     assert_eq!(
-        ocr.status, lens_core::notebooks::SourceStatus::NeedsOcr,
+        ocr.status,
+        lens_core::notebooks::SourceStatus::NeedsOcr,
         "needs_ocr must survive crash-recovery reset (got {:?})",
         ocr.status.as_str()
     );
@@ -692,7 +705,8 @@ async fn crash_recovery_skips_needs_js_and_needs_ocr() {
         .expect("get render_failed source")
         .expect("exists");
     assert_eq!(
-        rf.status, lens_core::notebooks::SourceStatus::RenderFailed,
+        rf.status,
+        lens_core::notebooks::SourceStatus::RenderFailed,
         "render_failed must survive crash-recovery reset (got {:?})",
         rf.status.as_str()
     );
@@ -747,7 +761,8 @@ async fn needs_js_not_set_via_err_path() {
     let updated = repo.get_source(&source.id).await.unwrap().unwrap();
     assert_eq!(updated.status, lens_core::notebooks::SourceStatus::NeedsJs);
     assert_ne!(
-        updated.status, lens_core::notebooks::SourceStatus::Error,
+        updated.status,
+        lens_core::notebooks::SourceStatus::Error,
         "needs_js must NOT be set via the Err path (would be 'error')"
     );
 }
@@ -1082,7 +1097,8 @@ async fn reingest_into_needs_js_wipes_stale_chunks_and_vectors() {
     );
     let after_second = repo.get_source(&source.id).await.unwrap().unwrap();
     assert_eq!(
-        after_second.status, lens_core::notebooks::SourceStatus::NeedsJs,
+        after_second.status,
+        lens_core::notebooks::SourceStatus::NeedsJs,
         "re-ingest into a JS shell must flip status to needs_js (got {:?})",
         after_second.status.as_str()
     );
@@ -1182,7 +1198,8 @@ async fn js_render_fallback_indexes_when_renderer_populates() {
     let repo = lens_core::notebooks::NotebookRepo::new(&pool);
     let updated = repo.get_source(&source.id).await.unwrap().unwrap();
     assert_eq!(
-        updated.status, lens_core::notebooks::SourceStatus::Indexed,
+        updated.status,
+        lens_core::notebooks::SourceStatus::Indexed,
         "renderer populated the page → source must end indexed (got {:?})",
         updated.status.as_str()
     );
@@ -1237,7 +1254,8 @@ async fn js_render_fallback_render_failed_when_renderer_returns_none() {
     let repo = lens_core::notebooks::NotebookRepo::new(&pool);
     let updated = repo.get_source(&source.id).await.unwrap().unwrap();
     assert_eq!(
-        updated.status, lens_core::notebooks::SourceStatus::RenderFailed,
+        updated.status,
+        lens_core::notebooks::SourceStatus::RenderFailed,
         "a renderer that never populates must set render_failed (got {:?})",
         updated.status.as_str()
     );
@@ -1311,7 +1329,8 @@ async fn js_render_fallback_render_failed_when_renderer_errors() {
     let repo = lens_core::notebooks::NotebookRepo::new(&pool);
     let updated = repo.get_source(&source.id).await.unwrap().unwrap();
     assert_eq!(
-        updated.status, lens_core::notebooks::SourceStatus::RenderFailed,
+        updated.status,
+        lens_core::notebooks::SourceStatus::RenderFailed,
         "a renderer that ERRORS must set render_failed (NOT error) (got {:?})",
         updated.status.as_str()
     );
@@ -1370,7 +1389,8 @@ async fn js_render_fallback_opt_out_stays_needs_js() {
     let repo = lens_core::notebooks::NotebookRepo::new(&pool);
     let updated = repo.get_source(&source.id).await.unwrap().unwrap();
     assert_eq!(
-        updated.status, lens_core::notebooks::SourceStatus::NeedsJs,
+        updated.status,
+        lens_core::notebooks::SourceStatus::NeedsJs,
         "js_render_enabled=false must preserve needs_js (got {:?})",
         updated.status.as_str()
     );
@@ -1415,7 +1435,8 @@ async fn js_render_fallback_no_renderer_stays_needs_js() {
     let repo = lens_core::notebooks::NotebookRepo::new(&pool);
     let updated = repo.get_source(&source.id).await.unwrap().unwrap();
     assert_eq!(
-        updated.status, lens_core::notebooks::SourceStatus::NeedsJs,
+        updated.status,
+        lens_core::notebooks::SourceStatus::NeedsJs,
         "no injected renderer must gracefully preserve needs_js (got {:?})",
         updated.status.as_str()
     );
@@ -1467,7 +1488,8 @@ async fn js_render_provenance_blocked_render_failed_writes_nothing() {
     let repo = lens_core::notebooks::NotebookRepo::new(&pool);
     let updated = repo.get_source(&source.id).await.unwrap().unwrap();
     assert_eq!(
-        updated.status, lens_core::notebooks::SourceStatus::RenderFailed,
+        updated.status,
+        lens_core::notebooks::SourceStatus::RenderFailed,
         "provenance-blocked output must yield render_failed (got {:?})",
         updated.status.as_str()
     );
@@ -1532,7 +1554,8 @@ async fn js_render_over_cap_html_maps_to_render_failed() {
     let repo = lens_core::notebooks::NotebookRepo::new(&pool);
     let updated = repo.get_source(&source.id).await.unwrap().unwrap();
     assert_eq!(
-        updated.status, lens_core::notebooks::SourceStatus::RenderFailed,
+        updated.status,
+        lens_core::notebooks::SourceStatus::RenderFailed,
         "rendered HTML over the byte cap must set render_failed (got {:?})",
         updated.status.as_str()
     );

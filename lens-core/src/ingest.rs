@@ -378,9 +378,7 @@ async fn run_ingest(
     }
 
     // Sniff `.json` files for JSON Lines: if ≥2 newline-delimited JSON values, use the jsonl extractor.
-    let effective_kind: String = if kind == crate::parse::SourceKind::Json
-        && sniff_is_jsonl(&raw)
-    {
+    let effective_kind: String = if kind == crate::parse::SourceKind::Json && sniff_is_jsonl(&raw) {
         tracing::info!(
             source_id,
             "`.json` source sniffed as JSON Lines (>=2 newline-delimited JSON values); using jsonl extractor"

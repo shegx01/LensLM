@@ -1476,4 +1476,38 @@ mod tests {
         let pos = |target: &Block| items.iter().position(|x| std::ptr::eq(*x, target)).unwrap();
         assert!(pos(a) < pos(b) && pos(b) < pos(c), "document order a<b<c");
     }
+
+    #[test]
+    fn source_kind_serde_wire_lock() {
+        let variants = [
+            SourceKind::Text,
+            SourceKind::Markdown,
+            SourceKind::Pdf,
+            SourceKind::Docx,
+            SourceKind::Url,
+            SourceKind::Json,
+            SourceKind::Jsonl,
+            SourceKind::Yaml,
+            SourceKind::Xml,
+            SourceKind::Rtf,
+            SourceKind::Odt,
+            SourceKind::Epub,
+            SourceKind::Xlsx,
+            SourceKind::Xls,
+            SourceKind::Csv,
+            SourceKind::Audio,
+            SourceKind::File,
+        ];
+        for v in variants {
+            let json = serde_json::to_string(&v).unwrap();
+            assert_eq!(
+                json,
+                format!("\"{}\"", v.as_str()),
+                "serde wire must equal as_str for {:?}",
+                v
+            );
+            let rt: SourceKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(rt, v, "serde round-trip must equal original for {:?}", v);
+        }
+    }
 }

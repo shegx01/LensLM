@@ -535,12 +535,8 @@ impl<'a> NotebookRepo<'a> {
                         enrichment_status: row
                             .try_get("enrichment_status")
                             .map_err(LensError::from)?,
-                        enrichment_meta: row
-                            .try_get("enrichment_meta")
-                            .map_err(LensError::from)?,
-                        force_js_render: row
-                            .try_get("force_js_render")
-                            .map_err(LensError::from)?,
+                        enrichment_meta: row.try_get("enrichment_meta").map_err(LensError::from)?,
+                        force_js_render: row.try_get("force_js_render").map_err(LensError::from)?,
                         error_meta: row.try_get("error_meta").map_err(LensError::from)?,
                     },
                     notebook_title: row.try_get("notebook_title").map_err(LensError::from)?,
@@ -1626,6 +1622,32 @@ mod tests {
                 transient,
                 "{status:?} transient classification must be locked"
             );
+        }
+    }
+
+    #[test]
+    fn source_status_serde_wire_lock() {
+        let variants = [
+            SourceStatus::Pending,
+            SourceStatus::Queued,
+            SourceStatus::Parsing,
+            SourceStatus::Embedding,
+            SourceStatus::Indexed,
+            SourceStatus::Error,
+            SourceStatus::NeedsOcr,
+            SourceStatus::NeedsJs,
+            SourceStatus::RenderFailed,
+        ];
+        for v in variants {
+            let json = serde_json::to_string(&v).unwrap();
+            assert_eq!(
+                json,
+                format!("\"{}\"", v.as_str()),
+                "serde wire must equal as_str for {:?}",
+                v
+            );
+            let rt: SourceStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(rt, v, "serde round-trip must equal original for {:?}", v);
         }
     }
 

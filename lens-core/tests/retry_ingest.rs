@@ -140,7 +140,11 @@ async fn fail_then_retry_fail_increments_attempt_count_to_2() {
     );
 
     let after = source_by_id(&engine, &nb.id, &id).await;
-    assert_eq!(after.status, lens_core::notebooks::SourceStatus::Error, "still errored after failed retry");
+    assert_eq!(
+        after.status,
+        lens_core::notebooks::SourceStatus::Error,
+        "still errored after failed retry"
+    );
     let meta2 = parse_meta(&after);
     assert_eq!(meta2.attempt_count, 2, "failed retry increments to 2");
 }
@@ -206,7 +210,11 @@ async fn retry_success_clears_error_meta_and_indexes() {
         .expect("retry should succeed once the locator is restored");
 
     let recovered = source_by_id(&engine, &nb.id, &src.id).await;
-    assert_eq!(recovered.status, lens_core::notebooks::SourceStatus::Indexed, "successful retry ⇒ indexed");
+    assert_eq!(
+        recovered.status,
+        lens_core::notebooks::SourceStatus::Indexed,
+        "successful retry ⇒ indexed"
+    );
     assert!(
         recovered.error_meta.is_none(),
         "successful retry clears error_meta"
