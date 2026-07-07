@@ -48,11 +48,11 @@ CREATE TABLE IF NOT EXISTS entity_mentions (
     UNIQUE (entity_node_id, chunk_id, char_start, char_end)
 );
 
-CREATE INDEX IF NOT EXISTS idx_gnodes_nb ON entity_nodes (notebook_id);
+CREATE INDEX IF NOT EXISTS idx_gnodes_nb ON entity_nodes (notebook_id, name);
 CREATE INDEX IF NOT EXISTS idx_gnodes_source ON entity_nodes (source_id);
 CREATE INDEX IF NOT EXISTS idx_gedges_src ON entity_edges (from_node);
 CREATE INDEX IF NOT EXISTS idx_gedges_tgt ON entity_edges (to_node);
-CREATE INDEX IF NOT EXISTS idx_gedges_rel ON entity_edges (relation);
+CREATE INDEX IF NOT EXISTS idx_gedges_rel ON entity_edges (notebook_id, relation);
 CREATE INDEX IF NOT EXISTS idx_gedges_chunk ON entity_edges (chunk_id);
 CREATE INDEX IF NOT EXISTS idx_gmentions_entity ON entity_mentions (entity_node_id);
 CREATE INDEX IF NOT EXISTS idx_gmentions_chunk ON entity_mentions (chunk_id);

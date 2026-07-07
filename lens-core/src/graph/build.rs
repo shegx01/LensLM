@@ -118,6 +118,9 @@ pub fn build_entity_graph_rows(
         }
     }
 
+    // Lowercased node names, computed once and reused across the per-chunk scan.
+    let lower_names: Vec<String> = nodes.iter().map(|n| n.name.to_lowercase()).collect();
+
     let mut mentions: Vec<EntityMention> = Vec::new();
     // Canonical (min,max) node-id pair -> (count, first co-occurring chunk_id).
     let mut pairs: BTreeMap<(String, String), (u32, String)> = BTreeMap::new();
@@ -133,12 +136,12 @@ pub fn build_entity_graph_rows(
         let mut present: Vec<usize> = Vec::new();
         let lower_text = chunk.text.to_lowercase();
         for (node_i, node) in nodes.iter().enumerate() {
-            let name_lower = node.name.to_lowercase();
+            let name_lower = &lower_names[node_i];
             if name_lower.is_empty() {
                 continue;
             }
             let mut found_in_chunk = false;
-            for (cp_start, cp_end) in find_word_boundary_occurrences(&lower_text, &name_lower) {
+            for (cp_start, cp_end) in find_word_boundary_occurrences(&lower_text, name_lower) {
                 found_in_chunk = true;
                 mentions.push(EntityMention {
                     id: ids(),
