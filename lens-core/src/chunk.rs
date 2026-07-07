@@ -208,17 +208,21 @@ fn token_count(tokenizer: &Tokenizer, text: &str) -> Result<usize, LensError> {
 
 /// Shared implementation backing both [`chunk_blocks`] and
 /// [`chunk_blocks_deterministic`].
+fn non_blank_blocks(blocks: &[Block]) -> Vec<Block> {
+    blocks
+        .iter()
+        .filter(|b| !b.text.trim().is_empty())
+        .cloned()
+        .collect()
+}
+
 fn chunk_blocks_inner(
     src: &str,
     blocks: &[Block],
     tokenizer: &Tokenizer,
     strategy: IdStrategy,
 ) -> Result<Vec<Chunk>, LensError> {
-    let blocks: Vec<Block> = blocks
-        .iter()
-        .filter(|b| !b.text.trim().is_empty())
-        .cloned()
-        .collect();
+    let blocks = non_blank_blocks(blocks);
     if blocks.is_empty() {
         return Ok(Vec::new());
     }
@@ -987,6 +991,28 @@ mod tests {
             let result = chunk_blocks("", &[], &tok).unwrap();
             assert!(result.is_empty());
         }
+    }
+
+    #[test]
+    fn non_blank_blocks_drops_whitespace_only() {
+        let paragraph = crate::parse::BlockType::Paragraph.as_str().to_string();
+        let mk = |t: &str, s: usize, e: usize| Block {
+            block_type: paragraph.clone(),
+            section_path: String::new(),
+            text: t.to_string(),
+            char_start: s,
+            char_end: e,
+        };
+        let blocks = vec![
+            mk("real", 0, 4),
+            mk("   ", 6, 9),
+            mk("\n\t ", 11, 14),
+            mk("more", 16, 20),
+        ];
+        let kept = non_blank_blocks(&blocks);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].text, "real");
+        assert_eq!(kept[1].text, "more");
     }
 
     #[test]

@@ -269,6 +269,23 @@ mod tests {
         guard_zip_entry_count(b"not a zip at all").expect("non-zip passes through");
     }
 
+    #[test]
+    fn guard_zip_entry_count_allows_exactly_max_entries() {
+        use std::io::Cursor;
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let opts: zip::write::FileOptions = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for i in 0..MAX_ZIP_ENTRIES {
+                zip.start_file(format!("e{i}.txt"), opts)
+                    .expect("start entry");
+            }
+            zip.finish().expect("finish zip");
+        }
+        guard_zip_entry_count(&buf).expect("exactly MAX_ZIP_ENTRIES must be allowed");
+    }
+
     fn assert_text_kind_matches_parse_blocks(kind_str: &str, source_kind: SourceKind, src: &str) {
         let extractor = extractor_for(kind_str).expect("extractor for known kind");
         let out = extractor
