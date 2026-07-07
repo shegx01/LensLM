@@ -65,6 +65,10 @@ pub const STRUCTURAL_MAP_MAX_FIELD_CHARS: usize = 1_000;
 pub const COREF_MAX_RESULTS: usize = 256;
 pub const COREF_MAX_SUBS_PER_CHUNK: usize = 128;
 
+/// Per-chunk cap on entities considered for co-occurrence edges (M13). Overflow
+/// beyond the first `N` (insertion order) is dropped and counted for observability.
+pub const CO_OCCURRENCE_MAX_ENTITIES: usize = 30;
+
 /// Per-doc structural map produced by the LLM (AC4). Unknown fields are rejected
 /// (`deny_unknown_fields`) so a garbled shape triggers a reprompt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

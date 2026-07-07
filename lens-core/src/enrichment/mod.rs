@@ -32,3 +32,9 @@ pub use worker::{EnrichmentJob, spawn_worker};
 /// Bounded capacity of the enrichment `mpsc` queue. A full channel drops the job;
 /// the startup/rescan queue-rebuild re-enqueues any missed source (self-healing).
 pub const ENRICHMENT_QUEUE_CAPACITY: usize = 1024;
+
+/// Block types that skip the structural map (non-prose). Shared by the worker's
+/// prose gate and the M13 graph builder's prose-leaf filter so they agree.
+pub fn is_nonprose_block(block_type: Option<&str>) -> bool {
+    matches!(block_type, Some("code") | Some("table") | Some("html"))
+}

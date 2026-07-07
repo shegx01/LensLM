@@ -49,17 +49,12 @@ pub fn spawn_worker(engine: LensEngine, mut rx: mpsc::Receiver<EnrichmentJob>) {
     });
 }
 
-/// Block types that skip the structural map (non-prose). Still receive a context-prefix `embedding_text`.
-fn is_nonprose_block(block_type: Option<&str>) -> bool {
-    matches!(block_type, Some("code") | Some("table") | Some("html"))
-}
-
 /// Returns true if at least one level-0 parent chunk is prose (not code/table/html).
 fn source_is_prose(chunks: &[EnrichmentChunk]) -> bool {
     chunks
         .iter()
         .filter(|c| c.level == 0)
-        .any(|c| !is_nonprose_block(c.block_type.as_deref()))
+        .any(|c| !super::is_nonprose_block(c.block_type.as_deref()))
 }
 
 async fn process_job(

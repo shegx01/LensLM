@@ -17,6 +17,7 @@ pub mod embedding;
 pub mod enrichment;
 pub mod error;
 pub mod extract;
+pub mod graph;
 pub(crate) mod http;
 pub mod ingest;
 pub mod llm;
