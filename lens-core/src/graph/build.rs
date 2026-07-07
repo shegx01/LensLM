@@ -4,11 +4,29 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use sha2::{Digest, Sha256};
+
 use super::{EntityEdge, EntityGraphRows, EntityKind, EntityMention, EntityNode, Relation};
 use crate::enrichment::coref::CorefSub;
 use crate::enrichment::is_nonprose_block;
 use crate::enrichment::meta::Definition;
 use crate::notebooks::EnrichmentChunk;
+
+/// Deterministic node id derived from `(source_id, lowercased name, kind)` — the
+/// node's UNIQUE key. STABILITY IS LOAD-BEARING: re-enrichment regenerates rows, and
+/// `INSERT OR IGNORE` keeps the FIRST-seen node row. If node ids were random, edges
+/// and mentions built in the SAME re-run would reference the fresh (ignored) ids and
+/// violate their FK to `entity_nodes`. A stable id makes the regenerated node id
+/// equal the persisted one, so edges/mentions always reference a row that exists.
+fn node_id(source_id: &str, lower_name: &str, kind: EntityKind) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(source_id.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(lower_name.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(kind.as_str().as_bytes());
+    crate::hex_encode(&hasher.finalize())
+}
 
 /// Builds nodes / chunk-anchored mentions / bounded co-occurrence edges from the
 /// in-memory enrichment outputs of a single source. Pure + deterministic:
@@ -43,9 +61,9 @@ pub fn build_entity_graph_rows(
         if index.contains_key(&key) {
             continue;
         }
-        index.insert(key, nodes.len());
+        index.insert(key.clone(), nodes.len());
         nodes.push(EntityNode {
-            id: ids(),
+            id: node_id(source_id, &key, EntityKind::Concept),
             notebook_id: notebook_id.to_string(),
             source_id: source_id.to_string(),
             kind: EntityKind::Concept,
@@ -63,9 +81,9 @@ pub fn build_entity_graph_rows(
         if index.contains_key(&key) {
             continue;
         }
-        index.insert(key, nodes.len());
+        index.insert(key.clone(), nodes.len());
         nodes.push(EntityNode {
-            id: ids(),
+            id: node_id(source_id, &key, EntityKind::Date),
             notebook_id: notebook_id.to_string(),
             source_id: source_id.to_string(),
             kind: EntityKind::Date,
@@ -85,9 +103,9 @@ pub fn build_entity_graph_rows(
                 nodes[i].definition = Some(def.definition.clone());
             }
         } else {
-            index.insert(key, nodes.len());
+            index.insert(key.clone(), nodes.len());
             nodes.push(EntityNode {
-                id: ids(),
+                id: node_id(source_id, &key, EntityKind::Concept),
                 notebook_id: notebook_id.to_string(),
                 source_id: source_id.to_string(),
                 kind: EntityKind::Concept,

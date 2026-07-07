@@ -188,7 +188,8 @@ async fn graph_idempotency_all_tables() {
 }
 
 // ---------------------------------------------------------------------------
-// AC7 — atomicity: rows absent until commit; written with chunk-enrichment
+// AC7 — chunk enrichment + graph rows both land from one `write_enrichment_and_graph`
+// call (rows absent before, present after).
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -409,5 +410,80 @@ async fn zero_llm_delta() {
         calls.load(Ordering::SeqCst),
         2,
         "exactly map + coref calls; the graph step adds ZERO LLM calls"
+    );
+}
+
+/// Regression: a second enrichment over an already-enriched source (cache-key
+/// mismatch forces a re-run) must complete. On the re-run the prior run's summary
+/// RAPTOR node is a prose-leaf chunk, so the graph builder emits co-occurrence edges
+/// + mentions. Node ids are DETERMINISTIC (a hash of source_id+name+kind), so the
+/// regenerated nodes `INSERT OR IGNORE` back onto the SAME rows and the edges/mentions
+/// FK-reference ids that exist — no "referenced record does not exist" failure, and
+/// no row accumulation on any table.
+#[tokio::test]
+async fn rerun_over_summary_chunk_persists_without_fk_error() {
+    let (_dir, engine) = file_engine().await;
+    let body = long_prose();
+    let nb = engine
+        .create_notebook("nb", None, None)
+        .await
+        .unwrap()
+        .id
+        .to_string();
+    let pool = engine.pool().await;
+    let source_id = uuid::Uuid::now_v7().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO sources (id, notebook_id, kind, title, status, locator, selected, \
+         content_hash, enrichment_status, created_at) \
+         VALUES (?, ?, 'text', 'seed', 'indexed', '/tmp/seed.txt', 1, 'hr', NULL, ?)",
+    )
+    .bind(&source_id)
+    .bind(&nb)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .unwrap();
+    // A prose CHILD (level 1) so mentions + co-occurrence edges actually form.
+    let cid = format!("{source_id}-c0");
+    sqlx::query(
+        "INSERT INTO chunks (id, source_id, parent_id, kind, level, section_path, text, \
+          token_start, token_end, char_start, char_end, block_type, created_at) \
+         VALUES (?, ?, NULL, 'parent', 0, 'Intro', ?, 0, 1, 0, 1, 'paragraph', ?)",
+    )
+    .bind(&cid)
+    .bind(&source_id)
+    .bind(&body)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let _ = nb;
+
+    let (pa, _ca) = mock_provider("model-A", vec![valid_map(), empty_coref()]);
+    engine.set_llm_provider(Some(pa)).await;
+    engine.enqueue_enrichment_for_test(&source_id);
+    assert!(
+        wait_for_status(&engine, &source_id, "enriched").await,
+        "first run must reach enriched"
+    );
+    let nodes_1 = count(&engine, "entity_nodes").await;
+    assert!(nodes_1 >= 1, "first run persisted nodes");
+
+    // Different model id → cache-key mismatch → the source re-enriches. The summary
+    // chunk from run 1's re-embed is now present, so the graph builder emits edges.
+    let (pb, _cb) = mock_provider("model-B", vec![valid_map(), empty_coref()]);
+    engine.set_llm_provider(Some(pb)).await;
+    engine.enqueue_enrichment_for_test(&source_id);
+    assert!(
+        wait_for_status(&engine, &source_id, "enriched").await,
+        "re-run must reach enriched (no FK failure on graph write)"
+    );
+
+    // Idempotent: node count is stable across the re-run (deterministic ids).
+    assert_eq!(
+        count(&engine, "entity_nodes").await,
+        nodes_1,
+        "re-run must not accumulate nodes"
     );
 }

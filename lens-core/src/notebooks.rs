@@ -10,7 +10,7 @@ use std::str::FromStr;
 use sha2::{Digest, Sha256};
 
 use serde::{Deserialize, Serialize};
-use sqlx::{Sqlite, SqlitePool, Transaction};
+use sqlx::{SqliteConnection, SqlitePool};
 use uuid::Uuid;
 
 use crate::LensError;
@@ -437,9 +437,9 @@ const SOURCE_DEDUP_SELECT: &str = "SELECT id, notebook_id, kind, title, status, 
      FROM sources WHERE notebook_id = ? AND raw_content_hash = ? AND trashed_at IS NULL LIMIT 1";
 
 /// Applies `updates` (composed `embedding_text`, plus `enrichment` JSON on parent
-/// rows) inside an existing transaction. `chunks.text` is never modified.
+/// rows) on `conn` inside an in-progress transaction. `chunks.text` is never modified.
 async fn write_chunk_enrichment_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    conn: &mut SqliteConnection,
     updates: &[ChunkEnrichmentUpdate],
 ) -> Result<(), LensError> {
     for u in updates {
@@ -449,14 +449,14 @@ async fn write_chunk_enrichment_tx(
                     .bind(&u.embedding_text)
                     .bind(json)
                     .bind(&u.chunk_id)
-                    .execute(&mut **tx)
+                    .execute(&mut *conn)
                     .await?;
             }
             None => {
                 sqlx::query("UPDATE chunks SET embedding_text = ? WHERE id = ?")
                     .bind(&u.embedding_text)
                     .bind(&u.chunk_id)
-                    .execute(&mut **tx)
+                    .execute(&mut *conn)
                     .await?;
             }
         }
@@ -464,16 +464,24 @@ async fn write_chunk_enrichment_tx(
     Ok(())
 }
 
-/// Inserts the M13 entity-graph rows (nodes → edges → mentions) inside an existing
-/// transaction. All three inserts are `INSERT OR IGNORE` against their UNIQUE
-/// constraints so re-enrichment (incl. the #154 prompt-version storm) never
-/// accumulates rows.
+/// Persists the M13 entity-graph rows (nodes → edges → mentions), each `INSERT OR
+/// IGNORE` against its UNIQUE constraint so re-enrichment (incl. the #154
+/// prompt-version storm) never accumulates rows on any table.
+///
+/// Each insert runs in SQLite autocommit (its own implicit statement transaction),
+/// NOT a shared explicit transaction: batching multiple `INSERT OR IGNORE`
+/// conflict-resolutions into one deferred sqlx `BEGIN` deadlocks/errors the SQLite
+/// connection on a re-enrichment (the prior job's re-embed advances the WAL, and the
+/// deferred transaction cannot escalate its read snapshot to a write). Autocommit
+/// sidesteps it. The graph is unread until #158's opt-in gate, so the loss of joint
+/// atomicity with the chunk-enrichment write is benign: a crash mid-loop leaves a
+/// partial graph that the next (idempotent) re-enrichment completes.
 ///
 /// Teardown scope: #157 adds the explicit `DELETE FROM entity_nodes WHERE
 /// source_id=?`; until then source-keyed nodes may accumulate on content-changing
 /// re-ingest — harmless, as the graph is unread until #158's opt-in gate.
-async fn write_entity_graph_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+async fn write_entity_graph_autocommit(
+    pool: &SqlitePool,
     graph: &EntityGraphRows,
 ) -> Result<(), LensError> {
     for node in &graph.nodes {
@@ -492,7 +500,7 @@ async fn write_entity_graph_tx(
         .bind(&node.definition)
         .bind(node.resolution_conf)
         .bind(&node.created_at)
-        .execute(&mut **tx)
+        .execute(pool)
         .await?;
     }
     for edge in &graph.edges {
@@ -512,7 +520,7 @@ async fn write_entity_graph_tx(
         .bind(edge.weight)
         .bind(edge.confidence)
         .bind(&edge.created_at)
-        .execute(&mut **tx)
+        .execute(pool)
         .await?;
     }
     for mention in &graph.mentions {
@@ -528,7 +536,7 @@ async fn write_entity_graph_tx(
         .bind(mention.char_start)
         .bind(mention.char_end)
         .bind(&mention.created_at)
-        .execute(&mut **tx)
+        .execute(pool)
         .await?;
     }
     Ok(())
@@ -1492,20 +1500,17 @@ impl<'a> NotebookRepo<'a> {
         Ok(())
     }
 
-    /// Writes chunk enrichment (TEXT columns) and the M13 entity-graph rows in a
-    /// SINGLE transaction so a crash can never leave chunks enriched but the graph
-    /// empty (or vice-versa). Graph inserts are `INSERT OR IGNORE`, so re-runs over
-    /// identical rows never accumulate on any table.
+    /// Writes chunk enrichment (TEXT columns) then the M13 entity-graph rows. The
+    /// chunk write is one transaction; the graph rows are then persisted via
+    /// `INSERT OR IGNORE` (idempotent) in autocommit — see
+    /// [`write_entity_graph_autocommit`] for why they cannot share one transaction.
     pub async fn write_enrichment_and_graph(
         &self,
         updates: &[ChunkEnrichmentUpdate],
         graph: &EntityGraphRows,
     ) -> Result<(), LensError> {
-        let mut tx = self.pool.begin().await?;
-        write_chunk_enrichment_tx(&mut tx, updates).await?;
-        write_entity_graph_tx(&mut tx, graph).await?;
-        tx.commit().await?;
-        Ok(())
+        self.write_chunk_enrichment(updates).await?;
+        write_entity_graph_autocommit(self.pool, graph).await
     }
 
     /// Lists chunks for the Step-5 re-embed flip: `(id, level,
