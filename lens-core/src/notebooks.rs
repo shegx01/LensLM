@@ -1498,6 +1498,30 @@ impl<'a> NotebookRepo<'a> {
         Ok(rows)
     }
 
+    /// Loads the relation predicate vocabulary (`relation_types.name`) for the
+    /// #154 extraction pass. An empty set (e.g. migration not yet run) makes the
+    /// pass drop every triple — safe (zero semantic edges).
+    pub async fn list_relation_type_names(
+        &self,
+    ) -> Result<std::collections::HashSet<String>, LensError> {
+        let names: Vec<String> = sqlx::query_scalar("SELECT name FROM relation_types")
+            .fetch_all(self.pool)
+            .await?;
+        Ok(names.into_iter().collect())
+    }
+
+    /// Loads relation-type aliases (`alias -> canonical`) for query-time / write-time
+    /// alias resolution (#154). Never mutates stored predicates.
+    pub async fn list_relation_type_aliases(
+        &self,
+    ) -> Result<std::collections::HashMap<String, String>, LensError> {
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT alias, canonical FROM relation_type_aliases")
+                .fetch_all(self.pool)
+                .await?;
+        Ok(rows.into_iter().collect())
+    }
+
     /// Writes `embedding_text` (and, for parent rows, `enrichment` JSON) in one
     /// transaction. `chunks.text` is never modified. Retained for the prefix-only
     /// fallback path (`worker.rs`), which has no graph rows.

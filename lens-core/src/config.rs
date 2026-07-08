@@ -185,6 +185,10 @@ pub struct EnrichmentConfig {
     /// via [`deserialize_coref_strategy`] so old configs don't fail.
     #[serde(deserialize_with = "deserialize_coref_strategy")]
     pub coref_strategy: CorefStrategy,
+    /// Opt-in LLM relation-extraction strategy (#154). `#[serde(default)]` +
+    /// tolerant deserializer so old configs read back as `Off`.
+    #[serde(default, deserialize_with = "deserialize_relations_strategy")]
+    pub relations_strategy: RelationsStrategy,
     /// Explicit consent to send document text to a cloud LLM (AC11). Ollama
     /// enrichment ignores this flag.
     pub cloud_consent: bool,
@@ -200,6 +204,10 @@ pub use crate::llm::LlmRouting;
 /// the enrichment module. Single definition lives in `crate::enrichment`.
 pub use crate::enrichment::CorefStrategy;
 
+/// Re-export so `config::RelationsStrategy` resolves without reaching into the
+/// enrichment module. Single definition lives in `crate::enrichment`.
+pub use crate::enrichment::RelationsStrategy;
+
 /// Tolerant deserializer for [`EnrichmentConfig::coref_strategy`]. Legacy
 /// `"dedicated_model"` maps to `LlmInline` so old `config.json` files survive.
 fn deserialize_coref_strategy<'de, D>(deserializer: D) -> Result<CorefStrategy, D::Error>
@@ -208,6 +216,16 @@ where
 {
     let raw = String::deserialize(deserializer)?;
     Ok(CorefStrategy::from_config(&raw))
+}
+
+/// Tolerant deserializer for [`EnrichmentConfig::relations_strategy`]. Unknown
+/// values map to `Off` so old/garbled `config.json` files survive.
+fn deserialize_relations_strategy<'de, D>(deserializer: D) -> Result<RelationsStrategy, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    Ok(RelationsStrategy::from_config(&raw))
 }
 
 impl Default for EnrichmentConfig {
@@ -220,6 +238,7 @@ impl Default for EnrichmentConfig {
             map_model: None,
             chat_model: None,
             coref_strategy: CorefStrategy::default(),
+            relations_strategy: RelationsStrategy::default(),
             cloud_consent: false,
             routing: LlmRouting::default(),
         }
@@ -234,6 +253,7 @@ impl EnrichmentConfig {
             Self {
                 enabled: true,
                 coref_strategy: CorefStrategy::LlmInline,
+                relations_strategy: RelationsStrategy::default(),
                 cloud_consent: false,
                 routing: LlmRouting::default(),
                 ..Self::default()
@@ -242,6 +262,7 @@ impl EnrichmentConfig {
             Self {
                 enabled: false,
                 coref_strategy: CorefStrategy::LlmInline,
+                relations_strategy: RelationsStrategy::default(),
                 cloud_consent: false,
                 routing: LlmRouting::default(),
                 ..Self::default()
@@ -941,6 +962,19 @@ mod tests {
     }
 
     #[test]
+    fn default_relations_strategy_is_off() {
+        assert_eq!(
+            EnrichmentConfig::default().relations_strategy,
+            RelationsStrategy::Off
+        );
+        // AC3 compile-coverage: `for_provider` populates the field (defaults to Off).
+        assert_eq!(
+            EnrichmentConfig::for_provider(true, false).relations_strategy,
+            RelationsStrategy::Off
+        );
+    }
+
+    #[test]
     fn missing_per_task_models_deserialize_to_none() {
         let json = r#"{
             "enabled": true,
@@ -952,6 +986,8 @@ mod tests {
         assert_eq!(e.coref_model, None);
         assert_eq!(e.map_model, None);
         assert_eq!(e.chat_model, None);
+        // AC1: a config without `relations_strategy` reads back as `Off`.
+        assert_eq!(e.relations_strategy, RelationsStrategy::Off);
     }
 
     #[test]

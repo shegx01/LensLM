@@ -7,7 +7,7 @@
 mod build;
 mod tools;
 
-pub use build::build_entity_graph_rows;
+pub use build::{ResolvedNode, build_entity_graph_rows, build_node_index};
 pub use tools::{GraphEntity, entity_evidence, entity_lookup};
 
 use crate::LensError;
@@ -49,24 +49,47 @@ impl EntityKind {
     }
 }
 
-/// Edge relation, stored as plain `TEXT`. Single-variant in Phase 1; #154 adds
-/// semantic relations with a trivial same-crate edit (no `#[non_exhaustive]`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Edge relation, stored as plain `TEXT` (no SQL CHECK; the Rust enum is the guard,
+/// mirroring [`EntityKind`]). `Semantic` carries a canonical predicate name validated
+/// against `relation_types` at construction time (#154).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Relation {
     CoOccurs,
+    /// A typed semantic predicate (e.g. `founded`, `part_of`). The name is the
+    /// canonical `relation_types.name`, validated by [`Relation::semantic`].
+    Semantic(String),
 }
 
 impl Relation {
-    pub fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &str {
         match self {
             Relation::CoOccurs => "co_occurs",
+            Relation::Semantic(name) => name.as_str(),
         }
     }
 
-    pub fn from_db(s: &str) -> Result<Self, LensError> {
+    /// Reconstructs a `Relation` from a DB value. Never errors: the value was
+    /// validated at write time, so any non-`co_occurs` string is a `Semantic`.
+    pub fn from_db(s: &str) -> Self {
         match s {
-            "co_occurs" => Ok(Relation::CoOccurs),
-            _ => Err(LensError::Parse(format!("unknown relation: {s}"))),
+            "co_occurs" => Relation::CoOccurs,
+            other => Relation::Semantic(other.to_string()),
+        }
+    }
+
+    /// Gated constructor for a semantic predicate: succeeds only when `name` is a
+    /// known `relation_types` predicate. `vocab` is the in-memory set loaded from
+    /// the DB. An empty vocab rejects everything (safe: zero semantic edges).
+    pub fn semantic(
+        name: &str,
+        vocab: &std::collections::HashSet<String>,
+    ) -> Result<Self, LensError> {
+        if vocab.contains(name) {
+            Ok(Relation::Semantic(name.to_string()))
+        } else {
+            Err(LensError::Parse(format!(
+                "unknown relation predicate: {name}"
+            )))
         }
     }
 }
@@ -157,14 +180,34 @@ mod tests {
     #[test]
     fn relation_as_str_roundtrips() {
         assert_eq!(Relation::CoOccurs.as_str(), "co_occurs");
-        assert_eq!(Relation::from_db("co_occurs").unwrap(), Relation::CoOccurs);
+        assert_eq!(Relation::from_db("co_occurs"), Relation::CoOccurs);
+        assert_eq!(
+            Relation::Semantic("founded".to_string()).as_str(),
+            "founded"
+        );
     }
 
     #[test]
-    fn relation_from_db_unknown_errors() {
+    fn relation_from_db_unknown_is_semantic() {
+        assert_eq!(
+            Relation::from_db("founded"),
+            Relation::Semantic("founded".to_string())
+        );
+    }
+
+    #[test]
+    fn relation_semantic_validates_against_vocab() {
+        let mut vocab = std::collections::HashSet::new();
+        vocab.insert("founded".to_string());
+        assert_eq!(
+            Relation::semantic("founded", &vocab).unwrap(),
+            Relation::Semantic("founded".to_string())
+        );
         assert!(matches!(
-            Relation::from_db("nope"),
+            Relation::semantic("nope", &vocab),
             Err(LensError::Parse(_))
         ));
+        // Empty vocab rejects everything.
+        assert!(Relation::semantic("founded", &std::collections::HashSet::new()).is_err());
     }
 }

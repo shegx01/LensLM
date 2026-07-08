@@ -12,6 +12,7 @@ pub mod embedding_text;
 pub mod map;
 pub mod meta;
 pub mod reembed;
+pub mod relations;
 pub mod worker;
 
 /// Shared enrichment test mock. Available in-crate (`#[cfg(test)]`) and to the
@@ -20,13 +21,16 @@ pub mod worker;
 pub mod test_util;
 
 pub use coref::{ChunkCoref, CorefResponse, CorefSub, apply_substitutions, resolve_coref_batch};
-pub use embedding_text::{CorefStrategy, compose_embedding_text, compose_prefix};
+pub use embedding_text::{
+    CorefStrategy, RelationsStrategy, compose_embedding_text, compose_prefix,
+};
 pub use map::{MapError, MapOutcome, build_structural_map};
 pub use meta::{
     Budget, BudgetCheck, CacheKeyParts, ENRICHMENT_PROMPT_VERSION, ENRICHMENT_SIZE_GATE_TOKENS,
     EnrichmentMeta, MAP_QUALITY_FALLBACK, MAP_QUALITY_OK, MAP_QUALITY_SKIPPED, SessionBudget,
     StructuralMap,
 };
+pub use relations::{RelationTriple, extract_relations};
 pub use worker::{EnrichmentJob, spawn_worker};
 
 /// Bounded capacity of the enrichment `mpsc` queue. A full channel drops the job;

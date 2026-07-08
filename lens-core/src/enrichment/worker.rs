@@ -13,12 +13,16 @@ use crate::LensEngine;
 use crate::notebooks::{ChunkEnrichmentUpdate, EnrichmentChunk, EnrichmentStatus, NotebookRepo};
 
 use super::coref::{CorefSub, apply_substitutions, resolve_coref_batch};
-use super::embedding_text::{CorefStrategy, compose_embedding_text, compose_prefix, count_tokens};
+use super::embedding_text::{
+    CorefStrategy, RelationsStrategy, compose_embedding_text, compose_prefix, count_tokens,
+};
 use super::map::{MapError, MapOutcome, build_structural_map};
 use super::meta::{
     Budget, CacheKeyParts, ENRICHMENT_MAX_TOKENS_PER_JOB, ENRICHMENT_SIZE_GATE_TOKENS,
-    EnrichmentMeta, MAP_QUALITY_FALLBACK, MAP_QUALITY_OK, MAP_QUALITY_SKIPPED, SessionBudget,
+    EnrichmentMeta, MAP_QUALITY_FALLBACK, MAP_QUALITY_OK, MAP_QUALITY_SKIPPED,
+    RELATIONS_ENTITY_DENSITY_FLOOR, SessionBudget,
 };
+use super::relations::{RelationTriple, extract_relations};
 
 /// A unit of background enrichment work. The worker re-loads the live source row
 /// from SQLite on dequeue so a purge mid-flight is handled by re-checking existence.
@@ -102,6 +106,7 @@ async fn process_job(
         llm_model_id: p.model_id().to_string(),
         prompt_version: super::meta::ENRICHMENT_PROMPT_VERSION,
         coref_strategy: coref.as_str().to_string(),
+        relations_strategy: enrichment_cfg.relations_strategy.as_str().to_string(),
     });
     let cache_key = cache_parts.as_ref().map(|p| p.compute());
 
@@ -259,20 +264,7 @@ async fn process_job(
             ),
             // AC11: budget circuit-break ⇒ `failed` + `budget_exceeded`.
             Err(MapError::BudgetExceeded) => {
-                let meta = EnrichmentMeta {
-                    cache_key,
-                    map_quality: String::new(),
-                    budget_exceeded: true,
-                    tokens_spent: budget.job_tokens(),
-                    calls_made: budget.job_calls(),
-                    failure_reason: None,
-                };
-                persist_meta(&repo, &job.source_id, EnrichmentStatus::Failed, &meta).await?;
-                tracing::warn!(
-                    source_id = %job.source_id,
-                    calls = budget.job_calls(),
-                    "enrichment: budget exceeded, circuit-broke to failed"
-                );
+                fail_budget_exceeded(&repo, &job.source_id, cache_key, "map", &budget).await?;
                 return Ok(());
             }
             // AC13(d): LLM error ⇒ `failed`, raw vectors untouched.
@@ -314,20 +306,7 @@ async fn process_job(
             Ok(subs) => subs,
             // AC11: budget breach during coref ⇒ `failed` + `budget_exceeded`.
             Err(MapError::BudgetExceeded) => {
-                let meta = EnrichmentMeta {
-                    cache_key,
-                    map_quality: String::new(),
-                    budget_exceeded: true,
-                    tokens_spent: budget.job_tokens(),
-                    calls_made: budget.job_calls(),
-                    failure_reason: None,
-                };
-                persist_meta(&repo, &job.source_id, EnrichmentStatus::Failed, &meta).await?;
-                tracing::warn!(
-                    source_id = %job.source_id,
-                    calls = budget.job_calls(),
-                    "enrichment: coref budget exceeded, circuit-broke to failed"
-                );
+                fail_budget_exceeded(&repo, &job.source_id, cache_key, "coref", &budget).await?;
                 return Ok(());
             }
             // Transport error: degrade to empty subs (coref is additive, not a source failure).
@@ -341,6 +320,48 @@ async fn process_job(
         }
     } else {
         HashMap::new()
+    };
+
+    // Relations pass (#154): opt-in typed semantic edges. Runs only on a graph-worthy
+    // doc (map OK + entity-density floor). Shares the map/coref Budget (AC12): a breach
+    // fails the source; a transport error degrades to zero semantic edges (additive).
+    let relation_triples: Vec<RelationTriple> = if enrichment_cfg.relations_strategy
+        == RelationsStrategy::On
+        && map_quality == MAP_QUALITY_OK
+        && map_entities.len() >= RELATIONS_ENTITY_DENSITY_FLOOR
+    {
+        let predicate_vocab = repo.list_relation_type_names().await?;
+        let aliases = repo.list_relation_type_aliases().await?;
+        let node_index = crate::graph::build_node_index(
+            &job.source_id,
+            &map_entities,
+            &map_definitions,
+            &map_dates,
+        );
+        match extract_relations(
+            map_provider.as_ref(),
+            &mut budget,
+            &chunks,
+            &map_entities,
+            &node_index,
+            &predicate_vocab,
+            &aliases,
+        )
+        .await
+        {
+            Ok(triples) => triples,
+            // AC12: budget breach during relations ⇒ `failed` + `budget_exceeded`.
+            Err(MapError::BudgetExceeded) => {
+                fail_budget_exceeded(&repo, &job.source_id, cache_key, "relations", &budget)
+                    .await?;
+                return Ok(());
+            }
+            // extract_relations absorbs transport errors (keeps partial triples), so
+            // this arm is not hit in practice; degrade to no semantic edges regardless.
+            Err(MapError::Llm(_)) => Vec::new(),
+        }
+    } else {
+        Vec::new()
     };
 
     // Compose `embedding_text` for every chunk (AC5); attach the map JSON to the
@@ -370,7 +391,7 @@ async fn process_job(
     }
     // M13: build the entity graph from in-memory enrichment outputs (ZERO new LLM
     // calls) and persist it in the SAME transaction as the chunk-enrichment writes.
-    let graph_rows = crate::graph::build_entity_graph_rows(
+    let mut graph_rows = crate::graph::build_entity_graph_rows(
         &source.notebook_id,
         &job.source_id,
         &chunks,
@@ -388,6 +409,23 @@ async fn process_job(
             dropped = graph_rows.dropped_cooccurrence,
             "entity graph: co-occurrence entities dropped over per-chunk cap"
         );
+    }
+    // #154: append semantic edges; UNIQUE(source,from,to,relation) keeps them distinct
+    // from co_occurs edges, so both edge types for the same pair coexist.
+    let now = chrono::Utc::now().to_rfc3339();
+    for triple in &relation_triples {
+        graph_rows.edges.push(crate::graph::EntityEdge {
+            id: uuid::Uuid::now_v7().to_string(),
+            notebook_id: source.notebook_id.clone(),
+            source_id: job.source_id.clone(),
+            chunk_id: triple.chunk_id.clone(),
+            from_node: triple.from_node.clone(),
+            to_node: triple.to_node.clone(),
+            relation: triple.relation.clone(),
+            weight: None,
+            confidence: Some(triple.confidence),
+            created_at: now.clone(),
+        });
     }
     repo.write_enrichment_and_graph(&updates, &graph_rows)
         .await?;
@@ -444,6 +482,32 @@ async fn process_job(
         source_id = %job.source_id,
         map_quality,
         "enrichment: re-embed flip complete (enriched)"
+    );
+    Ok(())
+}
+
+/// Persists `Failed` + `budget_exceeded: true` for any pass that hits the circuit-break
+/// ceiling. `phase` names the pass for the warning log.
+async fn fail_budget_exceeded(
+    repo: &NotebookRepo<'_>,
+    source_id: &str,
+    cache_key: String,
+    phase: &str,
+    budget: &Budget,
+) -> Result<(), crate::LensError> {
+    let meta = EnrichmentMeta {
+        cache_key,
+        map_quality: String::new(),
+        budget_exceeded: true,
+        tokens_spent: budget.job_tokens(),
+        calls_made: budget.job_calls(),
+        failure_reason: None,
+    };
+    persist_meta(repo, source_id, EnrichmentStatus::Failed, &meta).await?;
+    tracing::warn!(
+        source_id = %source_id,
+        calls = budget.job_calls(),
+        "enrichment: {phase} budget exceeded, circuit-broke to failed"
     );
     Ok(())
 }

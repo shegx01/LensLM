@@ -69,6 +69,22 @@ pub const COREF_MAX_SUBS_PER_CHUNK: usize = 128;
 /// beyond the first `N` (insertion order) is dropped and counted for observability.
 pub const CO_OCCURRENCE_MAX_ENTITIES: usize = 30;
 
+/// Relation-extraction gate: minimum distinct structural-map entities for a source
+/// to qualify for the pass (#154). Below this, code/table PDFs that leak through the
+/// prose gate yield zero semantic edges.
+pub const RELATIONS_ENTITY_DENSITY_FLOOR: usize = 8;
+/// Fraction of prose chunks sampled (ranked by entity density) for relation extraction.
+pub const RELATIONS_SAMPLE_FRACTION: f64 = 0.10;
+/// Hard cap on sampled chunks. `ceil(24/8)=3` LLM calls — tuned to the per-job budget
+/// shared with map+coref (`ENRICHMENT_MAX_CALLS_PER_JOB`), the binding constraint.
+pub const RELATIONS_SAMPLE_CAP: usize = 24;
+/// Chunks per relation-extraction LLM call.
+pub const RELATIONS_BATCH_SIZE: usize = 8;
+/// Triples below this confidence are dropped (#154 quality floor; #158 may tune it).
+pub const RELATIONS_MIN_CONFIDENCE: f64 = 0.5;
+/// Max output tokens per relation-extraction call (consistent with map/coref).
+pub const RELATIONS_MAX_TOKENS: u32 = 1_024;
+
 /// Per-doc structural map produced by the LLM (AC4). Unknown fields are rejected
 /// (`deny_unknown_fields`) so a garbled shape triggers a reprompt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,18 +174,26 @@ pub(super) fn extract_json_object(text: &str) -> Option<&str> {
     None
 }
 
-/// Composite enrichment cache key (AC9): `hash(content_hash ‖ model ‖ prompt_version ‖ coref)`.
-/// A match on re-enqueue short-circuits the LLM pass entirely.
+/// Composite enrichment cache key (AC9): SHA-256 over content hash, model, prompt version, coref strategy, and optionally relations strategy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheKeyParts {
     pub content_hash: String,
     pub llm_model_id: String,
     pub prompt_version: u32,
     pub coref_strategy: String,
+    /// `#[serde(default)]` so older persisted keys without this field deserialize cleanly.
+    #[serde(default = "relations_strategy_off")]
+    pub relations_strategy: String,
+}
+
+fn relations_strategy_off() -> String {
+    "off".to_string()
 }
 
 impl CacheKeyParts {
-    /// SHA-256 over the four components joined with NUL (unambiguous separator).
+    /// SHA-256 over the components joined with NUL (unambiguous separator). The
+    /// `relations_strategy` component is appended ONLY when != `"off"` so the
+    /// default-off case stays byte-identical to the prior 4-component key (AC2).
     pub fn compute(&self) -> String {
         let mut hasher = Sha256::new();
         hasher.update(self.content_hash.as_bytes());
@@ -179,6 +203,10 @@ impl CacheKeyParts {
         hasher.update(self.prompt_version.to_le_bytes());
         hasher.update([0u8]);
         hasher.update(self.coref_strategy.as_bytes());
+        if self.relations_strategy != "off" {
+            hasher.update([0u8]);
+            hasher.update(self.relations_strategy.as_bytes());
+        }
         crate::hex_encode(&hasher.finalize())
     }
 }
@@ -433,7 +461,30 @@ mod tests {
             llm_model_id: "llama3".to_string(),
             prompt_version: ENRICHMENT_PROMPT_VERSION,
             coref_strategy: "llm_inline".to_string(),
+            relations_strategy: "off".to_string(),
         }
+    }
+
+    /// AC2: the default-off relations strategy keeps the hash byte-identical to the
+    /// prior 4-component key; only opting in ("on") changes it.
+    #[test]
+    fn cache_key_relations_off_is_byte_identical_to_four_field_hash() {
+        // The prior 4-component hash, recomputed inline (content ‖ model ‖ version ‖ coref).
+        let mut hasher = Sha256::new();
+        hasher.update(b"abc123");
+        hasher.update([0u8]);
+        hasher.update(b"llama3");
+        hasher.update([0u8]);
+        hasher.update(ENRICHMENT_PROMPT_VERSION.to_le_bytes());
+        hasher.update([0u8]);
+        hasher.update(b"llm_inline");
+        let legacy = crate::hex_encode(&hasher.finalize());
+
+        assert_eq!(parts().compute(), legacy, "off must not perturb the hash");
+
+        let mut on = parts();
+        on.relations_strategy = "on".to_string();
+        assert_ne!(on.compute(), legacy, "on must change the hash");
     }
 
     #[test]
