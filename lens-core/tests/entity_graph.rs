@@ -191,6 +191,76 @@ async fn graph_idempotency_all_tables() {
 }
 
 // ---------------------------------------------------------------------------
+// #154 (AC10) — semantic + co-occurrence edges coexist for the same node pair
+// under UNIQUE(source_id, from_node, to_node, relation); duplicate co_occurs ignored.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn semantic_and_cooccurrence_edges_coexist_for_same_pair() {
+    let (_dir, engine) = file_engine().await;
+    let (nb, source_id, chunk_id) = seed_source_with_chunk(&engine).await;
+    let mut rows = sample_rows(&nb, &source_id, &chunk_id);
+
+    // Same A-B pair as the co-occurrence edge, but a `founded` semantic edge — a
+    // distinct UNIQUE slot, so both must survive.
+    let from = rows.edges[0].from_node.clone();
+    let to = rows.edges[0].to_node.clone();
+    rows.edges.push(EntityEdge {
+        id: format!("{source_id}-e-sem"),
+        notebook_id: nb.clone(),
+        source_id: source_id.clone(),
+        chunk_id: chunk_id.clone(),
+        from_node: from.clone(),
+        to_node: to.clone(),
+        relation: Relation::Semantic("founded".to_string()),
+        weight: None,
+        confidence: Some(0.9),
+        created_at: "2026-01-01T00:00:00Z".to_string(),
+    });
+    // A duplicate co_occurs for the same pair must be silently ignored (INSERT OR IGNORE).
+    rows.edges.push(EntityEdge {
+        id: format!("{source_id}-e-dup"),
+        notebook_id: nb.clone(),
+        source_id: source_id.clone(),
+        chunk_id: chunk_id.clone(),
+        from_node: from,
+        to_node: to,
+        relation: Relation::CoOccurs,
+        weight: Some(1.0),
+        confidence: None,
+        created_at: "2026-01-01T00:00:00Z".to_string(),
+    });
+
+    let pool = engine.pool().await;
+    NotebookRepo::new(&pool)
+        .write_enrichment_and_graph(&[], &rows)
+        .await
+        .expect("write mixed edges");
+
+    // 2 rows survive: one co_occurs + one founded; the duplicate co_occurs is ignored.
+    assert_eq!(count(&engine, "entity_edges").await, 2);
+    let relations: Vec<String> = sqlx::query_scalar(
+        "SELECT relation FROM entity_edges WHERE source_id = ? ORDER BY relation",
+    )
+    .bind(&source_id)
+    .fetch_all(&pool)
+    .await
+    .expect("relations");
+    assert_eq!(relations, vec!["co_occurs".to_string(), "founded".to_string()]);
+
+    // Re-writing the same rows is idempotent (self-replacing DELETE + reinsert).
+    NotebookRepo::new(&pool)
+        .write_enrichment_and_graph(&[], &rows)
+        .await
+        .expect("second write");
+    assert_eq!(
+        count(&engine, "entity_edges").await,
+        2,
+        "re-enrichment replaces both edge types cleanly"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // AC7 — chunk enrichment + graph rows both land from one `write_enrichment_and_graph`
 // call (rows absent before, present after).
 // ---------------------------------------------------------------------------
