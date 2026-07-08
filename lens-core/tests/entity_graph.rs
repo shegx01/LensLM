@@ -22,6 +22,8 @@ use lens_core::notebooks::{ChunkEnrichmentUpdate, NotebookRepo};
 use sqlx::Row;
 use tempfile::TempDir;
 
+mod support;
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -143,6 +145,7 @@ fn sample_rows(nb: &str, source_id: &str, chunk_id: &str) -> EntityGraphRows {
         },
     ];
     EntityGraphRows {
+        source_id: source_id.to_string(),
         nodes: vec![node_a, node_b],
         edges: vec![edge],
         mentions,
@@ -536,4 +539,227 @@ async fn rerun_over_summary_chunk_persists_without_fk_error() {
         nodes_1,
         "re-run must not accumulate nodes"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #157 — index consistency: self-replacing graph write + wipe-path node delete
+// ---------------------------------------------------------------------------
+
+/// The self-replacing write's leading `DELETE FROM entity_nodes` is a harmless no-op
+/// on a source that has no prior graph rows: the fresh write still lands in full.
+#[tokio::test]
+async fn first_time_enrichment_delete_is_noop() {
+    let (_dir, engine) = file_engine().await;
+    let (nb, source_id, chunk_id) = seed_source_with_chunk(&engine).await;
+    let pool = engine.pool().await;
+    NotebookRepo::new(&pool)
+        .write_enrichment_and_graph(&[], &sample_rows(&nb, &source_id, &chunk_id))
+        .await
+        .expect("first write");
+    assert_eq!(count(&engine, "entity_nodes").await, 2, "fresh write lands");
+    assert_eq!(count(&engine, "entity_edges").await, 1);
+    assert_eq!(count(&engine, "entity_mentions").await, 2);
+}
+
+/// The core #157 guarantee: when a re-enrichment's entity set SHRINKS/CHANGES, the
+/// self-replacing write purges the stale nodes rather than leaving orphans. Write
+/// {Alice, Bob}, then re-write the same source with only {Carol}; assert Alice/Bob
+/// (and their cascaded edges/mentions) are gone and only Carol remains.
+#[tokio::test]
+async fn enrichment_with_changed_entities_purges_stale_nodes() {
+    let (_dir, engine) = file_engine().await;
+    let (nb, source_id, chunk_id) = seed_source_with_chunk(&engine).await;
+    let pool = engine.pool().await;
+    let repo = NotebookRepo::new(&pool);
+
+    repo.write_enrichment_and_graph(&[], &sample_rows(&nb, &source_id, &chunk_id))
+        .await
+        .expect("first write {Alice, Bob}");
+    assert_eq!(count(&engine, "entity_nodes").await, 2);
+    assert_eq!(count(&engine, "entity_edges").await, 1);
+    assert_eq!(count(&engine, "entity_mentions").await, 2);
+
+    // Re-enrichment now yields a different entity set: only Carol.
+    let carol = EntityNode {
+        id: format!("{source_id}-carol"),
+        notebook_id: nb.clone(),
+        source_id: source_id.clone(),
+        kind: EntityKind::Concept,
+        name: "Carol".to_string(),
+        canonical_name: None,
+        definition: None,
+        resolution_conf: None,
+        created_at: "2026-01-02T00:00:00Z".to_string(),
+    };
+    let rows2 = EntityGraphRows {
+        source_id: source_id.clone(),
+        nodes: vec![carol],
+        edges: vec![],
+        mentions: vec![],
+        dropped_cooccurrence: 0,
+    };
+    repo.write_enrichment_and_graph(&[], &rows2)
+        .await
+        .expect("second write {Carol}");
+
+    assert_eq!(
+        count(&engine, "entity_nodes").await,
+        1,
+        "stale Alice/Bob purged, only Carol remains"
+    );
+    assert_eq!(count(&engine, "entity_edges").await, 0, "stale edge purged");
+    assert_eq!(
+        count(&engine, "entity_mentions").await,
+        0,
+        "stale mentions purged"
+    );
+    let name: String = sqlx::query_scalar("SELECT name FROM entity_nodes WHERE source_id = ?")
+        .bind(&source_id)
+        .fetch_one(&pool)
+        .await
+        .expect("one node");
+    assert_eq!(name, "Carol");
+}
+
+/// A content-changing re-ingest goes through the main inline re-ingest path
+/// (`ingest.rs`), whose transaction now deletes the source's `entity_nodes` explicitly.
+/// With enrichment DISABLED, that explicit delete is the ONLY thing that can clear a
+/// pre-existing node — so this isolates the wipe-path delete (independent of any
+/// re-enrichment). Needs a real tokenizer for chunking, so it is gated behind
+/// `tokenizer_available()` and skips cleanly offline, like the rest of the ingest suite.
+#[tokio::test]
+async fn reingest_changed_content_purges_stale_nodes() {
+    if !support::tokenizer_available().await {
+        eprintln!("skipping: tokenizer unavailable (offline)");
+        return;
+    }
+    let (dir, engine) = support::inject_counting_engine().await;
+    support::seed_tokenizer_from_env(dir.path());
+    {
+        let mut cfg = engine.config().await;
+        cfg.enrichment.enabled = false;
+        engine.set_config(cfg).await;
+    }
+    let nb = engine
+        .create_notebook("nb", None, None)
+        .await
+        .expect("create notebook");
+
+    let src = engine
+        .add_text_source(&nb.id, "doc", "Alice met Bob at the fair in Paris.", "text")
+        .await
+        .expect("add text source")
+        .source;
+    engine
+        .ingest_source(&src.id, |_p| {})
+        .await
+        .expect("first ingest");
+
+    // Simulate a prior enrichment's node for this source (enrichment is disabled here).
+    let pool = engine.pool().await;
+    sqlx::query(
+        "INSERT INTO entity_nodes (id, notebook_id, source_id, kind, name, created_at) \
+         VALUES (?, ?, ?, 'concept', 'Alice', '2026-01-01T00:00:00Z')",
+    )
+    .bind(format!("{}-stale", src.id))
+    .bind(nb.id.to_string())
+    .bind(&src.id)
+    .execute(&pool)
+    .await
+    .expect("seed stale node");
+    let stale: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entity_nodes WHERE source_id = ?")
+        .bind(&src.id)
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(stale, 1, "stale node seeded");
+
+    // Change the managed file's content so the re-ingest is not a content-hash no-op,
+    // then re-ingest through the main path.
+    std::fs::write(
+        &src.locator,
+        "A totally different note about Carol in Berlin.",
+    )
+    .expect("overwrite managed file");
+    engine
+        .ingest_source(&src.id, |_p| {})
+        .await
+        .expect("re-ingest");
+
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM entity_nodes WHERE source_id = ?")
+            .bind(&src.id)
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+    assert_eq!(
+        remaining, 0,
+        "re-ingest's explicit entity_nodes delete cleared the stale node"
+    );
+}
+
+/// `purge_source` (explicit `chunks_fts` delete + `DELETE FROM sources`) clears all
+/// three graph tables via `ON DELETE CASCADE` on the source/chunk FKs. Behavioral
+/// (count-based) so it fails loudly if the cascade ever regresses.
+#[tokio::test]
+async fn purge_source_cascades_graph_rows() {
+    let (_dir, engine) = file_engine().await;
+    let (nb, source_id, chunk_id) = seed_source_with_chunk(&engine).await;
+    let pool = engine.pool().await;
+    NotebookRepo::new(&pool)
+        .write_enrichment_and_graph(&[], &sample_rows(&nb, &source_id, &chunk_id))
+        .await
+        .expect("write");
+    assert_eq!(count(&engine, "entity_nodes").await, 2);
+
+    engine.trash_source(&source_id).await.expect("trash");
+    engine.purge_source(&source_id).await.expect("purge");
+
+    assert_eq!(count(&engine, "entity_nodes").await, 0, "nodes cascaded");
+    assert_eq!(count(&engine, "entity_edges").await, 0, "edges cascaded");
+    assert_eq!(
+        count(&engine, "entity_mentions").await,
+        0,
+        "mentions cascaded"
+    );
+}
+
+/// `purge_notebook` (`DELETE FROM notebooks`) cascades sources → chunks → all graph
+/// tables. Behavioral assertion.
+#[tokio::test]
+async fn purge_notebook_cascades_graph_rows() {
+    let (_dir, engine) = file_engine().await;
+    let (nb, source_id, chunk_id) = seed_source_with_chunk(&engine).await;
+    let pool = engine.pool().await;
+    NotebookRepo::new(&pool)
+        .write_enrichment_and_graph(&[], &sample_rows(&nb, &source_id, &chunk_id))
+        .await
+        .expect("write");
+    assert_eq!(count(&engine, "entity_nodes").await, 2);
+
+    let nb_id = lens_core::NotebookId::from(nb);
+    engine.trash_notebook(&nb_id).await.expect("trash notebook");
+    engine.purge_notebook(&nb_id).await.expect("purge notebook");
+
+    assert_eq!(count(&engine, "entity_nodes").await, 0, "nodes cascaded");
+    assert_eq!(count(&engine, "entity_edges").await, 0, "edges cascaded");
+    assert_eq!(
+        count(&engine, "entity_mentions").await,
+        0,
+        "mentions cascaded"
+    );
+}
+
+/// The cascade-based purge guarantees hold ONLY if `foreign_keys` is enforced at
+/// runtime. Pin it against the production pool constructor so a future pool-config
+/// change that drops the pragma fails loudly.
+#[tokio::test]
+async fn foreign_keys_pragma_enabled() {
+    let (_dir, engine) = file_engine().await;
+    let pool = engine.pool().await;
+    let fk: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+        .fetch_one(&pool)
+        .await
+        .expect("pragma");
+    assert_eq!(fk, 1, "foreign_keys must be ON for cascade correctness");
 }

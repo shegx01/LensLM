@@ -953,10 +953,14 @@ impl IngestContext<'_> {
 
         // G5 ordering: Lance vectors dropped FIRST, then SQLite chunks — a completed wipe
         // never leaves orphan Lance rows; chunk delete+insert run inside ONE transaction.
+        // (#155 wires the entity-vector drop here alongside the chunk-vector drop.)
         store.drop_source(&coord, source_id).await?;
 
         let mut tx = pool.begin().await?;
         delete_chunks_for_source(&mut tx, source_id).await?;
+        // #157: clear the source-keyed entity_nodes here and now (see the helper for why
+        // it's explicit) rather than waiting on the re-enqueued enrichment to replace them.
+        crate::notebooks::delete_entity_nodes_for_source(&mut tx, source_id).await?;
         insert_chunks(&mut tx, source_id, &chunks).await?;
         tx.commit().await?;
 
@@ -1612,9 +1616,12 @@ async fn wipe_source_content(
         embed_model,
         embed_dim,
     );
+    // (#155 wires the entity-vector drop here alongside the chunk-vector drop.)
     store.drop_source(&coord, source_id).await?;
     let mut tx = pool.begin().await?;
     delete_chunks_for_source(&mut tx, source_id).await?;
+    // #157: clear source-keyed entity_nodes explicitly (see the helper).
+    crate::notebooks::delete_entity_nodes_for_source(&mut tx, source_id).await?;
     tx.commit().await?;
     Ok(())
 }
