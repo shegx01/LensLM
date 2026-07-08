@@ -37,10 +37,9 @@ pub struct ResolvedNode {
     pub kind: EntityKind,
 }
 
-/// Maps `lowercased name -> (node id, kind)` mirroring the node-creation dedup in
-/// [`build_entity_graph_rows`] (entities → Concept; dates → Date unless the name is
-/// already a Concept; definition terms → Concept). The relation pass uses this to
-/// resolve an LLM-named endpoint to an existing node id by case-insensitive name.
+/// Maps lowercased name to `(node id, kind)` mirroring the dedup rules in
+/// [`build_entity_graph_rows`]. Used by the relation pass to resolve LLM-named
+/// endpoints to existing node ids by case-insensitive name.
 pub fn build_node_index(
     source_id: &str,
     entities: &[String],

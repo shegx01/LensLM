@@ -264,20 +264,7 @@ async fn process_job(
             ),
             // AC11: budget circuit-break ⇒ `failed` + `budget_exceeded`.
             Err(MapError::BudgetExceeded) => {
-                let meta = EnrichmentMeta {
-                    cache_key,
-                    map_quality: String::new(),
-                    budget_exceeded: true,
-                    tokens_spent: budget.job_tokens(),
-                    calls_made: budget.job_calls(),
-                    failure_reason: None,
-                };
-                persist_meta(&repo, &job.source_id, EnrichmentStatus::Failed, &meta).await?;
-                tracing::warn!(
-                    source_id = %job.source_id,
-                    calls = budget.job_calls(),
-                    "enrichment: budget exceeded, circuit-broke to failed"
-                );
+                fail_budget_exceeded(&repo, &job.source_id, cache_key, "map", &budget).await?;
                 return Ok(());
             }
             // AC13(d): LLM error ⇒ `failed`, raw vectors untouched.
@@ -319,20 +306,7 @@ async fn process_job(
             Ok(subs) => subs,
             // AC11: budget breach during coref ⇒ `failed` + `budget_exceeded`.
             Err(MapError::BudgetExceeded) => {
-                let meta = EnrichmentMeta {
-                    cache_key,
-                    map_quality: String::new(),
-                    budget_exceeded: true,
-                    tokens_spent: budget.job_tokens(),
-                    calls_made: budget.job_calls(),
-                    failure_reason: None,
-                };
-                persist_meta(&repo, &job.source_id, EnrichmentStatus::Failed, &meta).await?;
-                tracing::warn!(
-                    source_id = %job.source_id,
-                    calls = budget.job_calls(),
-                    "enrichment: coref budget exceeded, circuit-broke to failed"
-                );
+                fail_budget_exceeded(&repo, &job.source_id, cache_key, "coref", &budget).await?;
                 return Ok(());
             }
             // Transport error: degrade to empty subs (coref is additive, not a source failure).
@@ -378,29 +352,13 @@ async fn process_job(
             Ok(triples) => triples,
             // AC12: budget breach during relations ⇒ `failed` + `budget_exceeded`.
             Err(MapError::BudgetExceeded) => {
-                let meta = EnrichmentMeta {
-                    cache_key,
-                    map_quality: String::new(),
-                    budget_exceeded: true,
-                    tokens_spent: budget.job_tokens(),
-                    calls_made: budget.job_calls(),
-                    failure_reason: None,
-                };
-                persist_meta(&repo, &job.source_id, EnrichmentStatus::Failed, &meta).await?;
-                tracing::warn!(
-                    source_id = %job.source_id,
-                    calls = budget.job_calls(),
-                    "enrichment: relations budget exceeded, circuit-broke to failed"
-                );
+                fail_budget_exceeded(&repo, &job.source_id, cache_key, "relations", &budget)
+                    .await?;
                 return Ok(());
             }
-            // Transport error: degrade to zero semantic edges (additive, not a source failure).
-            Err(MapError::Llm(e)) => {
-                tracing::debug!(
-                    source_id = %job.source_id,
-                    "enrichment: relations LLM error, degrading to zero semantic edges: {e}"
-                );
-                Vec::new()
+            // extract_relations handles transport errors internally (FIX 1).
+            Err(MapError::Llm(_)) => {
+                unreachable!("transport errors are absorbed inside extract_relations")
             }
         }
     } else {
@@ -453,10 +411,8 @@ async fn process_job(
             "entity graph: co-occurrence entities dropped over per-chunk cap"
         );
     }
-    // #154: append semantic edges from the relations pass. A different `relation`
-    // value than `co_occurs` occupies a distinct UNIQUE(source,from,to,relation)
-    // slot, so co-occurrence and semantic edges for the same pair coexist. Endpoints
-    // are the resolved node ids (validated against the same map the nodes came from).
+    // #154: append semantic edges; UNIQUE(source,from,to,relation) keeps them distinct
+    // from co_occurs edges, so both edge types for the same pair coexist.
     let now = chrono::Utc::now().to_rfc3339();
     for triple in &relation_triples {
         graph_rows.edges.push(crate::graph::EntityEdge {
@@ -527,6 +483,32 @@ async fn process_job(
         source_id = %job.source_id,
         map_quality,
         "enrichment: re-embed flip complete (enriched)"
+    );
+    Ok(())
+}
+
+/// Persists `Failed` + `budget_exceeded: true` for any pass that hits the circuit-break
+/// ceiling. `phase` names the pass for the warning log.
+async fn fail_budget_exceeded(
+    repo: &NotebookRepo<'_>,
+    source_id: &str,
+    cache_key: String,
+    phase: &str,
+    budget: &Budget,
+) -> Result<(), crate::LensError> {
+    let meta = EnrichmentMeta {
+        cache_key,
+        map_quality: String::new(),
+        budget_exceeded: true,
+        tokens_spent: budget.job_tokens(),
+        calls_made: budget.job_calls(),
+        failure_reason: None,
+    };
+    persist_meta(repo, source_id, EnrichmentStatus::Failed, &meta).await?;
+    tracing::warn!(
+        source_id = %source_id,
+        calls = budget.job_calls(),
+        "enrichment: {phase} budget exceeded, circuit-broke to failed"
     );
     Ok(())
 }

@@ -1,9 +1,6 @@
-//! Integration tests for the #154 LLM relation-extraction pass (worker end-to-end).
-//!
-//! A call-counting/scripted `LlmProvider` serves map → coref → relations responses.
-//! Covers: strategy-off yields zero semantic edges; the On path persists semantic
-//! edges; the entity-density gate; mixed-confidence + non-existent-entity filtering;
-//! and a tight-budget breach flipping the source to `failed`.
+//! Integration tests for the #154 relation-extraction pass (worker end-to-end).
+//! Covers strategy-off, semantic-edge persistence, entity-density gate,
+//! confidence + entity filtering, and budget-breach failure.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;

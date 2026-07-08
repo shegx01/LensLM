@@ -47,8 +47,7 @@ impl CorefStrategy {
 }
 
 /// Opt-in strategy for the LLM relation-extraction pass (#154), mirroring
-/// [`CorefStrategy`]. Default `Off` so shipping causes zero behavioral change and
-/// zero cache churn (see [`CacheKeyParts::compute`](super::meta::CacheKeyParts)).
+/// [`CorefStrategy`]. Default `Off` so shipping causes zero behavioral change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RelationsStrategy {

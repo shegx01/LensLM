@@ -174,18 +174,14 @@ pub(super) fn extract_json_object(text: &str) -> Option<&str> {
     None
 }
 
-/// Composite enrichment cache key (AC9): `hash(content_hash ‖ model ‖ prompt_version ‖ coref)`,
-/// with `relations_strategy` appended as a fifth component ONLY when it is not `"off"`
-/// (AC2 — `Off` users keep a byte-identical hash, so shipping #154 causes zero churn).
-/// A match on re-enqueue short-circuits the LLM pass entirely.
+/// Composite enrichment cache key (AC9): SHA-256 over content hash, model, prompt version, coref strategy, and optionally relations strategy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheKeyParts {
     pub content_hash: String,
     pub llm_model_id: String,
     pub prompt_version: u32,
     pub coref_strategy: String,
-    /// `"off"` (default) leaves the hash unchanged; any other value adds a fifth
-    /// component. `#[serde(default)]` so older persisted keys deserialize.
+    /// `#[serde(default)]` so older persisted keys without this field deserialize cleanly.
     #[serde(default = "relations_strategy_off")]
     pub relations_strategy: String,
 }

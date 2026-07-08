@@ -1,13 +1,6 @@
-//! LLM relation-extraction pass (#154): typed semantic edges between entities
-//! already in the structural map, anchored to a `chunk_id` with confidence.
-//!
-//! Pure-logic (sampling / prompt / parse / validate) is DB- and network-free so it
-//! is unit-testable against the mock [`LlmProvider`](crate::llm::LlmProvider). The
-//! LLM shape mirrors the coref pass: an object `{"relations":[...]}`, strict-parsed
-//! with reprompt via [`run_llm_with_retries`]. Endpoints are resolved to existing
-//! node ids by case-insensitive name; unmatched / low-confidence / uncited triples
-//! and unknown predicates are dropped (additive — a mid-pass failure keeps triples
-//! gathered so far).
+//! LLM relation-extraction pass (#154): typed semantic edges between entities in the
+//! structural map, anchored to a `chunk_id`. Pure-logic (sampling/prompt/parse/validate)
+//! is DB- and network-free and testable against the mock [`LlmProvider`](crate::llm::LlmProvider).
 
 use std::collections::HashSet;
 
@@ -144,12 +137,9 @@ pub fn build_relations_prompt(
     prompt
 }
 
-/// Drops triples that fail the quality floor and resolves surviving endpoints to
-/// existing node ids and the cited chunk to its real DB id. A triple is kept iff:
-/// `confidence >= MIN_CONFIDENCE`; its positional `chunk_id` is in `chunk_id_map`;
-/// both endpoints resolve to a node in `node_index` (case-insensitive name); and its
-/// predicate maps to a known [`Relation`] (canonical or alias → canonical). The
-/// resulting `RelationTriple.chunk_id` is the real `chunks.id` (FK-ready).
+/// Validates raw triples: drops low/over-confidence, uncited, unknown-endpoint, self-loop,
+/// and unknown-predicate entries. Resolves endpoint names to node ids and positional chunk ids
+/// to real DB ids (FK-ready). Predicate aliases are resolved before vocab gating.
 pub fn validate_triples(
     raw: Vec<RawTriple>,
     node_index: &std::collections::HashMap<String, ResolvedNode>,
@@ -159,7 +149,7 @@ pub fn validate_triples(
 ) -> Vec<RelationTriple> {
     let mut out = Vec::new();
     for t in raw {
-        if t.confidence < RELATIONS_MIN_CONFIDENCE {
+        if !(RELATIONS_MIN_CONFIDENCE..=1.0).contains(&t.confidence) {
             continue;
         }
         let Some(real_chunk_id) = chunk_id_map.get(&t.chunk_id) else {
@@ -171,7 +161,9 @@ pub fn validate_triples(
         let Some(to) = node_index.get(&t.to_entity.to_lowercase()) else {
             continue;
         };
-        // Resolve alias → canonical, then gate against the known vocab.
+        if from.id == to.id {
+            continue;
+        }
         let canonical = aliases.get(&t.predicate).cloned().unwrap_or(t.predicate);
         let Ok(relation) = Relation::semantic(&canonical, predicate_vocab) else {
             continue;
@@ -187,10 +179,9 @@ pub fn validate_triples(
     out
 }
 
-/// Runs the relation-extraction pass: sample prose chunks, batch by
-/// [`RELATIONS_BATCH_SIZE`], extract + validate per batch. Accumulate-then-persist:
-/// a budget breach or transport error after some batches succeed keeps the triples
-/// gathered so far (budget breach still surfaces so the worker can flip `failed`).
+/// Samples prose chunks, batches by [`RELATIONS_BATCH_SIZE`], and extracts + validates
+/// triples per batch. Transport errors break the loop and return accumulated triples;
+/// `BudgetExceeded` propagates so the worker can flip `failed`.
 #[allow(clippy::too_many_arguments)]
 pub async fn extract_relations(
     provider: &dyn LlmProvider,
@@ -230,8 +221,8 @@ pub async fn extract_relations(
             Ok(None) => continue,
             // Budget breach surfaces (worker flips failed); prior triples are still gathered.
             Err(e @ MapError::BudgetExceeded) => return Err(e),
-            // Transport error: keep what we have (additive) — surface so the worker degrades.
-            Err(e @ MapError::Llm(_)) => return Err(e),
+            // Transport error: break and return what we have (additive partial-batch preservation).
+            Err(MapError::Llm(_)) => break,
         };
         all.extend(validate_triples(
             raw,
@@ -281,10 +272,10 @@ mod tests {
     fn sample_ranks_by_density_and_filters_nonprose() {
         let entities = vec!["Ada".to_string(), "Babbage".to_string()];
         let chunks = vec![
-            chunk("c0", 0, None, "Ada Babbage parent level 0"), // level 0 excluded
-            chunk("c1", 1, Some("code"), "Ada Babbage Ada"),    // non-prose excluded
-            chunk("c2", 1, None, "Ada mentions Babbage and Ada again"), // density 3
-            chunk("c3", 1, None, "nothing here"),               // density 0
+            chunk("c0", 0, None, "Ada Babbage parent level 0"),
+            chunk("c1", 1, Some("code"), "Ada Babbage Ada"),
+            chunk("c2", 1, None, "Ada mentions Babbage and Ada again"), // kept: density 3
+            chunk("c3", 1, None, "nothing here"),
         ];
         let sampled = sample_chunks(&chunks, &entities);
         // ceil(2 prose * 0.10) = 1 -> top chunk by density is c2 (index 2).
@@ -464,7 +455,6 @@ mod tests {
     async fn extract_empty_sample_makes_no_calls() {
         let entities = vec!["Ada".to_string()];
         let node_index = build_node_index("src", &entities, &[], &[]);
-        // Only a level-0 chunk → nothing sampled.
         let chunks = vec![chunk("c0", 0, None, "Ada parent")];
         let (provider, calls) = ScriptedProvider::new(vec!["{}"]);
         let mut budget = Budget::new(SessionBudget::new());
@@ -481,5 +471,151 @@ mod tests {
         .unwrap();
         assert!(out.is_empty());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// FIX 1: transport error on batch 2 keeps batch-1 triples (accumulate-then-persist).
+    #[tokio::test]
+    async fn transport_error_on_batch_2_keeps_batch_1_triples() {
+        use async_trait::async_trait;
+        use std::sync::atomic::AtomicUsize;
+
+        struct FailSecondCall {
+            call: AtomicUsize,
+            first_body: String,
+        }
+        #[async_trait]
+        impl crate::llm::LlmProvider for FailSecondCall {
+            fn model_id(&self) -> &str {
+                "fail-second"
+            }
+            async fn reachable(&self) -> bool {
+                true
+            }
+            async fn generate(
+                &self,
+                _req: &crate::llm::LlmRequest,
+            ) -> Result<crate::llm::LlmResponse, crate::LensError> {
+                let n = self.call.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    Ok(crate::llm::LlmResponse {
+                        text: self.first_body.clone(),
+                        tokens_used: 10,
+                    })
+                } else {
+                    Err(crate::LensError::Network(
+                        "simulated transport error".into(),
+                    ))
+                }
+            }
+        }
+
+        // Two entities, 9 prose level-1 chunks → ceil(9*0.10)=1 sampled.
+        // Use RELATIONS_SAMPLE_CAP / RELATIONS_BATCH_SIZE ratio to force 2 batches:
+        // we need > RELATIONS_BATCH_SIZE sampled chunks, so set all 24 cap's worth.
+        let entities: Vec<String> = (0..10).map(|i| format!("E{i}")).collect();
+        // 240 prose chunks so ceil(240*0.10)=24 are sampled, giving 3 batches.
+        // We only care that batch-1 result is non-empty and batch-2 transport error
+        // doesn't discard it; use 9 to guarantee exactly 2 batches.
+        //
+        // ceil(9 * RELATIONS_SAMPLE_FRACTION) = ceil(0.9) = 1 → only 1 batch.
+        // We need > RELATIONS_BATCH_SIZE chunks sampled. Use 9 * 10 = 90 chunks so
+        // ceil(90 * 0.10) = 9 samples → 2 batches of 8+1.
+        let chunks: Vec<_> = (0..90)
+            .map(|i| {
+                let text = entities.join(" ");
+                chunk(&format!("c{i}"), 1, None, &text)
+            })
+            .collect();
+        let node_index = build_node_index("src", &entities, &[], &[]);
+        let predicate_vocab = vocab(&["founded"]);
+
+        // First batch response: one valid triple (chunk_id will be a positional index).
+        // We use chunk_id "0" which maps to the first chunk in the batch.
+        let first_response = r#"{"relations":[{"from_entity":"E0","to_entity":"E1","predicate":"founded","chunk_id":"0","confidence":0.9}]}"#;
+
+        let provider = FailSecondCall {
+            call: AtomicUsize::new(0),
+            first_body: first_response.to_string(),
+        };
+        let mut budget = Budget::new(SessionBudget::new());
+        let out = extract_relations(
+            &provider,
+            &mut budget,
+            &chunks,
+            &entities,
+            &node_index,
+            &predicate_vocab,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !out.is_empty(),
+            "batch-1 triples must be preserved when batch-2 has a transport error"
+        );
+        assert_eq!(out[0].relation, Relation::Semantic("founded".to_string()));
+    }
+
+    /// FIX 4: a triple at exactly 0.5 confidence is kept (boundary is inclusive).
+    #[test]
+    fn validate_keeps_triple_at_exact_min_confidence() {
+        let entities = vec!["Ada".to_string(), "Babbage".to_string()];
+        let node_index = build_node_index("src", &entities, &[], &[]);
+        let mut chunk_id_map = HashMap::new();
+        chunk_id_map.insert("0".to_string(), "real-chunk-0".to_string());
+        let predicate_vocab = vocab(&["founded"]);
+
+        let raw = vec![RawTriple {
+            from_entity: "Ada".to_string(),
+            to_entity: "Babbage".to_string(),
+            predicate: "founded".to_string(),
+            chunk_id: "0".to_string(),
+            confidence: RELATIONS_MIN_CONFIDENCE,
+        }];
+        let out = validate_triples(
+            raw,
+            &node_index,
+            &chunk_id_map,
+            &predicate_vocab,
+            &HashMap::new(),
+        );
+        assert_eq!(
+            out.len(),
+            1,
+            "confidence == 0.5 must be kept (inclusive lower bound)"
+        );
+    }
+
+    /// Non-prose gate: all code-block chunks with relations On → zero edges extracted.
+    #[tokio::test]
+    async fn all_code_chunks_yields_zero_edges() {
+        let entities = vec!["Ada".to_string(), "Babbage".to_string()];
+        let node_index = build_node_index("src", &entities, &[], &[]);
+        let chunks = vec![
+            chunk("c0", 1, Some("code"), "Ada Babbage Ada"),
+            chunk("c1", 1, Some("code"), "Babbage Ada Babbage"),
+        ];
+        let (provider, calls) = ScriptedProvider::new(vec!["{}"]);
+        let mut budget = Budget::new(SessionBudget::new());
+        let out = extract_relations(
+            &provider,
+            &mut budget,
+            &chunks,
+            &entities,
+            &node_index,
+            &vocab(&["founded"]),
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            out.is_empty(),
+            "non-prose (code) chunks must yield zero edges"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "no LLM calls for non-prose source"
+        );
     }
 }
