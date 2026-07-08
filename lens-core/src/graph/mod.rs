@@ -5,8 +5,10 @@
 //! `resolution_conf` are carried but stay `None` in Phase 1 (#155/#156 populate them).
 
 mod build;
+mod tools;
 
 pub use build::build_entity_graph_rows;
+pub use tools::{GraphEntity, entity_evidence, entity_lookup};
 
 use crate::LensError;
 
