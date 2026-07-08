@@ -25,12 +25,12 @@ pub use embedding_text::{
     CorefStrategy, RelationsStrategy, compose_embedding_text, compose_prefix,
 };
 pub use map::{MapError, MapOutcome, build_structural_map};
-pub use relations::{RelationTriple, extract_relations};
 pub use meta::{
     Budget, BudgetCheck, CacheKeyParts, ENRICHMENT_PROMPT_VERSION, ENRICHMENT_SIZE_GATE_TOKENS,
     EnrichmentMeta, MAP_QUALITY_FALLBACK, MAP_QUALITY_OK, MAP_QUALITY_SKIPPED, SessionBudget,
     StructuralMap,
 };
+pub use relations::{RelationTriple, extract_relations};
 pub use worker::{EnrichmentJob, spawn_worker};
 
 /// Bounded capacity of the enrichment `mpsc` queue. A full channel drops the job;

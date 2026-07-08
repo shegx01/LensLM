@@ -906,7 +906,10 @@ async fn schema_relation_types_tables_and_indexes() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(type_count, 25, "25 seed predicates (co_occurs + 24 semantic)");
+    assert_eq!(
+        type_count, 25,
+        "25 seed predicates (co_occurs + 24 semantic)"
+    );
     for name in ["co_occurs", "founded", "part_of", "caused_by", "acquired"] {
         let hit: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM relation_types WHERE name = ?")
             .bind(name)
@@ -933,19 +936,24 @@ async fn schema_relation_types_tables_and_indexes() {
         .await
         .unwrap();
     assert!(
-        fks.iter().any(|fk| fk.get::<String, _>("table") == "relation_types"
-            && fk.get::<String, _>("to") == "name"),
+        fks.iter()
+            .any(|fk| fk.get::<String, _>("table") == "relation_types"
+                && fk.get::<String, _>("to") == "name"),
         "relation_type_aliases.canonical must FK to relation_types(name)"
     );
 
     // UNIQUE constraints reject duplicates.
     let now = chrono::Utc::now().to_rfc3339();
-    let dup_type = sqlx::query("INSERT INTO relation_types (id, name, created_at) VALUES (?, 'founded', ?)")
-        .bind(Uuid::now_v7().to_string())
-        .bind(&now)
-        .execute(&pool)
-        .await;
-    assert!(dup_type.is_err(), "duplicate relation_types.name must be rejected");
+    let dup_type =
+        sqlx::query("INSERT INTO relation_types (id, name, created_at) VALUES (?, 'founded', ?)")
+            .bind(Uuid::now_v7().to_string())
+            .bind(&now)
+            .execute(&pool)
+            .await;
+    assert!(
+        dup_type.is_err(),
+        "duplicate relation_types.name must be rejected"
+    );
     let dup_alias = sqlx::query(
         "INSERT INTO relation_type_aliases (id, alias, canonical, created_at) \
          VALUES (?, 'works_at', 'employed_by', ?)",
@@ -954,5 +962,8 @@ async fn schema_relation_types_tables_and_indexes() {
     .bind(&now)
     .execute(&pool)
     .await;
-    assert!(dup_alias.is_err(), "duplicate relation_type_aliases.alias must be rejected");
+    assert!(
+        dup_alias.is_err(),
+        "duplicate relation_type_aliases.alias must be rejected"
+    );
 }

@@ -87,7 +87,9 @@ impl Relation {
         if vocab.contains(name) {
             Ok(Relation::Semantic(name.to_string()))
         } else {
-            Err(LensError::Parse(format!("unknown relation predicate: {name}")))
+            Err(LensError::Parse(format!(
+                "unknown relation predicate: {name}"
+            )))
         }
     }
 }

@@ -375,15 +375,16 @@ mod tests {
                 confidence: 0.9,
             },
         ];
-        let out = validate_triples(
-            raw,
-            &node_index,
-            &chunk_id_map,
-            &predicate_vocab,
-            &aliases,
+        let out = validate_triples(raw, &node_index, &chunk_id_map, &predicate_vocab, &aliases);
+        assert_eq!(
+            out.len(),
+            1,
+            "only the valid alias-resolved triple survives"
         );
-        assert_eq!(out.len(), 1, "only the valid alias-resolved triple survives");
-        assert_eq!(out[0].relation, Relation::Semantic("employed_by".to_string()));
+        assert_eq!(
+            out[0].relation,
+            Relation::Semantic("employed_by".to_string())
+        );
         // Endpoint ids are the resolved node ids (not names); chunk id is the real DB id.
         assert_eq!(out[0].from_node, node_index["ada"].id);
         assert_eq!(out[0].to_node, node_index["babbage"].id);
@@ -418,7 +419,7 @@ mod tests {
     fn prompt_contains_entities_predicates_chunk_ids_and_object_hint() {
         let entities = vec!["Ada".to_string(), "Babbage".to_string()];
         let predicates = vec!["founded".to_string(), "employed_by".to_string()];
-        let chunks = vec![chunk("c0", 1, None, "Ada founded it.")];
+        let chunks = [chunk("c0", 1, None, "Ada founded it.")];
         let batch: Vec<(usize, &EnrichmentChunk)> = vec![(0, &chunks[0])];
         let prompt = build_relations_prompt(&batch, &entities, &predicates);
         assert!(prompt.contains("Ada"));
@@ -434,7 +435,12 @@ mod tests {
         let entities = vec!["Ada".to_string(), "Babbage".to_string()];
         let node_index = build_node_index("src", &entities, &[], &[]);
         let predicate_vocab = vocab(&["founded"]);
-        let chunks = vec![chunk("c0", 1, None, "Ada founded the company with Babbage.")];
+        let chunks = vec![chunk(
+            "c0",
+            1,
+            None,
+            "Ada founded the company with Babbage.",
+        )];
         let body = r#"{"relations":[{"from_entity":"Ada","to_entity":"Babbage","predicate":"founded","chunk_id":"0","confidence":0.9}]}"#;
         let (provider, calls) = ScriptedProvider::new(vec![body]);
         let mut budget = Budget::new(SessionBudget::new());

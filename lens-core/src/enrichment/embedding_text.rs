@@ -182,7 +182,10 @@ mod tests {
     #[test]
     fn relations_strategy_round_trips_and_defaults() {
         assert_eq!(RelationsStrategy::default(), RelationsStrategy::Off);
-        assert_eq!(RelationsStrategy::from_config("off"), RelationsStrategy::Off);
+        assert_eq!(
+            RelationsStrategy::from_config("off"),
+            RelationsStrategy::Off
+        );
         assert_eq!(RelationsStrategy::from_config("on"), RelationsStrategy::On);
         assert_eq!(
             RelationsStrategy::from_config("future"),

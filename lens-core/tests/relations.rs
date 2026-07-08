@@ -68,8 +68,7 @@ async fn seed_prose_source(engine: &LensEngine, content_hash: &str) -> (String, 
 
     // Level-0 parent: long prose so the size gate passes and the map runs.
     let parent = format!("{source_id}-p0");
-    let parent_text = "Ada Babbage Turing Hopper Lovelace Church Neumann Shannon "
-        .repeat(400);
+    let parent_text = "Ada Babbage Turing Hopper Lovelace Church Neumann Shannon ".repeat(400);
     sqlx::query(
         "INSERT INTO chunks (id, source_id, parent_id, kind, level, section_path, text, \
           token_start, token_end, char_start, char_end, block_type, created_at) \
@@ -182,16 +181,11 @@ async fn strategy_off_yields_zero_semantic_edges() {
 async fn strategy_on_persists_semantic_edges() {
     let (_dir, engine) = file_engine().await;
     set_relations_on(&engine).await;
-    let (source_id, child) = seed_prose_source(&engine, "on").await;
+    let (source_id, _child) = seed_prose_source(&engine, "on").await;
 
-    let relations = format!(
-        r#"{{"relations":[{{"from_entity":"Ada","to_entity":"Babbage","predicate":"founded","chunk_id":"1","confidence":0.9}}]}}"#
-    );
-    let _ = &child;
-    let (provider, _calls) = mock_provider(
-        "m-on",
-        vec![map_8_entities(), empty_coref(), relations.as_str()],
-    );
+    let relations = r#"{"relations":[{"from_entity":"Ada","to_entity":"Babbage","predicate":"founded","chunk_id":"1","confidence":0.9}]}"#;
+    let (provider, _calls) =
+        mock_provider("m-on", vec![map_8_entities(), empty_coref(), relations]);
     engine.set_llm_provider(Some(provider)).await;
     engine.enqueue_enrichment_for_test(&source_id);
 
@@ -249,10 +243,8 @@ async fn mixed_confidence_and_unknown_entity_filtered() {
         {"from_entity":"Ada","to_entity":"Turing","predicate":"influenced","chunk_id":"1","confidence":0.8},
         {"from_entity":"Nobody","to_entity":"Babbage","predicate":"founded","chunk_id":"1","confidence":0.9}
     ]}"#;
-    let (provider, _calls) = mock_provider(
-        "m-mixed",
-        vec![map_8_entities(), empty_coref(), relations],
-    );
+    let (provider, _calls) =
+        mock_provider("m-mixed", vec![map_8_entities(), empty_coref(), relations]);
     engine.set_llm_provider(Some(provider)).await;
     engine.enqueue_enrichment_for_test(&source_id);
 
@@ -281,10 +273,8 @@ async fn budget_breach_during_relations_fails_source() {
     let (source_id, _child) = seed_prose_source(&engine, "budget").await;
 
     let relations = r#"{"relations":[{"from_entity":"Ada","to_entity":"Babbage","predicate":"founded","chunk_id":"1","confidence":0.9}]}"#;
-    let (provider, _calls) = mock_provider(
-        "m-budget",
-        vec![map_8_entities(), empty_coref(), relations],
-    );
+    let (provider, _calls) =
+        mock_provider("m-budget", vec![map_8_entities(), empty_coref(), relations]);
     engine.set_llm_provider(Some(provider)).await;
     engine.enqueue_enrichment_for_test(&source_id);
 
@@ -305,5 +295,9 @@ async fn budget_breach_during_relations_fails_source() {
         meta["budget_exceeded"], true,
         "budget_exceeded must be recorded"
     );
-    assert_eq!(count(&engine, "entity_edges").await, 0, "no edges on breach");
+    assert_eq!(
+        count(&engine, "entity_edges").await,
+        0,
+        "no edges on breach"
+    );
 }

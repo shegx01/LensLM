@@ -246,7 +246,10 @@ async fn semantic_and_cooccurrence_edges_coexist_for_same_pair() {
     .fetch_all(&pool)
     .await
     .expect("relations");
-    assert_eq!(relations, vec!["co_occurs".to_string(), "founded".to_string()]);
+    assert_eq!(
+        relations,
+        vec!["co_occurs".to_string(), "founded".to_string()]
+    );
 
     // Re-writing the same rows is idempotent (self-replacing DELETE + reinsert).
     NotebookRepo::new(&pool)
