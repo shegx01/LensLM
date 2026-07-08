@@ -112,8 +112,13 @@ pub struct EntityMention {
 
 /// Output of [`build_entity_graph_rows`]: prebuilt rows ready for the write seam,
 /// plus the count of co-occurrence entities dropped over the per-chunk cap.
+///
+/// `source_id` scopes the rows to a single source; the write seam uses it to make
+/// the graph write self-replacing (delete-then-reinsert the source's nodes), so a
+/// re-enrichment that drops entities leaves no stale nodes behind (#157).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct EntityGraphRows {
+    pub source_id: String,
     pub nodes: Vec<EntityNode>,
     pub edges: Vec<EntityEdge>,
     pub mentions: Vec<EntityMention>,

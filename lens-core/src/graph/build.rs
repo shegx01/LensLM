@@ -215,6 +215,7 @@ pub fn build_entity_graph_rows(
         .collect();
 
     EntityGraphRows {
+        source_id: source_id.to_string(),
         nodes,
         edges,
         mentions,

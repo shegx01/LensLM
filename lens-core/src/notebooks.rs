@@ -464,18 +464,37 @@ async fn write_chunk_enrichment_tx(
     Ok(())
 }
 
+/// Deletes every `entity_nodes` row for `source_id`; edges and mentions cascade via
+/// their `ON DELETE CASCADE` FKs (`from_node`/`to_node`/`entity_node_id`). `entity_nodes`
+/// is source-keyed (no chunk FK), so it is the only graph table that survives a
+/// chunk-only wipe — hence the explicit delete (#157). Returns the row count for tracing.
+pub(crate) async fn delete_entity_nodes_for_source(
+    conn: &mut SqliteConnection,
+    source_id: &str,
+) -> Result<u64, LensError> {
+    let result = sqlx::query("DELETE FROM entity_nodes WHERE source_id = ?")
+        .bind(source_id)
+        .execute(&mut *conn)
+        .await?;
+    Ok(result.rows_affected())
+}
+
 /// Persists the M13 entity-graph rows (nodes → edges → mentions) on `conn` inside an
-/// in-progress transaction, each `INSERT OR IGNORE` against its UNIQUE constraint so
-/// re-enrichment (incl. the #154 prompt-version storm) never accumulates rows on any
-/// table. Insert order is nodes-before-edges/mentions so the FK references resolve.
-///
-/// Teardown scope: #157 adds the explicit `DELETE FROM entity_nodes WHERE
-/// source_id=?`; until then source-keyed nodes may accumulate on content-changing
-/// re-ingest — harmless, as the graph is unread until #158's opt-in gate.
+/// in-progress transaction. The write is **self-replacing**: it first deletes the
+/// source's existing nodes (edges/mentions cascade), so a re-enrichment whose entity
+/// set shrank leaves no stale nodes (#157). Inserts are `INSERT OR IGNORE` against each
+/// UNIQUE constraint (idempotent for identical re-runs). Insert order is
+/// nodes-before-edges/mentions so the FK references resolve.
 async fn write_entity_graph_tx(
     conn: &mut SqliteConnection,
     graph: &EntityGraphRows,
 ) -> Result<(), LensError> {
+    let deleted = delete_entity_nodes_for_source(conn, &graph.source_id).await?;
+    tracing::debug!(
+        source_id = %graph.source_id,
+        deleted_nodes = deleted,
+        "entity-graph write: replaced prior nodes"
+    );
     for node in &graph.nodes {
         sqlx::query(
             "INSERT OR IGNORE INTO entity_nodes \
@@ -1495,8 +1514,8 @@ impl<'a> NotebookRepo<'a> {
     /// Writes chunk enrichment (TEXT columns) and the M13 entity-graph rows in ONE
     /// transaction (AC7): begin → chunk enrichment → graph → commit. Either both land
     /// or neither does, so a mid-write failure never leaves enriched chunks with a
-    /// partial graph. The graph inserts are `INSERT OR IGNORE` (idempotent), so a
-    /// re-enrichment re-running this write does not accumulate rows.
+    /// partial graph. The graph write is self-replacing per source (see
+    /// [`write_entity_graph_tx`]), so a re-enrichment neither accumulates nor strands rows.
     pub async fn write_enrichment_and_graph(
         &self,
         updates: &[ChunkEnrichmentUpdate],
