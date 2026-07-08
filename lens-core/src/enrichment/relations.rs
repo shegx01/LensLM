@@ -145,14 +145,15 @@ pub fn build_relations_prompt(
 }
 
 /// Drops triples that fail the quality floor and resolves surviving endpoints to
-/// existing node ids. A triple is kept iff: `confidence >= MIN_CONFIDENCE`; its
-/// `chunk_id` is in `valid_chunk_ids`; both endpoints resolve to a node in
-/// `node_index` (case-insensitive name); and its predicate maps to a known
-/// [`Relation`] (canonical name or alias → canonical). Everything else is dropped.
+/// existing node ids and the cited chunk to its real DB id. A triple is kept iff:
+/// `confidence >= MIN_CONFIDENCE`; its positional `chunk_id` is in `chunk_id_map`;
+/// both endpoints resolve to a node in `node_index` (case-insensitive name); and its
+/// predicate maps to a known [`Relation`] (canonical or alias → canonical). The
+/// resulting `RelationTriple.chunk_id` is the real `chunks.id` (FK-ready).
 pub fn validate_triples(
     raw: Vec<RawTriple>,
     node_index: &std::collections::HashMap<String, ResolvedNode>,
-    valid_chunk_ids: &HashSet<String>,
+    chunk_id_map: &std::collections::HashMap<String, String>,
     predicate_vocab: &HashSet<String>,
     aliases: &std::collections::HashMap<String, String>,
 ) -> Vec<RelationTriple> {
@@ -161,9 +162,9 @@ pub fn validate_triples(
         if t.confidence < RELATIONS_MIN_CONFIDENCE {
             continue;
         }
-        if !valid_chunk_ids.contains(&t.chunk_id) {
+        let Some(real_chunk_id) = chunk_id_map.get(&t.chunk_id) else {
             continue;
-        }
+        };
         let Some(from) = node_index.get(&t.from_entity.to_lowercase()) else {
             continue;
         };
@@ -179,7 +180,7 @@ pub fn validate_triples(
             from_node: from.id.clone(),
             to_node: to.id.clone(),
             relation,
-            chunk_id: t.chunk_id,
+            chunk_id: real_chunk_id.clone(),
             confidence: t.confidence,
         });
     }
@@ -207,7 +208,11 @@ pub async fn extract_relations(
 
     let mut all: Vec<RelationTriple> = Vec::new();
     for batch in sampled.chunks(RELATIONS_BATCH_SIZE) {
-        let valid_ids: HashSet<String> = batch.iter().map(|(i, _)| i.to_string()).collect();
+        // Positional prompt id (string) -> real chunks.id, for validate + FK.
+        let chunk_id_map: std::collections::HashMap<String, String> = batch
+            .iter()
+            .map(|(i, c)| (i.to_string(), c.id.clone()))
+            .collect();
         let prompt = build_relations_prompt(batch, entities, &sorted_vocab(predicate_vocab));
 
         let raw = match run_llm_with_retries(
@@ -231,7 +236,7 @@ pub async fn extract_relations(
         all.extend(validate_triples(
             raw,
             node_index,
-            &valid_ids,
+            &chunk_id_map,
             predicate_vocab,
             aliases,
         ));
@@ -322,7 +327,8 @@ mod tests {
     fn validate_drops_lowconf_uncited_unknown_and_resolves_ids() {
         let entities = vec!["Ada".to_string(), "Babbage".to_string()];
         let node_index = build_node_index("src", &entities, &[], &[]);
-        let valid_ids: HashSet<String> = ["0"].iter().map(|s| s.to_string()).collect();
+        let mut chunk_id_map = HashMap::new();
+        chunk_id_map.insert("0".to_string(), "real-chunk-0".to_string());
         let predicate_vocab = vocab(&["founded", "employed_by"]);
         let mut aliases = HashMap::new();
         aliases.insert("works_at".to_string(), "employed_by".to_string());
@@ -372,15 +378,16 @@ mod tests {
         let out = validate_triples(
             raw,
             &node_index,
-            &valid_ids,
+            &chunk_id_map,
             &predicate_vocab,
             &aliases,
         );
         assert_eq!(out.len(), 1, "only the valid alias-resolved triple survives");
         assert_eq!(out[0].relation, Relation::Semantic("employed_by".to_string()));
-        // Endpoint ids are the resolved node ids (not names).
+        // Endpoint ids are the resolved node ids (not names); chunk id is the real DB id.
         assert_eq!(out[0].from_node, node_index["ada"].id);
         assert_eq!(out[0].to_node, node_index["babbage"].id);
+        assert_eq!(out[0].chunk_id, "real-chunk-0");
         assert_eq!(node_index["ada"].kind, EntityKind::Concept);
     }
 
@@ -388,7 +395,8 @@ mod tests {
     fn validate_empty_vocab_drops_all() {
         let entities = vec!["Ada".to_string(), "Babbage".to_string()];
         let node_index = build_node_index("src", &entities, &[], &[]);
-        let valid_ids: HashSet<String> = ["0"].iter().map(|s| s.to_string()).collect();
+        let mut chunk_id_map = HashMap::new();
+        chunk_id_map.insert("0".to_string(), "real-chunk-0".to_string());
         let raw = vec![RawTriple {
             from_entity: "Ada".to_string(),
             to_entity: "Babbage".to_string(),
@@ -399,7 +407,7 @@ mod tests {
         let out = validate_triples(
             raw,
             &node_index,
-            &valid_ids,
+            &chunk_id_map,
             &HashSet::new(),
             &HashMap::new(),
         );
