@@ -20,7 +20,9 @@ pub mod worker;
 pub mod test_util;
 
 pub use coref::{ChunkCoref, CorefResponse, CorefSub, apply_substitutions, resolve_coref_batch};
-pub use embedding_text::{CorefStrategy, compose_embedding_text, compose_prefix};
+pub use embedding_text::{
+    CorefStrategy, RelationsStrategy, compose_embedding_text, compose_prefix,
+};
 pub use map::{MapError, MapOutcome, build_structural_map};
 pub use meta::{
     Budget, BudgetCheck, CacheKeyParts, ENRICHMENT_PROMPT_VERSION, ENRICHMENT_SIZE_GATE_TOKENS,

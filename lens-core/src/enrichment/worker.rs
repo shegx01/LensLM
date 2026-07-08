@@ -102,6 +102,7 @@ async fn process_job(
         llm_model_id: p.model_id().to_string(),
         prompt_version: super::meta::ENRICHMENT_PROMPT_VERSION,
         coref_strategy: coref.as_str().to_string(),
+        relations_strategy: enrichment_cfg.relations_strategy.as_str().to_string(),
     });
     let cache_key = cache_parts.as_ref().map(|p| p.compute());
 

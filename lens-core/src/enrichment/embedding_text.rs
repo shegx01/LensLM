@@ -46,6 +46,37 @@ impl CorefStrategy {
     }
 }
 
+/// Opt-in strategy for the LLM relation-extraction pass (#154), mirroring
+/// [`CorefStrategy`]. Default `Off` so shipping causes zero behavioral change and
+/// zero cache churn (see [`CacheKeyParts::compute`](super::meta::CacheKeyParts)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelationsStrategy {
+    /// No relation extraction (default).
+    #[default]
+    Off,
+    /// Extract typed semantic relations with the configured LLM.
+    On,
+}
+
+impl RelationsStrategy {
+    /// Stable AC2 cache-key string.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::On => "on",
+        }
+    }
+
+    /// Parses the persisted/config string. Unknown values default to `Off`.
+    pub fn from_config(value: &str) -> Self {
+        match value {
+            "on" => Self::On,
+            _ => Self::Off,
+        }
+    }
+}
+
 /// Counts tokens using the tokenizer when supplied, else whitespace-word count.
 /// A tokenizer failure falls back to the word approximation (never panics).
 pub(crate) fn count_tokens(text: &str, tokenizer: Option<&Tokenizer>) -> usize {
@@ -146,6 +177,19 @@ mod tests {
         );
         assert_eq!(CorefStrategy::LlmInline.as_str(), "llm_inline");
         assert_eq!(CorefStrategy::None.as_str(), "none");
+    }
+
+    #[test]
+    fn relations_strategy_round_trips_and_defaults() {
+        assert_eq!(RelationsStrategy::default(), RelationsStrategy::Off);
+        assert_eq!(RelationsStrategy::from_config("off"), RelationsStrategy::Off);
+        assert_eq!(RelationsStrategy::from_config("on"), RelationsStrategy::On);
+        assert_eq!(
+            RelationsStrategy::from_config("future"),
+            RelationsStrategy::Off
+        );
+        assert_eq!(RelationsStrategy::Off.as_str(), "off");
+        assert_eq!(RelationsStrategy::On.as_str(), "on");
     }
 
     #[test]
