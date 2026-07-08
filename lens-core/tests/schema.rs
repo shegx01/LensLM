@@ -63,7 +63,7 @@ async fn migration_is_idempotent_second_run_is_noop() {
         .unwrap();
 
     assert_eq!(count_before, count_after);
-    assert_eq!(count_after, 14, "all migration files applied (0001..0014)");
+    assert_eq!(count_after, 15, "all migration files applied (0001..0015)");
 }
 
 #[tokio::test]
@@ -601,7 +601,7 @@ async fn cold_init_under_budget_on_empty_temp_db() {
     let engine = LensEngine::init(dir.path()).await.unwrap();
     let elapsed = start.elapsed();
     // Sanity: the engine works.
-    assert_eq!(engine.migration_count().await.unwrap(), 14);
+    assert_eq!(engine.migration_count().await.unwrap(), 15);
     // Generous smoke guard against accidentally-expensive migrations (e.g. a
     // future migration that scans/rewrites large tables on cold start). This is
     // NOT a tight perf benchmark — the wide 2s budget keeps it non-flaky on
@@ -749,8 +749,8 @@ async fn migration_0009_renames_file_hash_to_raw_content_hash() {
         "old idx_sources_notebook_file_hash must be gone after 0009"
     );
 
-    // Migration count reflects all fourteen migrations.
-    assert_eq!(engine.migration_count().await.unwrap(), 14);
+    // Migration count reflects all fifteen migrations.
+    assert_eq!(engine.migration_count().await.unwrap(), 15);
 }
 
 #[tokio::test]
@@ -871,4 +871,88 @@ async fn schema_entity_graph_tables_and_indexes() {
             );
         }
     }
+}
+
+/// AC8: migration 0015 creates `relation_types` + `relation_type_aliases`, the
+/// alias-canonical index, the seed vocab (`co_occurs` + 25 predicates + 5 aliases),
+/// the FK from `relation_type_aliases.canonical` to `relation_types.name`, and the
+/// UNIQUE constraints on `relation_types.name` / `relation_type_aliases.alias`.
+#[tokio::test]
+async fn schema_relation_types_tables_and_indexes() {
+    let engine = LensEngine::for_test().await;
+    let pool = engine.pool().await;
+
+    let tables = table_names(&engine).await;
+    for expected in ["relation_types", "relation_type_aliases"] {
+        assert!(tables.contains(expected), "missing table: {expected}");
+    }
+
+    // The alias-canonical lookup index exists by name.
+    let all_indexes: HashSet<String> =
+        sqlx::query("SELECT name FROM sqlite_master WHERE type = 'index'")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.get::<String, _>("name"))
+            .collect();
+    assert!(
+        all_indexes.contains("idx_rtype_aliases_canonical"),
+        "missing index idx_rtype_aliases_canonical, found: {all_indexes:?}"
+    );
+
+    // Seed vocab present: 25 predicate names total (co_occurs + 24 semantic); 5 aliases.
+    let type_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM relation_types")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(type_count, 25, "25 seed predicates (co_occurs + 24 semantic)");
+    for name in ["co_occurs", "founded", "part_of", "caused_by", "acquired"] {
+        let hit: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM relation_types WHERE name = ?")
+            .bind(name)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(hit, 1, "seed predicate {name} must be present");
+    }
+    let alias_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM relation_type_aliases")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(alias_count, 5, "5 aliases seeded");
+    let canonical: String =
+        sqlx::query_scalar("SELECT canonical FROM relation_type_aliases WHERE alias = 'works_at'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(canonical, "employed_by");
+
+    // FK from relation_type_aliases.canonical to relation_types(name).
+    let fks = sqlx::query("PRAGMA foreign_key_list(relation_type_aliases)")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert!(
+        fks.iter().any(|fk| fk.get::<String, _>("table") == "relation_types"
+            && fk.get::<String, _>("to") == "name"),
+        "relation_type_aliases.canonical must FK to relation_types(name)"
+    );
+
+    // UNIQUE constraints reject duplicates.
+    let now = chrono::Utc::now().to_rfc3339();
+    let dup_type = sqlx::query("INSERT INTO relation_types (id, name, created_at) VALUES (?, 'founded', ?)")
+        .bind(Uuid::now_v7().to_string())
+        .bind(&now)
+        .execute(&pool)
+        .await;
+    assert!(dup_type.is_err(), "duplicate relation_types.name must be rejected");
+    let dup_alias = sqlx::query(
+        "INSERT INTO relation_type_aliases (id, alias, canonical, created_at) \
+         VALUES (?, 'works_at', 'employed_by', ?)",
+    )
+    .bind(Uuid::now_v7().to_string())
+    .bind(&now)
+    .execute(&pool)
+    .await;
+    assert!(dup_alias.is_err(), "duplicate relation_type_aliases.alias must be rejected");
 }
