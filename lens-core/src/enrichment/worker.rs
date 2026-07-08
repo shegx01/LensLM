@@ -356,10 +356,9 @@ async fn process_job(
                     .await?;
                 return Ok(());
             }
-            // extract_relations handles transport errors internally (FIX 1).
-            Err(MapError::Llm(_)) => {
-                unreachable!("transport errors are absorbed inside extract_relations")
-            }
+            // extract_relations absorbs transport errors (keeps partial triples), so
+            // this arm is not hit in practice; degrade to no semantic edges regardless.
+            Err(MapError::Llm(_)) => Vec::new(),
         }
     } else {
         Vec::new()
