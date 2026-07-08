@@ -69,6 +69,22 @@ pub const COREF_MAX_SUBS_PER_CHUNK: usize = 128;
 /// beyond the first `N` (insertion order) is dropped and counted for observability.
 pub const CO_OCCURRENCE_MAX_ENTITIES: usize = 30;
 
+/// Relation-extraction gate: minimum distinct structural-map entities for a source
+/// to qualify for the pass (#154). Below this, code/table PDFs that leak through the
+/// prose gate yield zero semantic edges.
+pub const RELATIONS_ENTITY_DENSITY_FLOOR: usize = 8;
+/// Fraction of prose chunks sampled (ranked by entity density) for relation extraction.
+pub const RELATIONS_SAMPLE_FRACTION: f64 = 0.10;
+/// Hard cap on sampled chunks. `ceil(24/8)=3` LLM calls — tuned to the per-job budget
+/// shared with map+coref (`ENRICHMENT_MAX_CALLS_PER_JOB`), the binding constraint.
+pub const RELATIONS_SAMPLE_CAP: usize = 24;
+/// Chunks per relation-extraction LLM call.
+pub const RELATIONS_BATCH_SIZE: usize = 8;
+/// Triples below this confidence are dropped (#154 quality floor; #158 may tune it).
+pub const RELATIONS_MIN_CONFIDENCE: f64 = 0.5;
+/// Max output tokens per relation-extraction call (consistent with map/coref).
+pub const RELATIONS_MAX_TOKENS: u32 = 1_024;
+
 /// Per-doc structural map produced by the LLM (AC4). Unknown fields are rejected
 /// (`deny_unknown_fields`) so a garbled shape triggers a reprompt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

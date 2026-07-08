@@ -7,7 +7,7 @@
 mod build;
 mod tools;
 
-pub use build::build_entity_graph_rows;
+pub use build::{ResolvedNode, build_entity_graph_rows, build_node_index};
 pub use tools::{GraphEntity, entity_evidence, entity_lookup};
 
 use crate::LensError;

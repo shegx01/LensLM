@@ -18,7 +18,7 @@ use crate::notebooks::EnrichmentChunk;
 /// and mentions built in the SAME re-run would reference the fresh (ignored) ids and
 /// violate their FK to `entity_nodes`. A stable id makes the regenerated node id
 /// equal the persisted one, so edges/mentions always reference a row that exists.
-fn node_id(source_id: &str, lower_name: &str, kind: EntityKind) -> String {
+pub(crate) fn node_id(source_id: &str, lower_name: &str, kind: EntityKind) -> String {
     let mut hasher = Sha256::new();
     hasher.update(source_id.as_bytes());
     hasher.update([0u8]);
@@ -26,6 +26,50 @@ fn node_id(source_id: &str, lower_name: &str, kind: EntityKind) -> String {
     hasher.update([0u8]);
     hasher.update(kind.as_str().as_bytes());
     crate::hex_encode(&hasher.finalize())
+}
+
+/// A resolved graph node keyed by its lowercased name: the deterministic node id
+/// plus kind. Built by [`build_node_index`] with the SAME dedup rules as
+/// [`build_entity_graph_rows`] so relation endpoints resolve to real node ids.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedNode {
+    pub id: String,
+    pub kind: EntityKind,
+}
+
+/// Maps `lowercased name -> (node id, kind)` mirroring the node-creation dedup in
+/// [`build_entity_graph_rows`] (entities → Concept; dates → Date unless the name is
+/// already a Concept; definition terms → Concept). The relation pass uses this to
+/// resolve an LLM-named endpoint to an existing node id by case-insensitive name.
+pub fn build_node_index(
+    source_id: &str,
+    entities: &[String],
+    definitions: &[Definition],
+    dates: &[String],
+) -> HashMap<String, ResolvedNode> {
+    let mut index: HashMap<String, ResolvedNode> = HashMap::new();
+    for entity in entities {
+        let key = entity.to_lowercase();
+        index.entry(key.clone()).or_insert_with(|| ResolvedNode {
+            id: node_id(source_id, &key, EntityKind::Concept),
+            kind: EntityKind::Concept,
+        });
+    }
+    for date in dates {
+        let key = date.to_lowercase();
+        index.entry(key.clone()).or_insert_with(|| ResolvedNode {
+            id: node_id(source_id, &key, EntityKind::Date),
+            kind: EntityKind::Date,
+        });
+    }
+    for def in definitions {
+        let key = def.term.to_lowercase();
+        index.entry(key.clone()).or_insert_with(|| ResolvedNode {
+            id: node_id(source_id, &key, EntityKind::Concept),
+            kind: EntityKind::Concept,
+        });
+    }
+    index
 }
 
 /// Builds nodes / chunk-anchored mentions / bounded co-occurrence edges from the
