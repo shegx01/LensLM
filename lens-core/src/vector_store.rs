@@ -120,6 +120,23 @@ pub struct Hit {
     pub distance: f32,
 }
 
+/// A single entity-vector row for the coordinate-derived `ent__` table (#155).
+/// Unlike [`VectorRow`], entity vectors carry the node `kind` for the typed-veto
+/// prefilter and are keyed by `entity_node_id` rather than a chunk id.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntityVectorRow {
+    /// The `entity_nodes.id` this vector embeds.
+    pub entity_node_id: String,
+    /// The owning `sources.id` (drop-by-source scoping).
+    pub source_id: String,
+    /// The owning notebook id (`.only_if` scoping).
+    pub notebook_id: String,
+    /// The entity kind (typed-veto ANN prefilter).
+    pub kind: String,
+    /// The embedding vector. MUST match the coordinate's dim.
+    pub vector: Vec<f32>,
+}
+
 /// The vector-store seam. Implementations resolve `(notebook, model, dim)` to a
 /// physical store internally; callers never pass a physical table name.
 #[async_trait::async_trait]
@@ -184,6 +201,48 @@ pub trait VectorStore: Send + Sync {
     /// demotes its `active` row to `stale`, drops the Lance table, deletes the row.
     /// A crash between any step is recovered by GC. No-op if already retired.
     async fn retire_coordinate(&self, coord: &Coordinate) -> Result<(), LensError>;
+
+    /// Upserts entity vectors into the coordinate-derived `ent__` table (#155),
+    /// creating it on first use. Upsert = delete existing rows for the incoming
+    /// `entity_node_id`s, then insert — so a re-embed replaces. Empty `rows` is a
+    /// no-op. Unlike chunk vectors this has NO registry/building/flip lifecycle;
+    /// the resolution pass rebuilds the table directly.
+    async fn upsert_entity_vectors(
+        &self,
+        coord: &Coordinate,
+        rows: Vec<EntityVectorRow>,
+    ) -> Result<(), LensError>;
+
+    /// Returns the `k` nearest `(entity_node_id, cosine_distance)` for `query` in
+    /// the `ent__` table for `coord`, ascending by distance. Pins cosine and adds
+    /// `.only_if("notebook_id = …")`; when `kind` is `Some`, also `AND kind = …`
+    /// (typed-veto prefilter). A missing table returns an empty vec (never errors).
+    async fn entity_ann(
+        &self,
+        coord: &Coordinate,
+        query: &[f32],
+        k: usize,
+        kind: Option<&str>,
+    ) -> Result<Vec<(String, f32)>, LensError>;
+
+    /// Drops a source's rows from the `ent__` table for `coord` (mirror of
+    /// `drop_source`). A missing table is a no-op.
+    async fn drop_entity_source(
+        &self,
+        coord: &Coordinate,
+        source_id: &str,
+    ) -> Result<(), LensError>;
+
+    /// Drops every physical `ent__{notebook}__*` Lance table. Enumerates via
+    /// `table_names()` and prefix-matches, since `ent__` tables are NOT tracked in
+    /// `embedding_index`. Missing tables are a no-op (idempotent).
+    async fn drop_entity_tables_for_notebook(&self, notebook: &str) -> Result<(), LensError>;
+
+    /// Enumerates live `ent__{notebook}__*` physical table names (Step 5 GC helper).
+    async fn entity_table_names_for_notebook(
+        &self,
+        notebook: &str,
+    ) -> Result<Vec<String>, LensError>;
 }
 
 /// Slugifies a model id into a table-safe token: `nomic-embed-text-v1.5` →
@@ -217,6 +276,18 @@ fn model_slug(model: &str) -> String {
 fn table_name(notebook: &str, backend: EmbeddingBackend, model: &str, dim: usize) -> String {
     format!(
         "vec__{notebook}__{}__{}__d{dim}",
+        backend.as_str(),
+        model_slug(model)
+    )
+}
+
+/// Resolves the physical LanceDB table name for a coordinate's entity vectors
+/// (#155): `ent__{notebook}__{backend}__{model_slug}__d{dim}`. Coordinate-derived
+/// 1:1 with the chunk-vector table (`table_name`) but with an `ent__` prefix — no
+/// registry, no building/flip generations; the resolution pass rebuilds it in place.
+fn entity_table_name(notebook: &str, backend: EmbeddingBackend, model: &str, dim: usize) -> String {
+    format!(
+        "ent__{notebook}__{}__{}__d{dim}",
         backend.as_str(),
         model_slug(model)
     )
@@ -299,6 +370,60 @@ fn rows_to_batch(rows: &[VectorRow], dim: usize) -> Result<RecordBatch, LensErro
         ],
     )
     .map_err(|e| LensError::Vector(format!("failed to build record batch: {e}")))
+}
+
+/// Builds the Arrow schema for an entity-vector table (#155): four Utf8 columns
+/// plus a `FixedSizeList<Float32, dim>` vector. `kind` backs the typed-veto ANN
+/// prefilter; there is no `level` column (entity vectors are unlevelled).
+fn entity_vector_schema(dim: usize) -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("entity_node_id", DataType::Utf8, false),
+        Field::new("source_id", DataType::Utf8, false),
+        Field::new("notebook_id", DataType::Utf8, false),
+        Field::new("kind", DataType::Utf8, false),
+        Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                dim as i32,
+            ),
+            false,
+        ),
+    ]))
+}
+
+/// Builds a single `RecordBatch` from entity `rows`, validating each vector length.
+fn entity_rows_to_batch(rows: &[EntityVectorRow], dim: usize) -> Result<RecordBatch, LensError> {
+    let node_ids = StringArray::from_iter_values(rows.iter().map(|r| r.entity_node_id.as_str()));
+    let source_ids = StringArray::from_iter_values(rows.iter().map(|r| r.source_id.as_str()));
+    let notebook_ids = StringArray::from_iter_values(rows.iter().map(|r| r.notebook_id.as_str()));
+    let kinds = StringArray::from_iter_values(rows.iter().map(|r| r.kind.as_str()));
+
+    let mut vector_values: Vec<Option<Vec<Option<f32>>>> = Vec::with_capacity(rows.len());
+    for r in rows {
+        if r.vector.len() != dim {
+            return Err(LensError::Vector(format!(
+                "vector length {} != expected dim {dim} for entity {}",
+                r.vector.len(),
+                r.entity_node_id
+            )));
+        }
+        vector_values.push(Some(r.vector.iter().map(|v| Some(*v)).collect()));
+    }
+    let vectors =
+        FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(vector_values, dim as i32);
+
+    RecordBatch::try_new(
+        entity_vector_schema(dim),
+        vec![
+            Arc::new(node_ids),
+            Arc::new(source_ids),
+            Arc::new(notebook_ids),
+            Arc::new(kinds),
+            Arc::new(vectors),
+        ],
+    )
+    .map_err(|e| LensError::Vector(format!("failed to build entity record batch: {e}")))
 }
 
 /// Private registry collaborator (Decision M1). Maps each
@@ -1202,6 +1327,157 @@ impl VectorStore for LanceVectorStore {
         self.registry.delete_row_by_table(coord, &stale).await?;
         Ok(())
     }
+
+    async fn upsert_entity_vectors(
+        &self,
+        coord: &Coordinate,
+        rows: Vec<EntityVectorRow>,
+    ) -> Result<(), LensError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let dim = coord.dim;
+        let name = entity_table_name(&coord.notebook, coord.backend, &coord.model, dim);
+        let batch = entity_rows_to_batch(&rows, dim)?;
+
+        // Coordinate-derived, no registry: create the physical table on first use.
+        let table = match self.open_table_by_name(&name).await? {
+            Some(t) => t,
+            None => {
+                let conn = self.connect().await?;
+                conn.create_empty_table(name.as_str(), entity_vector_schema(dim))
+                    .execute()
+                    .await
+                    .map_err(|e| {
+                        LensError::Vector(format!("lancedb create_empty_table failed: {e}"))
+                    })?
+            }
+        };
+
+        // Upsert = delete-then-insert on entity_node_id (a re-embed replaces).
+        let id_list = rows
+            .iter()
+            .map(|r| format!("'{}'", escape_lance_literal(&r.entity_node_id)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        table
+            .delete(format!("entity_node_id IN ({id_list})").as_str())
+            .await
+            .map_err(|e| LensError::Vector(format!("lancedb entity delete failed: {e}")))?;
+        table
+            .add(batch)
+            .execute()
+            .await
+            .map_err(|e| LensError::Vector(format!("lancedb entity add failed: {e}")))?;
+        Ok(())
+    }
+
+    async fn entity_ann(
+        &self,
+        coord: &Coordinate,
+        query: &[f32],
+        k: usize,
+        kind: Option<&str>,
+    ) -> Result<Vec<(String, f32)>, LensError> {
+        let dim = coord.dim;
+        if query.len() != dim {
+            return Err(LensError::Vector(format!(
+                "query vector length {} != expected dim {dim}",
+                query.len()
+            )));
+        }
+        let name = entity_table_name(&coord.notebook, coord.backend, &coord.model, dim);
+        let table = match self.open_table_by_name(&name).await? {
+            Some(t) => t,
+            None => return Ok(Vec::new()),
+        };
+
+        let mut predicate = format!("notebook_id = '{}'", escape_lance_literal(&coord.notebook));
+        if let Some(kind) = kind {
+            predicate.push_str(&format!(" AND kind = '{}'", escape_lance_literal(kind)));
+        }
+
+        let stream = table
+            .query()
+            .nearest_to(query)
+            .map_err(|e| LensError::Vector(format!("lancedb nearest_to failed: {e}")))?
+            .distance_type(DistanceType::Cosine)
+            .only_if(predicate)
+            .limit(k)
+            .execute()
+            .await
+            .map_err(|e| LensError::Vector(format!("lancedb entity search execute failed: {e}")))?;
+
+        let batches: Vec<RecordBatch> = stream
+            .try_collect()
+            .await
+            .map_err(|e| LensError::Vector(format!("lancedb result stream failed: {e}")))?;
+
+        let mut hits: Vec<(String, f32)> = Vec::new();
+        for batch in &batches {
+            let node_ids = batch
+                .column_by_name("entity_node_id")
+                .ok_or_else(|| LensError::Vector("result missing entity_node_id column".into()))?
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| LensError::Vector("entity_node_id column is not Utf8".into()))?;
+            let distances = batch
+                .column_by_name("_distance")
+                .ok_or_else(|| LensError::Vector("result missing _distance column".into()))?
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| LensError::Vector("_distance column is not Float32".into()))?;
+            for i in 0..batch.num_rows() {
+                hits.push((node_ids.value(i).to_string(), distances.value(i)));
+            }
+        }
+
+        hits.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        hits.truncate(k);
+        Ok(hits)
+    }
+
+    async fn drop_entity_source(
+        &self,
+        coord: &Coordinate,
+        source_id: &str,
+    ) -> Result<(), LensError> {
+        let name = entity_table_name(&coord.notebook, coord.backend, &coord.model, coord.dim);
+        let table = match self.open_table_by_name(&name).await? {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+        table
+            .delete(format!("source_id = '{}'", escape_lance_literal(source_id)).as_str())
+            .await
+            .map_err(|e| LensError::Vector(format!("lancedb entity delete failed: {e}")))?;
+        Ok(())
+    }
+
+    async fn drop_entity_tables_for_notebook(&self, notebook: &str) -> Result<(), LensError> {
+        let names = self.entity_table_names_for_notebook(notebook).await?;
+        self.drop_tables(&names).await
+    }
+
+    async fn entity_table_names_for_notebook(
+        &self,
+        notebook: &str,
+    ) -> Result<Vec<String>, LensError> {
+        let conn = self.connect().await?;
+        let existing = conn
+            .table_names()
+            .execute()
+            .await
+            .map_err(|e| LensError::Vector(format!("lancedb table_names failed: {e}")))?;
+        // `ent__` tables carry no registry; match the coordinate-derived prefix.
+        // Encode the notebook exactly as `entity_table_name` does so a substring of
+        // a longer notebook id can never match (the trailing `__` delimits the id).
+        let prefix = format!("ent__{notebook}__");
+        Ok(existing
+            .into_iter()
+            .filter(|t| t.starts_with(&prefix))
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -1376,6 +1652,249 @@ mod tests {
         let batch = rows_to_batch(&rows, 4).expect("batch builds");
         assert_eq!(batch.num_rows(), 2);
         assert_eq!(batch.num_columns(), 5);
+    }
+
+    #[test]
+    fn entity_table_name_uses_ent_prefix() {
+        assert_eq!(
+            entity_table_name(
+                "nb1",
+                EmbeddingBackend::Fastembed,
+                "nomic-embed-text-v1.5",
+                768
+            ),
+            "ent__nb1__fastembed__nomic_v15__d768"
+        );
+    }
+
+    #[test]
+    fn entity_vector_schema_shape() {
+        let schema = entity_vector_schema(4);
+        assert_eq!(schema.fields().len(), 5);
+        assert_eq!(schema.field(0).name(), "entity_node_id");
+        assert_eq!(schema.field(3).name(), "kind");
+        assert_eq!(schema.field(3).data_type(), &DataType::Utf8);
+        match schema.field(4).data_type() {
+            DataType::FixedSizeList(item, len) => {
+                assert_eq!(item.data_type(), &DataType::Float32);
+                assert_eq!(*len, 4);
+            }
+            other => panic!("vector field is not FixedSizeList: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn entity_rows_to_batch_rejects_wrong_dim() {
+        let rows = vec![EntityVectorRow {
+            entity_node_id: "e1".into(),
+            source_id: "s1".into(),
+            notebook_id: "n1".into(),
+            kind: "person".into(),
+            vector: vec![0.0; 3],
+        }];
+        assert!(matches!(
+            entity_rows_to_batch(&rows, 4),
+            Err(LensError::Vector(_))
+        ));
+    }
+
+    /// An in-memory pool the entity-vector methods never touch (they resolve
+    /// coordinate-derived `ent__` tables directly, bypassing the registry). It only
+    /// satisfies `LanceVectorStore::new`'s signature.
+    async fn empty_pool() -> SqlitePool {
+        sqlx::sqlite::SqlitePoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory pool")
+    }
+
+    fn ent_coord(nb: &str) -> Coordinate {
+        Coordinate::new(nb, EmbeddingBackend::Fastembed, "nomic-embed-text-v1.5", 3)
+    }
+
+    fn ent_row(id: &str, source: &str, nb: &str, kind: &str, v: [f32; 3]) -> EntityVectorRow {
+        EntityVectorRow {
+            entity_node_id: id.into(),
+            source_id: source.into(),
+            notebook_id: nb.into(),
+            kind: kind.into(),
+            vector: v.to_vec(),
+        }
+    }
+
+    #[tokio::test]
+    async fn entity_vector_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LanceVectorStore::new(dir.path(), empty_pool().await);
+        let coord = ent_coord("nb");
+
+        store
+            .upsert_entity_vectors(
+                &coord,
+                vec![
+                    ent_row("e-near", "s1", "nb", "person", [1.0, 0.0, 0.0]),
+                    ent_row("e-mid", "s1", "nb", "person", [0.7, 0.7, 0.0]),
+                    ent_row("e-far", "s1", "nb", "person", [0.0, 0.0, 1.0]),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let hits = store
+            .entity_ann(&coord, &[1.0, 0.0, 0.0], 3, None)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 3);
+        let ids: Vec<&str> = hits.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["e-near", "e-mid", "e-far"]);
+        // Ascending cosine distance.
+        assert!(hits[0].1 <= hits[1].1 && hits[1].1 <= hits[2].1);
+    }
+
+    #[tokio::test]
+    async fn entity_ann_kind_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LanceVectorStore::new(dir.path(), empty_pool().await);
+        let coord = ent_coord("nb");
+
+        store
+            .upsert_entity_vectors(
+                &coord,
+                vec![
+                    ent_row("person-a", "s1", "nb", "person", [1.0, 0.0, 0.0]),
+                    ent_row("org-a", "s1", "nb", "org", [1.0, 0.0, 0.0]),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let hits = store
+            .entity_ann(&coord, &[1.0, 0.0, 0.0], 10, Some("person"))
+            .await
+            .unwrap();
+        let ids: Vec<&str> = hits.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["person-a"]);
+    }
+
+    #[tokio::test]
+    async fn entity_upsert_replaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LanceVectorStore::new(dir.path(), empty_pool().await);
+        let coord = ent_coord("nb");
+
+        store
+            .upsert_entity_vectors(
+                &coord,
+                vec![ent_row("e1", "s1", "nb", "person", [1.0, 0.0, 0.0])],
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_entity_vectors(
+                &coord,
+                vec![ent_row("e1", "s1", "nb", "person", [0.0, 1.0, 0.0])],
+            )
+            .await
+            .unwrap();
+
+        let hits = store
+            .entity_ann(&coord, &[0.0, 1.0, 0.0], 10, None)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1, "re-upsert must replace, not duplicate");
+        assert_eq!(hits[0].0, "e1");
+    }
+
+    #[tokio::test]
+    async fn drop_entity_source_removes_only_that_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LanceVectorStore::new(dir.path(), empty_pool().await);
+        let coord = ent_coord("nb");
+
+        store
+            .upsert_entity_vectors(
+                &coord,
+                vec![
+                    ent_row("e1", "s1", "nb", "person", [1.0, 0.0, 0.0]),
+                    ent_row("e2", "s2", "nb", "person", [0.0, 1.0, 0.0]),
+                ],
+            )
+            .await
+            .unwrap();
+
+        store.drop_entity_source(&coord, "s1").await.unwrap();
+
+        let hits = store
+            .entity_ann(&coord, &[1.0, 1.0, 1.0], 10, None)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = hits.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["e2"]);
+
+        // Missing table is a no-op.
+        let other = ent_coord("nb-empty");
+        store.drop_entity_source(&other, "s1").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn drop_entity_tables_for_notebook_removes_all_ent_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LanceVectorStore::new(dir.path(), empty_pool().await);
+
+        let c_a = Coordinate::new(
+            "nb",
+            EmbeddingBackend::Fastembed,
+            "nomic-embed-text-v1.5",
+            3,
+        );
+        let c_b = Coordinate::new("nb", EmbeddingBackend::Ollama, "all-minilm", 3);
+        let c_other = Coordinate::new(
+            "nb-other",
+            EmbeddingBackend::Fastembed,
+            "nomic-embed-text-v1.5",
+            3,
+        );
+
+        for c in [&c_a, &c_b, &c_other] {
+            store
+                .upsert_entity_vectors(
+                    c,
+                    vec![ent_row("e", "s", &c.notebook, "person", [1.0, 0.0, 0.0])],
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            store
+                .entity_table_names_for_notebook("nb")
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+
+        store.drop_entity_tables_for_notebook("nb").await.unwrap();
+
+        assert!(
+            store
+                .entity_table_names_for_notebook("nb")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // The other notebook's ent__ table survives.
+        assert_eq!(
+            store
+                .entity_table_names_for_notebook("nb-other")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Idempotent: dropping again is a no-op.
+        store.drop_entity_tables_for_notebook("nb").await.unwrap();
     }
 
     #[test]
