@@ -249,7 +249,16 @@ async fn lookup_collapses_canonical_aliases_across_sources() {
 
     // Distinct surface names, resolved by #155 to the same canonical entity.
     seed_entity_node(&pool, "nA", &nb, "sA", "concept", "AWS", None).await;
-    seed_entity_node(&pool, "nB", &nb, "sB", "concept", "Amazon Web Services", None).await;
+    seed_entity_node(
+        &pool,
+        "nB",
+        &nb,
+        "sB",
+        "concept",
+        "Amazon Web Services",
+        None,
+    )
+    .await;
     for id in ["nA", "nB"] {
         sqlx::query(
             "UPDATE entity_nodes SET canonical_name = 'Amazon Web Services', \

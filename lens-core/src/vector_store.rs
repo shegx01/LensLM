@@ -1704,7 +1704,10 @@ mod tests {
         );
         assert_eq!(entity_table_notebook(&name).as_deref(), Some("nb-abc"));
         // Chunk-vector tables and anything without the ent__ prefix are ignored.
-        assert_eq!(entity_table_notebook("vec__nb__fastembed__nomic_v15__d768"), None);
+        assert_eq!(
+            entity_table_notebook("vec__nb__fastembed__nomic_v15__d768"),
+            None
+        );
         assert_eq!(entity_table_notebook("ent__no_delimiter"), None);
     }
 
