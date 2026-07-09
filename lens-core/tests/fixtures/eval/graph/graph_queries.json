@@ -1,0 +1,41 @@
+[
+  {
+    "query": "What is the thermally actuated drain mechanism in the Halden Reactor?",
+    "kind": "single_hop",
+    "seed_entities": [{ "name": "Halden Reactor", "kind": "concept" }],
+    "gold_markers": ["thermally actuated drain: when the core temperature crosses"]
+  },
+  {
+    "query": "Is there any need for auxiliary support systems to keep the Meridian reactor stable after it trips?",
+    "kind": "bridging",
+    "seed_entities": [
+      { "name": "Project Meridian", "kind": "concept" },
+      { "name": "Halden Reactor", "kind": "concept" }
+    ],
+    "gold_markers": ["No active cooling circuit is required after the drain completes"]
+  },
+  {
+    "query": "Under what conditions can the Meridian programme's heat source continue operating without halting?",
+    "kind": "bridging",
+    "seed_entities": [
+      { "name": "Project Meridian", "kind": "concept" },
+      { "name": "Halden Reactor", "kind": "concept" }
+    ],
+    "gold_markers": ["tolerates rapid load swings without shutdown"]
+  },
+  {
+    "query": "What royalty income flows to the institute that hosts Project Meridian?",
+    "kind": "rollup",
+    "seed_entities": [
+      { "name": "Project Meridian", "kind": "concept" },
+      { "name": "Kestrel Institute", "kind": "org" }
+    ],
+    "gold_markers": ["Licensing royalties from the Halden Reactor drain patent"]
+  },
+  {
+    "query": "What changes to the Kestrel Institute research portfolio are planned for the next funding cycle?",
+    "kind": "rollup",
+    "seed_entities": [{ "name": "Kestrel Institute", "kind": "org" }],
+    "gold_markers": ["Basalt Composites closes, and a new atmospheric-chemistry programme"]
+  }
+]
