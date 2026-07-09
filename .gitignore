@@ -35,3 +35,6 @@ worktrees/
 # via scripts/fetch-pdfium.sh; NEVER committed (the script + CHECKSUMS are).
 src-tauri/frameworks/libpdfium.dylib
 .omg
+
+# Local agent/session artifacts (signoff logs, scratch state); never tracked.
+.claude/
