@@ -392,6 +392,10 @@ pub struct Notebook {
     /// MRU ordering key. Bumped on open, rename, and non-dedup source-add.
     /// `None` on pre-migration rows; read paths use `COALESCE(last_activity_at, created_at)`.
     pub last_activity_at: Option<String>,
+    /// Per-notebook override of the app-wide graph-retrieval opt-in (#158a).
+    /// `None` = inherit `RetrievalConfig::graph_retrieval_enabled`. Not consumed by
+    /// live retrieval until #21; the eval reads it only as evidence context.
+    pub graph_retrieval_enabled: Option<bool>,
 }
 
 /// Notebook list response with source count. Does NOT derive `sqlx::FromRow`:
@@ -581,7 +585,7 @@ impl<'a> NotebookRepo<'a> {
     pub async fn list(&self) -> Result<Vec<Notebook>, LensError> {
         let rows = sqlx::query_as::<_, Notebook>(
             "SELECT id, title, description, focus_mode, embedding_model, embedding_backend, \
-                    created_at, updated_at, trashed_at, last_activity_at \
+                    created_at, updated_at, trashed_at, last_activity_at, graph_retrieval_enabled \
              FROM notebooks WHERE trashed_at IS NULL \
              ORDER BY COALESCE(last_activity_at, created_at) DESC",
         )
@@ -598,7 +602,7 @@ impl<'a> NotebookRepo<'a> {
         self.list_summaries(
             "SELECT n.id, n.title, n.description, n.focus_mode, n.embedding_model, \
                     n.embedding_backend, n.created_at, n.updated_at, n.trashed_at, \
-                    n.last_activity_at, \
+                    n.last_activity_at, n.graph_retrieval_enabled, \
                     COALESCE(COUNT(s.id), 0) AS source_count \
              FROM notebooks n \
              LEFT JOIN sources s ON s.notebook_id = n.id AND s.trashed_at IS NULL \
@@ -616,7 +620,7 @@ impl<'a> NotebookRepo<'a> {
         self.list_summaries(
             "SELECT n.id, n.title, n.description, n.focus_mode, n.embedding_model, \
                     n.embedding_backend, n.created_at, n.updated_at, n.trashed_at, \
-                    n.last_activity_at, \
+                    n.last_activity_at, n.graph_retrieval_enabled, \
                     COALESCE(COUNT(s.id), 0) AS source_count \
              FROM notebooks n \
              LEFT JOIN sources s ON s.notebook_id = n.id \
@@ -625,6 +629,21 @@ impl<'a> NotebookRepo<'a> {
              ORDER BY n.trashed_at DESC",
         )
         .await
+    }
+
+    /// Counts live chunks in a notebook — DISTINCT chunk ids joined to live,
+    /// selected sources (same scope as retrieval: `trashed_at IS NULL AND
+    /// selected = 1`). Used by the #158a eval floor (≥50 chunks).
+    pub async fn live_chunk_count(&self, notebook_id: &str) -> Result<i64, LensError> {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(DISTINCT c.id) \
+             FROM chunks c JOIN sources s ON c.source_id = s.id \
+             WHERE s.notebook_id = ? AND s.trashed_at IS NULL AND s.selected = 1",
+        )
+        .bind(notebook_id)
+        .fetch_one(self.pool)
+        .await?;
+        Ok(n)
     }
 
     /// Lists individually-trashed sources whose parent notebook is still live,
@@ -698,6 +717,7 @@ impl<'a> NotebookRepo<'a> {
                         updated_at: row.try_get("updated_at")?,
                         trashed_at: row.try_get("trashed_at")?,
                         last_activity_at: row.try_get("last_activity_at")?,
+                        graph_retrieval_enabled: row.try_get("graph_retrieval_enabled")?,
                     },
                     source_count: row.try_get("source_count")?,
                 })
@@ -751,6 +771,7 @@ impl<'a> NotebookRepo<'a> {
             updated_at: now.clone(),
             trashed_at: None,
             last_activity_at: Some(now),
+            graph_retrieval_enabled: None,
         })
     }
 
@@ -2037,6 +2058,7 @@ mod tests {
             updated_at: "2026-01-01T00:00:00Z".into(),
             trashed_at: None,
             last_activity_at: Some("2026-01-01T00:00:00Z".into()),
+            graph_retrieval_enabled: None,
         };
         let json = serde_json::to_value(&nb).unwrap();
         assert_eq!(json["embedding_model"], "bge-m3");
@@ -2622,6 +2644,7 @@ mod tests {
                 updated_at: "2026-06-23T00:00:00+00:00".to_string(),
                 trashed_at: None,
                 last_activity_at: Some("2026-06-23T00:00:00+00:00".to_string()),
+                graph_retrieval_enabled: None,
             },
             source_count: 5,
         };
@@ -2642,6 +2665,7 @@ mod tests {
                 "embedding_backend",
                 "embedding_model",
                 "focus_mode",
+                "graph_retrieval_enabled",
                 "id",
                 "last_activity_at",
                 "source_count",

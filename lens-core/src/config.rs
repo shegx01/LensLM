@@ -349,6 +349,12 @@ pub struct RetrievalConfig {
     pub hybrid_enabled: bool,
     #[serde(default)]
     pub reranker: RerankerConfig,
+    /// App-wide default for entity-graph retrieval (#158a). Opt-in, `false` by
+    /// default, mirroring [`RerankerConfig::enabled`]. Consumed by the #21 router
+    /// (per-notebook override on `notebooks.graph_retrieval_enabled`); #158a only
+    /// defines/stores it and reports eval evidence — no live path reads it yet.
+    #[serde(default)]
+    pub graph_retrieval_enabled: bool,
 }
 
 impl Default for RetrievalConfig {
@@ -356,6 +362,7 @@ impl Default for RetrievalConfig {
         Self {
             hybrid_enabled: default_hybrid_enabled(),
             reranker: RerankerConfig::default(),
+            graph_retrieval_enabled: false,
         }
     }
 }
@@ -1124,6 +1131,10 @@ mod tests {
         let r = AppConfig::default().retrieval;
         assert!(r.hybrid_enabled, "hybrid retrieval defaults ON");
         assert!(!r.reranker.enabled, "reranker defaults OFF (opt-in)");
+        assert!(
+            !r.graph_retrieval_enabled,
+            "graph retrieval defaults OFF (opt-in, #158a)"
+        );
         assert_eq!(r.reranker.model, RerankerModel::BgeRerankerBase);
         assert_eq!(r.reranker.timeout_ms, 3_000);
         assert_eq!(r, RetrievalConfig::default());
@@ -1156,6 +1167,10 @@ mod tests {
         let r: RetrievalConfig = serde_json::from_str(json).unwrap();
         assert!(r.hybrid_enabled, "absent hybrid_enabled reads back true");
         assert!(r.reranker.enabled);
+        assert!(
+            !r.graph_retrieval_enabled,
+            "absent graph_retrieval_enabled reads back false"
+        );
         assert_eq!(r.reranker.model, RerankerModel::BgeRerankerBase);
         assert_eq!(r.reranker.timeout_ms, 3_000);
     }
@@ -1181,6 +1196,7 @@ mod tests {
                     model: RerankerModel::BgeRerankerBase,
                     timeout_ms: 1_500,
                 },
+                graph_retrieval_enabled: true,
             },
             ..AppConfig::default()
         };
