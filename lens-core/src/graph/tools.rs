@@ -12,6 +12,13 @@ const MAX_TRIPLES: usize = 50;
 /// Depth ceiling for [`expand_neighbors`]; larger requests are clamped down.
 const MAX_DEPTH: usize = 2;
 
+/// Seed ceiling for [`expand_neighbors`]; the anchor query binds `2 * seeds.len()`
+/// params, so cap the seed set to stay under the SQLite bound-variable limit.
+const MAX_SEEDS: usize = 64;
+
+/// Per-neighbor chunk-evidence cap so the mention lookup stays bounded.
+const MAX_CHUNKS_PER_NEIGHBOR: usize = 50;
+
 /// A collapsed logical entity: one row per distinct (name COLLATE NOCASE, kind)
 /// in a notebook, aggregated across its per-source nodes.
 #[derive(Debug, Clone, PartialEq)]
@@ -110,7 +117,20 @@ pub async fn entity_evidence(
     kind: EntityKind,
     k: usize,
 ) -> Result<Vec<String>, LensError> {
-    let rows = sqlx::query(
+    mention_chunk_ids(pool, notebook_id, name, kind, Some(k)).await
+}
+
+/// Chunk ids mentioning a logical entity (canonical-or-raw match, live-source
+/// scoped), drawn from `entity_mentions`. Ordered by mention count then doc order.
+/// `limit` bounds the row count; `None` means unbounded.
+async fn mention_chunk_ids(
+    pool: &SqlitePool,
+    notebook_id: &str,
+    name: &str,
+    kind: EntityKind,
+    limit: Option<usize>,
+) -> Result<Vec<String>, LensError> {
+    let mut sql = String::from(
         "SELECT em.chunk_id
         FROM entity_mentions em
         JOIN entity_nodes en ON en.id = em.entity_node_id
@@ -121,15 +141,20 @@ pub async fn entity_evidence(
           AND en.kind = ?3
           AND s.trashed_at IS NULL AND s.selected = 1
         GROUP BY em.chunk_id
-        ORDER BY COUNT(*) DESC, c.level ASC, c.token_start ASC NULLS LAST
-        LIMIT ?4",
-    )
-    .bind(notebook_id)
-    .bind(name)
-    .bind(kind.as_str())
-    .bind(k as i64)
-    .fetch_all(pool)
-    .await?;
+        ORDER BY COUNT(*) DESC, c.level ASC, c.token_start ASC NULLS LAST",
+    );
+    if limit.is_some() {
+        sql.push_str(" LIMIT ?4");
+    }
+
+    let mut q = sqlx::query(&sql)
+        .bind(notebook_id)
+        .bind(name)
+        .bind(kind.as_str());
+    if let Some(k) = limit {
+        q = q.bind(k as i64);
+    }
+    let rows = q.fetch_all(pool).await?;
 
     Ok(rows
         .iter()
@@ -165,9 +190,17 @@ pub async fn expand_neighbors(
     if depth == 0 {
         return Ok(Vec::new());
     }
+    let seeds = if seeds.len() > MAX_SEEDS {
+        tracing::warn!(
+            seeds = seeds.len(),
+            "expand_neighbors: seed count exceeds {MAX_SEEDS}, truncating"
+        );
+        &seeds[..MAX_SEEDS]
+    } else {
+        seeds
+    };
 
-    // Resolve seeds → per-source node ids (canonical-or-raw match, live-source
-    // scoped), mirroring #156a. Seeds are OR-ed as (name, kind) pairs.
+    // Resolve seeds to per-source node ids, mirroring #156a.
     let mut anchor_sql = String::from(
         "SELECT en.id
          FROM entity_nodes en
@@ -203,6 +236,7 @@ pub async fn expand_neighbors(
     // not `OR`), excluding self-loops. The `path` column carries the visited node
     // ids; the join guard `instr(path, ...)` blocks revisits (SQLite has no native
     // visited-set), so cycles terminate.
+    // SAFETY: values are DB-read `entity_nodes.id` UUIDs (not caller input), single-quote-escaped.
     let seed_ids_csv = seed_ids
         .iter()
         .map(|id| format!("'{}'", id.replace('\'', "''")))
@@ -259,8 +293,6 @@ pub async fn expand_neighbors(
         .fetch_all(pool)
         .await?;
 
-    // Collapse to logical entities: max blended weight per (logical_name, kind),
-    // remembering the relation of that max-weight edge.
     let mut best: HashMap<(String, EntityKind), NeighborRow> = HashMap::new();
     for row in &rows {
         let logical_name: String = row.get("logical_name");
@@ -272,8 +304,6 @@ pub async fn expand_neighbors(
         let w = blended_edge_weight(&relation, weight, confidence);
 
         let key = (logical_name.clone(), kind);
-        // A neighbor that is itself a seed match is excluded below; keep it here to
-        // avoid a second query — seeds never appear because depth > 0 rows only.
         best.entry(key)
             .and_modify(|nr| {
                 if w > nr.weight {
@@ -288,6 +318,15 @@ pub async fn expand_neighbors(
                 weight: w,
             });
     }
+
+    // A seed reached as a depth>0 neighbor from another seed must not leak into the
+    // results. Exclude any collapsed row whose (name, kind) matches an input seed,
+    // case-insensitively (consistent with the COLLATE NOCASE seed resolution above).
+    let seed_keys: std::collections::HashSet<(String, EntityKind)> = seeds
+        .iter()
+        .map(|(name, kind)| (name.to_lowercase(), *kind))
+        .collect();
+    best.retain(|(name, kind), _| !seed_keys.contains(&(name.to_lowercase(), *kind)));
 
     if best.is_empty() {
         return Ok(Vec::new());
@@ -313,7 +352,14 @@ pub async fn expand_neighbors(
 
     let mut hits = Vec::with_capacity(neighbors.len());
     for nr in neighbors {
-        let chunk_ids = neighbor_chunk_ids(pool, notebook_id, &nr.logical_name, nr.kind).await?;
+        let chunk_ids = mention_chunk_ids(
+            pool,
+            notebook_id,
+            &nr.logical_name,
+            nr.kind,
+            Some(MAX_CHUNKS_PER_NEIGHBOR),
+        )
+        .await?;
         let confidence = if max_weight > 0.0 {
             nr.weight / max_weight
         } else {
@@ -329,37 +375,4 @@ pub async fn expand_neighbors(
     }
 
     Ok(hits)
-}
-
-/// Chunk ids mentioning a logical entity (canonical-or-raw match, live-source
-/// scoped), drawn from `entity_mentions`. Ordered by mention count then doc order.
-async fn neighbor_chunk_ids(
-    pool: &SqlitePool,
-    notebook_id: &str,
-    name: &str,
-    kind: EntityKind,
-) -> Result<Vec<String>, LensError> {
-    let rows = sqlx::query(
-        "SELECT em.chunk_id
-         FROM entity_mentions em
-         JOIN entity_nodes en ON en.id = em.entity_node_id
-         JOIN sources s ON s.id = en.source_id
-         JOIN chunks c ON c.id = em.chunk_id
-         WHERE en.notebook_id = ?1
-           AND (en.name = ?2 COLLATE NOCASE OR en.canonical_name = ?2 COLLATE NOCASE)
-           AND en.kind = ?3
-           AND s.trashed_at IS NULL AND s.selected = 1
-         GROUP BY em.chunk_id
-         ORDER BY COUNT(*) DESC, c.level ASC, c.token_start ASC NULLS LAST",
-    )
-    .bind(notebook_id)
-    .bind(name)
-    .bind(kind.as_str())
-    .fetch_all(pool)
-    .await?;
-
-    Ok(rows
-        .iter()
-        .map(|r| r.get::<String, _>("chunk_id"))
-        .collect())
 }

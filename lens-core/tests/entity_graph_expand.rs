@@ -429,6 +429,71 @@ async fn expand_excludes_dead_sources() {
     assert!(hits.is_empty(), "neighbor in a trashed source is excluded");
 }
 
+/// Multi-seed exclusion: with seeds A and C and an edge C->A, neither A nor C
+/// appears in the results even though A is a depth-1 neighbor reached from C.
+#[tokio::test]
+async fn expand_multi_seed_excludes_all_seeds() {
+    let (_dir, engine) = file_engine().await;
+    let nb = new_notebook(&engine).await;
+    let pool = engine.pool().await;
+
+    seed_source(&pool, "s1", &nb, 1, None).await;
+    for (c, ts) in [("cA", 0), ("cB", 1), ("cC", 2)] {
+        seed_chunk(&pool, c, "s1", 1, Some(ts), "t").await;
+    }
+    for (nid, name) in [("nA", "A"), ("nB", "B"), ("nC", "C")] {
+        seed_entity_node(&pool, nid, &nb, "s1", "concept", name, None).await;
+    }
+    seed_mention(&pool, "mA", &nb, "nA", "cA", 0).await;
+    seed_mention(&pool, "mB", &nb, "nB", "cB", 0).await;
+    seed_mention(&pool, "mC", &nb, "nC", "cC", 0).await;
+    // A -> B (so B is a genuine non-seed neighbor) and C -> A (so seed A is reached
+    // as a depth>0 neighbor from seed C).
+    seed_edge(
+        &pool,
+        "e1",
+        &nb,
+        "s1",
+        "cA",
+        "nA",
+        "nB",
+        "co_occurs",
+        Some(2.0),
+        None,
+    )
+    .await;
+    seed_edge(
+        &pool,
+        "e2",
+        &nb,
+        "s1",
+        "cC",
+        "nC",
+        "nA",
+        "co_occurs",
+        Some(2.0),
+        None,
+    )
+    .await;
+
+    let seeds = vec![
+        ("A".to_string(), EntityKind::Concept),
+        ("C".to_string(), EntityKind::Concept),
+    ];
+    let hits = expand_neighbors(&pool, &nb, &seeds, 2)
+        .await
+        .expect("expand ok");
+    let names: Vec<&str> = hits.iter().map(|h| h.name.as_str()).collect();
+    assert!(
+        !names.contains(&"A") && !names.contains(&"C"),
+        "no seed leaks into results: {names:?}"
+    );
+    assert!(
+        names.contains(&"B"),
+        "genuine neighbor B present: {names:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // NotebookGraph::load — graph-state edge cases
 // ---------------------------------------------------------------------------
@@ -527,7 +592,6 @@ async fn load_all_null_resolution() {
 
     let g = NotebookGraph::load(&pool, &nb).await.expect("load ok");
     assert_eq!(g.node_count(), 2);
-    // Seeding by raw name resolves.
     let hits = ppr_expand(&pool, &g, &seed("A", EntityKind::Concept), 5)
         .await
         .expect("ppr ok");
@@ -742,7 +806,6 @@ async fn ppr_known_answer_single_seed() {
     assert!(!hits.iter().any(|h| h.name == "A"), "seed excluded");
 
     assert!((c - 1.0).abs() < 1e-4, "C normalizes to 1.0, got {c}");
-    // Reference scores max-normalized to C: B/C = 0.7407407, D/C = 0.5666666.
     assert!((b - 0.740_740_7).abs() < 1e-4, "B confidence off: {b}");
     assert!((d - 0.566_666_6).abs() < 1e-4, "D confidence off: {d}");
 
@@ -799,9 +862,6 @@ async fn ppr_dangling_mass_to_seeds() {
         .await
         .expect("ppr ok");
 
-    // If dangling mass went uniform instead of to the seed, D and the others would
-    // not match the reference ratios computed with seed-teleport dangling handling.
-    // Reference D score 0.15677174 max-normalized to C 0.27665602 = 0.5666666.
     let d = hits
         .iter()
         .find(|h| h.name == "D")
@@ -832,7 +892,6 @@ async fn ppr_convergence_deterministic() {
         .await
         .expect("ok");
     assert_eq!(h1, h2, "PPR is deterministic across runs");
-    // Top hit must be C (reachable via the strongest path A->B->C).
     assert_eq!(h1[0].name, "C");
 }
 
@@ -853,6 +912,30 @@ async fn ppr_empty_and_zero_match_seeds() {
     assert!(zero.is_empty());
 }
 
+/// Case-insensitive seed resolution: a seed passed in a different case than the
+/// stored node still resolves (PPR index is lowercased, matching COLLATE NOCASE).
+#[tokio::test]
+async fn ppr_seed_resolution_case_insensitive() {
+    let (_dir, engine) = file_engine().await;
+    let nb = new_notebook(&engine).await;
+    let pool = engine.pool().await;
+    seed_known_answer_graph(&pool, &nb).await;
+
+    let g = NotebookGraph::load(&pool, &nb).await.expect("load ok");
+    // Stored node name is "A"; seed with "a".
+    let hits = ppr_expand(&pool, &g, &seed("a", EntityKind::Concept), 5)
+        .await
+        .expect("ppr ok");
+    assert!(
+        hits.iter().any(|h| h.name == "C"),
+        "lowercase seed resolves to node A and returns its neighbors: {hits:?}"
+    );
+    assert!(
+        !hits.iter().any(|h| h.name == "A"),
+        "the resolved seed is excluded from results"
+    );
+}
+
 /// Guard trip → fallback to expand_neighbors. We use the test-only capped entry
 /// point via a tiny EDGE_CAP so a small graph trips the guard and the fallback
 /// path returns expand_neighbors-equivalent results.
@@ -864,8 +947,6 @@ async fn ppr_guard_trips_to_expand_neighbors() {
     seed_known_answer_graph(&pool, &nb).await;
 
     let g = NotebookGraph::load(&pool, &nb).await.expect("load ok");
-    // Directly compare: the guard fallback IS expand_neighbors(depth 2), so a
-    // guard-tripped ppr_expand must equal expand_neighbors for the same seeds.
     let expanded = expand_neighbors(&pool, &nb, &seed("A", EntityKind::Concept), 2)
         .await
         .expect("expand ok");

@@ -36,19 +36,24 @@ struct LogicalNode {
 /// A notebook's entity graph collapsed to logical nodes (one per
 /// `(COALESCE(canonical_name, name), kind)`), directed, with blended edge weights.
 /// `co_occurs` edges are inserted both ways; semantic edges subject→object only.
+/// The `index` key lowercases the name so seed resolution is case-insensitive,
+/// matching the `COLLATE NOCASE` behavior of the SQL `expand_neighbors` fallback.
 pub struct NotebookGraph {
     notebook_id: String,
     graph: DiGraph<LogicalNode, f32>,
     index: HashMap<(String, EntityKind), NodeIndex>,
 }
 
+/// Maximum number of seeds honored by PPR/`expand_neighbors`; excess seeds are
+/// dropped (with a warning) to stay under the SQLite bound-variable ceiling.
+const MAX_SEEDS: usize = 64;
+
 impl NotebookGraph {
     /// Loads and collapses the live-source portion of a notebook's entity graph.
     /// Live-source filtering (`trashed_at IS NULL AND selected = 1`) is applied at
     /// the node level; edges with an excluded endpoint are dropped.
     pub async fn load(pool: &SqlitePool, notebook_id: &str) -> Result<NotebookGraph, LensError> {
-        // Per-source node rows scoped to live sources. `logical_key` collapses
-        // cross-doc aliases the same way #156a does (COALESCE(canonical_name, name)).
+        // COALESCE(canonical_name, name) collapses cross-doc aliases (#156a).
         let node_rows = sqlx::query(
             "SELECT en.id,
                     COALESCE(en.canonical_name, en.name) AS logical_name,
@@ -64,7 +69,6 @@ impl NotebookGraph {
 
         let mut graph: DiGraph<LogicalNode, f32> = DiGraph::new();
         let mut index: HashMap<(String, EntityKind), NodeIndex> = HashMap::new();
-        // Per-source node id → logical NodeIndex (for edge endpoint resolution).
         let mut node_to_logical: HashMap<String, NodeIndex> = HashMap::new();
 
         for row in &node_rows {
@@ -72,7 +76,8 @@ impl NotebookGraph {
             let logical_name: String = row.get("logical_name");
             let kind_str: String = row.get("kind");
             let kind = EntityKind::from_db(&kind_str)?;
-            let key = (logical_name.clone(), kind);
+            // Lowercase only the lookup key; keep the original casing for display.
+            let key = (logical_name.to_lowercase(), kind);
             let node_index = *index.entry(key).or_insert_with(|| {
                 graph.add_node(LogicalNode {
                     name: logical_name,
@@ -83,7 +88,6 @@ impl NotebookGraph {
             node_to_logical.insert(id, node_index);
         }
 
-        // Chunk evidence per logical node, from mentions (live-source scoped).
         let mention_rows = sqlx::query(
             "SELECT DISTINCT em.entity_node_id, em.chunk_id
              FROM entity_mentions em
@@ -168,12 +172,17 @@ impl NotebookGraph {
         self.graph.edge_count()
     }
 
+    pub fn notebook_id(&self) -> &str {
+        &self.notebook_id
+    }
+
     /// Resolves seed `(name, kind)` pairs to logical node indices, matching by
-    /// logical key. Unmatched seeds are silently skipped.
+    /// logical key (case-insensitive, consistent with `load`). Unmatched seeds are
+    /// silently skipped.
     fn resolve_seeds(&self, seeds: &[(String, EntityKind)]) -> Vec<NodeIndex> {
         let mut out = Vec::new();
         for (name, kind) in seeds {
-            if let Some(&ix) = self.index.get(&(name.clone(), *kind))
+            if let Some(&ix) = self.index.get(&(name.to_lowercase(), *kind))
                 && !out.contains(&ix)
             {
                 out.push(ix);
@@ -211,8 +220,6 @@ pub async fn ppr_expand_capped_for_test(
     ppr_expand_capped(pool, graph, seeds, k, edge_cap, node_cap).await
 }
 
-/// [`ppr_expand`] with injectable caps so the guard-trip fallback is testable
-/// without materializing a graph beyond the production ceiling.
 async fn ppr_expand_capped(
     pool: &SqlitePool,
     graph: &NotebookGraph,
@@ -221,6 +228,7 @@ async fn ppr_expand_capped(
     edge_cap: usize,
     node_cap: usize,
 ) -> Result<Vec<GraphHit>, LensError> {
+    let seeds = clamp_seeds(seeds);
     if graph.edge_count() > edge_cap || graph.node_count() > node_cap {
         tracing::warn!(
             notebook_id = %graph.notebook_id,
@@ -238,7 +246,6 @@ async fn ppr_expand_capped(
 
     let scores = power_iteration(&graph.graph, &seed_nodes);
 
-    // Rank non-seed nodes by score desc.
     let mut ranked: Vec<(NodeIndex, f64)> = scores
         .iter()
         .enumerate()
@@ -251,7 +258,11 @@ async fn ppr_expand_capped(
             }
         })
         .collect();
-    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| graph.graph[a.0].name.cmp(&graph.graph[b.0].name))
+    });
     ranked.truncate(k);
 
     let max_score = ranked.first().map(|(_, s)| *s).unwrap_or(0.0);
@@ -277,6 +288,19 @@ async fn ppr_expand_capped(
     Ok(hits)
 }
 
+/// Truncates the seed set to [`MAX_SEEDS`], warning if it overflowed.
+fn clamp_seeds(seeds: &[(String, EntityKind)]) -> &[(String, EntityKind)] {
+    if seeds.len() > MAX_SEEDS {
+        tracing::warn!(
+            seeds = seeds.len(),
+            "ppr_expand: seed count exceeds {MAX_SEEDS}, truncating"
+        );
+        &seeds[..MAX_SEEDS]
+    } else {
+        seeds
+    }
+}
+
 /// Power-iteration personalized PageRank. Teleport (and dangling-node mass) both
 /// land on the personalization vector — uniform over `seed_nodes` — NOT uniform
 /// over all nodes. Transition probability along an out-edge is proportional to its
@@ -289,7 +313,6 @@ fn power_iteration(graph: &DiGraph<LogicalNode, f32>, seed_nodes: &[NodeIndex]) 
         personalization[ix.index()] = seed_mass;
     }
 
-    // Per-node out-weight sum (for transition normalization); zero = dangling.
     let mut out_sum = vec![0.0f64; n];
     for edge in graph.edge_references() {
         out_sum[edge.source().index()] += *edge.weight() as f64;

@@ -1,5 +1,8 @@
 //! Shared entity-graph seed helpers for integration tests. Kept offline: no
 //! model downloads, no LLM — callers hand-build nodes/edges/mentions.
+//!
+//! Compiled once per integration-test binary; not every test uses every helper.
+#![allow(dead_code)]
 
 use lens_core::LensEngine;
 use tempfile::TempDir;

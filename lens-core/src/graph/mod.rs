@@ -32,6 +32,10 @@ pub struct GraphHit {
 /// outranks a raw co-occurrence of equal nominal strength. Tunable estimate.
 const SEMANTIC_BOOST: f64 = 3.0;
 
+/// Strictly-positive floor on a blended edge weight so PPR normalization never
+/// divides by (or propagates) a zero weight.
+const WEIGHT_FLOOR: f32 = 0.01;
+
 /// Strictly-positive transition/ranking weight for a directed edge, shared by the
 /// `expand_neighbors` post-ranking and the PPR loader. `co_occurs` weight is the
 /// stored co-occurrence count, log-damped; a semantic edge uses its confidence
@@ -43,7 +47,7 @@ fn blended_edge_weight(relation: &Relation, weight: Option<f64>, confidence: Opt
         Relation::CoOccurs => weight.unwrap_or(1.0).max(0.0).ln_1p(),
         Relation::Semantic(_) => SEMANTIC_BOOST * confidence.unwrap_or(0.5),
     };
-    (raw as f32).max(0.01)
+    (raw as f32).max(WEIGHT_FLOOR)
 }
 
 /// Entity node kind, stored as plain `TEXT` (no SQL CHECK; the Rust enum is the guard).
