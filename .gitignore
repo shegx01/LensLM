@@ -17,6 +17,9 @@ src-tauri/gen/schemas
 /playwright-report
 /playwright/.cache
 /coverage
+# Stray LanceDB stores some engine tests write to a cwd-relative path.
+lens-core/lancedb/
+src-tauri/lancedb/
 
 # OS
 .DS_Store

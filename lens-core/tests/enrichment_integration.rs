@@ -14,7 +14,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use lens_core::vector_store::{Coordinate, LanceVectorStore, VectorRow, VectorStore};
+use lens_core::vector_store::{
+    Coordinate, EntityVectorRow, LanceVectorStore, VectorRow, VectorStore,
+};
 use lens_core::{DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, EmbeddingBackend, LensEngine};
 
 fn coord(nb: &str, model: &str, dim: usize) -> Coordinate {
@@ -405,6 +407,74 @@ async fn startup_gc_reclaims_building_and_stale_rows() {
             .iter()
             .any(|n| n == &format!("vec__{nb}__fastembed__nomic_v15__d{DEFAULT_EMBED_DIM}")),
         "the active Lance table must survive GC; live tables: {names:?}"
+    );
+}
+
+/// #155 startup-GC: an `ent__` table whose notebook no longer exists (a crashed
+/// `purge_notebook` scenario) is reclaimed on restart, while a live notebook's `ent__`
+/// table survives. `ent__` tables carry no `embedding_index` registry, so the GC keys
+/// purely on notebook liveness.
+#[tokio::test]
+async fn startup_gc_reclaims_orphan_entity_tables() {
+    let (dir, engine) = file_engine().await;
+    let live_nb = engine
+        .create_notebook("live", None, None)
+        .await
+        .unwrap()
+        .id
+        .to_string();
+    let data_dir = engine.data_dir_for_test().await;
+    let store = LanceVectorStore::new(&data_dir, engine.pool().await);
+
+    let ent_row = |nb: &str| EntityVectorRow {
+        entity_node_id: format!("{nb}-e"),
+        source_id: format!("{nb}-s"),
+        notebook_id: nb.to_string(),
+        kind: "concept".to_string(),
+        vector: unit_vector(0),
+    };
+
+    // A live-notebook ent__ table (must survive) and an orphan ent__ table for a
+    // notebook id that was never inserted into `notebooks` (no live row).
+    let orphan_nb = "orphan-nb";
+    for nb in [&live_nb, &orphan_nb.to_string()] {
+        store
+            .upsert_entity_vectors(
+                &coord(nb, DEFAULT_EMBED_MODEL_ID, DEFAULT_EMBED_DIM),
+                vec![ent_row(nb)],
+            )
+            .await
+            .expect("seed ent table");
+    }
+    assert_eq!(
+        store
+            .entity_table_names_for_notebook(orphan_nb)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    drop(engine);
+    let engine2 = reopen_engine(&dir).await;
+    let store2 = LanceVectorStore::new(&engine2.data_dir_for_test().await, engine2.pool().await);
+
+    assert!(
+        store2
+            .entity_table_names_for_notebook(orphan_nb)
+            .await
+            .unwrap()
+            .is_empty(),
+        "startup-GC must reclaim the orphan-notebook ent__ table"
+    );
+    assert_eq!(
+        store2
+            .entity_table_names_for_notebook(&live_nb)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "a live notebook's ent__ table must survive GC"
     );
 }
 

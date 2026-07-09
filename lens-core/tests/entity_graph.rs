@@ -19,6 +19,8 @@ use lens_core::graph::{
 };
 use lens_core::llm::LlmProvider;
 use lens_core::notebooks::{ChunkEnrichmentUpdate, NotebookRepo};
+use lens_core::vector_store::{Coordinate, EntityVectorRow, LanceVectorStore, VectorStore};
+use lens_core::{EmbeddingBackend, NotebookId};
 use sqlx::Row;
 use tempfile::TempDir;
 
@@ -99,6 +101,7 @@ fn sample_rows(nb: &str, source_id: &str, chunk_id: &str) -> EntityGraphRows {
         canonical_name: None,
         definition: None,
         resolution_conf: None,
+        resolution_prompt_version: None,
         created_at: now.clone(),
     };
     let node_b = EntityNode {
@@ -110,6 +113,7 @@ fn sample_rows(nb: &str, source_id: &str, chunk_id: &str) -> EntityGraphRows {
         canonical_name: None,
         definition: None,
         resolution_conf: None,
+        resolution_prompt_version: None,
         created_at: now.clone(),
     };
     let edge = EntityEdge {
@@ -159,6 +163,76 @@ async fn count(engine: &LensEngine, table: &str) -> i64 {
         .fetch_one(&pool)
         .await
         .unwrap_or_else(|_| panic!("count {table}"))
+}
+
+async fn ent_store(engine: &LensEngine, nb: &str) -> (LanceVectorStore, Coordinate) {
+    let pool = engine.pool().await;
+    let data_dir = engine.data_dir_for_test().await;
+    let (model, dim, _backend) = engine
+        .resolve_notebook_embedding(&NotebookId::from(nb.to_string()))
+        .await
+        .expect("resolve embedding");
+    let store = LanceVectorStore::new(&data_dir, pool);
+    let coord = Coordinate::new(nb.to_string(), EmbeddingBackend::Fastembed, model, dim);
+    (store, coord)
+}
+
+/// Marks the notebook's default coordinate `active` in `embedding_index` — `purge_source`
+/// only drops vectors for coordinates it finds there.
+async fn seed_active_coord(engine: &LensEngine, nb: &str) {
+    let pool = engine.pool().await;
+    let (model, dim, backend) = engine
+        .resolve_notebook_embedding(&NotebookId::from(nb.to_string()))
+        .await
+        .expect("resolve embedding");
+    sqlx::query(
+        "INSERT INTO embedding_index \
+         (id, notebook_id, model, dim, prefix_convention, lance_table_name, status, backend, created_at) \
+         VALUES (?, ?, ?, ?, 'nomic', ?, 'active', ?, ?)",
+    )
+    .bind(uuid::Uuid::now_v7().to_string())
+    .bind(nb)
+    .bind(&model)
+    .bind(dim as i64)
+    .bind(format!("chunks__{nb}"))
+    .bind(backend.as_str())
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(&pool)
+    .await
+    .expect("seed active coord");
+}
+
+/// Seeds one entity vector into the `ent__` table for testing drop-path assertions.
+async fn seed_ent_vector(
+    store: &LanceVectorStore,
+    coord: &Coordinate,
+    entity_node_id: &str,
+    source_id: &str,
+    nb: &str,
+) {
+    let dim = coord.dim;
+    store
+        .upsert_entity_vectors(
+            coord,
+            vec![EntityVectorRow {
+                entity_node_id: entity_node_id.to_string(),
+                source_id: source_id.to_string(),
+                notebook_id: nb.to_string(),
+                kind: "concept".to_string(),
+                vector: vec![0.1; dim],
+            }],
+        )
+        .await
+        .expect("seed entity vector");
+}
+
+async fn ent_rows_for_source(store: &LanceVectorStore, coord: &Coordinate) -> usize {
+    let probe = vec![0.1; coord.dim];
+    store
+        .entity_ann(coord, &probe, 100, None)
+        .await
+        .expect("entity_ann")
+        .len()
 }
 
 // ---------------------------------------------------------------------------
@@ -662,6 +736,7 @@ async fn enrichment_with_changed_entities_purges_stale_nodes() {
         canonical_name: None,
         definition: None,
         resolution_conf: None,
+        resolution_prompt_version: None,
         created_at: "2026-01-02T00:00:00Z".to_string(),
     };
     let rows2 = EntityGraphRows {
@@ -835,4 +910,174 @@ async fn foreign_keys_pragma_enabled() {
         .await
         .expect("pragma");
     assert_eq!(fk, 1, "foreign_keys must be ON for cascade correctness");
+}
+
+// ---------------------------------------------------------------------------
+// #155 — entity-vector zero-orphan on every chunk-vector drop site (S2/S4)
+// ---------------------------------------------------------------------------
+
+/// A content-changing re-ingest drops the source's chunk vectors before the SQLite
+/// txn (`wipe_source_content`); #155 wires the entity-vector drop alongside it, so
+/// the source's `ent__` rows must be gone after the re-ingest. Gated on a tokenizer
+/// (real chunking) like the rest of the ingest suite; skips cleanly offline.
+#[tokio::test]
+async fn reingest_drops_entity_vectors() {
+    if !support::tokenizer_available().await {
+        eprintln!("skipping: tokenizer unavailable (offline)");
+        return;
+    }
+    let (dir, engine) = support::inject_counting_engine().await;
+    support::seed_tokenizer_from_env(dir.path());
+    {
+        let mut cfg = engine.config().await;
+        cfg.enrichment.enabled = false;
+        engine.set_config(cfg).await;
+    }
+    let nb = engine
+        .create_notebook("nb", None, None)
+        .await
+        .expect("create notebook");
+    let nb_id = nb.id.to_string();
+
+    let src = engine
+        .add_text_source(&nb.id, "doc", "Alice met Bob at the fair in Paris.", "text")
+        .await
+        .expect("add text source")
+        .source;
+    engine
+        .ingest_source(&src.id, |_p| {})
+        .await
+        .expect("first ingest");
+
+    let (store, coord) = ent_store(&engine, &nb_id).await;
+    seed_ent_vector(&store, &coord, &format!("{}-e0", src.id), &src.id, &nb_id).await;
+    assert_eq!(
+        ent_rows_for_source(&store, &coord).await,
+        1,
+        "entity vector seeded"
+    );
+
+    std::fs::write(
+        &src.locator,
+        "A totally different note about Carol in Berlin.",
+    )
+    .expect("overwrite managed file");
+    engine
+        .ingest_source(&src.id, |_p| {})
+        .await
+        .expect("re-ingest");
+
+    assert_eq!(
+        ent_rows_for_source(&store, &coord).await,
+        0,
+        "re-ingest must drop the source's ent__ rows"
+    );
+}
+
+/// `purge_source` iterates active coordinates dropping chunk vectors; #155 adds the
+/// entity-vector drop in the same loop (the SQLite cascade never reaches Lance).
+#[tokio::test]
+async fn purge_source_drops_entity_vectors() {
+    let (_dir, engine) = file_engine().await;
+    let (nb, source_id, chunk_id) = seed_source_with_chunk(&engine).await;
+    seed_active_coord(&engine, &nb).await;
+    let pool = engine.pool().await;
+    NotebookRepo::new(&pool)
+        .write_enrichment_and_graph(&[], &sample_rows(&nb, &source_id, &chunk_id))
+        .await
+        .expect("write");
+
+    let (store, coord) = ent_store(&engine, &nb).await;
+    seed_ent_vector(&store, &coord, &format!("{source_id}-na"), &source_id, &nb).await;
+    assert_eq!(ent_rows_for_source(&store, &coord).await, 1);
+
+    engine.trash_source(&source_id).await.expect("trash");
+    engine.purge_source(&source_id).await.expect("purge");
+
+    assert_eq!(count(&engine, "entity_nodes").await, 0, "nodes cascaded");
+    assert_eq!(
+        ent_rows_for_source(&store, &coord).await,
+        0,
+        "purge_source must drop the source's ent__ rows"
+    );
+}
+
+/// `purge_notebook` drops the notebook's chunk-vector tables from the registry; #155
+/// adds an explicit `ent__`-table drop (those tables carry no registry). Asserts the
+/// physical `ent__` tables for the notebook are gone.
+#[tokio::test]
+async fn purge_notebook_drops_entity_tables() {
+    let (_dir, engine) = file_engine().await;
+    let (nb, source_id, chunk_id) = seed_source_with_chunk(&engine).await;
+    let pool = engine.pool().await;
+    NotebookRepo::new(&pool)
+        .write_enrichment_and_graph(&[], &sample_rows(&nb, &source_id, &chunk_id))
+        .await
+        .expect("write");
+
+    let (store, coord) = ent_store(&engine, &nb).await;
+    seed_ent_vector(&store, &coord, &format!("{source_id}-na"), &source_id, &nb).await;
+    assert_eq!(
+        store
+            .entity_table_names_for_notebook(&nb)
+            .await
+            .expect("list ent tables")
+            .len(),
+        1,
+        "ent__ table exists before purge"
+    );
+
+    let nb_id = NotebookId::from(nb.clone());
+    engine.trash_notebook(&nb_id).await.expect("trash notebook");
+    engine.purge_notebook(&nb_id).await.expect("purge notebook");
+
+    assert_eq!(count(&engine, "entity_nodes").await, 0, "nodes cascaded");
+    assert!(
+        store
+            .entity_table_names_for_notebook(&nb)
+            .await
+            .expect("list ent tables")
+            .is_empty(),
+        "purge_notebook must physically drop the notebook's ent__ tables"
+    );
+}
+
+/// #155: a resolution pass fully resets prior canonical assignments — a node aliased by
+/// an earlier pass but no longer in a merged group must not keep a stale canonical_name.
+#[tokio::test]
+async fn resolution_write_clears_stale_canonical() {
+    let (_dir, engine) = file_engine().await;
+    let (nb, source_id, chunk_id) = seed_source_with_chunk(&engine).await;
+    let pool = engine.pool().await;
+    let repo = NotebookRepo::new(&pool);
+    repo.write_enrichment_and_graph(&[], &sample_rows(&nb, &source_id, &chunk_id))
+        .await
+        .expect("write graph");
+
+    // Simulate a prior resolution pass that aliased this source's nodes.
+    sqlx::query(
+        "UPDATE entity_nodes SET canonical_name = 'Alias', resolution_conf = 0.95, \
+         resolution_prompt_version = 'res-v1' WHERE notebook_id = ?",
+    )
+    .bind(&nb)
+    .execute(&pool)
+    .await
+    .expect("seed prior resolution");
+
+    // A new pass that merges nothing (empty updates) must clear the stale aliases.
+    repo.write_resolution_updates(&nb, "res-v1", &[], false)
+        .await
+        .expect("resolution write");
+
+    let stale: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM entity_nodes WHERE notebook_id = ? AND canonical_name IS NOT NULL",
+    )
+    .bind(&nb)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(
+        stale, 0,
+        "prior-pass canonical_name must be cleared by a fresh pass"
+    );
 }

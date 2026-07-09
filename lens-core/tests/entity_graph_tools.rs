@@ -229,6 +229,65 @@ async fn lookup_collapse_across_sources() {
     assert_eq!(results[0].mention_count, 3, "mention_count = sum of both");
 }
 
+/// 2b. #155: nodes with DIFFERENT raw names but the same `canonical_name` collapse
+/// into one result (cross-doc alias resolution), keyed and returned by the canonical.
+#[tokio::test]
+async fn lookup_collapses_canonical_aliases_across_sources() {
+    let (_dir, engine) = file_engine().await;
+    let nb = engine
+        .create_notebook("nb", None, None)
+        .await
+        .expect("create notebook")
+        .id
+        .to_string();
+    let pool = engine.pool().await;
+
+    seed_source(&pool, "sA", &nb, 1, None).await;
+    seed_source(&pool, "sB", &nb, 1, None).await;
+    seed_chunk(&pool, "cA", "sA", 1, Some(0), "text").await;
+    seed_chunk(&pool, "cB", "sB", 1, Some(0), "text").await;
+
+    // Distinct surface names, resolved by #155 to the same canonical entity.
+    seed_entity_node(&pool, "nA", &nb, "sA", "concept", "AWS", None).await;
+    seed_entity_node(
+        &pool,
+        "nB",
+        &nb,
+        "sB",
+        "concept",
+        "Amazon Web Services",
+        None,
+    )
+    .await;
+    for id in ["nA", "nB"] {
+        sqlx::query(
+            "UPDATE entity_nodes SET canonical_name = 'Amazon Web Services', \
+             resolution_conf = 0.95, resolution_prompt_version = 'res-v1' WHERE id = ?",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .expect("set canonical");
+    }
+
+    seed_mention(&pool, "mA", &nb, "nA", "cA", 0).await;
+    seed_mention(&pool, "mB", &nb, "nB", "cB", 0).await;
+
+    // "Amazon" matches nB by name prefix and nA by canonical_name prefix; grouping by
+    // COALESCE(canonical_name, name) then collapses both into one canonical entity.
+    let results = entity_lookup(&pool, &nb, "Amazon", 10)
+        .await
+        .expect("lookup ok");
+
+    assert_eq!(results.len(), 1, "canonical aliases collapse to one entity");
+    assert_eq!(
+        results[0].name, "Amazon Web Services",
+        "returns the canonical name, not a raw alias"
+    );
+    assert_eq!(results[0].source_count, 2, "spans both sources");
+    assert_eq!(results[0].mention_count, 2);
+}
+
 /// 3. k truncation
 #[tokio::test]
 async fn lookup_k_truncation() {
@@ -708,4 +767,49 @@ async fn evidence_respects_kind() {
         .await
         .expect("evidence ok");
     assert_eq!(right_kind, vec!["c1"]);
+}
+
+/// #155: entity_evidence resolves by canonical_name too, so evidence for a resolved
+/// entity spans the chunks of all its aliased nodes across sources.
+#[tokio::test]
+async fn evidence_matches_canonical_aliases() {
+    let (_dir, engine) = file_engine().await;
+    let nb = engine
+        .create_notebook("nb", None, None)
+        .await
+        .expect("create notebook")
+        .id
+        .to_string();
+    let pool = engine.pool().await;
+
+    seed_source(&pool, "sA", &nb, 1, None).await;
+    seed_source(&pool, "sB", &nb, 1, None).await;
+    seed_chunk(&pool, "cA", "sA", 1, Some(0), "text").await;
+    seed_chunk(&pool, "cB", "sB", 1, Some(0), "text").await;
+    seed_entity_node(&pool, "nA", &nb, "sA", "concept", "AWS", None).await;
+    seed_entity_node(
+        &pool,
+        "nB",
+        &nb,
+        "sB",
+        "concept",
+        "Amazon Web Services",
+        None,
+    )
+    .await;
+    for id in ["nA", "nB"] {
+        sqlx::query("UPDATE entity_nodes SET canonical_name = 'Amazon Web Services' WHERE id = ?")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("set canonical");
+    }
+    seed_mention(&pool, "mA", &nb, "nA", "cA", 0).await;
+    seed_mention(&pool, "mB", &nb, "nB", "cB", 0).await;
+
+    let chunks = entity_evidence(&pool, &nb, "Amazon Web Services", EntityKind::Concept, 10)
+        .await
+        .expect("evidence ok");
+    assert_eq!(chunks.len(), 2, "evidence spans both aliased nodes' chunks");
+    assert!(chunks.contains(&"cA".to_string()) && chunks.contains(&"cB".to_string()));
 }

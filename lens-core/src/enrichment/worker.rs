@@ -427,8 +427,15 @@ async fn process_job(
             created_at: now.clone(),
         });
     }
-    repo.write_enrichment_and_graph(&updates, &graph_rows)
-        .await?;
+    // #155: serialize the entity-graph write against the resolution pass on the same
+    // notebook via the per-notebook lock. Hold it ONLY for the duration of this write,
+    // then drop the guard so the two writers never race on `entity_nodes`.
+    {
+        let lock = engine.notebook_lock(&source.notebook_id);
+        let _guard = lock.lock().await;
+        repo.write_enrichment_and_graph(&updates, &graph_rows)
+            .await?;
+    }
 
     // Status stays `enriching` (Step-4→Step-5 handoff): text columns written,
     // re-embed flip (below) advances it to `enriched`.
@@ -483,6 +490,22 @@ async fn process_job(
         map_quality,
         "enrichment: re-embed flip complete (enriched)"
     );
+
+    // #155: trigger cross-document resolution ONLY here — after the job fully succeeds
+    // and the re-embed flip landed, never at the graph-write or on any failure/purge
+    // early-return. Best-effort `try_send`: a full/closed channel is logged and ignored
+    // (a later job re-triggers), so it never fails an already-completed enrichment.
+    if let Err(e) = engine
+        .resolution_tx
+        .try_send(crate::resolution::ResolveNotebook {
+            notebook_id: source.notebook_id.clone(),
+        })
+    {
+        tracing::debug!(
+            notebook_id = %source.notebook_id,
+            "enrichment: resolution trigger dropped ({e}); a later job re-triggers"
+        );
+    }
     Ok(())
 }
 

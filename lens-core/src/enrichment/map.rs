@@ -69,7 +69,7 @@ fn batch_parents(parent_texts: &[String]) -> Vec<String> {
 /// Returns `Ok(Some)` on success, `Ok(None)` on exhausted retries (caller degrades),
 /// `Err(BudgetExceeded)` on pre-dispatch breach, `Err(Llm)` on transport failure.
 /// Budget is checked before every `generate()`; calls pin `temperature=0, json=true`.
-pub(super) async fn run_llm_with_retries<T>(
+pub(crate) async fn run_llm_with_retries<T>(
     provider: &dyn LlmProvider,
     budget: &mut Budget,
     system_prompt: &str,

@@ -142,7 +142,7 @@ pub(super) fn truncate_chars(s: &mut String, max_chars: usize) {
 
 /// Extracts the first balanced `{...}` JSON object from `text` so a response
 /// wrapped in markdown fences or preamble still parses. Returns `None` if not found.
-pub(super) fn extract_json_object(text: &str) -> Option<&str> {
+pub(crate) fn extract_json_object(text: &str) -> Option<&str> {
     let start = text.find('{')?;
     let bytes = text.as_bytes();
     let mut depth = 0usize;

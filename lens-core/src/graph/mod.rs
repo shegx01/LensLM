@@ -94,7 +94,8 @@ impl Relation {
     }
 }
 
-/// An entity node (per-source). `canonical_name`/`resolution_conf` stay `None` in Phase 1.
+/// An entity node (per-source). `canonical_name`/`resolution_conf`/
+/// `resolution_prompt_version` stay `None` until the #155 resolution pass populates them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EntityNode {
     pub id: String,
@@ -105,6 +106,7 @@ pub struct EntityNode {
     pub canonical_name: Option<String>,
     pub definition: Option<String>,
     pub resolution_conf: Option<f64>,
+    pub resolution_prompt_version: Option<String>,
     pub created_at: String,
 }
 

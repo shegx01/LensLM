@@ -25,6 +25,7 @@ pub mod model_catalog;
 pub mod notebooks;
 pub mod parse;
 pub mod render;
+pub mod resolution;
 pub mod retrieval;
 pub mod system_check;
 pub mod transcription;
@@ -232,6 +233,10 @@ pub struct LensEngine {
     /// Sender half of the background enrichment queue (M4 Phase 3). `Clone` so it
     /// rides `#[derive(Clone)]`. Dropping every clone closes the channel.
     enrichment_tx: mpsc::Sender<EnrichmentJob>,
+    /// Separate channel/worker from enrichment; fired only after a job fully succeeds.
+    /// `Clone` rides `#[derive(Clone)]`.
+    resolution_tx: mpsc::Sender<crate::resolution::ResolveNotebook>,
+    notebook_locks: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Active enrichment LLM provider. `RwLock<Option<...>>` rather than `OnceCell`
     /// because AC10 requires rebinding on an unreachable→reachable transition.
     llm_provider: Arc<RwLock<Option<Arc<dyn LlmProvider>>>>,
@@ -271,6 +276,13 @@ pub struct LensEngine {
     /// AC11 test seam: non-zero overrides the per-job LLM-call ceiling.
     #[cfg(feature = "test-util")]
     enrichment_max_calls_override: Arc<std::sync::atomic::AtomicU32>,
+    /// #155 test seam: counts completed resolution passes (drain-coalesce assertion).
+    #[cfg(feature = "test-util")]
+    resolution_pass_count: Arc<std::sync::atomic::AtomicU32>,
+    /// #155 test seam: when `true`, `write_resolution_updates` aborts its txn AFTER the
+    /// version stamp but BEFORE the canonical updates (single-txn atomicity assertion).
+    #[cfg(feature = "test-util")]
+    resolution_write_fault: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl LensEngine {
@@ -340,6 +352,9 @@ impl LensEngine {
 
         let (enrichment_tx, enrichment_rx) =
             mpsc::channel::<EnrichmentJob>(enrichment::ENRICHMENT_QUEUE_CAPACITY);
+        let (resolution_tx, resolution_rx) = mpsc::channel::<crate::resolution::ResolveNotebook>(
+            enrichment::ENRICHMENT_QUEUE_CAPACITY,
+        );
 
         let engine = Self {
             inner: Arc::new(RwLock::new(LensEngineInner { db, config })),
@@ -348,6 +363,8 @@ impl LensEngine {
             tokenizer: Arc::new(OnceCell::new()),
             ingest_lock: Arc::new(Semaphore::new(1)),
             enrichment_tx,
+            resolution_tx,
+            notebook_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             llm_provider: Arc::new(RwLock::new(None)),
             js_renderer: Arc::new(RwLock::new(None)),
             asr_engine: Arc::new(RwLock::new(None)),
@@ -363,9 +380,14 @@ impl LensEngine {
             skip_tokenizer: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "test-util")]
             enrichment_max_calls_override: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            #[cfg(feature = "test-util")]
+            resolution_pass_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            #[cfg(feature = "test-util")]
+            resolution_write_fault: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         enrichment::spawn_worker(engine.clone(), enrichment_rx);
+        crate::resolution::spawn_resolution_worker(engine.clone(), resolution_rx);
 
         // Best-effort model-catalog refresh at startup; a slow/failed fetch degrades
         // to the cached/bundled copy — never blocks init.
@@ -416,6 +438,9 @@ impl LensEngine {
             .expect("migrations should apply to a fresh in-memory db");
         let (enrichment_tx, enrichment_rx) =
             mpsc::channel::<EnrichmentJob>(enrichment::ENRICHMENT_QUEUE_CAPACITY);
+        let (resolution_tx, resolution_rx) = mpsc::channel::<crate::resolution::ResolveNotebook>(
+            enrichment::ENRICHMENT_QUEUE_CAPACITY,
+        );
         let engine = Self {
             inner: Arc::new(RwLock::new(LensEngineInner {
                 db,
@@ -426,6 +451,8 @@ impl LensEngine {
             tokenizer: Arc::new(OnceCell::new()),
             ingest_lock: Arc::new(Semaphore::new(1)),
             enrichment_tx,
+            resolution_tx,
+            notebook_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             llm_provider: Arc::new(RwLock::new(None)),
             js_renderer: Arc::new(RwLock::new(None)),
             asr_engine: Arc::new(RwLock::new(None)),
@@ -441,8 +468,13 @@ impl LensEngine {
             skip_tokenizer: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "test-util")]
             enrichment_max_calls_override: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            #[cfg(feature = "test-util")]
+            resolution_pass_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            #[cfg(feature = "test-util")]
+            resolution_write_fault: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         enrichment::spawn_worker(engine.clone(), enrichment_rx);
+        crate::resolution::spawn_resolution_worker(engine.clone(), resolution_rx);
         engine
     }
 
@@ -699,6 +731,8 @@ impl LensEngine {
                 dim as usize,
             );
             store.drop_source(&coord, source_id).await?;
+            // #155: entity-vector drop (same ordering as the chunk-vector drop above).
+            store.drop_entity_source(&coord, source_id).await?;
         }
         NotebookRepo::new(&pool).purge_source(source_id).await?;
         // Best-effort: remove managed source file + siblings; a missing file is not an error.
@@ -752,6 +786,22 @@ impl LensEngine {
 
     pub(crate) fn ingest_lock(&self) -> &Arc<Semaphore> {
         &self.ingest_lock
+    }
+
+    /// Returns the per-notebook write lock, creating it on first use. The enrichment
+    /// writer (around `write_enrichment_and_graph`) and the #155 resolution pass both
+    /// acquire this same lock so the two `entity_nodes` writers never interleave. The
+    /// inner `std::sync::Mutex` is held only for the fast get-or-insert (never across
+    /// an await); the returned `tokio::sync::Mutex` is the actual serialization point.
+    pub(crate) fn notebook_lock(&self, notebook_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self
+            .notebook_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        locks
+            .entry(notebook_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// Installs (or replaces) the active enrichment LLM provider. `None` clears it
@@ -1225,19 +1275,49 @@ impl LensEngine {
         )
         .fetch_all(db)
         .await?;
-        if table_names.is_empty() {
+        if !table_names.is_empty() {
+            let store = crate::vector_store::LanceVectorStore::new(data_dir, db.clone());
+            // Drop tables first (idempotent), then delete rows. A crash between the two
+            // leaves only a dangling stale row; the next startup's GC no-ops the drop.
+            crate::vector_store::VectorStore::drop_tables(&store, &table_names).await?;
+            sqlx::query("DELETE FROM embedding_index WHERE status IN ('building', 'stale')")
+                .execute(db)
+                .await?;
+            tracing::info!(
+                count = table_names.len(),
+                "startup-GC reclaimed orphan building/stale embedding tables"
+            );
+        }
+        // ent__ tables carry no registry, so their GC runs regardless of the
+        // building/stale scan above (a crashed purge_notebook orphans them alone).
+        Self::gc_orphan_entity_tables(db, data_dir).await
+    }
+
+    /// Startup-GC for `ent__` entity-vector tables (#155): drops Lance dirs for
+    /// notebooks that no longer exist in the `notebooks` table.
+    async fn gc_orphan_entity_tables(db: &SqlitePool, data_dir: &Path) -> Result<(), LensError> {
+        let store = crate::vector_store::LanceVectorStore::new(data_dir, db.clone());
+        let tables = store.entity_tables_with_notebook().await?;
+        if tables.is_empty() {
             return Ok(());
         }
-        let store = crate::vector_store::LanceVectorStore::new(data_dir, db.clone());
-        // Drop tables first (idempotent), then delete rows. A crash between the two
-        // leaves only a dangling stale row; the next startup's GC no-ops the drop.
-        crate::vector_store::VectorStore::drop_tables(&store, &table_names).await?;
-        sqlx::query("DELETE FROM embedding_index WHERE status IN ('building', 'stale')")
-            .execute(db)
-            .await?;
+        let mut orphans: Vec<String> = Vec::new();
+        for (table, notebook_id) in tables {
+            let live: Option<i64> = sqlx::query_scalar("SELECT 1 FROM notebooks WHERE id = ?")
+                .bind(&notebook_id)
+                .fetch_optional(db)
+                .await?;
+            if live.is_none() {
+                orphans.push(table);
+            }
+        }
+        if orphans.is_empty() {
+            return Ok(());
+        }
+        crate::vector_store::VectorStore::drop_tables(&store, &orphans).await?;
         tracing::info!(
-            count = table_names.len(),
-            "startup-GC reclaimed orphan building/stale embedding tables"
+            count = orphans.len(),
+            "startup-GC reclaimed orphan entity-vector tables"
         );
         Ok(())
     }
@@ -1300,6 +1380,60 @@ impl LensEngine {
     pub fn disable_tokenizer_for_test(&self) {
         self.skip_tokenizer
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Enqueues a `ResolveNotebook` for testing; the production trigger is in the enrichment worker.
+    #[cfg(feature = "test-util")]
+    pub fn enqueue_resolution_for_test(&self, notebook_id: &str) {
+        let _ = self
+            .resolution_tx
+            .try_send(crate::resolution::ResolveNotebook {
+                notebook_id: notebook_id.to_string(),
+            });
+    }
+
+    /// Runs one resolution pass synchronously, bypassing the debounced worker.
+    #[cfg(feature = "test-util")]
+    pub async fn resolve_notebook_for_test(&self, notebook_id: &str) -> Result<(), LensError> {
+        crate::resolution::worker::resolve_one(self, notebook_id).await
+    }
+
+    /// Exposes `notebook_lock` (pub(crate)) to the test crate; lets tests simulate the enrichment
+    /// writer holding the lock to assert the resolution pass serializes behind it.
+    #[cfg(feature = "test-util")]
+    pub fn notebook_lock_for_test(&self, notebook_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.notebook_lock(notebook_id)
+    }
+
+    /// Count of resolution passes completed (drain-coalesce assertion).
+    #[cfg(feature = "test-util")]
+    pub fn resolution_pass_count_for_test(&self) -> u32 {
+        self.resolution_pass_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "test-util")]
+    pub(crate) fn note_resolution_pass(&self) {
+        self.resolution_pass_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Arms/disarms the write-fault in `write_resolution_updates` (single-txn atomicity seam).
+    #[cfg(feature = "test-util")]
+    pub fn set_resolution_write_fault_for_test(&self, armed: bool) {
+        self.resolution_write_fault
+            .store(armed, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "test-util")]
+    pub(crate) fn resolution_write_fault_armed(&self) -> bool {
+        self.resolution_write_fault
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(not(feature = "test-util"))]
+    pub(crate) fn resolution_write_fault_armed(&self) -> bool {
+        false
     }
 
     /// AC11 budget test seam: `0` restores the production default.
@@ -1645,10 +1779,17 @@ impl LensEngine {
                 .await?;
         let store = crate::vector_store::LanceVectorStore::new(&data_dir, pool.clone());
         store.drop_notebook_tables(id.as_str()).await?;
+        // #155: entity-vector drop (same ordering as the chunk-vector drop above).
+        store.drop_entity_tables_for_notebook(id.as_str()).await?;
         NotebookRepo::new(&pool).purge(id).await?;
         for (source_id, locator) in &sources {
             remove_managed_source_file(&data_dir, source_id, locator);
         }
+        // #155: drop the per-notebook write lock so the map does not grow unbounded.
+        self.notebook_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(id.as_str());
         Ok(())
     }
 }
