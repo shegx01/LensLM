@@ -333,7 +333,6 @@ pub struct ReembedChunk {
     pub embed_text: String,
 }
 
-/// Raw `entity_nodes` row mapped to [`crate::graph::EntityNode`] at the call boundary.
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct EntityNodeRow {
     id: String,
@@ -1568,9 +1567,7 @@ impl<'a> NotebookRepo<'a> {
         Ok(())
     }
 
-    /// Lists every `entity_nodes` row for a notebook (across all sources) — the input
-    /// set for the #155 cross-document resolution pass. Ordered by `created_at` for a
-    /// deterministic pass over the same notebook.
+    /// All `entity_nodes` for a notebook, ordered by `created_at` for a deterministic pass.
     pub async fn list_entity_nodes(
         &self,
         notebook_id: &str,
@@ -1601,9 +1598,8 @@ impl<'a> NotebookRepo<'a> {
             .collect()
     }
 
-    /// Writes a #155 resolution pass in ONE atomic transaction: resets the notebook's
-    /// resolution columns, stamps `resolution_prompt_version` on every node, then applies
-    /// this pass's canonical assignments (a shrunk group leaves no stale `canonical_name`).
+    /// Writes one resolution pass atomically: resets all resolution columns, stamps the version,
+    /// then applies canonical assignments (prevents stale aliases from a prior pass).
     pub async fn write_resolution_updates(
         &self,
         notebook_id: &str,

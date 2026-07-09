@@ -155,9 +155,8 @@ impl VectorStore for MockStore {
     }
 }
 
-/// A counting mock cache. `get` returns a preseeded verdict (and counts hits); `put`
-/// records the verdict. `get_calls` proves cache consultation; `put_calls` proves the
-/// LLM ran (a miss followed by a persist).
+/// Counting mock cache: `get` returns preseeded verdicts; `put` records them.
+/// `get_calls`/`put_calls` assert cache hits vs LLM misses.
 #[derive(Default)]
 struct MockCache {
     seed: Mutex<HashMap<String, (bool, f64)>>,
@@ -201,7 +200,6 @@ impl AdjudicationCache for MockCache {
     }
 }
 
-/// Distance for a target cosine similarity (`distance = 1 - sim`).
 fn dist(sim: f64) -> f32 {
     (1.0 - sim) as f32
 }
@@ -359,7 +357,6 @@ async fn tier2_auto_merge_at_high_sim_keep_separate_at_low_sim() {
 
 // --- Tier 3 -----------------------------------------------------------------
 
-/// `(nodes, vectors, neighbours)` for a mid-band fixture.
 type MidbandFixture = (
     Vec<EntityNode>,
     HashMap<String, Vec<f32>>,

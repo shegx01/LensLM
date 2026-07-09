@@ -120,8 +120,7 @@ pub struct Hit {
     pub distance: f32,
 }
 
-/// A single entity-vector row for the coordinate-derived `ent__` table (#155).
-/// Carries `kind` for the typed-veto prefilter; keyed by `entity_node_id`.
+/// An entity-vector row for the coordinate-derived `ent__` table. `kind` backs the typed-veto ANN prefilter.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EntityVectorRow {
     pub entity_node_id: String,
@@ -197,20 +196,17 @@ pub trait VectorStore: Send + Sync {
     /// A crash between any step is recovered by GC. No-op if already retired.
     async fn retire_coordinate(&self, coord: &Coordinate) -> Result<(), LensError>;
 
-    /// Upserts entity vectors into the coordinate-derived `ent__` table (#155),
-    /// creating it on first use. Unlike chunk vectors, `ent__` tables have NO
-    /// `embedding_index` registry/building/flip lifecycle; the resolution pass
-    /// rebuilds the table directly (delete-then-insert per `entity_node_id`).
+    /// Upserts into the coordinate-derived `ent__` table, creating it on first use.
+    /// No `embedding_index` registry or flip lifecycle — the resolution pass rebuilds
+    /// in place (delete-then-insert per `entity_node_id`).
     async fn upsert_entity_vectors(
         &self,
         coord: &Coordinate,
         rows: Vec<EntityVectorRow>,
     ) -> Result<(), LensError>;
 
-    /// Returns the `k` nearest `(entity_node_id, cosine_distance)` for `query` in
-    /// the `ent__` table for `coord`, ascending by distance. Pins cosine and adds
-    /// `.only_if("notebook_id = …")`; when `kind` is `Some`, also `AND kind = …`
-    /// (typed-veto prefilter). A missing table returns an empty vec (never errors).
+    /// ANN over the `ent__` table for `coord`; returns `(entity_node_id, cosine_distance)`
+    /// ascending. A missing table returns an empty vec. `kind` adds a typed-veto prefilter.
     async fn entity_ann(
         &self,
         coord: &Coordinate,
@@ -219,18 +215,15 @@ pub trait VectorStore: Send + Sync {
         kind: Option<&str>,
     ) -> Result<Vec<(String, f32)>, LensError>;
 
-    /// Drops a source's rows from the `ent__` table for `coord` (mirror of
-    /// `drop_source`). A missing table is a no-op.
+    /// Drops a source's rows from the `ent__` table. A missing table is a no-op.
     async fn drop_entity_source(
         &self,
         coord: &Coordinate,
         source_id: &str,
     ) -> Result<(), LensError>;
 
-    /// Drops every physical `ent__{notebook}__*` Lance table. Missing tables are a no-op.
     async fn drop_entity_tables_for_notebook(&self, notebook: &str) -> Result<(), LensError>;
 
-    /// Prefix-match on the coordinate-derived name to enumerate `ent__{notebook}__*` tables.
     async fn entity_table_names_for_notebook(
         &self,
         notebook: &str,
@@ -276,10 +269,8 @@ fn table_name(notebook: &str, backend: EmbeddingBackend, model: &str, dim: usize
     )
 }
 
-/// Resolves the physical LanceDB table name for a coordinate's entity vectors
-/// (#155): `ent__{notebook}__{backend}__{model_slug}__d{dim}`. Coordinate-derived
-/// 1:1 with the chunk-vector table (`table_name`) but with an `ent__` prefix — no
-/// registry, no building/flip generations; the resolution pass rebuilds it in place.
+/// Physical LanceDB table name for entity vectors: `ent__{notebook}__{backend}__{slug}__d{dim}`.
+/// No registry or flip lifecycle; the resolution pass rebuilds in place.
 fn entity_table_name(notebook: &str, backend: EmbeddingBackend, model: &str, dim: usize) -> String {
     format!(
         "ent__{notebook}__{}__{}__d{dim}",
@@ -367,9 +358,8 @@ fn rows_to_batch(rows: &[VectorRow], dim: usize) -> Result<RecordBatch, LensErro
     .map_err(|e| LensError::Vector(format!("failed to build record batch: {e}")))
 }
 
-/// Builds the Arrow schema for an entity-vector table (#155): four Utf8 columns
-/// plus a `FixedSizeList<Float32, dim>` vector. `kind` backs the typed-veto ANN
-/// prefilter; there is no `level` column (entity vectors are unlevelled).
+/// Arrow schema for `ent__` tables: `entity_node_id`, `source_id`, `notebook_id`,
+/// `kind` (typed-veto filter), `vector<dim>`. No `level` column.
 fn entity_vector_schema(dim: usize) -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("entity_node_id", DataType::Utf8, false),
@@ -387,7 +377,6 @@ fn entity_vector_schema(dim: usize) -> SchemaRef {
     ]))
 }
 
-/// Builds a single `RecordBatch` from entity `rows`, validating each vector length.
 fn entity_rows_to_batch(rows: &[EntityVectorRow], dim: usize) -> Result<RecordBatch, LensError> {
     let node_ids = StringArray::from_iter_values(rows.iter().map(|r| r.entity_node_id.as_str()));
     let source_ids = StringArray::from_iter_values(rows.iter().map(|r| r.source_id.as_str()));

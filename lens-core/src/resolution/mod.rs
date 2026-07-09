@@ -23,14 +23,10 @@ use crate::graph::EntityNode;
 use crate::llm::LlmProvider;
 use crate::vector_store::{Coordinate, VectorStore};
 
-/// Per-notebook LLM-call ceiling for the resolution pass.
 pub const RESOLUTION_MAX_CALLS_PER_NOTEBOOK: u32 = 24;
-/// Per-notebook output-token ceiling for the resolution pass.
 pub const RESOLUTION_MAX_TOKENS_PER_NOTEBOOK: u32 = 48_000;
-/// Max output tokens requested for a single adjudication call (bool + confidence).
 pub const RESOLUTION_ADJUDICATION_MAX_TOKENS: u32 = 512;
 
-/// ANN neighbours fetched per node in Tier 2.
 const TIER2_ANN_K: usize = 8;
 /// Cosine similarity at/above which Tier 2 auto-merges without asking the LLM.
 const TIER2_AUTO_MERGE_SIM: f64 = 0.90;
@@ -54,14 +50,12 @@ pub struct ResolutionUpdate {
 /// full-notebook recompute; a version bump invalidates by key.
 #[async_trait]
 pub trait AdjudicationCache: Send + Sync {
-    /// Returns the cached `(verdict, confidence)` for this pair+version, if any.
     async fn get(
         &self,
         normalized_pair: &str,
         version: &str,
     ) -> Result<Option<(bool, f64)>, LensError>;
 
-    /// Persists a verdict for this pair+version.
     async fn put(
         &self,
         normalized_pair: &str,
@@ -343,7 +337,6 @@ async fn tier3_adjudicate(
     Ok(())
 }
 
-/// Outcome of a single LLM adjudication attempt.
 enum LlmVerdict {
     Verdict((bool, f64)),
     /// Provider absent, transport error, or malformed reply — skip this pair only.

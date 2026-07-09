@@ -26,10 +26,8 @@ use tempfile::TempDir;
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Builds an in-memory engine with a deterministic injected embedder registered
-/// under the default (nomic/fastembed) coordinate, and a tempdir data-dir so the
-/// entity-vector `ent__` Lance tables are written under the temp scratch (not CWD).
-/// The returned [`TempDir`] guard must outlive the engine.
+/// In-memory engine with an injected `CountingEmbedder` and a tempdir data dir.
+/// The returned [`TempDir`] guard must outlive the engine (its drop closes the Lance tables).
 async fn test_engine() -> (TempDir, LensEngine) {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = LensEngine::for_test().await;
@@ -80,7 +78,6 @@ async fn seed_notebook_with_active_coord(engine: &LensEngine) -> String {
     nb
 }
 
-/// Inserts one `indexed` source into a notebook and returns its id.
 async fn seed_source(engine: &LensEngine, notebook_id: &str) -> String {
     let pool = engine.pool().await;
     let source_id = uuid::Uuid::now_v7().to_string();
@@ -97,7 +94,6 @@ async fn seed_source(engine: &LensEngine, notebook_id: &str) -> String {
     source_id
 }
 
-/// Inserts an `entity_nodes` row and returns its id.
 async fn seed_node(
     engine: &LensEngine,
     notebook_id: &str,
@@ -125,7 +121,6 @@ async fn seed_node(
     id
 }
 
-/// Reads `(canonical_name, resolution_conf, resolution_prompt_version)` for a node.
 async fn node_resolution(
     engine: &LensEngine,
     node_id: &str,

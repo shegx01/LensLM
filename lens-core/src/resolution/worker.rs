@@ -22,13 +22,12 @@ use crate::{LensEngine, LensError};
 /// invalidates cached verdicts and forces a full re-resolve on the next pass.
 pub const RESOLUTION_PROMPT_VERSION: &str = "res-v1";
 
-/// A request to (re-)resolve a notebook's entity graph. Coalesced by `notebook_id`.
+/// Coalesced by `notebook_id` in the background worker drain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolveNotebook {
     pub notebook_id: String,
 }
 
-/// Spawns the background resolution worker; see the module doc for lifecycle.
 pub fn spawn_resolution_worker(engine: LensEngine, mut rx: mpsc::Receiver<ResolveNotebook>) {
     tokio::spawn(async move {
         tracing::debug!("resolution worker started");
@@ -51,7 +50,6 @@ pub fn spawn_resolution_worker(engine: LensEngine, mut rx: mpsc::Receiver<Resolv
     });
 }
 
-/// Runs one full-notebook resolution pass; see the module doc for lifecycle.
 pub(crate) async fn resolve_one(engine: &LensEngine, notebook_id: &str) -> Result<(), LensError> {
     #[cfg(feature = "test-util")]
     engine.note_resolution_pass();

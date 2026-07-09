@@ -233,11 +233,9 @@ pub struct LensEngine {
     /// Sender half of the background enrichment queue (M4 Phase 3). `Clone` so it
     /// rides `#[derive(Clone)]`. Dropping every clone closes the channel.
     enrichment_tx: mpsc::Sender<EnrichmentJob>,
-    /// Sender half of the background cross-document resolution queue (#155). Separate
-    /// channel/worker from enrichment: `process_job` fires `ResolveNotebook` only after
-    /// a job fully succeeds. `Clone` rides `#[derive(Clone)]`.
+    /// Separate channel/worker from enrichment; fired only after a job fully succeeds.
+    /// `Clone` rides `#[derive(Clone)]`.
     resolution_tx: mpsc::Sender<crate::resolution::ResolveNotebook>,
-    /// Per-notebook write lock (see `notebook_lock`).
     notebook_locks: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Active enrichment LLM provider. `RwLock<Option<...>>` rather than `OnceCell`
     /// because AC10 requires rebinding on an unreachable→reachable transition.
@@ -1384,9 +1382,7 @@ impl LensEngine {
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// #155 test seam: directly enqueue a `ResolveNotebook` onto the resolution queue
-    /// (the production trigger is internal to the enrichment worker). Absent from
-    /// production builds.
+    /// Enqueues a `ResolveNotebook` for testing; the production trigger is in the enrichment worker.
     #[cfg(feature = "test-util")]
     pub fn enqueue_resolution_for_test(&self, notebook_id: &str) {
         let _ = self
@@ -1396,53 +1392,45 @@ impl LensEngine {
             });
     }
 
-    /// #155 test seam: runs one resolution pass synchronously and returns when it
-    /// completes (bypasses the debounced worker for deterministic assertions).
+    /// Runs one resolution pass synchronously, bypassing the debounced worker.
     #[cfg(feature = "test-util")]
     pub async fn resolve_notebook_for_test(&self, notebook_id: &str) -> Result<(), LensError> {
         crate::resolution::worker::resolve_one(self, notebook_id).await
     }
 
-    /// #155 test seam: the per-notebook write lock (the `pub(crate)` `notebook_lock`
-    /// is unreachable from the test crate). Lets a test hold it to simulate the
-    /// enrichment writer and assert the resolution pass serializes behind it.
+    /// Exposes `notebook_lock` (pub(crate)) to the test crate; lets tests simulate the enrichment
+    /// writer holding the lock to assert the resolution pass serializes behind it.
     #[cfg(feature = "test-util")]
     pub fn notebook_lock_for_test(&self, notebook_id: &str) -> Arc<tokio::sync::Mutex<()>> {
         self.notebook_lock(notebook_id)
     }
 
-    /// #155 test seam: number of resolution passes that have run (drain-coalesce
-    /// assertion). Incremented at the start of each [`resolve_one`] pass.
+    /// Count of resolution passes completed (drain-coalesce assertion).
     #[cfg(feature = "test-util")]
     pub fn resolution_pass_count_for_test(&self) -> u32 {
         self.resolution_pass_count
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// #155 test seam: reads (and is bumped by) the resolution pass. `pub(crate)` so
-    /// `resolve_one` can increment it.
     #[cfg(feature = "test-util")]
     pub(crate) fn note_resolution_pass(&self) {
         self.resolution_pass_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// #155 test seam: arms/disarms the single-txn atomicity fault in
-    /// `write_resolution_updates`. Absent from production builds.
+    /// Arms/disarms the write-fault in `write_resolution_updates` (single-txn atomicity seam).
     #[cfg(feature = "test-util")]
     pub fn set_resolution_write_fault_for_test(&self, armed: bool) {
         self.resolution_write_fault
             .store(armed, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// #155: whether the atomicity fault is armed. Always `false` in production.
     #[cfg(feature = "test-util")]
     pub(crate) fn resolution_write_fault_armed(&self) -> bool {
         self.resolution_write_fault
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// #155: whether the atomicity fault is armed. Always `false` in production.
     #[cfg(not(feature = "test-util"))]
     pub(crate) fn resolution_write_fault_armed(&self) -> bool {
         false

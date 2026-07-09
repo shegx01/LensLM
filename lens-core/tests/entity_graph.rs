@@ -165,7 +165,6 @@ async fn count(engine: &LensEngine, table: &str) -> i64 {
         .unwrap_or_else(|_| panic!("count {table}"))
 }
 
-/// Opens the coordinate-derived entity-vector store + `Coordinate` for a notebook.
 async fn ent_store(engine: &LensEngine, nb: &str) -> (LanceVectorStore, Coordinate) {
     let pool = engine.pool().await;
     let data_dir = engine.data_dir_for_test().await;
@@ -203,8 +202,7 @@ async fn seed_active_coord(engine: &LensEngine, nb: &str) {
     .expect("seed active coord");
 }
 
-/// Seeds one entity vector for `(entity_node_id, source_id)` into the notebook's
-/// `ent__` Lance table so the drop-path assertions have something to observe.
+/// Seeds one entity vector into the `ent__` table for testing drop-path assertions.
 async fn seed_ent_vector(
     store: &LanceVectorStore,
     coord: &Coordinate,
@@ -228,7 +226,6 @@ async fn seed_ent_vector(
         .expect("seed entity vector");
 }
 
-/// Counts `ent__` rows for a source via an ANN probe (returns hits whose id we seeded).
 async fn ent_rows_for_source(store: &LanceVectorStore, coord: &Coordinate) -> usize {
     let probe = vec![0.1; coord.dim];
     store
