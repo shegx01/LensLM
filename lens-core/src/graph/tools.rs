@@ -1,7 +1,16 @@
+use std::collections::HashMap;
+
 use sqlx::{Row, SqlitePool};
 
-use super::EntityKind;
+use super::{EntityKind, GraphHit, Relation, blended_edge_weight};
 use crate::LensError;
+
+/// Max neighbor triples returned by [`expand_neighbors`] (log a warning when the
+/// candidate set is truncated to this cap).
+const MAX_TRIPLES: usize = 50;
+
+/// Depth ceiling for [`expand_neighbors`]; larger requests are clamped down.
+const MAX_DEPTH: usize = 2;
 
 /// A collapsed logical entity: one row per distinct (name COLLATE NOCASE, kind)
 /// in a notebook, aggregated across its per-source nodes.
@@ -119,6 +128,233 @@ pub async fn entity_evidence(
     .bind(name)
     .bind(kind.as_str())
     .bind(k as i64)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .iter()
+        .map(|r| r.get::<String, _>("chunk_id"))
+        .collect())
+}
+
+/// A neighbor node reached by the traversal, before logical collapse.
+struct NeighborRow {
+    logical_name: String,
+    kind: EntityKind,
+    relation: Relation,
+    weight: f32,
+}
+
+/// Expands the entity graph outward from `seeds` up to `depth` hops (clamped to 2),
+/// returning neighbor entities ranked by blended edge weight. Traversal is over the
+/// live-source portion of the notebook; results collapse to logical entities
+/// (`COALESCE(canonical_name, name)`), with `chunk_ids` drawn from `entity_mentions`
+/// (not `entity_edges.chunk_id`, which anchors only the first co-occurrence).
+/// `graph_confidence` is max-normalized over the returned set; `relation` is the
+/// neighbor's max-weight edge relation. Empty or zero-match seeds → `Ok(vec![])`.
+pub async fn expand_neighbors(
+    pool: &SqlitePool,
+    notebook_id: &str,
+    seeds: &[(String, EntityKind)],
+    depth: usize,
+) -> Result<Vec<GraphHit>, LensError> {
+    if seeds.is_empty() {
+        return Ok(Vec::new());
+    }
+    let depth = depth.min(MAX_DEPTH);
+    if depth == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Resolve seeds → per-source node ids (canonical-or-raw match, live-source
+    // scoped), mirroring #156a. Seeds are OR-ed as (name, kind) pairs.
+    let mut anchor_sql = String::from(
+        "SELECT en.id
+         FROM entity_nodes en
+         JOIN sources s ON s.id = en.source_id
+         WHERE en.notebook_id = ?1
+           AND s.trashed_at IS NULL AND s.selected = 1
+           AND (",
+    );
+    for i in 0..seeds.len() {
+        if i > 0 {
+            anchor_sql.push_str(" OR ");
+        }
+        let name_param = 2 + i * 2;
+        let kind_param = name_param + 1;
+        anchor_sql.push_str(&format!(
+            "((en.name = ?{name_param} COLLATE NOCASE OR en.canonical_name = ?{name_param} COLLATE NOCASE) AND en.kind = ?{kind_param})"
+        ));
+    }
+    anchor_sql.push(')');
+
+    let mut anchor_q = sqlx::query(&anchor_sql).bind(notebook_id);
+    for (name, kind) in seeds {
+        anchor_q = anchor_q.bind(name.clone()).bind(kind.as_str());
+    }
+    let anchor_rows = anchor_q.fetch_all(pool).await?;
+    if anchor_rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let seed_ids: Vec<String> = anchor_rows.iter().map(|r| r.get("id")).collect();
+
+    // Recursive CTE: walk node ids up to `depth` hops. Each hop expands via a
+    // UNION ALL of `from_node = frontier` and `to_node = frontier` (index-friendly,
+    // not `OR`), excluding self-loops. The `path` column carries the visited node
+    // ids; the join guard `instr(path, ...)` blocks revisits (SQLite has no native
+    // visited-set), so cycles terminate.
+    let seed_ids_csv = seed_ids
+        .iter()
+        .map(|id| format!("'{}'", id.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let cte_sql = format!(
+        "WITH RECURSIVE seed_nodes(id) AS (
+            SELECT id FROM entity_nodes WHERE id IN ({seed_ids_csv})
+         ),
+         walk(node, depth, path) AS (
+            SELECT id, 0, '|' || id || '|' FROM seed_nodes
+            UNION ALL
+            SELECT ee.to_node, w.depth + 1, w.path || ee.to_node || '|'
+            FROM walk w
+            JOIN entity_edges ee ON ee.from_node = w.node
+            WHERE w.depth < ?1
+              AND ee.notebook_id = ?2
+              AND ee.to_node <> w.node
+              AND instr(w.path, '|' || ee.to_node || '|') = 0
+            UNION ALL
+            SELECT ee.from_node, w.depth + 1, w.path || ee.from_node || '|'
+            FROM walk w
+            JOIN entity_edges ee ON ee.to_node = w.node
+            WHERE w.depth < ?1
+              AND ee.notebook_id = ?2
+              AND ee.from_node <> w.node
+              AND instr(w.path, '|' || ee.from_node || '|') = 0
+         )
+         SELECT DISTINCT w.node AS neighbor_id,
+                COALESCE(en.canonical_name, en.name) AS logical_name,
+                en.kind AS kind,
+                ee.relation AS relation,
+                ee.weight AS weight,
+                ee.confidence AS confidence
+         FROM walk w
+         JOIN entity_nodes en ON en.id = w.node
+         JOIN sources s ON s.id = en.source_id
+         JOIN entity_edges ee
+              ON (ee.from_node = w.node OR ee.to_node = w.node)
+             AND ee.notebook_id = ?2
+         JOIN entity_nodes other
+              ON other.id = CASE WHEN ee.from_node = w.node THEN ee.to_node ELSE ee.from_node END
+         JOIN sources os ON os.id = other.source_id
+         WHERE w.depth > 0
+           AND s.trashed_at IS NULL AND s.selected = 1
+           AND os.trashed_at IS NULL AND os.selected = 1
+           AND ee.from_node <> ee.to_node"
+    );
+
+    let rows = sqlx::query(&cte_sql)
+        .bind(depth as i64)
+        .bind(notebook_id)
+        .fetch_all(pool)
+        .await?;
+
+    // Collapse to logical entities: max blended weight per (logical_name, kind),
+    // remembering the relation of that max-weight edge.
+    let mut best: HashMap<(String, EntityKind), NeighborRow> = HashMap::new();
+    for row in &rows {
+        let logical_name: String = row.get("logical_name");
+        let kind_str: String = row.get("kind");
+        let kind = EntityKind::from_db(&kind_str)?;
+        let relation = Relation::from_db(&row.get::<String, _>("relation"));
+        let weight: Option<f64> = row.get("weight");
+        let confidence: Option<f64> = row.get("confidence");
+        let w = blended_edge_weight(&relation, weight, confidence);
+
+        let key = (logical_name.clone(), kind);
+        // A neighbor that is itself a seed match is excluded below; keep it here to
+        // avoid a second query — seeds never appear because depth > 0 rows only.
+        best.entry(key)
+            .and_modify(|nr| {
+                if w > nr.weight {
+                    nr.weight = w;
+                    nr.relation = relation.clone();
+                }
+            })
+            .or_insert(NeighborRow {
+                logical_name,
+                kind,
+                relation,
+                weight: w,
+            });
+    }
+
+    if best.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut neighbors: Vec<NeighborRow> = best.into_values().collect();
+    neighbors.sort_by(|a, b| {
+        b.weight
+            .partial_cmp(&a.weight)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.logical_name.cmp(&b.logical_name))
+    });
+    if neighbors.len() > MAX_TRIPLES {
+        tracing::warn!(
+            notebook_id = %notebook_id,
+            candidates = neighbors.len(),
+            "expand_neighbors: truncating to {MAX_TRIPLES} triples"
+        );
+        neighbors.truncate(MAX_TRIPLES);
+    }
+
+    let max_weight = neighbors.first().map(|n| n.weight).unwrap_or(0.0);
+
+    let mut hits = Vec::with_capacity(neighbors.len());
+    for nr in neighbors {
+        let chunk_ids = neighbor_chunk_ids(pool, notebook_id, &nr.logical_name, nr.kind).await?;
+        let confidence = if max_weight > 0.0 {
+            nr.weight / max_weight
+        } else {
+            0.0
+        };
+        hits.push(GraphHit {
+            name: nr.logical_name,
+            kind: nr.kind,
+            chunk_ids,
+            graph_confidence: confidence,
+            relation: Some(nr.relation.as_str().to_string()),
+        });
+    }
+
+    Ok(hits)
+}
+
+/// Chunk ids mentioning a logical entity (canonical-or-raw match, live-source
+/// scoped), drawn from `entity_mentions`. Ordered by mention count then doc order.
+async fn neighbor_chunk_ids(
+    pool: &SqlitePool,
+    notebook_id: &str,
+    name: &str,
+    kind: EntityKind,
+) -> Result<Vec<String>, LensError> {
+    let rows = sqlx::query(
+        "SELECT em.chunk_id
+         FROM entity_mentions em
+         JOIN entity_nodes en ON en.id = em.entity_node_id
+         JOIN sources s ON s.id = en.source_id
+         JOIN chunks c ON c.id = em.chunk_id
+         WHERE en.notebook_id = ?1
+           AND (en.name = ?2 COLLATE NOCASE OR en.canonical_name = ?2 COLLATE NOCASE)
+           AND en.kind = ?3
+           AND s.trashed_at IS NULL AND s.selected = 1
+         GROUP BY em.chunk_id
+         ORDER BY COUNT(*) DESC, c.level ASC, c.token_start ASC NULLS LAST",
+    )
+    .bind(notebook_id)
+    .bind(name)
+    .bind(kind.as_str())
     .fetch_all(pool)
     .await?;
 

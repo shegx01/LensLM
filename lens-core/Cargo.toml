@@ -75,6 +75,7 @@ tokio-util = { workspace = true }
 sqlx = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
+petgraph = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 # Outbound HTTP client for local runtime detection (system-check probes).

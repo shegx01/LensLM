@@ -37,6 +37,10 @@ sqlx = { version = "=0.8.6", default-features = false, features = [
 # uuid ^1.21. uuid 1.x is API-stable (v7 + serde present throughout 1.x).
 uuid = { version = "=1.23.3", features = ["v7", "serde"] }
 chrono = { version = "=0.4.45", features = ["serde"] }
+# In-memory directed entity graph for #156b PPR/neighbor expansion. No ABI/compat
+# lock (unpinned major); we use only Graph + NodeIndex, not the built-in page_rank
+# (it lacks a personalization vector, so PPR is hand-rolled in graph/ppr.rs).
+petgraph = "0.8"
 serde_json = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
