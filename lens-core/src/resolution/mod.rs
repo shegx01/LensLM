@@ -11,6 +11,10 @@
 //! under-merge is recoverable by a `resolution_prompt_version` bump. Thresholds are
 //! conservative and typed-veto is inherent (only same-`kind` names ever group).
 
+pub mod worker;
+
+pub use worker::{RESOLUTION_PROMPT_VERSION, ResolveNotebook, spawn_resolution_worker};
+
 use std::collections::HashMap;
 
 use async_trait::async_trait;

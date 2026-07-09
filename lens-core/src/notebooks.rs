@@ -333,6 +333,22 @@ pub struct ReembedChunk {
     pub embed_text: String,
 }
 
+/// Raw `entity_nodes` row (`kind` as TEXT) for [`NotebookRepo::list_entity_nodes`].
+/// Mapped into a typed [`crate::graph::EntityNode`] (enum `kind`) at the boundary.
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct EntityNodeRow {
+    id: String,
+    notebook_id: String,
+    source_id: String,
+    kind: String,
+    name: String,
+    canonical_name: Option<String>,
+    definition: Option<String>,
+    resolution_conf: Option<f64>,
+    resolution_prompt_version: Option<String>,
+    created_at: String,
+}
+
 /// Chunk projected for the dev/QA Embeddings Inspector (M4). Read-only view
 /// of identity, hierarchy, citation text, and enrichment metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, sqlx::FromRow)]
@@ -1549,6 +1565,81 @@ impl<'a> NotebookRepo<'a> {
         let mut tx = self.pool.begin().await?;
         write_chunk_enrichment_tx(&mut tx, updates).await?;
         write_entity_graph_tx(&mut tx, graph).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Lists every `entity_nodes` row for a notebook (across all sources) — the input
+    /// set for the #155 cross-document resolution pass. Ordered by `created_at` for a
+    /// deterministic pass over the same notebook.
+    pub async fn list_entity_nodes(
+        &self,
+        notebook_id: &str,
+    ) -> Result<Vec<crate::graph::EntityNode>, LensError> {
+        let rows: Vec<EntityNodeRow> = sqlx::query_as(
+            "SELECT id, notebook_id, source_id, kind, name, canonical_name, definition, \
+                    resolution_conf, resolution_prompt_version, created_at \
+             FROM entity_nodes WHERE notebook_id = ? ORDER BY created_at ASC, id ASC",
+        )
+        .bind(notebook_id)
+        .fetch_all(self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|r| {
+                Ok(crate::graph::EntityNode {
+                    kind: crate::graph::EntityKind::from_db(&r.kind)?,
+                    id: r.id,
+                    notebook_id: r.notebook_id,
+                    source_id: r.source_id,
+                    name: r.name,
+                    canonical_name: r.canonical_name,
+                    definition: r.definition,
+                    resolution_conf: r.resolution_conf,
+                    resolution_prompt_version: r.resolution_prompt_version,
+                    created_at: r.created_at,
+                })
+            })
+            .collect()
+    }
+
+    /// Writes a #155 resolution pass's results in ONE transaction (atomic — a crash
+    /// mid-write leaves no partial resolution state). Stamps `resolution_prompt_version`
+    /// on EVERY node in the notebook (marking the whole set as processed at this
+    /// version), then applies each `ResolutionUpdate`'s `canonical_name`/
+    /// `resolution_conf`. Both writes share the txn so version-stamp and canonical
+    /// assignment always land together. `fault_after_stamp` is a test-only seam
+    /// (always `false` in production) that aborts the txn between the two writes.
+    pub async fn write_resolution_updates(
+        &self,
+        notebook_id: &str,
+        prompt_version: &str,
+        updates: &[crate::resolution::ResolutionUpdate],
+        fault_after_stamp: bool,
+    ) -> Result<(), LensError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("UPDATE entity_nodes SET resolution_prompt_version = ? WHERE notebook_id = ?")
+            .bind(prompt_version)
+            .bind(notebook_id)
+            .execute(&mut *tx)
+            .await?;
+        // Test seam (always `false` in production): abort AFTER the version stamp but
+        // BEFORE the canonical updates. Dropping `tx` unwritten rolls back the stamp
+        // too — proving the write is all-or-nothing.
+        if fault_after_stamp {
+            return Err(LensError::Internal(
+                "resolution write fault (test seam)".to_string(),
+            ));
+        }
+        for update in updates {
+            sqlx::query(
+                "UPDATE entity_nodes SET canonical_name = ?, resolution_conf = ? WHERE id = ?",
+            )
+            .bind(&update.canonical_name)
+            .bind(update.resolution_conf)
+            .bind(&update.entity_node_id)
+            .execute(&mut *tx)
+            .await?;
+        }
         tx.commit().await?;
         Ok(())
     }

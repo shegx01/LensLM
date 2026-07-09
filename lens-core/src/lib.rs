@@ -233,6 +233,15 @@ pub struct LensEngine {
     /// Sender half of the background enrichment queue (M4 Phase 3). `Clone` so it
     /// rides `#[derive(Clone)]`. Dropping every clone closes the channel.
     enrichment_tx: mpsc::Sender<EnrichmentJob>,
+    /// Sender half of the background cross-document resolution queue (#155). Separate
+    /// channel/worker from enrichment: `process_job` fires `ResolveNotebook` only after
+    /// a job fully succeeds. `Clone` rides `#[derive(Clone)]`.
+    resolution_tx: mpsc::Sender<crate::resolution::ResolveNotebook>,
+    /// Per-notebook locks serializing the two `entity_nodes` writers — the enrichment
+    /// writer (`write_enrichment_and_graph`) and the resolution pass. Non-reentrant
+    /// `tokio::sync::Mutex`; the outer `std::sync::Mutex` guards only the fast
+    /// get-or-insert of the per-notebook async lock (never held across an await).
+    notebook_locks: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Active enrichment LLM provider. `RwLock<Option<...>>` rather than `OnceCell`
     /// because AC10 requires rebinding on an unreachable→reachable transition.
     llm_provider: Arc<RwLock<Option<Arc<dyn LlmProvider>>>>,
@@ -272,6 +281,13 @@ pub struct LensEngine {
     /// AC11 test seam: non-zero overrides the per-job LLM-call ceiling.
     #[cfg(feature = "test-util")]
     enrichment_max_calls_override: Arc<std::sync::atomic::AtomicU32>,
+    /// #155 test seam: counts completed resolution passes (drain-coalesce assertion).
+    #[cfg(feature = "test-util")]
+    resolution_pass_count: Arc<std::sync::atomic::AtomicU32>,
+    /// #155 test seam: when `true`, `write_resolution_updates` aborts its txn AFTER the
+    /// version stamp but BEFORE the canonical updates (single-txn atomicity assertion).
+    #[cfg(feature = "test-util")]
+    resolution_write_fault: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl LensEngine {
@@ -341,6 +357,9 @@ impl LensEngine {
 
         let (enrichment_tx, enrichment_rx) =
             mpsc::channel::<EnrichmentJob>(enrichment::ENRICHMENT_QUEUE_CAPACITY);
+        let (resolution_tx, resolution_rx) = mpsc::channel::<crate::resolution::ResolveNotebook>(
+            enrichment::ENRICHMENT_QUEUE_CAPACITY,
+        );
 
         let engine = Self {
             inner: Arc::new(RwLock::new(LensEngineInner { db, config })),
@@ -349,6 +368,8 @@ impl LensEngine {
             tokenizer: Arc::new(OnceCell::new()),
             ingest_lock: Arc::new(Semaphore::new(1)),
             enrichment_tx,
+            resolution_tx,
+            notebook_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             llm_provider: Arc::new(RwLock::new(None)),
             js_renderer: Arc::new(RwLock::new(None)),
             asr_engine: Arc::new(RwLock::new(None)),
@@ -364,9 +385,14 @@ impl LensEngine {
             skip_tokenizer: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "test-util")]
             enrichment_max_calls_override: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            #[cfg(feature = "test-util")]
+            resolution_pass_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            #[cfg(feature = "test-util")]
+            resolution_write_fault: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         enrichment::spawn_worker(engine.clone(), enrichment_rx);
+        crate::resolution::spawn_resolution_worker(engine.clone(), resolution_rx);
 
         // Best-effort model-catalog refresh at startup; a slow/failed fetch degrades
         // to the cached/bundled copy — never blocks init.
@@ -417,6 +443,9 @@ impl LensEngine {
             .expect("migrations should apply to a fresh in-memory db");
         let (enrichment_tx, enrichment_rx) =
             mpsc::channel::<EnrichmentJob>(enrichment::ENRICHMENT_QUEUE_CAPACITY);
+        let (resolution_tx, resolution_rx) = mpsc::channel::<crate::resolution::ResolveNotebook>(
+            enrichment::ENRICHMENT_QUEUE_CAPACITY,
+        );
         let engine = Self {
             inner: Arc::new(RwLock::new(LensEngineInner {
                 db,
@@ -427,6 +456,8 @@ impl LensEngine {
             tokenizer: Arc::new(OnceCell::new()),
             ingest_lock: Arc::new(Semaphore::new(1)),
             enrichment_tx,
+            resolution_tx,
+            notebook_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             llm_provider: Arc::new(RwLock::new(None)),
             js_renderer: Arc::new(RwLock::new(None)),
             asr_engine: Arc::new(RwLock::new(None)),
@@ -442,8 +473,13 @@ impl LensEngine {
             skip_tokenizer: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "test-util")]
             enrichment_max_calls_override: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            #[cfg(feature = "test-util")]
+            resolution_pass_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            #[cfg(feature = "test-util")]
+            resolution_write_fault: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         enrichment::spawn_worker(engine.clone(), enrichment_rx);
+        crate::resolution::spawn_resolution_worker(engine.clone(), resolution_rx);
         engine
     }
 
@@ -753,6 +789,22 @@ impl LensEngine {
 
     pub(crate) fn ingest_lock(&self) -> &Arc<Semaphore> {
         &self.ingest_lock
+    }
+
+    /// Returns the per-notebook write lock, creating it on first use. The enrichment
+    /// writer (around `write_enrichment_and_graph`) and the #155 resolution pass both
+    /// acquire this same lock so the two `entity_nodes` writers never interleave. The
+    /// inner `std::sync::Mutex` is held only for the fast get-or-insert (never across
+    /// an await); the returned `tokio::sync::Mutex` is the actual serialization point.
+    pub(crate) fn notebook_lock(&self, notebook_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self
+            .notebook_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        locks
+            .entry(notebook_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// Installs (or replaces) the active enrichment LLM provider. `None` clears it
@@ -1301,6 +1353,70 @@ impl LensEngine {
     pub fn disable_tokenizer_for_test(&self) {
         self.skip_tokenizer
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// #155 test seam: directly enqueue a `ResolveNotebook` onto the resolution queue
+    /// (the production trigger is internal to the enrichment worker). Absent from
+    /// production builds.
+    #[cfg(feature = "test-util")]
+    pub fn enqueue_resolution_for_test(&self, notebook_id: &str) {
+        let _ = self
+            .resolution_tx
+            .try_send(crate::resolution::ResolveNotebook {
+                notebook_id: notebook_id.to_string(),
+            });
+    }
+
+    /// #155 test seam: runs one resolution pass synchronously and returns when it
+    /// completes (bypasses the debounced worker for deterministic assertions).
+    #[cfg(feature = "test-util")]
+    pub async fn resolve_notebook_for_test(&self, notebook_id: &str) -> Result<(), LensError> {
+        crate::resolution::worker::resolve_one(self, notebook_id).await
+    }
+
+    /// #155 test seam: the per-notebook write lock (the `pub(crate)` `notebook_lock`
+    /// is unreachable from the test crate). Lets a test hold it to simulate the
+    /// enrichment writer and assert the resolution pass serializes behind it.
+    #[cfg(feature = "test-util")]
+    pub fn notebook_lock_for_test(&self, notebook_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.notebook_lock(notebook_id)
+    }
+
+    /// #155 test seam: number of resolution passes that have run (drain-coalesce
+    /// assertion). Incremented at the start of each [`resolve_one`] pass.
+    #[cfg(feature = "test-util")]
+    pub fn resolution_pass_count_for_test(&self) -> u32 {
+        self.resolution_pass_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// #155 test seam: reads (and is bumped by) the resolution pass. `pub(crate)` so
+    /// `resolve_one` can increment it.
+    #[cfg(feature = "test-util")]
+    pub(crate) fn note_resolution_pass(&self) {
+        self.resolution_pass_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// #155 test seam: arms/disarms the single-txn atomicity fault in
+    /// `write_resolution_updates`. Absent from production builds.
+    #[cfg(feature = "test-util")]
+    pub fn set_resolution_write_fault_for_test(&self, armed: bool) {
+        self.resolution_write_fault
+            .store(armed, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// #155: whether the atomicity fault is armed. Always `false` in production.
+    #[cfg(feature = "test-util")]
+    pub(crate) fn resolution_write_fault_armed(&self) -> bool {
+        self.resolution_write_fault
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// #155: whether the atomicity fault is armed. Always `false` in production.
+    #[cfg(not(feature = "test-util"))]
+    pub(crate) fn resolution_write_fault_armed(&self) -> bool {
+        false
     }
 
     /// AC11 budget test seam: `0` restores the production default.
