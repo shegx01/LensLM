@@ -34,10 +34,12 @@ pub async fn entity_lookup(
         .replace('%', r"\%")
         .replace('_', r"\_");
 
-    // canonical_name clauses are inert (NULL) until #155 populates the column.
+    // #155: nodes resolved to the same entity share a `canonical_name`; group and
+    // return by COALESCE(canonical_name, name) so cross-doc aliases collapse into one
+    // result. Unresolved nodes (NULL canonical_name) fall back to their own name.
     let rows = sqlx::query(
         "SELECT
-            en.name,
+            COALESCE(en.canonical_name, en.name) AS name,
             en.kind,
             MIN(en.definition) AS definition,
             COUNT(DISTINCT en.source_id) AS source_count,
@@ -62,8 +64,8 @@ pub async fn entity_lookup(
            OR en.name LIKE '%' || ?2 || '%' ESCAPE '\\'
            OR en.canonical_name LIKE '%' || ?2 || '%' ESCAPE '\\'
           )
-        GROUP BY en.name COLLATE NOCASE, en.kind
-        ORDER BY tier ASC, length(en.name) ASC
+        GROUP BY COALESCE(en.canonical_name, en.name) COLLATE NOCASE, en.kind
+        ORDER BY tier ASC, length(COALESCE(en.canonical_name, en.name)) ASC
         LIMIT ?4",
     )
     .bind(query)
