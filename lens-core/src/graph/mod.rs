@@ -5,16 +5,54 @@
 //! `resolution_conf` are carried but stay `None` in Phase 1 (#155/#156 populate them).
 
 mod build;
+mod ppr;
 mod tools;
 
 pub use build::{ResolvedNode, build_entity_graph_rows, build_node_index};
-pub use tools::{GraphEntity, entity_evidence, entity_lookup};
+pub use ppr::{NotebookGraph, ppr_expand, ppr_expand_capped_for_test};
+pub use tools::{GraphEntity, entity_evidence, entity_lookup, expand_neighbors};
 
 use crate::LensError;
 
+/// A graph-traversal result: a neighbor entity reached from the seed set.
+/// `graph_confidence` is max-normalized over the returned set (top hit ~1.0;
+/// all-zero → 0.0) and is a within-call ranking signal only. `relation` is the
+/// relation of the neighbor's max-weight edge (`expand_neighbors`) or `None`
+/// (`ppr_expand`, where hits are ranked by a global PPR score, not one edge).
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphHit {
+    pub name: String,
+    pub kind: EntityKind,
+    pub chunk_ids: Vec<String>,
+    pub graph_confidence: f32,
+    pub relation: Option<String>,
+}
+
+/// Multiplier applied to a semantic edge's confidence so a typed predicate
+/// outranks a raw co-occurrence of equal nominal strength. Tunable estimate.
+const SEMANTIC_BOOST: f64 = 3.0;
+
+/// Strictly-positive floor on a blended edge weight so PPR normalization never
+/// divides by (or propagates) a zero weight.
+const WEIGHT_FLOOR: f32 = 0.01;
+
+/// Strictly-positive transition/ranking weight for a directed edge, shared by the
+/// `expand_neighbors` post-ranking and the PPR loader. `co_occurs` weight is the
+/// stored co-occurrence count, log-damped; a semantic edge uses its confidence
+/// scaled by [`SEMANTIC_BOOST`]. When a logical pair carries both classes, the
+/// caller takes the `max`. Floored at `0.01` so PPR normalization never divides
+/// by (or propagates) a zero weight.
+fn blended_edge_weight(relation: &Relation, weight: Option<f64>, confidence: Option<f64>) -> f32 {
+    let raw = match relation {
+        Relation::CoOccurs => weight.unwrap_or(1.0).max(0.0).ln_1p(),
+        Relation::Semantic(_) => SEMANTIC_BOOST * confidence.unwrap_or(0.5),
+    };
+    (raw as f32).max(WEIGHT_FLOOR)
+}
+
 /// Entity node kind, stored as plain `TEXT` (no SQL CHECK; the Rust enum is the guard).
 /// `Person`/`Org`/`Location`/`Other` are schema-allowed forward variants unused in Phase 1.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EntityKind {
     Concept,
     Date,
@@ -211,5 +249,35 @@ mod tests {
         ));
         // Empty vocab rejects everything.
         assert!(Relation::semantic("founded", &std::collections::HashSet::new()).is_err());
+    }
+
+    #[test]
+    fn blended_weight_cooccurs_log_damped() {
+        // ln_1p(1) ≈ 0.6931; NULL weight defaults to 1.0.
+        let w = blended_edge_weight(&Relation::CoOccurs, Some(1.0), None);
+        assert!((w - 1.0f64.ln_1p() as f32).abs() < 1e-6);
+        let d = blended_edge_weight(&Relation::CoOccurs, None, None);
+        assert!((d - 1.0f64.ln_1p() as f32).abs() < 1e-6);
+        // Higher count → higher (but log-damped) weight.
+        let hi = blended_edge_weight(&Relation::CoOccurs, Some(10.0), None);
+        assert!(hi > w);
+    }
+
+    #[test]
+    fn blended_weight_semantic_boosted() {
+        let s = Relation::Semantic("founded".to_string());
+        // SEMANTIC_BOOST(3.0) * 0.5 default when confidence is NULL.
+        let d = blended_edge_weight(&s, None, None);
+        assert!((d - (SEMANTIC_BOOST * 0.5) as f32).abs() < 1e-6);
+        let c = blended_edge_weight(&s, None, Some(0.8));
+        assert!((c - (SEMANTIC_BOOST * 0.8) as f32).abs() < 1e-6);
+    }
+
+    #[test]
+    fn blended_weight_floored_strictly_positive() {
+        // A zero-count co_occurs (ln_1p(0)=0) is floored to 0.01, never 0.
+        let z = blended_edge_weight(&Relation::CoOccurs, Some(0.0), None);
+        assert!((z - 0.01).abs() < 1e-6);
+        assert!(z > 0.0);
     }
 }

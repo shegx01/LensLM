@@ -5284,6 +5284,7 @@ dependencies = [
  "lancedb",
  "lens-core",
  "pdfium-render",
+ "petgraph",
  "printpdf",
  "pulldown-cmark",
  "quick-xml 0.41.0",
