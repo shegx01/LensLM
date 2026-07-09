@@ -953,9 +953,8 @@ impl IngestContext<'_> {
 
         // G5 ordering: Lance vectors dropped FIRST, then SQLite chunks — a completed wipe
         // never leaves orphan Lance rows; chunk delete+insert run inside ONE transaction.
-        // #155: the entity-vector drop shares the chunk-vector coordinate and MUST run
-        // before `tx.begin()` too (same Lance-before-SQLite ordering).
         store.drop_source(&coord, source_id).await?;
+        // #155: entity-vector drop (same ordering as the chunk-vector drop above).
         store.drop_entity_source(&coord, source_id).await?;
 
         let mut tx = pool.begin().await?;
@@ -1618,8 +1617,8 @@ async fn wipe_source_content(
         embed_model,
         embed_dim,
     );
-    // #155: drop chunk- AND entity-vectors before the SQLite txn (Lance-before-SQLite).
     store.drop_source(&coord, source_id).await?;
+    // #155: entity-vector drop (same ordering as the chunk-vector drop above).
     store.drop_entity_source(&coord, source_id).await?;
     let mut tx = pool.begin().await?;
     delete_chunks_for_source(&mut tx, source_id).await?;

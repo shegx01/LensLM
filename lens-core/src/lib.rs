@@ -237,10 +237,7 @@ pub struct LensEngine {
     /// channel/worker from enrichment: `process_job` fires `ResolveNotebook` only after
     /// a job fully succeeds. `Clone` rides `#[derive(Clone)]`.
     resolution_tx: mpsc::Sender<crate::resolution::ResolveNotebook>,
-    /// Per-notebook locks serializing the two `entity_nodes` writers — the enrichment
-    /// writer (`write_enrichment_and_graph`) and the resolution pass. Non-reentrant
-    /// `tokio::sync::Mutex`; the outer `std::sync::Mutex` guards only the fast
-    /// get-or-insert of the per-notebook async lock (never held across an await).
+    /// Per-notebook write lock (see `notebook_lock`).
     notebook_locks: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Active enrichment LLM provider. `RwLock<Option<...>>` rather than `OnceCell`
     /// because AC10 requires rebinding on an unreachable→reachable transition.
@@ -736,8 +733,7 @@ impl LensEngine {
                 dim as usize,
             );
             store.drop_source(&coord, source_id).await?;
-            // #155: ent__ tables are NOT in `embedding_index`, so the SQLite cascade
-            // below never reaches them — drop the source's entity vectors per coordinate.
+            // #155: entity-vector drop (same ordering as the chunk-vector drop above).
             store.drop_entity_source(&coord, source_id).await?;
         }
         NotebookRepo::new(&pool).purge_source(source_id).await?;
@@ -1299,11 +1295,8 @@ impl LensEngine {
         Self::gc_orphan_entity_tables(db, data_dir).await
     }
 
-    /// Startup-GC for `ent__` entity-vector tables (#155). These carry no
-    /// `embedding_index` registry, so a crashed `purge_notebook` can leave their Lance
-    /// dirs behind. Conservative: enumerate every `ent__` table and drop only those
-    /// whose notebook id no longer exists in `notebooks` (a live notebook's tables are
-    /// always kept — a stale coordinate is reclaimed with its chunk table on retire).
+    /// Startup-GC for `ent__` entity-vector tables (#155): drops Lance dirs for
+    /// notebooks that no longer exist in the `notebooks` table.
     async fn gc_orphan_entity_tables(db: &SqlitePool, data_dir: &Path) -> Result<(), LensError> {
         let store = crate::vector_store::LanceVectorStore::new(data_dir, db.clone());
         let tables = store.entity_tables_with_notebook().await?;
@@ -1798,9 +1791,7 @@ impl LensEngine {
                 .await?;
         let store = crate::vector_store::LanceVectorStore::new(&data_dir, pool.clone());
         store.drop_notebook_tables(id.as_str()).await?;
-        // #155: `drop_notebook_tables` only reaches chunk-vector tables from the
-        // `embedding_index` registry; ent__ tables carry no registry, so drop them
-        // explicitly (mirrors the Lance-before-SQLite ordering above).
+        // #155: entity-vector drop (same ordering as the chunk-vector drop above).
         store.drop_entity_tables_for_notebook(id.as_str()).await?;
         NotebookRepo::new(&pool).purge(id).await?;
         for (source_id, locator) in &sources {

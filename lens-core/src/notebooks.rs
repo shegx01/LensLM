@@ -333,8 +333,7 @@ pub struct ReembedChunk {
     pub embed_text: String,
 }
 
-/// Raw `entity_nodes` row (`kind` as TEXT) for [`NotebookRepo::list_entity_nodes`].
-/// Mapped into a typed [`crate::graph::EntityNode`] (enum `kind`) at the boundary.
+/// Raw `entity_nodes` row mapped to [`crate::graph::EntityNode`] at the call boundary.
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct EntityNodeRow {
     id: String,

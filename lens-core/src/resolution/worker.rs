@@ -1,11 +1,8 @@
 //! The background cross-document resolution worker (#155, Step 4).
 //!
-//! Runs on its OWN channel, separate from enrichment: `process_job` fires a
-//! [`ResolveNotebook`] only after a job fully succeeds (past the re-embed flip), and
-//! the worker drains all pending messages, dedupes by notebook, and runs one holistic
-//! [`resolve_one`] pass per distinct notebook. The pass owns a FRESH [`SessionBudget`]
-//! (never touches the enrichment budget) and serializes against the enrichment writer
-//! via the engine's per-notebook lock. The write is a single SQLite transaction.
+//! Runs on its own channel (separate from enrichment). Each pass owns a FRESH
+//! [`SessionBudget`] (never touches the enrichment budget) and serializes against
+//! the enrichment writer via the engine's per-notebook lock.
 
 use std::collections::HashSet;
 
@@ -31,12 +28,7 @@ pub struct ResolveNotebook {
     pub notebook_id: String,
 }
 
-/// Spawns the dedicated background resolution worker task.
-///
-/// Drain-based coalescing: on each wake it takes the first message, then drains every
-/// other currently-pending message, dedupes the notebook ids, and runs exactly one
-/// [`resolve_one`] pass per distinct notebook — so a burst of N single-notebook triggers
-/// (a multi-source import) collapses to one pass.
+/// Spawns the background resolution worker; see the module doc for lifecycle.
 pub fn spawn_resolution_worker(engine: LensEngine, mut rx: mpsc::Receiver<ResolveNotebook>) {
     tokio::spawn(async move {
         tracing::debug!("resolution worker started");
@@ -59,10 +51,7 @@ pub fn spawn_resolution_worker(engine: LensEngine, mut rx: mpsc::Receiver<Resolv
     });
 }
 
-/// Runs one full-notebook resolution pass under the per-notebook lock (serialized
-/// against the enrichment writer). Loads all nodes, (re)builds their entity vectors
-/// into the coordinate's `ent__` table, runs the 3-tier cascade with a fresh budget,
-/// and writes the canonical assignments + version stamp in one transaction.
+/// Runs one full-notebook resolution pass; see the module doc for lifecycle.
 pub(crate) async fn resolve_one(engine: &LensEngine, notebook_id: &str) -> Result<(), LensError> {
     #[cfg(feature = "test-util")]
     engine.note_resolution_pass();
@@ -155,8 +144,6 @@ pub(crate) async fn resolve_one(engine: &LensEngine, notebook_id: &str) -> Resul
     let provider = engine.llm_provider().await;
     let cache = SqliteAdjudicationCache { pool: &pool };
 
-    // Fresh, ISOLATED budget: a separate `SessionBudget` so a resolution pass never
-    // decrements the enrichment worker's session counters.
     let session = SessionBudget::new();
     let mut budget = Budget::with_caps(
         session,

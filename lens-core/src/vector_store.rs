@@ -121,19 +121,14 @@ pub struct Hit {
 }
 
 /// A single entity-vector row for the coordinate-derived `ent__` table (#155).
-/// Unlike [`VectorRow`], entity vectors carry the node `kind` for the typed-veto
-/// prefilter and are keyed by `entity_node_id` rather than a chunk id.
+/// Carries `kind` for the typed-veto prefilter; keyed by `entity_node_id`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EntityVectorRow {
-    /// The `entity_nodes.id` this vector embeds.
     pub entity_node_id: String,
-    /// The owning `sources.id` (drop-by-source scoping).
     pub source_id: String,
-    /// The owning notebook id (`.only_if` scoping).
     pub notebook_id: String,
-    /// The entity kind (typed-veto ANN prefilter).
     pub kind: String,
-    /// The embedding vector. MUST match the coordinate's dim.
+    /// MUST match the coordinate's dim.
     pub vector: Vec<f32>,
 }
 
@@ -203,10 +198,9 @@ pub trait VectorStore: Send + Sync {
     async fn retire_coordinate(&self, coord: &Coordinate) -> Result<(), LensError>;
 
     /// Upserts entity vectors into the coordinate-derived `ent__` table (#155),
-    /// creating it on first use. Upsert = delete existing rows for the incoming
-    /// `entity_node_id`s, then insert — so a re-embed replaces. Empty `rows` is a
-    /// no-op. Unlike chunk vectors this has NO registry/building/flip lifecycle;
-    /// the resolution pass rebuilds the table directly.
+    /// creating it on first use. Unlike chunk vectors, `ent__` tables have NO
+    /// `embedding_index` registry/building/flip lifecycle; the resolution pass
+    /// rebuilds the table directly (delete-then-insert per `entity_node_id`).
     async fn upsert_entity_vectors(
         &self,
         coord: &Coordinate,
@@ -233,20 +227,16 @@ pub trait VectorStore: Send + Sync {
         source_id: &str,
     ) -> Result<(), LensError>;
 
-    /// Drops every physical `ent__{notebook}__*` Lance table. Enumerates via
-    /// `table_names()` and prefix-matches, since `ent__` tables are NOT tracked in
-    /// `embedding_index`. Missing tables are a no-op (idempotent).
+    /// Drops every physical `ent__{notebook}__*` Lance table. Missing tables are a no-op.
     async fn drop_entity_tables_for_notebook(&self, notebook: &str) -> Result<(), LensError>;
 
-    /// Enumerates live `ent__{notebook}__*` physical table names (Step 5 GC helper).
+    /// Prefix-match on the coordinate-derived name to enumerate `ent__{notebook}__*` tables.
     async fn entity_table_names_for_notebook(
         &self,
         notebook: &str,
     ) -> Result<Vec<String>, LensError>;
 
-    /// Enumerates every `ent__` physical table across all notebooks (Step 5 startup
-    /// GC): pairs each with the notebook id encoded in its name so orphans (no live
-    /// notebook) can be reclaimed. Malformed names are skipped.
+    /// Enumerates every `ent__` table, paired with its encoded notebook id (startup GC).
     async fn entity_tables_with_notebook(&self) -> Result<Vec<(String, String)>, LensError>;
 }
 

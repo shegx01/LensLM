@@ -1,11 +1,6 @@
-//! Cross-document entity resolution (#155): the pure 3-tier cascade that decides
+//! Cross-document entity resolution (#155): the 3-tier cascade that decides
 //! which per-source [`EntityNode`]s name the same real-world entity and stamps a
 //! shared `canonical_name`/`resolution_conf` onto each member.
-//!
-//! Decoupled from I/O so it is unit-testable offline: the cascade takes an
-//! in-memory node set plus hand-built vectors, a [`VectorStore`] handle, an
-//! optional [`LlmProvider`], and an [`AdjudicationCache`] trait object. The
-//! Step-4 worker wires the real DB/Lance/LLM handles; tests use mocks.
 //!
 //! Correctness bias is **under-merge** (Principle 2): over-merge is unrecoverable,
 //! under-merge is recoverable by a `resolution_prompt_version` bump. Thresholds are
@@ -28,8 +23,7 @@ use crate::graph::EntityNode;
 use crate::llm::LlmProvider;
 use crate::vector_store::{Coordinate, VectorStore};
 
-/// Per-notebook LLM-call ceiling for the resolution pass (own budget, never shares
-/// the enrichment `SessionBudget`). Backstops the persisted adjudication cache.
+/// Per-notebook LLM-call ceiling for the resolution pass.
 pub const RESOLUTION_MAX_CALLS_PER_NOTEBOOK: u32 = 24;
 /// Per-notebook output-token ceiling for the resolution pass.
 pub const RESOLUTION_MAX_TOKENS_PER_NOTEBOOK: u32 = 48_000;
@@ -161,11 +155,7 @@ impl UnionFind {
     }
 }
 
-/// Each node's binding confidence = the minimum edge weight on the tree path linking it
-/// into its group (the weakest link is the conservative bound for a multi-hop chain). The
-/// union edges form a spanning forest, so a non-singleton member always sits on ≥1 edge; a
-/// singleton has none → `None`. The traversal anchor takes the group's overall minimum so
-/// it never reads as more confident than the weakest link holding the group together.
+/// Per-node confidence = minimum edge weight on the spanning-forest path into the group.
 fn node_confidences(n: usize, uf: &UnionFind) -> Vec<Option<f64>> {
     let mut adj: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
     for &(a, b, conf) in &uf.edges {
