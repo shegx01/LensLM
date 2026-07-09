@@ -227,7 +227,7 @@ pdfium-render = { version = "=0.9.2", default-features = false, features = [
 fastembed = "5.17.2"
 # Embedded vector store. lancedb 0.30.0 pins Arrow 58 — every arrow crate below
 # MUST match that major or the binary hits an ABI break (verify: `cargo tree -d`).
-lancedb = "0.30.0"
+lancedb = "0.31.0"
 arrow-array = "58"
 arrow-schema = "58"
 # Layout-aware Markdown parsing → bounded blocks. 0.13.4 fixes a TightParagraph
@@ -279,7 +279,7 @@ wiremock = "0.6"
 # Direct LanceDB reads in the ingest integration tests (orphan-vector assertions
 # in the re-ingest/wipe test). Pinned to the same versions the lib already
 # resolves so no second copy is pulled into the lock tree.
-lancedb = "0.30.0"
+lancedb = "0.31.0"
 # Pure-Rust PDF writer — generates the tiny text-layer PDF fixture IN-TEST (Step 5
 # TDD) so no binary fixture is committed. Dev-only; never in production builds.
 # MIT-licensed (deny.toml allowlist).
