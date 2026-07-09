@@ -499,8 +499,8 @@ async fn write_entity_graph_tx(
         sqlx::query(
             "INSERT OR IGNORE INTO entity_nodes \
                  (id, notebook_id, source_id, kind, name, canonical_name, definition, \
-                  resolution_conf, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                  resolution_conf, resolution_prompt_version, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&node.id)
         .bind(&node.notebook_id)
@@ -510,6 +510,7 @@ async fn write_entity_graph_tx(
         .bind(&node.canonical_name)
         .bind(&node.definition)
         .bind(node.resolution_conf)
+        .bind(&node.resolution_prompt_version)
         .bind(&node.created_at)
         .execute(&mut *conn)
         .await?;

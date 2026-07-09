@@ -114,6 +114,7 @@ pub fn build_entity_graph_rows(
             canonical_name: None,
             definition: None,
             resolution_conf: None,
+            resolution_prompt_version: None,
             created_at: created_at.to_string(),
         });
     }
@@ -134,6 +135,7 @@ pub fn build_entity_graph_rows(
             canonical_name: None,
             definition: None,
             resolution_conf: None,
+            resolution_prompt_version: None,
             created_at: created_at.to_string(),
         });
     }
@@ -156,6 +158,7 @@ pub fn build_entity_graph_rows(
                 canonical_name: None,
                 definition: Some(def.definition.clone()),
                 resolution_conf: None,
+                resolution_prompt_version: None,
                 created_at: created_at.to_string(),
             });
         }

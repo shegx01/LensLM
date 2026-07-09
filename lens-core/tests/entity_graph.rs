@@ -99,6 +99,7 @@ fn sample_rows(nb: &str, source_id: &str, chunk_id: &str) -> EntityGraphRows {
         canonical_name: None,
         definition: None,
         resolution_conf: None,
+        resolution_prompt_version: None,
         created_at: now.clone(),
     };
     let node_b = EntityNode {
@@ -110,6 +111,7 @@ fn sample_rows(nb: &str, source_id: &str, chunk_id: &str) -> EntityGraphRows {
         canonical_name: None,
         definition: None,
         resolution_conf: None,
+        resolution_prompt_version: None,
         created_at: now.clone(),
     };
     let edge = EntityEdge {
@@ -662,6 +664,7 @@ async fn enrichment_with_changed_entities_purges_stale_nodes() {
         canonical_name: None,
         definition: None,
         resolution_conf: None,
+        resolution_prompt_version: None,
         created_at: "2026-01-02T00:00:00Z".to_string(),
     };
     let rows2 = EntityGraphRows {
