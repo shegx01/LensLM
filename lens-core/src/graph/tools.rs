@@ -108,7 +108,7 @@ pub async fn entity_evidence(
         JOIN sources s ON s.id = en.source_id
         JOIN chunks c ON c.id = em.chunk_id
         WHERE en.notebook_id = ?1
-          AND en.name = ?2 COLLATE NOCASE
+          AND (en.name = ?2 COLLATE NOCASE OR en.canonical_name = ?2 COLLATE NOCASE)
           AND en.kind = ?3
           AND s.trashed_at IS NULL AND s.selected = 1
         GROUP BY em.chunk_id

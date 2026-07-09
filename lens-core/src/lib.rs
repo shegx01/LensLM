@@ -1806,6 +1806,11 @@ impl LensEngine {
         for (source_id, locator) in &sources {
             remove_managed_source_file(&data_dir, source_id, locator);
         }
+        // #155: drop the per-notebook write lock so the map does not grow unbounded.
+        self.notebook_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(id.as_str());
         Ok(())
     }
 }

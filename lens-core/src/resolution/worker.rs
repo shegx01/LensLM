@@ -121,8 +121,7 @@ pub(crate) async fn resolve_one(engine: &LensEngine, notebook_id: &str) -> Resul
             crate::embedder::WorkloadKind::Bulk,
         )
         .await?;
-    let texts: Vec<String> = nodes.iter().map(embedding_text).collect();
-    let embed_texts = texts.clone();
+    let embed_texts: Vec<String> = nodes.iter().map(embedding_text).collect();
     let embedder_clone = embedder.clone();
     let vectors =
         tokio::task::spawn_blocking(move || embedder_clone.embed_documents_owned(embed_texts))

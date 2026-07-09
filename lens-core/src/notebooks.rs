@@ -1602,13 +1602,9 @@ impl<'a> NotebookRepo<'a> {
             .collect()
     }
 
-    /// Writes a #155 resolution pass's results in ONE transaction (atomic — a crash
-    /// mid-write leaves no partial resolution state). Stamps `resolution_prompt_version`
-    /// on EVERY node in the notebook (marking the whole set as processed at this
-    /// version), then applies each `ResolutionUpdate`'s `canonical_name`/
-    /// `resolution_conf`. Both writes share the txn so version-stamp and canonical
-    /// assignment always land together. `fault_after_stamp` is a test-only seam
-    /// (always `false` in production) that aborts the txn between the two writes.
+    /// Writes a #155 resolution pass in ONE atomic transaction: resets the notebook's
+    /// resolution columns, stamps `resolution_prompt_version` on every node, then applies
+    /// this pass's canonical assignments (a shrunk group leaves no stale `canonical_name`).
     pub async fn write_resolution_updates(
         &self,
         notebook_id: &str,
@@ -1617,11 +1613,18 @@ impl<'a> NotebookRepo<'a> {
         fault_after_stamp: bool,
     ) -> Result<(), LensError> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query("UPDATE entity_nodes SET resolution_prompt_version = ? WHERE notebook_id = ?")
-            .bind(prompt_version)
-            .bind(notebook_id)
-            .execute(&mut *tx)
-            .await?;
+        // Full reset before re-applying: clears prior-pass canonical/conf so a node that
+        // is no longer in a merged group does not retain a stale alias, while stamping
+        // the current version on the whole notebook.
+        sqlx::query(
+            "UPDATE entity_nodes \
+             SET resolution_prompt_version = ?, canonical_name = NULL, resolution_conf = NULL \
+             WHERE notebook_id = ?",
+        )
+        .bind(prompt_version)
+        .bind(notebook_id)
+        .execute(&mut *tx)
+        .await?;
         // Test seam (always `false` in production): abort AFTER the version stamp but
         // BEFORE the canonical updates. Dropping `tx` unwritten rolls back the stamp
         // too — proving the write is all-or-nothing.

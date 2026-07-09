@@ -768,3 +768,48 @@ async fn evidence_respects_kind() {
         .expect("evidence ok");
     assert_eq!(right_kind, vec!["c1"]);
 }
+
+/// #155: entity_evidence resolves by canonical_name too, so evidence for a resolved
+/// entity spans the chunks of all its aliased nodes across sources.
+#[tokio::test]
+async fn evidence_matches_canonical_aliases() {
+    let (_dir, engine) = file_engine().await;
+    let nb = engine
+        .create_notebook("nb", None, None)
+        .await
+        .expect("create notebook")
+        .id
+        .to_string();
+    let pool = engine.pool().await;
+
+    seed_source(&pool, "sA", &nb, 1, None).await;
+    seed_source(&pool, "sB", &nb, 1, None).await;
+    seed_chunk(&pool, "cA", "sA", 1, Some(0), "text").await;
+    seed_chunk(&pool, "cB", "sB", 1, Some(0), "text").await;
+    seed_entity_node(&pool, "nA", &nb, "sA", "concept", "AWS", None).await;
+    seed_entity_node(
+        &pool,
+        "nB",
+        &nb,
+        "sB",
+        "concept",
+        "Amazon Web Services",
+        None,
+    )
+    .await;
+    for id in ["nA", "nB"] {
+        sqlx::query("UPDATE entity_nodes SET canonical_name = 'Amazon Web Services' WHERE id = ?")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("set canonical");
+    }
+    seed_mention(&pool, "mA", &nb, "nA", "cA", 0).await;
+    seed_mention(&pool, "mB", &nb, "nB", "cB", 0).await;
+
+    let chunks = entity_evidence(&pool, &nb, "Amazon Web Services", EntityKind::Concept, 10)
+        .await
+        .expect("evidence ok");
+    assert_eq!(chunks.len(), 2, "evidence spans both aliased nodes' chunks");
+    assert!(chunks.contains(&"cA".to_string()) && chunks.contains(&"cB".to_string()));
+}

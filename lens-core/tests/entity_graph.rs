@@ -1044,3 +1044,43 @@ async fn purge_notebook_drops_entity_tables() {
         "purge_notebook must physically drop the notebook's ent__ tables"
     );
 }
+
+/// #155: a resolution pass fully resets prior canonical assignments — a node aliased by
+/// an earlier pass but no longer in a merged group must not keep a stale canonical_name.
+#[tokio::test]
+async fn resolution_write_clears_stale_canonical() {
+    let (_dir, engine) = file_engine().await;
+    let (nb, source_id, chunk_id) = seed_source_with_chunk(&engine).await;
+    let pool = engine.pool().await;
+    let repo = NotebookRepo::new(&pool);
+    repo.write_enrichment_and_graph(&[], &sample_rows(&nb, &source_id, &chunk_id))
+        .await
+        .expect("write graph");
+
+    // Simulate a prior resolution pass that aliased this source's nodes.
+    sqlx::query(
+        "UPDATE entity_nodes SET canonical_name = 'Alias', resolution_conf = 0.95, \
+         resolution_prompt_version = 'res-v1' WHERE notebook_id = ?",
+    )
+    .bind(&nb)
+    .execute(&pool)
+    .await
+    .expect("seed prior resolution");
+
+    // A new pass that merges nothing (empty updates) must clear the stale aliases.
+    repo.write_resolution_updates(&nb, "res-v1", &[], false)
+        .await
+        .expect("resolution write");
+
+    let stale: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM entity_nodes WHERE notebook_id = ? AND canonical_name IS NOT NULL",
+    )
+    .bind(&nb)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(
+        stale, 0,
+        "prior-pass canonical_name must be cleared by a fresh pass"
+    );
+}
