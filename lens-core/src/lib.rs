@@ -25,6 +25,7 @@ pub mod model_catalog;
 pub mod notebooks;
 pub mod parse;
 pub mod render;
+pub mod resolution;
 pub mod retrieval;
 pub mod system_check;
 pub mod transcription;
