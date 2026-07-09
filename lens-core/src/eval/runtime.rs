@@ -1,12 +1,6 @@
 //! M13 #158a runtime per-notebook eval harness (gated behind `LENS_RUN_MODEL_TESTS`
-//! for the networked path; the plumbing is exercised offline with a mock LLM).
-//!
-//! Gold is **generation-provenance**: the LLM emits the chunk ids it grounded each
-//! question in (having been shown the chunks WITH their ids in the prompt). This makes
-//! gold independent of BOTH retrievers — `graph_arm` and `hybrid_arm` are both
-//! measured against the same independent provenance gold, so the ≥5pp promotion bar
-//! is genuinely reachable and the comparison is honest. It NEVER mutates
-//! `graph_retrieval_enabled`.
+//! for the networked path; the plumbing is exercised offline with a mock LLM). Never
+//! mutates `graph_retrieval_enabled`. Provenance-gold rationale: see [`super`].
 
 use std::collections::HashSet;
 use std::time::Instant;
@@ -14,7 +8,7 @@ use std::time::Instant;
 use serde::Deserialize;
 use sqlx::SqlitePool;
 
-use super::{graph_arm, hybrid_arm, recall_at_k};
+use super::{graph_arm, hybrid_arm, mean, recall_at_k};
 use crate::LensError;
 use crate::config::RetrievalConfig;
 use crate::embedder::Embedder;
@@ -68,7 +62,8 @@ about 10 of each kind.";
 
 /// One question kind. Rust-enum-validated; stored as lowercase snake_case TEXT
 /// (no SQL CHECK, per repo convention).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum QuestionKind {
     SingleHop,
     Bridging,
@@ -115,9 +110,7 @@ struct EvalQuestion {
     kind: QuestionKind,
     question: String,
     seeds: Vec<SeedEntity>,
-    /// Provenance gold: chunk ids emitted by the LLM and validated against the fed
-    /// corpus. Independent of both `graph_arm` and `hybrid_arm` so the comparison
-    /// is honest and the ≥5pp bar is reachable.
+    /// Provenance gold: LLM-emitted chunk ids validated against the fed corpus.
     gold_chunk_ids: Vec<String>,
 }
 
@@ -146,11 +139,8 @@ pub struct EvalReport {
     pub prompt_version: String,
 }
 
-/// Dependencies for one runtime eval run. Mirrors how `bin/eval.rs::measure_hybrid`
-/// acquires the store/coord; the embedder embeds queries for the retrieval arms and
-/// the LLM provider drives QA-gen. `graph_enabled` is the caller-resolved effective
-/// flag snapshot (via `LensEngine::notebook_graph_retrieval_enabled`) — recorded as
-/// context only, NEVER mutated here.
+/// Dependencies for one runtime eval run. `graph_enabled` is the caller-resolved
+/// effective flag snapshot — recorded as context only, NEVER mutated here.
 pub struct RunEvalDeps<'a> {
     pub pool: &'a SqlitePool,
     pub store: &'a dyn VectorStore,
@@ -557,14 +547,6 @@ async fn persist_log(
     .execute(pool)
     .await?;
     Ok(())
-}
-
-/// Mean of a slice; empty → `0.0` (an empty scored subset scores neutral, not NaN).
-fn mean(xs: &[f32]) -> f32 {
-    if xs.is_empty() {
-        return 0.0;
-    }
-    xs.iter().sum::<f32>() / xs.len() as f32
 }
 
 /// 95th-percentile (nearest-rank) of `xs`; empty → `0.0`. With ~20-30 samples this

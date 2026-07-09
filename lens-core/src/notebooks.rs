@@ -631,21 +631,6 @@ impl<'a> NotebookRepo<'a> {
         .await
     }
 
-    /// Counts live chunks in a notebook — DISTINCT chunk ids joined to live,
-    /// selected sources (same scope as retrieval: `trashed_at IS NULL AND
-    /// selected = 1`). Used by the #158a eval floor (≥50 chunks).
-    pub async fn live_chunk_count(&self, notebook_id: &str) -> Result<i64, LensError> {
-        let n: i64 = sqlx::query_scalar(
-            "SELECT COUNT(DISTINCT c.id) \
-             FROM chunks c JOIN sources s ON c.source_id = s.id \
-             WHERE s.notebook_id = ? AND s.trashed_at IS NULL AND s.selected = 1",
-        )
-        .bind(notebook_id)
-        .fetch_one(self.pool)
-        .await?;
-        Ok(n)
-    }
-
     /// Lists individually-trashed sources whose parent notebook is still live,
     /// ordered by `trashed_at DESC`. Sources under a trashed notebook are excluded.
     /// Uses manual row mapping because `notebook_title` is a JOIN alias.

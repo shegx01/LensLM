@@ -88,7 +88,7 @@ use lens_core::embedder::{
 use lens_core::enrichment::{
     CorefSub, apply_substitutions, compose_embedding_text, compose_prefix,
 };
-use lens_core::eval::{graph_arm, hybrid_arm, recall_at_k};
+use lens_core::eval::{QuestionKind, graph_arm, hybrid_arm, mean, recall_at_k};
 use lens_core::graph::{EntityKind, NotebookGraph};
 use lens_core::parse::{SourceKind, parse_blocks};
 use lens_core::retrieval::{Reranker, hybrid_search};
@@ -145,26 +145,16 @@ struct Query {
 #[derive(Debug, Deserialize)]
 struct GraphQuery {
     query: String,
-    kind: GraphQueryKind,
-    seed_entities: Vec<SeedEntity>,
+    kind: QuestionKind,
+    seed_entities: Vec<RawSeedEntity>,
     gold_markers: Vec<String>,
-}
-
-/// The question class, driving the ablation breakdown. `single_hop` is the control;
-/// `bridging`/`rollup` are where the graph is expected to help.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum GraphQueryKind {
-    SingleHop,
-    Bridging,
-    Rollup,
 }
 
 /// A seed entity for the graph arm. `kind` is a plain string in JSON (mirroring the
 /// runtime harness) and converted to [`EntityKind`] via `EntityKind::from_db` at load,
 /// failing loudly on an unknown kind. `EntityKind` has no serde derive by design.
 #[derive(Debug, Deserialize)]
-struct SeedEntity {
+struct RawSeedEntity {
     name: String,
     kind: String,
 }
@@ -829,57 +819,10 @@ async fn measure_hybrid(
         spec.dim,
     );
 
+    // Namespace ids by notebook so a doc reused across corpora (distractors) never
+    // collides on the source id / content_hash across measurement passes.
     for doc in docs {
-        let blocks = parse_blocks(&doc.text, SourceKind::Markdown);
-        let chunks = chunk_blocks_deterministic(&doc.text, &blocks, tokenizer)?;
-
-        // Namespace ids by notebook so a doc reused across corpora (distractors)
-        // never collides on the source id / content_hash across measurement passes.
-        let source_id = format!("src-{notebook_id}-{}", doc.name);
-        sqlx::query(
-            "INSERT INTO sources (id, notebook_id, kind, title, status, locator, selected, \
-             content_hash, created_at) \
-             VALUES (?, ?, 'text', ?, 'indexed', ?, 1, ?, ?)",
-        )
-        .bind(&source_id)
-        .bind(notebook_id)
-        .bind(&doc.name)
-        .bind(format!("/tmp/{}.md", doc.name))
-        .bind(format!("hash-{source_id}"))
-        .bind(chrono::Utc::now().to_rfc3339())
-        .execute(&pool)
-        .await?;
-
-        let mut rows: Vec<VectorRow> = Vec::with_capacity(chunks.len());
-        let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
-        let vectors = tokio::task::block_in_place(|| embedder.embed_documents(&texts))?;
-        for (chunk, vector) in chunks.iter().zip(vectors.into_iter()) {
-            sqlx::query(
-                "INSERT INTO chunks \
-                 (id, source_id, parent_id, kind, level, section_path, text, \
-                  token_start, token_end, char_start, char_end, block_type, created_at) \
-                 VALUES (?, ?, NULL, ?, ?, ?, ?, 0, 1, 0, ?, 'paragraph', ?)",
-            )
-            .bind(&chunk.id)
-            .bind(&source_id)
-            .bind(if chunk.level == 0 { "parent" } else { "child" })
-            .bind(chunk.level)
-            .bind(&chunk.section_path)
-            .bind(&chunk.text)
-            .bind(chunk.text.len() as i64)
-            .bind(chrono::Utc::now().to_rfc3339())
-            .execute(&pool)
-            .await?;
-            rows.push(VectorRow {
-                chunk_id: chunk.id.clone(),
-                source_id: source_id.clone(),
-                notebook_id: notebook_id.to_string(),
-                level: chunk.level,
-                vector,
-            });
-        }
-        store.add(&coord, rows).await?;
-        println!("ingested {} ({} chunks)", doc.name, chunks.len());
+        ingest_fixture_doc(&pool, &store, embedder, tokenizer, &coord, notebook_id, doc).await?;
     }
 
     let reranker = Reranker::new(data_dir);
@@ -923,13 +866,8 @@ async fn measure_hybrid(
     ))
 }
 
-/// Graph fixture corpus (#158a). Three main docs sharing entities (`Project Meridian`,
-/// `Dr. Elara Voss`, `Kestrel Institute`, `Halden Reactor`) plus five topically competing
-/// distractor docs. The distractors are essential for a real graph-lift measurement:
-/// without a crowded retrieval space (~32 chunks), every chunk lands in the top-5
-/// regardless of method. The distractors cover passive reactor safety, remote energy
-/// storage, institute governance, nuclear safety systems, and funding — all vocabulary
-/// that competes directly with the bridging/rollup gold chunks.
+/// Graph fixture corpus (#158a): three entity-sharing docs plus five topically
+/// competing distractors so bridging/rollup gold does not trivially fill the top-5.
 const GRAPH_DOCS: &[&str] = &[
     "meridian_charter",
     "voss_profile",
@@ -941,13 +879,8 @@ const GRAPH_DOCS: &[&str] = &[
     "energy_programme_funding",
 ];
 
-/// #158a graph-eval gate: compares the graph arm (seed entities → `graph_arm`) against
-/// the hybrid baseline using AUTHORED PROVENANCE GOLD — unique substring markers resolved
-/// to actual chunk ids at runtime. Gold is independent of both retrievers. The fixture is
-/// designed so bridging/rollup gold chunks are lexically distant from the raw query
-/// (distractor docs compete on the same vocabulary) but reachable via entity graph hops.
-/// Gate: FAIL if graph recall@5 < hybrid recall@5 overall (non-regression). PASS[graph-lift]
-/// if bridge+rollup delta ≥ 5pp (genuine graph advantage). Uses the REAL embedder.
+/// #158a graph-eval gate: graph arm vs hybrid baseline over authored provenance gold.
+/// FAIL if graph recall@5 regresses overall or bridge+rollup delta < 5pp.
 async fn run_graph_gate(
     embedder: &dyn Embedder,
     backend: EmbeddingBackend,
@@ -976,7 +909,7 @@ async fn run_graph_gate(
 
     println!("\n############ GRAPH FIXTURE (graph-arm vs hybrid gate) ############");
     for doc in &docs {
-        ingest_graph_doc(
+        ingest_fixture_doc(
             &pool,
             &store,
             embedder,
@@ -1026,16 +959,26 @@ async fn run_graph_gate(
 
     report_graph_ablation(&rows);
 
-    let overall_hybrid = mean(rows.iter().map(|r| r.hybrid_recall));
-    let overall_graph = mean(rows.iter().map(|r| r.graph_recall));
+    let overall_hybrid = mean(&rows.iter().map(|r| r.hybrid_recall).collect::<Vec<f32>>());
+    let overall_graph = mean(&rows.iter().map(|r| r.graph_recall).collect::<Vec<f32>>());
 
     // Bridging + rollup subset drives the graph-lift bar; single_hop is the control arm.
     let lift_rows: Vec<&GraphRow> = rows
         .iter()
-        .filter(|r| matches!(r.kind, GraphQueryKind::Bridging | GraphQueryKind::Rollup))
+        .filter(|r| matches!(r.kind, QuestionKind::Bridging | QuestionKind::Rollup))
         .collect();
-    let lift_hybrid = mean(lift_rows.iter().map(|r| r.hybrid_recall));
-    let lift_graph = mean(lift_rows.iter().map(|r| r.graph_recall));
+    let lift_hybrid = mean(
+        &lift_rows
+            .iter()
+            .map(|r| r.hybrid_recall)
+            .collect::<Vec<f32>>(),
+    );
+    let lift_graph = mean(
+        &lift_rows
+            .iter()
+            .map(|r| r.graph_recall)
+            .collect::<Vec<f32>>(),
+    );
     let lift_delta_pp = (lift_graph - lift_hybrid) * 100.0;
 
     println!("\n=================== #158a GRAPH GATE ===================");
@@ -1074,19 +1017,9 @@ async fn run_graph_gate(
 /// One graph-gate measurement row for the ablation table.
 struct GraphRow {
     query: String,
-    kind: GraphQueryKind,
+    kind: QuestionKind,
     hybrid_recall: f32,
     graph_recall: f32,
-}
-
-fn mean(vals: impl Iterator<Item = f32>) -> f32 {
-    let mut sum = 0.0;
-    let mut n = 0usize;
-    for v in vals {
-        sum += v;
-        n += 1;
-    }
-    if n == 0 { 0.0 } else { sum / n as f32 }
 }
 
 /// Prints the per-kind + per-query recall breakdown (single_hop / bridging / rollup).
@@ -1096,26 +1029,26 @@ fn report_graph_ablation(rows: &[GraphRow]) {
     for r in rows {
         println!(
             "{:<12} {:>8.4} {:>8.4}   {:?}",
-            kind_label(r.kind),
+            r.kind.as_str(),
             r.hybrid_recall,
             r.graph_recall,
             snippet(&r.query)
         );
     }
     for kind in [
-        GraphQueryKind::SingleHop,
-        GraphQueryKind::Bridging,
-        GraphQueryKind::Rollup,
+        QuestionKind::SingleHop,
+        QuestionKind::Bridging,
+        QuestionKind::Rollup,
     ] {
         let subset: Vec<&GraphRow> = rows.iter().filter(|r| r.kind == kind).collect();
         if subset.is_empty() {
             continue;
         }
-        let h = mean(subset.iter().map(|r| r.hybrid_recall));
-        let g = mean(subset.iter().map(|r| r.graph_recall));
+        let h = mean(&subset.iter().map(|r| r.hybrid_recall).collect::<Vec<f32>>());
+        let g = mean(&subset.iter().map(|r| r.graph_recall).collect::<Vec<f32>>());
         println!(
             "-- {:<9} mean: hybrid {:.4}  graph {:.4}  (n={})",
-            kind_label(kind),
+            kind.as_str(),
             h,
             g,
             subset.len()
@@ -1123,27 +1056,20 @@ fn report_graph_ablation(rows: &[GraphRow]) {
     }
 }
 
-fn kind_label(kind: GraphQueryKind) -> &'static str {
-    match kind {
-        GraphQueryKind::SingleHop => "single_hop",
-        GraphQueryKind::Bridging => "bridging",
-        GraphQueryKind::Rollup => "rollup",
-    }
-}
-
-/// Converts fixture `SeedEntity` rows to `(name, EntityKind)` seeds, failing loudly on
+/// Converts fixture `RawSeedEntity` rows to `(name, EntityKind)` seeds, failing loudly on
 /// an unknown kind (`EntityKind` has no serde derive; parsed via `from_db`).
-fn seed_pairs(seeds: &[SeedEntity]) -> Result<Vec<(String, EntityKind)>, LensError> {
+fn seed_pairs(seeds: &[RawSeedEntity]) -> Result<Vec<(String, EntityKind)>, LensError> {
     seeds
         .iter()
         .map(|s| Ok((s.name.clone(), EntityKind::from_db(&s.kind)?)))
         .collect()
 }
 
-/// Ingests one graph-fixture doc into real `sources`+`chunks` rows (so FTS + graph
-/// joins resolve) plus Lance vectors. Mirrors `measure_hybrid`'s ingestion; the source
-/// id is namespaced by notebook so ids never collide across passes.
-async fn ingest_graph_doc(
+/// Ingests one fixture doc into real `sources`+`chunks` rows (so FTS + graph joins
+/// resolve) plus Lance vectors. The source id is namespaced by notebook so ids never
+/// collide across passes. Returns the ingested chunk ids in order.
+#[allow(clippy::too_many_arguments)]
+async fn ingest_fixture_doc(
     pool: &sqlx::SqlitePool,
     store: &LanceVectorStore,
     embedder: &dyn Embedder,
@@ -1151,7 +1077,7 @@ async fn ingest_graph_doc(
     coord: &lens_core::vector_store::Coordinate,
     notebook_id: &str,
     doc: &Doc,
-) -> Result<(), LensError> {
+) -> Result<Vec<String>, LensError> {
     let blocks = parse_blocks(&doc.text, SourceKind::Markdown);
     let chunks = chunk_blocks_deterministic(&doc.text, &blocks, tokenizer)?;
 
@@ -1171,6 +1097,7 @@ async fn ingest_graph_doc(
     .await?;
 
     let mut rows: Vec<VectorRow> = Vec::with_capacity(chunks.len());
+    let mut chunk_ids: Vec<String> = Vec::with_capacity(chunks.len());
     let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
     let vectors = tokio::task::block_in_place(|| embedder.embed_documents(&texts))?;
     for (chunk, vector) in chunks.iter().zip(vectors.into_iter()) {
@@ -1197,17 +1124,15 @@ async fn ingest_graph_doc(
             level: chunk.level,
             vector,
         });
+        chunk_ids.push(chunk.id.clone());
     }
     store.add(coord, rows).await?;
     println!("ingested {} ({} chunks)", doc.name, chunks.len());
-    Ok(())
+    Ok(chunk_ids)
 }
 
-/// Inserts hand-authored `entity_nodes` / `entity_edges` / `entity_mentions` keyed to
-/// the ACTUAL ingested chunk ids. Each seed entity is created as a per-source node and
-/// its mentions are linked to the query's authored gold chunk ids, so `graph_arm`'s
-/// `entity_evidence` retrieves exactly those chunks. Co-occurrence edges between seed
-/// nodes give `ppr_expand` real graph structure to traverse. Deterministic — no LLM.
+/// Inserts hand-authored nodes/mentions/edges keyed to the ACTUAL ingested chunk ids so
+/// `graph_arm` retrieves the gold and `ppr_expand` has real structure. Deterministic.
 async fn load_graph_rows(
     pool: &sqlx::SqlitePool,
     notebook_id: &str,

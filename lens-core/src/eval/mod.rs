@@ -35,15 +35,19 @@ pub fn recall_at_k(retrieved: &[String], gold: &[String], k: usize) -> f32 {
     hits as f32 / gold.len() as f32
 }
 
+/// Mean of a slice; empty → `0.0` (an empty scored subset scores neutral, not NaN).
+pub fn mean(xs: &[f32]) -> f32 {
+    if xs.is_empty() {
+        return 0.0;
+    }
+    xs.iter().sum::<f32>() / xs.len() as f32
+}
+
 /// Tool-level graph retrieval for one question's seed entities, agent-agnostic.
-///
-/// Merge order (LOCKED, #158a): (1) `entity_evidence` chunks per seed at a fixed
-/// confidence `1.0` (direct mentions outrank expansion); (2) `ppr_expand` chunks
-/// at each hit's `graph_confidence` (ppr_expand internally falls back to
-/// `expand_neighbors` on oversized graphs, so it is the single expansion source).
-/// Dedup by `chunk_id` keeping the highest confidence; stable sort by confidence
-/// DESC with first-seen breaking ties (so evidence precedes equal-confidence
-/// expansion); truncate to `k`. Seeds are the question's own, never notebook-wide.
+/// Merge invariant (LOCKED, #158a): evidence (direct mentions, fixed conf 1.0)
+/// precedes equal-confidence `ppr_expand` output; see [`merge_ranked`].
+// #21 should extract this seed→chunk composition into a shared module, not import
+// graph_arm from eval.
 pub async fn graph_arm(
     pool: &SqlitePool,
     graph: &NotebookGraph,
@@ -67,11 +71,10 @@ pub async fn graph_arm(
     Ok(merge_ranked(evidence, expansion, k))
 }
 
-/// The LOCKED graph_arm merge (extracted pure for offline testing). `evidence`
-/// chunks (direct mentions) get a fixed confidence `1.0` in call order; each
-/// `expansion` entry carries its traversal `graph_confidence`. Dedup by chunk id
-/// keeping the highest confidence; stable sort by confidence DESC with first-seen
-/// breaking ties (so evidence precedes equal-confidence expansion); truncate to `k`.
+/// The LOCKED graph_arm merge (extracted pure for offline testing). `evidence` gets
+/// fixed conf `1.0` in call order; `expansion` carries traversal `graph_confidence`.
+/// Dedup by chunk id keeping the highest conf; stable sort conf DESC, first-seen
+/// tie-break (evidence precedes equal-conf expansion); truncate to `k`.
 fn merge_ranked(evidence: Vec<String>, expansion: Vec<(String, f32)>, k: usize) -> Vec<String> {
     // chunk_id -> (best confidence, first-seen ordinal).
     let mut best: HashMap<String, (f32, usize)> = HashMap::new();
@@ -108,9 +111,7 @@ fn insert_ranked(
         });
 }
 
-/// The pre-graph hybrid baseline as bare `chunk_id`s — the arm the graph is scored
-/// against. Gold is generation-provenance (independent of both arms), so this can
-/// score <1.0 and graph can genuinely beat it. Thin wrapper over [`hybrid_search`];
+/// The hybrid baseline arm as bare `chunk_id`s — thin wrapper over [`hybrid_search`];
 /// the caller owns the query embedding (both feeders already have an embedder).
 #[allow(clippy::too_many_arguments)]
 pub async fn hybrid_arm(

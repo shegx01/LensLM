@@ -1,8 +1,8 @@
 -- M13 #158a: entity-graph eval harness + opt-in gate. Adds the per-notebook
 -- graph-retrieval override, the synthetic-QA store, and the ablation log. The
 -- eval only writes evidence here; it never flips the flag (that is the user, in
--- #158b). Gold chunk ids are derived from pre-graph hybrid_search, never the
--- graph — the tables store the result, not the derivation.
+-- #158b). Gold chunk ids are generation-provenance (LLM-emitted from the fed corpus)
+-- or hand-authored fixture markers — independent of both retrievers.
 
 -- Per-notebook override of the app-wide RetrievalConfig.graph_retrieval_enabled.
 -- NULL = inherit the app default. Not consumed by live retrieval until #21.

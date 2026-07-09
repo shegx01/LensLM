@@ -25,6 +25,9 @@ use lens_core::{DEFAULT_EMBED_DIM, LensEngine, LensError, RetrievalConfig};
 use sqlx::SqlitePool;
 use tempfile::TempDir;
 
+mod common;
+use common::{seed_edge, seed_entity_node, seed_mention};
+
 /// Deterministic offline embedder: maps any text to a seeded unit vector of the
 /// default dim. Query embedding is needed for the measurement arms; gold correctness
 /// is independent (provenance, not retrieval).
@@ -108,16 +111,9 @@ fn canned_qa(s0_c0: &str, s0_c1: &str) -> String {
     )
 }
 
-/// Canned QA with all-hallucinated gold ids (ids not present in the fed corpus).
-/// `run_llm_with_retries` will exhaust retries (each attempt fails parse → reprompt)
-/// and return `None` → `generate_qa` yields an empty vec → zero questions scored.
-/// `dropped_n` stays 0 (no questions survived parse to be dropped post-seed-check).
-///
-/// To test the `dropped_n` path for valid-parse but zero-valid-gold-after-live-check,
-/// we use ids that ARE in the fed set but point to chunks in a deselected source.
-/// However, the simpler and equally honest path is: provide valid fed-corpus ids but
-/// mark those chunks' sources as deselected — then `live_chunk_id` returns false and
-/// the question is dropped with `dropped_n += 1`.
+/// Canned QA with all-hallucinated gold ids (absent from the fed corpus): every parse
+/// attempt fails → `run_llm_with_retries` returns `None` → `generate_qa` yields an
+/// empty vec → zero questions scored, `dropped_n` stays 0.
 fn canned_qa_hallucinated_gold() -> String {
     // These ids will never appear in the fed corpus (harness prefixes chunk ids
     // deterministically; "HALLUCINATED" is not a valid prefix), so parse fails on
@@ -203,53 +199,44 @@ async fn insert_graph_rows(
     anchor_chunk: &str,
 ) {
     let source_id = format!("src-{source_tag}");
-    let now = "2026-01-01T00:00:00Z";
     let mut node_ids = Vec::new();
     for (suffix, name) in NOTEBOOK_SEEDS {
         let node_id = format!("{source_id}-{suffix}");
-        sqlx::query(
-            "INSERT INTO entity_nodes (id, notebook_id, source_id, kind, name, created_at) \
-             VALUES (?, ?, ?, 'concept', ?, ?)",
+        seed_entity_node(
+            pool,
+            &node_id,
+            notebook_id,
+            &source_id,
+            "concept",
+            name,
+            None,
         )
-        .bind(&node_id)
-        .bind(notebook_id)
-        .bind(&source_id)
-        .bind(name)
-        .bind(now)
-        .execute(pool)
-        .await
-        .expect("insert node");
-        sqlx::query(
-            "INSERT INTO entity_mentions \
-             (id, notebook_id, entity_node_id, chunk_id, char_start, char_end, created_at) \
-             VALUES (?, ?, ?, ?, 0, 5, ?)",
+        .await;
+        seed_mention(
+            pool,
+            &format!("{node_id}-m"),
+            notebook_id,
+            &node_id,
+            anchor_chunk,
+            0,
         )
-        .bind(format!("{node_id}-m"))
-        .bind(notebook_id)
-        .bind(&node_id)
-        .bind(anchor_chunk)
-        .bind(now)
-        .execute(pool)
-        .await
-        .expect("insert mention");
+        .await;
         node_ids.push(node_id);
     }
     // One co-occurrence edge (Alice—Bob) so the graph has a traversable structure.
-    sqlx::query(
-        "INSERT INTO entity_edges \
-         (id, notebook_id, source_id, chunk_id, from_node, to_node, relation, weight, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, 'co_occurs', 1.0, ?)",
+    seed_edge(
+        pool,
+        &format!("{source_id}-e"),
+        notebook_id,
+        &source_id,
+        anchor_chunk,
+        &node_ids[0],
+        &node_ids[1],
+        "co_occurs",
+        Some(1.0),
+        None,
     )
-    .bind(format!("{source_id}-e"))
-    .bind(notebook_id)
-    .bind(&source_id)
-    .bind(anchor_chunk)
-    .bind(&node_ids[0])
-    .bind(&node_ids[1])
-    .bind(now)
-    .execute(pool)
-    .await
-    .expect("insert edge");
+    .await;
 }
 
 /// The notebook's default coordinate (nomic/fastembed), for the vector store.
@@ -485,30 +472,8 @@ async fn live_gold_check_drops_deselected_source_chunks() {
     let s0 = insert_source_with_chunks(&pool, &nb, "s0", 20).await;
     insert_source_with_chunks(&pool, &nb, "s1", 20).await;
     insert_source_with_chunks(&pool, &nb, "s2", 15).await;
-    // Deselected source with 5 chunks — contributes to the fed context (they are
-    // queried before the live-check; they appear in `entity_dense_context` which
-    // does not apply the live filter on context). We need them to appear in the fed
-    // context so the parse step accepts the gold id, then the live-check drops it.
-    // Actually entity_dense_context does apply the live filter (selected=1), so
-    // deselected chunks are NOT in the fed context → would be a hallucinated id →
-    // fails parse. To get a post-parse drop we need valid-fed ids that later fail
-    // the live-check. The cleanest way: insert a source as selected, collect its ids
-    // into the fed context (they appear at eval time), then mark it deselected AFTER
-    // the context is computed but BEFORE live_chunk_id runs — but the harness runs
-    // in sequence so we cannot interleave. Instead, we use a different scenario:
-    // provide gold ids from s0 (live + fed), which pass both parse AND live-check,
-    // mixed with a question whose seeds are absent → that question is dropped with
-    // dropped_n += 1 at the seed step. This exercises the same `dropped_n` counter.
-    //
-    // For a pure live-gold drop, use a custom approach: insert the deselected source
-    // BEFORE the engine run so its chunks ARE in the context (as unselected, they
-    // are excluded from entity_dense_context by selected=1 filter)... this cannot
-    // be forced through the sequential harness.
-    //
-    // Pragmatic decision: this test validates the seed-drop path (dropped_n += 1 for
-    // zero-graph-seed questions), which is equivalent coverage of the drop counter.
-    // The live-gold-check path is covered by the unit test for `live_chunk_id` above
-    // (it is a straightforward DB query, not requiring integration setup).
+    // Asserts the `dropped_n` counter via the ghost-seed drop path (a question whose
+    // seeds are absent from the graph); the pure live-gold drop is covered by unit tests.
     insert_graph_rows(&pool, &nb, "s0", &s0[0]).await;
 
     let store = LanceVectorStore::new(dir.path(), pool.clone());
