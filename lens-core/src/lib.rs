@@ -736,6 +736,9 @@ impl LensEngine {
                 dim as usize,
             );
             store.drop_source(&coord, source_id).await?;
+            // #155: ent__ tables are NOT in `embedding_index`, so the SQLite cascade
+            // below never reaches them — drop the source's entity vectors per coordinate.
+            store.drop_entity_source(&coord, source_id).await?;
         }
         NotebookRepo::new(&pool).purge_source(source_id).await?;
         // Best-effort: remove managed source file + siblings; a missing file is not an error.
@@ -1278,19 +1281,52 @@ impl LensEngine {
         )
         .fetch_all(db)
         .await?;
-        if table_names.is_empty() {
+        if !table_names.is_empty() {
+            let store = crate::vector_store::LanceVectorStore::new(data_dir, db.clone());
+            // Drop tables first (idempotent), then delete rows. A crash between the two
+            // leaves only a dangling stale row; the next startup's GC no-ops the drop.
+            crate::vector_store::VectorStore::drop_tables(&store, &table_names).await?;
+            sqlx::query("DELETE FROM embedding_index WHERE status IN ('building', 'stale')")
+                .execute(db)
+                .await?;
+            tracing::info!(
+                count = table_names.len(),
+                "startup-GC reclaimed orphan building/stale embedding tables"
+            );
+        }
+        // ent__ tables carry no registry, so their GC runs regardless of the
+        // building/stale scan above (a crashed purge_notebook orphans them alone).
+        Self::gc_orphan_entity_tables(db, data_dir).await
+    }
+
+    /// Startup-GC for `ent__` entity-vector tables (#155). These carry no
+    /// `embedding_index` registry, so a crashed `purge_notebook` can leave their Lance
+    /// dirs behind. Conservative: enumerate every `ent__` table and drop only those
+    /// whose notebook id no longer exists in `notebooks` (a live notebook's tables are
+    /// always kept — a stale coordinate is reclaimed with its chunk table on retire).
+    async fn gc_orphan_entity_tables(db: &SqlitePool, data_dir: &Path) -> Result<(), LensError> {
+        let store = crate::vector_store::LanceVectorStore::new(data_dir, db.clone());
+        let tables = store.entity_tables_with_notebook().await?;
+        if tables.is_empty() {
             return Ok(());
         }
-        let store = crate::vector_store::LanceVectorStore::new(data_dir, db.clone());
-        // Drop tables first (idempotent), then delete rows. A crash between the two
-        // leaves only a dangling stale row; the next startup's GC no-ops the drop.
-        crate::vector_store::VectorStore::drop_tables(&store, &table_names).await?;
-        sqlx::query("DELETE FROM embedding_index WHERE status IN ('building', 'stale')")
-            .execute(db)
-            .await?;
+        let mut orphans: Vec<String> = Vec::new();
+        for (table, notebook_id) in tables {
+            let live: Option<i64> = sqlx::query_scalar("SELECT 1 FROM notebooks WHERE id = ?")
+                .bind(&notebook_id)
+                .fetch_optional(db)
+                .await?;
+            if live.is_none() {
+                orphans.push(table);
+            }
+        }
+        if orphans.is_empty() {
+            return Ok(());
+        }
+        crate::vector_store::VectorStore::drop_tables(&store, &orphans).await?;
         tracing::info!(
-            count = table_names.len(),
-            "startup-GC reclaimed orphan building/stale embedding tables"
+            count = orphans.len(),
+            "startup-GC reclaimed orphan entity-vector tables"
         );
         Ok(())
     }
@@ -1762,6 +1798,10 @@ impl LensEngine {
                 .await?;
         let store = crate::vector_store::LanceVectorStore::new(&data_dir, pool.clone());
         store.drop_notebook_tables(id.as_str()).await?;
+        // #155: `drop_notebook_tables` only reaches chunk-vector tables from the
+        // `embedding_index` registry; ent__ tables carry no registry, so drop them
+        // explicitly (mirrors the Lance-before-SQLite ordering above).
+        store.drop_entity_tables_for_notebook(id.as_str()).await?;
         NotebookRepo::new(&pool).purge(id).await?;
         for (source_id, locator) in &sources {
             remove_managed_source_file(&data_dir, source_id, locator);

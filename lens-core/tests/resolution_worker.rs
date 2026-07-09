@@ -16,6 +16,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
+use lens_core::graph::{EntityGraphRows, EntityKind, EntityNode};
+use lens_core::notebooks::NotebookRepo;
 use lens_core::{CountingEmbedder, Embedder, EmbeddingBackend, LensEngine};
 use sqlx::Row;
 use tempfile::TempDir;
@@ -385,4 +387,110 @@ async fn write_txn_is_atomic_no_partial_state_on_fault() {
             "the version stamp must roll back too (single-txn atomicity)"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Re-enrichment resets resolution columns (S5): a model-only re-enrichment
+// delete-then-reinserts a source's nodes with NULL resolution columns, so no stale
+// canonical_name survives; the next resolution pass repopulates them.
+// ---------------------------------------------------------------------------
+
+/// Builds an `EntityNode` with the given id/name (all resolution columns NULL, as the
+/// enrichment path always produces).
+fn enrich_node(id: &str, nb: &str, source: &str, name: &str) -> EntityNode {
+    EntityNode {
+        id: id.to_string(),
+        notebook_id: nb.to_string(),
+        source_id: source.to_string(),
+        kind: EntityKind::Concept,
+        name: name.to_string(),
+        canonical_name: None,
+        definition: Some("a cloud".to_string()),
+        resolution_conf: None,
+        resolution_prompt_version: None,
+        created_at: "2026-01-01T00:00:00Z".to_string(),
+    }
+}
+
+#[tokio::test]
+async fn re_enrichment_resets_resolution_columns_then_repopulates() {
+    let (_dir, engine) = test_engine().await;
+    let nb = seed_notebook_with_active_coord(&engine).await;
+    let s1 = seed_source(&engine, &nb).await;
+    let s2 = seed_source(&engine, &nb).await;
+    let pool = engine.pool().await;
+    let repo = NotebookRepo::new(&pool);
+
+    let n1 = format!("{s1}-node");
+    let n2 = format!("{s2}-node");
+    // Enrichment writes both aliased nodes (resolution columns NULL).
+    repo.write_enrichment_and_graph(
+        &[],
+        &EntityGraphRows {
+            source_id: s1.clone(),
+            nodes: vec![enrich_node(&n1, &nb, &s1, "AWS")],
+            edges: vec![],
+            mentions: vec![],
+            dropped_cooccurrence: 0,
+        },
+    )
+    .await
+    .expect("write s1");
+    repo.write_enrichment_and_graph(
+        &[],
+        &EntityGraphRows {
+            source_id: s2.clone(),
+            nodes: vec![enrich_node(&n2, &nb, &s2, "aws")],
+            edges: vec![],
+            mentions: vec![],
+            dropped_cooccurrence: 0,
+        },
+    )
+    .await
+    .expect("write s2");
+
+    // First resolution pass aliases the two into one canonical group.
+    engine
+        .resolve_notebook_for_test(&nb)
+        .await
+        .expect("first resolution pass");
+    let (c1, _, v1) = node_resolution(&engine, &n1).await;
+    assert_eq!(c1.as_deref(), Some("AWS"), "aliased and canonicalized");
+    assert!(v1.is_some(), "version-stamped");
+
+    // A model-only re-enrichment re-inserts s1's node (same id) with NULL resolution
+    // columns — the self-replacing write deletes the resolved row first, so no stale
+    // canonical_name can survive.
+    repo.write_enrichment_and_graph(
+        &[],
+        &EntityGraphRows {
+            source_id: s1.clone(),
+            nodes: vec![enrich_node(&n1, &nb, &s1, "AWS")],
+            edges: vec![],
+            mentions: vec![],
+            dropped_cooccurrence: 0,
+        },
+    )
+    .await
+    .expect("re-enrich s1");
+
+    let (c1_reset, conf_reset, v_reset) = node_resolution(&engine, &n1).await;
+    assert!(
+        c1_reset.is_none() && conf_reset.is_none() && v_reset.is_none(),
+        "re-enrichment resets the re-inserted node's resolution columns to NULL \
+         (no stale canonical_name survives)"
+    );
+
+    // The debounced pass re-resolves the whole notebook and repopulates.
+    engine
+        .resolve_notebook_for_test(&nb)
+        .await
+        .expect("second resolution pass");
+    let (c1_again, _, v_again) = node_resolution(&engine, &n1).await;
+    assert_eq!(
+        c1_again.as_deref(),
+        Some("AWS"),
+        "a resolution pass repopulates canonical_name after re-enrichment"
+    );
+    assert!(v_again.is_some(), "re-stamped");
 }

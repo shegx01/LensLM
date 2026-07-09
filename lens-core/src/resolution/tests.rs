@@ -150,6 +150,9 @@ impl VectorStore for MockStore {
     async fn entity_table_names_for_notebook(&self, _n: &str) -> Result<Vec<String>, LensError> {
         unreachable!()
     }
+    async fn entity_tables_with_notebook(&self) -> Result<Vec<(String, String)>, LensError> {
+        unreachable!()
+    }
 }
 
 /// A counting mock cache. `get` returns a preseeded verdict (and counts hits); `put`

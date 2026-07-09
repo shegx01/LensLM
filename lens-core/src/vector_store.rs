@@ -243,6 +243,11 @@ pub trait VectorStore: Send + Sync {
         &self,
         notebook: &str,
     ) -> Result<Vec<String>, LensError>;
+
+    /// Enumerates every `ent__` physical table across all notebooks (Step 5 startup
+    /// GC): pairs each with the notebook id encoded in its name so orphans (no live
+    /// notebook) can be reclaimed. Malformed names are skipped.
+    async fn entity_tables_with_notebook(&self) -> Result<Vec<(String, String)>, LensError>;
 }
 
 /// Slugifies a model id into a table-safe token: `nomic-embed-text-v1.5` →
@@ -1478,6 +1483,28 @@ impl VectorStore for LanceVectorStore {
             .filter(|t| t.starts_with(&prefix))
             .collect())
     }
+
+    async fn entity_tables_with_notebook(&self) -> Result<Vec<(String, String)>, LensError> {
+        let conn = self.connect().await?;
+        let existing = conn
+            .table_names()
+            .execute()
+            .await
+            .map_err(|e| LensError::Vector(format!("lancedb table_names failed: {e}")))?;
+        Ok(existing
+            .into_iter()
+            .filter_map(|t| entity_table_notebook(&t).map(|nb| (t, nb)))
+            .collect())
+    }
+}
+
+/// Decodes the notebook id from an `ent__{notebook}__…` table name, or `None` for a
+/// name that is not an `ent__` table. Notebook ids are UUIDv7 (no `__`), so the id is
+/// the segment between the leading `ent__` and the next `__` delimiter.
+fn entity_table_notebook(name: &str) -> Option<String> {
+    let rest = name.strip_prefix("ent__")?;
+    let end = rest.find("__")?;
+    Some(rest[..end].to_string())
 }
 
 #[cfg(test)]
@@ -1665,6 +1692,20 @@ mod tests {
             ),
             "ent__nb1__fastembed__nomic_v15__d768"
         );
+    }
+
+    #[test]
+    fn entity_table_notebook_round_trips_and_rejects_non_ent() {
+        let name = entity_table_name(
+            "nb-abc",
+            EmbeddingBackend::Fastembed,
+            "nomic-embed-text-v1.5",
+            768,
+        );
+        assert_eq!(entity_table_notebook(&name).as_deref(), Some("nb-abc"));
+        // Chunk-vector tables and anything without the ent__ prefix are ignored.
+        assert_eq!(entity_table_notebook("vec__nb__fastembed__nomic_v15__d768"), None);
+        assert_eq!(entity_table_notebook("ent__no_delimiter"), None);
     }
 
     #[test]
