@@ -1401,7 +1401,6 @@ async fn resolve_gold_markers(
                 )));
             }
             1 => {
-                // matches.len() == 1 so into_iter().next() is always Some.
                 if let Some(id) = matches.into_iter().next()
                     && !ids.contains(&id)
                 {

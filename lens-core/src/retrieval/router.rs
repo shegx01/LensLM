@@ -376,7 +376,6 @@ async fn assemble_tier2(
 ) -> Result<Vec<ContextUnit>, LensError> {
     let retrieved = hydrate_retrieved(pool, hits, graph_conf).await?;
 
-    // Group retrieved children by parent to evaluate the ≥50% merge boundary.
     let mut by_parent: HashMap<String, Vec<RetrievedChunk>> = HashMap::new();
     let mut orphans: Vec<RetrievedChunk> = Vec::new();
     for rc in retrieved {
@@ -386,8 +385,6 @@ async fn assemble_tier2(
         }
     }
 
-    // Provenance of a merged parent unit: merge the child sources (graph membership
-    // wins its own tag; otherwise the fused source of the children).
     #[derive(Clone)]
     struct Candidate {
         chunk_id: String,
@@ -449,7 +446,6 @@ async fn assemble_tier2(
         });
     }
 
-    // Re-sort survivors to document order.
     let mut keyed: Vec<((usize, i32, i64), Candidate)> = Vec::with_capacity(candidates.len());
     for c in candidates {
         let key = doc_order_key(pool, &c.chunk_id, source_rank).await?;
@@ -457,7 +453,6 @@ async fn assemble_tier2(
     }
     keyed.sort_by(|a, b| a.0.cmp(&b.0));
 
-    // Trim to the tier-2 cap by running `chars/4` estimate.
     let mut units = Vec::new();
     let mut running = 0usize;
     for (order_index, (_, c)) in keyed.into_iter().enumerate() {
@@ -531,6 +526,12 @@ const STOP_WORDS: &[&str] = &[
 /// the per-query `entity_lookup` fan-out (mirrors the graph module's cap discipline).
 const MAX_SEED_SPAN: usize = 5;
 
+/// Ceiling on the number of leading content tokens considered for seed spans. Query
+/// text is user-controlled; without this, a pasted long query would drive an
+/// `O(MAX_SEED_SPAN * tokens)` `entity_lookup` fan-out. A relational question's
+/// entities appear early, so the leading window loses nothing in practice.
+const MAX_SEED_TOKENS: usize = 64;
+
 /// Tokenizes on whitespace/punctuation, lowercased.
 fn content_tokens(text: &str) -> Vec<String> {
     text.split(|c: char| !c.is_alphanumeric())
@@ -558,7 +559,8 @@ async fn resolve_seeds(
     notebook_id: &str,
     query: &str,
 ) -> Result<SeedResolution, LensError> {
-    let tokens = content_tokens(query);
+    let mut tokens = content_tokens(query);
+    tokens.truncate(MAX_SEED_TOKENS);
     let mut claimed = vec![false; tokens.len()];
     let mut seeds: Vec<(String, EntityKind)> = Vec::new();
     let mut seen: HashSet<(String, EntityKind)> = HashSet::new();

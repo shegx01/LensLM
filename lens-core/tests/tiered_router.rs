@@ -611,9 +611,20 @@ async fn seam_parity_reranker_off() {
 
 #[tokio::test]
 async fn seam_parity_reranker_on() {
-    // Reranker disabled by config even though "on" here means enabled=true; the
-    // fastembed model is absent offline so rerank_with_fallback returns RRF order.
+    // Reranker ENABLED. To keep this in the offline suite (no model download), point
+    // fastembed at an unreachable endpoint so init fails and rerank_with_fallback
+    // returns RRF order — the same fallback path CI hits with no cached model. Parity
+    // still holds because both callers share fuse_and_rerank; the enabled flag
+    // exercises the reranker branch without the network. Mirrors rerank.rs's pattern;
+    // nextest isolates each test in its own process, so the env var is safe.
+    // SAFETY: single-threaded test process setting an env var before the init call.
+    unsafe {
+        std::env::set_var("HF_ENDPOINT", "http://127.0.0.1:1");
+    }
     assert_seam_parity(true).await;
+    unsafe {
+        std::env::remove_var("HF_ENDPOINT");
+    }
 }
 
 #[tokio::test]
