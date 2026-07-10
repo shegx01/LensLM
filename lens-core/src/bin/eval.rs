@@ -81,7 +81,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use lens_core::chunk::{Chunk, chunk_blocks_deterministic};
-use lens_core::config::RetrievalConfig;
+use lens_core::config::{ModelConfig, RetrievalConfig, TierThresholds};
 use lens_core::embedder::{
     DEFAULT_EMBED_MODEL_ID, Embedder, EmbeddingBackend, FastembedEmbedder, OllamaEmbedder,
 };
@@ -91,6 +91,7 @@ use lens_core::enrichment::{
 use lens_core::eval::{QuestionKind, graph_arm, hybrid_arm, mean, recall_at_k};
 use lens_core::graph::{EntityKind, NotebookGraph};
 use lens_core::parse::{SourceKind, parse_blocks};
+use lens_core::retrieval::router::tiered_search;
 use lens_core::retrieval::{Reranker, hybrid_search};
 use lens_core::vector_store::{LanceVectorStore, VectorRow, VectorStore};
 use lens_core::{EmbeddingModelSpec, LensEngine, LensError};
@@ -937,6 +938,17 @@ async fn run_graph_gate(
     let reranker = Reranker::new(data_dir);
     let config = RetrievalConfig::default();
 
+    // Router arm (#21) measured with graph ON: per-notebook override enabled and the
+    // app-wide flag on, so the router's deterministic gate can fold in the graph list.
+    let router_config = RetrievalConfig {
+        graph_retrieval_enabled: true,
+        ..RetrievalConfig::default()
+    };
+    // context=0 → the TierThresholds fallback caps Tier-1 low enough that the fixture
+    // corpus overflows into Tier-2 (fused retrieval), which is what recall@k measures.
+    let router_model = ModelConfig::default();
+    let thresholds = TierThresholds::default();
+
     let mut rows: Vec<GraphRow> = Vec::with_capacity(queries.len());
     for (q, gold) in queries.iter().zip(golds.iter()) {
         let qvec = tokio::task::block_in_place(|| embedder.embed_query(&q.query))?;
@@ -947,13 +959,33 @@ async fn run_graph_gate(
         let seeds = seed_pairs(&q.seed_entities)?;
         let graph_ids = graph_arm(&pool, &graph, &seeds, K).await?;
 
+        let router_out = tiered_search(
+            &pool,
+            &store,
+            &reranker,
+            Some(&graph),
+            &coord,
+            &q.query,
+            &qvec,
+            &router_model,
+            K,
+            &router_config,
+            Some(true),
+            &thresholds,
+            None,
+        )
+        .await?;
+        let router_ids: Vec<String> = router_out.units.into_iter().map(|u| u.chunk_id).collect();
+
         let hybrid_recall = recall_at_k(&hybrid_ids, gold, K);
         let graph_recall = recall_at_k(&graph_ids, gold, K);
+        let router_recall = recall_at_k(&router_ids, gold, K);
         rows.push(GraphRow {
             query: q.query.clone(),
             kind: q.kind,
             hybrid_recall,
             graph_recall,
+            router_recall,
         });
     }
 
@@ -961,6 +993,7 @@ async fn run_graph_gate(
 
     let overall_hybrid = mean(&rows.iter().map(|r| r.hybrid_recall).collect::<Vec<f32>>());
     let overall_graph = mean(&rows.iter().map(|r| r.graph_recall).collect::<Vec<f32>>());
+    let overall_router = mean(&rows.iter().map(|r| r.router_recall).collect::<Vec<f32>>());
 
     // Bridging + rollup subset drives the graph-lift bar; single_hop is the control arm.
     let lift_rows: Vec<&GraphRow> = rows
@@ -982,9 +1015,23 @@ async fn run_graph_gate(
     let lift_delta_pp = (lift_graph - lift_hybrid) * 100.0;
 
     println!("\n=================== #158a GRAPH GATE ===================");
-    println!("overall: hybrid {overall_hybrid:.4}  graph {overall_graph:.4}");
+    println!(
+        "overall: hybrid {overall_hybrid:.4}  graph {overall_graph:.4}  router {overall_router:.4}"
+    );
     println!(
         "bridge+rollup: hybrid {lift_hybrid:.4}  graph {lift_graph:.4}  Δ {lift_delta_pp:+.2}pp"
+    );
+
+    // #21 non-regression: the router (graph on) must not retrieve worse than the
+    // hybrid baseline overall (it folds the same fused pool plus an additive graph list).
+    if overall_router + 1e-6 < overall_hybrid {
+        eprintln!(
+            "\nFAIL [router non-regression]: router recall@{K} {overall_router:.4} < hybrid {overall_hybrid:.4}"
+        );
+        return Ok(ExitCode::FAILURE);
+    }
+    println!(
+        "PASS [router non-regression]: router recall@{K} {overall_router:.4} ≥ hybrid {overall_hybrid:.4}"
     );
 
     if overall_graph + 1e-6 < overall_hybrid {
@@ -1020,18 +1067,23 @@ struct GraphRow {
     kind: QuestionKind,
     hybrid_recall: f32,
     graph_recall: f32,
+    router_recall: f32,
 }
 
 /// Prints the per-kind + per-query recall breakdown (single_hop / bridging / rollup).
 fn report_graph_ablation(rows: &[GraphRow]) {
     println!("\n=== graph ablation (recall@{K}) ===");
-    println!("{:<12} {:>8} {:>8}   query", "kind", "hybrid", "graph");
+    println!(
+        "{:<12} {:>8} {:>8} {:>8}   query",
+        "kind", "hybrid", "graph", "router"
+    );
     for r in rows {
         println!(
-            "{:<12} {:>8.4} {:>8.4}   {:?}",
+            "{:<12} {:>8.4} {:>8.4} {:>8.4}   {:?}",
             r.kind.as_str(),
             r.hybrid_recall,
             r.graph_recall,
+            r.router_recall,
             snippet(&r.query)
         );
     }
@@ -1046,11 +1098,13 @@ fn report_graph_ablation(rows: &[GraphRow]) {
         }
         let h = mean(&subset.iter().map(|r| r.hybrid_recall).collect::<Vec<f32>>());
         let g = mean(&subset.iter().map(|r| r.graph_recall).collect::<Vec<f32>>());
+        let rr = mean(&subset.iter().map(|r| r.router_recall).collect::<Vec<f32>>());
         println!(
-            "-- {:<9} mean: hybrid {:.4}  graph {:.4}  (n={})",
+            "-- {:<9} mean: hybrid {:.4}  graph {:.4}  router {:.4}  (n={})",
             kind.as_str(),
             h,
             g,
+            rr,
             subset.len()
         );
     }

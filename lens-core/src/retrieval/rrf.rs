@@ -52,7 +52,11 @@ pub fn rrf_merge3(
     let mut acc: HashMap<&str, Acc> = HashMap::new();
     let mut order = 0usize;
 
-    for (list, which) in [(dense, List::Dense), (bm25, List::Bm25), (graph, List::Graph)] {
+    for (list, which) in [
+        (dense, List::Dense),
+        (bm25, List::Bm25),
+        (graph, List::Graph),
+    ] {
         for (rank, id) in list.iter().enumerate() {
             let e = acc.entry(id.as_str()).or_insert_with(|| {
                 let seen = order;

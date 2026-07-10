@@ -252,9 +252,29 @@ async fn seed_tier2_notebook(
 ) {
     // Oversized so the router always picks Tier-2.
     insert_source(pool, nb, "s1", 9_000).await;
-    insert_chunk(pool, "s1", "p1", None, "parent", 0, 0, "PARENT ONE full text").await;
+    insert_chunk(
+        pool,
+        "s1",
+        "p1",
+        None,
+        "parent",
+        0,
+        0,
+        "PARENT ONE full text",
+    )
+    .await;
     for (i, cid) in ["c1", "c2", "c3", "c4"].iter().enumerate() {
-        insert_chunk(pool, "s1", cid, Some("p1"), "child", 1, i as i64, &format!("child {cid}")).await;
+        insert_chunk(
+            pool,
+            "s1",
+            cid,
+            Some("p1"),
+            "child",
+            1,
+            i as i64,
+            &format!("child {cid}"),
+        )
+        .await;
     }
     let mut rows = Vec::new();
     for (i, cid) in ["c1", "c2", "c3", "c4"].iter().enumerate() {
@@ -347,8 +367,14 @@ async fn tier2_no_merge_when_below_half() {
     .await
     .unwrap();
     let ids: Vec<&str> = out.units.iter().map(|u| u.chunk_id.as_str()).collect();
-    assert!(ids.contains(&"c1"), "1/4 must NOT merge; child stays, got {ids:?}");
-    assert!(!ids.contains(&"p1"), "no parent merge below 50%, got {ids:?}");
+    assert!(
+        ids.contains(&"c1"),
+        "1/4 must NOT merge; child stays, got {ids:?}"
+    );
+    assert!(
+        !ids.contains(&"p1"),
+        "no parent merge below 50%, got {ids:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -489,8 +515,28 @@ async fn assert_seam_parity(reranker_enabled: bool) {
     // Children so both paths reach the same fused set; keep <50% per parent so no
     // merge changes the id set (one parent, one child each so parent has 1 child;
     // retrieving that child is 1/1 = merge — avoid by using level-1 orphans).
-    insert_chunk(&pool, "s1", "c1", None, "child", 1, 0, "quokka rare lexical alpha").await;
-    insert_chunk(&pool, "s1", "c2", None, "child", 1, 1, "wombat rare lexical beta").await;
+    insert_chunk(
+        &pool,
+        "s1",
+        "c1",
+        None,
+        "child",
+        1,
+        0,
+        "quokka rare lexical alpha",
+    )
+    .await;
+    insert_chunk(
+        &pool,
+        "s1",
+        "c2",
+        None,
+        "child",
+        1,
+        1,
+        "wombat rare lexical beta",
+    )
+    .await;
 
     let (store, coord) = store_and_coord(&engine, dir.path(), pool.clone(), &nb);
     store
@@ -545,10 +591,16 @@ async fn assert_seam_parity(reranker_enabled: bool) {
     )
     .await
     .unwrap();
-    let router_ids: Vec<&str> = out.units.iter().map(|u| u.chunk_id.as_str()).collect();
+    // The fusion seam (rrf_merge3 + reranker) is shared by construction, so the SET
+    // of surfaced chunks is identical with graph off; the router additionally re-sorts
+    // survivors to document order, so compare membership (sorted), not rank order.
+    let mut router_ids: Vec<&str> = out.units.iter().map(|u| u.chunk_id.as_str()).collect();
+    let mut hybrid_sorted = hybrid_ids.clone();
+    router_ids.sort_unstable();
+    hybrid_sorted.sort_unstable();
     assert_eq!(
-        router_ids, hybrid_ids,
-        "seam parity (reranker={reranker_enabled}): router Tier-2 ids must equal hybrid_search ids"
+        router_ids, hybrid_sorted,
+        "seam parity (reranker={reranker_enabled}): router Tier-2 chunk set must equal hybrid_search set"
     );
 }
 

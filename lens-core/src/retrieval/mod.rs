@@ -110,7 +110,14 @@ pub async fn hybrid_search(
     );
 
     fuse_and_rerank(
-        pool_db, reranker, query_text, &dense_ids, &bm25_ids, &[], pool, config,
+        pool_db,
+        reranker,
+        query_text,
+        &dense_ids,
+        &bm25_ids,
+        &[],
+        pool,
+        config,
     )
     .await
 }

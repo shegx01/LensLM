@@ -106,5 +106,4 @@ mod tests {
         let retrieved = vec!["a".into()];
         assert_eq!(recall_at_k(&retrieved, &["a".into()], 5), 1.0);
     }
-
 }

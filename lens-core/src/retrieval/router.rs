@@ -16,7 +16,7 @@ use crate::config::{ModelConfig, RetrievalConfig, TierThresholds};
 use crate::graph::{EntityKind, NotebookGraph, entity_evidence, entity_lookup, ppr_expand};
 use crate::vector_store::{Coordinate, VectorStore};
 
-use super::{HitSource, Reranker, RetrievalHit, bm25, live_chunk_ids};
+use super::{HitSource, MAX_OVERFETCH, OVERFETCH, Reranker, RetrievalHit, bm25, live_chunk_ids};
 
 /// Headroom reserved for the model's generation.
 const RESERVED_OUTPUT: u32 = 2_048;
@@ -98,7 +98,9 @@ pub struct TokenBudget {
 
 /// Computes the usable-input budget for a model context window (saturating).
 fn token_budget(ctx: u32) -> TokenBudget {
-    let usable = ctx.saturating_sub(RESERVED_OUTPUT).saturating_sub(SYSTEM_OVERHEAD);
+    let usable = ctx
+        .saturating_sub(RESERVED_OUTPUT)
+        .saturating_sub(SYSTEM_OVERHEAD);
     TokenBudget {
         usable_input: usable as usize,
         reserved_output: RESERVED_OUTPUT as usize,
@@ -329,12 +331,14 @@ async fn load_parent(pool: &SqlitePool, parent_id: &str) -> Result<Option<Parent
     .bind(parent_id)
     .fetch_optional(pool)
     .await?;
-    Ok(rec.map(|(source_id, text, source_anchor, section_path)| ParentRow {
-        chunk_id: parent_id.to_string(),
-        source_id,
-        text,
-        locator: source_anchor.or(Some(section_path)),
-    }))
+    Ok(
+        rec.map(|(source_id, text, source_anchor, section_path)| ParentRow {
+            chunk_id: parent_id.to_string(),
+            source_id,
+            text,
+            locator: source_anchor.or(Some(section_path)),
+        }),
+    )
 }
 
 /// Document-order key for a chunk id (`(source rank, level, token_start)`), so the
@@ -402,18 +406,18 @@ async fn assemble_tier2(
         let retrieved_count = children.len();
         let merge = total > 0 && retrieved_count * 2 >= total;
         if merge {
-            if merged_parent_ids.insert(parent_id.clone()) {
-                if let Some(parent) = load_parent(pool, &parent_id).await? {
-                    let provenance = merged_provenance(&children);
-                    candidates.push(Candidate {
-                        chunk_id: parent.chunk_id,
-                        source_id: parent.source_id,
-                        parent_id: Some(parent_id.clone()),
-                        text: parent.text,
-                        locator: parent.locator,
-                        provenance,
-                    });
-                }
+            if merged_parent_ids.insert(parent_id.clone())
+                && let Some(parent) = load_parent(pool, &parent_id).await?
+            {
+                let provenance = merged_provenance(&children);
+                candidates.push(Candidate {
+                    chunk_id: parent.chunk_id,
+                    source_id: parent.source_id,
+                    parent_id: Some(parent_id.clone()),
+                    text: parent.text,
+                    locator: parent.locator,
+                    provenance,
+                });
             }
         } else {
             for rc in children {
@@ -751,7 +755,8 @@ pub async fn tiered_search(
     }
 
     // Tier-2: fused retrieval (dense pre-filter + bm25 + optional graph) → assembly.
-    let overfetch = pool.max(1);
+    // Over-fetch per path IDENTICALLY to hybrid_search so the fusion seam matches.
+    let overfetch = pool.clamp(OVERFETCH, MAX_OVERFETCH);
 
     // DENSE: pre-filter to selected+live BEFORE top-N (#39 fix) when the id-set is
     // small; above the guard, notebook-scope search + the live_chunk_ids post-filter
@@ -781,8 +786,7 @@ pub async fn tiered_search(
     let graph_ids: Vec<String> = match graph {
         Some(g) => {
             let resolution = resolve_seeds(pool_db, &coord.notebook, query_text).await?;
-            let flag =
-                effective_graph_flag(notebook_graph_flag, retrieval.graph_retrieval_enabled);
+            let flag = effective_graph_flag(notebook_graph_flag, retrieval.graph_retrieval_enabled);
             if should_run_graph(&resolution, flag) {
                 let pairs = graph_compose(pool_db, g, &resolution.seeds, overfetch).await?;
                 let mut ids = Vec::with_capacity(pairs.len());
@@ -800,14 +804,7 @@ pub async fn tiered_search(
     };
 
     let fused = super::fuse_and_rerank(
-        pool_db,
-        reranker,
-        query_text,
-        &dense_ids,
-        &bm25_ids,
-        &graph_ids,
-        overfetch,
-        retrieval,
+        pool_db, reranker, query_text, &dense_ids, &bm25_ids, &graph_ids, pool, retrieval,
     )
     .await?;
 
