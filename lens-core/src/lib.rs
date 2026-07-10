@@ -16,6 +16,7 @@ pub mod embedder;
 pub mod embedding;
 pub mod enrichment;
 pub mod error;
+pub mod eval;
 pub mod extract;
 pub mod graph;
 pub(crate) mod http;
@@ -1659,6 +1660,55 @@ impl LensEngine {
             )));
         }
         Ok(())
+    }
+
+    /// Sets (or, with `None`, clears) the per-notebook graph-retrieval override
+    /// (#158a). `None` reverts the notebook to inheriting the app-wide
+    /// `RetrievalConfig::graph_retrieval_enabled`. Does NOT enable/disable any live
+    /// retrieval path — that wiring is #21; this only persists the user's choice.
+    pub async fn set_notebook_graph_retrieval_enabled(
+        &self,
+        notebook_id: &NotebookId,
+        enabled: Option<bool>,
+    ) -> Result<(), LensError> {
+        let pool = self.pool().await;
+        let result = sqlx::query(
+            "UPDATE notebooks SET graph_retrieval_enabled = ?, updated_at = ? \
+             WHERE id = ? AND trashed_at IS NULL",
+        )
+        .bind(enabled)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(notebook_id.as_str())
+        .execute(&pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(LensError::Validation(format!(
+                "no live notebook with id {notebook_id}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Effective graph-retrieval opt-in for a notebook: the per-notebook override
+    /// if set, else the app-wide `RetrievalConfig` default (#158a). Read by the
+    /// eval to record the `graph_enabled` snapshot; no live path consumes it yet.
+    pub async fn notebook_graph_retrieval_enabled(
+        &self,
+        notebook_id: &NotebookId,
+    ) -> Result<bool, LensError> {
+        let pool = self.pool().await;
+        let row: Option<(Option<bool>,)> =
+            sqlx::query_as("SELECT graph_retrieval_enabled FROM notebooks WHERE id = ?")
+                .bind(notebook_id.as_str())
+                .fetch_optional(&pool)
+                .await?;
+        let override_val = row
+            .ok_or_else(|| LensError::Validation(format!("no notebook with id {notebook_id}")))?
+            .0;
+        match override_val {
+            Some(v) => Ok(v),
+            None => Ok(self.config().await.retrieval.graph_retrieval_enabled),
+        }
     }
 
     /// Returns `(model_id, dim, backend, status)` for a notebook's embedding

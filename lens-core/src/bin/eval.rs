@@ -73,6 +73,7 @@
 //! cargo run -p lens-core --bin eval -- --enriched # three-way A/B/C on all corpora + gates
 //! cargo run -p lens-core --bin eval -- --print-ids  # dump deterministic ids per doc
 //! cargo run -p lens-core --bin eval -- --hybrid    # AC1: hybrid vs vector-only recall@5 (#39)
+//! cargo run -p lens-core --bin eval -- --graph     # #158a: graph-arm vs hybrid recall@5 (dev gate)
 //! ```
 
 use std::collections::HashMap;
@@ -87,6 +88,8 @@ use lens_core::embedder::{
 use lens_core::enrichment::{
     CorefSub, apply_substitutions, compose_embedding_text, compose_prefix,
 };
+use lens_core::eval::{QuestionKind, graph_arm, hybrid_arm, mean, recall_at_k};
+use lens_core::graph::{EntityKind, NotebookGraph};
 use lens_core::parse::{SourceKind, parse_blocks};
 use lens_core::retrieval::{Reranker, hybrid_search};
 use lens_core::vector_store::{LanceVectorStore, VectorRow, VectorStore};
@@ -135,6 +138,27 @@ struct Query {
     gold_chunk_ids: Vec<String>,
 }
 
+/// A #158a graph-eval query. `gold_markers` are unique substrings of the answer chunk's
+/// text — resolved at runtime to exact chunk ids via a `LIKE` scan of the ingested
+/// `chunks` table. This keeps gold independent of both retrievers (authored provenance,
+/// not hybrid-derived). Resolution fails loudly if any marker matches zero or >1 chunks.
+#[derive(Debug, Deserialize)]
+struct GraphQuery {
+    query: String,
+    kind: QuestionKind,
+    seed_entities: Vec<RawSeedEntity>,
+    gold_markers: Vec<String>,
+}
+
+/// A seed entity for the graph arm. `kind` is a plain string in JSON (mirroring the
+/// runtime harness) and converted to [`EntityKind`] via `EntityKind::from_db` at load,
+/// failing loudly on an unknown kind. `EntityKind` has no serde derive by design.
+#[derive(Debug, Deserialize)]
+struct RawSeedEntity {
+    name: String,
+    kind: String,
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     match run().await {
@@ -150,6 +174,7 @@ async fn run() -> Result<ExitCode, LensError> {
     let fixtures_dir = eval_fixtures_dir();
     let enriched_mode = std::env::args().any(|a| a == "--enriched");
     let hybrid_mode = std::env::args().any(|a| a == "--hybrid");
+    let graph_mode = std::env::args().any(|a| a == "--graph");
 
     let model_id: String = {
         let args: Vec<String> = std::env::args().collect();
@@ -243,6 +268,10 @@ async fn run() -> Result<ExitCode, LensError> {
             &main_queries,
         )
         .await;
+    }
+
+    if graph_mode {
+        return run_graph_gate(embedder, backend, &tokenizer, &fixtures_dir, spec).await;
     }
 
     if !enriched_mode {
@@ -790,57 +819,10 @@ async fn measure_hybrid(
         spec.dim,
     );
 
+    // Namespace ids by notebook so a doc reused across corpora (distractors) never
+    // collides on the source id / content_hash across measurement passes.
     for doc in docs {
-        let blocks = parse_blocks(&doc.text, SourceKind::Markdown);
-        let chunks = chunk_blocks_deterministic(&doc.text, &blocks, tokenizer)?;
-
-        // Namespace ids by notebook so a doc reused across corpora (distractors)
-        // never collides on the source id / content_hash across measurement passes.
-        let source_id = format!("src-{notebook_id}-{}", doc.name);
-        sqlx::query(
-            "INSERT INTO sources (id, notebook_id, kind, title, status, locator, selected, \
-             content_hash, created_at) \
-             VALUES (?, ?, 'text', ?, 'indexed', ?, 1, ?, ?)",
-        )
-        .bind(&source_id)
-        .bind(notebook_id)
-        .bind(&doc.name)
-        .bind(format!("/tmp/{}.md", doc.name))
-        .bind(format!("hash-{source_id}"))
-        .bind(chrono::Utc::now().to_rfc3339())
-        .execute(&pool)
-        .await?;
-
-        let mut rows: Vec<VectorRow> = Vec::with_capacity(chunks.len());
-        let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
-        let vectors = tokio::task::block_in_place(|| embedder.embed_documents(&texts))?;
-        for (chunk, vector) in chunks.iter().zip(vectors.into_iter()) {
-            sqlx::query(
-                "INSERT INTO chunks \
-                 (id, source_id, parent_id, kind, level, section_path, text, \
-                  token_start, token_end, char_start, char_end, block_type, created_at) \
-                 VALUES (?, ?, NULL, ?, ?, ?, ?, 0, 1, 0, ?, 'paragraph', ?)",
-            )
-            .bind(&chunk.id)
-            .bind(&source_id)
-            .bind(if chunk.level == 0 { "parent" } else { "child" })
-            .bind(chunk.level)
-            .bind(&chunk.section_path)
-            .bind(&chunk.text)
-            .bind(chunk.text.len() as i64)
-            .bind(chrono::Utc::now().to_rfc3339())
-            .execute(&pool)
-            .await?;
-            rows.push(VectorRow {
-                chunk_id: chunk.id.clone(),
-                source_id: source_id.clone(),
-                notebook_id: notebook_id.to_string(),
-                level: chunk.level,
-                vector,
-            });
-        }
-        store.add(&coord, rows).await?;
-        println!("ingested {} ({} chunks)", doc.name, chunks.len());
+        ingest_fixture_doc(&pool, &store, embedder, tokenizer, &coord, notebook_id, doc).await?;
     }
 
     let reranker = Reranker::new(data_dir);
@@ -882,6 +864,520 @@ async fn measure_hybrid(
             total: queries.len(),
         },
     ))
+}
+
+/// Graph fixture corpus (#158a): three entity-sharing docs plus five topically
+/// competing distractors so bridging/rollup gold does not trivially fill the top-5.
+const GRAPH_DOCS: &[&str] = &[
+    "meridian_charter",
+    "voss_profile",
+    "kestrel_report",
+    "salt_reactor_survey",
+    "remote_energy_storage",
+    "research_institute_governance",
+    "nuclear_safety_systems",
+    "energy_programme_funding",
+];
+
+/// #158a graph-eval gate: graph arm vs hybrid baseline over authored provenance gold.
+/// FAIL if graph recall@5 regresses overall or bridge+rollup delta < 5pp.
+async fn run_graph_gate(
+    embedder: &dyn Embedder,
+    backend: EmbeddingBackend,
+    tokenizer: &Tokenizer,
+    fixtures_dir: &Path,
+    spec: &'static EmbeddingModelSpec,
+) -> Result<ExitCode, LensError> {
+    let docs = load_corpus(&fixtures_dir.join("graph"), GRAPH_DOCS)?;
+    let queries = load_graph_queries(&fixtures_dir.join("graph"), "graph_queries.json")?;
+
+    let dir = tempfile::tempdir().map_err(|e| LensError::Io(e.to_string()))?;
+    let data_dir = dir.path();
+    let engine = LensEngine::init(data_dir).await?;
+    let pool = engine.pool().await;
+    let store = LanceVectorStore::new(data_dir, pool.clone());
+    let notebook = engine
+        .create_notebook(EVAL_NOTEBOOK_TITLE, None, None)
+        .await?;
+    let notebook_id = notebook.id.as_str().to_string();
+    let coord = lens_core::vector_store::Coordinate::new(
+        notebook_id.clone(),
+        backend,
+        spec.id.to_string(),
+        spec.dim,
+    );
+
+    println!("\n############ GRAPH FIXTURE (graph-arm vs hybrid gate) ############");
+    for doc in &docs {
+        ingest_fixture_doc(
+            &pool,
+            &store,
+            embedder,
+            tokenizer,
+            &coord,
+            &notebook_id,
+            doc,
+        )
+        .await?;
+    }
+
+    // Resolve each query's authored gold markers to actual chunk ids. Fails loudly if a
+    // marker matches zero or more than one chunk (fixture integrity guard).
+    let mut golds: Vec<Vec<String>> = Vec::with_capacity(queries.len());
+    for q in &queries {
+        let gold = resolve_gold_markers(&pool, &q.gold_markers).await?;
+        golds.push(gold);
+    }
+
+    // Hand-author entity rows: seed entity nodes + mentions keyed to gold chunk ids, so
+    // graph_arm's entity_evidence retrieves the authored gold directly.
+    load_graph_rows(&pool, &notebook_id, &docs, &queries, &golds, tokenizer).await?;
+
+    let graph = NotebookGraph::load(&pool, &notebook_id).await?;
+    let reranker = Reranker::new(data_dir);
+    let config = RetrievalConfig::default();
+
+    let mut rows: Vec<GraphRow> = Vec::with_capacity(queries.len());
+    for (q, gold) in queries.iter().zip(golds.iter()) {
+        let qvec = tokio::task::block_in_place(|| embedder.embed_query(&q.query))?;
+        let hybrid_ids = hybrid_arm(
+            &pool, &store, &reranker, &coord, &q.query, &qvec, K, &config,
+        )
+        .await?;
+        let seeds = seed_pairs(&q.seed_entities)?;
+        let graph_ids = graph_arm(&pool, &graph, &seeds, K).await?;
+
+        let hybrid_recall = recall_at_k(&hybrid_ids, gold, K);
+        let graph_recall = recall_at_k(&graph_ids, gold, K);
+        rows.push(GraphRow {
+            query: q.query.clone(),
+            kind: q.kind,
+            hybrid_recall,
+            graph_recall,
+        });
+    }
+
+    report_graph_ablation(&rows);
+
+    let overall_hybrid = mean(&rows.iter().map(|r| r.hybrid_recall).collect::<Vec<f32>>());
+    let overall_graph = mean(&rows.iter().map(|r| r.graph_recall).collect::<Vec<f32>>());
+
+    // Bridging + rollup subset drives the graph-lift bar; single_hop is the control arm.
+    let lift_rows: Vec<&GraphRow> = rows
+        .iter()
+        .filter(|r| matches!(r.kind, QuestionKind::Bridging | QuestionKind::Rollup))
+        .collect();
+    let lift_hybrid = mean(
+        &lift_rows
+            .iter()
+            .map(|r| r.hybrid_recall)
+            .collect::<Vec<f32>>(),
+    );
+    let lift_graph = mean(
+        &lift_rows
+            .iter()
+            .map(|r| r.graph_recall)
+            .collect::<Vec<f32>>(),
+    );
+    let lift_delta_pp = (lift_graph - lift_hybrid) * 100.0;
+
+    println!("\n=================== #158a GRAPH GATE ===================");
+    println!("overall: hybrid {overall_hybrid:.4}  graph {overall_graph:.4}");
+    println!(
+        "bridge+rollup: hybrid {lift_hybrid:.4}  graph {lift_graph:.4}  Δ {lift_delta_pp:+.2}pp"
+    );
+
+    if overall_graph + 1e-6 < overall_hybrid {
+        eprintln!(
+            "\nFAIL [non-regression]: graph recall@{K} {overall_graph:.4} < hybrid {overall_hybrid:.4}"
+        );
+        return Ok(ExitCode::FAILURE);
+    }
+    println!(
+        "PASS [non-regression]: graph recall@{K} {overall_graph:.4} ≥ hybrid {overall_hybrid:.4}"
+    );
+
+    if lift_delta_pp >= 5.0 - 1e-6 {
+        println!("PASS[graph-lift]: bridge+rollup graph − hybrid {lift_delta_pp:+.2}pp ≥ 5pp");
+    } else {
+        // If the fixture doesn't demonstrate ≥5pp lift, the fixture design needs revision —
+        // this is not an acceptable fallback (see coordinator guidance). Report the delta
+        // and return failure so the fixture author knows to adjust it.
+        eprintln!(
+            "\nFAIL [graph-lift]: bridge+rollup Δ {lift_delta_pp:+.2}pp < 5pp; \
+             fixture bridging/rollup queries must be redesigned so hybrid misses \
+             gold chunks that graph_arm reaches via entity hops."
+        );
+        return Ok(ExitCode::FAILURE);
+    }
+
+    Ok(ExitCode::SUCCESS)
+}
+
+/// One graph-gate measurement row for the ablation table.
+struct GraphRow {
+    query: String,
+    kind: QuestionKind,
+    hybrid_recall: f32,
+    graph_recall: f32,
+}
+
+/// Prints the per-kind + per-query recall breakdown (single_hop / bridging / rollup).
+fn report_graph_ablation(rows: &[GraphRow]) {
+    println!("\n=== graph ablation (recall@{K}) ===");
+    println!("{:<12} {:>8} {:>8}   query", "kind", "hybrid", "graph");
+    for r in rows {
+        println!(
+            "{:<12} {:>8.4} {:>8.4}   {:?}",
+            r.kind.as_str(),
+            r.hybrid_recall,
+            r.graph_recall,
+            snippet(&r.query)
+        );
+    }
+    for kind in [
+        QuestionKind::SingleHop,
+        QuestionKind::Bridging,
+        QuestionKind::Rollup,
+    ] {
+        let subset: Vec<&GraphRow> = rows.iter().filter(|r| r.kind == kind).collect();
+        if subset.is_empty() {
+            continue;
+        }
+        let h = mean(&subset.iter().map(|r| r.hybrid_recall).collect::<Vec<f32>>());
+        let g = mean(&subset.iter().map(|r| r.graph_recall).collect::<Vec<f32>>());
+        println!(
+            "-- {:<9} mean: hybrid {:.4}  graph {:.4}  (n={})",
+            kind.as_str(),
+            h,
+            g,
+            subset.len()
+        );
+    }
+}
+
+/// Converts fixture `RawSeedEntity` rows to `(name, EntityKind)` seeds, failing loudly on
+/// an unknown kind (`EntityKind` has no serde derive; parsed via `from_db`).
+fn seed_pairs(seeds: &[RawSeedEntity]) -> Result<Vec<(String, EntityKind)>, LensError> {
+    seeds
+        .iter()
+        .map(|s| Ok((s.name.clone(), EntityKind::from_db(&s.kind)?)))
+        .collect()
+}
+
+/// Ingests one fixture doc into real `sources`+`chunks` rows (so FTS + graph joins
+/// resolve) plus Lance vectors. The source id is namespaced by notebook so ids never
+/// collide across passes. Returns the ingested chunk ids in order.
+#[allow(clippy::too_many_arguments)]
+async fn ingest_fixture_doc(
+    pool: &sqlx::SqlitePool,
+    store: &LanceVectorStore,
+    embedder: &dyn Embedder,
+    tokenizer: &Tokenizer,
+    coord: &lens_core::vector_store::Coordinate,
+    notebook_id: &str,
+    doc: &Doc,
+) -> Result<Vec<String>, LensError> {
+    let blocks = parse_blocks(&doc.text, SourceKind::Markdown);
+    let chunks = chunk_blocks_deterministic(&doc.text, &blocks, tokenizer)?;
+
+    let source_id = format!("src-{notebook_id}-{}", doc.name);
+    sqlx::query(
+        "INSERT INTO sources (id, notebook_id, kind, title, status, locator, selected, \
+         content_hash, created_at) \
+         VALUES (?, ?, 'text', ?, 'indexed', ?, 1, ?, ?)",
+    )
+    .bind(&source_id)
+    .bind(notebook_id)
+    .bind(&doc.name)
+    .bind(format!("/tmp/{}.md", doc.name))
+    .bind(format!("hash-{source_id}"))
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(pool)
+    .await?;
+
+    let mut rows: Vec<VectorRow> = Vec::with_capacity(chunks.len());
+    let mut chunk_ids: Vec<String> = Vec::with_capacity(chunks.len());
+    let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
+    let vectors = tokio::task::block_in_place(|| embedder.embed_documents(&texts))?;
+    for (chunk, vector) in chunks.iter().zip(vectors.into_iter()) {
+        sqlx::query(
+            "INSERT INTO chunks \
+             (id, source_id, parent_id, kind, level, section_path, text, \
+              token_start, token_end, char_start, char_end, block_type, created_at) \
+             VALUES (?, ?, NULL, ?, ?, ?, ?, 0, 1, 0, ?, 'paragraph', ?)",
+        )
+        .bind(&chunk.id)
+        .bind(&source_id)
+        .bind(if chunk.level == 0 { "parent" } else { "child" })
+        .bind(chunk.level)
+        .bind(&chunk.section_path)
+        .bind(&chunk.text)
+        .bind(chunk.text.len() as i64)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(pool)
+        .await?;
+        rows.push(VectorRow {
+            chunk_id: chunk.id.clone(),
+            source_id: source_id.clone(),
+            notebook_id: notebook_id.to_string(),
+            level: chunk.level,
+            vector,
+        });
+        chunk_ids.push(chunk.id.clone());
+    }
+    store.add(coord, rows).await?;
+    println!("ingested {} ({} chunks)", doc.name, chunks.len());
+    Ok(chunk_ids)
+}
+
+/// Inserts hand-authored nodes/mentions/edges keyed to the ACTUAL ingested chunk ids so
+/// `graph_arm` retrieves the gold and `ppr_expand` has real structure. Deterministic.
+async fn load_graph_rows(
+    pool: &sqlx::SqlitePool,
+    notebook_id: &str,
+    docs: &[Doc],
+    queries: &[GraphQuery],
+    golds: &[Vec<String>],
+    tokenizer: &Tokenizer,
+) -> Result<(), LensError> {
+    let now = chrono::Utc::now().to_rfc3339();
+
+    // All chunk ids per source, so a mention can be anchored to a real chunk even when
+    // it is not itself a gold chunk (edges must reference an existing chunk row).
+    let mut source_chunks: HashMap<String, Vec<String>> = HashMap::new();
+    for doc in docs {
+        let source_id = format!("src-{notebook_id}-{}", doc.name);
+        let blocks = parse_blocks(&doc.text, SourceKind::Markdown);
+        let chunks = chunk_blocks_deterministic(&doc.text, &blocks, tokenizer)?;
+        let ids: Vec<String> = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM chunks WHERE source_id = ? ORDER BY level ASC, id ASC",
+        )
+        .bind(&source_id)
+        .fetch_all(pool)
+        .await?;
+        // Sanity: the DB round-trip must reproduce the deterministic chunk ids.
+        if ids.len() != chunks.len() {
+            return Err(LensError::Validation(format!(
+                "graph loader: {} chunks ingested for {} but {} read back",
+                chunks.len(),
+                doc.name,
+                ids.len()
+            )));
+        }
+        source_chunks.insert(source_id, ids);
+    }
+
+    // A per-source node id for a (source, name, kind), created on first use, plus the
+    // node→source map used to place co-occurrence edges. The graph loader collapses
+    // per-source nodes by logical name, so an entity named in two docs becomes one
+    // logical node with edges spanning both. A monotonic counter keys node ids so the
+    // hyphen-laden source id never has to be parsed back out.
+    let mut node_ids: HashMap<(String, String, EntityKind), String> = HashMap::new();
+    let mut node_source: HashMap<String, String> = HashMap::new();
+    let mut node_seq = 0usize;
+
+    let mut mention_ord = 0usize;
+    for (q, gold) in queries.iter().zip(golds.iter()) {
+        for seed in &q.seed_entities {
+            let kind = EntityKind::from_db(&seed.kind)?;
+            for gold_chunk in gold {
+                let Some(source_id) = source_of_chunk(&source_chunks, gold_chunk) else {
+                    continue;
+                };
+                let key = (source_id.clone(), seed.name.clone(), kind);
+                let node_id = if let Some(existing) = node_ids.get(&key) {
+                    existing.clone()
+                } else {
+                    let id = format!("gn-{node_seq}");
+                    node_seq += 1;
+                    node_ids.insert(key, id.clone());
+                    node_source.insert(id.clone(), source_id.clone());
+                    insert_node(pool, &id, notebook_id, &source_id, kind, &seed.name, &now).await?;
+                    id
+                };
+                insert_mention(pool, notebook_id, &node_id, gold_chunk, mention_ord, &now).await?;
+                mention_ord += 1;
+            }
+        }
+    }
+
+    // Co-occurrence edges between every pair of seed nodes that share a source, so the
+    // PPR expansion has real edges to traverse (bridging structure). Anchored to the
+    // first chunk of the shared source.
+    let node_list: Vec<(String, String)> = node_source
+        .iter()
+        .map(|(id, src)| (id.clone(), src.clone()))
+        .collect();
+    let mut edge_ord = 0usize;
+    for i in 0..node_list.len() {
+        for j in (i + 1)..node_list.len() {
+            let (from_id, from_src) = &node_list[i];
+            let (to_id, to_src) = &node_list[j];
+            if from_src != to_src {
+                continue;
+            }
+            let Some(anchor) = source_chunks.get(from_src).and_then(|c| c.first()).cloned() else {
+                continue;
+            };
+            insert_edge(
+                pool,
+                notebook_id,
+                from_src,
+                &anchor,
+                from_id,
+                to_id,
+                edge_ord,
+                &now,
+            )
+            .await?;
+            edge_ord += 1;
+        }
+    }
+    Ok(())
+}
+
+/// The `src-{notebook}-{doc}` id owning `chunk_id`, if any.
+fn source_of_chunk(source_chunks: &HashMap<String, Vec<String>>, chunk_id: &str) -> Option<String> {
+    source_chunks
+        .iter()
+        .find(|(_, ids)| ids.iter().any(|c| c == chunk_id))
+        .map(|(sid, _)| sid.clone())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_node(
+    pool: &sqlx::SqlitePool,
+    id: &str,
+    notebook_id: &str,
+    source_id: &str,
+    kind: EntityKind,
+    name: &str,
+    now: &str,
+) -> Result<(), LensError> {
+    sqlx::query(
+        "INSERT OR IGNORE INTO entity_nodes \
+         (id, notebook_id, source_id, kind, name, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(id)
+    .bind(notebook_id)
+    .bind(source_id)
+    .bind(kind.as_str())
+    .bind(name)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn insert_mention(
+    pool: &sqlx::SqlitePool,
+    notebook_id: &str,
+    entity_node_id: &str,
+    chunk_id: &str,
+    ord: usize,
+    now: &str,
+) -> Result<(), LensError> {
+    // char span is nominal — the graph arm keys on chunk membership, not offsets. ord
+    // keeps the UNIQUE(entity_node_id, chunk_id, char_start, char_end) key distinct.
+    sqlx::query(
+        "INSERT OR IGNORE INTO entity_mentions \
+         (id, notebook_id, entity_node_id, chunk_id, char_start, char_end, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(format!("gm-{entity_node_id}-{ord}"))
+    .bind(notebook_id)
+    .bind(entity_node_id)
+    .bind(chunk_id)
+    .bind(ord as i64)
+    .bind(ord as i64 + 1)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_edge(
+    pool: &sqlx::SqlitePool,
+    notebook_id: &str,
+    source_id: &str,
+    chunk_id: &str,
+    from_node: &str,
+    to_node: &str,
+    ord: usize,
+    now: &str,
+) -> Result<(), LensError> {
+    sqlx::query(
+        "INSERT OR IGNORE INTO entity_edges \
+         (id, notebook_id, source_id, chunk_id, from_node, to_node, relation, weight, \
+          confidence, created_at) VALUES (?, ?, ?, ?, ?, ?, 'co_occurs', 2.0, NULL, ?)",
+    )
+    .bind(format!("ge-{source_id}-{ord}"))
+    .bind(notebook_id)
+    .bind(source_id)
+    .bind(chunk_id)
+    .bind(from_node)
+    .bind(to_node)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Resolves a query's `gold_markers` (unique substrings of the gold chunk's text) to
+/// actual `chunk_id`s via a LIKE scan. Fails loudly if a marker matches zero or >1
+/// chunks — the fixture author must ensure each marker is unique in the corpus.
+async fn resolve_gold_markers(
+    pool: &sqlx::SqlitePool,
+    markers: &[String],
+) -> Result<Vec<String>, LensError> {
+    let mut ids: Vec<String> = Vec::with_capacity(markers.len());
+    for marker in markers {
+        let pattern = format!("%{}%", marker);
+        let matches: Vec<String> = sqlx::query_scalar("SELECT id FROM chunks WHERE text LIKE ?")
+            .bind(&pattern)
+            .fetch_all(pool)
+            .await?;
+        match matches.len() {
+            0 => {
+                return Err(LensError::Validation(format!(
+                    "gold_marker {:?} matched no chunks — check fixture text",
+                    marker
+                )));
+            }
+            1 => {
+                // matches.len() == 1 so into_iter().next() is always Some.
+                if let Some(id) = matches.into_iter().next()
+                    && !ids.contains(&id)
+                {
+                    ids.push(id);
+                }
+            }
+            n => {
+                return Err(LensError::Validation(format!(
+                    "gold_marker {:?} matched {n} chunks (must be unique) — \
+                     use a longer or more specific marker substring",
+                    marker
+                )));
+            }
+        }
+    }
+    Ok(ids)
+}
+
+fn load_graph_queries(dir: &Path, file: &str) -> Result<Vec<GraphQuery>, LensError> {
+    let path = dir.join(file);
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|e| LensError::Io(format!("{}: {e}", path.display())))?;
+    let queries: Vec<GraphQuery> = serde_json::from_str(&raw)?;
+    if queries.is_empty() {
+        return Err(LensError::Validation(format!(
+            "no graph queries loaded from {}",
+            path.display()
+        )));
+    }
+    Ok(queries)
 }
 
 /// Derives the deterministic doc summary stand-in for the LLM structural map: the H1
