@@ -11,6 +11,7 @@
 
 pub mod bm25;
 pub mod rerank;
+pub mod router;
 pub mod rrf;
 
 use sqlx::SqlitePool;
@@ -39,8 +40,10 @@ pub enum HitSource {
     Dense,
     /// BM25 (lexical) search only.
     Bm25,
-    /// Both paths.
+    /// Both dense and BM25 paths.
     Both,
+    /// Surfaced only by the entity-graph arm (#21); present in neither dense nor BM25.
+    Graph,
 }
 
 /// A fused retrieval hit. Distinct from [`crate::vector_store::Hit`] whose
@@ -127,7 +130,7 @@ pub async fn hybrid_search(
 /// AND selected (`selected = 1`), preserving the input order, optionally narrowing
 /// by `source_id`/`level`. This is the dense-path scope filter (the vector store
 /// scopes only by `notebook_id`, so trashed/deselected exclusion happens here).
-async fn live_chunk_ids(
+pub(crate) async fn live_chunk_ids(
     pool: &SqlitePool,
     chunk_ids: &[String],
     source_id: Option<&str>,
@@ -163,7 +166,10 @@ async fn live_chunk_ids(
 /// vanished between fusion and hydration is dropped from both lists' correspondence
 /// by returning an empty string; the reranker keys results by index so alignment
 /// must be preserved — we look each id up individually to guarantee ordering.
-async fn hydrate_texts(pool: &SqlitePool, hits: &[RetrievalHit]) -> Result<Vec<String>, LensError> {
+pub(crate) async fn hydrate_texts(
+    pool: &SqlitePool,
+    hits: &[RetrievalHit],
+) -> Result<Vec<String>, LensError> {
     let mut texts = Vec::with_capacity(hits.len());
     for h in hits {
         let text: Option<String> =

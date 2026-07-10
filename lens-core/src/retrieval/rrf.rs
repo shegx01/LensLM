@@ -64,6 +64,7 @@ pub fn rrf_merge(dense: &[String], bm25: &[String], k: usize, limit: usize) -> V
                 (true, true) => HitSource::Both,
                 (true, false) => HitSource::Dense,
                 (false, true) => HitSource::Bm25,
+                // Two-list merge never yields a member absent from both inputs.
                 (false, false) => HitSource::Dense,
             };
             (
