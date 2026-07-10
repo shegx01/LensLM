@@ -13,13 +13,12 @@ pub use runtime::{
     run_notebook_eval,
 };
 
-use std::collections::HashMap;
-
 use sqlx::SqlitePool;
 
 use crate::LensError;
 use crate::config::RetrievalConfig;
-use crate::graph::{EntityKind, NotebookGraph, entity_evidence, ppr_expand};
+use crate::graph::{EntityKind, NotebookGraph};
+use crate::retrieval::router::graph_compose;
 use crate::retrieval::{Reranker, hybrid_search};
 use crate::vector_store::{Coordinate, VectorStore};
 
@@ -45,70 +44,20 @@ pub fn mean(xs: &[f32]) -> f32 {
 
 /// Tool-level graph retrieval for one question's seed entities, agent-agnostic.
 /// Merge invariant (LOCKED, #158a): evidence (direct mentions, fixed conf 1.0)
-/// precedes equal-confidence `ppr_expand` output; see [`merge_ranked`].
-// #21 should extract this seed→chunk composition into a shared module, not import
-// graph_arm from eval.
+/// precedes equal-confidence `ppr_expand` output. Delegates to the #21 router's
+/// pair-preserving `graph_compose` and drops the confidence to keep this arm's
+/// `Vec<String>` output byte-for-byte identical to before the extraction.
 pub async fn graph_arm(
     pool: &SqlitePool,
     graph: &NotebookGraph,
     seeds: &[(String, EntityKind)],
     k: usize,
 ) -> Result<Vec<String>, LensError> {
-    let notebook_id = graph.notebook_id().to_string();
-    let mut evidence = Vec::new();
-    for (name, kind) in seeds {
-        evidence.extend(entity_evidence(pool, &notebook_id, name, *kind, k).await?);
-    }
-    let expansion: Vec<(String, f32)> = ppr_expand(pool, graph, seeds, k)
+    Ok(graph_compose(pool, graph, seeds, k)
         .await?
         .into_iter()
-        .flat_map(|hit| {
-            hit.chunk_ids
-                .into_iter()
-                .map(move |c| (c, hit.graph_confidence))
-        })
-        .collect();
-    Ok(merge_ranked(evidence, expansion, k))
-}
-
-/// The LOCKED graph_arm merge (extracted pure for offline testing). `evidence` gets
-/// fixed conf `1.0` in call order; `expansion` carries traversal `graph_confidence`.
-/// Dedup by chunk id keeping the highest conf; stable sort conf DESC, first-seen
-/// tie-break (evidence precedes equal-conf expansion); truncate to `k`.
-fn merge_ranked(evidence: Vec<String>, expansion: Vec<(String, f32)>, k: usize) -> Vec<String> {
-    // chunk_id -> (best confidence, first-seen ordinal).
-    let mut best: HashMap<String, (f32, usize)> = HashMap::new();
-    let mut seen = 0usize;
-    for chunk_id in evidence {
-        insert_ranked(&mut best, &mut seen, chunk_id, 1.0);
-    }
-    for (chunk_id, conf) in expansion {
-        insert_ranked(&mut best, &mut seen, chunk_id, conf);
-    }
-    let mut ranked: Vec<(String, f32, usize)> =
-        best.into_iter().map(|(id, (c, o))| (id, c, o)).collect();
-    ranked.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.2.cmp(&b.2))
-    });
-    ranked.truncate(k);
-    ranked.into_iter().map(|(id, _, _)| id).collect()
-}
-
-fn insert_ranked(
-    best: &mut HashMap<String, (f32, usize)>,
-    seen: &mut usize,
-    chunk_id: String,
-    conf: f32,
-) {
-    best.entry(chunk_id)
-        .and_modify(|(c, _)| *c = c.max(conf))
-        .or_insert_with(|| {
-            let ord = *seen;
-            *seen += 1;
-            (conf, ord)
-        });
+        .map(|(id, _)| id)
+        .collect())
 }
 
 /// The hybrid baseline arm as bare `chunk_id`s — thin wrapper over [`hybrid_search`];
@@ -158,27 +107,4 @@ mod tests {
         assert_eq!(recall_at_k(&retrieved, &["a".into()], 5), 1.0);
     }
 
-    #[test]
-    fn merge_ranks_evidence_before_equal_confidence_expansion() {
-        // Evidence chunk "e" (conf 1.0) must outrank an expansion chunk "x" even
-        // when expansion confidence also normalizes to 1.0 (first-seen tie-break).
-        let out = merge_ranked(
-            vec!["e".into()],
-            vec![("x".into(), 1.0), ("y".into(), 0.4)],
-            5,
-        );
-        assert_eq!(out, vec!["e", "x", "y"]);
-    }
-
-    #[test]
-    fn merge_dedups_keeping_highest_confidence_and_truncates() {
-        // "d" appears as both evidence (1.0) and low-conf expansion (0.2): one
-        // entry at conf 1.0. Expansion sorts by confidence DESC. Truncate to k=2.
-        let out = merge_ranked(
-            vec!["d".into()],
-            vec![("d".into(), 0.2), ("hi".into(), 0.9), ("lo".into(), 0.1)],
-            2,
-        );
-        assert_eq!(out, vec!["d", "hi"]);
-    }
 }

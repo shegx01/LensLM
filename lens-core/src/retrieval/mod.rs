@@ -109,7 +109,31 @@ pub async fn hybrid_search(
         "hybrid_search: retrieved candidates"
     );
 
-    let fused = rrf::rrf_merge(&dense_ids, &bm25_ids, RRF_K, overfetch);
+    fuse_and_rerank(
+        pool_db, reranker, query_text, &dense_ids, &bm25_ids, &[], pool, config,
+    )
+    .await
+}
+
+/// The shared fusion + rerank tail (issue #21). Both [`hybrid_search`] and the
+/// tiered router (`router::tiered_search`) call this identical body, so graph-OFF
+/// fusion-seam parity holds by construction: given the same dense/bm25 ids and an
+/// empty `graph_ids`, the output is bitwise-identical regardless of caller. Mirrors
+/// the former `hybrid_search` tail exactly: over-fetch clamp → three-list RRF →
+/// non-reranker truncation → reranker hydrate+rerank.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn fuse_and_rerank(
+    pool_db: &SqlitePool,
+    reranker: &Reranker,
+    query_text: &str,
+    dense_ids: &[String],
+    bm25_ids: &[String],
+    graph_ids: &[String],
+    pool: usize,
+    config: &RetrievalConfig,
+) -> Result<Vec<RetrievalHit>, LensError> {
+    let overfetch = pool.clamp(OVERFETCH, MAX_OVERFETCH);
+    let fused = rrf::rrf_merge3(dense_ids, bm25_ids, graph_ids, RRF_K, overfetch);
 
     if !config.reranker.enabled || fused.is_empty() {
         let mut out = fused;
@@ -122,7 +146,7 @@ pub async fn hybrid_search(
     let reranked = reranker
         .rerank_with_fallback(query_text, fused, texts, &config.reranker, pool)
         .await;
-    tracing::debug!(reranked = reranked.len(), "hybrid_search: reranked");
+    tracing::debug!(reranked = reranked.len(), "fuse_and_rerank: reranked");
     Ok(reranked)
 }
 
