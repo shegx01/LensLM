@@ -908,14 +908,10 @@ impl LensEngine {
     }
 
     /// Registers a fresh single-flight cancellation token for a grounded-answer run,
-    /// keyed by `notebook_id` (#173). If a prior ask is in flight for this notebook,
-    /// its token is `.cancel()`d FIRST (the superseded stream actually stops), then a
-    /// fresh token replaces it. Returns the `Arc`-wrapped token: the caller derives a
-    /// plain `CancellationToken` (`(*arc).clone()`) for `answer_notebook` and passes
-    /// the `Arc` to [`ask_cancel_guard`](Self::ask_cancel_guard) so Drop can
-    /// `Arc::ptr_eq`-match it. Diverges from
-    /// [`register_media_cancel`](Self::register_media_cancel), which silently
-    /// overwrites and orphans the evicted token.
+    /// keyed by `notebook_id` (#173). A prior in-flight ask for this notebook is
+    /// `.cancel()`d FIRST (so the superseded stream stops), then replaced. Returns the
+    /// `Arc`-wrapped token; the caller passes the `Arc` to
+    /// [`ask_cancel_guard`](Self::ask_cancel_guard) for the `Arc::ptr_eq` Drop match.
     pub fn register_ask(&self, notebook_id: &str) -> Arc<tokio_util::sync::CancellationToken> {
         let token = Arc::new(tokio_util::sync::CancellationToken::new());
         let mut map = self
@@ -1025,7 +1021,12 @@ impl LensEngine {
             crate::vector_store::LanceVectorStore::new(&data_dir, pool.clone()),
         );
 
-        let graph = if config.retrieval.graph_retrieval_enabled {
+        // Honor the per-notebook graph-retrieval override (falling back to the
+        // app-wide default), not the raw app flag — this is the live #21-era
+        // consumer of that toggle. The resolved value gates the graph load AND the
+        // `tiered_search` flag below, so the two never disagree.
+        let graph_enabled = self.notebook_graph_retrieval_enabled(notebook_id).await?;
+        let graph = if graph_enabled {
             Some(Arc::new(
                 crate::graph::NotebookGraph::load(&pool, notebook_id.as_str()).await?,
             ))
@@ -1044,6 +1045,9 @@ impl LensEngine {
             .cloned()
             .unwrap_or_default();
 
+        let mut retrieval = config.retrieval;
+        retrieval.graph_retrieval_enabled = graph_enabled;
+
         let ctx = crate::answer::AnswerCtx {
             provider,
             store,
@@ -1053,7 +1057,7 @@ impl LensEngine {
             pool,
             coord,
             model,
-            retrieval: config.retrieval,
+            retrieval,
             thresholds: config.tier_thresholds,
             tokenizer,
             question,
@@ -2018,11 +2022,9 @@ impl LensEngine {
     }
 }
 
-/// RAII guard that removes a grounded-answer (#173) cancellation-registry entry on
-/// drop — but ONLY when the stored token is still the one this guard owns
-/// (`Arc::ptr_eq`). This is the deliberate divergence from `MediaCancelGuard`
-/// (ingest.rs), which removes unconditionally: here a superseded old run's guard
-/// must NOT evict the token a newer run has since registered (single-flight ABA).
+/// RAII guard that clears a grounded-answer (#173) cancellation-registry entry on
+/// drop via [`remove_ask_if_owner`](LensEngine::remove_ask_if_owner). See the
+/// `ask_cancel_tokens` field doc for the ABA rationale this guard exists to satisfy.
 pub struct AskCancelGuard {
     engine: LensEngine,
     notebook_id: String,
