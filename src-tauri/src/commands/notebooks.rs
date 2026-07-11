@@ -1,8 +1,9 @@
 //! Notebook commands. Thin pass-throughs to `lens-core`; full CRUD UI is M3.
 
+use futures::StreamExt;
 use lens_core::{
-    AddSourceOutcome, IngestProgress, LensEngine, LensError, Notebook, NotebookId, NotebookSummary,
-    Source, TrashedSource,
+    AddSourceOutcome, AnswerEvent, IngestProgress, LensEngine, LensError, Notebook, NotebookId,
+    NotebookSummary, Source, TrashedSource,
 };
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
@@ -328,6 +329,87 @@ pub async fn cancel_media_ingest(
     engine: tauri::State<'_, LensEngine>,
 ) -> Result<bool, LensError> {
     Ok(engine.cancel_media_ingest(&source_id))
+}
+
+/// Answers a notebook question, streaming the grounded-answer pipeline (#173):
+/// `Started` → per-event `Chunk(AnswerEvent)` → `Done`, or `Failed(err)` on any
+/// ctx-gathering or in-stream error. Per-notebook single-flight: registering the
+/// ask supersedes (and cancels) any prior in-flight ask for the same notebook; the
+/// [`AskCancelGuard`](lens_core::AskCancelGuard) removes only its own token on drop.
+#[tracing::instrument(skip(question, on_answer, engine))]
+#[tauri::command]
+pub async fn ask_notebook(
+    notebook_id: String,
+    question: String,
+    on_answer: Channel<StreamEvent<AnswerEvent>>,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<(), LensError> {
+    if let Err(e) = send_event(&on_answer, StreamEvent::Started) {
+        tracing::warn!("ask_notebook: started event send failed: {e}");
+    }
+
+    // Register single-flight cancellation; the guard's Drop cleans the registry up
+    // (only if still the owner) when this command returns on any path.
+    let token = engine.register_ask(&notebook_id);
+    let _guard = engine.ask_cancel_guard(&notebook_id, token.clone());
+
+    // Ctx-gathering / provider-None errors surface HERE, before any stream is built.
+    let stream = match engine
+        .answer_notebook(&NotebookId::from(notebook_id), question, (*token).clone())
+        .await
+    {
+        Ok(s) => s,
+        Err(err) => {
+            if let Err(e) = send_event(&on_answer, StreamEvent::Failed(err.clone())) {
+                tracing::warn!("ask_notebook: failed event send failed: {e}");
+            }
+            return Err(err);
+        }
+    };
+
+    let mut stream = std::pin::pin!(stream);
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(ev) => {
+                if let Err(e) = send_event(&on_answer, StreamEvent::Chunk(ev)) {
+                    tracing::warn!("ask_notebook: chunk send failed: {e}");
+                }
+            }
+            Err(err) => {
+                // In-stream failure: surface Failed with the preserved kind and stop
+                // — never emit Done for a truncated/failed answer.
+                if let Err(e) = send_event(&on_answer, StreamEvent::Failed(err.clone())) {
+                    tracing::warn!("ask_notebook: failed event send failed: {e}");
+                }
+                return Err(err);
+            }
+        }
+    }
+
+    // The stream ends with no further items on cancellation too (engine contract),
+    // so distinguish a user-cancelled run from a real completion here — otherwise a
+    // stopped, truncated answer would look identical to success. Cancel → Failed
+    // (kind `Cancelled`), never Done.
+    if token.is_cancelled() {
+        let err = LensError::Cancelled("answer generation cancelled".into());
+        if let Err(e) = send_event(&on_answer, StreamEvent::Failed(err)) {
+            tracing::warn!("ask_notebook: cancelled event send failed: {e}");
+        }
+    } else if let Err(e) = send_event(&on_answer, StreamEvent::Done) {
+        tracing::warn!("ask_notebook: done event send failed: {e}");
+    }
+    Ok(())
+}
+
+/// Cancels the in-flight grounded answer for a notebook (#173, the stop button).
+/// Returns `true` if an ask was in flight and cancelled, `false` otherwise.
+#[tracing::instrument(skip(engine))]
+#[tauri::command]
+pub async fn cancel_ask(
+    notebook_id: String,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<bool, LensError> {
+    Ok(engine.cancel_ask_notebook(&notebook_id))
 }
 
 /// Renames a notebook.

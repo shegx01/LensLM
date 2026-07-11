@@ -21,6 +21,11 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 # `CancellationToken` for the audio-ingest cancellation registry (issue #43).
 tokio-util = { version = "0.7" }
+# `stream!` macro for the grounded-answer orchestrator's lazy event stream (#173):
+# chosen over an mpsc channel because cancellation is a separate `CancellationToken`
+# knob both designs need, and `async-stream` adds lazy backpressure, prompt drop-abort,
+# panic visibility, and a pure unit-testable `impl Stream` with no external task handle.
+async-stream = "0.3"
 # Async SQLite via bundled libsqlite3-sys. `macros` is for `migrate!`/`FromRow`
 # only (we use runtime-checked `query`/`query_as`, NOT `query!`, so no
 # DATABASE_URL / offline cache is needed). `uuid` feature deliberately omitted —

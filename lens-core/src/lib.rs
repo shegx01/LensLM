@@ -7,6 +7,7 @@
 //! No Tauri, windowing, or UI dependencies. [`LensEngine`] is a thin handle
 //! that delegates to per-domain repositories over the shared connection pool.
 
+pub mod answer;
 pub mod asr;
 pub mod chunk;
 pub mod citation;
@@ -35,6 +36,12 @@ pub mod tts;
 pub mod url_normalize;
 pub mod vector_store;
 
+pub use answer::{AnswerEvent, AnswerStage};
+// `AnswerCtx`/`answer_stream` are internal orchestrator seams; only the external
+// integration-test crate needs them public, so gate behind `test-util`. The
+// desktop bridge uses `answer_notebook` + `AnswerEvent`.
+#[cfg(feature = "test-util")]
+pub use answer::{AnswerCtx, answer_stream};
 #[cfg(feature = "test-util")]
 pub use asr::MockAsrEngine;
 #[cfg(feature = "local-whisper")]
@@ -81,6 +88,10 @@ pub use notebooks::{
 };
 pub use render::JsRenderer;
 pub use retrieval::router::{ContextUnit, Provenance, RouterOutput, Tier, tiered_search};
+// Test-only: the integration test asserts `RESERVED_OUTPUT`'s value; production
+// code reads it via `crate::retrieval::router`.
+#[cfg(feature = "test-util")]
+pub use retrieval::router::RESERVED_OUTPUT;
 pub use retrieval::{HitSource, Reranker, RetrievalHit, hybrid_search};
 pub use system_check::{
     ALLOWED_EMBEDDING_MODELS, CheckAction, CheckId, CheckResult, CheckStatus, LlmDetection,
@@ -262,6 +273,13 @@ pub struct LensEngine {
     /// are fast HashMap lookups never held across an await point.
     media_cancel_tokens:
         Arc<std::sync::Mutex<HashMap<String, tokio_util::sync::CancellationToken>>>,
+    /// In-flight grounded-answer (#173) cancellation tokens, keyed by `notebook_id`
+    /// (single-flight per notebook). Diverges from `media_cancel_tokens`: the token
+    /// is `Arc`-wrapped so [`AskCancelGuard`] can `Arc::ptr_eq`-gate its Drop and a
+    /// superseded old ask's guard never evicts the new ask's token (ABA-safe). A new
+    /// ask actively `.cancel()`s the evicted token so the prior stream stops.
+    ask_cancel_tokens:
+        Arc<std::sync::Mutex<HashMap<String, Arc<tokio_util::sync::CancellationToken>>>>,
     /// Lazily-built internal LocalWhisper engines, keyed by model id (#42). Mirrors
     /// the embedder cache but lighter — whisper has one active model at a time. The
     /// single `Mutex` over the map ensures the ggml load runs exactly once per key.
@@ -376,6 +394,7 @@ impl LensEngine {
             js_renderer: Arc::new(RwLock::new(None)),
             asr_engine: Arc::new(RwLock::new(None)),
             media_cancel_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            ask_cancel_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
             #[cfg(feature = "local-whisper")]
             whisper_engines: Arc::new(Mutex::new(HashMap::new())),
             catalog_cache: Arc::new(RwLock::new(None)),
@@ -464,6 +483,7 @@ impl LensEngine {
             js_renderer: Arc::new(RwLock::new(None)),
             asr_engine: Arc::new(RwLock::new(None)),
             media_cancel_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            ask_cancel_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
             #[cfg(feature = "local-whisper")]
             whisper_engines: Arc::new(Mutex::new(HashMap::new())),
             catalog_cache: Arc::new(RwLock::new(None)),
@@ -892,6 +912,162 @@ impl LensEngine {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         map.remove(source_id);
+    }
+
+    /// Registers a fresh single-flight cancellation token for a grounded-answer run,
+    /// keyed by `notebook_id` (#173). A prior in-flight ask for this notebook is
+    /// `.cancel()`d FIRST (so the superseded stream stops), then replaced. Returns the
+    /// `Arc`-wrapped token; the caller passes the `Arc` to
+    /// [`ask_cancel_guard`](Self::ask_cancel_guard) for the `Arc::ptr_eq` Drop match.
+    pub fn register_ask(&self, notebook_id: &str) -> Arc<tokio_util::sync::CancellationToken> {
+        let token = Arc::new(tokio_util::sync::CancellationToken::new());
+        let mut map = self
+            .ask_cancel_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(prev) = map.insert(notebook_id.to_string(), token.clone()) {
+            prev.cancel();
+        }
+        token
+    }
+
+    /// Cancels the in-flight grounded-answer run for `notebook_id` by flipping its
+    /// token. Returns `true` if one was found, `false` otherwise (#173).
+    pub fn cancel_ask_notebook(&self, notebook_id: &str) -> bool {
+        let map = self
+            .ask_cancel_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match map.get(notebook_id) {
+            Some(token) => {
+                token.cancel();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Removes the ask token for `notebook_id` only when `owner` is still the stored
+    /// token (`Arc::ptr_eq`). See the `ask_cancel_tokens` field doc for the ABA rationale.
+    fn remove_ask_if_owner(
+        &self,
+        notebook_id: &str,
+        owner: &Arc<tokio_util::sync::CancellationToken>,
+    ) {
+        let mut map = self
+            .ask_cancel_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(current) = map.get(notebook_id)
+            && Arc::ptr_eq(current, owner)
+        {
+            map.remove(notebook_id);
+        }
+    }
+
+    /// Builds the RAII [`AskCancelGuard`] for a registered ask; `owner` is the `Arc`
+    /// from [`register_ask`] that the guard's Drop `Arc::ptr_eq`-matches on removal.
+    pub fn ask_cancel_guard(
+        &self,
+        notebook_id: &str,
+        owner: Arc<tokio_util::sync::CancellationToken>,
+    ) -> AskCancelGuard {
+        AskCancelGuard {
+            engine: self.clone(),
+            notebook_id: notebook_id.to_string(),
+            owner,
+        }
+    }
+
+    /// Grounded-answer entry point (#173, the "rag route"). Gathers ALL fallible
+    /// context up front — pool, config-derived `ModelConfig`/`RetrievalConfig`/
+    /// `TierThresholds`, the LLM provider (errors when none is configured), the
+    /// notebook's embedder + coordinate, the tokenizer, and the graph when enabled —
+    /// then returns the pure [`answer_stream`]. Must be `-> Result<impl Stream + Send
+    /// + 'static, _>` (NOT `async fn -> impl Stream`), so the returned stream owns
+    /// only `Send + 'static` values and never captures `&self`.
+    pub async fn answer_notebook(
+        &self,
+        notebook_id: &NotebookId,
+        question: String,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<
+        impl futures_util::Stream<Item = Result<AnswerEvent, LensError>> + Send + 'static,
+        LensError,
+    > {
+        let pool = self.pool().await;
+        let config = self.config().await;
+
+        let provider = self
+            .llm_provider()
+            .await
+            .ok_or_else(|| LensError::Model("no chat model configured".into()))?;
+
+        // Coordinate + query embedder resolve from ONE tuple (plan §10): the same
+        // (model_id, backend, dim) feeds both the embedder and the search Coordinate,
+        // dissolving the "pick the matching active coordinate" circularity.
+        let (model_id, dim, backend) = self.resolve_notebook_embedding(notebook_id).await?;
+        let embedder = self
+            .embedder_for(
+                &model_id,
+                backend,
+                crate::embedder::WorkloadKind::Interactive,
+            )
+            .await?;
+        let coord =
+            crate::vector_store::Coordinate::new(notebook_id.as_str(), backend, model_id, dim);
+
+        let tokenizer = self.tokenizer().await.ok();
+
+        let data_dir = self.data_dir().await;
+        let reranker = crate::retrieval::Reranker::new(&data_dir);
+        let store: Arc<dyn crate::vector_store::VectorStore> = Arc::new(
+            crate::vector_store::LanceVectorStore::new(&data_dir, pool.clone()),
+        );
+
+        // Honor the per-notebook graph-retrieval override (falling back to the
+        // app-wide default), not the raw app flag — this is the live #21-era
+        // consumer of that toggle. The resolved value gates the graph load AND the
+        // `tiered_search` flag below, so the two never disagree.
+        let graph_enabled = self.notebook_graph_retrieval_enabled(notebook_id).await?;
+        let graph = if graph_enabled {
+            Some(Arc::new(
+                crate::graph::NotebookGraph::load(&pool, notebook_id.as_str()).await?,
+            ))
+        } else {
+            None
+        };
+
+        // The chat model's context window drives the router's token budget. Match the
+        // `config.models` entry the resolved provider was built from (by model id);
+        // fall back to the first configured model, else defaults.
+        let model = config
+            .models
+            .iter()
+            .find(|m| m.model == provider.model_id())
+            .or_else(|| config.models.first())
+            .cloned()
+            .unwrap_or_default();
+
+        let mut retrieval = config.retrieval;
+        retrieval.graph_retrieval_enabled = graph_enabled;
+
+        let ctx = crate::answer::AnswerCtx {
+            provider,
+            store,
+            embedder,
+            reranker,
+            graph,
+            pool,
+            coord,
+            model,
+            retrieval,
+            thresholds: config.tier_thresholds,
+            tokenizer,
+            question,
+        };
+
+        Ok(crate::answer::answer_stream(ctx, cancel))
     }
 
     /// Transcribes 16 kHz mono f32 PCM (#41 output), selecting the backend via
@@ -1850,6 +2026,22 @@ impl LensEngine {
     }
 }
 
+/// RAII guard that clears a grounded-answer (#173) cancellation-registry entry on
+/// drop via [`remove_ask_if_owner`](LensEngine::remove_ask_if_owner). See the
+/// `ask_cancel_tokens` field doc for the ABA rationale this guard exists to satisfy.
+pub struct AskCancelGuard {
+    engine: LensEngine,
+    notebook_id: String,
+    owner: Arc<tokio_util::sync::CancellationToken>,
+}
+
+impl Drop for AskCancelGuard {
+    fn drop(&mut self) {
+        self.engine
+            .remove_ask_if_owner(&self.notebook_id, &self.owner);
+    }
+}
+
 /// Best-effort removal of a managed source file and its `.extracted.txt` /
 /// `.tables.md` siblings. Siblings are derived from `(data_dir, source_id)` via the
 /// shared `ingest::*_sibling_path` builders — NOT from the locator — so URL sources
@@ -2099,5 +2291,78 @@ mod media_cancel_tests {
     async fn cancel_unknown_source_is_false() {
         let engine = LensEngine::for_test().await;
         assert!(!engine.cancel_media_ingest("never-registered"));
+    }
+}
+
+#[cfg(test)]
+mod ask_cancel_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn register_then_present_and_live() {
+        let engine = LensEngine::for_test().await;
+        let token = engine.register_ask("nb-1");
+        assert!(
+            !token.is_cancelled(),
+            "freshly registered ask token is live"
+        );
+        assert!(
+            engine.cancel_ask_notebook("nb-1"),
+            "registered ask is found"
+        );
+        assert!(token.is_cancelled(), "cancel flips the registered token");
+    }
+
+    #[tokio::test]
+    async fn cancel_unknown_notebook_is_false() {
+        let engine = LensEngine::for_test().await;
+        assert!(!engine.cancel_ask_notebook("never-registered"));
+    }
+
+    #[tokio::test]
+    async fn supersede_cancels_old_and_registers_new() {
+        let engine = LensEngine::for_test().await;
+        let old = engine.register_ask("nb-1");
+        let new = engine.register_ask("nb-1");
+        assert!(
+            old.is_cancelled(),
+            "registering a new ask cancels the superseded one"
+        );
+        assert!(!new.is_cancelled(), "the new ask token is live");
+        assert!(
+            !Arc::ptr_eq(&old, &new),
+            "supersession installs a distinct token"
+        );
+        // The map holds the NEW token: cancelling flips `new`, not `old`.
+        assert!(engine.cancel_ask_notebook("nb-1"));
+        assert!(new.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn old_guard_drop_does_not_evict_new_token() {
+        let engine = LensEngine::for_test().await;
+        let old = engine.register_ask("nb-1");
+        let old_guard = engine.ask_cancel_guard("nb-1", old);
+        // A new ask supersedes; the OLD guard must not remove the NEW token on drop.
+        let new = engine.register_ask("nb-1");
+        drop(old_guard);
+        // The registry still holds `new`, so cancel finds it and flips it.
+        assert!(
+            engine.cancel_ask_notebook("nb-1"),
+            "old guard drop must NOT evict the superseding token"
+        );
+        assert!(new.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn own_guard_drop_removes_token() {
+        let engine = LensEngine::for_test().await;
+        let token = engine.register_ask("nb-1");
+        let guard = engine.ask_cancel_guard("nb-1", token);
+        drop(guard);
+        assert!(
+            !engine.cancel_ask_notebook("nb-1"),
+            "own-guard drop removes the registry entry"
+        );
     }
 }

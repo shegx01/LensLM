@@ -64,6 +64,17 @@ pub async fn open_in_memory_pool() -> Result<SqlitePool, LensError> {
     Ok(pool)
 }
 
+/// Max ids per batched `IN (…)` query. SQLite's default bind-variable limit is
+/// 999; stay well under it so large id lists don't overflow the parameter cap.
+pub(crate) const BIND_BATCH: usize = 500;
+
+/// Comma-joined `?` placeholders for a SQLite `IN (…)` clause of length `n`
+/// (`n = 3` → `"?,?,?"`). Only `?` characters — never user data — so the result
+/// is injection-safe; bind the values separately. Pair with [`BIND_BATCH`].
+pub(crate) fn in_placeholders(n: usize) -> String {
+    std::iter::repeat_n("?", n).collect::<Vec<_>>().join(",")
+}
+
 /// Applies all pending embedded migrations. Idempotent: re-running is a no-op.
 #[tracing::instrument(skip_all)]
 pub async fn run_migrations(pool: &SqlitePool) -> Result<(), LensError> {
