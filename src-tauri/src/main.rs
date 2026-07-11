@@ -114,6 +114,8 @@ fn main() {
             commands::notebooks::retry_ingest_source,
             commands::notebooks::retry_all_failed_sources,
             commands::notebooks::cancel_media_ingest,
+            commands::notebooks::ask_notebook,
+            commands::notebooks::cancel_ask,
             commands::notebooks::set_notebook_embedding_model,
             commands::notebooks::get_notebook_embedding_model,
             commands::system::health_check,
