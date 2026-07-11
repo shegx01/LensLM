@@ -9,6 +9,7 @@
 
 pub mod asr;
 pub mod chunk;
+pub mod citation;
 pub mod config;
 pub(crate) mod db;
 pub(crate) mod download;
@@ -44,6 +45,10 @@ pub use asr::{
     TranscribeConfig, TranscriptSegment, WHISPER_REGISTRY, WhisperModelSpec,
     download_whisper_model, resolve_whisper, select_asr_backend, whisper_model_downloaded,
     whisper_model_path,
+};
+pub use citation::{
+    CITATION_PROMPT_INSTRUCTION, ChunkLocatorRow, Citation, Locator, extract_citations,
+    hydrate_locators, load_chunk_locators,
 };
 pub use config::{
     AppConfig, CloudAsrProvider, EnrichmentConfig, RerankerConfig, RerankerModel, RetrievalConfig,
