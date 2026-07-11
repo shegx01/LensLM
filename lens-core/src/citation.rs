@@ -177,10 +177,6 @@ pub fn hydrate_locators(citations: &mut [Citation], rows: &HashMap<String, Chunk
     }
 }
 
-/// Batch size for the `id IN (…)` load. SQLite's default bind-variable limit is 999;
-/// stay well under it so large notebooks don't overflow the parameter cap (R11).
-const LOCATOR_LOAD_BATCH: usize = 500;
-
 /// Loads [`ChunkLocatorRow`]s for `chunk_ids` from the `chunks` table — the single
 /// owned DB path so #23b can reach real page/char via
 /// `load_chunk_locators` → [`hydrate_locators`]. Chunks the `IN (…)` list under the
@@ -193,10 +189,8 @@ pub async fn load_chunk_locators(
     if chunk_ids.is_empty() {
         return Ok(out);
     }
-    for batch in chunk_ids.chunks(LOCATOR_LOAD_BATCH) {
-        let placeholders = std::iter::repeat_n("?", batch.len())
-            .collect::<Vec<_>>()
-            .join(",");
+    for batch in chunk_ids.chunks(crate::db::BIND_BATCH) {
+        let placeholders = crate::db::in_placeholders(batch.len());
         let sql = format!(
             "SELECT id, section_path, page, char_start, char_end \
              FROM chunks WHERE id IN ({placeholders})"

@@ -36,7 +36,12 @@ pub mod tts;
 pub mod url_normalize;
 pub mod vector_store;
 
-pub use answer::{AnswerCtx, AnswerEvent, AnswerStage, answer_stream};
+pub use answer::{AnswerEvent, AnswerStage};
+// `AnswerCtx`/`answer_stream` are internal orchestrator seams; only the external
+// integration-test crate needs them public, so gate behind `test-util`. The
+// desktop bridge uses `answer_notebook` + `AnswerEvent`.
+#[cfg(feature = "test-util")]
+pub use answer::{AnswerCtx, answer_stream};
 #[cfg(feature = "test-util")]
 pub use asr::MockAsrEngine;
 #[cfg(feature = "local-whisper")]
@@ -82,9 +87,11 @@ pub use notebooks::{
     Source, TrashedSource,
 };
 pub use render::JsRenderer;
-pub use retrieval::router::{
-    ContextUnit, Provenance, RESERVED_OUTPUT, RouterOutput, Tier, tiered_search,
-};
+pub use retrieval::router::{ContextUnit, Provenance, RouterOutput, Tier, tiered_search};
+// Test-only: the integration test asserts `RESERVED_OUTPUT`'s value; production
+// code reads it via `crate::retrieval::router`.
+#[cfg(feature = "test-util")]
+pub use retrieval::router::RESERVED_OUTPUT;
 pub use retrieval::{HitSource, Reranker, RetrievalHit, hybrid_search};
 pub use system_check::{
     ALLOWED_EMBEDDING_MODELS, CheckAction, CheckId, CheckResult, CheckStatus, LlmDetection,
@@ -940,10 +947,8 @@ impl LensEngine {
         }
     }
 
-    /// Removes the ask token for `notebook_id` ONLY when `owner` is still the stored
-    /// token (`Arc::ptr_eq` identity). A superseded old run's guard must NOT evict the
-    /// new run's token (single-flight ABA hazard, R7). Diverges from
-    /// [`remove_media_cancel`](Self::remove_media_cancel)'s unconditional remove.
+    /// Removes the ask token for `notebook_id` only when `owner` is still the stored
+    /// token (`Arc::ptr_eq`). See the `ask_cancel_tokens` field doc for the ABA rationale.
     fn remove_ask_if_owner(
         &self,
         notebook_id: &str,
@@ -960,9 +965,8 @@ impl LensEngine {
         }
     }
 
-    /// Builds the RAII [`AskCancelGuard`] for a registered ask. `owner` is the exact
-    /// `Arc` stored in the registry by [`register_ask`], so the guard's Drop can
-    /// `Arc::ptr_eq`-match it and avoid evicting a superseding run's token.
+    /// Builds the RAII [`AskCancelGuard`] for a registered ask; `owner` is the `Arc`
+    /// from [`register_ask`] that the guard's Drop `Arc::ptr_eq`-matches on removal.
     pub fn ask_cancel_guard(
         &self,
         notebook_id: &str,

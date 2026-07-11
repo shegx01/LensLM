@@ -386,7 +386,16 @@ pub async fn ask_notebook(
         }
     }
 
-    if let Err(e) = send_event(&on_answer, StreamEvent::Done) {
+    // The stream ends with no further items on cancellation too (engine contract),
+    // so distinguish a user-cancelled run from a real completion here — otherwise a
+    // stopped, truncated answer would look identical to success. Cancel → Failed
+    // (kind `Cancelled`), never Done.
+    if token.is_cancelled() {
+        let err = LensError::Cancelled("answer generation cancelled".into());
+        if let Err(e) = send_event(&on_answer, StreamEvent::Failed(err)) {
+            tracing::warn!("ask_notebook: cancelled event send failed: {e}");
+        }
+    } else if let Err(e) = send_event(&on_answer, StreamEvent::Done) {
         tracing::warn!("ask_notebook: done event send failed: {e}");
     }
     Ok(())

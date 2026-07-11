@@ -1,7 +1,7 @@
 //! Grounded-answer orchestrator (issue #173): the "rag route". Turns a notebook
-//! question into a streamed, citation-bearing answer, all headless — NO `tauri`/UI
-//! types. [`answer_stream`] is a pure free fn over an owned [`AnswerCtx`]; the
-//! fallible ctx-gathering lives in `LensEngine::answer_notebook` (lib.rs).
+//! question into a streamed, citation-bearing answer. [`answer_stream`] is a pure
+//! free fn over an owned [`AnswerCtx`]; the fallible ctx-gathering lives in
+//! `LensEngine::answer_notebook` (lib.rs).
 //!
 //! Items are `Result<AnswerEvent, LensError>`, mirroring the engine's existing
 //! streaming idiom ([`LlmProvider::generate_stream`] yields
@@ -114,9 +114,6 @@ async fn load_source_titles(
     pool: &SqlitePool,
     units: &[ContextUnit],
 ) -> Result<HashMap<String, String>, LensError> {
-    // SQLite default bind-variable limit is 999; stay well under it.
-    const TITLE_LOAD_BATCH: usize = 500;
-
     let mut ids: Vec<&str> = units.iter().map(|u| u.source_id.as_str()).collect();
     ids.sort_unstable();
     ids.dedup();
@@ -125,10 +122,8 @@ async fn load_source_titles(
     if ids.is_empty() {
         return Ok(out);
     }
-    for batch in ids.chunks(TITLE_LOAD_BATCH) {
-        let placeholders = std::iter::repeat_n("?", batch.len())
-            .collect::<Vec<_>>()
-            .join(",");
+    for batch in ids.chunks(crate::db::BIND_BATCH) {
+        let placeholders = crate::db::in_placeholders(batch.len());
         let sql = format!("SELECT id, title FROM sources WHERE id IN ({placeholders})");
         let mut q = sqlx::query_as::<_, (String, String)>(&sql);
         for id in batch {
@@ -143,12 +138,6 @@ async fn load_source_titles(
 
 /// The grounded-answer stream. Pure over the owned [`AnswerCtx`] so the returned
 /// future is `Send + 'static`. See the module header for the event contract.
-///
-/// Errors surface as a terminal [`AnswerEvent`]-less end: the caller (the command
-/// glue) maps the absence-of-`Done` plus the yielded terminal marker onto
-/// `StreamEvent::Failed`. Within the engine, an error mid-stream stops emission
-/// after the last successful delta with NO `Citations`/`Done` (a truncated answer
-/// is never cited).
 pub fn answer_stream(
     ctx: AnswerCtx,
     cancel: CancellationToken,
@@ -301,6 +290,11 @@ pub fn answer_stream(
                 yield Err(err);
                 return;
             }
+        }
+        // Cancel arriving in the hydration window must still end silently — no
+        // terminal Citations/Done for a run the user stopped.
+        if cancel.is_cancelled() {
+            return;
         }
         yield Ok(AnswerEvent::Citations(cites));
         yield Ok(AnswerEvent::Done { tokens_used });
