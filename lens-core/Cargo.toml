@@ -72,6 +72,8 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 # `CancellationToken` for the audio-ingest cancellation registry (issue #43).
 tokio-util = { workspace = true }
+# `stream!` for the grounded-answer orchestrator's lazy `AnswerEvent` stream (#173).
+async-stream = { workspace = true }
 sqlx = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }

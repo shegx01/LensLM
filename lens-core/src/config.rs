@@ -340,6 +340,11 @@ fn default_hybrid_enabled() -> bool {
     true
 }
 
+/// Serde default for [`RetrievalConfig::answer_candidate_pool`] (`20`).
+fn default_answer_candidate_pool() -> usize {
+    20
+}
+
 /// Hybrid-retrieval configuration (issue #39). Additive `#[serde(default)]` struct;
 /// an absent `retrieval` key in an old `config.json` reads back as this default.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -355,6 +360,11 @@ pub struct RetrievalConfig {
     /// defines/stores it and reports eval evidence — no live path reads it yet.
     #[serde(default)]
     pub graph_retrieval_enabled: bool,
+    /// Fuse/rerank candidate budget for grounded-answer generation (#173): the
+    /// `pool` passed to `tiered_search` on the answer path. The router still trims
+    /// to the token budget; this only bounds the pre-fusion candidate count.
+    #[serde(default = "default_answer_candidate_pool")]
+    pub answer_candidate_pool: usize,
 }
 
 impl Default for RetrievalConfig {
@@ -363,6 +373,7 @@ impl Default for RetrievalConfig {
             hybrid_enabled: default_hybrid_enabled(),
             reranker: RerankerConfig::default(),
             graph_retrieval_enabled: false,
+            answer_candidate_pool: default_answer_candidate_pool(),
         }
     }
 }
@@ -1176,6 +1187,23 @@ mod tests {
     }
 
     #[test]
+    fn missing_answer_candidate_pool_defaults_to_20() {
+        // An old `config.json` written before #173 has no `answer_candidate_pool`
+        // key; it must read back the default (20), not 0.
+        let json = r#"{ "reranker": { "enabled": true } }"#;
+        let r: RetrievalConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            r.answer_candidate_pool, 20,
+            "absent answer_candidate_pool reads back the default 20"
+        );
+        assert_eq!(
+            RetrievalConfig::default().answer_candidate_pool,
+            20,
+            "manual Default body carries the same 20"
+        );
+    }
+
+    #[test]
     fn reranker_model_serializes_to_stable_snake_case() {
         assert_eq!(
             serde_json::to_string(&RerankerModel::BgeRerankerBase).unwrap(),
@@ -1197,6 +1225,7 @@ mod tests {
                     timeout_ms: 1_500,
                 },
                 graph_retrieval_enabled: true,
+                answer_candidate_pool: 35,
             },
             ..AppConfig::default()
         };
@@ -1206,6 +1235,7 @@ mod tests {
         assert!(!loaded.retrieval.hybrid_enabled);
         assert!(loaded.retrieval.reranker.enabled);
         assert_eq!(loaded.retrieval.reranker.timeout_ms, 1_500);
+        assert_eq!(loaded.retrieval.answer_candidate_pool, 35);
 
         let on_disk = std::fs::read_to_string(dir.path().join(CONFIG_FILE_NAME)).unwrap();
         assert!(on_disk.contains("\"model\": \"bge_reranker_base\""));

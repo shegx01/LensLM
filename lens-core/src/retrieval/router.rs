@@ -18,8 +18,11 @@ use crate::vector_store::{Coordinate, VectorStore};
 
 use super::{HitSource, MAX_OVERFETCH, OVERFETCH, Reranker, RetrievalHit, bm25, live_chunk_ids};
 
-/// Headroom reserved for the model's generation.
-const RESERVED_OUTPUT: u32 = 2_048;
+/// Headroom reserved for the model's generation. `pub` so the grounded-answer
+/// orchestrator (#173) uses the same value for `LlmRequest.max_tokens` that the
+/// router carved out of `usable_input` (router-internal budget math only — this
+/// exposes a value, not behaviour).
+pub const RESERVED_OUTPUT: u32 = 2_048;
 /// System/prompt-scaffold budget the downstream consumer will spend.
 const SYSTEM_OVERHEAD: u32 = 512;
 /// Near-cap band that triggers an exact tokenizer recount of a `chars/4` estimate.

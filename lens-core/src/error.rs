@@ -118,6 +118,19 @@ impl From<sqlx::migrate::MigrateError> for LensError {
     }
 }
 
+impl From<tokio::task::JoinError> for LensError {
+    fn from(err: tokio::task::JoinError) -> Self {
+        // A cancelled `spawn_blocking` (e.g. the grounded-answer query-embed task,
+        // #173) maps to the cooperative `Cancelled` variant; a panicked task is an
+        // unexpected `Internal` failure. Keeps the answer path off `.unwrap()`.
+        if err.is_cancelled() {
+            LensError::Cancelled("task cancelled".into())
+        } else {
+            LensError::Internal("background task failed".into())
+        }
+    }
+}
+
 impl LensError {
     /// The stable `kind` discriminant string — identical to the `kind` field of
     /// this error's serialized `{kind, message}` wire shape. Used to build the
@@ -244,6 +257,25 @@ mod tests {
             assert_eq!(meta.attempt_count, 1);
             assert!(!meta.timestamp.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn join_error_cancelled_maps_to_cancelled() {
+        let handle = tokio::task::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        handle.abort();
+        let join_err = handle.await.expect_err("aborted task yields a JoinError");
+        assert!(join_err.is_cancelled());
+        assert!(matches!(LensError::from(join_err), LensError::Cancelled(_)));
+    }
+
+    #[tokio::test]
+    async fn join_error_panic_maps_to_internal() {
+        let handle = tokio::task::spawn_blocking(|| panic!("boom"));
+        let join_err = handle.await.expect_err("panicked task yields a JoinError");
+        assert!(join_err.is_panic());
+        assert!(matches!(LensError::from(join_err), LensError::Internal(_)));
     }
 
     #[test]

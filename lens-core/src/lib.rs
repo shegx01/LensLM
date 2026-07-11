@@ -80,7 +80,9 @@ pub use notebooks::{
     Source, TrashedSource,
 };
 pub use render::JsRenderer;
-pub use retrieval::router::{ContextUnit, Provenance, RouterOutput, Tier, tiered_search};
+pub use retrieval::router::{
+    ContextUnit, Provenance, RESERVED_OUTPUT, RouterOutput, Tier, tiered_search,
+};
 pub use retrieval::{HitSource, Reranker, RetrievalHit, hybrid_search};
 pub use system_check::{
     ALLOWED_EMBEDDING_MODELS, CheckAction, CheckId, CheckResult, CheckStatus, LlmDetection,
