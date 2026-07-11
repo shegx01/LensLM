@@ -9,6 +9,7 @@
 
 pub mod answer;
 pub mod asr;
+pub mod chat;
 pub mod chunk;
 pub mod citation;
 pub mod config;
@@ -53,6 +54,7 @@ pub use asr::{
     download_whisper_model, resolve_whisper, select_asr_backend, whisper_model_downloaded,
     whisper_model_path,
 };
+pub use chat::{ChatFeedback, ChatMessage, ChatRole};
 pub use citation::{
     CITATION_PROMPT_INSTRUCTION, ChunkLocatorRow, Citation, Locator, extract_citations,
     hydrate_locators, load_chunk_locators,
@@ -627,6 +629,76 @@ impl LensEngine {
     pub async fn list_sources(&self, notebook_id: &NotebookId) -> Result<Vec<Source>, LensError> {
         let pool = self.pool().await;
         NotebookRepo::new(&pool).list_sources(notebook_id).await
+    }
+
+    /// Persists a user chat message on send (#22). `turn_id` is the frontend-minted
+    /// grouping key the assistant row will later share.
+    #[tracing::instrument(skip_all)]
+    pub async fn save_chat_user(
+        &self,
+        notebook_id: &NotebookId,
+        turn_id: &str,
+        content: &str,
+    ) -> Result<ChatMessage, LensError> {
+        let pool = self.pool().await;
+        crate::chat::ChatRepo::new(&pool)
+            .insert_user(notebook_id.as_str(), turn_id, content)
+            .await
+    }
+
+    /// Persists an assistant chat message on stream `Done` (#22). Serializes the
+    /// citation payload to JSON internally (the engine owns the JSON contract).
+    #[tracing::instrument(skip_all)]
+    pub async fn save_chat_assistant(
+        &self,
+        notebook_id: &NotebookId,
+        turn_id: &str,
+        content: &str,
+        citations: Option<&[Citation]>,
+        tokens_used: u32,
+    ) -> Result<ChatMessage, LensError> {
+        let citations_json = match citations {
+            None => None,
+            Some(c) => Some(
+                serde_json::to_string(c)
+                    .map_err(|e| LensError::Internal(format!("citations serialize failed: {e}")))?,
+            ),
+        };
+        let pool = self.pool().await;
+        crate::chat::ChatRepo::new(&pool)
+            .insert_assistant(
+                notebook_id.as_str(),
+                turn_id,
+                content,
+                citations_json.as_deref(),
+                i64::from(tokens_used),
+            )
+            .await
+    }
+
+    /// Sets or clears (`None`) feedback on a chat message (#22, toggleable thumbs).
+    #[tracing::instrument(skip_all)]
+    pub async fn set_chat_feedback(
+        &self,
+        message_id: &str,
+        feedback: Option<ChatFeedback>,
+    ) -> Result<(), LensError> {
+        let pool = self.pool().await;
+        crate::chat::ChatRepo::new(&pool)
+            .set_feedback(message_id, feedback)
+            .await
+    }
+
+    /// Lists a notebook's chat messages as flat rows in transcript order (#22).
+    #[tracing::instrument(skip_all)]
+    pub async fn list_chat_messages(
+        &self,
+        notebook_id: &NotebookId,
+    ) -> Result<Vec<ChatMessage>, LensError> {
+        let pool = self.pool().await;
+        crate::chat::ChatRepo::new(&pool)
+            .list(notebook_id.as_str())
+            .await
     }
 
     /// Reads a source's chunks (full per-chunk metadata, ordered `level`,

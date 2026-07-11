@@ -2,8 +2,8 @@
 
 use futures::StreamExt;
 use lens_core::{
-    AddSourceOutcome, AnswerEvent, IngestProgress, LensEngine, LensError, Notebook, NotebookId,
-    NotebookSummary, Source, TrashedSource,
+    AddSourceOutcome, AnswerEvent, ChatFeedback, ChatMessage, IngestProgress, LensEngine,
+    LensError, Notebook, NotebookId, NotebookSummary, Source, TrashedSource,
 };
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
@@ -410,6 +410,67 @@ pub async fn cancel_ask(
     engine: tauri::State<'_, LensEngine>,
 ) -> Result<bool, LensError> {
     Ok(engine.cancel_ask_notebook(&notebook_id))
+}
+
+/// Persists a user chat message on send (#22). `turn_id` is minted by the frontend
+/// and shared with the later assistant row of the same turn.
+#[tracing::instrument(skip(content, engine))]
+#[tauri::command]
+pub async fn save_chat_user(
+    notebook_id: String,
+    turn_id: String,
+    content: String,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<ChatMessage, LensError> {
+    engine
+        .save_chat_user(&NotebookId::from(notebook_id), &turn_id, &content)
+        .await
+}
+
+/// Persists an assistant chat message on stream `Done` (#22). `citations` is the
+/// typed payload; the engine serializes it to JSON.
+#[tracing::instrument(skip(content, citations, engine))]
+#[tauri::command]
+pub async fn save_chat_assistant(
+    notebook_id: String,
+    turn_id: String,
+    content: String,
+    citations: Option<Vec<lens_core::Citation>>,
+    tokens_used: u32,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<ChatMessage, LensError> {
+    engine
+        .save_chat_assistant(
+            &NotebookId::from(notebook_id),
+            &turn_id,
+            &content,
+            citations.as_deref(),
+            tokens_used,
+        )
+        .await
+}
+
+/// Sets or clears (`null`) feedback on a chat message (#22, toggleable thumbs).
+#[tracing::instrument(skip(engine))]
+#[tauri::command]
+pub async fn set_chat_feedback(
+    message_id: String,
+    feedback: Option<ChatFeedback>,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<(), LensError> {
+    engine.set_chat_feedback(&message_id, feedback).await
+}
+
+/// Lists a notebook's chat messages as flat rows in transcript order (#22).
+#[tracing::instrument(skip(engine))]
+#[tauri::command]
+pub async fn list_chat_messages(
+    notebook_id: String,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<Vec<ChatMessage>, LensError> {
+    engine
+        .list_chat_messages(&NotebookId::from(notebook_id))
+        .await
 }
 
 /// Renames a notebook.
