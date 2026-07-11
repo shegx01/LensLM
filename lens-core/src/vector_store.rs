@@ -148,6 +148,25 @@ pub trait VectorStore: Send + Sync {
         k: usize,
     ) -> Result<Vec<Hit>, LensError>;
 
+    /// Like [`search`](Self::search) but narrows to `source_ids` **before** the
+    /// top-`k` cut (the #39 recall fix). An empty `source_ids` means "no narrowing"
+    /// and behaves exactly like `search` (notebook scope).
+    ///
+    /// Default cannot narrow by source because [`Hit`] carries no `source_id`;
+    /// implementors that can narrow at the store layer SHOULD override. Callers
+    /// needing a hard guarantee must post-filter (the router pairs this with
+    /// `live_chunk_ids`).
+    async fn search_filtered(
+        &self,
+        coord: &Coordinate,
+        query: &[f32],
+        k: usize,
+        source_ids: &[String],
+    ) -> Result<Vec<Hit>, LensError> {
+        let _ = source_ids;
+        self.search(coord, query, k).await
+    }
+
     /// Drops all vectors for `source_id` from the active table. Runs BEFORE the
     /// SQLite `chunks` delete (cross-store ordering guarantee).
     async fn drop_source(&self, coord: &Coordinate, source_id: &str) -> Result<(), LensError>;
@@ -1127,6 +1146,91 @@ impl VectorStore for LanceVectorStore {
         }
 
         // Sort ascending: collecting across batches can interleave distances.
+        hits.sort_by(|a, b| {
+            a.distance
+                .partial_cmp(&b.distance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        hits.truncate(k);
+        Ok(hits)
+    }
+
+    /// Overrides the default with a real pre-filter: the `source_id IN (...)` clause
+    /// is applied inside LanceDB's `.only_if` **before** the top-`k` cut (the #39
+    /// recall fix), symmetric with BM25's `sources` JOIN scope. Empty `source_ids`
+    /// delegates to [`search`](Self::search) (notebook scope only).
+    async fn search_filtered(
+        &self,
+        coord: &Coordinate,
+        query: &[f32],
+        k: usize,
+        source_ids: &[String],
+    ) -> Result<Vec<Hit>, LensError> {
+        if source_ids.is_empty() {
+            return self.search(coord, query, k).await;
+        }
+        let dim = coord.dim;
+        let notebook = coord.notebook.as_str();
+        if query.len() != dim {
+            return Err(LensError::Vector(format!(
+                "query vector length {} != expected dim {dim}",
+                query.len()
+            )));
+        }
+        let table = match self.open_active_table(coord).await? {
+            Some(t) => t,
+            None => return Ok(Vec::new()),
+        };
+
+        let in_list = source_ids
+            .iter()
+            .map(|s| format!("'{}'", escape_lance_literal(s)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let filter = format!(
+            "notebook_id = '{}' AND source_id IN ({in_list})",
+            escape_lance_literal(notebook)
+        );
+
+        let stream = table
+            .query()
+            .nearest_to(query)
+            .map_err(|e| LensError::Vector(format!("lancedb nearest_to failed: {e}")))?
+            .distance_type(DistanceType::Cosine)
+            .only_if(filter)
+            .limit(k)
+            .execute()
+            .await
+            .map_err(|e| LensError::Vector(format!("lancedb search execute failed: {e}")))?;
+
+        let batches: Vec<RecordBatch> = stream
+            .try_collect()
+            .await
+            .map_err(|e| LensError::Vector(format!("lancedb result stream failed: {e}")))?;
+
+        let mut hits = Vec::new();
+        for batch in &batches {
+            let chunk_ids = batch
+                .column_by_name("chunk_id")
+                .ok_or_else(|| LensError::Vector("result missing chunk_id column".into()))?
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| LensError::Vector("chunk_id column is not Utf8".into()))?;
+            let distances = batch
+                .column_by_name("_distance")
+                .ok_or_else(|| LensError::Vector("result missing _distance column".into()))?
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| LensError::Vector("_distance column is not Float32".into()))?;
+
+            for i in 0..batch.num_rows() {
+                hits.push(Hit {
+                    chunk_id: chunk_ids.value(i).to_string(),
+                    distance: distances.value(i),
+                });
+            }
+        }
+
         hits.sort_by(|a, b| {
             a.distance
                 .partial_cmp(&b.distance)

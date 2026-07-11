@@ -11,6 +11,7 @@
 
 pub mod bm25;
 pub mod rerank;
+pub mod router;
 pub mod rrf;
 
 use sqlx::SqlitePool;
@@ -39,8 +40,10 @@ pub enum HitSource {
     Dense,
     /// BM25 (lexical) search only.
     Bm25,
-    /// Both paths.
+    /// Both dense and BM25 paths.
     Both,
+    /// Surfaced only by the entity-graph arm (#21); present in neither dense nor BM25.
+    Graph,
 }
 
 /// A fused retrieval hit. Distinct from [`crate::vector_store::Hit`] whose
@@ -106,7 +109,38 @@ pub async fn hybrid_search(
         "hybrid_search: retrieved candidates"
     );
 
-    let fused = rrf::rrf_merge(&dense_ids, &bm25_ids, RRF_K, overfetch);
+    fuse_and_rerank(
+        pool_db,
+        reranker,
+        query_text,
+        &dense_ids,
+        &bm25_ids,
+        &[],
+        pool,
+        config,
+    )
+    .await
+}
+
+/// The shared fusion + rerank tail (issue #21). Both [`hybrid_search`] and the
+/// tiered router (`router::tiered_search`) call this identical body, so graph-OFF
+/// fusion-seam parity holds by construction: given the same dense/bm25 ids and an
+/// empty `graph_ids`, the output is bitwise-identical regardless of caller. Mirrors
+/// the former `hybrid_search` tail exactly: over-fetch clamp → three-list RRF →
+/// non-reranker truncation → reranker hydrate+rerank.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn fuse_and_rerank(
+    pool_db: &SqlitePool,
+    reranker: &Reranker,
+    query_text: &str,
+    dense_ids: &[String],
+    bm25_ids: &[String],
+    graph_ids: &[String],
+    pool: usize,
+    config: &RetrievalConfig,
+) -> Result<Vec<RetrievalHit>, LensError> {
+    let overfetch = pool.clamp(OVERFETCH, MAX_OVERFETCH);
+    let fused = rrf::rrf_merge3(dense_ids, bm25_ids, graph_ids, RRF_K, overfetch);
 
     if !config.reranker.enabled || fused.is_empty() {
         let mut out = fused;
@@ -119,7 +153,7 @@ pub async fn hybrid_search(
     let reranked = reranker
         .rerank_with_fallback(query_text, fused, texts, &config.reranker, pool)
         .await;
-    tracing::debug!(reranked = reranked.len(), "hybrid_search: reranked");
+    tracing::debug!(reranked = reranked.len(), "fuse_and_rerank: reranked");
     Ok(reranked)
 }
 
@@ -127,7 +161,7 @@ pub async fn hybrid_search(
 /// AND selected (`selected = 1`), preserving the input order, optionally narrowing
 /// by `source_id`/`level`. This is the dense-path scope filter (the vector store
 /// scopes only by `notebook_id`, so trashed/deselected exclusion happens here).
-async fn live_chunk_ids(
+pub(crate) async fn live_chunk_ids(
     pool: &SqlitePool,
     chunk_ids: &[String],
     source_id: Option<&str>,
@@ -163,7 +197,10 @@ async fn live_chunk_ids(
 /// vanished between fusion and hydration is dropped from both lists' correspondence
 /// by returning an empty string; the reranker keys results by index so alignment
 /// must be preserved — we look each id up individually to guarantee ordering.
-async fn hydrate_texts(pool: &SqlitePool, hits: &[RetrievalHit]) -> Result<Vec<String>, LensError> {
+pub(crate) async fn hydrate_texts(
+    pool: &SqlitePool,
+    hits: &[RetrievalHit],
+) -> Result<Vec<String>, LensError> {
     let mut texts = Vec::with_capacity(hits.len());
     for h in hits {
         let text: Option<String> =
