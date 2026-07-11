@@ -211,9 +211,9 @@ pub async fn load_chunk_locators(
                 id,
                 ChunkLocatorRow {
                     section_path,
-                    page: page.map(|p| p as u32),
-                    char_start: char_start.map(|c| c as usize),
-                    char_end: char_end.map(|c| c as usize),
+                    page: page.and_then(|p| u32::try_from(p).ok()),
+                    char_start: char_start.and_then(|c| usize::try_from(c).ok()),
+                    char_end: char_end.and_then(|c| usize::try_from(c).ok()),
                 },
             );
         }
