@@ -18,6 +18,7 @@
   import SourcesRail from '$lib/components/sources/SourcesRail.svelte';
   import PreferencesShell from '$lib/components/embeddings/PreferencesShell.svelte';
   import NotebookSettingsSheet from '$lib/components/embeddings/NotebookSettingsSheet.svelte';
+  import ChatPane from '$lib/components/chat/ChatPane.svelte';
 
   let createOpen = $state(false);
   let userName = $state('');
@@ -118,7 +119,13 @@
     <main class="flex flex-col overflow-hidden">
       <NotebookTopBar />
       {#if activeNotebook}
-        <div class="flex flex-1 flex-col overflow-hidden"></div>
+        <div class="flex flex-1 flex-col overflow-hidden">
+          {#if notebookStore.activeTab === 'chat'}
+            {#key activeNotebook.id}
+              <ChatPane notebookId={activeNotebook.id} />
+            {/key}
+          {/if}
+        </div>
       {:else if !notebookStore.loading}
         <!-- Gate on !loading to prevent an empty-state flash before auto-select fires. -->
         <div class="flex flex-1 flex-col items-center justify-center gap-2">
