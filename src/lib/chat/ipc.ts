@@ -1,12 +1,7 @@
 // Typed IPC wrappers for the chat Tauri commands. Guarded with `isTauri()`.
 //
-// Two-frame terminator (highest-risk seam — see the plan's Risk R9): the outer
-// `StreamEvent<AnswerEvent>` wraps `started|chunk|done|failed`; the INNER
-// `AnswerEvent` (Stage/ThinkingDelta/TextDelta/Citations/Done) is delivered only
-// inside `chunk` frames. `askNotebook` forwards each layer separately and does NOT
-// treat the outer `done` as a finalize trigger — unlike `embeddings/ipc.ts`, which
-// finalizes on outer `done`. The caller (chat-state store) decides what to persist;
-// this module only relays frames.
+// Two-frame terminator (Risk R9): see chat-state.svelte.ts header for the full
+// persistence contract — this module only relays frames, it decides nothing.
 
 import { Channel, invoke, isTauri } from '@tauri-apps/api/core';
 import type { StreamEvent } from '$lib/sources/types.js';

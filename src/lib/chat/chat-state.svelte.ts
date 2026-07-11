@@ -30,6 +30,7 @@ interface NotebookChatState {
   currentTurnId: string | null;
   error: { kind: string; message: string } | null;
   pinnedToBottom: boolean;
+  streamGeneration: number;
 }
 
 function emptyNotebookState(): NotebookChatState {
@@ -42,7 +43,8 @@ function emptyNotebookState(): NotebookChatState {
     pendingCitations: null,
     currentTurnId: null,
     error: null,
-    pinnedToBottom: true
+    pinnedToBottom: true,
+    streamGeneration: 0
   };
 }
 
@@ -124,6 +126,7 @@ function resetStreamBuffers(state: NotebookChatState): void {
 
 async function runStream(notebookId: string, turnId: string, question: string): Promise<void> {
   const state = ensure(notebookId);
+  const gen = ++state.streamGeneration;
   state.streaming = true;
   state.stage = null;
   state.thinkingBuffer = '';
@@ -136,6 +139,7 @@ async function runStream(notebookId: string, turnId: string, question: string): 
   let persisted = false;
 
   const persistOnce = async (tokensUsed: number): Promise<void> => {
+    if (state.streamGeneration !== gen) return;
     if (persisted) return;
     persisted = true;
     const saved = await saveChatAssistant(
@@ -145,6 +149,7 @@ async function runStream(notebookId: string, turnId: string, question: string): 
       state.pendingCitations,
       tokensUsed
     );
+    if (state.streamGeneration !== gen) return;
     const turn = state.turns.find((t) => t.turn_id === turnId);
     if (turn) turn.versions.push(saved);
     state.streaming = false;
@@ -152,6 +157,7 @@ async function runStream(notebookId: string, turnId: string, question: string): 
 
   await askNotebook(notebookId, question, {
     onEvent: (event: AnswerEvent) => {
+      if (state.streamGeneration !== gen) return;
       if ('Stage' in event) {
         state.stage = event.Stage;
       } else if ('ThinkingDelta' in event) {
@@ -161,23 +167,25 @@ async function runStream(notebookId: string, turnId: string, question: string): 
       } else if ('Citations' in event) {
         state.pendingCitations = event.Citations;
       } else if ('Done' in event) {
-        // THE sole finalize+persist trigger. Fire-and-forget from the sync
-        // handler; errors surface as a store error (not thrown to askNotebook).
+        // Sole finalize+persist trigger (see header). Fire-and-forget from the
+        // sync handler; errors surface as a store error, not thrown to askNotebook.
         void persistOnce(event.Done.tokens_used).catch((err) => {
+          if (state.streamGeneration !== gen) return;
           state.error = { kind: 'Internal', message: String(err) };
           resetStreamBuffers(state);
         });
       }
     },
     onStreamDone: () => {
-      // Outer terminator — NO-OP for persistence (Risk R9). Only clear the
-      // streaming flag if the inner Done never arrived (defensive; normally
-      // persistOnce already cleared it).
+      if (state.streamGeneration !== gen) return;
+      // Outer terminator — no-op for persistence (see header). Only clear
+      // streaming if the inner Done never arrived.
       if (!persisted) {
         resetStreamBuffers(state);
       }
     },
     onFailed: (err) => {
+      if (state.streamGeneration !== gen) return;
       if (err.kind === 'Cancelled') {
         // AC8: keep partial answerBuffer in-session, persist nothing.
         state.streaming = false;
@@ -246,9 +254,14 @@ export async function setFeedback(
   for (const turn of state.turns) {
     const version = turn.versions.find((v) => v.id === messageId);
     if (version) {
+      const prev = version.feedback;
       const resolved = version.feedback === next ? null : next;
       version.feedback = resolved;
-      await setChatFeedback(messageId, resolved);
+      try {
+        await setChatFeedback(messageId, resolved);
+      } catch {
+        version.feedback = prev;
+      }
       return;
     }
   }

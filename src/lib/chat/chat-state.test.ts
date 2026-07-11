@@ -168,6 +168,43 @@ describe('send / persist-exactly-once fixture', () => {
     await send(NB, 'second');
     expect(cancelAsk).toHaveBeenCalledWith(NB);
   });
+
+  it('ignores a stale onFailed({Cancelled}) from a superseded stream (generation guard)', async () => {
+    vi.mocked(saveChatUser).mockResolvedValue(makeChatMessage({ id: 'u1' }));
+
+    let staleHandlers: AskNotebookHandlers | undefined;
+    // First send's askNotebook captures its handlers but never calls them —
+    // simulating a cancel command that resolves before the prior stream drains.
+    vi.mocked(askNotebook).mockImplementationOnce(
+      async (_nb: string, _q: string, handlers: AskNotebookHandlers) => {
+        staleHandlers = handlers;
+        handlers.onEvent({ TextDelta: 'stale-first-turn-text' });
+      }
+    );
+
+    await send(NB, 'first');
+    expect(chatStore.streaming(NB)).toBe(true);
+
+    // Second send's stream stays in-flight (never reaches Done) so we can
+    // observe corruption from the stale handler if the guard were absent.
+    vi.mocked(askNotebook).mockImplementationOnce(
+      async (_nb: string, _q: string, handlers: AskNotebookHandlers) => {
+        handlers.onEvent({ TextDelta: 'second-turn-text' });
+      }
+    );
+
+    await send(NB, 'second');
+    expect(chatStore.streaming(NB)).toBe(true);
+    expect(chatStore.answerBuffer(NB)).toBe('second-turn-text');
+
+    // The stale first-turn stream's onFailed arrives late, after the second
+    // runStream has already started. It must be inert.
+    staleHandlers?.onFailed({ kind: 'Cancelled', message: 'answer generation cancelled' });
+
+    expect(chatStore.streaming(NB)).toBe(true);
+    expect(chatStore.answerBuffer(NB)).toBe('second-turn-text');
+    expect(chatStore.error(NB)).toBeNull();
+  });
 });
 
 describe('cancel path', () => {
@@ -272,5 +309,25 @@ describe('feedback toggle', () => {
     await setFeedback(NB, 'a1', 'down');
     const turns = chatStore.turns(NB);
     expect(turns[0].versions[0].feedback).toBe('down');
+  });
+
+  it('rolls back the optimistic write when the IPC call rejects', async () => {
+    const user = makeChatMessage({ id: 'u1', turn_id: 't1', role: 'user' });
+    const assistant = makeChatMessage({
+      id: 'a1',
+      turn_id: 't1',
+      role: 'assistant',
+      feedback: 'up'
+    });
+    vi.mocked(listChatMessages).mockResolvedValue([user, assistant]);
+    await hydrate(NB);
+
+    const { setChatFeedback } = await import('./ipc.js');
+    vi.mocked(setChatFeedback).mockRejectedValueOnce(new Error('boom'));
+
+    await setFeedback(NB, 'a1', 'down');
+
+    const turns = chatStore.turns(NB);
+    expect(turns[0].versions[0].feedback).toBe('up');
   });
 });

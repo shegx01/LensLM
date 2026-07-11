@@ -21,8 +21,6 @@
 
   let { notebookId }: Props = $props();
 
-  let lastRetryQuestion = $state('');
-
   $effect(() => {
     void hydrate(notebookId);
   });
@@ -37,12 +35,12 @@
   const pinnedToBottom = $derived(chatStore.pinnedToBottom(notebookId));
 
   function handleSend(question: string): void {
-    lastRetryQuestion = question;
     void send(notebookId, question);
   }
 
   function handleRetry(): void {
-    if (lastRetryQuestion) void send(notebookId, lastRetryQuestion);
+    // Re-ask under the SAME turn_id (no duplicate user row), not a new `send`.
+    if (currentTurnId) void regenerate(notebookId, currentTurnId);
   }
 </script>
 
