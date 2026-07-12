@@ -53,6 +53,7 @@ function makeNotebook(id: string): import('$lib/notebooks/types.js').NotebookSum
     updated_at: '2026-01-01T00:00:00Z',
     trashed_at: null,
     last_activity_at: '2026-01-01T00:00:00Z',
+    graph_retrieval_enabled: null,
     source_count: 0
   };
 }

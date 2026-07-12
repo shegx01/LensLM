@@ -9,8 +9,8 @@
 mod runtime;
 
 pub use runtime::{
-    EvalOutcome, EvalReport, QA_PROMPT_VERSION, QuestionKind, RunEvalDeps, SeedEntity,
-    run_notebook_eval,
+    EvalOutcome, EvalPhase, EvalReport, LatestEval, QA_PROMPT_VERSION, QuestionKind, RunEvalDeps,
+    SeedEntity, run_notebook_eval,
 };
 
 use sqlx::SqlitePool;

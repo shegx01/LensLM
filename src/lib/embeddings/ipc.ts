@@ -31,6 +31,28 @@ export interface EmbeddingModelInfo {
   status: 'active' | 'none';
 }
 
+// SYNC-CHECK: must match src-tauri/src/commands/notebooks.rs EvalReportDto.
+export interface EvalReportDto {
+  graph_recall: number;
+  hybrid_recall: number;
+  delta_pp: number;
+  p95_ms: number;
+  passed: boolean;
+  sample_n: number;
+  dropped_n: number;
+  graph_enabled: boolean;
+  prompt_version: string;
+  ran_at: string;
+}
+
+// SYNC-CHECK: must match src-tauri/src/commands/notebooks.rs EvalOutcomeDto.
+export type EvalOutcomeDto =
+  | { status: 'skipped'; reason: string }
+  | { status: 'ran'; report: EvalReportDto };
+
+// SYNC-CHECK: must match src-tauri/src/commands/notebooks.rs EvalPhaseDto.
+export type EvalPhaseDto = 'generating_qa' | 'done';
+
 /** Outside Tauri returns `{ status: "none" }` so the picker renders without a native backend. */
 export async function getNotebookEmbeddingModel(notebookId: string): Promise<EmbeddingModelInfo> {
   if (!isTauri()) {
@@ -107,4 +129,52 @@ export async function listOllamaModels(baseUrl: string): Promise<string[]> {
   } catch {
     return [];
   }
+}
+
+/** Effective per-notebook graph-retrieval setting (override, else global default).
+ *  Returns `false` outside Tauri. */
+export async function getNotebookGraphRetrievalEnabled(notebookId: string): Promise<boolean> {
+  if (!isTauri()) return false;
+  return invoke<boolean>('get_notebook_graph_retrieval_enabled', { notebookId });
+}
+
+/** Persists the binary per-notebook graph-retrieval override. No-op outside Tauri. */
+export async function setNotebookGraphRetrievalEnabled(
+  notebookId: string,
+  enabled: boolean
+): Promise<void> {
+  if (!isTauri()) return;
+  await invoke<void>('set_notebook_graph_retrieval_enabled', { notebookId, enabled });
+}
+
+/** Latest eval verdict for a notebook, or `null` if it has never run (or outside Tauri). */
+export async function latestNotebookEval(notebookId: string): Promise<EvalReportDto | null> {
+  if (!isTauri()) return null;
+  return invoke<EvalReportDto | null>('latest_notebook_eval', { notebookId });
+}
+
+/**
+ * Runs the graph-retrieval eval on demand, streaming {@link EvalPhaseDto} phases and
+ * resolving with the {@link EvalOutcomeDto}. A `failed` event rejects with its message
+ * (missing/unreachable provider surfaces here). No-op resolve outside Tauri.
+ */
+export async function runNotebookGraphEval(
+  notebookId: string,
+  onPhase: (phase: EvalPhaseDto) => void
+): Promise<EvalOutcomeDto> {
+  if (!isTauri()) return { status: 'skipped', reason: 'not running in Tauri' };
+  const channel = new Channel<StreamEvent<EvalPhaseDto>>();
+  return new Promise<EvalOutcomeDto>((resolve, reject) => {
+    channel.onmessage = (ev) => {
+      if (ev.type === 'chunk') onPhase(ev.data);
+      else if (ev.type === 'failed') {
+        const e = new Error(ev.data.message);
+        (e as Error & { kind?: string }).kind = ev.data.kind;
+        reject(e);
+      }
+    };
+    invoke<EvalOutcomeDto>('run_notebook_graph_eval', { notebookId, onEvent: channel })
+      .then(resolve)
+      .catch(reject);
+  });
 }

@@ -19,6 +19,10 @@ export interface Notebook {
   trashed_at: string | null;
   // SYNC-CHECK: must match lens-core/src/notebooks.rs Notebook.last_activity_at (nullable TEXT).
   last_activity_at: string | null;
+  // SYNC-CHECK: must match lens-core/src/notebooks.rs Notebook.graph_retrieval_enabled (nullable).
+  /** Raw per-notebook override; `null` = inherit the global default. NOT the effective
+   *  value — read the effective bool via `getNotebookGraphRetrievalEnabled`. */
+  graph_retrieval_enabled: boolean | null;
 }
 
 // SYNC-CHECK: must match lens-core/src/notebooks.rs NotebookSummary struct.
@@ -36,5 +40,8 @@ export interface NotebookSummary {
   trashed_at: string | null;
   // SYNC-CHECK: must match lens-core/src/notebooks.rs Notebook.last_activity_at (nullable TEXT).
   last_activity_at: string | null;
+  // SYNC-CHECK: must match lens-core/src/notebooks.rs Notebook.graph_retrieval_enabled (nullable).
+  /** Raw per-notebook override; `null` = inherit the global default. */
+  graph_retrieval_enabled: boolean | null;
   source_count: number;
 }

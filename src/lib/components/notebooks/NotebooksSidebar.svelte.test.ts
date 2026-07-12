@@ -102,6 +102,7 @@ function makeNotebook(id: string, title: string, sourceCount = 2): NotebookSumma
     updated_at: '2026-06-01T00:00:00Z',
     trashed_at: null,
     last_activity_at: null,
+    graph_retrieval_enabled: null,
     embedding_model: null,
     embedding_backend: null,
     source_count: sourceCount
