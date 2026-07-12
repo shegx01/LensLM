@@ -3,11 +3,14 @@
 
 import { render, screen, fireEvent } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { tick } from 'svelte';
 import type { Source } from '$lib/sources/types.js';
 
 const { mockSourcesStore, mockNotebookStore } = vi.hoisted(() => {
   let _sources: Source[] = [];
   let _recentlyTrashed = false;
+  let _focusedSourceId: string | null = null;
+  let _focusNonce = 0;
 
   const mockSourcesStore = {
     get sources() {
@@ -23,11 +26,25 @@ const { mockSourcesStore, mockNotebookStore } = vi.hoisted(() => {
     get recentlyTrashed() {
       return _recentlyTrashed;
     },
+    get focusedSourceId() {
+      return _focusedSourceId;
+    },
+    get focusNonce() {
+      return _focusNonce;
+    },
     _setSources(s: Source[]) {
       _sources = s;
     },
     _setRecentlyTrashed(v: boolean) {
       _recentlyTrashed = v;
+    },
+    _focus(id: string | null) {
+      _focusedSourceId = id;
+      _focusNonce += 1;
+    },
+    _resetFocus() {
+      _focusedSourceId = null;
+      _focusNonce = 0;
     }
   };
 
@@ -62,8 +79,10 @@ vi.mock('$lib/sources/sources-state.svelte.js', () => ({
   toggleSelected: vi.fn().mockResolvedValue(undefined),
   removeSource: vi.fn().mockResolvedValue(undefined),
   undoRemove: vi.fn().mockResolvedValue(undefined),
+  retrySource: vi.fn().mockResolvedValue(undefined),
   resetSourcesStore: vi.fn(),
-  disposeTrashTimers: vi.fn()
+  disposeTrashTimers: vi.fn(),
+  focusSource: vi.fn()
 }));
 
 vi.mock('$lib/sources/ipc.js', () => ({
@@ -132,12 +151,14 @@ beforeEach(() => {
   vi.clearAllMocks();
   mockSourcesStore._setSources([]);
   mockSourcesStore._setRecentlyTrashed(false);
+  mockSourcesStore._resetFocus();
   mockNotebookStore._setRightRailCollapsed(false);
 });
 
 afterEach(() => {
   mockSourcesStore._setSources([]);
   mockSourcesStore._setRecentlyTrashed(false);
+  mockSourcesStore._resetFocus();
   mockNotebookStore._setRightRailCollapsed(false);
 });
 
@@ -465,6 +486,71 @@ describe('SourcesRail — Studio shell', () => {
     mockNotebookStore._setRightRailCollapsed(true);
     render(SourcesRail);
     expect(screen.queryByText('Audio Overview')).not.toBeInTheDocument();
+  });
+});
+
+describe('SourcesRail — data-source-id anchors', () => {
+  it('tags each source <li> with its data-source-id', () => {
+    mockSourcesStore._setSources([makeSource({ id: 'src-001' }), makeSource({ id: 'src-002' })]);
+    const { container } = render(SourcesRail);
+    expect(container.querySelector('[data-source-id="src-001"]')).not.toBeNull();
+    expect(container.querySelector('[data-source-id="src-002"]')).not.toBeNull();
+  });
+});
+
+describe('SourcesRail — reveal-in-rail (focusSource)', () => {
+  it('does NOT scroll on mount when focusedSourceId is null', async () => {
+    const scrollSpy = vi
+      .spyOn(HTMLElement.prototype, 'scrollIntoView')
+      .mockImplementation(() => {});
+    mockSourcesStore._setSources([makeSource({ id: 'src-001' })]);
+
+    render(SourcesRail);
+    await tick();
+
+    expect(scrollSpy).not.toHaveBeenCalled();
+    scrollSpy.mockRestore();
+  });
+
+  it('scrolls the focused row into view and applies the pulse ring', async () => {
+    const scrollSpy = vi
+      .spyOn(HTMLElement.prototype, 'scrollIntoView')
+      .mockImplementation(() => {});
+    mockSourcesStore._setSources([makeSource({ id: 'src-001' }), makeSource({ id: 'src-002' })]);
+    // Set focus BEFORE render so the effect picks it up on its first (mount) run.
+    mockSourcesStore._focus('src-002');
+
+    const { container } = render(SourcesRail);
+    await tick();
+    await tick();
+
+    expect(scrollSpy).toHaveBeenCalledWith({ block: 'nearest' });
+    const li = container.querySelector('[data-source-id="src-002"]') as HTMLElement;
+    expect(li.className).toContain('ring-2');
+    scrollSpy.mockRestore();
+  });
+
+  it('expands a collapsed rail before revealing the source', async () => {
+    vi.spyOn(HTMLElement.prototype, 'scrollIntoView').mockImplementation(() => {});
+    mockSourcesStore._setSources([makeSource({ id: 'src-001' })]);
+    mockNotebookStore._setRightRailCollapsed(true);
+    mockSourcesStore._focus('src-001');
+
+    render(SourcesRail);
+    await tick();
+
+    expect(mockNotebookStore.rightRailCollapsed).toBe(false);
+  });
+});
+
+describe('SourcesRail — trash-in-session (AC5 ≡ AC6 invariant)', () => {
+  it('a trashed cited source is absent from the rail (its <li> is gone)', () => {
+    // The store is exactly the live set: a trashed source is removed from it, so
+    // the rail has no <li> for it — matching a stale chip having no scroll target.
+    mockSourcesStore._setSources([makeSource({ id: 'src-live' })]);
+    const { container } = render(SourcesRail);
+    expect(container.querySelector('[data-source-id="src-live"]')).not.toBeNull();
+    expect(container.querySelector('[data-source-id="src-trashed"]')).toBeNull();
   });
 });
 

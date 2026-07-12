@@ -128,6 +128,39 @@ describe('send / persist-exactly-once fixture', () => {
     expect(chatStore.streaming(NB)).toBe(false);
   });
 
+  it('freshly-answered parity: the pushed version round-trips citations without a reload (S6.5)', async () => {
+    vi.mocked(saveChatUser).mockResolvedValue(makeChatMessage({ id: 'u1', turn_id: 'ignored' }));
+    const citations: Citation[] = [
+      { source_id: 'src-1', ordinal: 1, locators: [] },
+      { source_id: 'src-2', ordinal: 2, locators: [] }
+    ];
+    // Mirror insert_assistant (chat.rs:282): the saved row carries citations as a JSON string.
+    vi.mocked(saveChatAssistant).mockResolvedValue(
+      makeChatMessage({
+        id: 'a1',
+        role: 'assistant',
+        content: 'answer',
+        citations: JSON.stringify(citations)
+      })
+    );
+
+    vi.mocked(askNotebook).mockImplementation(
+      async (_nb: string, _q: string, handlers: AskNotebookHandlers) => {
+        handlers.onEvent({ TextDelta: 'answer' });
+        handlers.onEvent({ Citations: citations });
+        handlers.onEvent({ Done: { tokens_used: 7 } });
+        handlers.onStreamDone();
+      }
+    );
+
+    await send(NB, 'q?');
+
+    const turns = chatStore.turns(NB);
+    const saved = latestVersion(turns[0]);
+    expect(saved).not.toBeNull();
+    expect(messageCitations(saved!)).toEqual(citations);
+  });
+
   it('cancels an in-flight turn before starting a new send (single-flight)', async () => {
     vi.mocked(saveChatUser).mockResolvedValue(makeChatMessage({ id: 'u1' }));
     // First send's stream never reaches Done/onStreamDone/onFailed, so `streaming`

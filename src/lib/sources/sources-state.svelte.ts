@@ -39,6 +39,12 @@ interface TrashEntry {
 // LIFO queue — newest entry at the tail. undoRemove() pops from the tail.
 let trashQueue = $state<TrashEntry[]>([]);
 
+// Focus-source signal (#23b): a citation chip click sets `focusedSourceId` so the
+// SourcesRail scrolls+pulses that row. `focusNonce` bumps every call so re-clicking
+// the same chip re-fires the rail effect even when the id is unchanged.
+let focusedSourceId = $state<string | null>(null);
+let focusNonce = $state(0);
+
 // ---------------------------------------------------------------------------
 // Exported store object
 // ---------------------------------------------------------------------------
@@ -59,8 +65,25 @@ export const sourcesStore = {
   /** Whether any soft-deleted source is currently pending undo (drives the Undo bar). */
   get recentlyTrashed(): boolean {
     return trashQueue.length > 0;
+  },
+  /** Source the rail should reveal (set by a citation chip click); `null` when idle. */
+  get focusedSourceId(): string | null {
+    return focusedSourceId;
+  },
+  /** Bumps on every `focusSource` call so re-clicking the same chip re-fires the rail effect. */
+  get focusNonce(): number {
+    return focusNonce;
   }
 };
+
+/**
+ * Reveal a source in the SourcesRail (AC6). `_locator` is reserved for the future
+ * document viewer (AC7) — accepted here now so upgrading it won't touch chip code.
+ */
+export function focusSource(sourceId: string, _locator?: unknown): void {
+  focusedSourceId = sourceId;
+  focusNonce++;
+}
 
 /**
  * Cancel all pending trash timers and drain the queue.
@@ -327,6 +350,8 @@ export function resetSourcesStore(): void {
   sources = [];
   loading = false;
   error = null;
+  focusedSourceId = null;
+  focusNonce = 0;
   for (const entry of trashQueue) {
     clearTimeout(entry.timeoutId);
   }
