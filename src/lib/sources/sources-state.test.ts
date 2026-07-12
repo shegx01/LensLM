@@ -16,7 +16,8 @@ import {
   toggleSelected,
   removeSource,
   undoRemove,
-  disposeTrashTimers
+  disposeTrashTimers,
+  focusSource
 } from './sources-state.svelte.js';
 
 // ---------------------------------------------------------------------------
@@ -121,6 +122,47 @@ describe('resetSourcesStore', () => {
     expect(sourcesStore.sources).toHaveLength(0);
     expect(sourcesStore.loading).toBe(false);
     expect(sourcesStore.error).toBeNull();
+  });
+
+  it('clears the focus-source signal (id + nonce)', () => {
+    focusSource('src-001');
+    expect(sourcesStore.focusedSourceId).toBe('src-001');
+    expect(sourcesStore.focusNonce).toBeGreaterThan(0);
+
+    resetSourcesStore();
+
+    expect(sourcesStore.focusedSourceId).toBeNull();
+    expect(sourcesStore.focusNonce).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// focusSource — reveal-in-rail signal (#23b)
+// ---------------------------------------------------------------------------
+
+describe('focusSource', () => {
+  it('sets focusedSourceId and bumps focusNonce', () => {
+    expect(sourcesStore.focusedSourceId).toBeNull();
+    expect(sourcesStore.focusNonce).toBe(0);
+
+    focusSource('src-abc');
+
+    expect(sourcesStore.focusedSourceId).toBe('src-abc');
+    expect(sourcesStore.focusNonce).toBe(1);
+  });
+
+  it('bumps the nonce again when the same source is focused twice (re-fire)', () => {
+    focusSource('src-abc');
+    focusSource('src-abc');
+
+    expect(sourcesStore.focusedSourceId).toBe('src-abc');
+    expect(sourcesStore.focusNonce).toBe(2);
+  });
+
+  it('accepts an optional locator without changing the focused id (AC7 seam)', () => {
+    focusSource('src-abc', { page: 4 });
+    expect(sourcesStore.focusedSourceId).toBe('src-abc');
+    expect(sourcesStore.focusNonce).toBe(1);
   });
 });
 

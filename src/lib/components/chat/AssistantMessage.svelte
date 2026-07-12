@@ -7,8 +7,10 @@
   import ChevronLeft from '@lucide/svelte/icons/chevron-left';
   import ChevronRight from '@lucide/svelte/icons/chevron-right';
   import MessageActions from './MessageActions.svelte';
-  import { renderMarkdown } from '$lib/chat/render-markdown.js';
+  import CitationChips from './CitationChips.svelte';
+  import { renderMarkdown, stripCitationMarkers } from '$lib/chat/render-markdown.js';
   import { enhanceCodeBlocks } from '$lib/chat/code-copy.js';
+  import { messageCitations } from '$lib/chat/chat-state.svelte.js';
   import type { ChatMessage } from '$lib/chat/types.js';
 
   interface Props {
@@ -38,8 +40,14 @@
   });
 
   const current = $derived(versions[selectedIndex]);
+  const citations = $derived(current ? messageCitations(current) : null);
+  const ordinals = $derived(new Set((citations ?? []).map((c) => c.ordinal)));
   const html = $derived(
-    current ? renderMarkdown(current.content, { highlight: highlightCode }) : ''
+    current
+      ? renderMarkdown(stripCitationMarkers(current.content, ordinals), {
+          highlight: highlightCode
+        })
+      : ''
   );
 
   $effect(() => {
@@ -74,6 +82,10 @@
         <div bind:this={containerEl} class="chat-markdown text-sm leading-relaxed text-foreground">
           {@html html}
         </div>
+
+        {#if citations && citations.length > 0}
+          <CitationChips {citations} />
+        {/if}
 
         <div class="mt-1.5 flex items-center gap-2">
           <MessageActions

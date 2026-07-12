@@ -8,7 +8,8 @@ import { render, waitFor } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('$lib/chat/render-markdown.js', () => ({
-  renderMarkdown: (source: string) => `<pre><code>${source}</code></pre>`
+  renderMarkdown: (source: string) => `<pre><code>${source}</code></pre>`,
+  stripCitationMarkers: (source: string) => source
 }));
 
 import AssistantMessage from './AssistantMessage.svelte';

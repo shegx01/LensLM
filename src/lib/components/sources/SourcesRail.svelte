@@ -1,6 +1,11 @@
 <!-- SourcesRail — 320px right panel. Header is a drag region; all interactive children
      carry -webkit-app-region: no-drag so clicks don't conflict with window drag.
      All colours are CSS-variable tokens — no hardcoded hex. -->
+<script lang="ts" module>
+  /** How long (ms) the reveal pulse ring stays on a focused source row. */
+  export const PULSE_MS = 1000;
+</script>
+
 <script lang="ts">
   import File from '@lucide/svelte/icons/file';
   import FileText from '@lucide/svelte/icons/file-text';
@@ -12,7 +17,7 @@
   import PanelRightClose from '@lucide/svelte/icons/panel-right-close';
   import Headphones from '@lucide/svelte/icons/headphones';
   import { cn } from '$lib/utils.js';
-  import { onDestroy } from 'svelte';
+  import { onDestroy, tick, untrack } from 'svelte';
   import {
     sourcesStore,
     toggleSelected,
@@ -35,6 +40,42 @@
   // switch). Without this, orphan timers fire after unmount and mutate trashQueue
   // state belonging to a different notebook session.
   onDestroy(disposeTrashTimers);
+
+  // Reveal-in-rail (#23b): a citation chip sets sourcesStore.focusedSourceId;
+  // scroll that row into view and pulse it briefly. A single stored timer is
+  // cleared on re-fire and on destroy so it can't leak across notebook switches.
+  let pulsingId = $state<string | null>(null);
+  let pulseTimer: ReturnType<typeof setTimeout> | undefined;
+
+  $effect(() => {
+    if (sourcesStore.focusedSourceId === null) return;
+    // Reading focusNonce keeps it a dependency so re-clicking the same chip re-fires.
+    void sourcesStore.focusNonce;
+    const targetId = sourcesStore.focusedSourceId;
+
+    // untrack the collapsed read: this effect writes it below, so tracking it would
+    // re-run the effect on expand and scroll twice on the collapsed path.
+    if (untrack(() => notebookStore.rightRailCollapsed)) {
+      notebookStore.rightRailCollapsed = false;
+    }
+
+    void tick().then(() => {
+      const el = document.querySelector(
+        `[data-sources-scroll] [data-source-id="${CSS.escape(targetId)}"]`
+      );
+      // Cancel any prior pulse before the null-guard so a re-fire onto a missing
+      // element still clears the previous timer rather than leaking it.
+      clearTimeout(pulseTimer);
+      if (!el) return;
+      el.scrollIntoView({ block: 'nearest' });
+      pulsingId = targetId;
+      pulseTimer = setTimeout(() => {
+        pulsingId = null;
+      }, PULSE_MS);
+    });
+  });
+
+  onDestroy(() => clearTimeout(pulseTimer));
 
   function toggleCollapse(): void {
     notebookStore.rightRailCollapsed = !notebookStore.rightRailCollapsed;
@@ -277,7 +318,12 @@
           {@const meta = metaLine(source.token_count)}
           {@const status = source.status as SourceStatus}
           <li
-            class="group flex items-start gap-2.5 rounded-lg px-2.5 py-2.5 transition-colors duration-100 hover:bg-muted/50"
+            data-source-id={source.id}
+            data-pulsing={pulsingId === source.id}
+            class={cn(
+              'group flex items-start gap-2.5 rounded-lg px-2.5 py-2.5 transition-colors duration-100 hover:bg-muted/50',
+              pulsingId === source.id && 'ring-2 ring-primary/60'
+            )}
           >
             <button
               class={cn(
