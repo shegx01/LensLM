@@ -8,6 +8,7 @@
   import ChevronRight from '@lucide/svelte/icons/chevron-right';
   import MessageActions from './MessageActions.svelte';
   import { renderMarkdown } from '$lib/chat/render-markdown.js';
+  import { enhanceCodeBlocks } from '$lib/chat/code-copy.js';
   import type { ChatMessage } from '$lib/chat/types.js';
 
   interface Props {
@@ -16,11 +17,20 @@
     onregenerate: () => void;
     onfeedback: (messageId: string, next: 'up' | 'down') => void;
     regenerateDisabled?: boolean;
+    highlightCode?: boolean;
   }
 
-  let { versions, oncopy, onregenerate, onfeedback, regenerateDisabled = false }: Props = $props();
+  let {
+    versions,
+    oncopy,
+    onregenerate,
+    onfeedback,
+    regenerateDisabled = false,
+    highlightCode = true
+  }: Props = $props();
 
   let selectedIndex = $state(0);
+  let containerEl = $state<HTMLElement | null>(null);
 
   $effect(() => {
     // Follow newest version whenever a new one lands (regenerate appends).
@@ -28,7 +38,17 @@
   });
 
   const current = $derived(versions[selectedIndex]);
-  const html = $derived(current ? renderMarkdown(current.content) : '');
+  const html = $derived(
+    current ? renderMarkdown(current.content, { highlight: highlightCode }) : ''
+  );
+
+  $effect(() => {
+    // Read `html` so this re-runs after each {@html} render (post-DOM-update),
+    // then enhance settled answers only — skip transient streaming bubbles.
+    void html;
+    if (!highlightCode || !containerEl) return;
+    return enhanceCodeBlocks(containerEl);
+  });
 
   function prevVersion(): void {
     selectedIndex = Math.max(0, selectedIndex - 1);
@@ -51,7 +71,7 @@
 
       <div class="min-w-0 flex-1">
         <!-- eslint-disable-next-line svelte/no-at-html-tags -->
-        <div class="chat-markdown text-sm leading-relaxed text-foreground">
+        <div bind:this={containerEl} class="chat-markdown text-sm leading-relaxed text-foreground">
           {@html html}
         </div>
 
@@ -121,6 +141,7 @@
     font-size: 0.85em;
   }
   :global(.chat-markdown pre) {
+    position: relative;
     background: var(--muted);
     border-radius: 0.5rem;
     padding: 0.6em 0.8em;
@@ -130,6 +151,50 @@
   :global(.chat-markdown pre code) {
     background: none;
     padding: 0;
+  }
+  :global(.chat-markdown pre .code-copy-btn) {
+    position: absolute;
+    top: 0.4em;
+    right: 0.4em;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.65rem;
+    height: 1.65rem;
+    padding: 0;
+    border: 1px solid var(--border);
+    border-radius: 0.375rem;
+    background: var(--muted);
+    color: var(--muted-foreground);
+    cursor: pointer;
+    opacity: 0;
+    transition:
+      opacity 0.12s ease,
+      color 0.12s ease,
+      background 0.12s ease;
+  }
+  :global(.chat-markdown pre:hover .code-copy-btn),
+  :global(.chat-markdown pre .code-copy-btn:focus-visible) {
+    opacity: 1;
+  }
+  :global(.chat-markdown pre .code-copy-btn:hover) {
+    color: var(--foreground);
+  }
+  :global(.chat-markdown pre .code-copy-btn[data-copied='true']) {
+    opacity: 1;
+    color: var(--primary);
+  }
+  :global(.chat-markdown .code-copy-icon) {
+    display: block;
+  }
+  :global(.chat-markdown .code-copy-icon--check) {
+    display: none;
+  }
+  :global(.chat-markdown .code-copy-btn[data-copied='true'] .code-copy-icon--copy) {
+    display: none;
+  }
+  :global(.chat-markdown .code-copy-btn[data-copied='true'] .code-copy-icon--check) {
+    display: block;
   }
   :global(.chat-markdown a) {
     color: var(--primary);
