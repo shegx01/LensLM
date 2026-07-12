@@ -65,5 +65,5 @@ export async function purgeNotebook(id: string): Promise<void> {
  */
 export async function touchNotebookActivity(notebookId: string): Promise<void> {
   if (!isTauri()) return;
-  return invoke<void>('touch_notebook_activity', { notebook_id: notebookId });
+  return invoke<void>('touch_notebook_activity', { notebookId });
 }

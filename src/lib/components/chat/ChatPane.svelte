@@ -14,6 +14,7 @@
     jumpToLatest,
     unpin
   } from '$lib/chat/chat-state.svelte.js';
+  import { hydrate as hydrateNotes } from '$lib/notes/notes-state.svelte.js';
 
   interface Props {
     notebookId: string;
@@ -23,6 +24,9 @@
 
   $effect(() => {
     void hydrate(notebookId);
+    // Save-button state (MessageActions) needs saved-state up front, not just
+    // when the Notes tab is opened.
+    void hydrateNotes(notebookId);
   });
 
   const turns = $derived(chatStore.turns(notebookId));
@@ -46,6 +50,7 @@
 
 <div class="flex min-h-0 flex-1 flex-col overflow-hidden">
   <ChatTranscript
+    {notebookId}
     {turns}
     {streaming}
     {stage}

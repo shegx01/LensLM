@@ -27,6 +27,7 @@ pub mod ingest;
 pub mod llm;
 pub mod model_catalog;
 pub mod notebooks;
+pub mod notes;
 pub mod parse;
 pub mod render;
 pub mod resolution;
@@ -88,6 +89,7 @@ pub use notebooks::{
     AddSourceOutcome, EmbeddingStats, InspectorChunk, Notebook, NotebookId, NotebookSummary,
     Source, TrashedSource,
 };
+pub use notes::{Note, NoteId, NoteOrigin};
 pub use render::JsRenderer;
 pub use retrieval::router::{ContextUnit, Provenance, RouterOutput, Tier, tiered_search};
 // Test-only: the integration test asserts `RESERVED_OUTPUT`'s value; production
@@ -698,6 +700,83 @@ impl LensEngine {
         let pool = self.pool().await;
         crate::chat::ChatRepo::new(&pool)
             .list(notebook_id.as_str())
+            .await
+    }
+
+    /// Saves a completed grounded answer as a durable `origin=chat` note (#24).
+    /// Serializes the citation payload to JSON internally (engine owns the JSON
+    /// contract) and freezes `source_title` = the title of the ordinal-1 citation's
+    /// source, resolved once at save (`None` when there are no citations).
+    #[tracing::instrument(skip_all)]
+    pub async fn save_chat_note(
+        &self,
+        notebook_id: &NotebookId,
+        content: &str,
+        citations: Option<&[Citation]>,
+        source_message_id: &str,
+    ) -> Result<Note, LensError> {
+        let citations_json = match citations {
+            None => None,
+            Some(c) => Some(
+                serde_json::to_string(c)
+                    .map_err(|e| LensError::Internal(format!("citations serialize failed: {e}")))?,
+            ),
+        };
+        let pool = self.pool().await;
+        let source_title = match citations
+            .and_then(|c| c.iter().find(|cit| cit.ordinal == 1))
+            .map(|cit| cit.source_id.as_str())
+        {
+            None => None,
+            Some(sid) => crate::citation::source_titles(&pool, &[sid])
+                .await?
+                .remove(sid),
+        };
+        crate::notes::NotesRepo::new(&pool)
+            .create_chat_note(
+                notebook_id.as_str(),
+                content,
+                citations_json.as_deref(),
+                source_title.as_deref(),
+                source_message_id,
+            )
+            .await
+    }
+
+    /// Saves a user-authored manual note (#25). Rejects empty/whitespace-only
+    /// content; the persisted note has no citations, `source_title`, or
+    /// `source_message_id`.
+    #[tracing::instrument(skip_all)]
+    pub async fn save_manual_note(
+        &self,
+        notebook_id: &NotebookId,
+        content: &str,
+    ) -> Result<Note, LensError> {
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            return Err(LensError::Validation("note content is empty".into()));
+        }
+        let pool = self.pool().await;
+        crate::notes::NotesRepo::new(&pool)
+            .create_manual_note(notebook_id.as_str(), trimmed)
+            .await
+    }
+
+    /// Lists a notebook's notes, newest first (#24).
+    #[tracing::instrument(skip_all)]
+    pub async fn list_notes(&self, notebook_id: &NotebookId) -> Result<Vec<Note>, LensError> {
+        let pool = self.pool().await;
+        crate::notes::NotesRepo::new(&pool)
+            .list_notes(notebook_id.as_str())
+            .await
+    }
+
+    /// Deletes a note by id (#24, unsave path).
+    #[tracing::instrument(skip_all)]
+    pub async fn delete_note(&self, note_id: &str) -> Result<(), LensError> {
+        let pool = self.pool().await;
+        crate::notes::NotesRepo::new(&pool)
+            .delete_note(note_id)
             .await
     }
 

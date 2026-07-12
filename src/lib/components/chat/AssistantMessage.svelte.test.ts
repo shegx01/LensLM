@@ -8,8 +8,18 @@ import { render, waitFor } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('$lib/chat/render-markdown.js', () => ({
-  renderMarkdown: (source: string) => `<pre><code>${source}</code></pre>`,
-  stripCitationMarkers: (source: string) => source
+  renderMarkdown: (source: string) => `<pre><code>${source}</code></pre>`
+}));
+
+// This suite covers only the copy-button wiring with citation-free content, so
+// the sources store must be inert (no citations to resolve).
+vi.mock('$lib/sources/sources-state.svelte.js', () => ({
+  sourcesStore: {
+    get sources() {
+      return [];
+    }
+  },
+  focusSource: vi.fn()
 }));
 
 import AssistantMessage from './AssistantMessage.svelte';
@@ -19,6 +29,7 @@ let writeText: ReturnType<typeof vi.fn>;
 
 function props(overrides?: Record<string, unknown>) {
   return {
+    notebookId: 'nb-001',
     versions: [makeChatMessage({ role: 'assistant', content: 'const x = 1;\n' })],
     oncopy: vi.fn(),
     onregenerate: vi.fn(),

@@ -42,6 +42,10 @@ fn main() {
     tauri::Builder::default()
         // Native file picker for the onboarding "Add sources" step.
         .plugin(tauri_plugin_dialog::init())
+        // Persist + restore the main window's size/position across restarts so a
+        // resize survives relaunch. First launch uses the tauri.conf.json default;
+        // thereafter the saved geometry supersedes it. Auto-saves on exit.
+        .plugin(tauri_plugin_window_state::Builder::default().build())
         // Resolve the OS app-data dir, init the engine (open db + migrate +
         // load config) on it, and store the handle in Tauri managed state.
         .setup(|app| {
@@ -120,6 +124,10 @@ fn main() {
             commands::notebooks::save_chat_assistant,
             commands::notebooks::set_chat_feedback,
             commands::notebooks::list_chat_messages,
+            commands::notes::save_chat_note,
+            commands::notes::save_manual_note,
+            commands::notes::list_notes,
+            commands::notes::delete_note,
             commands::notebooks::set_notebook_embedding_model,
             commands::notebooks::get_notebook_embedding_model,
             commands::notebooks::set_notebook_graph_retrieval_enabled,

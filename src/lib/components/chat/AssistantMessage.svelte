@@ -7,28 +7,36 @@
   import ChevronLeft from '@lucide/svelte/icons/chevron-left';
   import ChevronRight from '@lucide/svelte/icons/chevron-right';
   import MessageActions from './MessageActions.svelte';
-  import CitationChips from './CitationChips.svelte';
-  import { renderMarkdown, stripCitationMarkers } from '$lib/chat/render-markdown.js';
+  import { renderMarkdown } from '$lib/chat/render-markdown.js';
   import { enhanceCodeBlocks } from '$lib/chat/code-copy.js';
+  import { enhanceCitations, type CitationTarget } from '$lib/chat/citation-inline.js';
   import { messageCitations } from '$lib/chat/chat-state.svelte.js';
+  import { sourcesStore } from '$lib/sources/sources-state.svelte.js';
+  import { notesStore, toggleSave } from '$lib/notes/notes-state.svelte.js';
   import type { ChatMessage } from '$lib/chat/types.js';
 
   interface Props {
+    notebookId: string;
     versions: ChatMessage[];
     oncopy: (content: string) => void;
     onregenerate: () => void;
     onfeedback: (messageId: string, next: 'up' | 'down') => void;
     regenerateDisabled?: boolean;
     highlightCode?: boolean;
+    /** Whether this bubble is a finalized answer — the streaming bubble passes
+     * `false` to hide Save (partial content has no stable message id to save). */
+    finalized?: boolean;
   }
 
   let {
+    notebookId,
     versions,
     oncopy,
     onregenerate,
     onfeedback,
     regenerateDisabled = false,
-    highlightCode = true
+    highlightCode = true,
+    finalized = true
   }: Props = $props();
 
   let selectedIndex = $state(0);
@@ -41,14 +49,24 @@
 
   const current = $derived(versions[selectedIndex]);
   const citations = $derived(current ? messageCitations(current) : null);
-  const ordinals = $derived(new Set((citations ?? []).map((c) => c.ordinal)));
   const html = $derived(
-    current
-      ? renderMarkdown(stripCitationMarkers(current.content, ordinals), {
-          highlight: highlightCode
-        })
-      : ''
+    current ? renderMarkdown(current.content, { highlight: highlightCode }) : ''
   );
+
+  // Ordinal → source, resolved against the live sources store so a removed source
+  // flips its inline chip to the disabled state (AC5) without a full re-render.
+  const citationTargets = $derived.by(() => {
+    const map = new Map<number, CitationTarget>();
+    for (const c of citations ?? []) {
+      const src = sourcesStore.sources.find((s) => s.id === c.source_id);
+      map.set(c.ordinal, {
+        source_id: c.source_id,
+        title: src?.title ?? 'Removed source',
+        live: !!src
+      });
+    }
+    return map;
+  });
 
   $effect(() => {
     // Read `html` so this re-runs after each {@html} render (post-DOM-update),
@@ -56,6 +74,16 @@
     void html;
     if (!highlightCode || !containerEl) return;
     return enhanceCodeBlocks(containerEl);
+  });
+
+  $effect(() => {
+    // Re-runs on render (`html`) AND when the resolved targets change (source
+    // added/removed), so inline chip liveness stays in sync. Streaming bubbles
+    // carry no citations, so this is a no-op there.
+    void html;
+    const targets = citationTargets;
+    if (!containerEl || targets.size === 0) return;
+    return enhanceCitations(containerEl, (n) => targets.get(n) ?? null);
   });
 
   function prevVersion(): void {
@@ -69,9 +97,9 @@
 
 {#if current}
   <div class="px-4 pt-3">
-    <div class="flex gap-2.5">
+    <div class="flex flex-col gap-2">
       <div
-        class="mt-0.5 flex size-6 shrink-0 items-center justify-center rounded-full bg-primary/10 text-primary"
+        class="flex size-6 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground"
         aria-hidden="true"
       >
         <Sparkles class="size-3.5" strokeWidth={1.75} />
@@ -83,17 +111,16 @@
           {@html html}
         </div>
 
-        {#if citations && citations.length > 0}
-          <CitationChips {citations} />
-        {/if}
-
         <div class="mt-1.5 flex items-center gap-2">
           <MessageActions
             feedback={current.feedback}
+            saved={notesStore.savedMessageIds(notebookId).has(current.id)}
             disabled={regenerateDisabled}
+            {finalized}
             oncopy={() => oncopy(current.content)}
             {onregenerate}
             onfeedback={(next) => onfeedback(current.id, next)}
+            onsave={() => void toggleSave(notebookId, current)}
           />
 
           {#if versions.length > 1}
@@ -150,7 +177,60 @@
     background: var(--muted);
     border-radius: 0.25rem;
     padding: 0.1em 0.35em;
-    font-size: 0.85em;
+    font-size: 0.92em;
+    letter-spacing: 0.015em;
+    font-family: var(--font-mono);
+    /* Programming ligatures (=>, !==, ->, etc.); calt drives JetBrains Mono's set. */
+    font-feature-settings:
+      'calt' 1,
+      'liga' 1;
+    font-variant-ligatures: contextual;
+  }
+  /* Collapsible code panel (built post-render by enhanceCodeBlocks). Bordered so
+     it reads as more prominent than the borderless user-message bubble. */
+  :global(.chat-markdown .code-block) {
+    margin: 0.5em 0;
+    border: 1px solid var(--border);
+    border-radius: 0.5rem;
+    overflow: hidden;
+    background: var(--muted);
+  }
+  :global(.chat-markdown .code-block__header) {
+    display: flex;
+    align-items: center;
+    gap: 0.4em;
+    width: 100%;
+    padding: 0.45em 0.6em;
+    border: 0;
+    background: transparent;
+    color: var(--muted-foreground);
+    font-size: 0.8em;
+    font-weight: 500;
+    cursor: pointer;
+    transition: color 0.12s ease;
+  }
+  :global(.chat-markdown .code-block__header:hover) {
+    color: var(--foreground);
+  }
+  :global(.chat-markdown .code-block__header:focus-visible) {
+    outline: none;
+    box-shadow: inset 0 0 0 2px var(--ring);
+  }
+  :global(.chat-markdown .code-block__icon) {
+    display: inline-flex;
+    align-items: center;
+  }
+  :global(.chat-markdown .code-block__chevron) {
+    display: inline-flex;
+    align-items: center;
+    margin-left: auto;
+    transition: transform 0.15s ease;
+  }
+  :global(.chat-markdown .code-block[data-expanded='true'] .code-block__chevron) {
+    transform: rotate(90deg);
+  }
+  :global(.chat-markdown .code-block[data-expanded='false'] .code-block__body) {
+    display: none;
   }
   :global(.chat-markdown pre) {
     position: relative;
@@ -159,6 +239,13 @@
     padding: 0.6em 0.8em;
     overflow-x: auto;
     margin: 0.5em 0;
+  }
+  /* Inside the collapsible panel the container owns the radius/margin; the pre
+     just fills the body and gets a divider under the header. */
+  :global(.chat-markdown .code-block__body pre) {
+    border-radius: 0;
+    margin: 0;
+    border-top: 1px solid var(--border);
   }
   :global(.chat-markdown pre code) {
     background: none;
@@ -215,5 +302,41 @@
   }
   :global(.chat-markdown strong) {
     font-weight: 600;
+  }
+  /* Inline citation chips (injected post-render by enhanceCitations) — compact,
+     superscript numbered pills placed at the exact cited spot. Token-only. */
+  :global(.chat-markdown .citation-chip) {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 1.1em;
+    height: 1.1em;
+    padding: 0 0.3em;
+    margin-left: 0.15em;
+    border: 0;
+    border-radius: 0.3rem;
+    background: var(--secondary);
+    color: var(--secondary-foreground);
+    font-size: 0.7em;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+    vertical-align: super;
+    cursor: pointer;
+    transition:
+      background 0.12s ease,
+      color 0.12s ease;
+  }
+  :global(.chat-markdown .citation-chip:hover) {
+    background: var(--primary);
+    color: var(--primary-foreground);
+  }
+  :global(.chat-markdown .citation-chip:focus-visible) {
+    outline: none;
+    box-shadow: 0 0 0 2px var(--ring);
+  }
+  :global(.chat-markdown .citation-chip--stale) {
+    cursor: default;
+    opacity: 0.55;
   }
 </style>

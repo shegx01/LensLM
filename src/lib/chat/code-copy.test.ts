@@ -114,3 +114,54 @@ describe('enhanceCodeBlocks', () => {
     await vi.waitFor(() => expect(writeText).toHaveBeenCalledWith('const y = 2;\n'));
   });
 });
+
+describe('enhanceCodeBlocks — collapsible panel', () => {
+  it('wraps each pre in an expanded panel with a language header + copy button inside', () => {
+    const root = makeContainer('<pre><code class="hljs language-json">{}\n</code></pre>');
+    enhanceCodeBlocks(root);
+
+    const panel = root.querySelector('.code-block');
+    expect(panel).not.toBeNull();
+    expect(panel?.getAttribute('data-expanded')).toBe('true');
+
+    const header = panel?.querySelector('.code-block__header');
+    expect(header?.getAttribute('aria-expanded')).toBe('true');
+    expect(header?.querySelector('.code-block__lang')?.textContent).toBe('JSON');
+
+    expect(panel?.querySelector('.code-block__body pre .code-copy-btn')).not.toBeNull();
+  });
+
+  it('toggles expanded state (and aria-expanded) when the header is clicked', () => {
+    const root = makeContainer('<pre><code class="language-js">x\n</code></pre>');
+    enhanceCodeBlocks(root);
+    const panel = root.querySelector('.code-block')!;
+    const header = panel.querySelector<HTMLButtonElement>('.code-block__header')!;
+
+    header.click();
+    expect(panel.getAttribute('data-expanded')).toBe('false');
+    expect(header.getAttribute('aria-expanded')).toBe('false');
+
+    header.click();
+    expect(panel.getAttribute('data-expanded')).toBe('true');
+    expect(header.getAttribute('aria-expanded')).toBe('true');
+  });
+
+  it('labels an un-hinted block as "Code"', () => {
+    const root = makeContainer('<pre><code class="hljs">plain\n</code></pre>');
+    enhanceCodeBlocks(root);
+    expect(root.querySelector('.code-block__lang')?.textContent).toBe('Code');
+  });
+
+  it('uses the braces icon only for JSON, the code icon otherwise', () => {
+    const root = makeContainer(
+      '<pre><code class="hljs language-json">{}\n</code></pre>' +
+        '<pre><code class="hljs language-js">x\n</code></pre>' +
+        '<pre><code class="hljs">plain\n</code></pre>'
+    );
+    enhanceCodeBlocks(root);
+    const icons = root.querySelectorAll('.code-block__icon');
+    expect(icons[0].getAttribute('data-icon')).toBe('braces'); // JSON
+    expect(icons[1].getAttribute('data-icon')).toBe('code'); // JavaScript
+    expect(icons[2].getAttribute('data-icon')).toBe('code'); // un-hinted
+  });
+});

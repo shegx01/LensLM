@@ -36,20 +36,6 @@ highlightMarked.setOptions({ breaks: true, gfm: true });
 const plainMarked = new Marked();
 plainMarked.setOptions({ breaks: true, gfm: true });
 
-/**
- * Removes inline `[n]` citation markers from `source`, but ONLY when `n` is a real
- * citation ordinal — the payload's ordinal set disambiguates a marker from a literal
- * numeric bracket in prose (`arr[0]`, out-of-range). `(?!\()` spares markdown links
- * `[1](url)`; `(?!\s*:)` spares reference-style definitions `[1]: url`. Empty set ⇒
- * nothing to strip.
- */
-export function stripCitationMarkers(source: string, ordinals: Set<number>): string {
-  if (ordinals.size === 0) return source;
-  return source.replace(/[ \t]?\[(\d+)\](?!\(|\s*:)/g, (m, num) =>
-    ordinals.has(Number(num)) ? '' : m
-  );
-}
-
 /** Parses `source` as GFM markdown and sanitizes the resulting HTML for safe `{@html}` use. */
 export function renderMarkdown(source: string, opts?: { highlight?: boolean }): string {
   const instance = opts?.highlight === false ? plainMarked : highlightMarked;

@@ -46,6 +46,39 @@
   src: url('/fonts/proximanova-extrabold.woff2') format('woff2');
 }
 
+/* JetBrains Mono (SIL OFL 1.1, see /fonts/JetBrainsMono-OFL.txt) — code-block/
+ * inline-code face with programming ligatures. `local()` first so a locally-installed
+ * copy is used in dev; the bundled woff2 is the portable fallback for shipped builds. */
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src:
+    local('JetBrains Mono'),
+    url('/fonts/jetbrains-mono-regular.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src:
+    local('JetBrains Mono Bold'),
+    url('/fonts/jetbrains-mono-bold.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: italic;
+  font-weight: 400;
+  font-display: swap;
+  src:
+    local('JetBrains Mono Italic'),
+    url('/fonts/jetbrains-mono-italic.woff2') format('woff2');
+}
+
 /* ---------------------------------------------------------------------------
  * Lens design tokens (M1-0).
  *
@@ -594,6 +627,11 @@
   --font-sans:
     'Proxima Nova', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial,
     sans-serif;
+
+  /* Maps to the `font-mono` utility; applied to chat code via .chat-markdown code. */
+  --font-mono:
+    'JetBrains Mono', ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, 'Liberation Mono',
+    monospace;
 
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);

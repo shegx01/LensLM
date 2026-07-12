@@ -1,6 +1,7 @@
-<!-- Action row: copy, regenerate, thumbs up/down (AC11, AC13-AC14, AC22). No
-     save-to-notes (#24) and no citation chips (#23) here. -->
+<!-- Action row: save-to-notes, copy, regenerate, thumbs up/down (AC11, AC13-AC14,
+     AC22, #24). No citation chips (#23) here. -->
 <script lang="ts">
+  import Bookmark from '@lucide/svelte/icons/bookmark';
   import Copy from '@lucide/svelte/icons/copy';
   import RefreshCw from '@lucide/svelte/icons/refresh-cw';
   import ThumbsUp from '@lucide/svelte/icons/thumbs-up';
@@ -11,13 +12,26 @@
 
   interface Props {
     feedback: ChatFeedback;
+    saved: boolean;
     disabled?: boolean;
+    /** Save is offered only for a finalized answer (not the live streaming bubble). */
+    finalized?: boolean;
     oncopy: () => void;
     onregenerate: () => void;
     onfeedback: (next: 'up' | 'down') => void;
+    onsave: () => void;
   }
 
-  let { feedback, disabled = false, oncopy, onregenerate, onfeedback }: Props = $props();
+  let {
+    feedback,
+    saved,
+    disabled = false,
+    finalized = true,
+    oncopy,
+    onregenerate,
+    onfeedback,
+    onsave
+  }: Props = $props();
 
   let copied = $state(false);
   let copyTimer: ReturnType<typeof setTimeout> | undefined;
@@ -38,6 +52,18 @@
 </script>
 
 <div class="mt-1 flex items-center gap-0.5" role="toolbar" aria-label="Message actions">
+  {#if finalized}
+    <button
+      type="button"
+      class={cn(iconBtn, saved && 'text-primary hover:text-primary')}
+      aria-label={saved ? 'Remove from notes' : 'Save to notes'}
+      aria-pressed={saved}
+      onclick={onsave}
+    >
+      <Bookmark class="size-3.5" strokeWidth={2} fill={saved ? 'currentColor' : 'none'} />
+    </button>
+  {/if}
+
   <button
     type="button"
     class={iconBtn}

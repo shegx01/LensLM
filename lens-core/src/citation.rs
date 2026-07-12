@@ -215,6 +215,36 @@ pub async fn load_chunk_locators(
     Ok(out)
 }
 
+/// Batched `SELECT id, title FROM sources` over the distinct `ids`, into a
+/// `source_id -> title` map. Chunks the `IN (…)` list under the SQLite bind limit;
+/// dedups the input. Absent ids are simply missing from the returned map. Shared
+/// by the answer orchestrator (prompt titles) and notes (frozen source tag).
+pub(crate) async fn source_titles(
+    pool: &SqlitePool,
+    ids: &[&str],
+) -> Result<HashMap<String, String>, LensError> {
+    let mut ids: Vec<&str> = ids.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+
+    let mut out = HashMap::new();
+    if ids.is_empty() {
+        return Ok(out);
+    }
+    for batch in ids.chunks(crate::db::BIND_BATCH) {
+        let placeholders = crate::db::in_placeholders(batch.len());
+        let sql = format!("SELECT id, title FROM sources WHERE id IN ({placeholders})");
+        let mut q = sqlx::query_as::<_, (String, String)>(&sql);
+        for id in batch {
+            q = q.bind(*id);
+        }
+        for (id, title) in q.fetch_all(pool).await? {
+            out.insert(id, title);
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

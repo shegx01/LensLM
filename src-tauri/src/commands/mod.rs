@@ -8,6 +8,7 @@ pub mod config;
 pub mod inspector;
 pub mod models;
 pub mod notebooks;
+pub mod notes;
 pub mod system;
 
 use lens_core::{LensEngine, LensError};

@@ -36,6 +36,8 @@ tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
 # Native file picker for the onboarding "Add sources" step (Tauri 2.x plugin).
 tauri-plugin-dialog = "2"
+# Persist the main window's size/position across restarts (Tauri 2.x plugin).
+tauri-plugin-window-state = "2"
 # `#[async_trait]` to implement lens-core's `JsRenderer` trait (issue #78).
 async-trait = "0.1"
 # `FutureExt::catch_unwind` so a panic in the untrusted-JS render body still
