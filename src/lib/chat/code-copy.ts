@@ -4,6 +4,7 @@
 // reconstructs the original source (hljs <span>s are styling only), so that is
 // what we copy — never the rendered/highlighted markup.
 
+// lucide "copy"/"check" icon paths, hand-inlined because an imperatively-injected button can't mount a Svelte icon component.
 const COPY_ICON =
   '<svg class="code-copy-icon code-copy-icon--copy" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>';
 
@@ -24,7 +25,6 @@ export function enhanceCodeBlocks(root: HTMLElement): () => void {
   for (const pre of root.querySelectorAll('pre')) {
     if (pre.dataset.copyEnhanced === 'true') continue;
     pre.dataset.copyEnhanced = 'true';
-    pre.classList.add('code-block');
 
     const button = document.createElement('button');
     button.type = 'button';
@@ -35,13 +35,14 @@ export function enhanceCodeBlocks(root: HTMLElement): () => void {
     button.addEventListener(
       'click',
       async () => {
-        const text = pre.querySelector('code')?.textContent ?? pre.textContent ?? '';
+        const text = pre.querySelector('code')?.textContent ?? '';
         try {
           await navigator.clipboard.writeText(text);
         } catch (err) {
           console.warn('enhanceCodeBlocks: clipboard write failed', err);
           return;
         }
+        if (controller.signal.aborted) return;
         button.dataset.copied = 'true';
         button.setAttribute('aria-label', 'Copied');
         const timer = setTimeout(() => {

@@ -93,4 +93,24 @@ describe('enhanceCodeBlocks', () => {
     await vi.waitFor(() => expect(writeText).toHaveBeenCalled());
     expect(btn.dataset.copied).toBeUndefined();
   });
+
+  // Regenerate/version-switch re-enhance path (why the caller's $effect returns
+  // cleanup). Covered here rather than in the component test because driving a
+  // version switch through AssistantMessage under happy-dom does not reliably
+  // re-fire its $derived-driven $effect; this simulates the same sequence the
+  // component performs — {@html} swaps the container's markup, old cleanup runs,
+  // then the new block is re-enhanced.
+  it('re-enhances a fresh block after an {@html} swap, leaving exactly one working button', async () => {
+    const root = makeContainer('<pre><code>const x = 1;\n</code></pre>');
+    const cleanup = enhanceCodeBlocks(root);
+    expect(root.querySelectorAll('.code-copy-btn')).toHaveLength(1);
+
+    root.innerHTML = '<pre><code>const y = 2;\n</code></pre>';
+    cleanup();
+    enhanceCodeBlocks(root);
+
+    expect(root.querySelectorAll('.code-copy-btn')).toHaveLength(1);
+    root.querySelector<HTMLButtonElement>('.code-copy-btn')!.click();
+    await vi.waitFor(() => expect(writeText).toHaveBeenCalledWith('const y = 2;\n'));
+  });
 });
