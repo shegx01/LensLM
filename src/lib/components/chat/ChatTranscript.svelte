@@ -50,6 +50,8 @@
 
   let viewportRef = $state<HTMLElement | null>(null);
   const isEmpty = $derived(turns.length === 0 && !streaming);
+  // Treat within Npx of bottom as "at bottom" for autoscroll pin/unpin.
+  const PIN_THRESHOLD_PX = 48;
 
   function scrollToBottom(): void {
     if (!viewportRef) return;
@@ -59,7 +61,6 @@
   // Re-pin follows content growth (streaming deltas, new turns) — but only
   // while pinned; an unpinned user stays put even as new content arrives.
   $effect(() => {
-    // Track dependencies explicitly: turns length + live buffers.
     void turns.length;
     void answerBuffer;
     void thinkingBuffer;
@@ -71,7 +72,7 @@
   function handleScroll(e: Event): void {
     const el = e.currentTarget as HTMLElement;
     const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-    if (distanceFromBottom > 48 && pinnedToBottom) {
+    if (distanceFromBottom > PIN_THRESHOLD_PX && pinnedToBottom) {
       onunpin();
     }
   }
@@ -136,9 +137,9 @@
                 regenerateDisabled={true}
               />
             {/if}
-            {#if error}
-              <ErrorCard {error} {onretry} />
-            {/if}
+          {/if}
+          {#if error && currentTurnId === turn.turn_id}
+            <ErrorCard {error} {onretry} />
           {/if}
         {/each}
       </div>

@@ -1,40 +1,36 @@
 import { render, screen, fireEvent } from '@testing-library/svelte';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import ChatTranscript from './ChatTranscript.svelte';
-import type { ChatMessage, Turn } from '$lib/chat/types.js';
+import type { Turn } from '$lib/chat/types.js';
+import { makeChatMessage } from '$lib/chat/test-fixtures.js';
 
 afterEach(() => {
   vi.restoreAllMocks();
 });
 
-function userRow(overrides: Partial<ChatMessage> = {}): ChatMessage {
-  return {
+function userRow(overrides: Partial<ReturnType<typeof makeChatMessage>> = {}) {
+  return makeChatMessage({
     id: 'msg-user-1',
     notebook_id: 'nb-1',
     turn_id: 'turn-1',
     role: 'user',
     content: 'What were the key drivers?',
-    citations: null,
-    feedback: null,
-    tokens_used: null,
     created_at: '2026-07-12T00:00:00Z',
     ...overrides
-  };
+  });
 }
 
-function assistantRow(overrides: Partial<ChatMessage> = {}): ChatMessage {
-  return {
+function assistantRow(overrides: Partial<ReturnType<typeof makeChatMessage>> = {}) {
+  return makeChatMessage({
     id: 'msg-assistant-1',
     notebook_id: 'nb-1',
     turn_id: 'turn-1',
     role: 'assistant',
     content: 'Three primary drivers stand out.',
-    citations: null,
-    feedback: null,
     tokens_used: 42,
     created_at: '2026-07-12T00:00:01Z',
     ...overrides
-  };
+  });
 }
 
 const baseProps = {
@@ -114,14 +110,14 @@ describe('ChatTranscript', () => {
     expect(screen.queryByLabelText('Jump to latest message')).not.toBeInTheDocument();
   });
 
-  it('renders an ErrorCard with Retry when a stream error is present for the current turn', async () => {
+  it('renders an ErrorCard with Retry in the real post-failure state (streaming=false, error set)', async () => {
     const onretry = vi.fn();
     const turns: Turn[] = [{ turn_id: 'turn-1', user: userRow(), versions: [] }];
     render(ChatTranscript, {
       props: {
         ...baseProps,
         turns,
-        streaming: true,
+        streaming: false,
         currentTurnId: 'turn-1',
         error: { kind: 'Internal', message: 'stream failed' },
         onretry
@@ -131,5 +127,24 @@ describe('ChatTranscript', () => {
     expect(screen.getByText('stream failed')).toBeInTheDocument();
     await fireEvent.click(screen.getByText('Retry'));
     expect(onretry).toHaveBeenCalledOnce();
+  });
+
+  it('does not render an ErrorCard for a turn other than the failed currentTurnId', () => {
+    const turns: Turn[] = [
+      { turn_id: 'turn-1', user: userRow(), versions: [] },
+      { turn_id: 'turn-2', user: userRow({ id: 'msg-user-2', turn_id: 'turn-2' }), versions: [] }
+    ];
+    render(ChatTranscript, {
+      props: {
+        ...baseProps,
+        turns,
+        streaming: false,
+        currentTurnId: 'turn-1',
+        error: { kind: 'Internal', message: 'stream failed' }
+      }
+    });
+
+    expect(screen.getByText('stream failed')).toBeInTheDocument();
+    expect(screen.getAllByText('stream failed')).toHaveLength(1);
   });
 });

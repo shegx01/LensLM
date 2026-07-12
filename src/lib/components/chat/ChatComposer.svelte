@@ -61,7 +61,8 @@
       disabled={streaming}
       oninput={handleInput}
       onkeydown={handleKeydown}
-      class="max-h-[200px] min-h-[36px] flex-1 resize-none border-0 bg-transparent px-2 py-1.5 text-sm text-foreground placeholder:text-muted-foreground/60 outline-none disabled:opacity-60"
+      class="min-h-[36px] flex-1 resize-none border-0 bg-transparent px-2 py-1.5 text-sm text-foreground placeholder:text-muted-foreground/60 outline-none disabled:opacity-60"
+      style={`max-height: ${MAX_HEIGHT_PX}px`}
     ></textarea>
 
     {#if streaming}

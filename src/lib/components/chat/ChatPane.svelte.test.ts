@@ -1,13 +1,14 @@
 import { render, screen, fireEvent } from '@testing-library/svelte';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { makeTurn } from '$lib/chat/test-fixtures.js';
 
-const failedTurn = {
+const failedTurn = makeTurn({
   turn_id: 'turn-failed',
   user: {
     id: 'u1',
     notebook_id: 'nb-1',
     turn_id: 'turn-failed',
-    role: 'user' as const,
+    role: 'user',
     content: 'what happened?',
     citations: null,
     feedback: null,
@@ -15,12 +16,14 @@ const failedTurn = {
     created_at: '2026-07-12T00:00:00Z'
   },
   versions: []
-};
+});
 
 vi.mock('$lib/chat/chat-state.svelte.js', () => ({
   chatStore: {
     turns: vi.fn(() => [failedTurn]),
-    streaming: vi.fn(() => true),
+    // Real post-failure state: streaming=false, error set, currentTurnId matches
+    // the failed turn (onFailed's non-cancel path — see chat-state.svelte.ts).
+    streaming: vi.fn(() => false),
     stage: vi.fn(() => null),
     thinkingBuffer: vi.fn(() => ''),
     answerBuffer: vi.fn(() => ''),

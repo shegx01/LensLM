@@ -44,11 +44,8 @@ export type ChatRole = 'user' | 'assistant';
 export type ChatFeedback = 'up' | 'down' | null;
 
 /**
- * Wire shape returned by `save_chat_user` / `save_chat_assistant` / `list_chat_messages`.
- * NOTE the asymmetry: `citations` is a JSON-ENCODED string on this wire type — parse
- * it with `JSON.parse` (into `Citation[]`) when hydrating; `save_chat_assistant` TAKES
- * a typed `Citation[]` array as an argument, it is only the return/list shape that is
- * a raw string.
+ * Wire shape from the chat commands. ASYMMETRY: citations is a JSON string on this
+ * return type (JSON.parse on read); save_chat_assistant TAKES a typed Citation[].
  */
 export interface ChatMessage {
   id: string;

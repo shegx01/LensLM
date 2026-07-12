@@ -9,8 +9,14 @@
 // save (that would double-persist or persist without tokens_used). A cancelled or
 // errored turn persists nothing — only the user row (written on send) survives.
 
-import { askNotebook, cancelAsk, saveChatUser, saveChatAssistant, setChatFeedback } from './ipc.js';
-import { listChatMessages } from './ipc.js';
+import {
+  askNotebook,
+  cancelAsk,
+  saveChatUser,
+  saveChatAssistant,
+  setChatFeedback,
+  listChatMessages
+} from './ipc.js';
 import type {
   AnswerEvent,
   AnswerStage,
@@ -93,7 +99,8 @@ function parseCitations(json: string | null): Citation[] | null {
   if (json === null) return null;
   try {
     return JSON.parse(json) as Citation[];
-  } catch {
+  } catch (err) {
+    console.warn('parseCitations: failed to parse citations JSON', err);
     return null;
   }
 }
@@ -126,6 +133,7 @@ function resetStreamBuffers(state: NotebookChatState): void {
 
 async function runStream(notebookId: string, turnId: string, question: string): Promise<void> {
   const state = ensure(notebookId);
+  // Bump so late callbacks from a superseded/cancelled stream no-op.
   const gen = ++state.streamGeneration;
   state.streaming = true;
   state.stage = null;
@@ -269,7 +277,11 @@ export async function setFeedback(
 
 /** Copies an assistant message's markdown source to the clipboard (AC11, AC22). */
 export async function copyMessage(content: string): Promise<void> {
-  await navigator.clipboard.writeText(content);
+  try {
+    await navigator.clipboard.writeText(content);
+  } catch (err) {
+    console.warn('copyMessage: clipboard write failed', err);
+  }
 }
 
 /** Re-pins the transcript to the bottom (AC19 "Jump to latest"). */

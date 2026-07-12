@@ -43,7 +43,7 @@ export async function cancelAsk(notebookId: string): Promise<boolean> {
   return invoke<boolean>('cancel_ask', { notebookId });
 }
 
-/** Persists a user chat message on send. `turnId` is minted by the frontend. */
+/** `turnId` is minted by the frontend. */
 export async function saveChatUser(
   notebookId: string,
   turnId: string,

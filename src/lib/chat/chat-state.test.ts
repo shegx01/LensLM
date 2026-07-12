@@ -29,24 +29,10 @@ import {
   listChatMessages
 } from './ipc.js';
 import type { AskNotebookHandlers } from './ipc.js';
-import type { ChatMessage, Citation } from './types.js';
+import type { Citation } from './types.js';
+import { makeChatMessage } from './test-fixtures.js';
 
 const NB = 'nb-001';
-
-function makeChatMessage(overrides?: Partial<ChatMessage>): ChatMessage {
-  return {
-    id: 'msg-001',
-    notebook_id: NB,
-    turn_id: 'turn-001',
-    role: 'user',
-    content: 'hello',
-    citations: null,
-    feedback: null,
-    tokens_used: null,
-    created_at: new Date().toISOString(),
-    ...overrides
-  };
-}
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -240,6 +226,27 @@ describe('error path', () => {
 
     expect(saveChatAssistant).not.toHaveBeenCalled();
     expect(chatStore.error(NB)).toEqual({ kind: 'Internal', message: 'boom' });
+    expect(chatStore.streaming(NB)).toBe(false);
+  });
+
+  it('sets error state and stops streaming when saveChatAssistant rejects on inner Done', async () => {
+    vi.mocked(saveChatUser).mockResolvedValue(makeChatMessage({ id: 'u1' }));
+    vi.mocked(saveChatAssistant).mockRejectedValue(new Error('save failed'));
+    vi.mocked(askNotebook).mockImplementation(
+      async (_nb: string, _q: string, handlers: AskNotebookHandlers) => {
+        handlers.onEvent({ TextDelta: 'partial answer' });
+        handlers.onEvent({ Done: { tokens_used: 5 } });
+        handlers.onStreamDone();
+        // persistOnce is fire-and-forget from the Done handler; flush microtasks
+        // so its rejection settles before we assert.
+        await Promise.resolve();
+        await Promise.resolve();
+      }
+    );
+
+    await send(NB, 'q');
+
+    expect(chatStore.error(NB)).toEqual({ kind: 'Internal', message: 'Error: save failed' });
     expect(chatStore.streaming(NB)).toBe(false);
   });
 });

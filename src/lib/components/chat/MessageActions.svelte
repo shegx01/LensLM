@@ -29,6 +29,10 @@
     copyTimer = setTimeout(() => (copied = false), 1500);
   }
 
+  $effect(() => {
+    return () => clearTimeout(copyTimer);
+  });
+
   const iconBtn =
     'flex size-7 items-center justify-center rounded-md text-muted-foreground/70 transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-40';
 </script>
