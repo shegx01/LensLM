@@ -177,6 +177,19 @@
   /* Reserved namespace — layered surfaces (M5). Alias base surfaces for now. */
   --surface-raised: var(--neutral-0);
   --surface-sunken: var(--neutral-50);
+
+  /* --- Syntax palette — LIGHT (see the .hljs-* block below for the rationale;
+     decorative, accent-independent, references primitives only) --- */
+  --code-keyword: var(--purple-500);
+  --code-string: var(--green-primary-aa);
+  --code-comment: var(--neutral-400);
+  --code-number: var(--amber-500);
+  --code-function: var(--blue-500);
+  --code-type: var(--teal-500);
+  --code-builtin: var(--orange-500);
+  --code-variable: var(--rose-500);
+  --code-meta: var(--indigo-500);
+  --code-punctuation: var(--neutral-500);
 }
 
 .dark {
@@ -214,6 +227,19 @@
   --sidebar-accent-foreground: var(--neutral-100);
   --sidebar-border: var(--alpha-border);
   --sidebar-ring: var(--green-primary);
+
+  /* --- Syntax palette — DARK (brighter/vivid steps so tokens read on the
+     muted dark code background) --- */
+  --code-keyword: var(--purple-500);
+  --code-string: var(--green-bright);
+  --code-comment: var(--neutral-500);
+  --code-number: var(--orange-bright);
+  --code-function: var(--blue-500);
+  --code-type: var(--teal-bright);
+  --code-builtin: var(--orange-bright);
+  --code-variable: var(--rose-500);
+  --code-meta: var(--indigo-bright);
+  --code-punctuation: var(--neutral-400);
 
   /* Reserved — layered surfaces (M5) */
   --surface-raised: var(--neutral-800);
@@ -483,6 +509,85 @@
 .dark .nb-indigo {
   --nb-bg: color-mix(in oklch, var(--indigo-600) 20%, transparent);
   --nb-fg: var(--indigo-bright);
+}
+
+/* -------------------------------------------------------------------------
+ * Syntax highlighting palette — highlight.js token colors for chat code.
+ *
+ * Like the .nb-* palette, this is decorative and independent of the user's
+ * [data-accent] selection: it never overrides semantic tokens and is never
+ * overridden by data-accent. The --code-* tokens (defined in :root/.dark)
+ * map ~10 conventional roles onto existing OKLCH primitives; the -500 steps
+ * read on the light code surface, the brighter steps on the dark one.
+ *
+ * Scoped under .chat-markdown so only assistant code blocks are affected.
+ * No .hljs background is set here — .chat-markdown pre supplies the block
+ * surface and `pre code { background:none }` resets the inner element.
+ * ------------------------------------------------------------------------- */
+.chat-markdown .hljs-keyword,
+.chat-markdown .hljs-selector-tag,
+.chat-markdown .hljs-literal,
+.chat-markdown .hljs-section,
+.chat-markdown .hljs-link {
+  color: var(--code-keyword);
+}
+.chat-markdown .hljs-string,
+.chat-markdown .hljs-regexp,
+.chat-markdown .hljs-addition,
+.chat-markdown .hljs-attribute,
+.chat-markdown .hljs-selector-attr,
+.chat-markdown .hljs-selector-pseudo {
+  color: var(--code-string);
+}
+.chat-markdown .hljs-comment,
+.chat-markdown .hljs-quote {
+  color: var(--code-comment);
+  font-style: italic;
+}
+.chat-markdown .hljs-number,
+.chat-markdown .hljs-symbol,
+.chat-markdown .hljs-bullet {
+  color: var(--code-number);
+}
+.chat-markdown .hljs-title,
+.chat-markdown .hljs-title.function_,
+.chat-markdown .hljs-section .hljs-title {
+  color: var(--code-function);
+}
+.chat-markdown .hljs-type,
+.chat-markdown .hljs-class .hljs-title,
+.chat-markdown .hljs-title.class_,
+.chat-markdown .hljs-selector-class {
+  color: var(--code-type);
+}
+.chat-markdown .hljs-built_in,
+.chat-markdown .hljs-builtin-name,
+.chat-markdown .hljs-keyword.hljs-built_in {
+  color: var(--code-builtin);
+}
+.chat-markdown .hljs-variable,
+.chat-markdown .hljs-template-variable,
+.chat-markdown .hljs-attr,
+.chat-markdown .hljs-property,
+.chat-markdown .hljs-params {
+  color: var(--code-variable);
+}
+.chat-markdown .hljs-meta,
+.chat-markdown .hljs-doctag,
+.chat-markdown .hljs-name,
+.chat-markdown .hljs-tag {
+  color: var(--code-meta);
+}
+.chat-markdown .hljs-punctuation,
+.chat-markdown .hljs-operator,
+.chat-markdown .hljs-deletion {
+  color: var(--code-punctuation);
+}
+.chat-markdown .hljs-emphasis {
+  font-style: italic;
+}
+.chat-markdown .hljs-strong {
+  font-weight: 600;
 }
 
 @theme inline {
