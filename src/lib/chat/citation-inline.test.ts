@@ -93,8 +93,7 @@ describe('enhanceCitations', () => {
 
   it('re-enhancing with a changed resolver flips a chip live→stale without duplicating (AC5)', () => {
     const el = host('<p>See [1].</p>');
-    const live = (n: number) =>
-      n === 1 ? { source_id: 's1', title: 'Alpha', live: true } : null;
+    const live = (n: number) => (n === 1 ? { source_id: 's1', title: 'Alpha', live: true } : null);
     const stale = (n: number) =>
       n === 1 ? { source_id: 's1', title: 'Alpha', live: false } : null;
 

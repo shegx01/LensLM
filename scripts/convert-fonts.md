@@ -42,3 +42,22 @@ rm -rf "$WORK"
 The `@font-face` declarations and the `--font-sans` token live in `src/app.css`.
 Fonts are bundled-only: `src: url('/fonts/...woff2')` resolves to the local
 `static/` dir — there is **no** CDN / Google Fonts / network request.
+
+# JetBrains Mono → woff2 (code font)
+
+The chat code font. Unlike Proxima Nova, these are the **official webfont woff2s**
+fetched from the JetBrains Mono release (SIL OFL 1.1; license shipped at
+`static/fonts/JetBrainsMono-OFL.txt`). Source:
+`https://raw.githubusercontent.com/JetBrains/JetBrainsMono/master/fonts/webfonts/JetBrainsMono-{Regular,Bold,Italic}.woff2`.
+The ligature build is used (`calt`), not the "NL" (no-ligatures) variant.
+
+Pinned SHA-256 (verify any re-fetch against these):
+
+| Output                         | SHA-256                                                            |
+| ------------------------------ | ------------------------------------------------------------------ |
+| `jetbrains-mono-regular.woff2` | `f1a7a03672cdd494ce0d5543fac6e4360fe22403c6de297fdc2e55a815f7baff` |
+| `jetbrains-mono-bold.woff2`    | `08863c7964612257a90bd821e3127dc5ccb0b5046f881673a1ade5809eb21d0f` |
+| `jetbrains-mono-italic.woff2`  | `9f158b85eca345daeee01dfffa602709a905ea08b0cc60dbf6153cbbd97da08f` |
+
+The `@font-face` declarations and `--font-mono` token live in `src/app.css`;
+bundled-only under CSP `default-src 'self'` (no runtime network fetch).
