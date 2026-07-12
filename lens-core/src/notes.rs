@@ -1,12 +1,11 @@
 //! Notes persistence (issue #24): durable, source-grounded note snapshots.
 //!
-//! A `origin=chat` [`Note`] freezes a grounded answer at save time — its
-//! `content`, `citations` JSON, and denormalized `source_title` survive later
-//! source deletion/rename (notes have no FK to `sources`). `source_message_id` is
-//! a soft toggle-linkage key back to the originating `chat_messages` row (no DB
-//! FK: SQLite ALTER cannot add one). The `citations` JSON mirrors
-//! `chat_messages.citations` (0018) verbatim for a lossless round-trip;
-//! [`Note::citations_parsed`] exposes the typed seam.
+//! A `origin=chat` [`Note`] freezes a grounded answer at save time: `content`,
+//! `citations` JSON, and denormalized `source_title` survive later source
+//! deletion/rename. `source_message_id` links back to the originating
+//! `chat_messages` row (see 0019 migration header for the no-FK rationale). The
+//! `citations` JSON mirrors `chat_messages.citations` (0018) verbatim for a
+//! lossless round-trip; [`Note::citations_parsed`] exposes the typed seam.
 
 use std::ops::Deref;
 use std::str::FromStr;
@@ -19,8 +18,7 @@ use crate::LensError;
 use crate::citation::Citation;
 
 /// Strongly-typed note identifier (UUIDv7 stored as TEXT). Mirrors
-/// [`NotebookId`](crate::NotebookId): newtype guards against cross-entity id
-/// confusion, `Deref`s to `str`, and binds directly into sqlx queries.
+/// [`NotebookId`](crate::NotebookId).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
 #[serde(transparent)]
 #[sqlx(transparent)]
@@ -130,9 +128,9 @@ pub struct Note {
     pub content: String,
     /// Raw JSON `Vec<Citation>` snapshot (chat notes); `None` when uncited/manual.
     pub citations: Option<String>,
-    /// Frozen title of the ordinal-1 cited source; survives source rename/delete.
+    /// Frozen ordinal-1 source title.
     pub source_title: Option<String>,
-    /// Soft toggle-linkage key to the originating `chat_messages.id` (no DB FK).
+    /// Toggle-linkage key to the originating `chat_messages.id`.
     pub source_message_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,

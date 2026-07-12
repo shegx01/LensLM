@@ -7,8 +7,9 @@
 // separately-tracked flag.
 
 import { saveChatNote, listNotes, deleteNote } from './ipc.js';
+import { parseCitations } from '$lib/chat/citations.js';
 import type { Note } from './types.js';
-import type { ChatMessage, Citation } from '$lib/chat/types.js';
+import type { ChatMessage } from '$lib/chat/types.js';
 
 /** Rendering-only grouping: notes sharing the ordinal-1 citation's `source_id`. */
 export interface NoteGroup {
@@ -18,6 +19,13 @@ export interface NoteGroup {
 }
 
 let byNotebook = $state<Record<string, Note[]>>({});
+/** Per-notebook hydrate generation (mirrors chat-state's streamGeneration): a
+ * stale `listNotes` resolving after a newer hydrate/toggle must not clobber.
+ * Plain (non-reactive) Map — only `byNotebook` needs to drive the UI. */
+const hydrateGeneration = new Map<string, number>();
+/** In-flight `toggleSave` message ids per notebook — guards a check-then-act
+ * race where two fast clicks both see "not saved" and insert two notes. */
+const pendingToggles = new Map<string, Set<string>>();
 
 function ensure(notebookId: string): Note[] {
   let notes = byNotebook[notebookId];
@@ -28,14 +36,20 @@ function ensure(notebookId: string): Note[] {
   return notes;
 }
 
-function parseCitations(json: string | null): Citation[] | null {
-  if (json === null) return null;
-  try {
-    return JSON.parse(json) as Citation[];
-  } catch (err) {
-    console.warn('notes-state: failed to parse citations JSON', err);
-    return null;
+function ensurePending(notebookId: string): Set<string> {
+  let pending = pendingToggles.get(notebookId);
+  if (!pending) {
+    pending = new Set();
+    pendingToggles.set(notebookId, pending);
   }
+  return pending;
+}
+
+/** Bumps and returns a notebook's generation counter (hydrate + toggleSave share it). */
+function bumpGeneration(notebookId: string): number {
+  const gen = (hydrateGeneration.get(notebookId) ?? 0) + 1;
+  hydrateGeneration.set(notebookId, gen);
+  return gen;
 }
 
 /** Ordinal-1 citation's `source_id` for a note, or `null` when uncited. */
@@ -46,25 +60,40 @@ function primarySourceId(note: Note): string | null {
 
 /** Hydrates a notebook's saved notes from `notes` (newest-first, as returned). */
 export async function hydrate(notebookId: string): Promise<void> {
+  const gen = bumpGeneration(notebookId);
   const rows = await listNotes(notebookId);
+  if (hydrateGeneration.get(notebookId) !== gen) return;
   byNotebook[notebookId] = rows;
 }
 
 /**
  * Toggles save-state for a chat message (AC24): if already saved, deletes the
  * backing note; otherwise saves a new snapshot and prepends it (newest-first).
+ * No-ops for a synthetic streaming-bubble id and while a toggle for this
+ * message is already in flight (belt-and-suspenders alongside the UI gate).
  */
 export async function toggleSave(notebookId: string, message: ChatMessage): Promise<void> {
-  const notes = ensure(notebookId);
-  const existing = notes.find((n) => n.source_message_id === message.id);
-  if (existing) {
-    await deleteNote(existing.id);
-    byNotebook[notebookId] = notes.filter((n) => n.id !== existing.id);
-    return;
+  if (message.id.endsWith('-streaming')) return;
+  const pending = ensurePending(notebookId);
+  if (pending.has(message.id)) return;
+  pending.add(message.id);
+  try {
+    const gen = bumpGeneration(notebookId);
+    const notes = ensure(notebookId);
+    const existing = notes.find((n) => n.source_message_id === message.id);
+    if (existing) {
+      await deleteNote(existing.id);
+      if (hydrateGeneration.get(notebookId) !== gen) return;
+      byNotebook[notebookId] = notes.filter((n) => n.id !== existing.id);
+      return;
+    }
+    const citations = parseCitations(message.citations);
+    const saved = await saveChatNote(notebookId, message.content, citations, message.id);
+    if (hydrateGeneration.get(notebookId) !== gen) return;
+    byNotebook[notebookId] = [saved, ...notes];
+  } finally {
+    pending.delete(message.id);
   }
-  const citations = parseCitations(message.citations);
-  const saved = await saveChatNote(notebookId, message.content, citations, message.id);
-  byNotebook[notebookId] = [saved, ...notes];
 }
 
 /** Removes a note by id (idempotent — no-op if the row is absent). */
@@ -110,4 +139,6 @@ export const notesStore = {
 /** Reset all state. Call in `afterEach` to prevent cross-test bleed. */
 export function resetNotesStore(): void {
   byNotebook = {};
+  hydrateGeneration.clear();
+  pendingToggles.clear();
 }

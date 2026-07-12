@@ -76,4 +76,10 @@ describe('MessageActions', () => {
     const btn = screen.getByLabelText('Save to notes');
     expect(btn).toHaveAttribute('aria-pressed', 'false');
   });
+
+  it('does not render the save button when finalized=false (streaming bubble)', () => {
+    render(MessageActions, { props: baseProps({ finalized: false }) });
+    expect(screen.queryByLabelText('Save to notes')).toBeNull();
+    expect(screen.queryByLabelText('Remove from notes')).toBeNull();
+  });
 });

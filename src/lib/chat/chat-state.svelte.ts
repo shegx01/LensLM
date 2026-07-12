@@ -17,6 +17,7 @@ import {
   setChatFeedback,
   listChatMessages
 } from './ipc.js';
+import { parseCitations } from './citations.js';
 import type {
   AnswerEvent,
   AnswerStage,
@@ -93,16 +94,6 @@ function groupIntoTurns(rows: ChatMessage[]): Turn[] {
     turns.push({ turn_id: turnId, user, versions: versions.get(turnId) ?? [] });
   }
   return turns;
-}
-
-function parseCitations(json: string | null): Citation[] | null {
-  if (json === null) return null;
-  try {
-    return JSON.parse(json) as Citation[];
-  } catch (err) {
-    console.warn('parseCitations: failed to parse citations JSON', err);
-    return null;
-  }
 }
 
 /** Hydrates a notebook's transcript from `chat_messages` (AC17). */

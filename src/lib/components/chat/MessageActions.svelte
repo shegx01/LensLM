@@ -14,6 +14,8 @@
     feedback: ChatFeedback;
     saved: boolean;
     disabled?: boolean;
+    /** Save is offered only for a finalized answer (not the live streaming bubble). */
+    finalized?: boolean;
     oncopy: () => void;
     onregenerate: () => void;
     onfeedback: (next: 'up' | 'down') => void;
@@ -24,6 +26,7 @@
     feedback,
     saved,
     disabled = false,
+    finalized = true,
     oncopy,
     onregenerate,
     onfeedback,
@@ -49,15 +52,17 @@
 </script>
 
 <div class="mt-1 flex items-center gap-0.5" role="toolbar" aria-label="Message actions">
-  <button
-    type="button"
-    class={cn(iconBtn, saved && 'text-primary hover:text-primary')}
-    aria-label={saved ? 'Remove from notes' : 'Save to notes'}
-    aria-pressed={saved}
-    onclick={onsave}
-  >
-    <Bookmark class="size-3.5" strokeWidth={2} fill={saved ? 'currentColor' : 'none'} />
-  </button>
+  {#if finalized}
+    <button
+      type="button"
+      class={cn(iconBtn, saved && 'text-primary hover:text-primary')}
+      aria-label={saved ? 'Remove from notes' : 'Save to notes'}
+      aria-pressed={saved}
+      onclick={onsave}
+    >
+      <Bookmark class="size-3.5" strokeWidth={2} fill={saved ? 'currentColor' : 'none'} />
+    </button>
+  {/if}
 
   <button
     type="button"

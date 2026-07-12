@@ -15,9 +15,9 @@ export interface Note {
   content: string;
   /** Raw JSON `Citation[]`; `null` for uncited chat notes / manual notes. */
   citations: string | null;
-  /** Frozen title of the ordinal-1 cited source; survives source rename/delete. */
+  /** Frozen ordinal-1 source title. */
   source_title: string | null;
-  /** Soft toggle-linkage key to the originating `chat_messages.id` (no DB FK). */
+  /** Toggle-linkage key to the originating `chat_messages.id`. */
   source_message_id: string | null;
   created_at: string;
   updated_at: string;

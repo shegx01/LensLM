@@ -140,6 +140,7 @@
                 onfeedback={() => {}}
                 regenerateDisabled={true}
                 highlightCode={false}
+                finalized={false}
               />
             {/if}
           {/if}

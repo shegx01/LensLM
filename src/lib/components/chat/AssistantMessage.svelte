@@ -22,6 +22,9 @@
     onfeedback: (messageId: string, next: 'up' | 'down') => void;
     regenerateDisabled?: boolean;
     highlightCode?: boolean;
+    /** Whether this bubble is a finalized answer — the streaming bubble passes
+     * `false` to hide Save (partial content has no stable message id to save). */
+    finalized?: boolean;
   }
 
   let {
@@ -31,7 +34,8 @@
     onregenerate,
     onfeedback,
     regenerateDisabled = false,
-    highlightCode = true
+    highlightCode = true,
+    finalized = true
   }: Props = $props();
 
   let selectedIndex = $state(0);
@@ -95,6 +99,7 @@
             feedback={current.feedback}
             saved={notesStore.savedMessageIds(notebookId).has(current.id)}
             disabled={regenerateDisabled}
+            {finalized}
             oncopy={() => oncopy(current.content)}
             {onregenerate}
             onfeedback={(next) => onfeedback(current.id, next)}

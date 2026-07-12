@@ -51,6 +51,52 @@ describe('hydrate', () => {
   });
 });
 
+describe('hydrate generation guard', () => {
+  it('a stale hydrate resolving after a newer toggleSave does not clobber the optimistic result', async () => {
+    let resolveStaleList: (rows: Note[]) => void = () => {};
+    vi.mocked(listNotes).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveStaleList = resolve;
+        })
+    );
+
+    const staleHydrate = hydrate(NB);
+
+    const message = makeChatMessage({ id: 'msg-010', role: 'assistant', content: 'insight' });
+    const saved = makeNote({ id: 'note-010', source_message_id: 'msg-010' });
+    vi.mocked(saveChatNote).mockResolvedValue(saved);
+    await toggleSave(NB, message);
+
+    // The stale listNotes call (started before the toggle) resolves last, with
+    // a snapshot that predates the just-saved note.
+    resolveStaleList([]);
+    await staleHydrate;
+
+    expect(notesStore.notes(NB)).toEqual([saved]);
+  });
+
+  it('a stale hydrate resolving after a newer hydrate does not clobber the fresh rows', async () => {
+    let resolveFirst: (rows: Note[]) => void = () => {};
+    vi.mocked(listNotes).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveFirst = resolve;
+        })
+    );
+    const firstHydrate = hydrate(NB);
+
+    const freshRows = [makeNote({ id: 'note-fresh' })];
+    vi.mocked(listNotes).mockResolvedValueOnce(freshRows);
+    await hydrate(NB);
+
+    resolveFirst([makeNote({ id: 'note-stale' })]);
+    await firstHydrate;
+
+    expect(notesStore.notes(NB)).toEqual(freshRows);
+  });
+});
+
 describe('toggleSave', () => {
   it('saves a new note and prepends it when not yet saved', async () => {
     const message: ChatMessage = makeChatMessage({
@@ -94,6 +140,44 @@ describe('toggleSave', () => {
     await toggleSave(NB, message);
     expect(deleteNote).toHaveBeenCalledWith('note-002');
     expect(notesStore.savedMessageIds(NB).has('msg-002')).toBe(false);
+  });
+
+  it('no-ops for a synthetic streaming-bubble id (belt-and-suspenders alongside the UI gate)', async () => {
+    const message = makeChatMessage({
+      id: 'turn-001-streaming',
+      role: 'assistant',
+      content: 'partial content'
+    });
+
+    await toggleSave(NB, message);
+
+    expect(saveChatNote).not.toHaveBeenCalled();
+    expect(deleteNote).not.toHaveBeenCalled();
+    expect(notesStore.notes(NB)).toEqual([]);
+  });
+
+  it('two concurrent toggleSave calls for the same message create exactly one note', async () => {
+    const message = makeChatMessage({
+      id: 'msg-003',
+      role: 'assistant',
+      content: 'the answer'
+    });
+    const saved = makeNote({ id: 'note-003', source_message_id: 'msg-003' });
+    let resolveSave: (note: Note) => void = () => {};
+    vi.mocked(saveChatNote).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveSave = resolve;
+        })
+    );
+
+    const first = toggleSave(NB, message);
+    const second = toggleSave(NB, message);
+    resolveSave(saved);
+    await Promise.all([first, second]);
+
+    expect(saveChatNote).toHaveBeenCalledTimes(1);
+    expect(notesStore.notes(NB)).toEqual([saved]);
   });
 });
 
