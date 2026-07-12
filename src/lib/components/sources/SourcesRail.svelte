@@ -7,7 +7,6 @@
 </script>
 
 <script lang="ts">
-  import File from '@lucide/svelte/icons/file';
   import FileText from '@lucide/svelte/icons/file-text';
   import Check from '@lucide/svelte/icons/check';
   import Plus from '@lucide/svelte/icons/plus';
@@ -343,13 +342,6 @@
                 <Check class="size-[9px] text-primary-foreground" strokeWidth={3} />
               {/if}
             </button>
-
-            <div
-              class="flex size-[28px] shrink-0 items-center justify-center rounded-[6px] bg-muted"
-              aria-hidden="true"
-            >
-              <File class="size-[13px] text-muted-foreground" strokeWidth={1.75} />
-            </div>
 
             <div class="min-w-0 flex-1">
               <div class="truncate text-sm font-medium leading-tight text-foreground">

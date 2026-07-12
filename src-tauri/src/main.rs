@@ -42,6 +42,10 @@ fn main() {
     tauri::Builder::default()
         // Native file picker for the onboarding "Add sources" step.
         .plugin(tauri_plugin_dialog::init())
+        // Persist + restore the main window's size/position across restarts so a
+        // resize survives relaunch. First launch uses the tauri.conf.json default;
+        // thereafter the saved geometry supersedes it. Auto-saves on exit.
+        .plugin(tauri_plugin_window_state::Builder::default().build())
         // Resolve the OS app-data dir, init the engine (open db + migrate +
         // load config) on it, and store the handle in Tauri managed state.
         .setup(|app| {

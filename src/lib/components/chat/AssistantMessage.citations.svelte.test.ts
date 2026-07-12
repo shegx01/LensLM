@@ -1,7 +1,7 @@
-// Component tests for AssistantMessage: inline [n] markers stripped from the
-// rendered prose; footer chips present for persisted citations, absent when
-// citations is null; copy passes the RAW content (with markers) while the
-// displayed prose is stripped (deliberate divergence).
+// Component tests for AssistantMessage: inline [n] markers become compact numbered
+// chips at their cited spot (no footer); a live chip reveals its source, a removed
+// source renders a disabled chip; streaming (citations null) shows none; copy passes
+// the RAW content (markers intact).
 
 import { render, screen, fireEvent } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -27,6 +27,7 @@ vi.mock('$lib/sources/sources-state.svelte.js', () => ({
 }));
 
 import AssistantMessage from './AssistantMessage.svelte';
+import { focusSource } from '$lib/sources/sources-state.svelte.js';
 
 function makeSource(overrides?: Partial<Source>): Source {
   return {
@@ -79,19 +80,8 @@ afterEach(() => {
   mockSourcesStore._setSources([]);
 });
 
-describe('AssistantMessage — marker strip + chips', () => {
-  it('strips inline [n] markers from the rendered prose', () => {
-    mockSourcesStore._setSources([makeSource({ id: 'src-a', title: 'Alpha' })]);
-    const msg = makeAssistant('Revenue grew 34%[1]. Solid.', [
-      { source_id: 'src-a', ordinal: 1, locators: [] }
-    ]);
-    const { container } = render(AssistantMessage, { versions: [msg], ...baseProps });
-    const prose = container.querySelector('.chat-markdown') as HTMLElement;
-    expect(prose.textContent).toContain('Revenue grew 34%. Solid.');
-    expect(prose.textContent).not.toContain('[1]');
-  });
-
-  it('renders footer chips for a persisted answer with citations', () => {
+describe('AssistantMessage — inline citation chips', () => {
+  it('replaces each [n] marker with a compact numbered chip at its spot', async () => {
     mockSourcesStore._setSources([
       makeSource({ id: 'src-a', title: 'Alpha' }),
       makeSource({ id: 'src-b', title: 'Beta' })
@@ -100,26 +90,55 @@ describe('AssistantMessage — marker strip + chips', () => {
       { source_id: 'src-a', ordinal: 1, locators: [] },
       { source_id: 'src-b', ordinal: 2, locators: [] }
     ]);
-    render(AssistantMessage, { versions: [msg], ...baseProps });
-    expect(screen.getByRole('button', { name: 'Source 1: Alpha' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Source 2: Beta' })).toBeInTheDocument();
+    const { container } = render(AssistantMessage, { versions: [msg], ...baseProps });
+
+    const chip1 = await screen.findByRole('button', { name: 'Source 1: Alpha' });
+    const chip2 = await screen.findByRole('button', { name: 'Source 2: Beta' });
+    expect(chip1).toHaveClass('citation-chip');
+    expect(chip1.textContent).toBe('1');
+    expect(chip2.textContent).toBe('2');
+
+    const prose = container.querySelector('.chat-markdown') as HTMLElement;
+    // Raw bracket markers are gone; the chip numbers remain in the flow.
+    expect(prose.textContent).not.toContain('[1]');
+    expect(prose.textContent).not.toContain('[2]');
   });
 
-  it('renders no footer row when citations is null (streaming/zero-citation)', () => {
-    const msg = makeAssistant('Just prose, no citations.', null);
+  it('reveals the source in the rail when a live chip is clicked', async () => {
+    mockSourcesStore._setSources([makeSource({ id: 'src-a', title: 'Alpha' })]);
+    const msg = makeAssistant('Grew 34%[1].', [{ source_id: 'src-a', ordinal: 1, locators: [] }]);
     render(AssistantMessage, { versions: [msg], ...baseProps });
-    expect(screen.queryByLabelText(/sources cited/i)).not.toBeInTheDocument();
+
+    await fireEvent.click(await screen.findByRole('button', { name: 'Source 1: Alpha' }));
+    expect(focusSource).toHaveBeenCalledWith('src-a');
   });
 
-  it('copy passes the RAW content (with markers) while the display is stripped', async () => {
+  it('renders a disabled chip for a citation whose source was removed', async () => {
+    mockSourcesStore._setSources([]); // src-a not present
+    const msg = makeAssistant('Gone [1].', [{ source_id: 'src-a', ordinal: 1, locators: [] }]);
+    render(AssistantMessage, { versions: [msg], ...baseProps });
+
+    const chip = await screen.findByRole('button', {
+      name: /Source 1: Removed source \(unavailable\)/
+    });
+    expect(chip).toBeDisabled();
+
+    await fireEvent.click(chip);
+    expect(focusSource).not.toHaveBeenCalled();
+  });
+
+  it('renders no chips when citations is null (streaming/zero-citation)', () => {
+    const msg = makeAssistant('Just prose, no citations [1].', null);
+    const { container } = render(AssistantMessage, { versions: [msg], ...baseProps });
+    expect(container.querySelector('.citation-chip')).toBeNull();
+  });
+
+  it('copy passes the RAW content (markers intact)', async () => {
     mockSourcesStore._setSources([makeSource({ id: 'src-a', title: 'Alpha' })]);
     const oncopy = vi.fn();
     const raw = 'Grew 34%[1].';
     const msg = makeAssistant(raw, [{ source_id: 'src-a', ordinal: 1, locators: [] }]);
-    const { container } = render(AssistantMessage, { versions: [msg], ...baseProps, oncopy });
-
-    const prose = container.querySelector('.chat-markdown') as HTMLElement;
-    expect(prose.textContent).not.toContain('[1]');
+    render(AssistantMessage, { versions: [msg], ...baseProps, oncopy });
 
     await fireEvent.click(screen.getByLabelText('Copy answer'));
     expect(oncopy).toHaveBeenCalledWith(raw);

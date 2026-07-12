@@ -8,6 +8,7 @@
   import { ScrollArea } from '$lib/components/ui/scroll-area/index.js';
   import UserMessage from './UserMessage.svelte';
   import AssistantMessage from './AssistantMessage.svelte';
+  import ChatScrubber from './ChatScrubber.svelte';
   import StatusLine from './StatusLine.svelte';
   import ThoughtsDisclosure from './ThoughtsDisclosure.svelte';
   import EmptyState from './EmptyState.svelte';
@@ -49,13 +50,45 @@
   }: Props = $props();
 
   let viewportRef = $state<HTMLElement | null>(null);
+  let activeTurnId = $state<string | null>(null);
   const isEmpty = $derived(turns.length === 0 && !streaming);
   // Treat within Npx of bottom as "at bottom" for autoscroll pin/unpin.
   const PIN_THRESHOLD_PX = 48;
+  // A turn counts as "in view" for the scrubber once its top is within this many
+  // px below the viewport top (i.e. it's the turn you're currently reading).
+  const ACTIVE_TOP_BAND_PX = 96;
 
   function scrollToBottom(): void {
     if (!viewportRef) return;
     viewportRef.scrollTop = viewportRef.scrollHeight;
+  }
+
+  /** Mark the last turn whose top has scrolled to/above the reading band. */
+  function updateActiveTurn(): void {
+    const vp = viewportRef;
+    if (!vp) return;
+    const vpTop = vp.getBoundingClientRect().top;
+    let active: string | null = null;
+    for (const el of vp.querySelectorAll<HTMLElement>('[data-turn-id]')) {
+      if (el.getBoundingClientRect().top - vpTop <= ACTIVE_TOP_BAND_PX) {
+        active = el.dataset.turnId ?? active;
+      } else {
+        break;
+      }
+    }
+    activeTurnId = active ?? turns[0]?.turn_id ?? null;
+  }
+
+  function scrollToTurn(turnId: string): void {
+    // Jumping to the last turn lands at the bottom and re-pins (like the pill),
+    // rather than top-aligning it and flashing the "Jump to latest" affordance.
+    if (turns[turns.length - 1]?.turn_id === turnId) {
+      handleJumpToLatest();
+      return;
+    }
+    const el = viewportRef?.querySelector<HTMLElement>(`[data-turn-id="${CSS.escape(turnId)}"]`);
+    // scrollIntoView fires the scroll handler, which manages pin/unpin + active turn.
+    el?.scrollIntoView({ block: 'start', behavior: 'smooth' });
   }
 
   // Re-pin follows content growth (streaming deltas, new turns) — but only
@@ -67,6 +100,7 @@
     if (pinnedToBottom) {
       tick().then(scrollToBottom);
     }
+    tick().then(updateActiveTurn);
   });
 
   function handleScroll(e: Event): void {
@@ -75,6 +109,7 @@
     if (distanceFromBottom > PIN_THRESHOLD_PX && pinnedToBottom) {
       onunpin();
     }
+    updateActiveTurn();
   }
 
   function handleJumpToLatest(): void {
@@ -96,20 +131,22 @@
   {#if isEmpty}
     <EmptyState />
   {:else}
-    <ScrollArea bind:viewportRef class="min-h-0 flex-1">
+    <ScrollArea bind:viewportRef scrollbarYClasses="hidden" class="min-h-0 flex-1">
       <div class="flex flex-col pb-2" role="log" aria-label="Chat transcript">
         {#each turns as turn (turn.turn_id)}
-          <UserMessage content={turn.user.content} />
+          <div data-turn-id={turn.turn_id}>
+            <UserMessage content={turn.user.content} />
 
-          {#if turn.versions.length > 0}
-            <AssistantMessage
-              versions={turn.versions}
-              {oncopy}
-              onregenerate={() => onregenerate(turn.turn_id)}
-              {onfeedback}
-              regenerateDisabled={streaming}
-            />
-          {/if}
+            {#if turn.versions.length > 0}
+              <AssistantMessage
+                versions={turn.versions}
+                {oncopy}
+                onregenerate={() => onregenerate(turn.turn_id)}
+                {onfeedback}
+                regenerateDisabled={streaming}
+              />
+            {/if}
+          </div>
 
           {#if streaming && currentTurnId === turn.turn_id}
             <StatusLine {stage} />
@@ -145,6 +182,8 @@
         {/each}
       </div>
     </ScrollArea>
+
+    <ChatScrubber {turns} {activeTurnId} onjump={scrollToTurn} />
 
     {#if !pinnedToBottom}
       <button

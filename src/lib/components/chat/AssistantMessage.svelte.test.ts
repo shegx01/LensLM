@@ -8,8 +8,18 @@ import { render, waitFor } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('$lib/chat/render-markdown.js', () => ({
-  renderMarkdown: (source: string) => `<pre><code>${source}</code></pre>`,
-  stripCitationMarkers: (source: string) => source
+  renderMarkdown: (source: string) => `<pre><code>${source}</code></pre>`
+}));
+
+// This suite covers only the copy-button wiring with citation-free content, so
+// the sources store must be inert (no citations to resolve).
+vi.mock('$lib/sources/sources-state.svelte.js', () => ({
+  sourcesStore: {
+    get sources() {
+      return [];
+    }
+  },
+  focusSource: vi.fn()
 }));
 
 import AssistantMessage from './AssistantMessage.svelte';
