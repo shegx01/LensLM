@@ -4,12 +4,20 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('./ipc.js', () => ({
   saveChatNote: vi.fn(),
+  saveManualNote: vi.fn(),
   listNotes: vi.fn(),
   deleteNote: vi.fn().mockResolvedValue(undefined)
 }));
 
-import { notesStore, resetNotesStore, hydrate, toggleSave, remove } from './notes-state.svelte.js';
-import { saveChatNote, listNotes, deleteNote } from './ipc.js';
+import {
+  notesStore,
+  resetNotesStore,
+  hydrate,
+  toggleSave,
+  addManualNote,
+  remove
+} from './notes-state.svelte.js';
+import { saveChatNote, saveManualNote, listNotes, deleteNote } from './ipc.js';
 import type { Note } from './types.js';
 import type { ChatMessage, Citation } from '$lib/chat/types.js';
 import { makeChatMessage } from '$lib/chat/test-fixtures.js';
@@ -178,6 +186,54 @@ describe('toggleSave', () => {
 
     expect(saveChatNote).toHaveBeenCalledTimes(1);
     expect(notesStore.notes(NB)).toEqual([saved]);
+  });
+});
+
+describe('addManualNote', () => {
+  it('saves an origin=manual note and prepends it', async () => {
+    const saved = makeNote({
+      id: 'm1',
+      origin: 'manual',
+      content: 'a personal thought',
+      source_message_id: null
+    });
+    vi.mocked(saveManualNote).mockResolvedValue(saved);
+
+    await addManualNote(NB, 'a personal thought');
+
+    expect(saveManualNote).toHaveBeenCalledWith(NB, 'a personal thought');
+    expect(notesStore.notes(NB)).toEqual([saved]);
+  });
+
+  it('prepends a manual note ahead of existing notes', async () => {
+    const existing = makeNote({ id: 'note-001' });
+    vi.mocked(listNotes).mockResolvedValue([existing]);
+    await hydrate(NB);
+
+    const saved = makeNote({ id: 'm1', origin: 'manual', source_message_id: null });
+    vi.mocked(saveManualNote).mockResolvedValue(saved);
+    await addManualNote(NB, 'newer');
+
+    expect(notesStore.notes(NB).map((n) => n.id)).toEqual(['m1', 'note-001']);
+  });
+
+  it('no-ops (no ipc call) on empty/whitespace content', async () => {
+    await addManualNote(NB, '   ');
+    expect(saveManualNote).not.toHaveBeenCalled();
+    expect(notesStore.notes(NB)).toEqual([]);
+  });
+});
+
+describe('manualNotes', () => {
+  it('returns only origin=manual notes, order preserved', async () => {
+    const chat = makeNote({ id: 'c1', origin: 'chat' });
+    const manual = makeNote({ id: 'm1', origin: 'manual', source_message_id: null });
+    vi.mocked(listNotes).mockResolvedValue([manual, chat]);
+    await hydrate(NB);
+
+    expect(notesStore.manualNotes(NB).map((n) => n.id)).toEqual(['m1']);
+    // groupedBySource stays chat-only so the sections never double-count.
+    expect(notesStore.groupedBySource(NB).flatMap((g) => g.notes.map((n) => n.id))).toEqual(['c1']);
   });
 });
 

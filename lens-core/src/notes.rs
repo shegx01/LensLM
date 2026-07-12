@@ -224,6 +224,42 @@ impl<'a> NotesRepo<'a> {
         })
     }
 
+    /// Inserts an `origin=manual` note (#25). Citations, `source_title`, and
+    /// `source_message_id` are always NULL — a manual note has no grounding.
+    /// `updated_at` equals `created_at` at insert.
+    pub async fn create_manual_note(
+        &self,
+        notebook_id: &str,
+        content: &str,
+    ) -> Result<Note, LensError> {
+        let id = Uuid::now_v7().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO notes \
+                 (id, notebook_id, content, origin, citations, source_title, \
+                  source_message_id, created_at, updated_at) \
+             VALUES (?, ?, ?, 'manual', NULL, NULL, NULL, ?, ?)",
+        )
+        .bind(&id)
+        .bind(notebook_id)
+        .bind(content)
+        .bind(&now)
+        .bind(&now)
+        .execute(self.pool)
+        .await?;
+        Ok(Note {
+            id,
+            notebook_id: notebook_id.to_string(),
+            origin: NoteOrigin::Manual,
+            content: content.to_string(),
+            citations: None,
+            source_title: None,
+            source_message_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+        })
+    }
+
     /// Lists a notebook's notes, newest first.
     pub async fn list_notes(&self, notebook_id: &str) -> Result<Vec<Note>, LensError> {
         let rows = sqlx::query_as::<_, Note>(

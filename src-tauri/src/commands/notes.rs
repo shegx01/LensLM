@@ -22,6 +22,18 @@ pub async fn save_chat_note(
         .await
 }
 
+/// Saves a user-authored manual note (#25).
+#[tauri::command]
+pub async fn save_manual_note(
+    notebook_id: String,
+    content: String,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<Note, LensError> {
+    engine
+        .save_manual_note(&NotebookId::from(notebook_id), &content)
+        .await
+}
+
 /// Lists a notebook's notes, newest first.
 #[tauri::command]
 pub async fn list_notes(

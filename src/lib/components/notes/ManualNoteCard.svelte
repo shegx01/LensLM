@@ -1,9 +1,8 @@
-<!-- A single saved chat note: optional source-title pill, sanitized answer
-     markdown (collapsible past ~4 lines), a relative timestamp, and a delete
-     action. Model content is sanitized (renderMarkdown/DOMPurify) — never run. -->
+<!-- A single user-authored manual note: sanitized markdown body (collapsible
+     past ~4 lines), a relative timestamp, and a delete action. No source pill —
+     manual notes have no grounding. Content is sanitized, never executed. -->
 <script lang="ts">
   import Trash2 from '@lucide/svelte/icons/trash-2';
-  import { Badge } from '$lib/components/ui/badge/index.js';
   import { renderMarkdown } from '$lib/chat/render-markdown.js';
   import { formatRelativeTime } from '$lib/notebooks/format-time.js';
   import { remove } from '$lib/notes/notes-state.svelte.js';
@@ -33,13 +32,7 @@
     <Trash2 class="size-4" strokeWidth={1.75} />
   </button>
 
-  {#if note.source_title}
-    <Badge variant="secondary" class="mb-2 max-w-[calc(100%-2rem)] truncate">
-      {note.source_title}
-    </Badge>
-  {/if}
-
-  <CollapsibleText {html} />
+  <CollapsibleText {html} class="pr-6" />
 
   <p class="mt-2 text-xs text-muted-foreground/70">{formatRelativeTime(note.created_at)}</p>
 </article>

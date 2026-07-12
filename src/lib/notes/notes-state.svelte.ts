@@ -6,7 +6,7 @@
 // truth for a chat message's saved-state — MessageActions reads it, never a
 // separately-tracked flag.
 
-import { saveChatNote, listNotes, deleteNote } from './ipc.js';
+import { saveChatNote, saveManualNote, listNotes, deleteNote } from './ipc.js';
 import { parseCitations } from '$lib/chat/citations.js';
 import type { Note } from './types.js';
 import type { ChatMessage } from '$lib/chat/types.js';
@@ -96,6 +96,21 @@ export async function toggleSave(notebookId: string, message: ChatMessage): Prom
   }
 }
 
+/**
+ * Saves a user-authored manual note and prepends it (newest-first). No-ops on
+ * empty/whitespace content (belt-and-suspenders alongside the engine's guard and
+ * the composer's disabled state). Shares the hydrate generation guard so a stale
+ * `listNotes` cannot clobber the freshly-prepended note.
+ */
+export async function addManualNote(notebookId: string, content: string): Promise<void> {
+  if (content.trim().length === 0) return;
+  const gen = bumpGeneration(notebookId);
+  const notes = ensure(notebookId);
+  const saved = await saveManualNote(notebookId, content);
+  if (hydrateGeneration.get(notebookId) !== gen) return;
+  byNotebook[notebookId] = [saved, ...notes];
+}
+
 /** Removes a note by id (idempotent — no-op if the row is absent). */
 export async function remove(notebookId: string, noteId: string): Promise<void> {
   await deleteNote(noteId);
@@ -117,9 +132,13 @@ export const notesStore = {
     }
     return ids;
   },
-  /** Notes grouped by the ordinal-1 citation's `source_id`; uncited notes group under `null`. Newest-first preserved. */
+  /** User-authored manual notes only, newest-first (as stored). */
+  manualNotes(notebookId: string): Note[] {
+    return (byNotebook[notebookId] ?? []).filter((n) => n.origin === 'manual');
+  },
+  /** Notes grouped by the ordinal-1 citation's `source_id`; uncited notes group under `null`. Newest-first preserved. Chat notes only. */
   groupedBySource(notebookId: string): NoteGroup[] {
-    const notes = byNotebook[notebookId] ?? [];
+    const notes = (byNotebook[notebookId] ?? []).filter((n) => n.origin === 'chat');
     const order: Array<string | null> = [];
     const groups = new Map<string | null, NoteGroup>();
     for (const note of notes) {

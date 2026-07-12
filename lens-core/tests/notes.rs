@@ -120,6 +120,46 @@ async fn null_citations_note_has_no_title() {
     assert_eq!(listed[0].citations_parsed().unwrap(), None);
 }
 
+/// A manual note persists `origin=manual` with NULL citations/source, lists
+/// newest-first alongside chat notes, and empty content is rejected (#25).
+#[tokio::test]
+async fn manual_note_persists_and_lists_alongside_chat() {
+    let engine = LensEngine::for_test().await;
+    let nb = engine.create_notebook("notes", None, None).await.unwrap();
+
+    let chat = engine
+        .save_chat_note(
+            &nb.id,
+            "grounded [1].",
+            Some(&[citation("src-1", 1)]),
+            "msg-1",
+        )
+        .await
+        .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+    let manual = engine
+        .save_manual_note(&nb.id, "a personal thought")
+        .await
+        .unwrap();
+    assert_eq!(manual.origin, NoteOrigin::Manual);
+    assert_eq!(manual.content, "a personal thought");
+    assert_eq!(manual.citations, None);
+    assert_eq!(manual.source_title, None);
+    assert_eq!(manual.source_message_id, None);
+
+    let listed = engine.list_notes(&nb.id).await.unwrap();
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0].id, manual.id, "newest (manual) note first");
+    assert_eq!(listed[1].id, chat.id);
+
+    assert!(
+        engine.save_manual_note(&nb.id, "   ").await.is_err(),
+        "empty/whitespace content rejected"
+    );
+}
+
 /// `NoteOrigin` rejects unknown persisted strings rather than mis-decoding.
 #[test]
 fn note_origin_enum_wire_values() {

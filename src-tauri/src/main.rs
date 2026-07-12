@@ -125,6 +125,7 @@ fn main() {
             commands::notebooks::set_chat_feedback,
             commands::notebooks::list_chat_messages,
             commands::notes::save_chat_note,
+            commands::notes::save_manual_note,
             commands::notes::list_notes,
             commands::notes::delete_note,
             commands::notebooks::set_notebook_embedding_model,

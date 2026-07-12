@@ -32,7 +32,7 @@ describe('KeyInsightCard — no-exec sanitization', () => {
     (globalThis as unknown as { __onExec?: () => void }).__onExec = onExec;
     const note = makeNote({ content: '<script>window.__onExec && window.__onExec()</script>' });
 
-    const { container } = render(KeyInsightCard, { props: { note } });
+    const { container } = render(KeyInsightCard, { props: { note, notebookId: 'nb-1' } });
 
     expect(container.querySelector('script')).toBeNull();
     expect(onExec).not.toHaveBeenCalled();
@@ -45,7 +45,7 @@ describe('KeyInsightCard — no-exec sanitization', () => {
       content: '<img src="x" onerror="window.__onExec && window.__onExec()">'
     });
 
-    const { container } = render(KeyInsightCard, { props: { note } });
+    const { container } = render(KeyInsightCard, { props: { note, notebookId: 'nb-1' } });
 
     const img = container.querySelector('img');
     if (img) {
@@ -57,7 +57,7 @@ describe('KeyInsightCard — no-exec sanitization', () => {
 
   it('renders plain markdown content unaffected', () => {
     const note = makeNote({ content: '**bold insight**' });
-    const { container } = render(KeyInsightCard, { props: { note } });
+    const { container } = render(KeyInsightCard, { props: { note, notebookId: 'nb-1' } });
     expect(container.querySelector('strong')?.textContent).toBe('bold insight');
   });
 });

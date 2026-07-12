@@ -743,6 +743,25 @@ impl LensEngine {
             .await
     }
 
+    /// Saves a user-authored manual note (#25). Rejects empty/whitespace-only
+    /// content; the persisted note has no citations, `source_title`, or
+    /// `source_message_id`.
+    #[tracing::instrument(skip_all)]
+    pub async fn save_manual_note(
+        &self,
+        notebook_id: &NotebookId,
+        content: &str,
+    ) -> Result<Note, LensError> {
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            return Err(LensError::Validation("note content is empty".into()));
+        }
+        let pool = self.pool().await;
+        crate::notes::NotesRepo::new(&pool)
+            .create_manual_note(notebook_id.as_str(), trimmed)
+            .await
+    }
+
     /// Lists a notebook's notes, newest first (#24).
     #[tracing::instrument(skip_all)]
     pub async fn list_notes(&self, notebook_id: &NotebookId) -> Result<Vec<Note>, LensError> {

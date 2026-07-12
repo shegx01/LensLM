@@ -20,6 +20,12 @@ export async function saveChatNote(
   });
 }
 
+/** Saves a user-authored `origin=manual` note. */
+export async function saveManualNote(notebookId: string, content: string): Promise<Note> {
+  if (!isTauri()) throw new Error('saveManualNote: not running under Tauri');
+  return invoke<Note>('save_manual_note', { notebookId, content });
+}
+
 /** Lists a notebook's notes, newest first. Returns `[]` outside Tauri. */
 export async function listNotes(notebookId: string): Promise<Note[]> {
   if (!isTauri()) return [];
