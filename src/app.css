@@ -227,8 +227,7 @@
   --sidebar-border: var(--alpha-border);
   --sidebar-ring: var(--green-primary);
 
-  /* --- Syntax palette — DARK (brighter/vivid steps so tokens read on the
-     muted dark code background) --- */
+  /* Syntax palette — DARK (rationale in the .hljs-* block below) */
   --code-keyword: var(--purple-500);
   --code-string: var(--green-bright);
   --code-comment: var(--neutral-500);
