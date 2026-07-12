@@ -131,6 +131,14 @@ function resetStreamBuffers(state: NotebookChatState): void {
   state.currentTurnId = null;
 }
 
+/** Passes a `{kind,message}` LensError through; wraps anything else without leaking a raw `Error:` prefix. */
+function toLensError(err: unknown): { kind: string; message: string } {
+  if (err && typeof err === 'object' && 'kind' in err && 'message' in err) {
+    return err as { kind: string; message: string };
+  }
+  return { kind: 'Internal', message: err instanceof Error ? err.message : String(err) };
+}
+
 async function runStream(notebookId: string, turnId: string, question: string): Promise<void> {
   const state = ensure(notebookId);
   // Bump so late callbacks from a superseded/cancelled stream no-op.
@@ -179,8 +187,11 @@ async function runStream(notebookId: string, turnId: string, question: string): 
         // sync handler; errors surface as a store error, not thrown to askNotebook.
         void persistOnce(event.Done.tokens_used).catch((err) => {
           if (state.streamGeneration !== gen) return;
-          state.error = { kind: 'Internal', message: String(err) };
-          resetStreamBuffers(state);
+          // Mirror onFailed's contract: keep currentTurnId so the ErrorCard gate
+          // (error && currentTurnId === turn) matches for this path too (AC7/AC21).
+          state.error = toLensError(err);
+          state.streaming = false;
+          state.stage = null;
         });
       }
     },

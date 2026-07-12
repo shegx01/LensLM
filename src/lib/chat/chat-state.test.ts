@@ -246,8 +246,13 @@ describe('error path', () => {
 
     await send(NB, 'q');
 
-    expect(chatStore.error(NB)).toEqual({ kind: 'Internal', message: 'Error: save failed' });
+    expect(chatStore.error(NB)).toEqual({ kind: 'Internal', message: 'save failed' });
     expect(chatStore.streaming(NB)).toBe(false);
+    // currentTurnId MUST survive so the ErrorCard gate (error && currentTurnId === turn)
+    // matches on this path too — otherwise the error/Retry UI is silently unreachable.
+    const turnId = chatStore.turns(NB)[0]?.turn_id;
+    expect(turnId).toBeTruthy();
+    expect(chatStore.currentTurnId(NB)).toBe(turnId);
   });
 });
 
