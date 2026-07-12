@@ -230,7 +230,7 @@ fastembed = "5.17.2"
 # Embedded vector store. lancedb 0.30.0 pins Arrow 58 — every arrow crate below
 # MUST match that major or the binary hits an ABI break (verify: `cargo tree -d`).
 lancedb = "0.30.0"
-arrow-array = "58"
+arrow-array = "59"
 arrow-schema = "58"
 # Layout-aware Markdown parsing → bounded blocks. 0.13.4 fixes a TightParagraph
 # panic that fires on arbitrary user Markdown.
@@ -290,7 +290,7 @@ printpdf = "=0.7.0"
 # (see `extract::spreadsheet` tests). calamine is READ-ONLY so it cannot write
 # fixtures. Dev-only; never in production builds. MIT OR Apache-2.0.
 rust_xlsxwriter = "=0.92.0"
-arrow-array = "58"
+arrow-array = "59"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # Tokenizer download fallback for tokenizer-dependent tests when offline cache
 # is absent (same version the lib resolves).
