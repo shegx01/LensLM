@@ -135,6 +135,7 @@
                 onregenerate={() => {}}
                 onfeedback={() => {}}
                 regenerateDisabled={true}
+                highlightCode={false}
               />
             {/if}
           {/if}

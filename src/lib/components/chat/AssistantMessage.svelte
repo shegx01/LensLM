@@ -16,9 +16,17 @@
     onregenerate: () => void;
     onfeedback: (messageId: string, next: 'up' | 'down') => void;
     regenerateDisabled?: boolean;
+    highlightCode?: boolean;
   }
 
-  let { versions, oncopy, onregenerate, onfeedback, regenerateDisabled = false }: Props = $props();
+  let {
+    versions,
+    oncopy,
+    onregenerate,
+    onfeedback,
+    regenerateDisabled = false,
+    highlightCode = true
+  }: Props = $props();
 
   let selectedIndex = $state(0);
 
@@ -28,7 +36,9 @@
   });
 
   const current = $derived(versions[selectedIndex]);
-  const html = $derived(current ? renderMarkdown(current.content) : '');
+  const html = $derived(
+    current ? renderMarkdown(current.content, { highlight: highlightCode }) : ''
+  );
 
   function prevVersion(): void {
     selectedIndex = Math.max(0, selectedIndex - 1);
