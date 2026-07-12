@@ -231,7 +231,7 @@ fastembed = "5.17.2"
 # MUST match that major or the binary hits an ABI break (verify: `cargo tree -d`).
 lancedb = "0.30.0"
 arrow-array = "58"
-arrow-schema = "58"
+arrow-schema = "59"
 # Layout-aware Markdown parsing → bounded blocks. 0.13.4 fixes a TightParagraph
 # panic that fires on arbitrary user Markdown.
 pulldown-cmark = "0.13.4"
