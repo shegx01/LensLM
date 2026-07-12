@@ -24,6 +24,8 @@
     "@tauri-apps/plugin-dialog": "^2.7.1",
     "bits-ui": "^2.18.1",
     "clsx": "^2.1.1",
+    "dompurify": "^3.4.12",
+    "marked": "^18.0.6",
     "mode-watcher": "^1.1.0",
     "motion": "^12.40.0",
     "tailwind-merge": "^3.6.0",
