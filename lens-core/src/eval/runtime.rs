@@ -123,6 +123,25 @@ pub enum EvalOutcome {
     Ran(EvalReport),
 }
 
+/// The latest logged eval for a notebook: the `EvalReport` plus the `ran_at`
+/// timestamp of the row it was read from (`EvalReport` itself carries no `ran_at`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LatestEval {
+    pub report: EvalReport,
+    pub ran_at: String,
+}
+
+/// Coarse progress phase for a user-triggered `run_graph_eval`. Only these two
+/// phases can fire: `run_notebook_eval` is monolithic with no internal progress
+/// hook, so the caller emits `GeneratingQa` immediately before the run and `Done`
+/// immediately after. Per-arm progress is a deferred change (would require threading
+/// a callback into `run_notebook_eval`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvalPhase {
+    GeneratingQa,
+    Done,
+}
+
 /// The ablation summary logged for one eval run.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EvalReport {

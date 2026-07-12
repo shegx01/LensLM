@@ -1965,6 +1965,98 @@ impl LensEngine {
         }
     }
 
+    /// Returns the most recent `notebook_eval_log` row for a notebook (#158b), or
+    /// `None` if the eval has never run. Read-only observational data for the
+    /// Retrieval settings verdict; never touches the flag.
+    pub async fn latest_notebook_eval(
+        &self,
+        notebook_id: &NotebookId,
+    ) -> Result<Option<crate::eval::LatestEval>, LensError> {
+        use sqlx::Row;
+        let pool = self.pool().await;
+        let row = sqlx::query(
+            "SELECT graph_recall, hybrid_recall, delta_pp, p95_ms, passed, sample_n, dropped_n, \
+             graph_enabled, prompt_version, ran_at \
+             FROM notebook_eval_log WHERE notebook_id = ? ORDER BY ran_at DESC LIMIT 1",
+        )
+        .bind(notebook_id.as_str())
+        .fetch_optional(&pool)
+        .await?;
+        // booleans stored as INTEGER, recall/delta/p95 as REAL (see `persist_log`).
+        Ok(row.map(|r| crate::eval::LatestEval {
+            report: crate::eval::EvalReport {
+                graph_recall: r.get::<f64, _>("graph_recall") as f32,
+                hybrid_recall: r.get::<f64, _>("hybrid_recall") as f32,
+                delta_pp: r.get::<f64, _>("delta_pp") as f32,
+                p95_ms: r.get::<f64, _>("p95_ms") as f32,
+                passed: r.get::<i64, _>("passed") != 0,
+                sample_n: r.get::<i64, _>("sample_n") as usize,
+                dropped_n: r.get::<i64, _>("dropped_n") as usize,
+                graph_enabled: r.get::<i64, _>("graph_enabled") != 0,
+                prompt_version: r.get::<String, _>("prompt_version"),
+            },
+            ran_at: r.get::<String, _>("ran_at"),
+        }))
+    }
+
+    /// Runs the per-notebook graph-retrieval eval on demand (#158b), reusing the
+    /// configured chat provider (`llm_provider`). Pre-checks the provider is present
+    /// AND reachable — returning a typed `LensError::Model` the UI branches on — then
+    /// assembles `RunEvalDeps` from engine state and delegates to `run_notebook_eval`.
+    /// `on_progress` fires only around the run (`GeneratingQa` before, `Done` after);
+    /// it is NOT threaded inside `run_notebook_eval`. Advisory only: never mutates the
+    /// flag; below the sample floor the outcome is `Skipped { reason }`.
+    pub async fn run_graph_eval(
+        &self,
+        notebook_id: &NotebookId,
+        mut on_progress: impl FnMut(crate::eval::EvalPhase) + Send,
+    ) -> Result<crate::eval::EvalOutcome, LensError> {
+        let provider = self
+            .llm_provider()
+            .await
+            .ok_or_else(|| LensError::Model("no chat model configured".into()))?;
+        if !provider.reachable().await {
+            return Err(LensError::Model("chat model unreachable".into()));
+        }
+
+        on_progress(crate::eval::EvalPhase::GeneratingQa);
+
+        // `RunEvalDeps` holds borrows, so build owned locals and lend `&`/`.as_ref()`
+        // references that live across the `run_notebook_eval(...).await`.
+        let pool = self.pool().await;
+        let config = self.config().await;
+        let (model_id, dim, backend) = self.resolve_notebook_embedding(notebook_id).await?;
+        let embedder = self
+            .embedder_for(
+                &model_id,
+                backend,
+                crate::embedder::WorkloadKind::Interactive,
+            )
+            .await?;
+        let coord =
+            crate::vector_store::Coordinate::new(notebook_id.as_str(), backend, model_id, dim);
+        let data_dir = self.data_dir().await;
+        let reranker = crate::retrieval::Reranker::new(&data_dir);
+        let store: Arc<dyn crate::vector_store::VectorStore> = Arc::new(
+            crate::vector_store::LanceVectorStore::new(&data_dir, pool.clone()),
+        );
+        let graph_enabled = self.notebook_graph_retrieval_enabled(notebook_id).await?;
+
+        let deps = crate::eval::RunEvalDeps {
+            pool: &pool,
+            store: store.as_ref(),
+            reranker: &reranker,
+            coord: &coord,
+            embedder: embedder.as_ref(),
+            llm: provider.as_ref(),
+            config: &config.retrieval,
+            graph_enabled,
+        };
+        let outcome = crate::eval::run_notebook_eval(&deps, notebook_id.as_str()).await?;
+        on_progress(crate::eval::EvalPhase::Done);
+        Ok(outcome)
+    }
+
     /// Returns `(model_id, dim, backend, status)` for a notebook's embedding
     /// coordinate. Status query is backend-scoped (R4/R7a, M4 Phase 4b-B): a
     /// cross-backend switch can leave the old backend `stale` while the new one

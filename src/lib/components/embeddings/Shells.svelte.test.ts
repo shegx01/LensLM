@@ -19,6 +19,7 @@ function makeNotebook(id: string, title: string): NotebookSummary {
     updated_at: '2026-01-01T00:00:00Z',
     trashed_at: null,
     last_activity_at: null,
+    graph_retrieval_enabled: null,
     source_count: 2
   };
 }

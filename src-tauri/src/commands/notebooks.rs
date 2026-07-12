@@ -35,6 +35,68 @@ pub struct EmbeddingModelInfo {
     pub status: String,
 }
 
+/// IPC wire form of an eval log row (#158b). The engine's `EvalReport`/`EvalOutcome`
+/// deliberately do NOT derive `Serialize` (keeping the headless engine decoupled from
+/// the wire format), so map them into these DTOs at the command boundary. `ran_at` is
+/// carried alongside because `EvalReport` itself has no timestamp.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvalReportDto {
+    pub graph_recall: f32,
+    pub hybrid_recall: f32,
+    pub delta_pp: f32,
+    pub p95_ms: f32,
+    pub passed: bool,
+    pub sample_n: usize,
+    pub dropped_n: usize,
+    pub graph_enabled: bool,
+    pub prompt_version: String,
+    pub ran_at: String,
+}
+
+impl EvalReportDto {
+    fn from_report(report: lens_core::eval::EvalReport, ran_at: String) -> Self {
+        Self {
+            graph_recall: report.graph_recall,
+            hybrid_recall: report.hybrid_recall,
+            delta_pp: report.delta_pp,
+            p95_ms: report.p95_ms,
+            passed: report.passed,
+            sample_n: report.sample_n,
+            dropped_n: report.dropped_n,
+            graph_enabled: report.graph_enabled,
+            prompt_version: report.prompt_version,
+            ran_at,
+        }
+    }
+}
+
+/// IPC wire form of `EvalOutcome` (#158b). Internally tagged on `status` so the
+/// frontend branches on `{ status: 'skipped' | 'ran' }`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum EvalOutcomeDto {
+    Skipped { reason: String },
+    Ran { report: EvalReportDto },
+}
+
+/// IPC wire form of `EvalPhase` (#158b), streamed as the `Chunk(T)` payload of a
+/// `StreamEvent`. Two variants only, mirroring the engine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvalPhaseDto {
+    GeneratingQa,
+    Done,
+}
+
+impl From<lens_core::eval::EvalPhase> for EvalPhaseDto {
+    fn from(phase: lens_core::eval::EvalPhase) -> Self {
+        match phase {
+            lens_core::eval::EvalPhase::GeneratingQa => EvalPhaseDto::GeneratingQa,
+            lens_core::eval::EvalPhase::Done => EvalPhaseDto::Done,
+        }
+    }
+}
+
 /// Lists live (non-trashed) notebooks with their source counts, newest first.
 #[tracing::instrument(skip_all)]
 #[tauri::command]
@@ -630,6 +692,105 @@ pub async fn get_notebook_embedding_model(
     })
 }
 
+/// Sets the per-notebook graph-retrieval override (#158b). Always writes `Some` —
+/// the UI is binary On/Off and never clears the override to `None`.
+#[tracing::instrument(skip(engine))]
+#[tauri::command]
+pub async fn set_notebook_graph_retrieval_enabled(
+    notebook_id: String,
+    enabled: bool,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<(), LensError> {
+    engine
+        .set_notebook_graph_retrieval_enabled(&NotebookId::from(notebook_id), Some(enabled))
+        .await
+}
+
+/// Returns the notebook's EFFECTIVE graph-retrieval setting (#158b): the per-notebook
+/// override if set, else the app-wide default. The frontend reads this rather than the
+/// raw `Option<bool>` because it does not know the global default.
+#[tracing::instrument(skip(engine))]
+#[tauri::command]
+pub async fn get_notebook_graph_retrieval_enabled(
+    notebook_id: String,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<bool, LensError> {
+    engine
+        .notebook_graph_retrieval_enabled(&NotebookId::from(notebook_id))
+        .await
+}
+
+/// Returns the latest eval verdict for a notebook (#158b), or `None` if it has never
+/// run. Maps the engine `LatestEval` into the wire DTO.
+#[tracing::instrument(skip(engine))]
+#[tauri::command]
+pub async fn latest_notebook_eval(
+    notebook_id: String,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<Option<EvalReportDto>, LensError> {
+    let latest = engine
+        .latest_notebook_eval(&NotebookId::from(notebook_id))
+        .await?;
+    Ok(latest.map(|l| EvalReportDto::from_report(l.report, l.ran_at)))
+}
+
+/// Runs the per-notebook graph-retrieval eval on demand (#158b), streaming
+/// `Started` → `Chunk(phase)` per phase → `Done`/`Failed`, and returning the outcome.
+/// Mirrors [`set_notebook_embedding_model`]'s Channel exec shape. A missing or
+/// unreachable provider surfaces as both a `Failed` event and the returned `Err`.
+#[tracing::instrument(skip(on_event, engine))]
+#[tauri::command]
+pub async fn run_notebook_graph_eval(
+    notebook_id: String,
+    on_event: Channel<StreamEvent<EvalPhaseDto>>,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<EvalOutcomeDto, LensError> {
+    let nb_id = NotebookId::from(notebook_id);
+
+    if let Err(e) = send_event(&on_event, StreamEvent::Started) {
+        tracing::warn!("run_notebook_graph_eval: started event send failed: {e}");
+    }
+
+    let result = engine
+        .run_graph_eval(&nb_id, |phase| {
+            if let Err(e) = send_event(&on_event, StreamEvent::Chunk(phase.into())) {
+                tracing::warn!("run_notebook_graph_eval: phase chunk send failed: {e}");
+            }
+        })
+        .await;
+
+    match result {
+        Ok(outcome) => {
+            if let Err(e) = send_event(&on_event, StreamEvent::Done) {
+                tracing::warn!("run_notebook_graph_eval: done event send failed: {e}");
+            }
+            match outcome {
+                lens_core::eval::EvalOutcome::Skipped { reason } => {
+                    Ok(EvalOutcomeDto::Skipped { reason })
+                }
+                lens_core::eval::EvalOutcome::Ran(report) => {
+                    // `EvalReport` carries no `ran_at`; re-read the row `run_graph_eval`
+                    // just wrote to stamp the DTO with the persisted timestamp.
+                    let ran_at = engine
+                        .latest_notebook_eval(&nb_id)
+                        .await?
+                        .map(|l| l.ran_at)
+                        .unwrap_or_default();
+                    Ok(EvalOutcomeDto::Ran {
+                        report: EvalReportDto::from_report(report, ran_at),
+                    })
+                }
+            }
+        }
+        Err(err) => {
+            if let Err(e) = send_event(&on_event, StreamEvent::Failed(err.clone())) {
+                tracing::warn!("run_notebook_graph_eval: failed event send failed: {e}");
+            }
+            Err(err)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -938,5 +1099,100 @@ mod tests {
                 .is_empty()
         );
         assert!(list_trashed_sources(engine).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn graph_retrieval_toggle_persists_and_survives() {
+        let app = tauri::test::mock_app();
+        app.manage(LensEngine::for_test().await);
+        let engine = app.state::<LensEngine>();
+
+        let nb = create_notebook("NB".into(), None, None, engine.clone())
+            .await
+            .unwrap();
+        let id = nb.id.to_string();
+
+        // Effective default is off (global default false, no override).
+        assert!(
+            !get_notebook_graph_retrieval_enabled(id.clone(), engine.clone())
+                .await
+                .unwrap()
+        );
+
+        set_notebook_graph_retrieval_enabled(id.clone(), true, engine.clone())
+            .await
+            .unwrap();
+        assert!(
+            get_notebook_graph_retrieval_enabled(id.clone(), engine.clone())
+                .await
+                .unwrap(),
+            "set true is read back as effective true"
+        );
+
+        set_notebook_graph_retrieval_enabled(id.clone(), false, engine.clone())
+            .await
+            .unwrap();
+        assert!(
+            !get_notebook_graph_retrieval_enabled(id.clone(), engine.clone())
+                .await
+                .unwrap(),
+            "set false survives"
+        );
+    }
+
+    #[tokio::test]
+    async fn latest_notebook_eval_none_then_row() {
+        let app = tauri::test::mock_app();
+        app.manage(LensEngine::for_test().await);
+        let engine = app.state::<LensEngine>();
+
+        let nb = create_notebook("NB".into(), None, None, engine.clone())
+            .await
+            .unwrap();
+        let id = nb.id.to_string();
+
+        // No eval yet → None.
+        assert!(
+            latest_notebook_eval(id.clone(), engine.clone())
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Seed one log row and read it back as an EvalReportDto.
+        let pool = engine.pool().await;
+        sqlx::query(
+            "INSERT INTO notebook_eval_log \
+             (id, notebook_id, ran_at, graph_recall, hybrid_recall, delta_pp, p95_ms, passed, \
+              sample_n, dropped_n, graph_enabled, prompt_version, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(uuid::Uuid::now_v7().to_string())
+        .bind(&id)
+        .bind("2026-07-12T00:00:00Z")
+        .bind(0.8_f64)
+        .bind(0.5_f64)
+        .bind(30.0_f64)
+        .bind(120.0_f64)
+        .bind(1_i64)
+        .bind(24_i64)
+        .bind(2_i64)
+        .bind(1_i64)
+        .bind("158a-qa-v2")
+        .bind("2026-07-12T00:00:00Z")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let dto = latest_notebook_eval(id, engine)
+            .await
+            .unwrap()
+            .expect("row present");
+        assert_eq!(dto.ran_at, "2026-07-12T00:00:00Z");
+        assert_eq!(dto.sample_n, 24);
+        assert_eq!(dto.dropped_n, 2);
+        assert!(dto.passed);
+        assert!(dto.graph_enabled);
+        assert!((dto.delta_pp - 30.0).abs() < 1e-4);
     }
 }

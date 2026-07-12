@@ -43,6 +43,7 @@ const CREATED: Notebook = {
   updated_at: new Date().toISOString(),
   trashed_at: null,
   last_activity_at: null,
+  graph_retrieval_enabled: null,
   embedding_model: null,
   embedding_backend: null
 };
