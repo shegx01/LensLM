@@ -66,7 +66,11 @@ export const sourcesStore = {
   get recentlyTrashed(): boolean {
     return trashQueue.length > 0;
   },
-  /** Source the rail should reveal (set by a citation chip click); `null` when idle. */
+  /**
+   * The LAST source a chip requested to reveal. Not cleared after a reveal, so it
+   * is NOT a fresh-request signal — `focusNonce` is. It stays `null` only until the
+   * first `focusSource` call.
+   */
   get focusedSourceId(): string | null {
     return focusedSourceId;
   },

@@ -526,7 +526,7 @@ describe('SourcesRail — reveal-in-rail (focusSource)', () => {
 
     expect(scrollSpy).toHaveBeenCalledWith({ block: 'nearest' });
     const li = container.querySelector('[data-source-id="src-002"]') as HTMLElement;
-    expect(li.className).toContain('ring-2');
+    expect(li.getAttribute('data-pulsing')).toBe('true');
     scrollSpy.mockRestore();
   });
 

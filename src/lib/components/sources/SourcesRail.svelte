@@ -1,6 +1,11 @@
 <!-- SourcesRail — 320px right panel. Header is a drag region; all interactive children
      carry -webkit-app-region: no-drag so clicks don't conflict with window drag.
      All colours are CSS-variable tokens — no hardcoded hex. -->
+<script lang="ts" module>
+  /** How long (ms) the reveal pulse ring stays on a focused source row. */
+  export const PULSE_MS = 1000;
+</script>
+
 <script lang="ts">
   import File from '@lucide/svelte/icons/file';
   import FileText from '@lucide/svelte/icons/file-text';
@@ -12,7 +17,7 @@
   import PanelRightClose from '@lucide/svelte/icons/panel-right-close';
   import Headphones from '@lucide/svelte/icons/headphones';
   import { cn } from '$lib/utils.js';
-  import { onDestroy, tick } from 'svelte';
+  import { onDestroy, tick, untrack } from 'svelte';
   import {
     sourcesStore,
     toggleSelected,
@@ -42,15 +47,15 @@
   let pulsingId = $state<string | null>(null);
   let pulseTimer: ReturnType<typeof setTimeout> | undefined;
 
-  const PULSE_MS = 1000;
-
   $effect(() => {
     if (sourcesStore.focusedSourceId === null) return;
     // Reading focusNonce keeps it a dependency so re-clicking the same chip re-fires.
     void sourcesStore.focusNonce;
     const targetId = sourcesStore.focusedSourceId;
 
-    if (notebookStore.rightRailCollapsed) {
+    // untrack the collapsed read: this effect writes it below, so tracking it would
+    // re-run the effect on expand and scroll twice on the collapsed path.
+    if (untrack(() => notebookStore.rightRailCollapsed)) {
       notebookStore.rightRailCollapsed = false;
     }
 
@@ -314,6 +319,7 @@
           {@const status = source.status as SourceStatus}
           <li
             data-source-id={source.id}
+            data-pulsing={pulsingId === source.id}
             class={cn(
               'group flex items-start gap-2.5 rounded-lg px-2.5 py-2.5 transition-colors duration-100 hover:bg-muted/50',
               pulsingId === source.id && 'ring-2 ring-primary/60'

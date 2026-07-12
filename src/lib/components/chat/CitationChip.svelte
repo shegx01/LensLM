@@ -4,7 +4,7 @@
      (source no longer in the store) render disabled + dimmed and do not activate. -->
 <script lang="ts">
   import { cn } from '$lib/utils.js';
-  import { badgeVariants } from '$lib/components/ui/badge/badge.svelte';
+  import { badgeVariants } from '$lib/components/ui/badge/index.js';
 
   interface Props {
     n: number;

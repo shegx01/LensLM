@@ -22,8 +22,16 @@ vi.mock('@tauri-apps/plugin-dialog', () => ({
   open: vi.fn().mockResolvedValue(null)
 }));
 
-const { mockNotebookStore } = vi.hoisted(() => {
-  let _rightRailCollapsed = false;
+// `rightRailCollapsed` is backed by real Svelte `$state` (in the .svelte.ts helper)
+// so the component's `{#if collapsed}` swap reacts when `focusSource` flips it.
+// A plain `let` would never re-render the expanded rail, so the collapsed-path
+// scroll would be unobservable (AC6 gap). The mock is built in vi.hoisted (so the
+// vi.mock factory can see it) but delegates to `railState`, which is late-bound
+// after the .svelte.ts import initialises the `$state`.
+import { railState } from './reveal-test-rail-state.svelte.js';
+
+const { mockNotebookStore, bindRailState } = vi.hoisted(() => {
+  let bound: { rightRailCollapsed: boolean } | null = null;
   const mockNotebookStore = {
     get activeNotebookId() {
       return 'nb-001';
@@ -32,17 +40,22 @@ const { mockNotebookStore } = vi.hoisted(() => {
       return { id: 'nb-001', title: 'iGaming Market Analysis' };
     },
     get rightRailCollapsed() {
-      return _rightRailCollapsed;
+      return bound?.rightRailCollapsed ?? false;
     },
     set rightRailCollapsed(v: boolean) {
-      _rightRailCollapsed = v;
+      if (bound) bound.rightRailCollapsed = v;
     },
     _setRightRailCollapsed(v: boolean) {
-      _rightRailCollapsed = v;
+      if (bound) bound.rightRailCollapsed = v;
     }
   };
-  return { mockNotebookStore };
+  const bindRailState = (rs: { rightRailCollapsed: boolean }) => {
+    bound = rs;
+  };
+  return { mockNotebookStore, bindRailState };
 });
+
+bindRailState(railState);
 
 vi.mock('$lib/notebooks/notebooks-state.svelte.js', () => ({
   notebookStore: mockNotebookStore,
@@ -56,7 +69,7 @@ import {
   focusSource,
   resetSourcesStore
 } from '$lib/sources/sources-state.svelte.js';
-import SourcesRail from './SourcesRail.svelte';
+import SourcesRail, { PULSE_MS } from './SourcesRail.svelte';
 
 function makeSource(overrides?: Partial<Source>): Source {
   return {
@@ -139,16 +152,53 @@ describe('SourcesRail — reveal-in-rail re-fire (real store, AC6)', () => {
       await tick();
 
       const li = () => container.querySelector('[data-source-id="src-001"]') as HTMLElement;
-      expect(li().className).toContain('ring-2');
+      expect(li().getAttribute('data-pulsing')).toBe('true');
 
-      vi.advanceTimersByTime(1000);
+      vi.advanceTimersByTime(PULSE_MS);
       await tick();
 
-      expect(li().className).not.toContain('ring-2');
+      expect(li().getAttribute('data-pulsing')).toBe('false');
 
       scrollSpy.mockRestore();
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('collapsed rail: focus expands it first, then scrolls+pulses the row exactly once (AC6)', async () => {
+    const scrollSpy = vi
+      .spyOn(HTMLElement.prototype, 'scrollIntoView')
+      .mockImplementation(() => {});
+
+    // Start collapsed: the reactive $state-backed mock means the component mounts
+    // the collapsed rail (no source <li>s), so nothing is scrollable until expand.
+    mockNotebookStore._setRightRailCollapsed(true);
+    addSourceLocal(makeSource({ id: 'src-001' }));
+
+    const { container } = render(SourcesRail);
+    await tick();
+    // Collapsed rail has no source list to scroll into.
+    expect(container.querySelector('[data-source-id="src-001"]')).toBeNull();
+    expect(scrollSpy).not.toHaveBeenCalled();
+
+    focusSource('src-001');
+    await tick();
+    await tick();
+
+    // (a) The rail expanded.
+    expect(mockNotebookStore.rightRailCollapsed).toBe(false);
+
+    const li = container.querySelector('[data-source-id="src-001"]') as HTMLElement;
+    expect(li).not.toBeNull();
+
+    // (b) scrollIntoView fired on the target <li> — exactly once (no double-scroll
+    // from the untracked collapsed read re-triggering the effect on expand).
+    expect(scrollSpy).toHaveBeenCalledTimes(1);
+    expect(scrollSpy.mock.instances[0]).toBe(li);
+
+    // (c) The target gained the pulse state.
+    expect(li.getAttribute('data-pulsing')).toBe('true');
+
+    scrollSpy.mockRestore();
   });
 });
