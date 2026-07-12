@@ -11,9 +11,11 @@
   import { renderMarkdown, stripCitationMarkers } from '$lib/chat/render-markdown.js';
   import { enhanceCodeBlocks } from '$lib/chat/code-copy.js';
   import { messageCitations } from '$lib/chat/chat-state.svelte.js';
+  import { notesStore, toggleSave } from '$lib/notes/notes-state.svelte.js';
   import type { ChatMessage } from '$lib/chat/types.js';
 
   interface Props {
+    notebookId: string;
     versions: ChatMessage[];
     oncopy: (content: string) => void;
     onregenerate: () => void;
@@ -23,6 +25,7 @@
   }
 
   let {
+    notebookId,
     versions,
     oncopy,
     onregenerate,
@@ -90,10 +93,12 @@
         <div class="mt-1.5 flex items-center gap-2">
           <MessageActions
             feedback={current.feedback}
+            saved={notesStore.savedMessageIds(notebookId).has(current.id)}
             disabled={regenerateDisabled}
             oncopy={() => oncopy(current.content)}
             {onregenerate}
             onfeedback={(next) => onfeedback(current.id, next)}
+            onsave={() => void toggleSave(notebookId, current)}
           />
 
           {#if versions.length > 1}

@@ -19,6 +19,7 @@
   import PreferencesShell from '$lib/components/embeddings/PreferencesShell.svelte';
   import NotebookSettingsSheet from '$lib/components/embeddings/NotebookSettingsSheet.svelte';
   import ChatPane from '$lib/components/chat/ChatPane.svelte';
+  import NotesPane from '$lib/components/notes/NotesPane.svelte';
 
   let createOpen = $state(false);
   let userName = $state('');
@@ -123,6 +124,10 @@
           {#if notebookStore.activeTab === 'chat'}
             {#key activeNotebook.id}
               <ChatPane notebookId={activeNotebook.id} />
+            {/key}
+          {:else if notebookStore.activeTab === 'notes'}
+            {#key activeNotebook.id}
+              <NotesPane notebookId={activeNotebook.id} />
             {/key}
           {/if}
         </div>

@@ -75,10 +75,10 @@ beforeEach(async () => {
   const { listNotebooks } = await import('$lib/notebooks/ipc.js');
   vi.mocked(listNotebooks).mockResolvedValue([]);
   // AppShell auto-selecting a notebook mounts ChatPane, which hydrates via
-  // `list_chat_messages` through this same mocked `invoke` — keep it answering
-  // `[]` regardless of each test's `get_config` override below.
+  // `list_chat_messages`/`list_notes` through this same mocked `invoke` — keep
+  // them answering `[]` regardless of each test's `get_config` override below.
   vi.mocked(invoke).mockImplementation((cmd: string) => {
-    if (cmd === 'list_chat_messages') return Promise.resolve([]);
+    if (cmd === 'list_chat_messages' || cmd === 'list_notes') return Promise.resolve([]);
     return Promise.resolve(makeConfig(true));
   });
 });
@@ -176,7 +176,9 @@ describe('AppShell.svelte', () => {
     const { listNotebooks } = await import('$lib/notebooks/ipc.js');
     vi.mocked(listNotebooks).mockResolvedValue([makeNotebook('nb-1'), makeNotebook('nb-2')]);
     vi.mocked(invoke).mockImplementation((cmd: string) =>
-      cmd === 'list_chat_messages' ? Promise.resolve([]) : Promise.resolve(makeConfig(true))
+      cmd === 'list_chat_messages' || cmd === 'list_notes'
+        ? Promise.resolve([])
+        : Promise.resolve(makeConfig(true))
     );
 
     render(AppShell);
@@ -191,7 +193,9 @@ describe('AppShell.svelte', () => {
     const { listNotebooks } = await import('$lib/notebooks/ipc.js');
     vi.mocked(listNotebooks).mockResolvedValue([makeNotebook('nb-1')]);
     vi.mocked(invoke).mockImplementation((cmd: string) =>
-      cmd === 'list_chat_messages' ? Promise.resolve([]) : Promise.resolve(makeConfig(false))
+      cmd === 'list_chat_messages' || cmd === 'list_notes'
+        ? Promise.resolve([])
+        : Promise.resolve(makeConfig(false))
     );
 
     render(AppShell);
@@ -204,7 +208,9 @@ describe('AppShell.svelte', () => {
   it('does NOT auto-select when notebook list is empty, and empty state is shown', async () => {
     mockIsTauri.mockReturnValue(true);
     vi.mocked(invoke).mockImplementation((cmd: string) =>
-      cmd === 'list_chat_messages' ? Promise.resolve([]) : Promise.resolve(makeConfig(true))
+      cmd === 'list_chat_messages' || cmd === 'list_notes'
+        ? Promise.resolve([])
+        : Promise.resolve(makeConfig(true))
     );
 
     render(AppShell);
@@ -219,7 +225,7 @@ describe('AppShell.svelte', () => {
     const { listNotebooks } = await import('$lib/notebooks/ipc.js');
     vi.mocked(listNotebooks).mockResolvedValue([makeNotebook('nb-1'), makeNotebook('nb-2')]);
     vi.mocked(invoke).mockImplementation((cmd: string) =>
-      cmd === 'list_chat_messages'
+      cmd === 'list_chat_messages' || cmd === 'list_notes'
         ? Promise.resolve([])
         : Promise.reject(new Error('config read failed'))
     );

@@ -19,6 +19,7 @@ let writeText: ReturnType<typeof vi.fn>;
 
 function props(overrides?: Record<string, unknown>) {
   return {
+    notebookId: 'nb-001',
     versions: [makeChatMessage({ role: 'assistant', content: 'const x = 1;\n' })],
     oncopy: vi.fn(),
     onregenerate: vi.fn(),

@@ -15,6 +15,7 @@
   import type { AnswerStage, Turn } from '$lib/chat/types.js';
 
   interface Props {
+    notebookId: string;
     turns: Turn[];
     streaming: boolean;
     stage: AnswerStage | null;
@@ -32,6 +33,7 @@
   }
 
   let {
+    notebookId,
     turns,
     streaming,
     stage,
@@ -103,6 +105,7 @@
 
           {#if turn.versions.length > 0}
             <AssistantMessage
+              {notebookId}
               versions={turn.versions}
               {oncopy}
               onregenerate={() => onregenerate(turn.turn_id)}
@@ -118,6 +121,7 @@
             {/if}
             {#if answerBuffer.length > 0}
               <AssistantMessage
+                {notebookId}
                 versions={[
                   {
                     id: `${turn.turn_id}-streaming`,

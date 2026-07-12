@@ -65,6 +65,7 @@ function makeAssistant(content: string, citations: Citation[] | null): ChatMessa
 }
 
 const baseProps = {
+  notebookId: 'nb-001',
   oncopy: vi.fn(),
   onregenerate: vi.fn(),
   onfeedback: vi.fn()
