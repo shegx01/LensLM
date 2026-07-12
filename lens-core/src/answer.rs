@@ -114,26 +114,8 @@ async fn load_source_titles(
     pool: &SqlitePool,
     units: &[ContextUnit],
 ) -> Result<HashMap<String, String>, LensError> {
-    let mut ids: Vec<&str> = units.iter().map(|u| u.source_id.as_str()).collect();
-    ids.sort_unstable();
-    ids.dedup();
-
-    let mut out = HashMap::new();
-    if ids.is_empty() {
-        return Ok(out);
-    }
-    for batch in ids.chunks(crate::db::BIND_BATCH) {
-        let placeholders = crate::db::in_placeholders(batch.len());
-        let sql = format!("SELECT id, title FROM sources WHERE id IN ({placeholders})");
-        let mut q = sqlx::query_as::<_, (String, String)>(&sql);
-        for id in batch {
-            q = q.bind(*id);
-        }
-        for (id, title) in q.fetch_all(pool).await? {
-            out.insert(id, title);
-        }
-    }
-    Ok(out)
+    let ids: Vec<&str> = units.iter().map(|u| u.source_id.as_str()).collect();
+    crate::citation::source_titles(pool, &ids).await
 }
 
 /// The grounded-answer stream. Pure over the owned [`AnswerCtx`] so the returned
