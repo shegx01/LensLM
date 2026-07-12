@@ -63,7 +63,7 @@ async fn migration_is_idempotent_second_run_is_noop() {
         .unwrap();
 
     assert_eq!(count_before, count_after);
-    assert_eq!(count_after, 18, "all migration files applied (0001..0018)");
+    assert_eq!(count_after, 19, "all migration files applied (0001..0019)");
 }
 
 #[tokio::test]
@@ -474,7 +474,7 @@ async fn purging_notebook_cascades_to_children() {
     .execute(&pool)
     .await
     .unwrap();
-    sqlx::query("INSERT INTO notes (id, notebook_id, content, origin, created_at, updated_at) VALUES (?, ?, 'n', 'user', ?, ?)")
+    sqlx::query("INSERT INTO notes (id, notebook_id, content, origin, created_at, updated_at) VALUES (?, ?, 'n', 'chat', ?, ?)")
         .bind(Uuid::now_v7().to_string())
         .bind(&nb.id)
         .bind(&now)
@@ -601,7 +601,7 @@ async fn cold_init_under_budget_on_empty_temp_db() {
     let engine = LensEngine::init(dir.path()).await.unwrap();
     let elapsed = start.elapsed();
     // Sanity: the engine works.
-    assert_eq!(engine.migration_count().await.unwrap(), 18);
+    assert_eq!(engine.migration_count().await.unwrap(), 19);
     // Generous smoke guard against accidentally-expensive migrations (e.g. a
     // future migration that scans/rewrites large tables on cold start). This is
     // NOT a tight perf benchmark — the wide 2s budget keeps it non-flaky on
@@ -749,8 +749,8 @@ async fn migration_0009_renames_file_hash_to_raw_content_hash() {
         "old idx_sources_notebook_file_hash must be gone after 0009"
     );
 
-    // Migration count reflects all eighteen migrations.
-    assert_eq!(engine.migration_count().await.unwrap(), 18);
+    // Migration count reflects all nineteen migrations.
+    assert_eq!(engine.migration_count().await.unwrap(), 19);
 }
 
 #[tokio::test]

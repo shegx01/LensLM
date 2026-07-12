@@ -12,24 +12,31 @@
   import { enhanceCitations, type CitationTarget } from '$lib/chat/citation-inline.js';
   import { messageCitations } from '$lib/chat/chat-state.svelte.js';
   import { sourcesStore } from '$lib/sources/sources-state.svelte.js';
+  import { notesStore, toggleSave } from '$lib/notes/notes-state.svelte.js';
   import type { ChatMessage } from '$lib/chat/types.js';
 
   interface Props {
+    notebookId: string;
     versions: ChatMessage[];
     oncopy: (content: string) => void;
     onregenerate: () => void;
     onfeedback: (messageId: string, next: 'up' | 'down') => void;
     regenerateDisabled?: boolean;
     highlightCode?: boolean;
+    /** Whether this bubble is a finalized answer — the streaming bubble passes
+     * `false` to hide Save (partial content has no stable message id to save). */
+    finalized?: boolean;
   }
 
   let {
+    notebookId,
     versions,
     oncopy,
     onregenerate,
     onfeedback,
     regenerateDisabled = false,
-    highlightCode = true
+    highlightCode = true,
+    finalized = true
   }: Props = $props();
 
   let selectedIndex = $state(0);
@@ -107,10 +114,13 @@
         <div class="mt-1.5 flex items-center gap-2">
           <MessageActions
             feedback={current.feedback}
+            saved={notesStore.savedMessageIds(notebookId).has(current.id)}
             disabled={regenerateDisabled}
+            {finalized}
             oncopy={() => oncopy(current.content)}
             {onregenerate}
             onfeedback={(next) => onfeedback(current.id, next)}
+            onsave={() => void toggleSave(notebookId, current)}
           />
 
           {#if versions.length > 1}

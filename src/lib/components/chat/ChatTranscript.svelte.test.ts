@@ -34,6 +34,7 @@ function assistantRow(overrides: Partial<ReturnType<typeof makeChatMessage>> = {
 }
 
 const baseProps = {
+  notebookId: 'nb-1',
   streaming: false,
   stage: null,
   thinkingBuffer: '',

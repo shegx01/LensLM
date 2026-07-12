@@ -66,6 +66,7 @@ function makeAssistant(content: string, citations: Citation[] | null): ChatMessa
 }
 
 const baseProps = {
+  notebookId: 'nb-001',
   oncopy: vi.fn(),
   onregenerate: vi.fn(),
   onfeedback: vi.fn()
@@ -142,5 +143,18 @@ describe('AssistantMessage — inline citation chips', () => {
 
     await fireEvent.click(screen.getByLabelText('Copy answer'));
     expect(oncopy).toHaveBeenCalledWith(raw);
+  });
+
+  it('does not render Save for the streaming bubble (finalized=false)', () => {
+    const msg = makeAssistant('partial content...', null);
+    render(AssistantMessage, { versions: [msg], ...baseProps, finalized: false });
+    expect(screen.queryByLabelText('Save to notes')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Remove from notes')).not.toBeInTheDocument();
+  });
+
+  it('renders Save for a finalized answer (default finalized=true)', () => {
+    const msg = makeAssistant('a finished answer', null);
+    render(AssistantMessage, { versions: [msg], ...baseProps });
+    expect(screen.getByLabelText('Save to notes')).toBeInTheDocument();
   });
 });
