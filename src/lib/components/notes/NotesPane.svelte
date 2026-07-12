@@ -13,6 +13,7 @@
   import KeyInsightCard from './KeyInsightCard.svelte';
   import ManualNoteCard from './ManualNoteCard.svelte';
   import { notesStore, hydrate, addManualNote } from '$lib/notes/notes-state.svelte.js';
+  import { truncateLabel } from '$lib/utils.js';
   import type { Note } from '$lib/notes/types.js';
 
   interface Props {
@@ -37,8 +38,7 @@
 
   function noteLabel(note: Note): string {
     if (note.source_title) return note.source_title;
-    const firstLine = note.content.trim().split('\n')[0]?.replace(/\s+/g, ' ') ?? '';
-    return firstLine.length > 60 ? `${firstLine.slice(0, 60)}…` : firstLine;
+    return truncateLabel(note.content.trim().split('\n')[0] ?? '');
   }
 
   let viewportRef = $state<HTMLElement | null>(null);
@@ -73,7 +73,13 @@
     if (!canSave) return;
     const content = draft;
     draft = '';
-    await addManualNote(notebookId, content);
+    try {
+      await addManualNote(notebookId, content);
+    } catch (err) {
+      // Restore the composer so a failed save doesn't silently discard the text.
+      draft = content;
+      throw err;
+    }
   }
 
   function onKeydown(e: KeyboardEvent): void {

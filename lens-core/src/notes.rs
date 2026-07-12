@@ -195,21 +195,16 @@ impl<'a> NotesRepo<'a> {
     ) -> Result<Note, LensError> {
         let id = Uuid::now_v7().to_string();
         let now = chrono::Utc::now().to_rfc3339();
-        sqlx::query(
-            "INSERT INTO notes \
-                 (id, notebook_id, content, origin, citations, source_title, \
-                  source_message_id, created_at, updated_at) \
-             VALUES (?, ?, ?, 'chat', ?, ?, ?, ?, ?)",
+        self.insert_note(
+            &id,
+            notebook_id,
+            content,
+            NoteOrigin::Chat,
+            citations_json,
+            source_title,
+            Some(source_message_id),
+            &now,
         )
-        .bind(&id)
-        .bind(notebook_id)
-        .bind(content)
-        .bind(citations_json)
-        .bind(source_title)
-        .bind(source_message_id)
-        .bind(&now)
-        .bind(&now)
-        .execute(self.pool)
         .await?;
         Ok(Note {
             id,
@@ -224,6 +219,41 @@ impl<'a> NotesRepo<'a> {
         })
     }
 
+    /// Inserts one `notes` row with the shared 9-column scaffold. `updated_at`
+    /// equals `created_at` at insert (the column is `NOT NULL`, 0001:81); the
+    /// public `create_*` methods own id/timestamp minting and the returned `Note`.
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_note(
+        &self,
+        id: &str,
+        notebook_id: &str,
+        content: &str,
+        origin: NoteOrigin,
+        citations: Option<&str>,
+        source_title: Option<&str>,
+        source_message_id: Option<&str>,
+        now: &str,
+    ) -> Result<(), LensError> {
+        sqlx::query(
+            "INSERT INTO notes \
+                 (id, notebook_id, content, origin, citations, source_title, \
+                  source_message_id, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(notebook_id)
+        .bind(content)
+        .bind(origin.as_str())
+        .bind(citations)
+        .bind(source_title)
+        .bind(source_message_id)
+        .bind(now)
+        .bind(now)
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Inserts an `origin=manual` note (#25). Citations, `source_title`, and
     /// `source_message_id` are always NULL — a manual note has no grounding.
     /// `updated_at` equals `created_at` at insert.
@@ -234,18 +264,16 @@ impl<'a> NotesRepo<'a> {
     ) -> Result<Note, LensError> {
         let id = Uuid::now_v7().to_string();
         let now = chrono::Utc::now().to_rfc3339();
-        sqlx::query(
-            "INSERT INTO notes \
-                 (id, notebook_id, content, origin, citations, source_title, \
-                  source_message_id, created_at, updated_at) \
-             VALUES (?, ?, ?, 'manual', NULL, NULL, NULL, ?, ?)",
+        self.insert_note(
+            &id,
+            notebook_id,
+            content,
+            NoteOrigin::Manual,
+            None,
+            None,
+            None,
+            &now,
         )
-        .bind(&id)
-        .bind(notebook_id)
-        .bind(content)
-        .bind(&now)
-        .bind(&now)
-        .execute(self.pool)
         .await?;
         Ok(Note {
             id,

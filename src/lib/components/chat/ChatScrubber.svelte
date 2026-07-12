@@ -3,6 +3,7 @@
      ui/scrubber/Scrubber.svelte for the tick/hover-expand interaction. -->
 <script lang="ts">
   import { Scrubber } from '$lib/components/ui/scrubber/index.js';
+  import { truncateLabel } from '$lib/utils.js';
   import type { Turn } from '$lib/chat/types.js';
 
   interface Props {
@@ -15,8 +16,7 @@
 
   /** Single-line question preview for the expanded label. */
   function snippet(turn: Turn): string {
-    const s = turn.user.content.trim().replace(/\s+/g, ' ');
-    return s.length > 60 ? `${s.slice(0, 60)}…` : s;
+    return truncateLabel(turn.user.content.trim());
   }
 
   const items = $derived(turns.map((turn) => ({ id: turn.turn_id, label: snippet(turn) })));
