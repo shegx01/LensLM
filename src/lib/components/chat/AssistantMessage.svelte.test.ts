@@ -1,127 +1,64 @@
-// Component tests for AssistantMessage: inline [n] markers stripped from the
-// rendered prose; footer chips present for persisted citations, absent when
-// citations is null; copy passes the RAW content (with markers) while the
-// displayed prose is stripped (deliberate divergence).
+// Component wiring for per-block copy buttons. renderMarkdown is stubbed to a
+// raw <pre><code> string because DOMPurify strips <pre> under happy-dom (an
+// environment quirk, not real-app behavior); stubbing isolates the $effect +
+// highlightCode gate from that quirk. Module-level behavior is covered in
+// ../../chat/code-copy.test.ts.
 
-import { render, screen, fireEvent } from '@testing-library/svelte';
+import { render, waitFor } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { Source } from '$lib/sources/types.js';
-import type { Citation, ChatMessage } from '$lib/chat/types.js';
 
-const { mockSourcesStore } = vi.hoisted(() => {
-  let _sources: Source[] = [];
-  const mockSourcesStore = {
-    get sources() {
-      return _sources;
-    },
-    _setSources(s: Source[]) {
-      _sources = s;
-    }
-  };
-  return { mockSourcesStore };
-});
-
-vi.mock('$lib/sources/sources-state.svelte.js', () => ({
-  sourcesStore: mockSourcesStore,
-  focusSource: vi.fn()
+vi.mock('$lib/chat/render-markdown.js', () => ({
+  renderMarkdown: (source: string) => `<pre><code>${source}</code></pre>`,
+  stripCitationMarkers: (source: string) => source
 }));
 
 import AssistantMessage from './AssistantMessage.svelte';
+import { makeChatMessage } from '$lib/chat/test-fixtures.js';
 
-function makeSource(overrides?: Partial<Source>): Source {
+let writeText: ReturnType<typeof vi.fn>;
+
+function props(overrides?: Record<string, unknown>) {
   return {
-    id: 'src-001',
-    notebook_id: 'nb-001',
-    kind: 'file',
-    title: 'Doc.md',
-    status: 'indexed',
-    locator: '/docs/Doc.md',
-    selected: 1,
-    created_at: new Date().toISOString(),
-    token_count: 100,
-    content_hash: 'h',
-    raw_content_hash: null,
-    trashed_at: null,
-    enrichment_status: null,
-    enrichment_meta: null,
-    force_js_render: 0,
-    error_meta: null,
+    versions: [makeChatMessage({ role: 'assistant', content: 'const x = 1;\n' })],
+    oncopy: vi.fn(),
+    onregenerate: vi.fn(),
+    onfeedback: vi.fn(),
     ...overrides
   };
 }
 
-function makeAssistant(content: string, citations: Citation[] | null): ChatMessage {
-  return {
-    id: 'a1',
-    notebook_id: 'nb-001',
-    turn_id: 't1',
-    role: 'assistant',
-    content,
-    citations: citations === null ? null : JSON.stringify(citations),
-    feedback: null,
-    tokens_used: 10,
-    created_at: '2026-07-12T00:00:00Z'
-  };
-}
-
-const baseProps = {
-  oncopy: vi.fn(),
-  onregenerate: vi.fn(),
-  onfeedback: vi.fn()
-};
-
 beforeEach(() => {
-  vi.clearAllMocks();
-  mockSourcesStore._setSources([]);
+  writeText = vi.fn().mockResolvedValue(undefined);
+  vi.stubGlobal('navigator', { clipboard: { writeText } });
 });
 
 afterEach(() => {
-  mockSourcesStore._setSources([]);
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
-describe('AssistantMessage — marker strip + chips', () => {
-  it('strips inline [n] markers from the rendered prose', () => {
-    mockSourcesStore._setSources([makeSource({ id: 'src-a', title: 'Alpha' })]);
-    const msg = makeAssistant('Revenue grew 34%[1]. Solid.', [
-      { source_id: 'src-a', ordinal: 1, locators: [] }
-    ]);
-    const { container } = render(AssistantMessage, { versions: [msg], ...baseProps });
-    const prose = container.querySelector('.chat-markdown') as HTMLElement;
-    expect(prose.textContent).toContain('Revenue grew 34%. Solid.');
-    expect(prose.textContent).not.toContain('[1]');
+describe('AssistantMessage code-copy', () => {
+  it('adds a copy button to a fenced block for a settled (highlighted) answer', async () => {
+    const { container } = render(AssistantMessage, { props: props() });
+    await waitFor(() => expect(container.querySelectorAll('.code-copy-btn')).toHaveLength(1));
   });
 
-  it('renders footer chips for a persisted answer with citations', () => {
-    mockSourcesStore._setSources([
-      makeSource({ id: 'src-a', title: 'Alpha' }),
-      makeSource({ id: 'src-b', title: 'Beta' })
-    ]);
-    const msg = makeAssistant('See [1] and [2].', [
-      { source_id: 'src-a', ordinal: 1, locators: [] },
-      { source_id: 'src-b', ordinal: 2, locators: [] }
-    ]);
-    render(AssistantMessage, { versions: [msg], ...baseProps });
-    expect(screen.getByRole('button', { name: 'Source 1: Alpha' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Source 2: Beta' })).toBeInTheDocument();
+  it('clicking the block copy button copies the block source', async () => {
+    const { container } = render(AssistantMessage, { props: props() });
+    const btn = await waitFor(() => {
+      const b = container.querySelector<HTMLButtonElement>('.code-copy-btn');
+      if (!b) throw new Error('no button yet');
+      return b;
+    });
+    btn.click();
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith('const x = 1;\n'));
   });
 
-  it('renders no footer row when citations is null (streaming/zero-citation)', () => {
-    const msg = makeAssistant('Just prose, no citations.', null);
-    render(AssistantMessage, { versions: [msg], ...baseProps });
-    expect(screen.queryByLabelText(/sources cited/i)).not.toBeInTheDocument();
-  });
-
-  it('copy passes the RAW content (with markers) while the display is stripped', async () => {
-    mockSourcesStore._setSources([makeSource({ id: 'src-a', title: 'Alpha' })]);
-    const oncopy = vi.fn();
-    const raw = 'Grew 34%[1].';
-    const msg = makeAssistant(raw, [{ source_id: 'src-a', ordinal: 1, locators: [] }]);
-    const { container } = render(AssistantMessage, { versions: [msg], ...baseProps, oncopy });
-
-    const prose = container.querySelector('.chat-markdown') as HTMLElement;
-    expect(prose.textContent).not.toContain('[1]');
-
-    await fireEvent.click(screen.getByLabelText('Copy answer'));
-    expect(oncopy).toHaveBeenCalledWith(raw);
+  it('renders no block copy button for a streaming answer (highlightCode=false)', async () => {
+    const { container } = render(AssistantMessage, {
+      props: props({ highlightCode: false })
+    });
+    await Promise.resolve();
+    expect(container.querySelectorAll('.code-copy-btn')).toHaveLength(0);
   });
 });

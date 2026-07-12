@@ -1,14 +1,40 @@
 // Sanitized markdown rendering for assistant chat messages. `marked` parses,
-// `DOMPurify` sanitizes — both are bundled (no CDN) and free of eval/new
-// Function, satisfying the CSP `script-src 'self' ...` policy (scripts/verify-csp-hash.mjs
-// only guards the inline pre-paint script and is unaffected by this dependency).
+// `highlight.js` colorizes fenced code (pure JS, no eval/new Function/WASM — CSP
+// `script-src 'self'`-safe; colors come from bundled .hljs-* token CSS, not
+// inline styles), and `DOMPurify` sanitizes — all bundled (no CDN), so
+// scripts/verify-csp-hash.mjs (inline pre-paint script only) is unaffected.
 //
-// Inline-only: no remote images/fonts/scripts are fetched by either library.
+// Inline-only: no remote images/fonts/scripts are fetched by any library.
+//
+// hljs is a static import (in the boot bundle) so renderMarkdown stays
+// synchronous — no highlight flash; acceptable for a local-first desktop app
+// (assets on disk, no network fetch).
 
-import { marked } from 'marked';
+import { Marked } from 'marked';
+import { markedHighlight } from 'marked-highlight';
+import hljs from 'highlight.js/lib/common';
 import DOMPurify from 'dompurify';
 
-marked.setOptions({ breaks: true, gfm: true });
+// Fence-hint priority, auto-detect fallback: honor a known language hint, else
+// let hljs guess over the ~37-language common preset.
+const highlightMarked = new Marked(
+  markedHighlight({
+    langPrefix: 'hljs language-',
+    highlight(code, lang) {
+      if (lang && hljs.getLanguage(lang)) {
+        return hljs.highlight(code, { language: lang }).value;
+      }
+      return hljs.highlightAuto(code).value;
+    }
+  })
+);
+highlightMarked.setOptions({ breaks: true, gfm: true });
+
+// Plain instance for the live streaming path: no hljs, so the growing buffer
+// isn't re-tokenized per token (O(n²)) and highlightAuto never runs on an
+// open fence. Same GFM options and DOMPurify pass as the highlighting path.
+const plainMarked = new Marked();
+plainMarked.setOptions({ breaks: true, gfm: true });
 
 /**
  * Removes inline `[n]` citation markers from `source`, but ONLY when `n` is a real
@@ -25,8 +51,9 @@ export function stripCitationMarkers(source: string, ordinals: Set<number>): str
 }
 
 /** Parses `source` as GFM markdown and sanitizes the resulting HTML for safe `{@html}` use. */
-export function renderMarkdown(source: string): string {
-  const html = marked.parse(source, { async: false }) as string;
+export function renderMarkdown(source: string, opts?: { highlight?: boolean }): string {
+  const instance = opts?.highlight === false ? plainMarked : highlightMarked;
+  const html = instance.parse(source, { async: false }) as string;
   return DOMPurify.sanitize(html, {
     ALLOWED_URI_REGEXP: /^(?:https?:|mailto:)/i,
     FORBID_ATTR: ['style', 'onerror', 'onload']
