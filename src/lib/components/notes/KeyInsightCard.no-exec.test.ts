@@ -22,6 +22,7 @@ function makeNote(overrides?: Partial<Note>): Note {
     source_message_id: 'msg-001',
     created_at: '2026-07-12T00:00:00Z',
     updated_at: '2026-07-12T00:00:00Z',
+    pinned: false,
     ...overrides
   };
 }

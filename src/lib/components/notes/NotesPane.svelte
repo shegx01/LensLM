@@ -13,6 +13,7 @@
   import KeyInsightCard from './KeyInsightCard.svelte';
   import ManualNoteCard from './ManualNoteCard.svelte';
   import { notesStore, hydrate, addManualNote } from '$lib/notes/notes-state.svelte.js';
+  import { notesNav } from '$lib/notes/notes-nav.svelte.js';
   import { truncateLabel } from '$lib/utils.js';
   import type { Note } from '$lib/notes/types.js';
 
@@ -100,6 +101,15 @@
     if (!el) return;
     el.addEventListener('scroll', updateActiveNote, { passive: true });
     return () => el.removeEventListener('scroll', updateActiveNote);
+  });
+
+  // ⌘K "jump to note": the palette pushes a request through notes-nav; scroll
+  // once per distinct request (the nonce makes repeat requests for the same id fire).
+  $effect(() => {
+    const req = notesNav.request;
+    if (!req) return;
+    void req.nonce;
+    tick().then(() => scrollToNote(req.noteId));
   });
 </script>
 

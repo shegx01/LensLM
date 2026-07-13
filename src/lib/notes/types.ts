@@ -21,4 +21,6 @@ export interface Note {
   source_message_id: string | null;
   created_at: string;
   updated_at: string;
+  /** Pinned notes float to the top of their section (migration 0020). */
+  pinned: boolean;
 }

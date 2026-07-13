@@ -20,6 +20,20 @@ import type { TrashedSource } from '$lib/sources/types.js';
 import type { Notebook, NotebookSummary } from './types.js';
 import { NOTEBOOK_PALETTE, notebookAccentClass } from './notebook-color.js';
 
+// Palette results are a discriminated union: notebook-title results (Chat tab or
+// no active notebook) or per-note results (Notes tab). The `note`-kind branch is
+// computed in CommandPalette, which can import `notes-state` freely — a static
+// import here would risk a circular dependency (notebooks-state ↔ notes-state).
+export type NotebookPaletteResult = { kind: 'notebook'; notebook: NotebookSummary };
+export type NotePaletteResult = {
+  kind: 'note';
+  noteId: string;
+  title: string;
+  snippet: string;
+  sourceTitle: string | null;
+};
+export type PaletteResult = NotebookPaletteResult | NotePaletteResult;
+
 // ---------------------------------------------------------------------------
 // Module-level reactive state
 // ---------------------------------------------------------------------------

@@ -6,7 +6,9 @@ vi.mock('./ipc.js', () => ({
   saveChatNote: vi.fn(),
   saveManualNote: vi.fn(),
   listNotes: vi.fn(),
-  deleteNote: vi.fn().mockResolvedValue(undefined)
+  deleteNote: vi.fn().mockResolvedValue(undefined),
+  updateNote: vi.fn(),
+  setNotePinned: vi.fn()
 }));
 
 import {
@@ -15,9 +17,19 @@ import {
   hydrate,
   toggleSave,
   addManualNote,
-  remove
+  remove,
+  editNote,
+  setPinned,
+  noteMatchesQuery
 } from './notes-state.svelte.js';
-import { saveChatNote, saveManualNote, listNotes, deleteNote } from './ipc.js';
+import {
+  saveChatNote,
+  saveManualNote,
+  listNotes,
+  deleteNote,
+  updateNote,
+  setNotePinned
+} from './ipc.js';
 import type { Note } from './types.js';
 import type { ChatMessage, Citation } from '$lib/chat/types.js';
 import { makeChatMessage } from '$lib/chat/test-fixtures.js';
@@ -35,6 +47,7 @@ function makeNote(overrides?: Partial<Note>): Note {
     source_message_id: 'msg-001',
     created_at: '2026-07-12T00:00:00Z',
     updated_at: '2026-07-12T00:00:00Z',
+    pinned: false,
     ...overrides
   };
 }
@@ -299,5 +312,180 @@ describe('groupedBySource', () => {
     expect(groups).toHaveLength(1);
     expect(groups[0].sourceId).toBeNull();
     expect(groups[0].notes.map((n) => n.id)).toEqual(['n1']);
+  });
+});
+
+describe('editNote', () => {
+  it('replaces the note in place with the returned row (bumped updated_at, grounding preserved)', async () => {
+    const original = makeNote({
+      id: 'note-001',
+      content: 'old',
+      source_title: 'Src A',
+      source_message_id: 'msg-001',
+      citations: JSON.stringify([{ source_id: 'src-a', ordinal: 1, locators: [] }])
+    });
+    vi.mocked(listNotes).mockResolvedValue([original]);
+    await hydrate(NB);
+
+    const updated = makeNote({
+      ...original,
+      content: 'new content [1]',
+      updated_at: '2026-07-13T00:00:00Z'
+    });
+    vi.mocked(updateNote).mockResolvedValue(updated);
+
+    await editNote(NB, 'note-001', 'new content [1]');
+
+    expect(updateNote).toHaveBeenCalledWith('note-001', 'new content [1]');
+    const [note] = notesStore.notes(NB);
+    expect(note.content).toBe('new content [1]');
+    expect(note.updated_at).toBe('2026-07-13T00:00:00Z');
+    // Grounding columns preserved from the returned row.
+    expect(note.source_title).toBe('Src A');
+    expect(note.source_message_id).toBe('msg-001');
+    expect(note.citations).toBe(original.citations);
+  });
+
+  it('no-ops (no ipc call) on empty/whitespace content', async () => {
+    const original = makeNote({ id: 'note-001', content: 'keep me' });
+    vi.mocked(listNotes).mockResolvedValue([original]);
+    await hydrate(NB);
+
+    await editNote(NB, 'note-001', '   ');
+
+    expect(updateNote).not.toHaveBeenCalled();
+    expect(notesStore.notes(NB)[0].content).toBe('keep me');
+  });
+
+  it('a stale editNote resolving after a newer hydrate does not clobber', async () => {
+    const original = makeNote({ id: 'note-001', content: 'v0' });
+    vi.mocked(listNotes).mockResolvedValue([original]);
+    await hydrate(NB);
+
+    let resolveUpdate: (n: Note) => void = () => {};
+    vi.mocked(updateNote).mockImplementation(
+      () => new Promise((resolve) => (resolveUpdate = resolve))
+    );
+    const staleEdit = editNote(NB, 'note-001', 'v1');
+
+    const freshRows = [makeNote({ id: 'note-002', content: 'fresh' })];
+    vi.mocked(listNotes).mockResolvedValue(freshRows);
+    await hydrate(NB);
+
+    resolveUpdate(makeNote({ id: 'note-001', content: 'v1' }));
+    await staleEdit;
+
+    expect(notesStore.notes(NB)).toEqual(freshRows);
+  });
+});
+
+describe('setPinned', () => {
+  it('pins a note and re-sorts so pinned floats to the top', async () => {
+    const older = makeNote({
+      id: 'a',
+      origin: 'manual',
+      source_message_id: null,
+      created_at: '2026-07-12T00:00:00Z'
+    });
+    const newer = makeNote({
+      id: 'b',
+      origin: 'manual',
+      source_message_id: null,
+      created_at: '2026-07-12T05:00:00Z'
+    });
+    // list_notes returns newest-first.
+    vi.mocked(listNotes).mockResolvedValue([newer, older]);
+    await hydrate(NB);
+    expect(notesStore.notes(NB).map((n) => n.id)).toEqual(['b', 'a']);
+
+    vi.mocked(setNotePinned).mockResolvedValue({ ...older, pinned: true });
+    await setPinned(NB, 'a', true);
+
+    // Pinned 'a' now floats above the newer-but-unpinned 'b'.
+    expect(setNotePinned).toHaveBeenCalledWith('a', true);
+    expect(notesStore.notes(NB).map((n) => n.id)).toEqual(['a', 'b']);
+    expect(notesStore.notes(NB)[0].pinned).toBe(true);
+  });
+
+  it('unpinning re-sorts back to newest-first', async () => {
+    const older = makeNote({
+      id: 'a',
+      origin: 'manual',
+      source_message_id: null,
+      pinned: true,
+      created_at: '2026-07-12T00:00:00Z'
+    });
+    const newer = makeNote({
+      id: 'b',
+      origin: 'manual',
+      source_message_id: null,
+      created_at: '2026-07-12T05:00:00Z'
+    });
+    vi.mocked(listNotes).mockResolvedValue([older, newer]);
+    await hydrate(NB);
+
+    vi.mocked(setNotePinned).mockResolvedValue({ ...older, pinned: false });
+    await setPinned(NB, 'a', false);
+
+    expect(notesStore.notes(NB).map((n) => n.id)).toEqual(['b', 'a']);
+  });
+
+  it('manualNotes and groupedBySource surface pinned-first ordering', async () => {
+    const manualOld = makeNote({
+      id: 'm1',
+      origin: 'manual',
+      source_message_id: null,
+      pinned: false,
+      created_at: '2026-07-12T05:00:00Z'
+    });
+    const manualPinned = makeNote({
+      id: 'm2',
+      origin: 'manual',
+      source_message_id: null,
+      pinned: true,
+      created_at: '2026-07-12T00:00:00Z'
+    });
+    const citations = JSON.stringify([{ source_id: 'src-a', ordinal: 1, locators: [] }]);
+    const chatOld = makeNote({
+      id: 'c1',
+      origin: 'chat',
+      citations,
+      source_title: 'A',
+      pinned: false,
+      created_at: '2026-07-12T05:00:00Z'
+    });
+    const chatPinned = makeNote({
+      id: 'c2',
+      origin: 'chat',
+      citations,
+      source_title: 'A',
+      pinned: true,
+      created_at: '2026-07-12T00:00:00Z'
+    });
+    vi.mocked(listNotes).mockResolvedValue([manualOld, manualPinned, chatOld, chatPinned]);
+    await hydrate(NB);
+
+    expect(notesStore.manualNotes(NB).map((n) => n.id)).toEqual(['m2', 'm1']);
+    expect(notesStore.groupedBySource(NB)[0].notes.map((n) => n.id)).toEqual(['c2', 'c1']);
+  });
+});
+
+describe('noteMatchesQuery', () => {
+  it('matches case-insensitive substrings of content', () => {
+    const note = makeNote({ content: 'The Quarterly Revenue Report' });
+    expect(noteMatchesQuery(note, 'revenue')).toBe(true);
+    expect(noteMatchesQuery(note, 'REVENUE')).toBe(true);
+    expect(noteMatchesQuery(note, 'nomatch')).toBe(false);
+  });
+
+  it('matches on source_title too', () => {
+    const note = makeNote({ content: 'body', source_title: 'Annual Filing' });
+    expect(noteMatchesQuery(note, 'annual')).toBe(true);
+  });
+
+  it('an empty/whitespace query matches everything', () => {
+    const note = makeNote({ content: 'anything' });
+    expect(noteMatchesQuery(note, '')).toBe(true);
+    expect(noteMatchesQuery(note, '   ')).toBe(true);
   });
 });

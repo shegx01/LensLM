@@ -6,7 +6,14 @@
 // truth for a chat message's saved-state — MessageActions reads it, never a
 // separately-tracked flag.
 
-import { saveChatNote, saveManualNote, listNotes, deleteNote } from './ipc.js';
+import {
+  saveChatNote,
+  saveManualNote,
+  listNotes,
+  deleteNote,
+  updateNote,
+  setNotePinned
+} from './ipc.js';
 import { parseCitations } from '$lib/chat/citations.js';
 import type { Note } from './types.js';
 import type { ChatMessage } from '$lib/chat/types.js';
@@ -56,6 +63,19 @@ function bumpGeneration(notebookId: string): number {
 function primarySourceId(note: Note): string | null {
   const citations = parseCitations(note.citations);
   return citations?.find((c) => c.ordinal === 1)?.source_id ?? null;
+}
+
+/**
+ * Client-side ordering mirroring the engine's `list_notes` ORDER BY
+ * (`pinned DESC, created_at DESC, id DESC`) so an optimistic pin toggle re-floats
+ * the note without a re-hydrate. Stable, non-mutating (returns a sorted copy).
+ */
+function sortNotes(notes: Note[]): Note[] {
+  return [...notes].sort((a, b) => {
+    if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+    if (a.created_at !== b.created_at) return a.created_at < b.created_at ? 1 : -1;
+    return a.id < b.id ? 1 : a.id > b.id ? -1 : 0;
+  });
 }
 
 /** Hydrates a notebook's saved notes from `notes` (newest-first, as returned). */
@@ -119,6 +139,52 @@ export async function remove(notebookId: string, noteId: string): Promise<void> 
   byNotebook[notebookId] = notes.filter((n) => n.id !== noteId);
 }
 
+/**
+ * Edits a note's content in place, replacing the row with the returned snapshot
+ * (bumped `updated_at`, grounding cols preserved by the engine). No-ops on
+ * empty/whitespace content (belt-and-suspenders alongside the engine guard).
+ * Shares the hydrate generation guard so a stale `listNotes` cannot clobber.
+ */
+export async function editNote(notebookId: string, noteId: string, content: string): Promise<void> {
+  if (content.trim().length === 0) return;
+  const gen = bumpGeneration(notebookId);
+  const updated = await updateNote(noteId, content);
+  if (hydrateGeneration.get(notebookId) !== gen) return;
+  const notes = byNotebook[notebookId];
+  if (!notes) return;
+  byNotebook[notebookId] = notes.map((n) => (n.id === noteId ? updated : n));
+}
+
+/**
+ * Pins/unpins a note, replacing the row with the returned snapshot and re-sorting
+ * so pinned notes float to the top (mirrors the engine ORDER BY). Shares the
+ * hydrate generation guard so a stale `listNotes` cannot clobber the new order.
+ */
+export async function setPinned(
+  notebookId: string,
+  noteId: string,
+  pinned: boolean
+): Promise<void> {
+  const gen = bumpGeneration(notebookId);
+  const updated = await setNotePinned(noteId, pinned);
+  if (hydrateGeneration.get(notebookId) !== gen) return;
+  const notes = byNotebook[notebookId];
+  if (!notes) return;
+  byNotebook[notebookId] = sortNotes(notes.map((n) => (n.id === noteId ? updated : n)));
+}
+
+/**
+ * Case-insensitive substring match over a note's `content` + `source_title`
+ * (both sections). Pure — used by the ⌘K palette's Notes-tab branch. An empty
+ * query matches everything (mirrors the notebook-title branch).
+ */
+export function noteMatchesQuery(note: Note, query: string): boolean {
+  const q = query.trim().toLowerCase();
+  if (q.length === 0) return true;
+  if (note.content.toLowerCase().includes(q)) return true;
+  return note.source_title?.toLowerCase().includes(q) ?? false;
+}
+
 export const notesStore = {
   notes(notebookId: string): Note[] {
     return byNotebook[notebookId] ?? [];
@@ -132,13 +198,13 @@ export const notesStore = {
     }
     return ids;
   },
-  /** User-authored manual notes only, newest-first (as stored). */
+  /** User-authored manual notes only, pinned-first then newest-first. */
   manualNotes(notebookId: string): Note[] {
-    return (byNotebook[notebookId] ?? []).filter((n) => n.origin === 'manual');
+    return sortNotes((byNotebook[notebookId] ?? []).filter((n) => n.origin === 'manual'));
   },
-  /** Notes grouped by the ordinal-1 citation's `source_id`; uncited notes group under `null`. Newest-first preserved. Chat notes only. */
+  /** Notes grouped by the ordinal-1 citation's `source_id`; uncited notes group under `null`. Pinned-first then newest-first within each group. Chat notes only. */
   groupedBySource(notebookId: string): NoteGroup[] {
-    const notes = (byNotebook[notebookId] ?? []).filter((n) => n.origin === 'chat');
+    const notes = sortNotes((byNotebook[notebookId] ?? []).filter((n) => n.origin === 'chat'));
     const order: Array<string | null> = [];
     const groups = new Map<string | null, NoteGroup>();
     for (const note of notes) {
