@@ -12,7 +12,9 @@
   import { Scrubber, type ScrubberItem } from '$lib/components/ui/scrubber/index.js';
   import KeyInsightCard from './KeyInsightCard.svelte';
   import ManualNoteCard from './ManualNoteCard.svelte';
+  import NotesExportMenu from './NotesExportMenu.svelte';
   import { notesStore, hydrate, addManualNote } from '$lib/notes/notes-state.svelte.js';
+  import { notesNav } from '$lib/notes/notes-nav.svelte.js';
   import { truncateLabel } from '$lib/utils.js';
   import type { Note } from '$lib/notes/types.js';
 
@@ -101,9 +103,23 @@
     el.addEventListener('scroll', updateActiveNote, { passive: true });
     return () => el.removeEventListener('scroll', updateActiveNote);
   });
+
+  // ⌘K "jump to note": the palette pushes a request through notes-nav; scroll
+  // once per distinct request (the nonce makes repeat requests for the same id fire).
+  $effect(() => {
+    const req = notesNav.request;
+    if (!req) return;
+    void req.nonce;
+    tick().then(() => scrollToNote(req.noteId));
+  });
 </script>
 
 <div class="flex min-h-0 flex-1 flex-col overflow-hidden">
+  {#if !isEmpty}
+    <div class="flex items-center justify-end border-b border-border px-3 py-1.5">
+      <NotesExportMenu {notebookId} hasNotes={!isEmpty} />
+    </div>
+  {/if}
   {#if isEmpty}
     <div class="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
       <div

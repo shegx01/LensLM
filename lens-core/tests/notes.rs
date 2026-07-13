@@ -2,7 +2,7 @@
 //! migration 0019), `NotesRepo`, and the `LensEngine` notes methods. Offline
 //! (tempfile scratch DB via `LensEngine::for_test`).
 
-use lens_core::{Citation, LensEngine, Locator, NoteOrigin};
+use lens_core::{Citation, LensEngine, LensError, Locator, NoteOrigin};
 use uuid::Uuid;
 
 fn citation(source_id: &str, ordinal: u32) -> Citation {
@@ -158,6 +158,106 @@ async fn manual_note_persists_and_lists_alongside_chat() {
         engine.save_manual_note(&nb.id, "   ").await.is_err(),
         "empty/whitespace content rejected"
     );
+}
+
+/// Editing a chat note bumps `updated_at`, keeps `[n]` markers in content that
+/// the edit leaves intact, and preserves grounding columns (AC4).
+#[tokio::test]
+async fn update_note_bumps_updated_at_and_preserves_grounding() {
+    let engine = LensEngine::for_test().await;
+    let nb = engine.create_notebook("notes", None, None).await.unwrap();
+
+    let cites = vec![citation("src-1", 1)];
+    let note = engine
+        .save_chat_note(&nb.id, "grounded answer [1].", Some(&cites), "msg-1")
+        .await
+        .unwrap();
+    assert_eq!(
+        note.created_at, note.updated_at,
+        "fresh note not yet edited"
+    );
+
+    // Ensure the bumped timestamp is strictly later (rfc3339 sorts lexically).
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+    let edited = engine
+        .update_note(&note.id, "grounded answer [1] with more detail.")
+        .await
+        .unwrap();
+
+    assert_eq!(edited.content, "grounded answer [1] with more detail.");
+    assert!(
+        edited.content.contains("[1]"),
+        "citation marker survives an edit that leaves it intact"
+    );
+    assert_ne!(
+        edited.updated_at, edited.created_at,
+        "updated_at bumped past created_at"
+    );
+    assert_eq!(edited.created_at, note.created_at, "created_at unchanged");
+    assert_eq!(edited.origin, NoteOrigin::Chat);
+    assert_eq!(edited.source_message_id.as_deref(), Some("msg-1"));
+    assert_eq!(edited.citations_parsed().unwrap(), Some(cites));
+
+    // Rehydrate from the DB to confirm the persisted row matches.
+    let listed = engine.list_notes(&nb.id).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].content, "grounded answer [1] with more detail.");
+    assert_eq!(listed[0].source_message_id.as_deref(), Some("msg-1"));
+    assert_ne!(listed[0].updated_at, listed[0].created_at);
+}
+
+/// Empty/whitespace edits are rejected by the engine wrapper (AC5) — the single
+/// enforcement point, mirroring `save_manual_note`.
+#[tokio::test]
+async fn update_note_rejects_empty_content() {
+    let engine = LensEngine::for_test().await;
+    let nb = engine.create_notebook("notes", None, None).await.unwrap();
+
+    let note = engine
+        .save_manual_note(&nb.id, "original content")
+        .await
+        .unwrap();
+
+    let err = engine.update_note(&note.id, "   ").await.unwrap_err();
+    assert!(
+        matches!(err, LensError::Validation(_)),
+        "whitespace-only edit is a Validation error, got {err:?}"
+    );
+
+    // The original content is untouched (guard runs before the repo write).
+    let listed = engine.list_notes(&nb.id).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].content, "original content");
+}
+
+/// Pinning the older note floats it to the top of `list_notes` (AC8).
+#[tokio::test]
+async fn set_pinned_floats_note_to_top() {
+    let engine = LensEngine::for_test().await;
+    let nb = engine.create_notebook("notes", None, None).await.unwrap();
+
+    let older = engine.save_manual_note(&nb.id, "older note").await.unwrap();
+    assert!(!older.pinned, "notes start unpinned");
+
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+    let newer = engine.save_manual_note(&nb.id, "newer note").await.unwrap();
+
+    // Unpinned: newest first.
+    let before = engine.list_notes(&nb.id).await.unwrap();
+    assert_eq!(before[0].id, newer.id);
+    assert_eq!(before[1].id, older.id);
+
+    let pinned = engine.set_note_pinned(&older.id, true).await.unwrap();
+    assert!(pinned.pinned);
+
+    // Pinned older note now floats above the newer unpinned one.
+    let after = engine.list_notes(&nb.id).await.unwrap();
+    assert_eq!(after[0].id, older.id, "pinned note floats to top");
+    assert!(after[0].pinned);
+    assert_eq!(after[1].id, newer.id);
+    assert!(!after[1].pinned);
 }
 
 /// `NoteOrigin` rejects unknown persisted strings rather than mis-decoding.

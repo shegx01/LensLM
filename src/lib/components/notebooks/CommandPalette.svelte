@@ -7,6 +7,7 @@
   import SearchIcon from '@lucide/svelte/icons/search';
   import ChevronRight from '@lucide/svelte/icons/chevron-right';
   import BookOpen from '@lucide/svelte/icons/book-open';
+  import StickyNote from '@lucide/svelte/icons/sticky-note';
   import {
     notebookStore,
     selectNotebook,
@@ -14,13 +15,45 @@
     formatRelativeTime,
     formatSourceCount
   } from '$lib/notebooks/index.js';
+  import type { PaletteResult } from '$lib/notebooks/notebooks-state.svelte.js';
+  import { notesStore, noteMatchesQuery } from '$lib/notes/notes-state.svelte.js';
+  import { requestScrollTo } from '$lib/notes/notes-nav.svelte.js';
+  import { truncateLabel } from '$lib/utils.js';
 
   let highlightedIndex = $state(0);
   let previouslyFocusedEl: Element | null = null;
   let searchInput: HTMLInputElement | null = $state(null);
   let panelEl: HTMLDivElement | null = $state(null);
 
-  const results = $derived(notebookStore.paletteResults);
+  // Notes mode: the active Notes tab of an open notebook searches THAT notebook's
+  // notes (both sections). Otherwise the palette searches notebook titles.
+  const notesMode = $derived(
+    notebookStore.activeTab === 'notes' && notebookStore.activeNotebookId !== null
+  );
+
+  const results = $derived<PaletteResult[]>(
+    notesMode
+      ? notesStore
+          .notes(notebookStore.activeNotebookId!)
+          .filter((n) => noteMatchesQuery(n, notebookStore.paletteQuery))
+          .map((n) => ({
+            kind: 'note' as const,
+            noteId: n.id,
+            title: n.source_title ?? truncateLabel(n.content.trim().split('\n')[0] ?? ''),
+            snippet: truncateLabel(n.content.trim().replace(/\s+/g, ' ')),
+            sourceTitle: n.source_title
+          }))
+      : notebookStore.paletteResults.map((notebook) => ({ kind: 'notebook' as const, notebook }))
+  );
+
+  /** Stable per-row id for `aria-activedescendant` / row keying, across both kinds. */
+  function resultId(result: PaletteResult): string {
+    return result.kind === 'note' ? result.noteId : result.notebook.id;
+  }
+
+  const searchLabel = $derived(notesMode ? 'Search notes' : 'Search notebooks');
+  const sectionLabel = $derived(notesMode ? 'Notes' : 'Notebooks');
+  const emptyLabel = $derived(notesMode ? 'No notes found' : 'No notebooks found');
 
   $effect(() => {
     // Touch `results` to subscribe; reset highlight on any change.
@@ -55,8 +88,13 @@
   function selectAt(index: number) {
     const result = results[index];
     if (!result) return;
-    selectNotebook(result.id);
-    close();
+    if (result.kind === 'note') {
+      requestScrollTo(result.noteId);
+      close();
+    } else {
+      selectNotebook(result.notebook.id);
+      close();
+    }
   }
 
   function handlePanelKeydown(e: KeyboardEvent) {
@@ -146,7 +184,7 @@
       bind:this={panelEl}
       role="dialog"
       aria-modal="true"
-      aria-label="Search notebooks"
+      aria-label={searchLabel}
       tabindex="-1"
       class="bg-popover text-popover-foreground ring-foreground/10 w-full max-w-[480px] rounded-xl shadow-2xl ring-1 overflow-hidden flex flex-col"
       style="max-height: min(560px, calc(100vh - 30vh - 2rem));"
@@ -162,11 +200,11 @@
           aria-autocomplete="list"
           aria-controls="palette-results"
           aria-expanded={results.length > 0}
-          aria-activedescendant={results.length > 0
-            ? `palette-result-${results[highlightedIndex]?.id}`
+          aria-activedescendant={results.length > 0 && results[highlightedIndex]
+            ? `palette-result-${resultId(results[highlightedIndex])}`
             : undefined}
-          aria-label="Search notebooks"
-          placeholder="Search notebooks"
+          aria-label={searchLabel}
+          placeholder={searchLabel}
           class="min-w-0 flex-1 bg-transparent text-[14px] text-foreground placeholder:text-muted-foreground outline-none"
           value={notebookStore.paletteQuery}
           oninput={(e) => {
@@ -187,23 +225,27 @@
       <div class="flex-1 overflow-y-auto min-h-0 border-t border-border">
         {#if results.length === 0}
           <div class="px-4 py-8 text-center text-[13px] text-muted-foreground">
-            No notebooks found
+            {emptyLabel}
           </div>
         {:else}
           <div class="px-4 pt-3 pb-1">
             <div
               class="text-[10px] font-bold tracking-[0.1em] uppercase text-muted-foreground mb-1"
             >
-              Notebooks
+              {sectionLabel}
             </div>
           </div>
 
-          <ul id="palette-results" role="listbox" aria-label="Notebook results" class="px-2 pb-2">
-            {#each results as notebook, i (notebook.id)}
+          <ul
+            id="palette-results"
+            role="listbox"
+            aria-label="{sectionLabel} results"
+            class="px-2 pb-2"
+          >
+            {#each results as result, i (resultId(result))}
               {@const isHighlighted = i === highlightedIndex}
-              {@const accentCls = notebookColorClass(notebook.id)}
               <li
-                id="palette-result-{notebook.id}"
+                id="palette-result-{resultId(result)}"
                 data-result-index={i}
                 role="option"
                 aria-selected={isHighlighted}
@@ -217,26 +259,50 @@
                 }}
                 tabindex="-1"
               >
-                <div
-                  class={[
-                    'size-8 shrink-0 rounded-[7px] flex items-center justify-center',
-                    accentCls
-                  ].join(' ')}
-                  aria-hidden="true"
-                >
-                  <BookOpen class="size-4" />
-                </div>
+                {#if result.kind === 'note'}
+                  <div
+                    class="size-8 shrink-0 rounded-[7px] flex items-center justify-center bg-muted text-muted-foreground"
+                    aria-hidden="true"
+                  >
+                    <StickyNote class="size-4" />
+                  </div>
 
-                <div class="min-w-0 flex-1">
-                  <div class="truncate text-[14px] font-bold leading-snug">
-                    {notebook.title}
+                  <div class="min-w-0 flex-1">
+                    <div class="truncate text-[14px] font-bold leading-snug">
+                      {result.title}
+                    </div>
+                    <!-- Chat notes: title is the source pill, so show the body snippet
+                         beneath it. Manual notes: title already IS the first line, so a
+                         snippet subtitle would just repeat it — suppress it there. -->
+                    {#if result.sourceTitle}
+                      <div class="truncate text-[12px] text-muted-foreground leading-snug mt-0.5">
+                        {result.snippet}
+                      </div>
+                    {/if}
                   </div>
-                  <div class="truncate text-[12px] text-muted-foreground leading-snug mt-0.5">
-                    {formatSourceCount(notebook.source_count)} · {formatRelativeTime(
-                      notebook.updated_at
-                    )}
+                {:else}
+                  {@const accentCls = notebookColorClass(result.notebook.id)}
+                  <div
+                    class={[
+                      'size-8 shrink-0 rounded-[7px] flex items-center justify-center',
+                      accentCls
+                    ].join(' ')}
+                    aria-hidden="true"
+                  >
+                    <BookOpen class="size-4" />
                   </div>
-                </div>
+
+                  <div class="min-w-0 flex-1">
+                    <div class="truncate text-[14px] font-bold leading-snug">
+                      {result.notebook.title}
+                    </div>
+                    <div class="truncate text-[12px] text-muted-foreground leading-snug mt-0.5">
+                      {formatSourceCount(result.notebook.source_count)} · {formatRelativeTime(
+                        result.notebook.updated_at
+                      )}
+                    </div>
+                  </div>
+                {/if}
 
                 <ChevronRight
                   class={[

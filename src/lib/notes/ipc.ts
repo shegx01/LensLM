@@ -37,3 +37,15 @@ export async function deleteNote(noteId: string): Promise<void> {
   if (!isTauri()) return;
   return invoke<void>('delete_note', { noteId });
 }
+
+/** Edits a note's content in place; returns the updated row (bumped `updated_at`). */
+export async function updateNote(noteId: string, content: string): Promise<Note> {
+  if (!isTauri()) throw new Error('updateNote: not running under Tauri');
+  return invoke<Note>('update_note', { noteId, content });
+}
+
+/** Pins/unpins a note; returns the updated row. */
+export async function setNotePinned(noteId: string, pinned: boolean): Promise<Note> {
+  if (!isTauri()) throw new Error('setNotePinned: not running under Tauri');
+  return invoke<Note>('set_note_pinned', { noteId, pinned });
+}

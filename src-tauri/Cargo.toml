@@ -36,6 +36,10 @@ tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
 # Native file picker for the onboarding "Add sources" step (Tauri 2.x plugin).
 tauri-plugin-dialog = "2"
+# Write exported notes to the path chosen via the save-file dialog (issue #25).
+tauri-plugin-fs = "2"
+# Copy exported notes text to the OS clipboard (issue #25).
+tauri-plugin-clipboard-manager = "2"
 # Persist the main window's size/position across restarts (Tauri 2.x plugin).
 tauri-plugin-window-state = "2"
 # `#[async_trait]` to implement lens-core's `JsRenderer` trait (issue #78).

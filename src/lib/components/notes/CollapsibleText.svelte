@@ -12,9 +12,12 @@
     html: string;
     lineClamp?: number;
     class?: string;
+    /** Post-render hook over the body element (e.g. mermaid hydration). Runs after
+     *  each render; must be idempotent/restore-safe. */
+    onrender?: (body: HTMLElement) => void;
   }
 
-  let { html, lineClamp = 4, class: className = '' }: Props = $props();
+  let { html, lineClamp = 4, class: className = '', onrender }: Props = $props();
 
   let expanded = $state(false);
   let overflows = $state(false);
@@ -26,6 +29,12 @@
     // scrollHeight exceeds clientHeight only while the clamp is truncating.
     overflows = el.scrollHeight - el.clientHeight > 1;
   }
+
+  // Run the post-render hook (e.g. mermaid hydration) after each {@html} render.
+  $effect(() => {
+    void html;
+    if (bodyRef && onrender) onrender(bodyRef);
+  });
 
   // Re-measure when content or the (collapsed) layout changes. While expanded we
   // skip measuring — the toggle stays visible so the user can collapse again.

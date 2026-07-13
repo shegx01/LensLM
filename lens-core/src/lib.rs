@@ -771,6 +771,31 @@ impl LensEngine {
             .await
     }
 
+    /// Updates a note's content (#25). Rejects empty/whitespace-only content
+    /// (mirrors `save_manual_note`; this wrapper is the authoritative server-side
+    /// guard — the IPC command must route through it, never the repo directly);
+    /// grounding columns and `created_at` are preserved, `updated_at` bumped.
+    #[tracing::instrument(skip_all)]
+    pub async fn update_note(&self, note_id: &str, content: &str) -> Result<Note, LensError> {
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            return Err(LensError::Validation("note content is empty".into()));
+        }
+        let pool = self.pool().await;
+        crate::notes::NotesRepo::new(&pool)
+            .update_note(note_id, trimmed)
+            .await
+    }
+
+    /// Sets a note's pinned flag (#25, pin-to-top).
+    #[tracing::instrument(skip_all)]
+    pub async fn set_note_pinned(&self, note_id: &str, pinned: bool) -> Result<Note, LensError> {
+        let pool = self.pool().await;
+        crate::notes::NotesRepo::new(&pool)
+            .set_pinned(note_id, pinned)
+            .await
+    }
+
     /// Deletes a note by id (#24, unsave path).
     #[tracing::instrument(skip_all)]
     pub async fn delete_note(&self, note_id: &str) -> Result<(), LensError> {

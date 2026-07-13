@@ -3,5 +3,12 @@
   "identifier": "default",
   "description": "Default capability set granted to the main LensLM window.",
   "windows": ["main"],
-  "permissions": ["core:default", "dialog:allow-open", "core:window:allow-start-dragging"]
+  "permissions": [
+    "core:default",
+    "dialog:allow-open",
+    "core:window:allow-start-dragging",
+    "dialog:allow-save",
+    "fs:allow-write-text-file",
+    "clipboard-manager:allow-write-text"
+  ]
 }

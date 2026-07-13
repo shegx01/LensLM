@@ -5,7 +5,7 @@ import { render, screen, fireEvent } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Note } from '$lib/notes/types.js';
 
-const { mockNotesStore, addManualNote, remove } = vi.hoisted(() => {
+const { mockNotesStore, addManualNote, remove, setPinned, editNote } = vi.hoisted(() => {
   let _groups: Array<{ sourceId: string | null; sourceTitle: string | null; notes: Note[] }> = [];
   let _manual: Note[] = [];
   const mockNotesStore = {
@@ -18,14 +18,22 @@ const { mockNotesStore, addManualNote, remove } = vi.hoisted(() => {
       _manual = m;
     }
   };
-  return { mockNotesStore, addManualNote: vi.fn(), remove: vi.fn() };
+  return {
+    mockNotesStore,
+    addManualNote: vi.fn(),
+    remove: vi.fn(),
+    setPinned: vi.fn(),
+    editNote: vi.fn()
+  };
 });
 
 vi.mock('$lib/notes/notes-state.svelte.js', () => ({
   notesStore: mockNotesStore,
   hydrate: vi.fn().mockResolvedValue(undefined),
   addManualNote,
-  remove
+  remove,
+  setPinned,
+  editNote
 }));
 
 import NotesPane from './NotesPane.svelte';
@@ -41,6 +49,7 @@ function makeNote(overrides?: Partial<Note>): Note {
     source_message_id: 'msg-001',
     created_at: '2026-07-12T00:00:00Z',
     updated_at: '2026-07-12T00:00:00Z',
+    pinned: false,
     ...overrides
   };
 }

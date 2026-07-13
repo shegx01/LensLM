@@ -705,3 +705,63 @@
     @apply bg-background text-foreground font-sans;
   }
 }
+
+/* -------------------------------------------------------------------------
+ * Rich-content rendering — KaTeX math + mermaid diagrams (chat + notes).
+ * KaTeX ships its own glyph CSS (bundled via render-markdown.ts); we only add
+ * layout containment. Diagram/math color follows the mermaid theme config +
+ * tokens — no hard-coded colors here.
+ * ------------------------------------------------------------------------- */
+.katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.2em 0;
+}
+.mermaid-figure {
+  display: flex;
+  justify-content: center;
+  margin: 0.75em 0;
+  overflow-x: auto;
+}
+.mermaid-figure svg {
+  max-width: 100%;
+  height: auto;
+}
+
+/* Inline citation chips (injected post-render by enhanceCitations) — compact,
+ * superscript numbered pills placed at the exact cited spot. Shared by chat
+ * (.chat-markdown) and notes (.note-preview); token-only, light/dark/accent. */
+.citation-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.1em;
+  height: 1.1em;
+  padding: 0 0.3em;
+  margin-left: 0.15em;
+  border: 0;
+  border-radius: 0.3rem;
+  background: var(--secondary);
+  color: var(--secondary-foreground);
+  font-size: 0.7em;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  vertical-align: super;
+  cursor: pointer;
+  transition:
+    background 0.12s ease,
+    color 0.12s ease;
+}
+.citation-chip:hover {
+  background: var(--primary);
+  color: var(--primary-foreground);
+}
+.citation-chip:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--ring);
+}
+.citation-chip--stale {
+  cursor: default;
+  opacity: 0.55;
+}
