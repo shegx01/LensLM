@@ -42,6 +42,10 @@ fn main() {
     tauri::Builder::default()
         // Native file picker for the onboarding "Add sources" step.
         .plugin(tauri_plugin_dialog::init())
+        // Write exported notes to the path chosen via the save-file dialog (issue #25).
+        .plugin(tauri_plugin_fs::init())
+        // Copy exported notes text to the OS clipboard (issue #25).
+        .plugin(tauri_plugin_clipboard_manager::init())
         // Persist + restore the main window's size/position across restarts so a
         // resize survives relaunch. First launch uses the tauri.conf.json default;
         // thereafter the saved geometry supersedes it. Auto-saves on exit.
