@@ -4,6 +4,7 @@
 <script lang="ts">
   import { Badge } from '$lib/components/ui/badge/index.js';
   import { renderMarkdown } from '$lib/chat/render-markdown.js';
+  import { hydrateMermaid } from '$lib/chat/mermaid.js';
   import CollapsibleText from './CollapsibleText.svelte';
   import NoteCard from './NoteCard.svelte';
   import type { Note } from '$lib/notes/types.js';
@@ -27,6 +28,6 @@
     {/if}
   {/snippet}
   {#snippet body()}
-    <CollapsibleText {html} />
+    <CollapsibleText {html} onrender={(body) => void hydrateMermaid(body)} />
   {/snippet}
 </NoteCard>

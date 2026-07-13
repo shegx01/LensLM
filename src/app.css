@@ -705,3 +705,25 @@
     @apply bg-background text-foreground font-sans;
   }
 }
+
+/* -------------------------------------------------------------------------
+ * Rich-content rendering — KaTeX math + mermaid diagrams (chat + notes).
+ * KaTeX ships its own glyph CSS (bundled via render-markdown.ts); we only add
+ * layout containment. Diagram/math color follows the mermaid theme config +
+ * tokens — no hard-coded colors here.
+ * ------------------------------------------------------------------------- */
+.katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.2em 0;
+}
+.mermaid-figure {
+  display: flex;
+  justify-content: center;
+  margin: 0.75em 0;
+  overflow-x: auto;
+}
+.mermaid-figure svg {
+  max-width: 100%;
+  height: auto;
+}

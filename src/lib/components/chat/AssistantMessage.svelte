@@ -10,6 +10,7 @@
   import { renderMarkdown } from '$lib/chat/render-markdown.js';
   import { enhanceCodeBlocks } from '$lib/chat/code-copy.js';
   import { enhanceCitations, type CitationTarget } from '$lib/chat/citation-inline.js';
+  import { hydrateMermaid } from '$lib/chat/mermaid.js';
   import { messageCitations } from '$lib/chat/chat-state.svelte.js';
   import { sourcesStore } from '$lib/sources/sources-state.svelte.js';
   import { notesStore, toggleSave } from '$lib/notes/notes-state.svelte.js';
@@ -84,6 +85,15 @@
     const targets = citationTargets;
     if (!containerEl || targets.size === 0) return;
     return enhanceCitations(containerEl, (n) => targets.get(n) ?? null);
+  });
+
+  $effect(() => {
+    // Async two-pass mermaid: upgrade supported ```mermaid fences to sanitized SVG
+    // after each render. Only on the highlighted (final) path — streaming bubbles
+    // keep the raw fence so the growing buffer never hits the layout engine.
+    void html;
+    if (!highlightCode || !containerEl) return;
+    void hydrateMermaid(containerEl);
   });
 
   function prevVersion(): void {

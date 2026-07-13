@@ -91,4 +91,45 @@ describe('renderMarkdown', () => {
     expect(() => renderMarkdown('```js\n```')).not.toThrow();
     expect(() => renderMarkdown('```js\n```', { highlight: false })).not.toThrow();
   });
+
+  // KaTeX (C6, AC16): math renders only on the final (highlight) path, mirroring the
+  // hljs/plain split; `\$` stays a literal dollar. Sanitization keeps KaTeX's inline
+  // `style`; the no-exec proof lives in KeyInsightCard.no-exec.test.ts (jsdom).
+  it('renders inline $…$ math via KaTeX', () => {
+    const html = renderMarkdown('Euler $e^{i\\pi}+1=0$ done');
+    expect(html).toContain('class="katex"');
+  });
+
+  it('renders block $$…$$ math via KaTeX (display mode)', () => {
+    const html = renderMarkdown('$$x^2 + y^2 = z^2$$');
+    expect(html).toContain('katex-display');
+  });
+
+  it('renders LaTeX \\[…\\] block and \\(…\\) inline delimiters via KaTeX', () => {
+    expect(renderMarkdown('\\[x^2\\]')).toContain('katex-display');
+    expect(renderMarkdown('here \\(a+b\\) done')).toContain('class="katex"');
+  });
+
+  it('keeps an escaped \\$ as a literal dollar sign, not math', () => {
+    const html = renderMarkdown('the cost is \\$5 today');
+    expect(html).not.toContain('katex');
+    expect(html).toContain('$5');
+  });
+
+  it('does not render math on the streaming (plain) path', () => {
+    const html = renderMarkdown('inline $a+b$ here', { highlight: false });
+    expect(html).not.toContain('katex');
+    expect(html).toContain('$a+b$');
+  });
+
+  it('preserves KaTeX inline style but still strips a non-math inline style', () => {
+    const math = renderMarkdown('$x^2$');
+    expect(math).toMatch(/class="katex"/);
+    // KaTeX layout struts carry inline style — it must survive the sanitize pass.
+    expect(math).toMatch(/style="[^"]*height/);
+    // A hand-written non-KaTeX inline style is still stripped (style stays forbidden
+    // globally; the hook re-keeps it only on .katex nodes).
+    const plain = renderMarkdown('<p style="color:red">hi</p>');
+    expect(plain).not.toMatch(/style=/);
+  });
 });

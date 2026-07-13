@@ -15,6 +15,7 @@
   import { Button } from '$lib/components/ui/button/index.js';
   import { renderMarkdown } from '$lib/chat/render-markdown.js';
   import { enhanceCitations, type CitationTarget } from '$lib/chat/citation-inline.js';
+  import { hydrateMermaid } from '$lib/chat/mermaid.js';
   import { parseCitations } from '$lib/chat/citations.js';
   import { sourcesStore } from '$lib/sources/sources-state.svelte.js';
   import { editNote } from '$lib/notes/notes-state.svelte.js';
@@ -109,6 +110,12 @@
     const targets = citationTargets;
     if (!previewEl || targets.size === 0) return;
     return enhanceCitations(previewEl, (n) => targets.get(n) ?? null);
+  });
+
+  // Upgrade supported ```mermaid fences in the live preview (idempotent).
+  $effect(() => {
+    void previewHtml;
+    if (previewEl) void hydrateMermaid(previewEl);
   });
 
   async function save(): Promise<void> {
