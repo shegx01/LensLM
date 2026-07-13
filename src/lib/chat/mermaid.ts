@@ -1,30 +1,18 @@
 // Async, two-pass mermaid hydration. `renderMarkdown` stays synchronous and emits
 // ```mermaid fences as ordinary highlighted code blocks; this pass upgrades the
 // SUPPORTED subset (flowchart + sequence) into sanitized inline SVG, and leaves
-// every other fence as its already-highlighted raw code (never blank).
-//
-// Security posture (never-execute-model-output): mermaid runs in
-// `securityLevel:'strict'` (no HTML labels, no click handlers) with
-// `startOnLoad:false`, and its SVG output is re-sanitized through a DEDICATED
-// DOMPurify profile that drops `<script>`/`<foreignObject>` and any `on*`
-// handler while still blocking `javascript:` URIs — so an SVG synthesized from a
-// malicious diagram source is inert (proven by the no-exec test). mermaid itself
-// is lazy-imported ONLY when a mermaid fence is present, keeping it off the boot
-// bundle and off the synchronous render path.
-//
-// Re-runnable / restore-safe like enhanceCitations: each call re-reads the
-// original source from the (preserved) fence, so re-render/theme-change is
-// idempotent and a previously-hydrated block never double-renders.
+// every other fence as its already-highlighted raw code (never blank). Inert by
+// construction — see `sanitizeSvg` for the security posture. Re-runnable /
+// restore-safe like enhanceCitations: each call re-reads the original source from
+// the (preserved) fence, so re-render/theme-change is idempotent.
 
 import DOMPurify from 'dompurify';
 
-// The eval-free subset we commit to rendering. `mermaid.parse` reports these
-// `diagramType` values; anything else (or a parse failure) keeps the raw fence.
+// Supported subset, in two vocabularies that MUST stay in sync (keep both edited
+// together): `SUPPORTED_KEYWORDS` is the cheap leading-keyword pre-filter run
+// before mermaid; `SUPPORTED_TYPES` is the `mermaid.parse` `diagramType` gate run
+// after. Anything not in both keeps its raw fence.
 const SUPPORTED_TYPES: ReadonlySet<string> = new Set(['flowchart', 'flowchart-v2', 'sequence']);
-
-// Leading keyword → diagram family, checked BEFORE invoking mermaid (Interpretation
-// B: allowlist gate first, runtime try/catch as the catch-all). Cheap pre-filter so
-// unsupported types never reach the layout engine.
 const SUPPORTED_KEYWORDS = /^\s*(?:flowchart|graph|sequenceDiagram)\b/;
 
 let mermaidReady: Promise<typeof import('mermaid').default> | null = null;
@@ -43,16 +31,22 @@ async function loadMermaid(theme: 'default' | 'dark'): Promise<typeof import('me
   return mermaid;
 }
 
-// The SVG profile already drops every `on*` event handler, `<script>` and
-// `javascript:` URIs; `foreignObject` is forbidden explicitly so no HTML (and thus
-// no img/onerror) can ride inside the SVG. Verified inert by the no-exec test.
+// Never-execute-model-output posture: mermaid runs `securityLevel:'strict'`
+// (no HTML labels / click handlers) and its SVG is re-sanitized here — `<script>`,
+// `<foreignObject>` (no HTML/img-onerror ride-along), `on*` handlers and
+// `javascript:` URIs are all dropped, so an SVG from a malicious diagram source is
+// inert (proven by mermaid.no-exec.test). `ALLOWED_URI_REGEXP` allows ONLY
+// same-document refs — a bare `#id` fragment or the functional `url(#id)` form that
+// flowchart arrowheads/edge markers and gradient/clip fills depend on — while still
+// rejecting external `http(s):`/`data:`/`mailto:` URIs so no diagram can fetch or
+// exfil (defense-in-depth beyond CSP img-src).
+const SAME_DOCUMENT_URI = /^(?:#|url\(['"]?#)/;
+
 function sanitizeSvg(svg: string): string {
   return DOMPurify.sanitize(svg, {
     USE_PROFILES: { svg: true, svgFilters: true },
-    // flowchart/sequence output never needs external-image elements or remote URIs;
-    // forbid them so exfil beacons don't rely on CSP img-src alone (defense-in-depth).
     FORBID_TAGS: ['script', 'foreignObject', 'image', 'feImage'],
-    ALLOWED_URI_REGEXP: /^#/
+    ALLOWED_URI_REGEXP: SAME_DOCUMENT_URI
   });
 }
 
@@ -101,8 +95,7 @@ export async function hydrateMermaid(container: HTMLElement): Promise<void> {
 
       const figure = document.createElement('div');
       figure.className = 'mermaid-figure';
-      // Sanitized SVG string from the dedicated profile above — inert, no <script>,
-      // no foreignObject, no on* handlers (proven by mermaid no-exec test).
+      // `clean` is inert per sanitizeSvg (see its doc); safe for innerHTML.
       figure.innerHTML = clean;
       pre.replaceWith(figure);
     } catch {

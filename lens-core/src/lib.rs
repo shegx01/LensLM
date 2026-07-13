@@ -772,7 +772,8 @@ impl LensEngine {
     }
 
     /// Updates a note's content (#25). Rejects empty/whitespace-only content
-    /// (mirrors `save_manual_note` — the single empty-edit enforcement point);
+    /// (mirrors `save_manual_note`; this wrapper is the authoritative server-side
+    /// guard — the IPC command must route through it, never the repo directly);
     /// grounding columns and `created_at` are preserved, `updated_at` bumped.
     #[tracing::instrument(skip_all)]
     pub async fn update_note(&self, note_id: &str, content: &str) -> Result<Note, LensError> {

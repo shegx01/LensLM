@@ -10,7 +10,7 @@ import { notebookStore } from '$lib/notebooks/notebooks-state.svelte.js';
 import { notesStore } from './notes-state.svelte.js';
 import type { Note } from './types.js';
 
-/** One line per note: its content, followed by an italic source-title attribution if present. */
+/** A note's content, followed by an italic source-title attribution line if present. */
 function formatNote(note: Note): string {
   const body = note.content.trim();
   if (note.source_title) return `${body}\n\n*Source: ${note.source_title}*`;

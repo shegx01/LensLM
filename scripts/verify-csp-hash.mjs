@@ -7,6 +7,12 @@
 //
 // Run via: node scripts/verify-csp-hash.mjs
 // Or:      bun run verify:csp
+//
+// CSP-sensitive deps (documented here since package.json/JSON can't carry a
+// comment): `mermaid` and `katex` are exact-pinned (no `^`) in package.json.
+// A minor bump could change mermaid's layout backend and reintroduce an
+// eval/worker path that violates the strict `script-src` (no unsafe-eval).
+// Do NOT re-add carets without re-verifying rendering under the shipped CSP.
 
 import { readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';

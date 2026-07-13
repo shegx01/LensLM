@@ -22,6 +22,20 @@ const HOSTILE_SVG =
   '<foreignObject><body xmlns="http://www.w3.org/1999/xhtml">' +
   '<img src="x" onerror="window.__onExec && window.__onExec()"></body></foreignObject>' +
   '<a xlink:href="javascript:window.__onExec && window.__onExec()">link</a>' +
+  '<image href="http://evil.example/beacon.png"/>' +
+  '<path fill="url(http://evil.example/beacon)"/>' +
+  '</svg>';
+
+// A realistic flowchart SVG: an arrowhead <marker> in <defs>, a <path> that
+// references it via marker-end="url(#…)", plus gradient/clip internal refs. These
+// same-document refs are what mermaid arrowheads/edges depend on and MUST survive.
+const FLOWCHART_SVG =
+  '<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100">' +
+  '<defs><marker id="arrowhead" markerWidth="10" markerHeight="7">' +
+  '<path d="M0,0 L10,3 L0,7 z"/></marker>' +
+  '<linearGradient id="grad"><stop offset="0%" stop-color="red"/></linearGradient>' +
+  '<clipPath id="clip"><rect width="50" height="50"/></clipPath></defs>' +
+  '<path d="M10,10 L90,90" marker-end="url(#arrowhead)" fill="url(#grad)" clip-path="url(#clip)"/>' +
   '</svg>';
 
 const parse = vi.fn(async (src: string) => {
@@ -68,7 +82,11 @@ describe('hydrateMermaid — no-exec + fallback', () => {
     // The hostile parts of the mocked mermaid SVG are all stripped by the SVG profile.
     expect(fig?.querySelector('script')).toBeNull();
     expect(fig?.querySelector('foreignObject')).toBeNull();
+    expect(fig?.querySelector('image')).toBeNull();
     expect(fig?.innerHTML).not.toMatch(/javascript:/i);
+    // No external fetch/exfil URI survives (http(s)/data/mailto blocked; only
+    // same-document `#`/`url(#…)` refs are allowed — see FLOWCHART test below).
+    expect(fig?.innerHTML).not.toMatch(/https?:\/\/evil/i);
     for (const node of Array.from(fig?.querySelectorAll('*') ?? [])) {
       for (const attr of Array.from(node.attributes)) {
         expect(attr.name.toLowerCase().startsWith('on')).toBe(false);
@@ -80,6 +98,23 @@ describe('hydrateMermaid — no-exec + fallback', () => {
       node.dispatchEvent(new Event('load'));
     }
     expect(onExec).not.toHaveBeenCalled();
+  });
+
+  it('keeps same-document marker/gradient/clip refs so flowchart arrowheads render', async () => {
+    render.mockResolvedValueOnce({ svg: FLOWCHART_SVG, diagramType: 'flowchart' });
+    const el = mount('```mermaid\nflowchart TD\n  A --> B\n```');
+
+    await hydrateMermaid(el);
+
+    const fig = el.querySelector('.mermaid-figure');
+    expect(fig).not.toBeNull();
+    // The <defs> arrowhead marker and its url(#…) references survive sanitization —
+    // stripping these would produce arrowless, uncolored flowcharts.
+    expect(fig?.querySelector('marker#arrowhead')).not.toBeNull();
+    const path = fig?.querySelector('path[marker-end]');
+    expect(path?.getAttribute('marker-end')).toBe('url(#arrowhead)');
+    expect(path?.getAttribute('fill')).toBe('url(#grad)');
+    expect(path?.getAttribute('clip-path')).toBe('url(#clip)');
   });
 
   it('AC14: an unsupported diagram type (pie) keeps the raw highlighted code fence', async () => {

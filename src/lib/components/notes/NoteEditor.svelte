@@ -160,33 +160,3 @@
     </Button>
   </div>
 </div>
-
-<style>
-  :global(.note-preview .citation-chip) {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    min-width: 1.1em;
-    height: 1.1em;
-    padding: 0 0.3em;
-    margin-left: 0.15em;
-    border: 0;
-    border-radius: 0.3rem;
-    background: var(--secondary);
-    color: var(--secondary-foreground);
-    font-size: 0.7em;
-    font-weight: 600;
-    font-variant-numeric: tabular-nums;
-    line-height: 1;
-    vertical-align: super;
-    cursor: pointer;
-  }
-  :global(.note-preview .citation-chip:hover) {
-    background: var(--primary);
-    color: var(--primary-foreground);
-  }
-  :global(.note-preview .citation-chip--stale) {
-    cursor: default;
-    opacity: 0.55;
-  }
-</style>

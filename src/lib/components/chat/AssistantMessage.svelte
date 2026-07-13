@@ -88,9 +88,8 @@
   });
 
   $effect(() => {
-    // Async two-pass mermaid: upgrade supported ```mermaid fences to sanitized SVG
-    // after each render. Only on the highlighted (final) path — streaming bubbles
-    // keep the raw fence so the growing buffer never hits the layout engine.
+    // Final path only — streaming bubbles keep the raw fence so the growing
+    // buffer never reaches the layout engine.
     void html;
     if (!highlightCode || !containerEl) return;
     void hydrateMermaid(containerEl);
@@ -313,40 +312,6 @@
   :global(.chat-markdown strong) {
     font-weight: 600;
   }
-  /* Inline citation chips (injected post-render by enhanceCitations) — compact,
-     superscript numbered pills placed at the exact cited spot. Token-only. */
-  :global(.chat-markdown .citation-chip) {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    min-width: 1.1em;
-    height: 1.1em;
-    padding: 0 0.3em;
-    margin-left: 0.15em;
-    border: 0;
-    border-radius: 0.3rem;
-    background: var(--secondary);
-    color: var(--secondary-foreground);
-    font-size: 0.7em;
-    font-weight: 600;
-    font-variant-numeric: tabular-nums;
-    line-height: 1;
-    vertical-align: super;
-    cursor: pointer;
-    transition:
-      background 0.12s ease,
-      color 0.12s ease;
-  }
-  :global(.chat-markdown .citation-chip:hover) {
-    background: var(--primary);
-    color: var(--primary-foreground);
-  }
-  :global(.chat-markdown .citation-chip:focus-visible) {
-    outline: none;
-    box-shadow: 0 0 0 2px var(--ring);
-  }
-  :global(.chat-markdown .citation-chip--stale) {
-    cursor: default;
-    opacity: 0.55;
-  }
+  /* Inline citation chips are styled globally in app.css (.citation-chip) —
+     shared with the notes preview. */
 </style>
