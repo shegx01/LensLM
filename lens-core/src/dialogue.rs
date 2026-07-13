@@ -2,9 +2,6 @@
 //! audio-overview pipeline. Turns a notebook's selected+live sources into a
 //! validated, typed two-speaker (Host/Guest) [`DialogueScript`] via one
 //! `tiered_search` overview retrieval and a one-shot [`LlmProvider::generate`].
-//! Reliability comes from a `json` hint, a trailing-comma pre-clean, array
-//! salvage-parse, exactly one fix-oriented repair, then a [`LensError`] fallback;
-//! cancellation from a `tokio::select!` race per model call.
 //!
 //! [`generate_dialogue`] is a pure free fn over an owned [`DialogueCtx`]; the
 //! fallible ctx-gathering lives in `LensEngine::generate_dialogue` (lib.rs). No
@@ -67,8 +64,7 @@ pub enum Speaker {
     Guest,
 }
 
-/// Per-turn delivery hint. Unvalidated: an unknown wire value deserializes to
-/// `None` via `Turn::emotion`'s `#[serde(default)]`, never rejecting a script.
+/// Per-turn delivery hint (Kokoro ignores it; Orpheus #161 renders it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Emotion {
@@ -297,7 +293,7 @@ fn extract_json_array(text: &str) -> Option<&str> {
             b'}' => brace_depth = brace_depth.saturating_sub(1),
             b'[' => bracket_depth += 1,
             b']' => {
-                bracket_depth -= 1;
+                bracket_depth = bracket_depth.saturating_sub(1);
                 if bracket_depth == 0 && brace_depth == 0 {
                     return Some(&text[start..=i]);
                 }
@@ -313,8 +309,13 @@ fn extract_json_array(text: &str) -> Option<&str> {
 /// object form → map serde errors to [`LensError::Parse`]. Never panics.
 fn parse_dialogue(text: &str) -> Result<DialogueScript, LensError> {
     let cleaned = preclean(text);
-    if let Some(arr) = extract_json_array(&cleaned) {
-        let turns: Vec<Turn> = serde_json::from_str(arr)?;
+    // The array form is tried first but must NOT short-circuit on failure: a
+    // leading non-turns array (e.g. a `meta` list before `turns`) is bracket-
+    // balanced and extracted, yet fails to parse as `Vec<Turn>` — that failure has
+    // to fall through to the object-wrapper form rather than propagate via `?`.
+    if let Some(arr) = extract_json_array(&cleaned)
+        && let Ok(turns) = serde_json::from_str::<Vec<Turn>>(arr)
+    {
         return Ok(DialogueScript { turns });
     }
     if let Some(obj) = crate::enrichment::meta::extract_json_object(&cleaned) {
@@ -370,6 +371,20 @@ fn validate_script(
     Ok(())
 }
 
+/// The shared non-content `LlmRequest` fields for both the initial and repair
+/// calls, so temperature/json/thinking can't drift between the two sites.
+fn base_request(system: String, prompt: String, preset: &LengthPreset) -> LlmRequest {
+    LlmRequest {
+        system: Some(system),
+        prompt,
+        max_tokens: preset.max_tokens,
+        temperature: DIALOGUE_TEMPERATURE,
+        json: true,
+        thinking: false,
+        reasoning_effort: None,
+    }
+}
+
 /// Builds the fix-oriented repair request from the prior malformed output and the
 /// specific failure reason. The instruction differs for a parse failure vs a
 /// validation failure; a single repair covers both.
@@ -395,15 +410,11 @@ fn build_repair_request(prior: &str, failure: &LensError, preset: &LengthPreset)
          {{\"speaker\": \"host\"|\"guest\", \"text\": string, \"emotion\": string \
          (optional), \"source_ids\": [string]}}."
     );
-    LlmRequest {
-        system: Some(system),
-        prompt: "Return the corrected JSON array of turns now.".to_string(),
-        max_tokens: preset.max_tokens,
-        temperature: DIALOGUE_TEMPERATURE,
-        json: true,
-        thinking: false,
-        reasoning_effort: None,
-    }
+    base_request(
+        system,
+        "Return the corrected JSON array of turns now.".to_string(),
+        preset,
+    )
 }
 
 /// The grounded dialogue-script orchestrator. Pure over the owned [`DialogueCtx`] so
@@ -470,15 +481,10 @@ pub async fn generate_dialogue(
     }
 
     let (system, prompt) = build_dialogue_prompt(&out.units, &titles, &preset);
-    let req = LlmRequest {
-        system: Some(system),
-        prompt,
-        max_tokens: preset.max_tokens,
-        temperature: DIALOGUE_TEMPERATURE,
-        json: true,
-        thinking: false,
-        reasoning_effort: None,
-    };
+    // tiered_search budgets input against the fixed RESERVED_OUTPUT=2048, so Long
+    // (8192) can overcommit input on small-context models; salvage-parse + one
+    // repair degrade this safely. Re-budgeting the shared router is out of #26 scope.
+    let req = base_request(system, prompt, &preset);
 
     on_phase(DialoguePhase::Generating);
 
@@ -641,6 +647,32 @@ mod tests {
     }
 
     #[test]
+    fn extract_json_array_stray_close_bracket_never_panics() {
+        // A stray unquoted `]` while bracket_depth==0 and brace_depth>0 must not
+        // underflow bracket_depth's saturating_sub (regression: previously an
+        // unconditional `-= 1` panicked here with "attempt to subtract with
+        // overflow"). The walk only balances brackets/braces — it is not a JSON
+        // validator — so a syntactically-invalid-but-bracket-balanced input may
+        // still return `Some`; the downstream `serde_json::from_str` in
+        // `parse_dialogue` is what rejects it (falling to repair). The contract
+        // under test here is solely: never panic.
+        assert!(extract_json_array("[{]]").is_none());
+        let _ = extract_json_array(r#"[{"a": ]] }]"#); // must not panic
+    }
+
+    #[test]
+    fn parse_dialogue_stray_close_bracket_input_errors_without_panicking() {
+        // End-to-end: a bracket-balanced-but-invalid-JSON input must surface as a
+        // clean Parse error, never a panic, regardless of how extract_json_array's
+        // pre-filter resolves it.
+        assert!(matches!(parse_dialogue("[{]]"), Err(LensError::Parse(_))));
+        assert!(matches!(
+            parse_dialogue(r#"[{"a": ]] }]"#),
+            Err(LensError::Parse(_))
+        ));
+    }
+
+    #[test]
     fn preclean_strips_trailing_commas_outside_strings() {
         let input = r#"[{"a":1,},]"#;
         assert_eq!(preclean(input), r#"[{"a":1}]"#);
@@ -662,10 +694,16 @@ mod tests {
 
     #[test]
     fn parse_dialogue_recovers_object_wrapper() {
-        let text = r#"{"turns":[{"speaker":"guest","text":"yo"}]}"#;
+        // A leading non-turns array (`meta`) means extract_json_array's bare-array
+        // path grabs `[1,2]` first, which fails to parse as `Vec<Turn>` — so this
+        // fixture genuinely exercises the `extract_json_object` fallback branch,
+        // unlike a bare `{"turns":[...]}` (whose `[` is the turns array itself and
+        // never reaches the object branch).
+        let text = r#"{"meta":[1,2],"turns":[{"speaker":"host","text":"hi"},{"speaker":"guest","text":"yo"}]}"#;
         let script = parse_dialogue(text).unwrap();
-        assert_eq!(script.turns.len(), 1);
-        assert_eq!(script.turns[0].speaker, Speaker::Guest);
+        assert_eq!(script.turns.len(), 2);
+        assert_eq!(script.turns[0].speaker, Speaker::Host);
+        assert_eq!(script.turns[1].speaker, Speaker::Guest);
     }
 
     #[test]

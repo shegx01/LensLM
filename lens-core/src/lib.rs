@@ -1413,9 +1413,10 @@ impl LensEngine {
         crate::dialogue::generate_dialogue(ctx, cancel, on_phase).await
     }
 
-    /// The selected + live (not-trashed) source ids for a notebook, using the exact
-    /// predicate `router::resolve_selected_sources` and BM25 share so every path
-    /// agrees on the corpus scope. Backs the dialogue validator's grounding set (#26).
+    /// The selected + live (not-trashed) source ids for a notebook. Deliberately
+    /// duplicates `router::resolve_selected_sources`'s corpus-scope predicate (that
+    /// fn is private) — keep the two in sync. Backs the dialogue validator's
+    /// grounding set (#26).
     async fn selected_live_source_ids(
         &self,
         notebook_id: &str,
