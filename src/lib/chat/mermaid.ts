@@ -49,8 +49,10 @@ async function loadMermaid(theme: 'default' | 'dark'): Promise<typeof import('me
 function sanitizeSvg(svg: string): string {
   return DOMPurify.sanitize(svg, {
     USE_PROFILES: { svg: true, svgFilters: true },
-    FORBID_TAGS: ['script', 'foreignObject'],
-    ALLOWED_URI_REGEXP: /^(?:https?:|mailto:|#)/i
+    // flowchart/sequence output never needs external-image elements or remote URIs;
+    // forbid them so exfil beacons don't rely on CSP img-src alone (defense-in-depth).
+    FORBID_TAGS: ['script', 'foreignObject', 'image', 'feImage'],
+    ALLOWED_URI_REGEXP: /^#/
   });
 }
 

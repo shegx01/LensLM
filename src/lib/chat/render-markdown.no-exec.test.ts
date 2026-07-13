@@ -53,3 +53,29 @@ describe('renderMarkdown math — no-exec sanitization (AC17)', () => {
     expect(onExec).not.toHaveBeenCalled();
   });
 });
+
+describe('renderMarkdown — forged class="katex" cannot smuggle style (no clickjacking overlay)', () => {
+  it('strips a full-viewport position:fixed overlay style even under a forged katex class', () => {
+    const el = mount(
+      '<span class="katex"><span style="position:fixed;top:0;left:0;width:100vw;height:100vh;z-index:9999;background:red">x</span></span>'
+    );
+    for (const node of Array.from(el.querySelectorAll('[style]'))) {
+      const style = node.getAttribute('style') ?? '';
+      expect(style).not.toMatch(/position\s*:\s*fixed/i);
+      expect(style).not.toMatch(/100v[wh]/i);
+    }
+  });
+
+  it('strips style on a forged top-level class="katex" element', () => {
+    const el = mount('<div class="katex" style="position:fixed;inset:0">overlay</div>');
+    const div = el.querySelector('div.katex');
+    expect(div?.getAttribute('style')).toBeNull();
+  });
+
+  it('keeps a genuine KaTeX-shaped length style (allow-list positive case)', () => {
+    const el = mount(
+      '<span class="katex"><span style="height:0.8em;vertical-align:-0.2em">x</span></span>'
+    );
+    expect(el.querySelector('.katex [style]')).not.toBeNull();
+  });
+});

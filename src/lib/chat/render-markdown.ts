@@ -89,24 +89,50 @@ highlightMarked.use({
 const plainMarked = new Marked();
 plainMarked.setOptions({ breaks: true, gfm: true });
 
-// KaTeX lays out glyphs with inline `style` (e.g. height/margin on class-bearing
-// spans), so `style` cannot be globally stripped for math output. Under the app
-// CSP (no `unsafe-inline` for scripts; no eval/WASM) an inline `style` attribute
-// cannot execute JS — it is pure presentation — so allowing it ONLY on KaTeX's
-// own class-bearing elements is safe. This hook permits `style` on `.katex*`
-// nodes and strips it everywhere else, while event handlers and `javascript:`
-// URIs stay forbidden by the sanitize config below (proven by the no-exec tests).
+// KaTeX lays out glyphs with inline `style` (lengths + display/position:relative on
+// its own spans), so `style` cannot be globally stripped for math output. We must NOT
+// decide by class — `marked` passes model/user-authored HTML through, so a forged
+// `class="katex"` would otherwise smuggle an arbitrary `style` (e.g. a full-viewport
+// `position:fixed` clickjacking overlay). Instead we keep `style` only when EVERY
+// declaration is a safe presentational one KaTeX emits (em/px/%/pt/rem lengths,
+// `display`, `vertical-align`, `position:relative`). Viewport units, `position:fixed`,
+// and any `url(...)`/function are rejected regardless of class. `\color` math loses
+// its color (graceful degradation) — an acceptable trade for closing the overlay
+// vector. Event handlers and `javascript:` URIs stay forbidden by the config below.
+const KATEX_STYLE_PROP =
+  /^(?:height|width|min-width|max-width|margin(?:-(?:left|right|top|bottom))?|padding(?:-(?:left|right|top|bottom))?|top|bottom|left|right|vertical-align|display|position)$/;
+const KATEX_STYLE_VALUE =
+  /^(?:-?[0-9.]+(?:em|ex|px|pt|rem|%)?|inline-block|inline|block|middle|baseline|text-top|text-bottom|top|bottom|relative)$/;
+
+function isSafeKatexStyle(value: string): boolean {
+  const decls = value
+    .split(';')
+    .map((d) => d.trim())
+    .filter(Boolean);
+  if (decls.length === 0) return false;
+  for (const decl of decls) {
+    const idx = decl.indexOf(':');
+    if (idx < 0) return false;
+    const prop = decl.slice(0, idx).trim().toLowerCase();
+    const val = decl
+      .slice(idx + 1)
+      .trim()
+      .toLowerCase();
+    if (!KATEX_STYLE_PROP.test(prop)) return false;
+    if (val.includes('(')) return false; // no url()/calc()/any function
+    if (prop === 'position' && val !== 'relative') return false; // never fixed/absolute/sticky
+    if (!KATEX_STYLE_VALUE.test(val)) return false;
+  }
+  return true;
+}
+
 let katexHookRegistered = false;
 function ensureKatexStyleHook(): void {
   if (katexHookRegistered) return;
   katexHookRegistered = true;
   DOMPurify.addHook('uponSanitizeAttribute', (node, data) => {
     if (data.attrName !== 'style') return;
-    const el = node as Element;
-    const cls = typeof el.className === 'string' ? el.className : '';
-    if (/\bkatex\b/.test(cls) || (el.closest && el.closest('.katex'))) {
-      data.forceKeepAttr = true;
-    }
+    if (isSafeKatexStyle(data.attrValue)) data.forceKeepAttr = true;
   });
 }
 
