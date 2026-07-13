@@ -48,9 +48,6 @@ pub use answer::{AnswerCtx, answer_stream};
 // Dialogue-script domain types (#26) — unconditional `pub` so the cross-crate
 // integration test sees them. `DialogueCtx`/`generate_dialogue` are the internal
 // orchestrator seam, gated behind `test-util` like `AnswerCtx`/`answer_stream`.
-pub use dialogue::{DialoguePhase, DialogueScript, Emotion, Length, Speaker, Turn};
-#[cfg(feature = "test-util")]
-pub use dialogue::{DialogueCtx, generate_dialogue};
 #[cfg(feature = "test-util")]
 pub use asr::MockAsrEngine;
 #[cfg(feature = "local-whisper")]
@@ -71,6 +68,9 @@ pub use config::{
     AppConfig, CloudAsrProvider, EnrichmentConfig, RerankerConfig, RerankerModel, RetrievalConfig,
     TaskModel,
 };
+#[cfg(feature = "test-util")]
+pub use dialogue::{DialogueCtx, generate_dialogue};
+pub use dialogue::{DialoguePhase, DialogueScript, Emotion, Length, Speaker, Turn};
 pub use embedder::{
     CountingEmbedder, DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, Embedder, EmbeddingBackend,
     EmbeddingModelSpec, FastembedEmbedder, OllamaEmbedder, REGISTRY, resolve, resolve_opt,

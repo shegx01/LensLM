@@ -1,10 +1,10 @@
 //! Grounded dialogue-script generation (issue #26): the first stage of the M7
 //! audio-overview pipeline. Turns a notebook's selected+live sources into a
 //! validated, typed two-speaker (Host/Guest) [`DialogueScript`] via one
-//! `tiered_search` overview retrieval and a one-shot [`LlmProvider::generate`],
-//! made reliable by a `json` hint + trailing-comma pre-clean + array salvage-parse
-//! + exactly one fix-oriented repair + [`LensError`] fallback, and cancellable by a
-//! `tokio::select!` race per model call.
+//! `tiered_search` overview retrieval and a one-shot [`LlmProvider::generate`].
+//! Reliability comes from a `json` hint, a trailing-comma pre-clean, array
+//! salvage-parse, exactly one fix-oriented repair, then a [`LensError`] fallback;
+//! cancellation from a `tokio::select!` race per model call.
 //!
 //! [`generate_dialogue`] is a pure free fn over an owned [`DialogueCtx`]; the
 //! fallible ctx-gathering lives in `LensEngine::generate_dialogue` (lib.rs). No
@@ -163,7 +163,13 @@ fn build_dialogue_prompt(
     let mut blocks = String::new();
     for (i, u) in units.iter().enumerate() {
         let title = titles.get(&u.source_id).unwrap_or(&u.source_id);
-        blocks.push_str(&format!("[{}] ({}) source_id={}: {}\n", i + 1, title, u.source_id, u.text));
+        blocks.push_str(&format!(
+            "[{}] ({}) source_id={}: {}\n",
+            i + 1,
+            title,
+            u.source_id,
+            u.text
+        ));
     }
     let system = format!(
         "You are scripting a two-speaker audio overview between a Host and a Guest, \
@@ -369,9 +375,9 @@ fn validate_script(
 /// validation failure; a single repair covers both.
 fn build_repair_request(prior: &str, failure: &LensError, preset: &LengthPreset) -> LlmRequest {
     let reason = match failure {
-        LensError::Parse(msg) => format!(
-            "your previous output could not be parsed as JSON (parse error: {msg})"
-        ),
+        LensError::Parse(msg) => {
+            format!("your previous output could not be parsed as JSON (parse error: {msg})")
+        }
         LensError::Validation(msg) => format!(
             "your previous output was valid JSON but failed a content rule: {msg}. \
              Remember: at least {min} turns, both a host and a guest must speak, no \
@@ -414,9 +420,7 @@ pub async fn generate_dialogue(
 
     on_phase(DialoguePhase::Retrieving);
     if cancel.is_cancelled() {
-        return Err(LensError::Cancelled(
-            "dialogue generation cancelled".into(),
-        ));
+        return Err(LensError::Cancelled("dialogue generation cancelled".into()));
     }
 
     // Embed the overview query fully OFF the async runtime — the fastembed
@@ -430,9 +434,7 @@ pub async fn generate_dialogue(
     };
 
     if cancel.is_cancelled() {
-        return Err(LensError::Cancelled(
-            "dialogue generation cancelled".into(),
-        ));
+        return Err(LensError::Cancelled("dialogue generation cancelled".into()));
     }
 
     let out = tiered_search(
@@ -464,9 +466,7 @@ pub async fn generate_dialogue(
     let titles = crate::citation::source_titles(&ctx.pool, &ids).await?;
 
     if cancel.is_cancelled() {
-        return Err(LensError::Cancelled(
-            "dialogue generation cancelled".into(),
-        ));
+        return Err(LensError::Cancelled("dialogue generation cancelled".into()));
     }
 
     let (system, prompt) = build_dialogue_prompt(&out.units, &titles, &preset);
@@ -489,8 +489,9 @@ pub async fn generate_dialogue(
         }
     };
 
-    let first_attempt = parse_dialogue(&resp.text)
-        .and_then(|script| validate_script(&script, &ctx.selected_live_ids, preset.min_turns).map(|()| script));
+    let first_attempt = parse_dialogue(&resp.text).and_then(|script| {
+        validate_script(&script, &ctx.selected_live_ids, preset.min_turns).map(|()| script)
+    });
 
     let script = match first_attempt {
         Ok(script) => script,
@@ -553,7 +554,10 @@ mod tests {
             serde_json::to_string(&Emotion::Thoughtful).unwrap(),
             "\"thoughtful\""
         );
-        assert_eq!(serde_json::to_string(&Length::Medium).unwrap(), "\"medium\"");
+        assert_eq!(
+            serde_json::to_string(&Length::Medium).unwrap(),
+            "\"medium\""
+        );
         assert_eq!(
             serde_json::to_string(&DialoguePhase::Retrieving).unwrap(),
             "\"retrieving\""

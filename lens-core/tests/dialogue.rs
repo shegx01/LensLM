@@ -3,7 +3,8 @@
 //! store, and a temp SQLite DB seeded via `LensEngine::init`. Covers the public
 //! serde surface, the pure `generate_dialogue` behavioural contract (parse/validate/
 //! repair/cancel/empty-notebook), and the `LensEngine::generate_dialogue` grounded
-//! ctx-gathering. No network, no `LENS_RUN_MODEL_TESTS`.
+//! ctx-gathering. The default suite is fully offline; a single real-local-model
+//! end-to-end test is gated behind `LENS_RUN_MODEL_TESTS=1` + `--ignored`.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -364,7 +365,11 @@ async fn truncated_long_response_falls_to_repair() {
     let err = generate_dialogue(ctx, CancellationToken::new(), no_phase())
         .await
         .expect_err("repaired-but-still-short is terminal");
-    assert_eq!(calls.load(Ordering::SeqCst), 2, "truncation triggered a repair");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "truncation triggered a repair"
+    );
     assert!(matches!(err, lens_core::LensError::Validation(_)));
 }
 
@@ -435,9 +440,8 @@ async fn cancel_mid_generate_interrupts_in_flight_call() {
     let cancel = CancellationToken::new();
 
     let cancel_for_task = cancel.clone();
-    let handle = tokio::spawn(async move {
-        generate_dialogue(ctx, cancel_for_task, no_phase()).await
-    });
+    let handle =
+        tokio::spawn(async move { generate_dialogue(ctx, cancel_for_task, no_phase()).await });
 
     // Wait until the provider is parked mid-generate, THEN cancel.
     parked.notified().await;
@@ -509,9 +513,63 @@ async fn engine_generate_dialogue_produces_grounded_script() {
     let allowed: HashSet<&str> = ["sA", "sB"].into_iter().collect();
     for t in &script.turns {
         for id in &t.source_ids {
-            assert!(allowed.contains(id.as_str()), "cited id {id} is selected+live");
+            assert!(
+                allowed.contains(id.as_str()),
+                "cited id {id} is selected+live"
+            );
         }
     }
+    assert!(script.turns.iter().any(|t| t.speaker == Speaker::Host));
+    assert!(script.turns.iter().any(|t| t.speaker == Speaker::Guest));
+}
+
+// ---------------------------------------------------------------------------
+// Step 9 — real-local-model end-to-end (gated behind LENS_RUN_MODEL_TESTS=1)
+// ---------------------------------------------------------------------------
+
+fn run_model_tests() -> bool {
+    std::env::var("LENS_RUN_MODEL_TESTS").is_ok()
+}
+
+/// End-to-end against a real local LLM (Ollama, from config) + a real fastembed
+/// embedder over a seeded notebook: proves a genuine model produces a script the
+/// salvage-parse + validator accept. Opt-in — needs a reachable local model.
+#[tokio::test]
+#[ignore = "needs a real local LLM; run with LENS_RUN_MODEL_TESTS=1 --ignored"]
+async fn real_model_generates_valid_grounded_dialogue() {
+    if !run_model_tests() {
+        eprintln!(
+            "skipping real_model_generates_valid_grounded_dialogue (set LENS_RUN_MODEL_TESTS=1)"
+        );
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let engine = LensEngine::init(dir.path()).await.unwrap();
+    let pool = engine.pool().await;
+    let nb = engine.create_notebook("nb", None, None).await.unwrap().id;
+    insert_source(&pool, nb.as_str(), "sA", "Photosynthesis").await;
+    insert_source(&pool, nb.as_str(), "sB", "Cellular Respiration").await;
+    insert_chunk(
+        &pool,
+        "sA",
+        "c1",
+        "Photosynthesis converts light energy into chemical energy stored in glucose.",
+    )
+    .await;
+    insert_chunk(
+        &pool,
+        "sB",
+        "c2",
+        "Cellular respiration breaks down glucose to release ATP for the cell.",
+    )
+    .await;
+
+    let script = engine
+        .generate_dialogue(&nb, Length::Short, CancellationToken::new(), no_phase())
+        .await
+        .expect("a reachable local model returns a valid grounded script");
+
+    assert!(script.turns.len() >= Length::Short.preset().min_turns);
     assert!(script.turns.iter().any(|t| t.speaker == Speaker::Host));
     assert!(script.turns.iter().any(|t| t.speaker == Speaker::Guest));
 }
