@@ -43,6 +43,28 @@ pub async fn list_notes(
     engine.list_notes(&NotebookId::from(notebook_id)).await
 }
 
+/// Updates a note's content (#25). Routes through the engine wrapper, which
+/// enforces the empty/whitespace guard — do NOT call `NotesRepo::update_note`
+/// directly here (that would bypass the guard).
+#[tauri::command]
+pub async fn update_note(
+    note_id: String,
+    content: String,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<Note, LensError> {
+    engine.update_note(&note_id, &content).await
+}
+
+/// Sets a note's pinned flag (#25, pin-to-top).
+#[tauri::command]
+pub async fn set_note_pinned(
+    note_id: String,
+    pinned: bool,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<Note, LensError> {
+    engine.set_note_pinned(&note_id, pinned).await
+}
+
 /// Deletes a note by id (drives chat toggle-unsave).
 #[tauri::command]
 pub async fn delete_note(

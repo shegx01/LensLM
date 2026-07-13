@@ -134,6 +134,8 @@ pub struct Note {
     pub source_message_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// Pinned-to-top flag (#25). Stored as SQLite INTEGER 0/1.
+    pub pinned: bool,
 }
 
 impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for Note {
@@ -153,6 +155,7 @@ impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for Note {
             source_message_id: row.try_get("source_message_id")?,
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
+            pinned: row.try_get::<i64, _>("pinned")? != 0,
         })
     }
 }
@@ -216,6 +219,7 @@ impl<'a> NotesRepo<'a> {
             source_message_id: Some(source_message_id.to_string()),
             created_at: now.clone(),
             updated_at: now,
+            pinned: false,
         })
     }
 
@@ -285,16 +289,57 @@ impl<'a> NotesRepo<'a> {
             source_message_id: None,
             created_at: now.clone(),
             updated_at: now,
+            pinned: false,
         })
     }
 
-    /// Lists a notebook's notes, newest first.
+    /// Updates a note's `content` and bumps `updated_at` to now (so it differs
+    /// from `created_at` — the "edited" signal). Grounding columns (`citations`,
+    /// `source_title`, `source_message_id`, `origin`) and `created_at` are
+    /// preserved. Returns the updated row. The empty-content guard lives in the
+    /// `lib.rs` engine wrapper (single enforcement point), not here.
+    pub async fn update_note(&self, id: &str, content: &str) -> Result<Note, LensError> {
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query("UPDATE notes SET content = ?, updated_at = ? WHERE id = ?")
+            .bind(content)
+            .bind(&now)
+            .bind(id)
+            .execute(self.pool)
+            .await?;
+        self.get_note(id).await
+    }
+
+    /// Sets a note's `pinned` flag and returns the updated row (#25).
+    pub async fn set_pinned(&self, id: &str, pinned: bool) -> Result<Note, LensError> {
+        sqlx::query("UPDATE notes SET pinned = ? WHERE id = ?")
+            .bind(pinned as i64)
+            .bind(id)
+            .execute(self.pool)
+            .await?;
+        self.get_note(id).await
+    }
+
+    /// Reads a single note by id.
+    async fn get_note(&self, id: &str) -> Result<Note, LensError> {
+        let note = sqlx::query_as::<_, Note>(
+            "SELECT id, notebook_id, origin, content, citations, source_title, \
+                    source_message_id, created_at, updated_at, pinned \
+             FROM notes WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(self.pool)
+        .await?
+        .ok_or_else(|| LensError::Validation(format!("note not found: {id}")))?;
+        Ok(note)
+    }
+
+    /// Lists a notebook's notes: pinned first, then newest first.
     pub async fn list_notes(&self, notebook_id: &str) -> Result<Vec<Note>, LensError> {
         let rows = sqlx::query_as::<_, Note>(
             "SELECT id, notebook_id, origin, content, citations, source_title, \
-                    source_message_id, created_at, updated_at \
+                    source_message_id, created_at, updated_at, pinned \
              FROM notes WHERE notebook_id = ? \
-             ORDER BY created_at DESC, id DESC",
+             ORDER BY pinned DESC, created_at DESC, id DESC",
         )
         .bind(notebook_id)
         .fetch_all(self.pool)
