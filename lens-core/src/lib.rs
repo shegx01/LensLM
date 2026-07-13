@@ -14,6 +14,7 @@ pub mod chunk;
 pub mod citation;
 pub mod config;
 pub(crate) mod db;
+pub mod dialogue;
 pub(crate) mod download;
 pub mod embedder;
 pub mod embedding;
@@ -44,6 +45,12 @@ pub use answer::{AnswerEvent, AnswerStage};
 // desktop bridge uses `answer_notebook` + `AnswerEvent`.
 #[cfg(feature = "test-util")]
 pub use answer::{AnswerCtx, answer_stream};
+// Dialogue-script domain types (#26) — unconditional `pub` so the cross-crate
+// integration test sees them. `DialogueCtx`/`generate_dialogue` are the internal
+// orchestrator seam, gated behind `test-util` like `AnswerCtx`/`answer_stream`.
+pub use dialogue::{DialoguePhase, DialogueScript, Emotion, Length, Speaker, Turn};
+#[cfg(feature = "test-util")]
+pub use dialogue::{DialogueCtx, generate_dialogue};
 #[cfg(feature = "test-util")]
 pub use asr::MockAsrEngine;
 #[cfg(feature = "local-whisper")]
@@ -284,6 +291,13 @@ pub struct LensEngine {
     /// ask actively `.cancel()`s the evicted token so the prior stream stops.
     ask_cancel_tokens:
         Arc<std::sync::Mutex<HashMap<String, Arc<tokio_util::sync::CancellationToken>>>>,
+    /// In-flight dialogue-script (#26) cancellation tokens, keyed by `notebook_id`
+    /// (single-flight per notebook). A DEDICATED registry, separate from
+    /// `ask_cancel_tokens`: a dialogue cancel must not stop an in-flight chat on the
+    /// same notebook (and vice-versa). Same ABA-safe `Arc::ptr_eq` guard shape as
+    /// the ask registry.
+    dialogue_cancel_tokens:
+        Arc<std::sync::Mutex<HashMap<String, Arc<tokio_util::sync::CancellationToken>>>>,
     /// Lazily-built internal LocalWhisper engines, keyed by model id (#42). Mirrors
     /// the embedder cache but lighter — whisper has one active model at a time. The
     /// single `Mutex` over the map ensures the ggml load runs exactly once per key.
@@ -399,6 +413,7 @@ impl LensEngine {
             asr_engine: Arc::new(RwLock::new(None)),
             media_cancel_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
             ask_cancel_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            dialogue_cancel_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
             #[cfg(feature = "local-whisper")]
             whisper_engines: Arc::new(Mutex::new(HashMap::new())),
             catalog_cache: Arc::new(RwLock::new(None)),
@@ -488,6 +503,7 @@ impl LensEngine {
             asr_engine: Arc::new(RwLock::new(None)),
             media_cancel_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
             ask_cancel_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            dialogue_cancel_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
             #[cfg(feature = "local-whisper")]
             whisper_engines: Arc::new(Mutex::new(HashMap::new())),
             catalog_cache: Arc::new(RwLock::new(None)),
@@ -1155,6 +1171,71 @@ impl LensEngine {
         }
     }
 
+    /// Registers a fresh single-flight cancellation token for a dialogue-script run
+    /// (#26), keyed by `notebook_id`. A prior in-flight dialogue generation for this
+    /// notebook is `.cancel()`d FIRST, then replaced. Dedicated registry — never the
+    /// ask registry (a dialogue cancel must not stop an in-flight chat).
+    pub fn register_dialogue(&self, notebook_id: &str) -> Arc<tokio_util::sync::CancellationToken> {
+        let token = Arc::new(tokio_util::sync::CancellationToken::new());
+        let mut map = self
+            .dialogue_cancel_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(prev) = map.insert(notebook_id.to_string(), token.clone()) {
+            prev.cancel();
+        }
+        token
+    }
+
+    /// Cancels the in-flight dialogue-script run for `notebook_id` by flipping its
+    /// token. Returns `true` if one was found, `false` otherwise (#26).
+    pub fn cancel_dialogue_generation(&self, notebook_id: &str) -> bool {
+        let map = self
+            .dialogue_cancel_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match map.get(notebook_id) {
+            Some(token) => {
+                token.cancel();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Removes the dialogue token for `notebook_id` only when `owner` is still the
+    /// stored token (`Arc::ptr_eq`), so a superseded run's guard never evicts the
+    /// live token (ABA-safe, mirroring `remove_ask_if_owner`).
+    fn remove_dialogue_if_owner(
+        &self,
+        notebook_id: &str,
+        owner: &Arc<tokio_util::sync::CancellationToken>,
+    ) {
+        let mut map = self
+            .dialogue_cancel_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(current) = map.get(notebook_id)
+            && Arc::ptr_eq(current, owner)
+        {
+            map.remove(notebook_id);
+        }
+    }
+
+    /// Builds the RAII [`DialogueCancelGuard`] for a registered dialogue run; `owner`
+    /// is the `Arc` from [`register_dialogue`] the guard's Drop `Arc::ptr_eq`-matches.
+    pub fn dialogue_cancel_guard(
+        &self,
+        notebook_id: &str,
+        owner: Arc<tokio_util::sync::CancellationToken>,
+    ) -> DialogueCancelGuard {
+        DialogueCancelGuard {
+            engine: self.clone(),
+            notebook_id: notebook_id.to_string(),
+            owner,
+        }
+    }
+
     /// Grounded-answer entry point (#173, the "rag route"). Gathers ALL fallible
     /// context up front — pool, config-derived `ModelConfig`/`RetrievalConfig`/
     /// `TierThresholds`, the LLM provider (errors when none is configured), the
@@ -1244,6 +1325,110 @@ impl LensEngine {
         };
 
         Ok(crate::answer::answer_stream(ctx, cancel))
+    }
+
+    /// Grounded dialogue-script entry point (#26). Gathers the same fallible context
+    /// as [`answer_notebook`](Self::answer_notebook) — pool, config-derived configs,
+    /// the LLM provider (errors when none is configured), the notebook's embedder +
+    /// coordinate, tokenizer, and graph when enabled — plus the FULL selected+live
+    /// source-id set (the validator's grounding allow-list), then awaits the pure
+    /// [`dialogue::generate_dialogue`]. One-shot: returns the validated script or a
+    /// terminal [`LensError`]; phase markers stream via `on_phase`.
+    pub async fn generate_dialogue(
+        &self,
+        notebook_id: &NotebookId,
+        length: dialogue::Length,
+        cancel: tokio_util::sync::CancellationToken,
+        on_phase: impl Fn(dialogue::DialoguePhase) + Send,
+    ) -> Result<dialogue::DialogueScript, LensError> {
+        let pool = self.pool().await;
+        let config = self.config().await;
+
+        let provider = self
+            .llm_provider()
+            .await
+            .ok_or_else(|| LensError::Model("no chat model configured".into()))?;
+
+        let (model_id, dim, backend) = self.resolve_notebook_embedding(notebook_id).await?;
+        let embedder = self
+            .embedder_for(
+                &model_id,
+                backend,
+                crate::embedder::WorkloadKind::Interactive,
+            )
+            .await?;
+        let coord =
+            crate::vector_store::Coordinate::new(notebook_id.as_str(), backend, model_id, dim);
+
+        let tokenizer = self.tokenizer().await.ok();
+
+        let data_dir = self.data_dir().await;
+        let reranker = crate::retrieval::Reranker::new(&data_dir);
+        let store: Arc<dyn crate::vector_store::VectorStore> = Arc::new(
+            crate::vector_store::LanceVectorStore::new(&data_dir, pool.clone()),
+        );
+
+        let graph_enabled = self.notebook_graph_retrieval_enabled(notebook_id).await?;
+        let graph = if graph_enabled {
+            Some(Arc::new(
+                crate::graph::NotebookGraph::load(&pool, notebook_id.as_str()).await?,
+            ))
+        } else {
+            None
+        };
+
+        let model = config
+            .models
+            .iter()
+            .find(|m| m.model == provider.model_id())
+            .or_else(|| config.models.first())
+            .cloned()
+            .unwrap_or_default();
+
+        let mut retrieval = config.retrieval;
+        retrieval.graph_retrieval_enabled = graph_enabled;
+
+        // The validator's grounding allow-list is the FULL selected+live set, using
+        // the SAME predicate `router::resolve_selected_sources` uses — NOT the
+        // retrieval subset — so a model citing a selected-but-not-retrieved source is
+        // not wrongly rejected.
+        let selected_live_ids = self.selected_live_source_ids(notebook_id.as_str()).await?;
+
+        let ctx = crate::dialogue::DialogueCtx {
+            provider,
+            store,
+            embedder,
+            reranker,
+            graph,
+            pool,
+            coord,
+            model,
+            retrieval,
+            thresholds: config.tier_thresholds,
+            tokenizer,
+            length,
+            selected_live_ids,
+        };
+
+        crate::dialogue::generate_dialogue(ctx, cancel, on_phase).await
+    }
+
+    /// The selected + live (not-trashed) source ids for a notebook, using the exact
+    /// predicate `router::resolve_selected_sources` and BM25 share so every path
+    /// agrees on the corpus scope. Backs the dialogue validator's grounding set (#26).
+    async fn selected_live_source_ids(
+        &self,
+        notebook_id: &str,
+    ) -> Result<std::collections::HashSet<String>, LensError> {
+        let pool = self.pool().await;
+        let rows = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM sources \
+             WHERE notebook_id = ? AND selected = 1 AND trashed_at IS NULL",
+        )
+        .bind(notebook_id)
+        .fetch_all(&pool)
+        .await?;
+        Ok(rows.into_iter().collect())
     }
 
     /// Transcribes 16 kHz mono f32 PCM (#41 output), selecting the backend via
@@ -2307,6 +2492,22 @@ impl Drop for AskCancelGuard {
     fn drop(&mut self) {
         self.engine
             .remove_ask_if_owner(&self.notebook_id, &self.owner);
+    }
+}
+
+/// RAII guard that clears a dialogue-script (#26) cancellation-registry entry on
+/// drop via [`remove_dialogue_if_owner`](LensEngine::remove_dialogue_if_owner). A
+/// dedicated guard over the dialogue registry, parallel to [`AskCancelGuard`].
+pub struct DialogueCancelGuard {
+    engine: LensEngine,
+    notebook_id: String,
+    owner: Arc<tokio_util::sync::CancellationToken>,
+}
+
+impl Drop for DialogueCancelGuard {
+    fn drop(&mut self) {
+        self.engine
+            .remove_dialogue_if_owner(&self.notebook_id, &self.owner);
     }
 }
 
