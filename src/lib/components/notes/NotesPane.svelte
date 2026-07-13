@@ -12,6 +12,7 @@
   import { Scrubber, type ScrubberItem } from '$lib/components/ui/scrubber/index.js';
   import KeyInsightCard from './KeyInsightCard.svelte';
   import ManualNoteCard from './ManualNoteCard.svelte';
+  import NotesExportMenu from './NotesExportMenu.svelte';
   import { notesStore, hydrate, addManualNote } from '$lib/notes/notes-state.svelte.js';
   import { notesNav } from '$lib/notes/notes-nav.svelte.js';
   import { truncateLabel } from '$lib/utils.js';
@@ -114,6 +115,11 @@
 </script>
 
 <div class="flex min-h-0 flex-1 flex-col overflow-hidden">
+  {#if !isEmpty}
+    <div class="flex items-center justify-end border-b border-border px-3 py-1.5">
+      <NotesExportMenu {notebookId} hasNotes={!isEmpty} />
+    </div>
+  {/if}
   {#if isEmpty}
     <div class="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
       <div
