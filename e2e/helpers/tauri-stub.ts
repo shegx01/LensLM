@@ -21,8 +21,17 @@ export type ModelConfig = {
   temperature: number;
   api_key: string;
 };
-export type VoiceConfig = { host: string; guest: string };
-export type TtsConfig = { provider: string; api_key: string };
+export type VoiceRef = string | { clip_path: string; transcript: string };
+export type VoiceConfig = { host: VoiceRef; guest: VoiceRef };
+export type CloudTtsKind = 'open_ai_compatible' | 'deepgram' | 'eleven_labs';
+export type TtsBackend = 'orpheus' | 'moss_local' | 'moss_ttsd' | { cloud: CloudTtsKind };
+export type CloudTtsConfig = { kind: CloudTtsKind; api_key: string; base_url: string };
+export type TtsConfig = {
+  version: number;
+  backend: TtsBackend;
+  model: string;
+  cloud: CloudTtsConfig | null;
+};
 export type PathConfig = { data_dir: string };
 export type TierThresholds = { tier1_token_cap: number; tier2_token_cap: number };
 export type AppConfig = {
@@ -59,7 +68,7 @@ export function makeConfig(onboardingComplete: boolean): AppConfig {
     models: [],
     endpoints: {},
     voices: { host: '', guest: '' },
-    tts: { provider: '', api_key: '' },
+    tts: { version: 1, backend: 'orpheus', model: '', cloud: null },
     paths: { data_dir: '' },
     tier_thresholds: { tier1_token_cap: 4000, tier2_token_cap: 16000 },
     onboarding_complete: onboardingComplete,
@@ -98,7 +107,7 @@ export const DEFAULT_CHECKS: CheckResult[] = [
     id: 'text_to_speech',
     label: 'Text-to-speech',
     status: 'pass',
-    detail: 'Kokoro audio engine ready',
+    detail: 'Audio engine ready',
     action: 'choose'
   }
 ];
@@ -183,7 +192,7 @@ export async function installTauriStub(
               ch?.onmessage?.({ status: 'success', completed: 10000, total: 10000 });
               return Promise.resolve(null);
             }
-            case 'download_tts_engine': {
+            case 'download_tts_model': {
               // Real command streams DownloadProgress { received, total, done }.
               const ch = args?.onProgress as { onmessage?: (m: unknown) => void } | undefined;
               ch?.onmessage?.({ received: 0, total: 90000000, done: false });
@@ -191,11 +200,13 @@ export async function installTauriStub(
               ch?.onmessage?.({ received: 90000000, total: 90000000, done: true });
               return Promise.resolve(null);
             }
+            case 'tts_model_downloaded':
+              return Promise.resolve(true);
             case 'list_tts_voices':
-              // Mirror the real Kokoro catalog shape (TtsVoice { id, name, gender }).
+              // Mirror the Orpheus named-voice catalog (TtsVoice { id, name, gender }).
               return Promise.resolve([
-                { id: 'af_heart', name: 'Heart', gender: 'female' },
-                { id: 'am_michael', name: 'Michael', gender: 'male' }
+                { id: 'tara', name: 'Tara', gender: 'female' },
+                { id: 'leo', name: 'Leo', gender: 'male' }
               ]);
             case 'create_notebook':
               // Notebook-shaped; the Create notebook screen reads `.id` into the

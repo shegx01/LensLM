@@ -40,7 +40,7 @@ const NOMIC_HF_REPO: &str = "nomic-ai/nomic-embed-text-v1.5";
 const NOMIC_HF_REVISION: &str = "e9b6763023c676ca8431644204f50c2b100d9aab";
 
 // SHA-256 of model.safetensors at NOMIC_HF_REVISION (HF LFS oid). Verified after
-// fetch — same supply-chain gate as KOKORO_MODEL_SHA256. The ~547 MB file is
+// fetch — same supply-chain gate as the TTS model downloads. The ~547 MB file is
 // mmapped into the process, so end-to-end verification is required.
 const NOMIC_SAFETENSORS_SHA256: &str =
     "9e7d262b1fe5ea350782829496efa831901b77486bbde1cea54a4c822d010d5c";

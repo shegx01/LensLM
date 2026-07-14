@@ -26,7 +26,9 @@ use crate::config::{VoiceConfig, VoiceRef};
 use crate::dialogue::{Speaker, Turn};
 use crate::error::LensError;
 use crate::tts::snac::SnacDecoder;
-use crate::tts::{AudioBuffer, TtsBackend, TtsProvider, TtsProviderInfo, emotion_tag};
+use crate::tts::{
+    AudioBuffer, Gender, TtsBackend, TtsProvider, TtsProviderInfo, TtsVoice, emotion_tag,
+};
 
 pub const ORPHEUS_MODEL_ID: &str = "orpheus";
 pub const ORPHEUS_MODEL_URL: &str = "https://huggingface.co/unsloth/orpheus-3b-0.1-ft-GGUF/resolve/main/orpheus-3b-0.1-ft-Q4_K_M.gguf";
@@ -60,7 +62,18 @@ const EARLY_EOS_FRACTION: f64 = 0.35;
 // `tts::CANCELLED_MSG` so the source of the cancellation is legible.
 const CANCELLED_MSG: &str = "orpheus generation cancelled";
 
-const ORPHEUS_VOICES: [&str; 8] = ["tara", "leah", "jess", "leo", "dan", "mia", "zac", "zoe"];
+/// Single source of truth for the Orpheus named voices: (id, display name, gender).
+/// Both `voices()` (catalog) and `orpheus_voice()` (id resolution) derive from it.
+const CATALOG: &[(&str, &str, Gender)] = &[
+    ("tara", "Tara", Gender::Female),
+    ("leah", "Leah", Gender::Female),
+    ("jess", "Jess", Gender::Female),
+    ("leo", "Leo", Gender::Male),
+    ("dan", "Dan", Gender::Male),
+    ("mia", "Mia", Gender::Female),
+    ("zac", "Zac", Gender::Male),
+    ("zoe", "Zoe", Gender::Female),
+];
 
 /// Locked Orpheus sampling (spike-tuned; exposure deferred to 161f settings).
 #[derive(Debug, Clone, Copy)]
@@ -168,6 +181,13 @@ impl TtsProvider for OrpheusAdapter {
             backend: TtsBackend::Orpheus,
             model: "orpheus-3b-0.1-ft-Q4_K_M".to_string(),
         }
+    }
+
+    fn voices(&self) -> Vec<TtsVoice> {
+        CATALOG
+            .iter()
+            .map(|&(id, name, gender)| TtsVoice::new(id, name, gender))
+            .collect()
     }
 
     async fn synthesize_turn(
@@ -388,7 +408,10 @@ fn default_voice(speaker: Speaker) -> &'static str {
 }
 
 fn orpheus_voice(name: &str) -> Option<&'static str> {
-    ORPHEUS_VOICES.iter().copied().find(|&v| v == name)
+    CATALOG
+        .iter()
+        .find(|&&(id, _, _)| id == name)
+        .map(|&(id, _, _)| id)
 }
 
 #[cfg(test)]
@@ -398,10 +421,24 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
+    fn voices_catalog_covers_all_named_voices() {
+        let adapter = OrpheusAdapter::new(PathBuf::from("/x/orpheus"), PathBuf::from("/x/snac"));
+        let voices = adapter.voices();
+        assert_eq!(voices.len(), CATALOG.len());
+        for &(id, _, _) in CATALOG {
+            assert!(voices.iter().any(|v| v.id == id), "missing voice {id}");
+        }
+        let female = voices.iter().filter(|v| v.gender == Gender::Female).count();
+        let male = voices.iter().filter(|v| v.gender == Gender::Male).count();
+        assert_eq!(female, 5);
+        assert_eq!(male, 3);
+    }
+
+    #[test]
     fn voice_id_named_resolves_all_eight() {
-        for v in ORPHEUS_VOICES {
-            let r = VoiceRef::Named(v.to_string());
-            assert_eq!(voice_id(&r, Speaker::Host).unwrap(), v);
+        for &(id, _, _) in CATALOG {
+            let r = VoiceRef::Named(id.to_string());
+            assert_eq!(voice_id(&r, Speaker::Host).unwrap(), id);
         }
     }
 

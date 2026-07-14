@@ -11,7 +11,7 @@ export function baseAppConfig(overrides?: Partial<AppConfig>): AppConfig {
     models: [],
     endpoints: {},
     voices: { host: '', guest: '' },
-    tts: { provider: '', api_key: '' },
+    tts: { version: 1, backend: 'orpheus', model: '', cloud: null },
     enrichment: { enabled: false, coref_strategy: 'llm_inline', cloud_consent: false },
     paths: { data_dir: '' },
     tier_thresholds: { tier1_token_cap: 4000, tier2_token_cap: 16000 },

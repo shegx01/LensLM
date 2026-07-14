@@ -104,7 +104,7 @@ impl Default for TtsConfig {
     fn default() -> Self {
         Self {
             version: 1,
-            backend: TtsBackend::Kokoro,
+            backend: TtsBackend::Orpheus,
             model: String::new(),
             cloud: None,
         }
@@ -838,10 +838,10 @@ mod tests {
     }
 
     #[test]
-    fn default_tts_is_kokoro() {
+    fn default_tts_is_orpheus() {
         assert_eq!(AppConfig::default().tts, TtsConfig::default());
         assert_eq!(AppConfig::default().tts.version, 1);
-        assert_eq!(AppConfig::default().tts.backend, TtsBackend::Kokoro);
+        assert_eq!(AppConfig::default().tts.backend, TtsBackend::Orpheus);
         assert!(AppConfig::default().tts.cloud.is_none());
     }
 
@@ -968,11 +968,11 @@ mod tests {
     }
 
     #[test]
-    fn legacy_empty_tts_coerces_to_kokoro() {
+    fn legacy_empty_tts_coerces_to_orpheus() {
         let json = r#"{ "provider": "", "api_key": "" }"#;
         let cfg: TtsConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg, TtsConfig::default());
-        assert_eq!(cfg.backend, TtsBackend::Kokoro);
+        assert_eq!(cfg.backend, TtsBackend::Orpheus);
         assert!(cfg.cloud.is_none());
     }
 

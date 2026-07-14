@@ -29,11 +29,11 @@ describe('TtsConfigPanel — voices', () => {
     const oncheck = vi.fn().mockResolvedValue(undefined);
     const oncollapse = vi.fn();
     mockIPC((cmd, args) => {
-      if (cmd === 'download_tts_engine') return driveDownload(args);
+      if (cmd === 'download_tts_model') return driveDownload(args);
       if (cmd === 'list_tts_voices')
         return [
-          { id: 'am_michael', name: 'Michael', gender: 'male' },
-          { id: 'af_heart', name: 'Heart', gender: 'female' }
+          { id: 'tara', name: 'Tara', gender: 'female' },
+          { id: 'leo', name: 'Leo', gender: 'male' }
         ];
       if (cmd === 'get_config') return baseConfig();
       if (cmd === 'set_config') {
@@ -43,15 +43,15 @@ describe('TtsConfigPanel — voices', () => {
     });
 
     render(TtsConfigPanel, { props: { oncheck, oncollapse } });
-    await fireEvent.click(screen.getByRole('button', { name: /download kokoro/i }));
-    await waitFor(() => expect(screen.getByText(/kokoro engine ready/i)).toBeInTheDocument());
+    await fireEvent.click(screen.getByRole('button', { name: /download voice engine/i }));
+    await waitFor(() => expect(screen.getByText(/voice engine ready/i)).toBeInTheDocument());
 
     await fireEvent.click(screen.getByRole('button', { name: /save voice settings/i }));
 
     await waitFor(() => expect(written).not.toBeNull());
     expect((written as unknown as AppConfig).voices).toEqual({
-      host: 'am_michael',
-      guest: 'af_heart'
+      host: 'leo',
+      guest: 'tara'
     });
     expect(oncollapse).toHaveBeenCalledOnce();
   });
@@ -59,7 +59,7 @@ describe('TtsConfigPanel — voices', () => {
   it('shows an inline error and disables Save when the voice list is empty (no stub voices)', async () => {
     const setConfig = vi.fn();
     mockIPC((cmd, args) => {
-      if (cmd === 'download_tts_engine') return driveDownload(args);
+      if (cmd === 'download_tts_model') return driveDownload(args);
       if (cmd === 'list_tts_voices') return [];
       if (cmd === 'set_config') {
         setConfig(args);
@@ -68,7 +68,7 @@ describe('TtsConfigPanel — voices', () => {
     });
 
     render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
-    await fireEvent.click(screen.getByRole('button', { name: /download kokoro/i }));
+    await fireEvent.click(screen.getByRole('button', { name: /download voice engine/i }));
 
     await waitFor(() =>
       expect(
@@ -111,8 +111,10 @@ describe('TtsConfigPanel — cloud (ElevenLabs)', () => {
     // Standard client-side RMW: set_config receives the whole config with `tts`
     // populated and every other field round-tripped untouched.
     expect((written as unknown as AppConfig).tts).toEqual({
-      provider: 'elevenlabs',
-      api_key: 'sk-elevenlabs-1234'
+      version: 1,
+      backend: { cloud: 'eleven_labs' },
+      model: '',
+      cloud: { kind: 'eleven_labs', api_key: 'sk-elevenlabs-1234', base_url: '' }
     });
     await waitFor(() => expect(oncheck).toHaveBeenCalledOnce());
     expect(oncollapse).toHaveBeenCalledOnce();
@@ -133,7 +135,15 @@ describe('TtsConfigPanel — cloud (ElevenLabs)', () => {
     mockIPC((cmd) => {
       if (cmd === 'get_config') {
         const cfg = baseConfig();
-        return { ...cfg, tts: { provider: 'elevenlabs', api_key: 'sk-saved-eleven' } };
+        return {
+          ...cfg,
+          tts: {
+            version: 1,
+            backend: { cloud: 'eleven_labs' },
+            model: '',
+            cloud: { kind: 'eleven_labs', api_key: 'sk-saved-eleven', base_url: '' }
+          }
+        };
       }
       if (cmd === 'set_config') return null;
     });
@@ -174,21 +184,22 @@ describe('TtsConfigPanel — cloud (ElevenLabs)', () => {
 });
 
 describe('TtsConfigPanel — local engine detection', () => {
-  it('skips the download step and shows voices when Kokoro is already on disk', async () => {
+  it('skips the download step and shows voices when the engine is already on disk', async () => {
     mockIPC((cmd) => {
-      if (cmd === 'get_config')
-        return { ...baseConfig(), voices: { host: 'am_michael', guest: 'af_heart' } };
-      if (cmd === 'kokoro_downloaded') return true;
+      if (cmd === 'get_config') return { ...baseConfig(), voices: { host: 'leo', guest: 'tara' } };
+      if (cmd === 'tts_model_downloaded') return true;
       if (cmd === 'list_tts_voices')
         return [
-          { id: 'am_michael', name: 'Michael', gender: 'male' },
-          { id: 'af_heart', name: 'Heart', gender: 'female' }
+          { id: 'tara', name: 'Tara', gender: 'female' },
+          { id: 'leo', name: 'Leo', gender: 'male' }
         ];
     });
 
     render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
 
-    await waitFor(() => expect(screen.getByText(/kokoro engine ready/i)).toBeInTheDocument());
-    expect(screen.queryByRole('button', { name: /download kokoro/i })).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText(/voice engine ready/i)).toBeInTheDocument());
+    expect(
+      screen.queryByRole('button', { name: /download voice engine/i })
+    ).not.toBeInTheDocument();
   });
 });

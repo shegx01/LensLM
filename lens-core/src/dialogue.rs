@@ -54,10 +54,9 @@ pub struct DialogueScript {
     pub turns: Vec<Turn>,
 }
 
-/// One dialogue turn. `emotion` is engine-forward metadata (Kokoro ignores it;
-/// Orpheus #161 renders it); an absent/unknown value deserializes to `None` and is
-/// never a validation failure. `source_ids` may be empty for ungrounded turns
-/// (natural transitions/backchannels).
+/// One dialogue turn. `emotion` is engine-forward metadata (Orpheus #161 renders it as
+/// inline tags; other backends ignore it) — an absent/unknown value deserializes to `None`,
+/// never a validation failure. `source_ids` may be empty for ungrounded turns.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Turn {
     pub speaker: Speaker,

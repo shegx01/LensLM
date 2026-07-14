@@ -88,7 +88,7 @@ reqwest = { version = "=0.13.4", default-features = false, features = [
     "json",
     "rustls",
     # `stream` exposes `Response::bytes_stream`, used by the embedding-model pull
-    # (NDJSON) and the Kokoro model download to report progress as bytes arrive.
+    # (NDJSON) and the TTS/ASR model downloads to report progress as bytes arrive.
     "stream",
     # `multipart` builds the OpenAI-compatible cloud-ASR upload form (#45).
     "multipart",
@@ -138,7 +138,7 @@ whisper-rs = { workspace = true, optional = true }
 # (SSRF no-redirect + bounded timeouts). MIT OR Apache-2.0 — both in deny.toml.
 genai = { version = "=0.6.5", default-features = false, features = ["rustls-tls"] }
 
-# SHA256 integrity verification of the downloaded Kokoro model. Pinned to the
+# SHA256 integrity verification of downloaded models. Pinned to the
 # version already resolved in the lock tree (transitive) so no new copy is added.
 sha2 = "=0.10.9"
 
@@ -228,7 +228,7 @@ pdfium-render = { version = "=0.9.2", default-features = false, features = [
 # --- M4 Source Grounding (Phase 1) ---
 # Local embeddings: nomic-embed-text-v1.5 (768d) via ONNX. fastembed transitively
 # pins `ort = =2.0.0-rc.12` (download-binaries default → onnxruntime bundled, no
-# system install). This is the FIRST `ort` in the workspace (Kokoro is download-only).
+# system install). This is the only `ort` in the workspace.
 fastembed = "5.17.2"
 # Embedded vector store. lancedb 0.30.0 pins Arrow 58 — every arrow crate below
 # MUST match that major or the binary hits an ABI break (verify: `cargo tree -d`).

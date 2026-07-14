@@ -8,9 +8,9 @@
   import CircleCheck from '@lucide/svelte/icons/circle-check';
   import Download from '@lucide/svelte/icons/download';
   import {
-    downloadTtsEngine,
+    downloadTtsModel,
     listTtsVoices,
-    kokoroDownloaded,
+    ttsModelDownloaded,
     saveTtsProvider,
     type TtsVoice
   } from '$lib/onboarding/system-check.js';
@@ -25,6 +25,12 @@
     oncheck: () => Promise<void>;
     oncollapse: () => void;
   } = $props();
+
+  // Orpheus is the current default local backend (#192); it needs both the
+  // GGUF weights and the SNAC decoder. Full multi-engine selection is #194.
+  // SYNC-CHECK: ids must match lens-core TTS_REGISTRY / TtsBackend::required_model_ids (orpheus, snac).
+  const TTS_ENGINE = 'orpheus';
+  const TTS_MODEL_IDS = ['orpheus', 'snac'] as const;
 
   type TtsTab = 'local' | 'cloud';
   let activeTab = $state<TtsTab>('local');
@@ -59,24 +65,33 @@
     savingCloud || (hasSavedKey ? !editingKey || !cloudApiKey.trim() : !cloudApiKey.trim())
   );
 
+  /** True once every model artifact the local engine needs is on disk. */
+  async function engineDownloaded(): Promise<boolean> {
+    for (const model of TTS_MODEL_IDS) {
+      if (!(await ttsModelDownloaded(TTS_ENGINE, model))) return false;
+    }
+    return true;
+  }
+
   onMount(async () => {
     if (!isTauri()) return;
     try {
       const cfg = await invoke<AppConfig>('get_config');
-      if (cfg.tts?.provider === 'elevenlabs' && cfg.tts.api_key.trim() !== '') {
+      if (cfg.tts?.cloud && cfg.tts.cloud.api_key.trim() !== '') {
         hasSavedKey = true;
         cloudApiKey = '';
       }
-      // If Kokoro is already on disk, skip the download step and go straight to
-      // voice selection — pre-filled from any previously saved host/guest voices.
-      // (The download detection wasn't propagating before: the panel always
-      // showed "Download Kokoro" even when the engine was installed.)
-      if (await kokoroDownloaded()) {
+      // If the local engine is already on disk, skip the download step and go
+      // straight to voice selection — pre-filled from any previously saved
+      // host/guest voices.
+      if (await engineDownloaded()) {
         downloaded = true;
         voices = await listTtsVoices();
         voicesUnavailable = voices.length === 0;
-        maleVoice = cfg.voices?.host || maleVoices[0]?.id || '';
-        femaleVoice = cfg.voices?.guest || femaleVoices[0]?.id || '';
+        const host = cfg.voices?.host;
+        const guest = cfg.voices?.guest;
+        maleVoice = (typeof host === 'string' ? host : '') || maleVoices[0]?.id || '';
+        femaleVoice = (typeof guest === 'string' ? guest : '') || femaleVoices[0]?.id || '';
       }
     } catch {
       // Non-fatal: fall back to the default empty Cloud form / download prompt.
@@ -95,9 +110,11 @@
     downloadError = null;
     downloadProgress = 0;
     try {
-      await downloadTtsEngine((pct) => {
-        downloadProgress = pct;
-      });
+      for (const [i, model] of TTS_MODEL_IDS.entries()) {
+        await downloadTtsModel(TTS_ENGINE, model, (pct) => {
+          downloadProgress = Math.round(((i + pct / 100) / TTS_MODEL_IDS.length) * 100);
+        });
+      }
       downloadProgress = 100;
       downloaded = true;
       // Load available voices from the engine. No stubs: if the catalog comes
@@ -133,7 +150,7 @@
     savingCloud = true;
     cloudError = null;
     try {
-      await saveTtsProvider({ provider: 'elevenlabs', apiKey: cloudApiKey });
+      await saveTtsProvider({ provider: 'cloud', apiKey: cloudApiKey });
       await oncheck();
       oncollapse();
     } catch (err) {
@@ -192,12 +209,12 @@
     {#if !downloaded}
       <div class="flex flex-col gap-2">
         <p class="text-muted-foreground text-[0.78rem] leading-relaxed">
-          Kokoro is an open-weight TTS engine that runs entirely on-device. Download once — no
-          internet required for synthesis.
+          This open-weight TTS engine runs entirely on-device. Download once — no internet required
+          for synthesis.
         </p>
         <div class="flex items-center justify-between text-[0.75rem] text-muted-foreground">
-          <span>Kokoro-82M</span>
-          <span>~86 MB · CPU · Fast</span>
+          <span>Local voice engine</span>
+          <span>On-device · Offline</span>
         </div>
 
         {#if downloadProgress !== null && downloadProgress < 100}
@@ -226,14 +243,14 @@
             Downloading…
           {:else}
             <Download class="size-4" />
-            Download Kokoro
+            Download voice engine
           {/if}
         </Button>
       </div>
     {:else}
       <div class="flex items-center gap-2 text-[0.78rem] text-primary" role="status">
         <CircleCheck class="size-4" />
-        Kokoro engine ready
+        Voice engine ready
       </div>
 
       {#if voicesUnavailable}

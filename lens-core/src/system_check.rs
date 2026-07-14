@@ -603,15 +603,21 @@ fn has_cloud_tts(config: &AppConfig) -> bool {
             .is_some_and(|c| !c.api_key.is_empty())
 }
 
-/// TTS readiness gate: passes when the Kokoro ONNX model is on disk AND both
-/// voices are saved, OR a cloud TTS provider is configured.
+/// TTS readiness gate: passes when the selected local backend's model(s) are on
+/// disk AND both voices are saved, OR a cloud TTS provider is configured.
 fn probe_text_to_speech(config: &AppConfig) -> CheckResult {
-    let model_path = crate::tts::kokoro_model_path(Path::new(&config.paths.data_dir));
-    let kokoro_on_disk = model_path.is_file();
+    let data_dir = Path::new(&config.paths.data_dir);
+    // A backend is local-model-ready only when it names artifacts AND all of them
+    // are on disk. An empty list (cloud / not-yet-wired) is never engine-ready.
+    let required = config.tts.backend.required_model_ids();
+    let engine_ready = !required.is_empty()
+        && required
+            .iter()
+            .all(|id| crate::tts::tts_model_downloaded(data_dir, id));
     let voices_set = !config.voices.host.is_unset() && !config.voices.guest.is_unset();
 
-    let (status, detail) = if kokoro_on_disk && voices_set {
-        (CheckStatus::Pass, "Kokoro audio engine ready".to_string())
+    let (status, detail) = if engine_ready && voices_set {
+        (CheckStatus::Pass, "Audio engine ready".to_string())
     } else if has_cloud_tts(config) {
         (CheckStatus::Pass, "Cloud voice configured".to_string())
     } else {
@@ -807,7 +813,7 @@ mod tests {
         use crate::tts::{CloudTtsKind, TtsBackend};
 
         let mut config = AppConfig::default();
-        // Kokoro (default) is not cloud.
+        // Orpheus (default) is not cloud.
         assert!(!has_cloud_tts(&config));
 
         // Cloud backend but empty key → not configured.
@@ -1132,12 +1138,14 @@ mod tests {
         assert!(!is_allowlisted_embedding_id("totally-made-up-model"));
     }
 
-    /// Test helper: materialize the Kokoro model file at the exact path the
-    /// downloader writes, under `data_dir`.
-    fn write_kokoro_model(data_dir: &Path) {
-        let model_path = crate::tts::kokoro_model_path(data_dir);
-        std::fs::create_dir_all(model_path.parent().unwrap()).unwrap();
-        std::fs::write(&model_path, b"fake-onnx-bytes").unwrap();
+    /// Test helper: materialize the default (Orpheus) backend's model files at the
+    /// exact paths the downloader writes, under `data_dir`.
+    fn write_tts_models(data_dir: &Path) {
+        for id in ["orpheus", "snac"] {
+            let model_path = crate::tts::tts_model_path(data_dir, id).unwrap();
+            std::fs::create_dir_all(model_path.parent().unwrap()).unwrap();
+            std::fs::write(&model_path, b"fake-model-bytes").unwrap();
+        }
     }
 
     #[test]
@@ -1159,7 +1167,7 @@ mod tests {
     #[test]
     fn text_to_speech_fail_when_model_present_but_voices_empty() {
         let dir = tempfile::tempdir().unwrap();
-        write_kokoro_model(dir.path());
+        write_tts_models(dir.path());
 
         let mut config = AppConfig::default();
         config.paths.data_dir = dir.path().display().to_string();
@@ -1175,7 +1183,7 @@ mod tests {
     #[test]
     fn text_to_speech_pass_when_model_present_and_voices_set() {
         let dir = tempfile::tempdir().unwrap();
-        write_kokoro_model(dir.path());
+        write_tts_models(dir.path());
 
         let mut config = AppConfig::default();
         config.paths.data_dir = dir.path().display().to_string();
@@ -1186,13 +1194,13 @@ mod tests {
 
         let result = probe_text_to_speech(&config);
         assert_eq!(result.status, CheckStatus::Pass);
-        assert_eq!(result.detail, "Kokoro audio engine ready");
+        assert_eq!(result.detail, "Audio engine ready");
     }
 
     #[test]
     fn text_to_speech_fail_when_only_one_voice_set() {
         let dir = tempfile::tempdir().unwrap();
-        write_kokoro_model(dir.path());
+        write_tts_models(dir.path());
 
         let mut config = AppConfig::default();
         config.paths.data_dir = dir.path().display().to_string();

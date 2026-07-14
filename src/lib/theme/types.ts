@@ -10,15 +10,35 @@ export interface ModelConfig {
   api_key: string;
 }
 
+// SYNC-CHECK: must match lens-core/src/config.rs VoiceRef — `#[serde(untagged)]`, so
+// `Named(String)` round-trips as a bare string and `Reference` as the object form.
+export type VoiceRef = string | { clip_path: string; transcript: string };
+
 export interface VoiceConfig {
-  host: string;
-  guest: string;
+  host: VoiceRef;
+  guest: VoiceRef;
+}
+
+// SYNC-CHECK: must match lens-core/src/tts/mod.rs CloudTtsKind — snake_case serde.
+export type CloudTtsKind = 'open_ai_compatible' | 'deepgram' | 'eleven_labs';
+
+// SYNC-CHECK: must match lens-core/src/tts/mod.rs TtsBackend — externally tagged: unit
+// variants round-trip as bare strings, `Cloud(CloudTtsKind)` as `{ cloud: CloudTtsKind }`.
+export type TtsBackend = 'orpheus' | 'moss_local' | 'moss_ttsd' | { cloud: CloudTtsKind };
+
+// SYNC-CHECK: must match lens-core/src/config.rs CloudTtsConfig — update both together.
+export interface CloudTtsConfig {
+  kind: CloudTtsKind;
+  api_key: string;
+  base_url: string;
 }
 
 // SYNC-CHECK: must match lens-core/src/config.rs TtsConfig — update both together.
 export interface TtsConfig {
-  provider: string;
-  api_key: string;
+  version: number;
+  backend: TtsBackend;
+  model: string;
+  cloud: CloudTtsConfig | null;
 }
 
 // SYNC-CHECK: must match lens-core/src/enrichment/embedding_text.rs CorefStrategy
@@ -87,7 +107,7 @@ export interface AppConfig {
   models: ModelConfig[];
   endpoints: Record<string, string>;
   voices: VoiceConfig;
-  // SYNC-CHECK: must match lens-core/src/config.rs AppConfig.tts (default empty).
+  // SYNC-CHECK: must match lens-core/src/config.rs AppConfig.tts (default backend Orpheus).
   tts: TtsConfig;
   // SYNC-CHECK: must match lens-core/src/config.rs AppConfig.enrichment (default disabled).
   enrichment: EnrichmentConfig;
