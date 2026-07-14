@@ -1319,7 +1319,17 @@ impl LensEngine {
         {
             return true;
         }
-        tts::resolve_tts_provider(cfg.backend, cfg).is_some()
+        // Cheap file probe (never a weight load): an embedded backend is available
+        // only when ALL its artifacts are on disk. Orpheus needs BOTH the GGUF and
+        // the SNAC decoder — a one-file state must not over-report available.
+        let data_dir = self.data_dir().await;
+        match cfg.backend {
+            tts::TtsBackend::Orpheus => {
+                tts::tts_model_downloaded(&data_dir, "orpheus")
+                    && tts::tts_model_downloaded(&data_dir, "snac")
+            }
+            _ => false,
+        }
     }
 
     pub async fn synthesize_overview(
@@ -1337,12 +1347,16 @@ impl LensEngine {
             _ => None,
         };
 
+        // Resolve `data_dir` before the resolve call: an embedded provider
+        // (Orpheus) needs it to construct its model paths (#191 B0 seam change).
+        let data_dir = self.data_dir().await;
+
         let buffer: tts::AudioBuffer = if let Some(sidecar) = healthy_sidecar {
             tts::synthesize_and_stitch(&script.turns, &on_phase, cancel, |turn| {
                 sidecar.synthesize_turn(turn, voices, cancel)
             })
             .await?
-        } else if let Some(provider) = tts::resolve_tts_provider(cfg.backend, cfg) {
+        } else if let Some(provider) = tts::resolve_tts_provider(cfg.backend, cfg, &data_dir) {
             provider
                 .synthesize_script(script, voices, &on_phase, cancel)
                 .await?
@@ -1353,7 +1367,6 @@ impl LensEngine {
         };
 
         on_phase(tts::TtsPhase::Encoding);
-        let data_dir = self.data_dir().await;
         let path = notebook_audio_path(&data_dir, notebook_id)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(LensError::from)?;

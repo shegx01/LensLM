@@ -62,6 +62,15 @@ tempfile = "3"
 # License: Unlicense (whisper-rs + whisper-rs-sys) — allowlisted in deny.toml.
 whisper-rs = { version = "=0.16.0", default-features = false }
 
+# issue #191 [161c]: Orpheus-3B GGUF inference via a bundled llama.cpp Rust
+# binding. `llama-cpp-sys-2` builds llama.cpp with cmake + a C++ compiler (same
+# toolchain whisper.cpp already requires in CI). `default-features = false` drops
+# the `openmp` default (Apple clang ships no libomp — a macOS build break) and
+# `common`/`android-shared-stdcxx`; we build only the core lib + samplers. Metal
+# is unioned on macOS-aarch64 via the target table. Pinned for a reproducible C++
+# build. MIT OR Apache-2.0 — allowlisted in deny.toml.
+llama-cpp-2 = { version = "=0.1.151", default-features = false, features = ["sampler"] }
+
 # Shared lint policy across the workspace.
 [workspace.lints.clippy]
 all = "warn"
