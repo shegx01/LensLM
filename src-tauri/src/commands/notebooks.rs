@@ -2,8 +2,9 @@
 
 use futures::StreamExt;
 use lens_core::{
-    AddSourceOutcome, AnswerEvent, ChatFeedback, ChatMessage, IngestProgress, LensEngine,
-    LensError, Notebook, NotebookId, NotebookSummary, Source, TrashedSource,
+    AddSourceOutcome, AnswerEvent, ChatFeedback, ChatMessage, DialoguePhase, DialogueScript,
+    IngestProgress, Length, LensEngine, LensError, Notebook, NotebookId, NotebookSummary, Source,
+    TrashedSource,
 };
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
@@ -472,6 +473,69 @@ pub async fn cancel_ask(
     engine: tauri::State<'_, LensEngine>,
 ) -> Result<bool, LensError> {
     Ok(engine.cancel_ask_notebook(&notebook_id))
+}
+
+/// Generates a grounded two-speaker dialogue script for a notebook (#26, first stage
+/// of the M7 audio-overview pipeline). Streams honest phase markers over
+/// `on_progress` (`Started` → `Chunk(Retrieving)` → `Chunk(Generating)` →
+/// `Chunk(Validating)` → `Done`) and returns the validated [`DialogueScript`].
+/// Per-notebook single-flight over a DEDICATED dialogue registry (never the ask
+/// registry). The empty-notebook path yields `Started → Chunk(Retrieving) →
+/// Failed(Validation)` with zero LLM calls; error/cancel yields `Failed(err)`.
+#[tracing::instrument(skip(on_progress, engine))]
+#[tauri::command]
+pub async fn generate_dialogue(
+    notebook_id: String,
+    length: Length,
+    on_progress: Channel<StreamEvent<DialoguePhase>>,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<DialogueScript, LensError> {
+    if let Err(e) = send_event(&on_progress, StreamEvent::Started) {
+        tracing::warn!("generate_dialogue: started event send failed: {e}");
+    }
+
+    let token = engine.register_dialogue(&notebook_id);
+    let _guard = engine.dialogue_cancel_guard(&notebook_id, token.clone());
+
+    let on_progress_phase = on_progress.clone();
+    let result = engine
+        .generate_dialogue(
+            &NotebookId::from(notebook_id),
+            length,
+            (*token).clone(),
+            move |phase| {
+                if let Err(e) = send_event(&on_progress_phase, StreamEvent::Chunk(phase)) {
+                    tracing::warn!("generate_dialogue: phase send failed: {e}");
+                }
+            },
+        )
+        .await;
+
+    match result {
+        Ok(script) => {
+            if let Err(e) = send_event(&on_progress, StreamEvent::Done) {
+                tracing::warn!("generate_dialogue: done event send failed: {e}");
+            }
+            Ok(script)
+        }
+        Err(err) => {
+            if let Err(e) = send_event(&on_progress, StreamEvent::Failed(err.clone())) {
+                tracing::warn!("generate_dialogue: failed event send failed: {e}");
+            }
+            Err(err)
+        }
+    }
+}
+
+/// Cancels the in-flight dialogue-script generation for a notebook (#26, stop
+/// button). Returns `true` if one was in flight and cancelled, `false` otherwise.
+#[tracing::instrument(skip(engine))]
+#[tauri::command]
+pub async fn cancel_dialogue(
+    notebook_id: String,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<bool, LensError> {
+    Ok(engine.cancel_dialogue_generation(&notebook_id))
 }
 
 /// Persists a user chat message on send (#22). `turn_id` is minted by the frontend
