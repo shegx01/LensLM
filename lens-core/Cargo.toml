@@ -38,14 +38,13 @@ default = ["local-whisper"]
 test-util = []
 
 # issue #91: the candle + Metal (Apple GPU) embedding backend.
-# Pulls candle-core/candle-nn/candle-transformers + hf-hub, all gated to
-# aarch64-apple-darwin in the target table below (they only build there). OFF by
-# default, so non-macOS / non-aarch64 CI never compiles candle. The GPU-offload
-# path proven live after the ORT-CoreML-EP path was measured dead (see memory
+# candle-core/candle-nn are now NON-optional base deps (issue #191 un-gated them
+# for the cross-platform SNAC decoder), so this feature only gates the embedder's
+# candle-transformers + hf-hub, still target-limited to aarch64-apple-darwin in the
+# target table below (they only build there). OFF by default; the GPU-offload path
+# proven live after the ORT-CoreML-EP path was measured dead (see memory
 # issue-91-native-ml-seam + .omc HANDOFF). MUST stay aarch64-apple-darwin only.
 native-ml-metal = [
-    "dep:candle-core",
-    "dep:candle-nn",
     "dep:candle-transformers",
     "dep:hf-hub",
 ]
@@ -243,23 +242,34 @@ pulldown-cmark = "0.13.4"
 tokenizers = "0.22"
 # async fn in the VectorStore trait.
 async-trait = "0.1"
+
+# --- issue #191 [161c]: SNAC neural-codec decoder (candle) ---
+# candle-core/candle-nn are NON-optional base deps: the SNAC decoder (tts/snac.rs)
+# decodes Orpheus audio tokens → 24 kHz PCM and MUST build on every platform (CPU
+# everywhere; the `metal` feature is unioned on macOS-aarch64 via the target table
+# below). Un-gated from the previous macOS-only #91 posture. candle-transformers +
+# hf-hub stay optional behind `native-ml-metal` (embedder path only). Pinned
+# =0.11.0 (matches #91); MIT OR Apache-2.0 — both in deny.toml allowlist.
+candle-core = "=0.11.0"
+candle-nn = "=0.11.0"
 # Temp dir for the `eval` binary's throwaway LanceDB corpus. (Also a dev-dep for
 # the integration tests; declaring it here makes it available to the bin target.)
 tempfile = { workspace = true }
 
-# --- issue #91: candle + Metal embedding backend ---
+# --- issue #91 + #191: candle + Metal on Apple Silicon ---
 # Gated to aarch64-apple-darwin: candle's `metal` feature pulls Apple's Metal
-# Shading Language kernels (objc2-metal) that ONLY build on Apple Silicon macOS,
-# and the whole point (GPU offload) is Apple-Silicon-specific. All four crates are
-# `optional` and pulled in ONLY by the `native-ml-metal` feature (off by default),
-# so a default build on this target does NOT compile them either. candle 0.11.0
-# (2026-06-26). Do NOT enable `flash-attn` (CUDA-only, will not compile on Metal).
-# Weights loaded as DType::F32 (fp16 on M-series is only ~1.1x faster but breaks
-# cross-engine cosine parity — see memory issue-91-native-ml-seam). MIT OR
-# Apache-2.0 (candle, hf-hub) — both in deny.toml allowlist.
+# Shading Language kernels (objc2-metal) that ONLY build on Apple Silicon macOS.
+# candle-core/candle-nn are declared here to UNION the `metal` feature onto the
+# non-optional base deps (GPU offload on Apple Silicon; CPU everywhere else).
+# candle-transformers/hf-hub remain `optional` — pulled in only by the
+# `native-ml-metal` embedder feature (off by default). candle 0.11.0 (2026-06-26).
+# Do NOT enable `flash-attn` (CUDA-only, will not compile on Metal). Weights loaded
+# as DType::F32 (fp16 on M-series is only ~1.1x faster but breaks cross-engine
+# cosine parity — see memory issue-91-native-ml-seam). MIT OR Apache-2.0 (candle,
+# hf-hub) — both in deny.toml allowlist.
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
-candle-core = { version = "=0.11.0", features = ["metal"], optional = true }
-candle-nn = { version = "=0.11.0", features = ["metal"], optional = true }
+candle-core = { version = "=0.11.0", features = ["metal"] }
+candle-nn = { version = "=0.11.0", features = ["metal"] }
 candle-transformers = { version = "=0.11.0", features = ["metal"], optional = true }
 # HF weight/config/tokenizer fetch for the candle backend. hf-hub 0.5.0 is ALREADY
 # resolved in the lock tree (transitive via fastembed), so this pulls NO new copy —

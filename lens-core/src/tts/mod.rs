@@ -12,6 +12,7 @@ pub mod audio;
 mod kokoro;
 pub mod registry;
 pub mod sidecar;
+pub mod snac;
 
 pub use audio::AudioBuffer;
 pub(crate) use audio::write_wav_16bit;

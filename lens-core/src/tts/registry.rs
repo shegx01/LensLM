@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use crate::LensError;
 use crate::tts::DownloadProgress;
 use crate::tts::kokoro::{KOKORO_MODEL_RELPATH, KOKORO_MODEL_SHA256_HEX, KOKORO_MODEL_URL};
+use crate::tts::snac::{SNAC_MODEL_ID, SNAC_MODEL_RELPATH, SNAC_MODEL_SHA256_HEX, SNAC_MODEL_URL};
 
 pub struct TtsModelSpec {
     pub id: &'static str,
@@ -11,12 +12,22 @@ pub struct TtsModelSpec {
     pub relpath: &'static str,
 }
 
-pub static TTS_REGISTRY: &[TtsModelSpec] = &[TtsModelSpec {
-    id: "kokoro",
-    url: KOKORO_MODEL_URL,
-    sha256: KOKORO_MODEL_SHA256_HEX,
-    relpath: KOKORO_MODEL_RELPATH,
-}];
+pub static TTS_REGISTRY: &[TtsModelSpec] = &[
+    TtsModelSpec {
+        id: "kokoro",
+        url: KOKORO_MODEL_URL,
+        sha256: KOKORO_MODEL_SHA256_HEX,
+        relpath: KOKORO_MODEL_RELPATH,
+    },
+    // issue #191 [161c]: SNAC 24 kHz neural-codec decoder weights (upstream
+    // PyTorch `.bin`, loaded by candle via `VarBuilder::from_pth`).
+    TtsModelSpec {
+        id: SNAC_MODEL_ID,
+        url: SNAC_MODEL_URL,
+        sha256: SNAC_MODEL_SHA256_HEX,
+        relpath: SNAC_MODEL_RELPATH,
+    },
+];
 
 pub fn resolve_tts(id: &str) -> Option<&'static TtsModelSpec> {
     TTS_REGISTRY.iter().find(|s| s.id == id)
@@ -67,6 +78,16 @@ mod tests {
         assert_eq!(spec.sha256.len(), 64);
         assert!(spec.sha256.bytes().all(|b| b.is_ascii_hexdigit()));
         assert!(spec.relpath.ends_with("model_q8f16.onnx"));
+    }
+
+    #[test]
+    fn resolve_known_snac() {
+        let spec = resolve_tts("snac").expect("snac must be registered");
+        assert_eq!(spec.id, "snac");
+        assert!(spec.url.starts_with("https://") && spec.url.contains("snac_24khz"));
+        assert_eq!(spec.sha256.len(), 64);
+        assert!(spec.sha256.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(spec.relpath, "models/snac/pytorch_model.bin");
     }
 
     #[test]
