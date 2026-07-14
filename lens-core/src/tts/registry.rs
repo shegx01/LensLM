@@ -3,6 +3,9 @@ use std::path::{Path, PathBuf};
 use crate::LensError;
 use crate::tts::DownloadProgress;
 use crate::tts::kokoro::{KOKORO_MODEL_RELPATH, KOKORO_MODEL_SHA256_HEX, KOKORO_MODEL_URL};
+use crate::tts::orpheus::{
+    ORPHEUS_MODEL_ID, ORPHEUS_MODEL_RELPATH, ORPHEUS_MODEL_SHA256_HEX, ORPHEUS_MODEL_URL,
+};
 use crate::tts::snac::{SNAC_MODEL_ID, SNAC_MODEL_RELPATH, SNAC_MODEL_SHA256_HEX, SNAC_MODEL_URL};
 
 pub struct TtsModelSpec {
@@ -26,6 +29,14 @@ pub static TTS_REGISTRY: &[TtsModelSpec] = &[
         url: SNAC_MODEL_URL,
         sha256: SNAC_MODEL_SHA256_HEX,
         relpath: SNAC_MODEL_RELPATH,
+    },
+    // issue #191 [161c]: Orpheus-3B Q4_K_M GGUF (llama.cpp) — emits SNAC audio
+    // tokens. Paired with the SNAC decoder above; both required for the backend.
+    TtsModelSpec {
+        id: ORPHEUS_MODEL_ID,
+        url: ORPHEUS_MODEL_URL,
+        sha256: ORPHEUS_MODEL_SHA256_HEX,
+        relpath: ORPHEUS_MODEL_RELPATH,
     },
 ];
 
@@ -88,6 +99,16 @@ mod tests {
         assert_eq!(spec.sha256.len(), 64);
         assert!(spec.sha256.bytes().all(|b| b.is_ascii_hexdigit()));
         assert_eq!(spec.relpath, "models/snac/pytorch_model.bin");
+    }
+
+    #[test]
+    fn resolve_known_orpheus() {
+        let spec = resolve_tts("orpheus").expect("orpheus must be registered");
+        assert_eq!(spec.id, "orpheus");
+        assert!(spec.url.starts_with("https://") && spec.url.ends_with(".gguf"));
+        assert_eq!(spec.sha256.len(), 64);
+        assert!(spec.sha256.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(spec.relpath, "models/orpheus/orpheus-3b-0.1-ft-Q4_K_M.gguf");
     }
 
     #[test]

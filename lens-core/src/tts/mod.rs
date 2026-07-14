@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -10,6 +11,7 @@ use crate::error::LensError;
 
 pub mod audio;
 mod kokoro;
+pub mod orpheus;
 pub mod registry;
 pub mod sidecar;
 pub mod snac;
@@ -142,18 +144,39 @@ pub trait TtsProvider: Send + Sync {
     }
 }
 
-pub fn resolve_tts_provider(backend: TtsBackend, _cfg: &TtsConfig) -> Option<Arc<dyn TtsProvider>> {
+/// Resolves a [`TtsProvider`] for `backend`. Construction is cheap: an embedded
+/// provider (Orpheus) holds only its model paths + config and lazy-loads weights
+/// on first synth (see [`orpheus::OrpheusAdapter`]). `data_dir` supplies the
+/// model relpaths; availability (whether those files exist) is a separate cheap
+/// probe (`tts_model_downloaded`), so a missing artifact surfaces as a lazy-load
+/// `LensError::Tts`, never a silent `None`.
+pub fn resolve_tts_provider(
+    backend: TtsBackend,
+    _cfg: &TtsConfig,
+    data_dir: &Path,
+) -> Option<Arc<dyn TtsProvider>> {
     match backend {
+        TtsBackend::Orpheus => {
+            let orpheus = tts_model_path(data_dir, "orpheus")?;
+            let snac = tts_model_path(data_dir, "snac")?;
+            Some(Arc::new(orpheus::OrpheusAdapter::new(orpheus, snac)))
+        }
         TtsBackend::Kokoro => None,
-        TtsBackend::Orpheus => None,
         TtsBackend::MossLocal => None,
         TtsBackend::MossTtsd => None,
         TtsBackend::Cloud(_) => None,
     }
 }
 
-pub fn emotion_tag(_emotion: Emotion, _backend: TtsBackend) -> Option<String> {
-    None
+pub fn emotion_tag(emotion: Emotion, backend: TtsBackend) -> Option<String> {
+    match backend {
+        TtsBackend::Orpheus => match emotion {
+            Emotion::Laugh => Some("<laugh>".to_string()),
+            Emotion::Sigh => Some("<sigh>".to_string()),
+            Emotion::Neutral | Emotion::Excited | Emotion::Thoughtful => None,
+        },
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -161,23 +184,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolve_returns_none_for_every_backend() {
+    fn resolve_returns_none_for_non_embedded_backends() {
         let cfg = TtsConfig::default();
+        let data_dir = Path::new("/data");
         for backend in [
             TtsBackend::Kokoro,
-            TtsBackend::Orpheus,
             TtsBackend::MossLocal,
             TtsBackend::MossTtsd,
             TtsBackend::Cloud(CloudTtsKind::OpenAiCompatible),
             TtsBackend::Cloud(CloudTtsKind::Deepgram),
             TtsBackend::Cloud(CloudTtsKind::ElevenLabs),
         ] {
-            assert!(resolve_tts_provider(backend, &cfg).is_none());
+            assert!(resolve_tts_provider(backend, &cfg, data_dir).is_none());
         }
     }
 
     #[test]
-    fn emotion_tag_is_none_scaffold() {
+    fn resolve_returns_orpheus_adapter_cheaply() {
+        // Cheap construct: an adapter is returned even when the weights are
+        // absent (paths only, no load); availability is a separate file probe.
+        let cfg = TtsConfig::default();
+        let provider = resolve_tts_provider(TtsBackend::Orpheus, &cfg, Path::new("/data"))
+            .expect("orpheus resolves to an adapter");
+        assert_eq!(provider.info().backend, TtsBackend::Orpheus);
+    }
+
+    #[test]
+    fn emotion_tag_orpheus_table() {
+        assert_eq!(emotion_tag(Emotion::Neutral, TtsBackend::Orpheus), None);
+        assert_eq!(
+            emotion_tag(Emotion::Laugh, TtsBackend::Orpheus).as_deref(),
+            Some("<laugh>")
+        );
+        assert_eq!(
+            emotion_tag(Emotion::Sigh, TtsBackend::Orpheus).as_deref(),
+            Some("<sigh>")
+        );
+        assert_eq!(emotion_tag(Emotion::Excited, TtsBackend::Orpheus), None);
+        assert_eq!(emotion_tag(Emotion::Thoughtful, TtsBackend::Orpheus), None);
+    }
+
+    #[test]
+    fn emotion_tag_none_for_non_orpheus_backends() {
         for emotion in [
             Emotion::Neutral,
             Emotion::Laugh,
@@ -185,7 +233,7 @@ mod tests {
             Emotion::Excited,
             Emotion::Thoughtful,
         ] {
-            assert!(emotion_tag(emotion, TtsBackend::Orpheus).is_none());
+            assert!(emotion_tag(emotion, TtsBackend::Kokoro).is_none());
         }
     }
 
