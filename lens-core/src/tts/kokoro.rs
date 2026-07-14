@@ -1,8 +1,4 @@
-//! Kokoro TTS scaffold (issue #190 seam split): static voice catalog and ONNX
-//! model download. Vestigial after #190 — the provider seam supersedes it — but
-//! kept intact and re-exported so the existing voice-list / download / system-check
-//! command paths do not regress. Removed in #192 once a real adapter (#191 Orpheus)
-//! exists.
+//! Text-to-speech (Kokoro): static voice catalog and ONNX model download.
 //!
 //! Owns the pure pieces (voice list, [`DownloadProgress`] IPC type, streaming download with a
 //! progress closure); the Tauri command layer adapts the closure onto a `tauri::ipc::Channel`.
@@ -21,9 +17,7 @@ pub const KOKORO_MODEL_URL: &str =
 pub const KOKORO_MODEL_FILENAME: &str = "model_q8f16.onnx";
 pub const KOKORO_MODEL_RELPATH: &str = "models/kokoro/model_q8f16.onnx";
 
-/// SHA256 from the HuggingFace LFS `oid` (`lfs.oid` IS the file SHA256), as raw
-/// hex. Shared with [`TTS_REGISTRY`](super::registry::TTS_REGISTRY) so the seam
-/// registry and the vestigial downloader agree on the pinned hash.
+/// SHA256 from the HuggingFace LFS `oid` (`lfs.oid` IS the file SHA256), as raw hex.
 pub(crate) const KOKORO_MODEL_SHA256_HEX: &str =
     "04c658aec1b6008857c2ad10f8c589d4180d0ec427e7e6118ceb487e215c3cd0";
 

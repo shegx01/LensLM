@@ -70,9 +70,6 @@ pub enum LensError {
     #[error("cancelled: {0}")]
     Cancelled(String),
 
-    /// Text-to-speech synthesis failed or no TTS backend is available (issue
-    /// #190). Distinct programmatic kind so the UI can prompt the user to install
-    /// an engine rather than surfacing a generic model error.
     #[error("tts error: {0}")]
     Tts(String),
 }

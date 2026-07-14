@@ -538,15 +538,6 @@ pub async fn cancel_dialogue(
     Ok(engine.cancel_dialogue_generation(&notebook_id))
 }
 
-/// Synthesizes a notebook's audio overview to a WAV and returns its path (#190).
-/// Streams `Started → Chunk(Synthesizing{turn,total})… → Chunk(Stitching) →
-/// Chunk(Encoding) → Done` on `on_progress`. Per-notebook single-flight over a
-/// DEDICATED TTS registry (never ask/dialogue). Checks backend availability
-/// FIRST: with no adapter (#190) or sidecar, that check always fails, so this
-/// returns the no-backend `LensError::Tts` WITHOUT spending a billable
-/// `generate_dialogue` call on a synthesis that is guaranteed to fail. Once a
-/// backend is available, the grounded dialogue script is generated at the
-/// default medium length (#194's UI will pick the length), then synthesized.
 #[tracing::instrument(skip(on_progress, engine))]
 #[tauri::command]
 pub async fn synthesize_overview(
@@ -621,8 +612,6 @@ pub async fn synthesize_overview(
     }
 }
 
-/// Cancels the in-flight audio-overview synthesis for a notebook (#190, stop
-/// button). Returns `true` if one was in flight and cancelled, `false` otherwise.
 #[tracing::instrument(skip(engine))]
 #[tauri::command]
 pub async fn cancel_synthesis(

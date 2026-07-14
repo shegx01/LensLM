@@ -145,12 +145,6 @@ pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
-/// Single source of truth for the f32→16-bit-PCM sample mapping: clamp to
-/// `[-1.0, 1.0]`, then scale to `i16`. Shared by the TTS hound WAV writer
-/// (`tts::audio::write_wav_16bit`) and the cloud-ASR in-memory WAV wrapper
-/// (`asr::cloud::wav::pcm_to_wav`) — sibling modules with no existing
-/// dependency between them, so the shared policy lives here rather than one
-/// importing the other (mirrors [`hex_encode`]'s placement).
 pub(crate) fn f32_sample_to_i16(s: f32) -> i16 {
     (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16
 }
@@ -311,15 +305,8 @@ pub struct LensEngine {
     /// the ask registry.
     dialogue_cancel_tokens:
         Arc<std::sync::Mutex<HashMap<String, Arc<tokio_util::sync::CancellationToken>>>>,
-    /// In-flight TTS-synthesis (#190) cancellation tokens, keyed by `notebook_id`
-    /// (single-flight per notebook — the overview WAV is overwritten on regenerate).
-    /// A DEDICATED registry, separate from ask/dialogue, with the same ABA-safe
-    /// `Arc::ptr_eq` guard shape.
     tts_cancel_tokens:
         Arc<std::sync::Mutex<HashMap<String, Arc<tokio_util::sync::CancellationToken>>>>,
-    /// Injected out-of-process TTS engine (#193). `None` in #190 and headless tests;
-    /// mirrors the `js_renderer` DI cell. The `synthesize_overview` resolution
-    /// precedence prefers this when present and healthy.
     tts_sidecar: Arc<RwLock<Option<Arc<dyn tts::TtsSidecar>>>>,
     /// Lazily-built internal LocalWhisper engines, keyed by model id (#42). Mirrors
     /// the embedder cache but lighter — whisper has one active model at a time. The
@@ -1076,17 +1063,10 @@ impl LensEngine {
         self.js_renderer.read().await.clone()
     }
 
-    /// Installs (or replaces) the out-of-process TTS engine (#193). `None` clears
-    /// it (the `synthesize_overview` precedence then falls through to
-    /// `resolve_tts_provider`). Mirrors [`set_js_renderer`](Self::set_js_renderer);
-    /// the concrete process manager is injected here because `lens-core` cannot
-    /// depend on `tauri`.
     pub async fn set_tts_sidecar(&self, sidecar: Option<Arc<dyn tts::TtsSidecar>>) {
         *self.tts_sidecar.write().await = sidecar;
     }
 
-    /// Returns a clone of the injected TTS sidecar handle, or `None` when none is
-    /// installed (#190 always).
     pub async fn tts_sidecar(&self) -> Option<Arc<dyn tts::TtsSidecar>> {
         self.tts_sidecar.read().await.clone()
     }
@@ -1278,10 +1258,6 @@ impl LensEngine {
         }
     }
 
-    /// Registers a fresh single-flight cancellation token for a TTS-synthesis run
-    /// (#190), keyed by `notebook_id`. A prior in-flight synthesis for this notebook
-    /// is `.cancel()`d FIRST, then replaced. Dedicated registry — never the ask or
-    /// dialogue registry (a synthesis cancel must not stop an in-flight chat/dialogue).
     pub fn register_tts(&self, notebook_id: &str) -> Arc<tokio_util::sync::CancellationToken> {
         let token = Arc::new(tokio_util::sync::CancellationToken::new());
         let mut map = self
@@ -1294,8 +1270,6 @@ impl LensEngine {
         token
     }
 
-    /// Cancels the in-flight TTS-synthesis run for `notebook_id` by flipping its
-    /// token. Returns `true` if one was found, `false` otherwise (#190).
     pub fn cancel_synthesis(&self, notebook_id: &str) -> bool {
         let map = self
             .tts_cancel_tokens
@@ -1310,9 +1284,7 @@ impl LensEngine {
         }
     }
 
-    /// Removes the TTS token for `notebook_id` only when `owner` is still the stored
-    /// token (`Arc::ptr_eq`), so a superseded run's guard never evicts the live
-    /// token (ABA-safe, mirroring `remove_dialogue_if_owner`).
+    // `Arc::ptr_eq` gate: a superseded run's guard must not evict the live token (ABA-safe).
     fn remove_tts_if_owner(
         &self,
         notebook_id: &str,
@@ -1329,9 +1301,6 @@ impl LensEngine {
         }
     }
 
-    /// Builds the RAII [`TtsCancelGuard`] for a registered synthesis run; `owner` is
-    /// the `Arc` from [`register_tts`](Self::register_tts) the guard's Drop
-    /// `Arc::ptr_eq`-matches on removal.
     pub fn tts_cancel_guard(
         &self,
         notebook_id: &str,
@@ -1344,11 +1313,6 @@ impl LensEngine {
         }
     }
 
-    /// Whether a TTS backend can currently serve [`synthesize_overview`](Self::synthesize_overview)
-    /// for `cfg`: a healthy injected sidecar, or a resolvable
-    /// [`resolve_tts_provider`](tts::resolve_tts_provider). Lets a caller
-    /// short-circuit before generating a (billable) dialogue script when
-    /// synthesis is guaranteed to fail with the no-backend error.
     pub async fn tts_backend_available(&self, cfg: &config::TtsConfig) -> bool {
         if let Some(sidecar) = self.tts_sidecar().await
             && sidecar.health().await
@@ -1358,16 +1322,6 @@ impl LensEngine {
         tts::resolve_tts_provider(cfg.backend, cfg).is_some()
     }
 
-    /// Synthesizes a dialogue `script` into a single overview WAV at
-    /// [`notebook_audio_path`] and returns that path (#190). Resolution precedence,
-    /// frozen so #191/#193 are pure fill-ins: (1) an injected + healthy
-    /// [`TtsSidecar`](tts::TtsSidecar) drives per-turn synthesis then stitches;
-    /// (2) else [`resolve_tts_provider`](tts::resolve_tts_provider) drives the
-    /// provider's `synthesize_script`; (3) else a typed no-backend
-    /// [`LensError::Tts`]. In #190 (1) and (2) never fire (no impl / all-`None`), so
-    /// this always hits (3). `Encoding` is emitted here exactly once, immediately
-    /// before the WAV write. `on_phase`'s `Fn + Sync` bound mirrors
-    /// [`TtsProvider::synthesize_script`](tts::TtsProvider::synthesize_script)'s.
     pub async fn synthesize_overview(
         &self,
         notebook_id: &str,
@@ -2684,9 +2638,6 @@ impl Drop for DialogueCancelGuard {
     }
 }
 
-/// RAII guard that clears a TTS-synthesis (#190) cancellation-registry entry on
-/// drop via [`remove_tts_if_owner`](LensEngine::remove_tts_if_owner). A dedicated
-/// guard over the TTS registry, parallel to [`DialogueCancelGuard`].
 pub struct TtsCancelGuard {
     engine: LensEngine,
     notebook_id: String,
@@ -2700,12 +2651,6 @@ impl Drop for TtsCancelGuard {
     }
 }
 
-/// Single source of truth for a notebook's overview-audio path:
-/// `{data_dir}/notebooks/{notebook_id}/overview.wav` (#190). One file per
-/// notebook, overwritten on regenerate — which is why the TTS cancel registry is
-/// single-flight per `notebook_id`. Rejects an empty, separator-containing,
-/// `..`-containing, or absolute id (`Validation`) so the IPC-supplied id can never
-/// escape `{data_dir}/notebooks/`.
 pub fn notebook_audio_path(
     data_dir: &Path,
     notebook_id: &str,
@@ -3126,8 +3071,6 @@ mod tts_cancel_tests {
 
     #[tokio::test]
     async fn synthesize_overview_no_backend_is_tts_error() {
-        // Default engine: Kokoro backend (all-None resolver) + no injected sidecar,
-        // so the resolution precedence falls through to the typed no-backend error.
         let engine = LensEngine::for_test().await;
         let script = DialogueScript {
             turns: vec![

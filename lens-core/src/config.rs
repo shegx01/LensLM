@@ -44,11 +44,6 @@ impl std::fmt::Debug for ModelConfig {
     }
 }
 
-/// A single voice reference bound to a [`Speaker`](crate::dialogue::Speaker):
-/// either a named preset (`"af_heart"`, an Orpheus voice) or a reference clip for
-/// voice-cloning backends (#191). `#[serde(untagged)]` with `Named` FIRST so a
-/// bare JSON string deserializes to `Named` and a `{clip_path, transcript}` object
-/// to `Reference`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum VoiceRef {
@@ -66,22 +61,17 @@ impl Default for VoiceRef {
 }
 
 impl VoiceRef {
-    /// Whether this reference is unset — an empty `Named` (the default). Used by
-    /// the system-check TTS readiness gate.
     pub fn is_unset(&self) -> bool {
         matches!(self, VoiceRef::Named(s) if s.is_empty())
     }
 }
 
-/// Host/guest voices used by the TTS subsystem.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct VoiceConfig {
     pub host: VoiceRef,
     pub guest: VoiceRef,
 }
 
-/// Cloud TTS credentials for [`TtsBackend::Cloud`]. `Debug` is manual so `api_key`
-/// is redacted, exactly like [`ModelConfig`].
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct CloudTtsConfig {
     pub kind: CloudTtsKind,
@@ -101,10 +91,6 @@ impl std::fmt::Debug for CloudTtsConfig {
     }
 }
 
-/// TTS synthesis configuration. `version` is an explicit forward-migration marker
-/// (the first such convention in `config.rs`); reads coerce a legacy
-/// `{provider, api_key}` shape via [`RawTtsConfig`]. `Debug` derives — the nested
-/// [`CloudTtsConfig`] redacts its own `api_key`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(from = "RawTtsConfig")]
 pub struct TtsConfig {
@@ -125,18 +111,12 @@ impl Default for TtsConfig {
     }
 }
 
-/// Deserialization shim carrying BOTH the legacy (`{provider, api_key}`) and new
-/// (`{version, backend, model, cloud}`) fields, so a coerce never silently drops a
-/// legacy cloud key (which per-field `#[serde(default)]` would). See
-/// [`From<RawTtsConfig> for TtsConfig`](TtsConfig).
 #[derive(Deserialize)]
 struct RawTtsConfig {
-    // Legacy shape (pre-#190).
     #[serde(default)]
     provider: Option<String>,
     #[serde(default)]
     api_key: Option<String>,
-    // Current shape.
     #[serde(default)]
     version: Option<u32>,
     #[serde(default)]
@@ -149,7 +129,6 @@ struct RawTtsConfig {
 
 impl From<RawTtsConfig> for TtsConfig {
     fn from(raw: RawTtsConfig) -> Self {
-        // A present `version` marks a current-shape payload: pass through.
         if let Some(version) = raw.version {
             return TtsConfig {
                 version,
@@ -158,8 +137,6 @@ impl From<RawTtsConfig> for TtsConfig {
                 cloud: raw.cloud,
             };
         }
-        // No version → legacy coerce. A non-empty legacy `provider` was always a
-        // cloud provider; preserve its key under the OpenAI-compatible dialect.
         match raw.provider {
             Some(provider) if !provider.is_empty() => TtsConfig {
                 version: 1,
@@ -977,9 +954,6 @@ mod tests {
 
     #[test]
     fn legacy_nonempty_tts_coerces_and_preserves_cloud_key() {
-        // A pre-#190 config with NO version and a non-empty legacy provider must
-        // coerce to a cloud backend WITHOUT dropping the api_key (the silent-drop
-        // regression the RawTtsConfig shim exists to prevent).
         let json = r#"{ "provider": "elevenlabs", "api_key": "sk-xyz" }"#;
         let cfg: TtsConfig = serde_json::from_str(json).unwrap();
         assert_eq!(
@@ -1004,19 +978,16 @@ mod tests {
 
     #[test]
     fn voice_ref_untagged_round_trips() {
-        // Bare string ↔ Named.
         let named = VoiceRef::Named("af_heart".to_string());
         let json = serde_json::to_string(&named).unwrap();
         assert_eq!(json, "\"af_heart\"");
         assert_eq!(serde_json::from_str::<VoiceRef>(&json).unwrap(), named);
-        // Object ↔ Reference.
         let reference = VoiceRef::Reference {
             clip_path: PathBuf::from("/clips/host.wav"),
             transcript: "hello there".to_string(),
         };
         let obj = serde_json::to_string(&reference).unwrap();
         assert_eq!(serde_json::from_str::<VoiceRef>(&obj).unwrap(), reference);
-        // A bare string must NOT accidentally match Reference.
         assert_eq!(
             serde_json::from_str::<VoiceRef>("\"x\"").unwrap(),
             VoiceRef::Named("x".to_string())

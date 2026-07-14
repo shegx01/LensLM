@@ -1,8 +1,3 @@
-//! Audio pipeline for the TTS overview (#190): the canonical [`AudioBuffer`]
-//! (24 kHz mono f32), a rubato resampler, the speaker-aware turn stitcher, and
-//! the 16-bit PCM WAV encoder. All behaviour is offline-provable with synthetic
-//! buffers — no synthesis engine is involved here.
-
 use std::path::Path;
 
 use rubato::{
@@ -12,30 +7,17 @@ use rubato::{
 use crate::dialogue::Speaker;
 use crate::error::LensError;
 
-/// Canonical output sample rate for the whole TTS pipeline. Adapter output at a
-/// different rate is resampled to this before stitching.
 pub const TARGET_RATE: u32 = 24_000;
 
-/// Inter-turn silence when the same speaker continues (ms).
 const WITHIN_GAP_MS: u32 = 350;
-/// Inter-turn silence at a speaker change (ms).
 const CHANGE_GAP_MS: u32 = 450;
-/// Raised-cosine edge-fade window applied to each turn's head and tail (ms).
 const FADE_MS: u32 = 30;
-/// Peak-normalization target for the full stitched output (dBFS).
 const PEAK_DBFS: f32 = -1.0;
 
-/// Fixed input-chunk size (source-rate frames) fed to the sinc resampler per
-/// `process` call — matching `transcription.rs`. The FIR retains state across
-/// calls, so this does not affect the output signal.
 const RESAMPLE_CHUNK_FRAMES: usize = 1024;
 
-/// Output channel index for the single (mono) resampler channel.
 const MONO: usize = 0;
 
-/// A block of mono f32 PCM at a known sample rate. The pipeline's canonical unit:
-/// an adapter produces one per turn; the stitcher concatenates them into the
-/// overview.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AudioBuffer {
     pub samples: Vec<f32>,
@@ -44,7 +26,6 @@ pub struct AudioBuffer {
 }
 
 impl AudioBuffer {
-    /// A mono buffer at the given rate.
     pub fn mono(samples: Vec<f32>, sample_rate: u32) -> Self {
         Self {
             samples,
@@ -53,11 +34,6 @@ impl AudioBuffer {
         }
     }
 
-    /// Resamples to `target` Hz. A no-op clone at an equal rate; otherwise a sinc
-    /// resample via `rubato::SincFixedIn` fed in fixed chunks with a
-    /// `process_partial` tail-flush (the same chunked pattern `transcription.rs`
-    /// uses — a one-shot whole-buffer `process` would error with
-    /// `WrongNumberOfFrames`). Mono only.
     pub fn resample_to(&self, target: u32) -> Result<AudioBuffer, LensError> {
         if self.sample_rate == target {
             return Ok(self.clone());
@@ -74,6 +50,7 @@ impl AudioBuffer {
             SincFixedIn::<f32>::new(ratio, 1.0, params, RESAMPLE_CHUNK_FRAMES, 1)
                 .map_err(|e| LensError::Internal(format!("tts resampler init failed: {e}")))?;
 
+        // SincFixedIn requires fixed-size chunks; a one-shot whole-buffer feed errors, so chunk + process_partial tail-flush.
         let mut out: Vec<f32> = Vec::new();
         let mut idx = 0usize;
         while self.samples.len() - idx >= RESAMPLE_CHUNK_FRAMES {
@@ -89,14 +66,11 @@ impl AudioBuffer {
                 .map_err(resample_err)?;
             out.extend_from_slice(&res[MONO]);
         }
-        // Flush the FIR delay line so no trailing input is dropped.
         let flushed = resampler
             .process_partial(None::<&[Vec<f32>]>, None)
             .map_err(resample_err)?;
         out.extend_from_slice(&flushed[MONO]);
 
-        // Trim to the duration-exact length: the sinc filter's group delay adds a
-        // few hundred trailing frames the caller never asked for.
         let expected =
             (self.samples.len() as u64 * target as u64 / self.sample_rate as u64) as usize;
         out.resize(expected, 0.0);
@@ -105,9 +79,6 @@ impl AudioBuffer {
     }
 }
 
-/// Stitches per-turn buffers into one overview at [`TARGET_RATE`], with
-/// speaker-aware silence gaps and edge fades — NOT an overlap-add crossfade,
-/// since the turns are silence-separated and there is nothing to overlap.
 pub(crate) fn stitch_turns(buffers: &[(Speaker, AudioBuffer)]) -> Result<AudioBuffer, LensError> {
     let fade_samples = ms_to_samples(FADE_MS);
     let mut out: Vec<f32> = Vec::new();
@@ -123,6 +94,7 @@ pub(crate) fn stitch_turns(buffers: &[(Speaker, AudioBuffer)]) -> Result<AudioBu
             out.resize(out.len() + ms_to_samples(gap_ms), 0.0);
         }
         let mut samples = buf.resample_to(TARGET_RATE)?.samples;
+        // Edge fades over silence-separated turns, NOT an overlap-add crossfade.
         apply_edge_fades(&mut samples, fade_samples);
         out.extend_from_slice(&samples);
         prev = Some(*speaker);
@@ -132,8 +104,6 @@ pub(crate) fn stitch_turns(buffers: &[(Speaker, AudioBuffer)]) -> Result<AudioBu
     Ok(AudioBuffer::mono(out, TARGET_RATE))
 }
 
-/// Encodes `buffer` as a single-channel 16-bit PCM WAV at `path` via hound.
-/// Sample mapping is [`crate::f32_sample_to_i16`].
 pub(crate) fn write_wav_16bit(buffer: &AudioBuffer, path: &Path) -> Result<(), LensError> {
     let spec = hound::WavSpec {
         channels: 1,
@@ -151,14 +121,10 @@ pub(crate) fn write_wav_16bit(buffer: &AudioBuffer, path: &Path) -> Result<(), L
     Ok(())
 }
 
-/// Whole samples for `ms` at [`TARGET_RATE`] (exact for the 350/450/30 ms consts).
 fn ms_to_samples(ms: u32) -> usize {
     (ms * TARGET_RATE / 1000) as usize
 }
 
-/// Applies a raised-cosine fade-in over the first `fade` samples and a fade-out
-/// over the last `fade` samples, in place. The window is clamped to
-/// `min(fade, len/2)` so a turn shorter than the fade window can never underflow.
 fn apply_edge_fades(samples: &mut [f32], fade: usize) {
     let n = samples.len();
     let fade = fade.min(n / 2);
@@ -173,8 +139,6 @@ fn apply_edge_fades(samples: &mut [f32], fade: usize) {
     }
 }
 
-/// Scales `samples` so the peak magnitude sits at `target_dbfs`. A fully-silent
-/// buffer (max magnitude 0) is left unchanged (no divide-by-zero).
 fn peak_normalize(samples: &mut [f32], target_dbfs: f32) {
     let max_abs = samples.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
     if max_abs == 0.0 {
@@ -207,14 +171,12 @@ mod tests {
     fn stitch_length_is_sum_of_turns_plus_gaps_with_zero_gap_region() {
         let a = buf(vec![0.5; 1000]);
         let b = buf(vec![0.5; 1000]);
-        // Same speaker → within-gap = 8400 samples @ 24 kHz.
         let out = stitch_turns(&[(Speaker::Host, a), (Speaker::Host, b)]).unwrap();
         let within_gap = (WITHIN_GAP_MS * TARGET_RATE / 1000) as usize;
         assert_eq!(within_gap, 8400);
         assert_eq!(out.samples.len(), 1000 + within_gap + 1000);
         assert_eq!(out.sample_rate, TARGET_RATE);
         assert_eq!(out.channels, 1);
-        // The gap region between the two turns is exactly zeros.
         for &s in &out.samples[1000..1000 + within_gap] {
             assert_eq!(s, 0.0);
         }
@@ -235,7 +197,6 @@ mod tests {
 
     #[test]
     fn short_turn_shorter_than_fade_window_does_not_panic() {
-        // 4 samples ≪ the 720-sample fade window; fade clamps to len/2 = 2.
         let out = stitch_turns(&[(Speaker::Host, buf(vec![0.9; 4]))]).unwrap();
         assert_eq!(out.samples.len(), 4);
     }
@@ -249,8 +210,6 @@ mod tests {
 
     #[test]
     fn peak_normalizes_to_minus_one_dbfs() {
-        // A single long turn (well over the fade window) with peak 0.2 must be
-        // lifted to ≈ 0.891 (−1 dBFS). Check a mid sample past the fade region.
         let out = stitch_turns(&[(Speaker::Host, buf(vec![0.2; 10_000]))]).unwrap();
         let peak = out.samples.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
         assert!((peak - 0.891_25).abs() < 1e-3, "peak was {peak}");
@@ -297,7 +256,6 @@ mod tests {
             .collect();
         assert_eq!(read.len(), samples.len());
         for (got, want) in read.iter().zip(samples.iter()) {
-            // 16-bit quantization step ≈ 1/32767.
             assert!((got - want).abs() < 1.0 / 32_000.0, "got {got} want {want}");
         }
     }

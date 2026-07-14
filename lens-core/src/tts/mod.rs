@@ -1,7 +1,3 @@
-//! Text-to-speech provider seam + audio pipeline (#190): the [`TtsProvider`]
-//! trait, backend/voice enums, the [`resolve_tts_provider`] router, and the
-//! audio/registry/sidecar submodules (see the `pub use` block below for exports).
-
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -29,9 +25,6 @@ pub use registry::{
 };
 pub use sidecar::TtsSidecar;
 
-/// The synthesis backend, selecting a [`TtsProvider`]. Strong-typed, not a magic
-/// string ([[strong-typing-no-stringly-domain]]). `Cloud` wraps the specific
-/// cloud API kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TtsBackend {
@@ -44,8 +37,6 @@ pub enum TtsBackend {
 }
 
 impl TtsBackend {
-    /// Stable storage/label token. `Cloud` collapses to `"cloud"` — the specific
-    /// [`CloudTtsKind`] rides in `TtsConfig.cloud`, not this discriminant.
     pub fn as_str(&self) -> &'static str {
         match self {
             TtsBackend::Kokoro => "kokoro",
@@ -56,9 +47,6 @@ impl TtsBackend {
         }
     }
 
-    /// Parses a stored token; `None`/empty/unknown resolves to the default
-    /// (`Kokoro`). Deliberately INFALLIBLE (an absent value is a normal case).
-    /// `"cloud"` resolves to `Cloud` with the default [`CloudTtsKind`].
     pub fn from_opt_str(s: Option<&str>) -> Self {
         match s.unwrap_or("") {
             "orpheus" => TtsBackend::Orpheus,
@@ -70,7 +58,6 @@ impl TtsBackend {
     }
 }
 
-/// The specific cloud TTS API dialect for [`TtsBackend::Cloud`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CloudTtsKind {
@@ -80,17 +67,12 @@ pub enum CloudTtsKind {
     ElevenLabs,
 }
 
-/// Static metadata about a resolved provider ([`TtsProvider::info`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TtsProviderInfo {
     pub backend: TtsBackend,
     pub model: String,
 }
 
-/// Honest phase markers streamed over the `synthesize_overview` progress channel.
-/// `Synthesizing` fires once per turn; `Stitching` once before concatenation;
-/// `Encoding` exactly once (emitted by the engine, not the default
-/// [`TtsProvider::synthesize_script`]) immediately before the WAV write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TtsPhase {
@@ -99,22 +81,12 @@ pub enum TtsPhase {
     Encoding,
 }
 
-/// Shared cancellation message for every early-return in [`synthesize_and_stitch`].
 const CANCELLED_MSG: &str = "tts synthesis cancelled";
 
-/// Per-turn synthesis closure shape shared by [`TtsProvider::synthesize_turn`] and
-/// [`TtsSidecar::synthesize_turn`] (identical signatures, async-trait-desugared to
-/// this boxed-future return).
 type TurnSynthFuture<'a> = std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<AudioBuffer, LensError>> + Send + 'a>,
 >;
 
-/// Drives the shared turn-synthesis loop: cancel-check → `Synthesizing` phase →
-/// race `synth_turn(turn)` against `cancel` → collect → `Stitching` phase →
-/// [`audio::stitch_turns`]. The ONE place both [`TtsProvider::synthesize_script`]'s
-/// default body and the engine's sidecar branch
-/// (`LensEngine::synthesize_overview`) call, so cancel/phase semantics can never
-/// drift between the provider path (#191) and the sidecar path (#193).
 pub(crate) async fn synthesize_and_stitch<'t, F>(
     turns: &'t [Turn],
     on_phase: &(dyn Fn(TtsPhase) + Send + Sync),
@@ -143,16 +115,10 @@ where
     audio::stitch_turns(&buffers)
 }
 
-/// An async, object-safe TTS backend held behind `Arc<dyn TtsProvider>`. Mirrors
-/// [`LlmProvider`](crate::llm::LlmProvider): concrete `synthesize_turn` plus a
-/// defaulted `synthesize_script` that loops turns and stitches.
 #[async_trait]
 pub trait TtsProvider: Send + Sync {
-    /// Backend + model identity.
     fn info(&self) -> TtsProviderInfo;
 
-    /// Synthesizes one dialogue turn into a canonical [`AudioBuffer`], racing the
-    /// call against `cancel`.
     async fn synthesize_turn(
         &self,
         turn: &Turn,
@@ -160,12 +126,7 @@ pub trait TtsProvider: Send + Sync {
         cancel: &CancellationToken,
     ) -> Result<AudioBuffer, LensError>;
 
-    /// Synthesizes the whole script into one stitched overview buffer via
-    /// [`synthesize_and_stitch`]. `on_phase` is a `&dyn Fn(TtsPhase) + Send + Sync`
-    /// (not a generic `impl Fn`) because an object-safe trait method cannot take a
-    /// generic closure, and a `&dyn Fn` held across `.await` in a `Send` future
-    /// needs the referent `+ Sync`. The engine emits `Encoding` separately, so this
-    /// method never does (no double phase event).
+    // `&dyn Fn` (not `impl Fn`) for object-safety; `+ Sync` because it is held across `.await` in a `Send` future.
     async fn synthesize_script(
         &self,
         script: &DialogueScript,
@@ -180,10 +141,6 @@ pub trait TtsProvider: Send + Sync {
     }
 }
 
-/// Resolves a [`TtsBackend`] to a concrete [`TtsProvider`]. **Wildcard-free**
-/// exhaustive match so enum growth and #191 are compiler-guided: every backend
-/// returns `None` in #190 (no adapter ships). #191 replaces `Orpheus => None` with
-/// `Orpheus => Some(Arc::new(OrpheusAdapter::new(cfg)))`, etc.
 pub fn resolve_tts_provider(backend: TtsBackend, _cfg: &TtsConfig) -> Option<Arc<dyn TtsProvider>> {
     match backend {
         TtsBackend::Kokoro => None,
@@ -194,9 +151,6 @@ pub fn resolve_tts_provider(backend: TtsBackend, _cfg: &TtsConfig) -> Option<Arc
     }
 }
 
-/// Maps a dialogue [`Emotion`] to a backend-specific inline tag. A scaffold in
-/// #190: always `None` (drop-if-unsupported). Real per-backend tables land with
-/// the adapters (#191 Orpheus tags, #195 SSML).
 pub fn emotion_tag(_emotion: Emotion, _backend: TtsBackend) -> Option<String> {
     None
 }
@@ -249,7 +203,6 @@ mod tests {
         ] {
             assert_eq!(TtsBackend::from_opt_str(Some(b.as_str())), b);
         }
-        // Cloud collapses to the default cloud kind on the string round-trip.
         assert_eq!(
             TtsBackend::Cloud(CloudTtsKind::ElevenLabs).as_str(),
             "cloud"
@@ -258,7 +211,6 @@ mod tests {
             TtsBackend::from_opt_str(Some("cloud")),
             TtsBackend::Cloud(CloudTtsKind::default())
         );
-        // None / empty / unknown → default.
         assert_eq!(TtsBackend::from_opt_str(None), TtsBackend::Kokoro);
         assert_eq!(TtsBackend::from_opt_str(Some("")), TtsBackend::Kokoro);
         assert_eq!(TtsBackend::from_opt_str(Some("nope")), TtsBackend::Kokoro);
@@ -277,8 +229,6 @@ mod tests {
         }
     }
 
-    /// A fake provider proving the defaulted `synthesize_script` compiles behind
-    /// `Arc<dyn TtsProvider>` and stitches per-turn buffers.
     struct FakeProvider;
 
     #[async_trait]
@@ -326,7 +276,6 @@ mod tests {
             .synthesize_script(&script, &voices, &on_phase, &cancel)
             .await
             .unwrap();
-        // Two 1000-sample turns + one speaker-change gap (10800) @ 24 kHz.
         assert_eq!(out.samples.len(), 1000 + 10_800 + 1000);
         let recorded = phases.lock().unwrap();
         assert_eq!(recorded[0], TtsPhase::Synthesizing { turn: 1, total: 2 });

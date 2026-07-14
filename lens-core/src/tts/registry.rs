@@ -1,30 +1,16 @@
-//! TTS model registry and download helpers (#190). Mirrors `asr/registry.rs`:
-//! a static allowlist of model specs with pinned URLs + SHA256 hashes, path
-//! helpers, and a streaming downloader delegating to `download::download_verified`.
-//! In #190 the only entry is the vestigial Kokoro model (reusing the pinned
-//! `kokoro::KOKORO_MODEL_*` consts); #191 adds the Orpheus GGUF entry.
-
 use std::path::{Path, PathBuf};
 
 use crate::LensError;
 use crate::tts::DownloadProgress;
 use crate::tts::kokoro::{KOKORO_MODEL_RELPATH, KOKORO_MODEL_SHA256_HEX, KOKORO_MODEL_URL};
 
-/// Static description of one supported TTS model. Same shape as
-/// [`WhisperModelSpec`](crate::asr::WhisperModelSpec).
 pub struct TtsModelSpec {
-    /// Short id used as the registry key (e.g. `"kokoro"`).
     pub id: &'static str,
-    /// Pinned resolve URL for the single-file model binary.
     pub url: &'static str,
-    /// SHA256 from the HF LFS `oid` pointer — verified before the `.part → final` rename.
     pub sha256: &'static str,
-    /// On-disk path relative to `data_dir`.
     pub relpath: &'static str,
 }
 
-/// All TTS models the seam knows how to fetch. The Kokoro entry is vestigial
-/// (removed with the rest of Kokoro in #192 once #191's Orpheus adapter ships).
 pub static TTS_REGISTRY: &[TtsModelSpec] = &[TtsModelSpec {
     id: "kokoro",
     url: KOKORO_MODEL_URL,
@@ -32,19 +18,14 @@ pub static TTS_REGISTRY: &[TtsModelSpec] = &[TtsModelSpec {
     relpath: KOKORO_MODEL_RELPATH,
 }];
 
-/// Resolves a model id to its [`TtsModelSpec`]. Returns `None` for unknown ids;
-/// this allowlist is what makes the path helpers immune to `..` traversal.
 pub fn resolve_tts(id: &str) -> Option<&'static TtsModelSpec> {
     TTS_REGISTRY.iter().find(|s| s.id == id)
 }
 
-/// On-disk path for a registered model: `{data_dir}/{spec.relpath}`. `None` for
-/// an unknown id (see [`resolve_tts`]).
 pub fn tts_model_path(data_dir: &Path, id: &str) -> Option<PathBuf> {
     resolve_tts(id).map(|spec| data_dir.join(spec.relpath))
 }
 
-/// Whether the resolved model's file exists on disk; unknown ids report `false`.
 pub fn tts_model_downloaded(data_dir: &Path, id: &str) -> bool {
     match tts_model_path(data_dir, id) {
         Some(path) => path.is_file(),
@@ -52,10 +33,6 @@ pub fn tts_model_downloaded(data_dir: &Path, id: &str) -> bool {
     }
 }
 
-/// Downloads the requested TTS model with streaming progress and SHA256
-/// verification. Unknown id → `LensError::Validation`; otherwise delegates to the
-/// shared `download_verified` helper (`.part` → verify → atomic rename) and
-/// returns the final path. Idempotent: skips a correctly-sized existing file.
 pub async fn download_tts_model<F>(
     data_dir: &Path,
     id: &str,
@@ -150,8 +127,6 @@ mod tests {
             .mount(&server)
             .await;
 
-        // The registry URL is a hardcoded HF endpoint; exercise the shared
-        // downloader against the mock (mirrors the asr registry test).
         let dir = tempfile::tempdir().unwrap();
         let dest = tts_model_path(dir.path(), "kokoro").unwrap();
         let mut events = Vec::new();

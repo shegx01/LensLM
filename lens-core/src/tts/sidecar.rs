@@ -1,10 +1,3 @@
-//! TTS sidecar seam (#190) — the tauri-free trait boundary for an out-of-process
-//! synthesis engine (#193 MOSS-TTS). Mirrors the `render.rs` `JsRenderer` seam:
-//! `lens-core` defines the trait and holds it behind an
-//! `Arc<RwLock<Option<Arc<dyn _>>>>` DI cell injected via
-//! [`set_tts_sidecar`](crate::LensEngine::set_tts_sidecar); the concrete process
-//! manager lives in `src-tauri`. No implementation ships in #190.
-
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
@@ -13,24 +6,14 @@ use crate::dialogue::Turn;
 use crate::error::LensError;
 use crate::tts::AudioBuffer;
 
-/// An async, object-safe out-of-process TTS engine held behind
-/// `Arc<dyn TtsSidecar>`. Explicit `start`/`stop` lifecycle (#193 owns a spawned
-/// process that must be booted and torn down), a cheap `health` probe used by the
-/// `synthesize_overview` resolution precedence, and per-turn synthesis producing a
-/// canonical [`AudioBuffer`] the engine stitches with the same `stitch_turns`.
 #[async_trait]
 pub trait TtsSidecar: Send + Sync {
-    /// Boots the sidecar process. Idempotent; returns once it is ready to serve.
     async fn start(&self) -> Result<(), LensError>;
 
-    /// Tears the sidecar process down. Idempotent.
     async fn stop(&self) -> Result<(), LensError>;
 
-    /// Whether the sidecar is up and ready to synthesize.
     async fn health(&self) -> bool;
 
-    /// Synthesizes one dialogue turn into a canonical [`AudioBuffer`], racing the
-    /// call against `cancel`.
     async fn synthesize_turn(
         &self,
         turn: &Turn,
@@ -46,8 +29,6 @@ mod tests {
     use crate::tts::audio::TARGET_RATE;
     use std::sync::Arc;
 
-    /// A fake sidecar proving `Arc<dyn TtsSidecar>` is object-safe and the engine
-    /// DI seam round-trips (set → get → clear), mirroring the `JsRenderer` test.
     struct FakeSidecar;
 
     #[async_trait]
