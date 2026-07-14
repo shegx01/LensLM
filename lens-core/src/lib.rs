@@ -65,8 +65,8 @@ pub use citation::{
     hydrate_locators, load_chunk_locators,
 };
 pub use config::{
-    AppConfig, CloudAsrProvider, EnrichmentConfig, RerankerConfig, RerankerModel, RetrievalConfig,
-    TaskModel,
+    AppConfig, CloudAsrProvider, CloudTtsCfg, EnrichmentConfig, RerankerConfig, RerankerModel,
+    RetrievalConfig, TaskModel, TtsConfig, VoiceConfig, VoiceRef,
 };
 #[cfg(feature = "test-util")]
 pub use dialogue::{DialogueCtx, generate_dialogue};
@@ -111,8 +111,11 @@ pub use system_check::{
 };
 pub use transcription::{WindowConfig, decode_and_resample_audio, decode_resample_windows};
 pub use tts::{
-    DownloadProgress, Gender, KOKORO_MODEL_FILENAME, KOKORO_MODEL_RELPATH, KOKORO_MODEL_URL,
-    TtsVoice, download_kokoro_model, kokoro_model_path, list_tts_voices,
+    AudioBuffer, CloudTtsKind, DownloadProgress, Gender, KOKORO_MODEL_FILENAME,
+    KOKORO_MODEL_RELPATH, KOKORO_MODEL_URL, TTS_REGISTRY, TtsBackend, TtsModelSpec, TtsPhase,
+    TtsProvider, TtsProviderInfo, TtsSidecar, TtsVoice, download_kokoro_model, download_tts_model,
+    emotion_tag, kokoro_model_path, list_tts_voices, resolve_tts, resolve_tts_provider,
+    stitch_turns, tts_model_downloaded, tts_model_path, write_wav_16bit,
 };
 pub use vector_store::{LanceVectorStore, VectorStore};
 
@@ -298,6 +301,16 @@ pub struct LensEngine {
     /// the ask registry.
     dialogue_cancel_tokens:
         Arc<std::sync::Mutex<HashMap<String, Arc<tokio_util::sync::CancellationToken>>>>,
+    /// In-flight TTS-synthesis (#190) cancellation tokens, keyed by `notebook_id`
+    /// (single-flight per notebook — the overview WAV is overwritten on regenerate).
+    /// A DEDICATED registry, separate from ask/dialogue, with the same ABA-safe
+    /// `Arc::ptr_eq` guard shape.
+    tts_cancel_tokens:
+        Arc<std::sync::Mutex<HashMap<String, Arc<tokio_util::sync::CancellationToken>>>>,
+    /// Injected out-of-process TTS engine (#193). `None` in #190 and headless tests;
+    /// mirrors the `js_renderer` DI cell. The `synthesize_overview` resolution
+    /// precedence prefers this when present and healthy.
+    tts_sidecar: Arc<RwLock<Option<Arc<dyn tts::TtsSidecar>>>>,
     /// Lazily-built internal LocalWhisper engines, keyed by model id (#42). Mirrors
     /// the embedder cache but lighter — whisper has one active model at a time. The
     /// single `Mutex` over the map ensures the ggml load runs exactly once per key.
@@ -414,6 +427,8 @@ impl LensEngine {
             media_cancel_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
             ask_cancel_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
             dialogue_cancel_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            tts_cancel_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            tts_sidecar: Arc::new(RwLock::new(None)),
             #[cfg(feature = "local-whisper")]
             whisper_engines: Arc::new(Mutex::new(HashMap::new())),
             catalog_cache: Arc::new(RwLock::new(None)),
@@ -504,6 +519,8 @@ impl LensEngine {
             media_cancel_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
             ask_cancel_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
             dialogue_cancel_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            tts_cancel_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            tts_sidecar: Arc::new(RwLock::new(None)),
             #[cfg(feature = "local-whisper")]
             whisper_engines: Arc::new(Mutex::new(HashMap::new())),
             catalog_cache: Arc::new(RwLock::new(None)),
@@ -1045,6 +1062,21 @@ impl LensEngine {
     /// Returns a clone of the active JS renderer handle, or `None` when none is
     /// installed (the URL-ingest fallback then keeps the legacy `needs_js`
     /// behavior).
+    /// Installs (or replaces) the out-of-process TTS engine (#193). `None` clears
+    /// it (the `synthesize_overview` precedence then falls through to
+    /// `resolve_tts_provider`). Mirrors [`set_js_renderer`](Self::set_js_renderer);
+    /// the concrete process manager is injected here because `lens-core` cannot
+    /// depend on `tauri`.
+    pub async fn set_tts_sidecar(&self, sidecar: Option<Arc<dyn tts::TtsSidecar>>) {
+        *self.tts_sidecar.write().await = sidecar;
+    }
+
+    /// Returns a clone of the injected TTS sidecar handle, or `None` when none is
+    /// installed (#190 always).
+    pub async fn tts_sidecar(&self) -> Option<Arc<dyn tts::TtsSidecar>> {
+        self.tts_sidecar.read().await.clone()
+    }
+
     pub async fn js_renderer(&self) -> Option<Arc<dyn render::JsRenderer>> {
         self.js_renderer.read().await.clone()
     }
@@ -1234,6 +1266,135 @@ impl LensEngine {
             notebook_id: notebook_id.to_string(),
             owner,
         }
+    }
+
+    /// Registers a fresh single-flight cancellation token for a TTS-synthesis run
+    /// (#190), keyed by `notebook_id`. A prior in-flight synthesis for this notebook
+    /// is `.cancel()`d FIRST, then replaced. Dedicated registry — never the ask or
+    /// dialogue registry (a synthesis cancel must not stop an in-flight chat/dialogue).
+    pub fn register_tts(&self, notebook_id: &str) -> Arc<tokio_util::sync::CancellationToken> {
+        let token = Arc::new(tokio_util::sync::CancellationToken::new());
+        let mut map = self
+            .tts_cancel_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(prev) = map.insert(notebook_id.to_string(), token.clone()) {
+            prev.cancel();
+        }
+        token
+    }
+
+    /// Cancels the in-flight TTS-synthesis run for `notebook_id` by flipping its
+    /// token. Returns `true` if one was found, `false` otherwise (#190).
+    pub fn cancel_synthesis(&self, notebook_id: &str) -> bool {
+        let map = self
+            .tts_cancel_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match map.get(notebook_id) {
+            Some(token) => {
+                token.cancel();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Removes the TTS token for `notebook_id` only when `owner` is still the stored
+    /// token (`Arc::ptr_eq`), so a superseded run's guard never evicts the live
+    /// token (ABA-safe, mirroring `remove_dialogue_if_owner`).
+    fn remove_tts_if_owner(
+        &self,
+        notebook_id: &str,
+        owner: &Arc<tokio_util::sync::CancellationToken>,
+    ) {
+        let mut map = self
+            .tts_cancel_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(current) = map.get(notebook_id)
+            && Arc::ptr_eq(current, owner)
+        {
+            map.remove(notebook_id);
+        }
+    }
+
+    /// Builds the RAII [`TtsCancelGuard`] for a registered synthesis run; `owner` is
+    /// the `Arc` from [`register_tts`](Self::register_tts) the guard's Drop
+    /// `Arc::ptr_eq`-matches on removal.
+    pub fn tts_cancel_guard(
+        &self,
+        notebook_id: &str,
+        owner: Arc<tokio_util::sync::CancellationToken>,
+    ) -> TtsCancelGuard {
+        TtsCancelGuard {
+            engine: self.clone(),
+            notebook_id: notebook_id.to_string(),
+            owner,
+        }
+    }
+
+    /// Synthesizes a dialogue `script` into a single overview WAV at
+    /// [`notebook_audio_path`] and returns that path (#190). Resolution precedence,
+    /// frozen so #191/#193 are pure fill-ins: (1) an injected + healthy
+    /// [`TtsSidecar`](tts::TtsSidecar) drives per-turn synthesis then stitches;
+    /// (2) else [`resolve_tts_provider`](tts::resolve_tts_provider) drives the
+    /// provider's `synthesize_script`; (3) else a typed no-backend
+    /// [`LensError::Tts`]. In #190 (1) and (2) never fire (no impl / all-`None`), so
+    /// this always hits (3). `Encoding` is emitted here exactly once, immediately
+    /// before the WAV write. `on_phase` is `Fn + Sync` (not just `Send`) so the
+    /// `&`-borrow handed to the trait method is `Send`.
+    pub async fn synthesize_overview(
+        &self,
+        notebook_id: &str,
+        script: &dialogue::DialogueScript,
+        voices: &config::VoiceConfig,
+        cfg: &config::TtsConfig,
+        on_phase: impl Fn(tts::TtsPhase) + Send + Sync,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<std::path::PathBuf, LensError> {
+        let sidecar = self.tts_sidecar().await;
+        let healthy_sidecar = match &sidecar {
+            Some(s) if s.health().await => Some(s.clone()),
+            _ => None,
+        };
+
+        let buffer: tts::AudioBuffer = if let Some(sidecar) = healthy_sidecar {
+            let total = script.turns.len();
+            let mut buffers: Vec<(dialogue::Speaker, tts::AudioBuffer)> = Vec::with_capacity(total);
+            for (i, turn) in script.turns.iter().enumerate() {
+                if cancel.is_cancelled() {
+                    return Err(LensError::Cancelled("tts synthesis cancelled".into()));
+                }
+                on_phase(tts::TtsPhase::Synthesizing { turn: i + 1, total });
+                let buf = tokio::select! {
+                    r = sidecar.synthesize_turn(turn, voices, cancel) => r?,
+                    _ = cancel.cancelled() => {
+                        return Err(LensError::Cancelled("tts synthesis cancelled".into()));
+                    }
+                };
+                buffers.push((turn.speaker, buf));
+            }
+            on_phase(tts::TtsPhase::Stitching);
+            tts::stitch_turns(&buffers)?
+        } else if let Some(provider) = tts::resolve_tts_provider(cfg.backend, cfg) {
+            provider
+                .synthesize_script(script, voices, &on_phase, cancel)
+                .await?
+        } else {
+            return Err(LensError::Tts(
+                "no TTS backend available; install an engine".into(),
+            ));
+        };
+
+        on_phase(tts::TtsPhase::Encoding);
+        let data_dir = self.data_dir().await;
+        let path = notebook_audio_path(&data_dir, notebook_id);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(LensError::from)?;
+        }
+        tts::write_wav_16bit(&buffer, &path)?;
+        Ok(path)
     }
 
     /// Grounded-answer entry point (#173, the "rag route"). Gathers ALL fallible
@@ -2512,6 +2673,33 @@ impl Drop for DialogueCancelGuard {
     }
 }
 
+/// RAII guard that clears a TTS-synthesis (#190) cancellation-registry entry on
+/// drop via [`remove_tts_if_owner`](LensEngine::remove_tts_if_owner). A dedicated
+/// guard over the TTS registry, parallel to [`DialogueCancelGuard`].
+pub struct TtsCancelGuard {
+    engine: LensEngine,
+    notebook_id: String,
+    owner: Arc<tokio_util::sync::CancellationToken>,
+}
+
+impl Drop for TtsCancelGuard {
+    fn drop(&mut self) {
+        self.engine
+            .remove_tts_if_owner(&self.notebook_id, &self.owner);
+    }
+}
+
+/// Single source of truth for a notebook's overview-audio path:
+/// `{data_dir}/notebooks/{notebook_id}/overview.wav` (#190). One file per
+/// notebook, overwritten on regenerate — which is why the TTS cancel registry is
+/// single-flight per `notebook_id`.
+pub fn notebook_audio_path(data_dir: &Path, notebook_id: &str) -> std::path::PathBuf {
+    data_dir
+        .join("notebooks")
+        .join(notebook_id)
+        .join("overview.wav")
+}
+
 /// Best-effort removal of a managed source file and its `.extracted.txt` /
 /// `.tables.md` siblings. Siblings are derived from `(data_dir, source_id)` via the
 /// shared `ingest::*_sibling_path` builders — NOT from the locator — so URL sources
@@ -2834,5 +3022,94 @@ mod ask_cancel_tests {
             !engine.cancel_ask_notebook("nb-1"),
             "own-guard drop removes the registry entry"
         );
+    }
+}
+
+#[cfg(test)]
+mod tts_cancel_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn register_then_present_and_live() {
+        let engine = LensEngine::for_test().await;
+        let token = engine.register_tts("nb-1");
+        assert!(
+            !token.is_cancelled(),
+            "freshly registered tts token is live"
+        );
+        assert!(
+            engine.cancel_synthesis("nb-1"),
+            "registered synthesis is found"
+        );
+        assert!(token.is_cancelled(), "cancel flips the registered token");
+    }
+
+    #[tokio::test]
+    async fn cancel_unknown_notebook_is_false() {
+        let engine = LensEngine::for_test().await;
+        assert!(!engine.cancel_synthesis("never-registered"));
+    }
+
+    #[tokio::test]
+    async fn old_guard_drop_does_not_evict_new_token() {
+        let engine = LensEngine::for_test().await;
+        let old = engine.register_tts("nb-1");
+        let old_guard = engine.tts_cancel_guard("nb-1", old);
+        let new = engine.register_tts("nb-1");
+        drop(old_guard);
+        assert!(
+            engine.cancel_synthesis("nb-1"),
+            "old guard drop must NOT evict the superseding token"
+        );
+        assert!(new.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn own_guard_drop_removes_token() {
+        let engine = LensEngine::for_test().await;
+        let token = engine.register_tts("nb-1");
+        let guard = engine.tts_cancel_guard("nb-1", token);
+        drop(guard);
+        assert!(!engine.cancel_synthesis("nb-1"));
+    }
+
+    #[test]
+    fn notebook_audio_path_joins_under_data_dir() {
+        let p = notebook_audio_path(Path::new("/data"), "nb-xyz");
+        assert!(
+            p.ends_with("notebooks/nb-xyz/overview.wav"),
+            "unexpected path: {p:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn synthesize_overview_no_backend_is_tts_error() {
+        // Default engine: Kokoro backend (all-None resolver) + no injected sidecar,
+        // so the resolution precedence falls through to the typed no-backend error.
+        let engine = LensEngine::for_test().await;
+        let script = DialogueScript {
+            turns: vec![
+                Turn {
+                    speaker: Speaker::Host,
+                    text: "hi".into(),
+                    emotion: None,
+                    source_ids: Vec::new(),
+                },
+                Turn {
+                    speaker: Speaker::Guest,
+                    text: "yo".into(),
+                    emotion: None,
+                    source_ids: Vec::new(),
+                },
+            ],
+        };
+        let voices = VoiceConfig::default();
+        let cfg = TtsConfig::default();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let err = engine
+            .synthesize_overview("nb-1", &script, &voices, &cfg, |_p| {}, &cancel)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), "Tts");
     }
 }

@@ -69,6 +69,12 @@ pub enum LensError {
     /// internal detail leaks across the IPC boundary.
     #[error("cancelled: {0}")]
     Cancelled(String),
+
+    /// Text-to-speech synthesis failed or no TTS backend is available (issue
+    /// #190). Distinct programmatic kind so the UI can prompt the user to install
+    /// an engine rather than surfacing a generic model error.
+    #[error("tts error: {0}")]
+    Tts(String),
 }
 
 // Manual `From` mappings (NOT `#[from]`): source error types are not `Serialize`
@@ -149,6 +155,7 @@ impl LensError {
             LensError::EmptyAudio(_) => "EmptyAudio",
             LensError::Transcription(_) => "Transcription",
             LensError::Cancelled(_) => "Cancelled",
+            LensError::Tts(_) => "Tts",
         }
     }
 
@@ -168,7 +175,8 @@ impl LensError {
             | LensError::MediaDecodeFailed(m)
             | LensError::EmptyAudio(m)
             | LensError::Transcription(m)
-            | LensError::Cancelled(m) => m,
+            | LensError::Cancelled(m)
+            | LensError::Tts(m) => m,
         }
     }
 }

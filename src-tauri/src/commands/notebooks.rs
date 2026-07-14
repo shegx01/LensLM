@@ -4,7 +4,7 @@ use futures::StreamExt;
 use lens_core::{
     AddSourceOutcome, AnswerEvent, ChatFeedback, ChatMessage, DialoguePhase, DialogueScript,
     IngestProgress, Length, LensEngine, LensError, Notebook, NotebookId, NotebookSummary, Source,
-    TrashedSource,
+    TrashedSource, TtsPhase,
 };
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
@@ -536,6 +536,90 @@ pub async fn cancel_dialogue(
     engine: tauri::State<'_, LensEngine>,
 ) -> Result<bool, LensError> {
     Ok(engine.cancel_dialogue_generation(&notebook_id))
+}
+
+/// Synthesizes a notebook's audio overview to a WAV and returns its path (#190).
+/// Streams `Started → Chunk(Synthesizing{turn,total})… → Chunk(Stitching) →
+/// Chunk(Encoding) → Done` on `on_progress`. Per-notebook single-flight over a
+/// DEDICATED TTS registry (never ask/dialogue). #190 seam: the grounded dialogue
+/// script is generated first at the default medium length (#194's UI picks the
+/// length later), then synthesized — but with no adapter yet the synthesis half
+/// always resolves to the no-backend `LensError::Tts`, so this is dead-but-wired.
+#[tracing::instrument(skip(on_progress, engine))]
+#[tauri::command]
+pub async fn synthesize_overview(
+    notebook_id: String,
+    on_progress: Channel<StreamEvent<TtsPhase>>,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<String, LensError> {
+    if let Err(e) = send_event(&on_progress, StreamEvent::Started) {
+        tracing::warn!("synthesize_overview: started event send failed: {e}");
+    }
+
+    let token = engine.register_tts(&notebook_id);
+    let _guard = engine.tts_cancel_guard(&notebook_id, token.clone());
+
+    let config = engine.config().await;
+
+    let script = match engine
+        .generate_dialogue(
+            &NotebookId::from(notebook_id.clone()),
+            Length::Medium,
+            (*token).clone(),
+            |_phase| {},
+        )
+        .await
+    {
+        Ok(script) => script,
+        Err(err) => {
+            if let Err(e) = send_event(&on_progress, StreamEvent::Failed(err.clone())) {
+                tracing::warn!("synthesize_overview: failed event send failed: {e}");
+            }
+            return Err(err);
+        }
+    };
+
+    let on_progress_phase = on_progress.clone();
+    let result = engine
+        .synthesize_overview(
+            &notebook_id,
+            &script,
+            &config.voices,
+            &config.tts,
+            move |phase| {
+                if let Err(e) = send_event(&on_progress_phase, StreamEvent::Chunk(phase)) {
+                    tracing::warn!("synthesize_overview: phase send failed: {e}");
+                }
+            },
+            &token,
+        )
+        .await;
+
+    match result {
+        Ok(path) => {
+            if let Err(e) = send_event(&on_progress, StreamEvent::Done) {
+                tracing::warn!("synthesize_overview: done event send failed: {e}");
+            }
+            Ok(path.to_string_lossy().into_owned())
+        }
+        Err(err) => {
+            if let Err(e) = send_event(&on_progress, StreamEvent::Failed(err.clone())) {
+                tracing::warn!("synthesize_overview: failed event send failed: {e}");
+            }
+            Err(err)
+        }
+    }
+}
+
+/// Cancels the in-flight audio-overview synthesis for a notebook (#190, stop
+/// button). Returns `true` if one was in flight and cancelled, `false` otherwise.
+#[tracing::instrument(skip(engine))]
+#[tauri::command]
+pub async fn cancel_synthesis(
+    notebook_id: String,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<bool, LensError> {
+    Ok(engine.cancel_synthesis(&notebook_id))
 }
 
 /// Persists a user chat message on send (#22). `turn_id` is minted by the frontend

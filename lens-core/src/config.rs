@@ -5,12 +5,13 @@
 //! table as an additive migration in the milestone that requires it.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::LensError;
 use crate::asr::Lang;
+use crate::tts::{CloudTtsKind, TtsBackend};
 
 /// File name for the on-disk config, relative to the engine data directory.
 const CONFIG_FILE_NAME: &str = "config.json";
@@ -43,29 +44,135 @@ impl std::fmt::Debug for ModelConfig {
     }
 }
 
-/// Host/guest voice identifiers used by the TTS subsystem.
+/// A single voice reference bound to a [`Speaker`](crate::dialogue::Speaker):
+/// either a named preset (`"af_heart"`, an Orpheus voice) or a reference clip for
+/// voice-cloning backends (#191). `#[serde(untagged)]` with `Named` FIRST so a
+/// bare JSON string deserializes to `Named` and a `{clip_path, transcript}` object
+/// to `Reference`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum VoiceRef {
+    Named(String),
+    Reference {
+        clip_path: PathBuf,
+        transcript: String,
+    },
+}
+
+impl Default for VoiceRef {
+    fn default() -> Self {
+        VoiceRef::Named(String::new())
+    }
+}
+
+impl VoiceRef {
+    /// Whether this reference is unset — an empty `Named` (the default). Used by
+    /// the system-check TTS readiness gate.
+    pub fn is_unset(&self) -> bool {
+        matches!(self, VoiceRef::Named(s) if s.is_empty())
+    }
+}
+
+/// Host/guest voices used by the TTS subsystem.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct VoiceConfig {
-    pub host: String,
-    pub guest: String,
+    pub host: VoiceRef,
+    pub guest: VoiceRef,
 }
 
-/// Cloud TTS provider configuration (e.g. ElevenLabs). Empty means no cloud TTS.
-/// `Debug` is manual so `api_key` is redacted, exactly like [`ModelConfig`].
-#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct TtsConfig {
-    pub provider: String,
+/// Cloud TTS credentials for [`TtsBackend::Cloud`]. `Debug` is manual so `api_key`
+/// is redacted, exactly like [`ModelConfig`].
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct CloudTtsCfg {
+    pub kind: CloudTtsKind,
     /// Stored in PLAINTEXT — see [`ModelConfig::api_key`] for the at-rest caveat.
     pub api_key: String,
+    pub base_url: String,
 }
 
-impl std::fmt::Debug for TtsConfig {
+impl std::fmt::Debug for CloudTtsCfg {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let api_key = if self.api_key.is_empty() { "" } else { "***" };
-        f.debug_struct("TtsConfig")
-            .field("provider", &self.provider)
+        f.debug_struct("CloudTtsCfg")
+            .field("kind", &self.kind)
             .field("api_key", &api_key)
+            .field("base_url", &self.base_url)
             .finish()
+    }
+}
+
+/// TTS synthesis configuration. `version` is an explicit forward-migration marker
+/// (the first such convention in `config.rs`); reads coerce a legacy
+/// `{provider, api_key}` shape via [`RawTtsConfig`]. `Debug` derives — the nested
+/// [`CloudTtsCfg`] redacts its own `api_key`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(from = "RawTtsConfig")]
+pub struct TtsConfig {
+    pub version: u32,
+    pub backend: TtsBackend,
+    pub model: String,
+    pub cloud: Option<CloudTtsCfg>,
+}
+
+impl Default for TtsConfig {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            backend: TtsBackend::Kokoro,
+            model: String::new(),
+            cloud: None,
+        }
+    }
+}
+
+/// Deserialization shim carrying BOTH the legacy (`{provider, api_key}`) and new
+/// (`{version, backend, model, cloud}`) fields, so a coerce never silently drops a
+/// legacy cloud key (which per-field `#[serde(default)]` would). See
+/// [`From<RawTtsConfig> for TtsConfig`](TtsConfig).
+#[derive(Deserialize)]
+struct RawTtsConfig {
+    // Legacy shape (pre-#190).
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    api_key: Option<String>,
+    // Current shape.
+    #[serde(default)]
+    version: Option<u32>,
+    #[serde(default)]
+    backend: Option<TtsBackend>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    cloud: Option<CloudTtsCfg>,
+}
+
+impl From<RawTtsConfig> for TtsConfig {
+    fn from(raw: RawTtsConfig) -> Self {
+        // A present `version` marks a current-shape payload: pass through.
+        if let Some(version) = raw.version {
+            return TtsConfig {
+                version,
+                backend: raw.backend.unwrap_or_default(),
+                model: raw.model.unwrap_or_default(),
+                cloud: raw.cloud,
+            };
+        }
+        // No version → legacy coerce. A non-empty legacy `provider` was always a
+        // cloud provider; preserve its key under the OpenAI-compatible dialect.
+        match raw.provider {
+            Some(provider) if !provider.is_empty() => TtsConfig {
+                version: 1,
+                backend: TtsBackend::Cloud(CloudTtsKind::OpenAiCompatible),
+                model: String::new(),
+                cloud: Some(CloudTtsCfg {
+                    kind: CloudTtsKind::OpenAiCompatible,
+                    api_key: raw.api_key.unwrap_or_default(),
+                    base_url: String::new(),
+                }),
+            },
+            _ => TtsConfig::default(),
+        }
     }
 }
 
@@ -730,29 +837,35 @@ mod tests {
     #[test]
     fn tts_config_debug_redacts_api_key() {
         let cfg = TtsConfig {
-            provider: "elevenlabs".to_string(),
-            api_key: "sk-elevenlabs-supersecret".to_string(),
+            version: 1,
+            backend: TtsBackend::Cloud(CloudTtsKind::OpenAiCompatible),
+            model: String::new(),
+            cloud: Some(CloudTtsCfg {
+                kind: CloudTtsKind::OpenAiCompatible,
+                api_key: "sk-elevenlabs-supersecret".to_string(),
+                base_url: String::new(),
+            }),
         };
         let debug = format!("{cfg:?}");
         assert!(!debug.contains("sk-elevenlabs-supersecret"));
         assert!(!debug.contains("supersecret"));
         assert!(debug.contains("***"));
-        assert!(debug.contains("elevenlabs"));
     }
 
     #[test]
-    fn tts_config_debug_shows_empty_api_key_as_empty() {
+    fn default_tts_config_debug_has_no_redaction_marker() {
         let cfg = TtsConfig::default();
         let debug = format!("{cfg:?}");
-        assert!(debug.contains("api_key: \"\""));
+        assert!(debug.contains("cloud: None"));
         assert!(!debug.contains("***"));
     }
 
     #[test]
-    fn default_tts_is_empty() {
+    fn default_tts_is_kokoro() {
         assert_eq!(AppConfig::default().tts, TtsConfig::default());
-        assert_eq!(AppConfig::default().tts.provider, "");
-        assert_eq!(AppConfig::default().tts.api_key, "");
+        assert_eq!(AppConfig::default().tts.version, 1);
+        assert_eq!(AppConfig::default().tts.backend, TtsBackend::Kokoro);
+        assert!(AppConfig::default().tts.cloud.is_none());
     }
 
     #[test]
@@ -833,15 +946,81 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = AppConfig {
             tts: TtsConfig {
-                provider: "elevenlabs".to_string(),
-                api_key: "sk-elevenlabs".to_string(),
+                version: 1,
+                backend: TtsBackend::Cloud(CloudTtsKind::ElevenLabs),
+                model: "eleven-turbo".to_string(),
+                cloud: Some(CloudTtsCfg {
+                    kind: CloudTtsKind::ElevenLabs,
+                    api_key: "sk-elevenlabs".to_string(),
+                    base_url: "https://api.elevenlabs.io".to_string(),
+                }),
             },
             ..AppConfig::default()
         };
         config.save(dir.path()).unwrap();
         let loaded = AppConfig::load(dir.path()).unwrap();
-        assert_eq!(loaded.tts.provider, "elevenlabs");
-        assert_eq!(loaded.tts.api_key, "sk-elevenlabs");
+        assert_eq!(loaded.tts, config.tts);
+    }
+
+    #[test]
+    fn new_tts_config_round_trips_with_version() {
+        let cfg = TtsConfig {
+            version: 1,
+            backend: TtsBackend::Orpheus,
+            model: "orpheus-3b".to_string(),
+            cloud: None,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: TtsConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(cfg, back);
+    }
+
+    #[test]
+    fn legacy_nonempty_tts_coerces_and_preserves_cloud_key() {
+        // A pre-#190 config with NO version and a non-empty legacy provider must
+        // coerce to a cloud backend WITHOUT dropping the api_key (the silent-drop
+        // regression the RawTtsConfig shim exists to prevent).
+        let json = r#"{ "provider": "elevenlabs", "api_key": "sk-xyz" }"#;
+        let cfg: TtsConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            cfg.backend,
+            TtsBackend::Cloud(CloudTtsKind::OpenAiCompatible)
+        );
+        let cloud = cfg
+            .cloud
+            .expect("legacy cloud provider must produce a cloud config");
+        assert_eq!(cloud.api_key, "sk-xyz");
+        assert_eq!(cfg.version, 1);
+    }
+
+    #[test]
+    fn legacy_empty_tts_coerces_to_kokoro() {
+        let json = r#"{ "provider": "", "api_key": "" }"#;
+        let cfg: TtsConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg, TtsConfig::default());
+        assert_eq!(cfg.backend, TtsBackend::Kokoro);
+        assert!(cfg.cloud.is_none());
+    }
+
+    #[test]
+    fn voice_ref_untagged_round_trips() {
+        // Bare string ↔ Named.
+        let named = VoiceRef::Named("af_heart".to_string());
+        let json = serde_json::to_string(&named).unwrap();
+        assert_eq!(json, "\"af_heart\"");
+        assert_eq!(serde_json::from_str::<VoiceRef>(&json).unwrap(), named);
+        // Object ↔ Reference.
+        let reference = VoiceRef::Reference {
+            clip_path: PathBuf::from("/clips/host.wav"),
+            transcript: "hello there".to_string(),
+        };
+        let obj = serde_json::to_string(&reference).unwrap();
+        assert_eq!(serde_json::from_str::<VoiceRef>(&obj).unwrap(), reference);
+        // A bare string must NOT accidentally match Reference.
+        assert_eq!(
+            serde_json::from_str::<VoiceRef>("\"x\"").unwrap(),
+            VoiceRef::Named("x".to_string())
+        );
     }
 
     #[test]

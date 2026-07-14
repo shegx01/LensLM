@@ -126,6 +126,8 @@ fn main() {
             commands::notebooks::cancel_ask,
             commands::notebooks::generate_dialogue,
             commands::notebooks::cancel_dialogue,
+            commands::notebooks::synthesize_overview,
+            commands::notebooks::cancel_synthesis,
             commands::notebooks::save_chat_user,
             commands::notebooks::save_chat_assistant,
             commands::notebooks::set_chat_feedback,
