@@ -10,7 +10,6 @@ use crate::dialogue::{DialogueScript, Emotion, Speaker, Turn};
 use crate::error::LensError;
 
 pub mod audio;
-mod kokoro;
 pub mod orpheus;
 pub mod registry;
 pub mod sidecar;
@@ -18,21 +17,53 @@ pub mod snac;
 
 pub use audio::AudioBuffer;
 pub(crate) use audio::write_wav_16bit;
-pub use kokoro::{
-    DownloadProgress, Gender, KOKORO_MODEL_FILENAME, KOKORO_MODEL_RELPATH, KOKORO_MODEL_URL,
-    TtsVoice, download_kokoro_model, kokoro_model_path, list_tts_voices,
-};
 pub use registry::{
     TTS_REGISTRY, TtsModelSpec, download_tts_model, resolve_tts, tts_model_downloaded,
     tts_model_path,
 };
 pub use sidecar::TtsSidecar;
 
+/// Speaker gender. Serializes lowercase to match the `'male' | 'female'` union in the Svelte
+/// client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Gender {
+    Male,
+    Female,
+}
+
+/// One selectable named voice. Frozen IPC contract — mirrored in the Svelte client as
+/// `TtsVoice { id, name, gender }`. The catalog is adapter-driven via [`TtsProvider::voices`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TtsVoice {
+    pub id: String,
+    pub name: String,
+    pub gender: Gender,
+}
+
+impl TtsVoice {
+    pub(crate) fn new(id: &str, name: &str, gender: Gender) -> Self {
+        Self {
+            id: id.to_string(),
+            name: name.to_string(),
+            gender,
+        }
+    }
+}
+
+/// Download progress. Frozen IPC contract — mirrored in the Svelte client as
+/// `{ received, total, done }`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DownloadProgress {
+    pub received: u64,
+    pub total: Option<u64>,
+    pub done: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TtsBackend {
     #[default]
-    Kokoro,
     Orpheus,
     MossLocal,
     MossTtsd,
@@ -42,7 +73,6 @@ pub enum TtsBackend {
 impl TtsBackend {
     pub fn as_str(&self) -> &'static str {
         match self {
-            TtsBackend::Kokoro => "kokoro",
             TtsBackend::Orpheus => "orpheus",
             TtsBackend::MossLocal => "moss_local",
             TtsBackend::MossTtsd => "moss_ttsd",
@@ -57,6 +87,15 @@ impl TtsBackend {
             "moss_ttsd" => TtsBackend::MossTtsd,
             "cloud" => TtsBackend::Cloud(CloudTtsKind::default()),
             _ => TtsBackend::default(),
+        }
+    }
+
+    /// Registry ids of every model artifact this backend needs on disk to be
+    /// usable. Non-embedded backends (cloud, not-yet-wired local) return `&[]`.
+    pub fn required_model_ids(&self) -> &'static [&'static str] {
+        match self {
+            TtsBackend::Orpheus => &["orpheus", "snac"],
+            TtsBackend::MossLocal | TtsBackend::MossTtsd | TtsBackend::Cloud(_) => &[],
         }
     }
 }
@@ -122,6 +161,10 @@ where
 pub trait TtsProvider: Send + Sync {
     fn info(&self) -> TtsProviderInfo;
 
+    /// Adapter-driven named-voice catalog. Empty when the backend enumerates no
+    /// fixed voices (e.g. a clone-only backend).
+    fn voices(&self) -> Vec<TtsVoice>;
+
     async fn synthesize_turn(
         &self,
         turn: &Turn,
@@ -161,7 +204,6 @@ pub fn resolve_tts_provider(
             let snac = tts_model_path(data_dir, "snac")?;
             Some(Arc::new(orpheus::OrpheusAdapter::new(orpheus, snac)))
         }
-        TtsBackend::Kokoro => None,
         TtsBackend::MossLocal => None,
         TtsBackend::MossTtsd => None,
         TtsBackend::Cloud(_) => None,
@@ -188,7 +230,6 @@ mod tests {
         let cfg = TtsConfig::default();
         let data_dir = Path::new("/data");
         for backend in [
-            TtsBackend::Kokoro,
             TtsBackend::MossLocal,
             TtsBackend::MossTtsd,
             TtsBackend::Cloud(CloudTtsKind::OpenAiCompatible),
@@ -233,19 +274,27 @@ mod tests {
             Emotion::Excited,
             Emotion::Thoughtful,
         ] {
-            assert!(emotion_tag(emotion, TtsBackend::Kokoro).is_none());
+            assert!(emotion_tag(emotion, TtsBackend::MossLocal).is_none());
         }
     }
 
     #[test]
-    fn backend_default_is_kokoro() {
-        assert_eq!(TtsBackend::default(), TtsBackend::Kokoro);
+    fn backend_default_is_orpheus() {
+        assert_eq!(TtsBackend::default(), TtsBackend::Orpheus);
+    }
+
+    #[test]
+    fn gender_serializes_lowercase() {
+        assert_eq!(serde_json::to_string(&Gender::Male).unwrap(), "\"male\"");
+        assert_eq!(
+            serde_json::to_string(&Gender::Female).unwrap(),
+            "\"female\""
+        );
     }
 
     #[test]
     fn backend_as_str_and_from_opt_str_round_trip() {
         for b in [
-            TtsBackend::Kokoro,
             TtsBackend::Orpheus,
             TtsBackend::MossLocal,
             TtsBackend::MossTtsd,
@@ -260,16 +309,16 @@ mod tests {
             TtsBackend::from_opt_str(Some("cloud")),
             TtsBackend::Cloud(CloudTtsKind::default())
         );
-        assert_eq!(TtsBackend::from_opt_str(None), TtsBackend::Kokoro);
-        assert_eq!(TtsBackend::from_opt_str(Some("")), TtsBackend::Kokoro);
-        assert_eq!(TtsBackend::from_opt_str(Some("nope")), TtsBackend::Kokoro);
+        assert_eq!(TtsBackend::from_opt_str(None), TtsBackend::Orpheus);
+        assert_eq!(TtsBackend::from_opt_str(Some("")), TtsBackend::Orpheus);
+        assert_eq!(TtsBackend::from_opt_str(Some("nope")), TtsBackend::Orpheus);
     }
 
     #[test]
     fn backend_serde_round_trips_including_cloud() {
         for b in [
-            TtsBackend::Kokoro,
             TtsBackend::Orpheus,
+            TtsBackend::MossLocal,
             TtsBackend::Cloud(CloudTtsKind::ElevenLabs),
         ] {
             let json = serde_json::to_string(&b).unwrap();
@@ -284,9 +333,12 @@ mod tests {
     impl TtsProvider for FakeProvider {
         fn info(&self) -> TtsProviderInfo {
             TtsProviderInfo {
-                backend: TtsBackend::Kokoro,
+                backend: TtsBackend::Orpheus,
                 model: "fake".to_string(),
             }
+        }
+        fn voices(&self) -> Vec<TtsVoice> {
+            Vec::new()
         }
         async fn synthesize_turn(
             &self,

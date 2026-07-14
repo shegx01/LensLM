@@ -3,6 +3,7 @@
 
 import { Channel, invoke, isTauri } from '@tauri-apps/api/core';
 import { updateConfig } from '$lib/config.js';
+import type { TtsConfig } from '$lib/theme/types.js';
 
 export type CheckId = 'llm_runtime' | 'embedding_model' | 'text_to_speech';
 
@@ -54,7 +55,7 @@ export interface InstallProgress {
   total: number | null;
 }
 
-// SYNC-CHECK: must match lens-core/src/tts.rs DownloadProgress
+// SYNC-CHECK: must match lens-core/src/tts/mod.rs DownloadProgress
 // `done` flips true on the final event (incl. already-present fast path).
 export interface DownloadProgress {
   received: number;
@@ -95,10 +96,15 @@ export async function installEmbeddingModel(
 }
 
 /**
- * Download the Kokoro TTS engine, streaming 0–100% progress.
- * When total is unknown, `done` is surfaced as 100%. No-op outside Tauri.
+ * Download a TTS model artifact (registry id, e.g. `"orpheus"`/`"snac"`) for the given
+ * engine, streaming 0–100% progress. When total is unknown, `done` is surfaced as 100%.
+ * No-op outside Tauri. Mirrors `download_whisper_model`.
  */
-export async function downloadTtsEngine(onProgress: (pct: number) => void): Promise<void> {
+export async function downloadTtsModel(
+  engine: string,
+  model: string,
+  onProgress: (pct: number) => void
+): Promise<void> {
   if (!isTauri()) return;
   const channel = new Channel<DownloadProgress>();
   channel.onmessage = (p) => {
@@ -106,32 +112,56 @@ export async function downloadTtsEngine(onProgress: (pct: number) => void): Prom
     if (pct !== null) onProgress(pct);
     else if (p.done) onProgress(100);
   };
-  await invoke<void>('download_tts_engine', { onProgress: channel });
+  await invoke<void>('download_tts_model', { engine, model, onProgress: channel });
 }
 
-/** List available TTS voices (Kokoro). Contract — Rust invoke to be implemented. */
+/** List the active backend's named-voice catalog. Adapter-driven — empty when no provider resolves. */
 export async function listTtsVoices(): Promise<TtsVoice[]> {
   if (!isTauri()) return [];
   return invoke<TtsVoice[]>('list_tts_voices');
 }
 
-/** Whether the Kokoro engine is already downloaded on disk (skip the download step). */
-export async function kokoroDownloaded(): Promise<boolean> {
+/** Whether the given TTS model artifact is already on disk (skip the download step). */
+export async function ttsModelDownloaded(engine: string, model: string): Promise<boolean> {
   if (!isTauri()) return false;
-  return invoke<boolean>('kokoro_downloaded');
+  return invoke<boolean>('tts_model_downloaded', { engine, model });
 }
 
-// SYNC-CHECK: must match lens-core/src/config.rs TtsConfig.provider
-// String union (not bare string) so panel + readiness gate agree on the exact id Rust checks.
-export type TtsProvider = 'elevenlabs';
+// SYNC-CHECK: a UI selector mapped to the wire `TtsBackend` (lens-core/src/tts/mod.rs) by
+// `nextTtsConfig` — NOT the wire type itself: it collapses moss_local/moss_ttsd → 'moss'
+// and every Cloud kind → 'cloud'.
+export type TtsProvider = 'orpheus' | 'moss' | 'cloud';
 
-/** Persist cloud TTS provider config (stores credentials for the readiness gate; synthesis is a later milestone). */
+/**
+ * Persist a TTS backend/provider selection into the current `TtsConfig` shape
+ * (read-modify-write). The panel's Cloud tab is ElevenLabs-only for now; full
+ * multi-backend/provider selection is deferred to #194.
+ */
 export async function saveTtsProvider(input: {
   provider: TtsProvider;
   apiKey: string;
 }): Promise<void> {
   await updateConfig((cfg) => ({
     ...cfg,
-    tts: { provider: input.provider, api_key: input.apiKey }
+    tts: nextTtsConfig(cfg.tts, input)
   }));
+}
+
+function nextTtsConfig(
+  prev: TtsConfig,
+  input: { provider: TtsProvider; apiKey: string }
+): TtsConfig {
+  // Local backends clear any lingering cloud config; the full local picker is deferred to #194.
+  if (input.provider === 'orpheus') {
+    return { ...prev, version: 1, backend: 'orpheus', cloud: null };
+  }
+  if (input.provider === 'moss') {
+    return { ...prev, version: 1, backend: 'moss_local', cloud: null };
+  }
+  return {
+    version: 1,
+    backend: { cloud: 'eleven_labs' },
+    model: prev.model,
+    cloud: { kind: 'eleven_labs', api_key: input.apiKey, base_url: '' }
+  };
 }

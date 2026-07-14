@@ -2,7 +2,6 @@ use std::path::{Path, PathBuf};
 
 use crate::LensError;
 use crate::tts::DownloadProgress;
-use crate::tts::kokoro::{KOKORO_MODEL_RELPATH, KOKORO_MODEL_SHA256_HEX, KOKORO_MODEL_URL};
 use crate::tts::orpheus::{
     ORPHEUS_MODEL_ID, ORPHEUS_MODEL_RELPATH, ORPHEUS_MODEL_SHA256_HEX, ORPHEUS_MODEL_URL,
 };
@@ -16,12 +15,6 @@ pub struct TtsModelSpec {
 }
 
 pub static TTS_REGISTRY: &[TtsModelSpec] = &[
-    TtsModelSpec {
-        id: "kokoro",
-        url: KOKORO_MODEL_URL,
-        sha256: KOKORO_MODEL_SHA256_HEX,
-        relpath: KOKORO_MODEL_RELPATH,
-    },
     // issue #191 [161c]: SNAC 24 kHz neural-codec decoder weights (upstream
     // PyTorch `.bin`; load mechanism documented at the snac.rs call site).
     TtsModelSpec {
@@ -82,16 +75,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_known_kokoro() {
-        let spec = resolve_tts("kokoro").expect("kokoro must be registered");
-        assert_eq!(spec.id, "kokoro");
-        assert!(!spec.url.is_empty());
-        assert_eq!(spec.sha256.len(), 64);
-        assert!(spec.sha256.bytes().all(|b| b.is_ascii_hexdigit()));
-        assert!(spec.relpath.ends_with("model_q8f16.onnx"));
-    }
-
-    #[test]
     fn resolve_known_snac() {
         let spec = resolve_tts("snac").expect("snac must be registered");
         assert_eq!(spec.id, "snac");
@@ -119,14 +102,14 @@ mod tests {
 
     #[test]
     fn path_joins_under_data_dir() {
-        let p = tts_model_path(Path::new("/data"), "kokoro").expect("known id resolves");
-        assert!(p.ends_with("models/kokoro/model_q8f16.onnx"));
+        let p = tts_model_path(Path::new("/data"), "orpheus").expect("known id resolves");
+        assert!(p.ends_with("models/orpheus/orpheus-3b-0.1-ft-Q4_K_M.gguf"));
     }
 
     #[test]
     fn rejects_traversal_id() {
         let dir = tempfile::tempdir().unwrap();
-        for bad in ["../../etc/passwd", "..", "kokoro/../../secret", ""] {
+        for bad in ["../../etc/passwd", "..", "orpheus/../../secret", ""] {
             assert!(
                 resolve_tts(bad).is_none(),
                 "traversal id {bad:?} must not resolve"
@@ -139,11 +122,11 @@ mod tests {
     #[test]
     fn downloaded_false_when_absent_true_when_present() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(!tts_model_downloaded(dir.path(), "kokoro"));
-        let path = tts_model_path(dir.path(), "kokoro").unwrap();
+        assert!(!tts_model_downloaded(dir.path(), "orpheus"));
+        let path = tts_model_path(dir.path(), "orpheus").unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"fake").unwrap();
-        assert!(tts_model_downloaded(dir.path(), "kokoro"));
+        assert!(tts_model_downloaded(dir.path(), "orpheus"));
     }
 
     #[tokio::test]
@@ -170,7 +153,7 @@ mod tests {
             .await;
 
         let dir = tempfile::tempdir().unwrap();
-        let dest = tts_model_path(dir.path(), "kokoro").unwrap();
+        let dest = tts_model_path(dir.path(), "orpheus").unwrap();
         let mut events = Vec::new();
         crate::download::download_verified(&server.uri(), &dest, Some(&expected), |p| {
             events.push(p)

@@ -24,7 +24,7 @@ const ALL_PASS: CheckResult[] = [
     id: 'text_to_speech',
     label: 'Text-to-speech',
     status: 'pass',
-    detail: 'Kokoro audio engine ready',
+    detail: 'Audio engine ready',
     action: 'choose'
   }
 ];

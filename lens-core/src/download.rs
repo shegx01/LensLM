@@ -1,6 +1,6 @@
 //! Shared streaming downloader with SHA256 integrity verification.
 //!
-//! Used by both the Kokoro TTS downloader and the Whisper ASR downloader so the
+//! Used by the TTS and Whisper ASR model downloaders so the
 //! `.part` → verify → atomic-rename flow stays in one place.
 
 use std::path::Path;
@@ -32,8 +32,8 @@ fn content_length_header(headers: &reqwest::header::HeaderMap) -> Option<u64> {
 /// verification (use only in tests).
 ///
 /// Integrity (SHA256) is enforced only on FRESH downloads; the size-match skip path
-/// does NOT re-hash a pre-existing file (matches prior Kokoro behavior — atomic rename
-/// means a landed file was previously verified before it took the final name).
+/// does NOT re-hash a pre-existing file (atomic rename means a landed file was
+/// previously verified before it took the final name).
 pub(crate) async fn download_verified<F>(
     url: &str,
     dest: &Path,

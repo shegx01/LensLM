@@ -78,11 +78,28 @@ fn sanitize_url_for_log(raw: &str) -> String {
     format!("{scheme}://{host_port}")
 }
 
-/// Returns the static Kokoro voice catalog (5 female + 5 male) for the TTS panel.
+/// Returns the currently selected TTS backend's named-voice catalog, adapter-driven
+/// via `TtsProvider::voices()`. Empty only when no provider resolves for the backend
+/// (e.g. cloud/moss backends not yet wired).
 #[tracing::instrument(skip_all)]
 #[tauri::command]
-pub async fn list_tts_voices() -> Result<Vec<TtsVoice>, LensError> {
-    Ok(lens_core::list_tts_voices())
+pub async fn list_tts_voices(
+    engine: tauri::State<'_, LensEngine>,
+    app: tauri::AppHandle,
+) -> Result<Vec<TtsVoice>, LensError> {
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| LensError::Io(e.to_string()))?;
+    let config = engine.config().await;
+    Ok(resolve_voices(&config.tts, &data_dir))
+}
+
+/// Testable core of [`list_tts_voices`] (no `AppHandle`/engine state).
+fn resolve_voices(cfg: &lens_core::TtsConfig, data_dir: &std::path::Path) -> Vec<TtsVoice> {
+    lens_core::resolve_tts_provider(cfg.backend, cfg, data_dir)
+        .map(|provider| provider.voices())
+        .unwrap_or_default()
 }
 
 /// Installs an embedding model via Ollama `POST /api/pull`, streaming NDJSON progress.
@@ -111,11 +128,14 @@ pub async fn install_embedding_model(
     .await
 }
 
-/// Downloads the Kokoro ONNX engine to `{app_data_dir}/models/kokoro/`. Idempotent:
-/// a complete file on disk emits a single `done` event without re-downloading.
-#[tracing::instrument(skip_all)]
-#[tauri::command]
-pub async fn download_tts_engine(
+/// Downloads a TTS model artifact (registry id such as `"orpheus"`/`"snac"`) to
+/// `{app_data_dir}/models/<id>/`. Parallels `download_whisper_model`; the extra
+/// `engine` arg is for #194 backend routing / log context — the registry is keyed by `model`.
+#[tracing::instrument(skip_all, fields(engine = %engine, model = %model))]
+#[tauri::command(rename_all = "snake_case")]
+pub async fn download_tts_model(
+    engine: String,
+    model: String,
     on_progress: Channel<DownloadProgress>,
     app: tauri::AppHandle,
 ) -> Result<(), LensError> {
@@ -123,25 +143,29 @@ pub async fn download_tts_engine(
         .path()
         .app_data_dir()
         .map_err(|e| LensError::Io(e.to_string()))?;
-    let dest = data_dir.join(lens_core::KOKORO_MODEL_RELPATH);
-    lens_core::download_kokoro_model(lens_core::KOKORO_MODEL_URL, &dest, |progress| {
+    lens_core::download_tts_model(&data_dir, &model, |progress| {
         if let Err(e) = on_progress.send(progress) {
-            tracing::warn!("download_tts_engine: progress channel send failed: {e}");
+            tracing::warn!("download_tts_model: progress channel send failed: {e}");
         }
     })
     .await
+    .map(|_| ())
 }
 
-/// Returns whether the Kokoro ONNX model is already on disk, so the TTS panel
-/// can skip the download step when the engine is already installed.
-#[tracing::instrument(skip_all)]
-#[tauri::command]
-pub async fn kokoro_downloaded(app: tauri::AppHandle) -> Result<bool, LensError> {
+/// Returns whether the given TTS model artifact is already on disk, so the
+/// onboarding UI can skip the download step. Mirrors `whisper_model_downloaded`.
+#[tracing::instrument(skip_all, fields(engine = %engine, model = %model))]
+#[tauri::command(rename_all = "snake_case")]
+pub async fn tts_model_downloaded(
+    engine: String,
+    model: String,
+    app: tauri::AppHandle,
+) -> Result<bool, LensError> {
     let data_dir = app
         .path()
         .app_data_dir()
         .map_err(|e| LensError::Io(e.to_string()))?;
-    Ok(data_dir.join(lens_core::KOKORO_MODEL_RELPATH).is_file())
+    Ok(lens_core::tts_model_downloaded(&data_dir, &model))
 }
 
 /// UI representation of a Whisper model entry from the registry.
@@ -172,7 +196,7 @@ pub async fn list_whisper_models() -> Result<Vec<WhisperModelInfo>, LensError> {
 
 /// Downloads the requested Whisper ggml model to `{app_data_dir}/models/whisper/`.
 /// Idempotent: a complete file on disk emits a single `done` event without re-downloading.
-/// Mirrors `download_tts_engine` exactly: same channel type, same progress reporting.
+/// Mirrors `download_tts_model` exactly: same channel type, same progress reporting.
 #[tracing::instrument(skip_all, fields(model = %model))]
 #[tauri::command(rename_all = "snake_case")]
 pub async fn download_whisper_model(
@@ -194,7 +218,7 @@ pub async fn download_whisper_model(
 }
 
 /// Returns whether the given Whisper model is already on disk, so the
-/// onboarding UI can skip the download step. Mirrors `kokoro_downloaded`.
+/// onboarding UI can skip the download step. Mirrors `tts_model_downloaded`.
 #[tracing::instrument(skip_all, fields(model = %model))]
 #[tauri::command(rename_all = "snake_case")]
 pub async fn whisper_model_downloaded(
@@ -545,21 +569,22 @@ mod tests {
         assert!(matches!(err, LensError::Validation(_)));
     }
 
-    #[tokio::test]
-    async fn list_tts_voices_returns_male_and_female_sets() {
-        use lens_core::Gender;
-        let voices = list_tts_voices().await.unwrap();
-        assert_eq!(voices.len(), 10);
-        assert_eq!(
-            voices.iter().filter(|v| v.gender == Gender::Female).count(),
-            5
-        );
-        assert_eq!(
-            voices.iter().filter(|v| v.gender == Gender::Male).count(),
-            5
-        );
-        assert!(voices.iter().any(|v| v.id == "af_heart"));
-        assert!(voices.iter().any(|v| v.id == "am_onyx"));
+    #[test]
+    fn resolve_voices_default_orpheus_returns_named_catalog() {
+        let cfg = lens_core::TtsConfig::default();
+        let voices = resolve_voices(&cfg, std::path::Path::new("/data"));
+        assert_eq!(voices.len(), 8);
+        assert!(voices.iter().any(|v| v.id == "tara"));
+    }
+
+    #[test]
+    fn resolve_voices_non_embedded_backend_is_empty() {
+        let cfg = lens_core::TtsConfig {
+            backend: lens_core::TtsBackend::MossLocal,
+            ..lens_core::TtsConfig::default()
+        };
+        let voices = resolve_voices(&cfg, std::path::Path::new("/data"));
+        assert!(voices.is_empty());
     }
 
     #[cfg(debug_assertions)]

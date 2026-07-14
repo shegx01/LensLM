@@ -111,11 +111,9 @@ pub use system_check::{
 };
 pub use transcription::{WindowConfig, decode_and_resample_audio, decode_resample_windows};
 pub use tts::{
-    AudioBuffer, CloudTtsKind, DownloadProgress, Gender, KOKORO_MODEL_FILENAME,
-    KOKORO_MODEL_RELPATH, KOKORO_MODEL_URL, TTS_REGISTRY, TtsBackend, TtsModelSpec, TtsPhase,
-    TtsProvider, TtsProviderInfo, TtsSidecar, TtsVoice, download_kokoro_model, download_tts_model,
-    emotion_tag, kokoro_model_path, list_tts_voices, resolve_tts, resolve_tts_provider,
-    tts_model_downloaded, tts_model_path,
+    AudioBuffer, CloudTtsKind, DownloadProgress, Gender, TTS_REGISTRY, TtsBackend, TtsModelSpec,
+    TtsPhase, TtsProvider, TtsProviderInfo, TtsSidecar, TtsVoice, download_tts_model, emotion_tag,
+    resolve_tts, resolve_tts_provider, tts_model_downloaded, tts_model_path,
 };
 pub use vector_store::{LanceVectorStore, VectorStore};
 
@@ -1320,16 +1318,14 @@ impl LensEngine {
             return true;
         }
         // Cheap file probe (never a weight load): an embedded backend is available
-        // only when ALL its artifacts are on disk. Orpheus needs BOTH the GGUF and
-        // the SNAC decoder — a one-file state must not over-report available.
+        // only when ALL its artifacts are on disk — a one-file state must not
+        // over-report available. Non-embedded backends name no artifacts.
         let data_dir = self.data_dir().await;
-        match cfg.backend {
-            tts::TtsBackend::Orpheus => {
-                tts::tts_model_downloaded(&data_dir, "orpheus")
-                    && tts::tts_model_downloaded(&data_dir, "snac")
-            }
-            _ => false,
-        }
+        let required = cfg.backend.required_model_ids();
+        !required.is_empty()
+            && required
+                .iter()
+                .all(|id| tts::tts_model_downloaded(&data_dir, id))
     }
 
     pub async fn synthesize_overview(
