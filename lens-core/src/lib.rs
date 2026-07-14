@@ -65,7 +65,7 @@ pub use citation::{
     hydrate_locators, load_chunk_locators,
 };
 pub use config::{
-    AppConfig, CloudAsrProvider, CloudTtsCfg, EnrichmentConfig, RerankerConfig, RerankerModel,
+    AppConfig, CloudAsrProvider, CloudTtsConfig, EnrichmentConfig, RerankerConfig, RerankerModel,
     RetrievalConfig, TaskModel, TtsConfig, VoiceConfig, VoiceRef,
 };
 #[cfg(feature = "test-util")]
@@ -115,7 +115,7 @@ pub use tts::{
     KOKORO_MODEL_RELPATH, KOKORO_MODEL_URL, TTS_REGISTRY, TtsBackend, TtsModelSpec, TtsPhase,
     TtsProvider, TtsProviderInfo, TtsSidecar, TtsVoice, download_kokoro_model, download_tts_model,
     emotion_tag, kokoro_model_path, list_tts_voices, resolve_tts, resolve_tts_provider,
-    stitch_turns, tts_model_downloaded, tts_model_path, write_wav_16bit,
+    tts_model_downloaded, tts_model_path,
 };
 pub use vector_store::{LanceVectorStore, VectorStore};
 
@@ -1062,6 +1062,10 @@ impl LensEngine {
     /// Returns a clone of the active JS renderer handle, or `None` when none is
     /// installed (the URL-ingest fallback then keeps the legacy `needs_js`
     /// behavior).
+    pub async fn js_renderer(&self) -> Option<Arc<dyn render::JsRenderer>> {
+        self.js_renderer.read().await.clone()
+    }
+
     /// Installs (or replaces) the out-of-process TTS engine (#193). `None` clears
     /// it (the `synthesize_overview` precedence then falls through to
     /// `resolve_tts_provider`). Mirrors [`set_js_renderer`](Self::set_js_renderer);
@@ -1075,10 +1079,6 @@ impl LensEngine {
     /// installed (#190 always).
     pub async fn tts_sidecar(&self) -> Option<Arc<dyn tts::TtsSidecar>> {
         self.tts_sidecar.read().await.clone()
-    }
-
-    pub async fn js_renderer(&self) -> Option<Arc<dyn render::JsRenderer>> {
-        self.js_renderer.read().await.clone()
     }
 
     /// Installs (or replaces) the Apple-native ASR engine (#42). `None` leaves the
@@ -1334,6 +1334,20 @@ impl LensEngine {
         }
     }
 
+    /// Whether a TTS backend can currently serve [`synthesize_overview`](Self::synthesize_overview)
+    /// for `cfg`: a healthy injected sidecar, or a resolvable
+    /// [`resolve_tts_provider`](tts::resolve_tts_provider). Lets a caller
+    /// short-circuit before generating a (billable) dialogue script when
+    /// synthesis is guaranteed to fail with the no-backend error.
+    pub async fn tts_backend_available(&self, cfg: &config::TtsConfig) -> bool {
+        if let Some(sidecar) = self.tts_sidecar().await
+            && sidecar.health().await
+        {
+            return true;
+        }
+        tts::resolve_tts_provider(cfg.backend, cfg).is_some()
+    }
+
     /// Synthesizes a dialogue `script` into a single overview WAV at
     /// [`notebook_audio_path`] and returns that path (#190). Resolution precedence,
     /// frozen so #191/#193 are pure fill-ins: (1) an injected + healthy
@@ -1342,8 +1356,8 @@ impl LensEngine {
     /// provider's `synthesize_script`; (3) else a typed no-backend
     /// [`LensError::Tts`]. In #190 (1) and (2) never fire (no impl / all-`None`), so
     /// this always hits (3). `Encoding` is emitted here exactly once, immediately
-    /// before the WAV write. `on_phase` is `Fn + Sync` (not just `Send`) so the
-    /// `&`-borrow handed to the trait method is `Send`.
+    /// before the WAV write. `on_phase`'s `Fn + Sync` bound mirrors
+    /// [`TtsProvider::synthesize_script`](tts::TtsProvider::synthesize_script)'s.
     pub async fn synthesize_overview(
         &self,
         notebook_id: &str,
@@ -1360,23 +1374,10 @@ impl LensEngine {
         };
 
         let buffer: tts::AudioBuffer = if let Some(sidecar) = healthy_sidecar {
-            let total = script.turns.len();
-            let mut buffers: Vec<(dialogue::Speaker, tts::AudioBuffer)> = Vec::with_capacity(total);
-            for (i, turn) in script.turns.iter().enumerate() {
-                if cancel.is_cancelled() {
-                    return Err(LensError::Cancelled("tts synthesis cancelled".into()));
-                }
-                on_phase(tts::TtsPhase::Synthesizing { turn: i + 1, total });
-                let buf = tokio::select! {
-                    r = sidecar.synthesize_turn(turn, voices, cancel) => r?,
-                    _ = cancel.cancelled() => {
-                        return Err(LensError::Cancelled("tts synthesis cancelled".into()));
-                    }
-                };
-                buffers.push((turn.speaker, buf));
-            }
-            on_phase(tts::TtsPhase::Stitching);
-            tts::stitch_turns(&buffers)?
+            tts::synthesize_and_stitch(&script.turns, &on_phase, cancel, |turn| {
+                sidecar.synthesize_turn(turn, voices, cancel)
+            })
+            .await?
         } else if let Some(provider) = tts::resolve_tts_provider(cfg.backend, cfg) {
             provider
                 .synthesize_script(script, voices, &on_phase, cancel)
@@ -1389,7 +1390,7 @@ impl LensEngine {
 
         on_phase(tts::TtsPhase::Encoding);
         let data_dir = self.data_dir().await;
-        let path = notebook_audio_path(&data_dir, notebook_id);
+        let path = notebook_audio_path(&data_dir, notebook_id)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(LensError::from)?;
         }
@@ -2692,12 +2693,27 @@ impl Drop for TtsCancelGuard {
 /// Single source of truth for a notebook's overview-audio path:
 /// `{data_dir}/notebooks/{notebook_id}/overview.wav` (#190). One file per
 /// notebook, overwritten on regenerate — which is why the TTS cancel registry is
-/// single-flight per `notebook_id`.
-pub fn notebook_audio_path(data_dir: &Path, notebook_id: &str) -> std::path::PathBuf {
-    data_dir
+/// single-flight per `notebook_id`. Rejects an empty, separator-containing,
+/// `..`-containing, or absolute id (`Validation`) so the IPC-supplied id can never
+/// escape `{data_dir}/notebooks/`.
+pub fn notebook_audio_path(
+    data_dir: &Path,
+    notebook_id: &str,
+) -> Result<std::path::PathBuf, LensError> {
+    let looks_like_traversal = notebook_id.is_empty()
+        || notebook_id.contains('/')
+        || notebook_id.contains('\\')
+        || notebook_id.contains("..")
+        || Path::new(notebook_id).is_absolute();
+    if looks_like_traversal {
+        return Err(LensError::Validation(format!(
+            "invalid notebook id: {notebook_id:?}"
+        )));
+    }
+    Ok(data_dir
         .join("notebooks")
         .join(notebook_id)
-        .join("overview.wav")
+        .join("overview.wav"))
 }
 
 /// Best-effort removal of a managed source file and its `.extracted.txt` /
@@ -3075,11 +3091,27 @@ mod tts_cancel_tests {
 
     #[test]
     fn notebook_audio_path_joins_under_data_dir() {
-        let p = notebook_audio_path(Path::new("/data"), "nb-xyz");
+        let p = notebook_audio_path(Path::new("/data"), "nb-xyz").expect("valid id resolves");
         assert!(
             p.ends_with("notebooks/nb-xyz/overview.wav"),
             "unexpected path: {p:?}"
         );
+    }
+
+    #[test]
+    fn notebook_audio_path_rejects_traversal_id() {
+        for bad in [
+            "../../etc/passwd",
+            "..",
+            "nb/../../secret",
+            "",
+            "/etc/passwd",
+            "a\\b",
+        ] {
+            let err = notebook_audio_path(Path::new("/data"), bad)
+                .expect_err(&format!("traversal id {bad:?} must be rejected"));
+            assert!(matches!(err, LensError::Validation(_)), "got {err:?}");
+        }
     }
 
     #[tokio::test]

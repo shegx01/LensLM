@@ -120,8 +120,8 @@ symphonia = { version = "=0.5.5", features = ["all"] }
 # MIT — in deny.toml allowlist.
 rubato = "=0.16.2"
 
-# issue #190: 16-bit PCM WAV encoding for the stitched TTS overview. Pure-Rust
-# (no C toolchain), so no ABI/version lock. Apache-2.0 — deny.toml allowlist.
+# issue #190: 16-bit PCM WAV encoding for the stitched TTS overview.
+# Apache-2.0 — deny.toml allowlist.
 hound.workspace = true
 
 # issue #42: local Whisper ASR (whisper.cpp). Optional — pulled in only by the

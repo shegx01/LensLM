@@ -1,14 +1,6 @@
-//! Text-to-speech provider seam + audio pipeline (#190).
-//!
-//! Replaces the download-only Kokoro scaffold with a provider abstraction: the
-//! object-safe [`TtsProvider`] trait (mirroring `LlmProvider`), the
-//! [`TtsBackend`]/[`CloudTtsKind`] selector enums, the [`resolve_tts_provider`]
-//! router, the [`registry`] model catalog, the [`audio`] pipeline
-//! ([`AudioBuffer`] + resample + speaker-aware stitch + WAV), the [`sidecar`]
-//! injection seam, and [`TtsPhase`] progress. No concrete synthesis engine ships
-//! in #190 — every resolution path returns `None`/a typed no-backend
-//! [`LensError::Tts`], so #191 (Orpheus) is a pure match-arm addition. Kokoro
-//! stays vestigial (`kokoro`), removed in #192.
+//! Text-to-speech provider seam + audio pipeline (#190): the [`TtsProvider`]
+//! trait, backend/voice enums, the [`resolve_tts_provider`] router, and the
+//! audio/registry/sidecar submodules (see the `pub use` block below for exports).
 
 use std::sync::Arc;
 
@@ -25,7 +17,8 @@ mod kokoro;
 pub mod registry;
 pub mod sidecar;
 
-pub use audio::{AudioBuffer, stitch_turns, write_wav_16bit};
+pub use audio::AudioBuffer;
+pub(crate) use audio::write_wav_16bit;
 pub use kokoro::{
     DownloadProgress, Gender, KOKORO_MODEL_FILENAME, KOKORO_MODEL_RELPATH, KOKORO_MODEL_URL,
     TtsVoice, download_kokoro_model, kokoro_model_path, list_tts_voices,
@@ -106,6 +99,50 @@ pub enum TtsPhase {
     Encoding,
 }
 
+/// Shared cancellation message for every early-return in [`synthesize_and_stitch`].
+const CANCELLED_MSG: &str = "tts synthesis cancelled";
+
+/// Per-turn synthesis closure shape shared by [`TtsProvider::synthesize_turn`] and
+/// [`TtsSidecar::synthesize_turn`] (identical signatures, async-trait-desugared to
+/// this boxed-future return).
+type TurnSynthFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<AudioBuffer, LensError>> + Send + 'a>,
+>;
+
+/// Drives the shared turn-synthesis loop: cancel-check → `Synthesizing` phase →
+/// race `synth_turn(turn)` against `cancel` → collect → `Stitching` phase →
+/// [`audio::stitch_turns`]. The ONE place both [`TtsProvider::synthesize_script`]'s
+/// default body and the engine's sidecar branch
+/// (`LensEngine::synthesize_overview`) call, so cancel/phase semantics can never
+/// drift between the provider path (#191) and the sidecar path (#193).
+pub(crate) async fn synthesize_and_stitch<'t, F>(
+    turns: &'t [Turn],
+    on_phase: &(dyn Fn(TtsPhase) + Send + Sync),
+    cancel: &CancellationToken,
+    mut synth_turn: F,
+) -> Result<AudioBuffer, LensError>
+where
+    F: FnMut(&'t Turn) -> TurnSynthFuture<'t>,
+{
+    let total = turns.len();
+    let mut buffers: Vec<(Speaker, AudioBuffer)> = Vec::with_capacity(total);
+    for (i, turn) in turns.iter().enumerate() {
+        if cancel.is_cancelled() {
+            return Err(LensError::Cancelled(CANCELLED_MSG.into()));
+        }
+        on_phase(TtsPhase::Synthesizing { turn: i + 1, total });
+        let buf = tokio::select! {
+            r = synth_turn(turn) => r?,
+            _ = cancel.cancelled() => {
+                return Err(LensError::Cancelled(CANCELLED_MSG.into()));
+            }
+        };
+        buffers.push((turn.speaker, buf));
+    }
+    on_phase(TtsPhase::Stitching);
+    audio::stitch_turns(&buffers)
+}
+
 /// An async, object-safe TTS backend held behind `Arc<dyn TtsProvider>`. Mirrors
 /// [`LlmProvider`](crate::llm::LlmProvider): concrete `synthesize_turn` plus a
 /// defaulted `synthesize_script` that loops turns and stitches.
@@ -123,14 +160,12 @@ pub trait TtsProvider: Send + Sync {
         cancel: &CancellationToken,
     ) -> Result<AudioBuffer, LensError>;
 
-    /// Synthesizes the whole script into one stitched overview buffer. The default
-    /// loops turns emitting `Synthesizing { turn, total }`, races each
-    /// `synthesize_turn` against `cancel`, then emits `Stitching` and returns
-    /// [`stitch_turns`]. `on_phase` is a `&dyn Fn(TtsPhase) + Send + Sync` (not a
-    /// generic `impl Fn`) because an object-safe trait method cannot take a generic
-    /// closure, and a `&dyn Fn` held across `.await` in a `Send` future needs the
-    /// referent `+ Sync`. The engine emits `Encoding` separately, so this method
-    /// never does (no double phase event).
+    /// Synthesizes the whole script into one stitched overview buffer via
+    /// [`synthesize_and_stitch`]. `on_phase` is a `&dyn Fn(TtsPhase) + Send + Sync`
+    /// (not a generic `impl Fn`) because an object-safe trait method cannot take a
+    /// generic closure, and a `&dyn Fn` held across `.await` in a `Send` future
+    /// needs the referent `+ Sync`. The engine emits `Encoding` separately, so this
+    /// method never does (no double phase event).
     async fn synthesize_script(
         &self,
         script: &DialogueScript,
@@ -138,23 +173,10 @@ pub trait TtsProvider: Send + Sync {
         on_phase: &(dyn Fn(TtsPhase) + Send + Sync),
         cancel: &CancellationToken,
     ) -> Result<AudioBuffer, LensError> {
-        let total = script.turns.len();
-        let mut buffers: Vec<(Speaker, AudioBuffer)> = Vec::with_capacity(total);
-        for (i, turn) in script.turns.iter().enumerate() {
-            if cancel.is_cancelled() {
-                return Err(LensError::Cancelled("tts synthesis cancelled".into()));
-            }
-            on_phase(TtsPhase::Synthesizing { turn: i + 1, total });
-            let buf = tokio::select! {
-                r = self.synthesize_turn(turn, voices, cancel) => r?,
-                _ = cancel.cancelled() => {
-                    return Err(LensError::Cancelled("tts synthesis cancelled".into()));
-                }
-            };
-            buffers.push((turn.speaker, buf));
-        }
-        on_phase(TtsPhase::Stitching);
-        stitch_turns(&buffers)
+        synthesize_and_stitch(&script.turns, on_phase, cancel, |turn| {
+            self.synthesize_turn(turn, voices, cancel)
+        })
+        .await
     }
 }
 

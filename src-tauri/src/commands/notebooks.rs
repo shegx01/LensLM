@@ -541,10 +541,12 @@ pub async fn cancel_dialogue(
 /// Synthesizes a notebook's audio overview to a WAV and returns its path (#190).
 /// Streams `Started → Chunk(Synthesizing{turn,total})… → Chunk(Stitching) →
 /// Chunk(Encoding) → Done` on `on_progress`. Per-notebook single-flight over a
-/// DEDICATED TTS registry (never ask/dialogue). #190 seam: the grounded dialogue
-/// script is generated first at the default medium length (#194's UI picks the
-/// length later), then synthesized — but with no adapter yet the synthesis half
-/// always resolves to the no-backend `LensError::Tts`, so this is dead-but-wired.
+/// DEDICATED TTS registry (never ask/dialogue). Checks backend availability
+/// FIRST: with no adapter (#190) or sidecar, that check always fails, so this
+/// returns the no-backend `LensError::Tts` WITHOUT spending a billable
+/// `generate_dialogue` call on a synthesis that is guaranteed to fail. Once a
+/// backend is available, the grounded dialogue script is generated at the
+/// default medium length (#194's UI will pick the length), then synthesized.
 #[tracing::instrument(skip(on_progress, engine))]
 #[tauri::command]
 pub async fn synthesize_overview(
@@ -556,10 +558,18 @@ pub async fn synthesize_overview(
         tracing::warn!("synthesize_overview: started event send failed: {e}");
     }
 
+    let config = engine.config().await;
+
+    if !engine.tts_backend_available(&config.tts).await {
+        let err = LensError::Tts("no TTS backend available; install an engine".into());
+        if let Err(e) = send_event(&on_progress, StreamEvent::Failed(err.clone())) {
+            tracing::warn!("synthesize_overview: failed event send failed: {e}");
+        }
+        return Err(err);
+    }
+
     let token = engine.register_tts(&notebook_id);
     let _guard = engine.tts_cancel_guard(&notebook_id, token.clone());
-
-    let config = engine.config().await;
 
     let script = match engine
         .generate_dialogue(

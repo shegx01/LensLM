@@ -38,15 +38,13 @@ pub fn resolve_tts(id: &str) -> Option<&'static TtsModelSpec> {
     TTS_REGISTRY.iter().find(|s| s.id == id)
 }
 
-/// On-disk path for a registered model: `{data_dir}/{spec.relpath}`. Returns
-/// `None` for an unknown id, so a caller can never build a path from an
-/// unvalidated (possibly traversing) id.
+/// On-disk path for a registered model: `{data_dir}/{spec.relpath}`. `None` for
+/// an unknown id (see [`resolve_tts`]).
 pub fn tts_model_path(data_dir: &Path, id: &str) -> Option<PathBuf> {
     resolve_tts(id).map(|spec| data_dir.join(spec.relpath))
 }
 
-/// Whether the resolved model's file exists on disk. Unknown/`..`-containing ids
-/// resolve to `None` → `false`, so the probed path always stays under `data_dir`.
+/// Whether the resolved model's file exists on disk; unknown ids report `false`.
 pub fn tts_model_downloaded(data_dir: &Path, id: &str) -> bool {
     match tts_model_path(data_dir, id) {
         Some(path) => path.is_file(),

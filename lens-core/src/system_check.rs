@@ -803,7 +803,7 @@ mod tests {
 
     #[test]
     fn has_cloud_tts_requires_cloud_backend_and_key() {
-        use crate::config::{CloudTtsCfg, TtsConfig};
+        use crate::config::{CloudTtsConfig, TtsConfig};
         use crate::tts::{CloudTtsKind, TtsBackend};
 
         let mut config = AppConfig::default();
@@ -815,7 +815,7 @@ mod tests {
             version: 1,
             backend: TtsBackend::Cloud(CloudTtsKind::ElevenLabs),
             model: String::new(),
-            cloud: Some(CloudTtsCfg {
+            cloud: Some(CloudTtsConfig {
                 kind: CloudTtsKind::ElevenLabs,
                 api_key: String::new(),
                 base_url: String::new(),
@@ -824,7 +824,7 @@ mod tests {
         assert!(!has_cloud_tts(&config));
 
         // Cloud backend + key → configured.
-        config.tts.cloud = Some(CloudTtsCfg {
+        config.tts.cloud = Some(CloudTtsConfig {
             kind: CloudTtsKind::ElevenLabs,
             api_key: "sk-key".to_string(),
             base_url: String::new(),
@@ -1228,7 +1228,7 @@ mod tests {
             version: 1,
             backend: crate::tts::TtsBackend::Cloud(crate::tts::CloudTtsKind::ElevenLabs),
             model: String::new(),
-            cloud: Some(crate::config::CloudTtsCfg {
+            cloud: Some(crate::config::CloudTtsConfig {
                 kind: crate::tts::CloudTtsKind::ElevenLabs,
                 api_key: "sk-elevenlabs".to_string(),
                 base_url: String::new(),

@@ -95,11 +95,8 @@ impl AudioBuffer {
             .map_err(resample_err)?;
         out.extend_from_slice(&flushed[MONO]);
 
-        // Fit to the duration-exact output length: the sinc filter's group delay +
-        // final-chunk zero-padding make the raw output run a few hundred frames
-        // long. Truncating that tail (or zero-padding a short one) gives a
-        // deterministic, duration-preserving buffer — value fidelity is not on the
-        // #190 audio path (stitch resamples nothing at the canonical 24 kHz).
+        // Trim to the duration-exact length: the sinc filter's group delay adds a
+        // few hundred trailing frames the caller never asked for.
         let expected =
             (self.samples.len() as u64 * target as u64 / self.sample_rate as u64) as usize;
         out.resize(expected, 0.0);
@@ -108,15 +105,10 @@ impl AudioBuffer {
     }
 }
 
-/// Stitches per-turn buffers into one overview at [`TARGET_RATE`]. Each turn is
-/// resampled to 24 kHz, then a raised-cosine edge fade takes its head in from
-/// silence and its tail out to silence (killing the boundary click WITHOUT an
-/// overlap-add crossfade — the turns are separated by silence, so there is
-/// nothing to overlap). Turns are concatenated with speaker-aware silence gaps
-/// (within-speaker 350 ms, speaker-change 450 ms). Total length is therefore
-/// `Σ turn_samples + Σ gap_samples`. Finally the whole output is peak-normalized
-/// to −1 dBFS, guarding a silent (all-zero) input against divide-by-zero.
-pub fn stitch_turns(buffers: &[(Speaker, AudioBuffer)]) -> Result<AudioBuffer, LensError> {
+/// Stitches per-turn buffers into one overview at [`TARGET_RATE`], with
+/// speaker-aware silence gaps and edge fades — NOT an overlap-add crossfade,
+/// since the turns are silence-separated and there is nothing to overlap.
+pub(crate) fn stitch_turns(buffers: &[(Speaker, AudioBuffer)]) -> Result<AudioBuffer, LensError> {
     let fade_samples = ms_to_samples(FADE_MS);
     let mut out: Vec<f32> = Vec::new();
     let mut prev: Option<Speaker> = None;
@@ -142,7 +134,7 @@ pub fn stitch_turns(buffers: &[(Speaker, AudioBuffer)]) -> Result<AudioBuffer, L
 
 /// Encodes `buffer` as a single-channel 16-bit PCM WAV at `path` via hound.
 /// f32 samples are clamped to [−1, 1] and scaled to `i16`.
-pub fn write_wav_16bit(buffer: &AudioBuffer, path: &Path) -> Result<(), LensError> {
+pub(crate) fn write_wav_16bit(buffer: &AudioBuffer, path: &Path) -> Result<(), LensError> {
     let spec = hound::WavSpec {
         channels: 1,
         sample_rate: buffer.sample_rate,

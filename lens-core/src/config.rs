@@ -83,17 +83,17 @@ pub struct VoiceConfig {
 /// Cloud TTS credentials for [`TtsBackend::Cloud`]. `Debug` is manual so `api_key`
 /// is redacted, exactly like [`ModelConfig`].
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
-pub struct CloudTtsCfg {
+pub struct CloudTtsConfig {
     pub kind: CloudTtsKind,
     /// Stored in PLAINTEXT — see [`ModelConfig::api_key`] for the at-rest caveat.
     pub api_key: String,
     pub base_url: String,
 }
 
-impl std::fmt::Debug for CloudTtsCfg {
+impl std::fmt::Debug for CloudTtsConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let api_key = if self.api_key.is_empty() { "" } else { "***" };
-        f.debug_struct("CloudTtsCfg")
+        f.debug_struct("CloudTtsConfig")
             .field("kind", &self.kind)
             .field("api_key", &api_key)
             .field("base_url", &self.base_url)
@@ -104,14 +104,14 @@ impl std::fmt::Debug for CloudTtsCfg {
 /// TTS synthesis configuration. `version` is an explicit forward-migration marker
 /// (the first such convention in `config.rs`); reads coerce a legacy
 /// `{provider, api_key}` shape via [`RawTtsConfig`]. `Debug` derives — the nested
-/// [`CloudTtsCfg`] redacts its own `api_key`.
+/// [`CloudTtsConfig`] redacts its own `api_key`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(from = "RawTtsConfig")]
 pub struct TtsConfig {
     pub version: u32,
     pub backend: TtsBackend,
     pub model: String,
-    pub cloud: Option<CloudTtsCfg>,
+    pub cloud: Option<CloudTtsConfig>,
 }
 
 impl Default for TtsConfig {
@@ -144,7 +144,7 @@ struct RawTtsConfig {
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
-    cloud: Option<CloudTtsCfg>,
+    cloud: Option<CloudTtsConfig>,
 }
 
 impl From<RawTtsConfig> for TtsConfig {
@@ -165,7 +165,7 @@ impl From<RawTtsConfig> for TtsConfig {
                 version: 1,
                 backend: TtsBackend::Cloud(CloudTtsKind::OpenAiCompatible),
                 model: String::new(),
-                cloud: Some(CloudTtsCfg {
+                cloud: Some(CloudTtsConfig {
                     kind: CloudTtsKind::OpenAiCompatible,
                     api_key: raw.api_key.unwrap_or_default(),
                     base_url: String::new(),
@@ -840,7 +840,7 @@ mod tests {
             version: 1,
             backend: TtsBackend::Cloud(CloudTtsKind::OpenAiCompatible),
             model: String::new(),
-            cloud: Some(CloudTtsCfg {
+            cloud: Some(CloudTtsConfig {
                 kind: CloudTtsKind::OpenAiCompatible,
                 api_key: "sk-elevenlabs-supersecret".to_string(),
                 base_url: String::new(),
@@ -949,7 +949,7 @@ mod tests {
                 version: 1,
                 backend: TtsBackend::Cloud(CloudTtsKind::ElevenLabs),
                 model: "eleven-turbo".to_string(),
-                cloud: Some(CloudTtsCfg {
+                cloud: Some(CloudTtsConfig {
                     kind: CloudTtsKind::ElevenLabs,
                     api_key: "sk-elevenlabs".to_string(),
                     base_url: "https://api.elevenlabs.io".to_string(),
