@@ -145,6 +145,16 @@ pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
+/// Single source of truth for the f32→16-bit-PCM sample mapping: clamp to
+/// `[-1.0, 1.0]`, then scale to `i16`. Shared by the TTS hound WAV writer
+/// (`tts::audio::write_wav_16bit`) and the cloud-ASR in-memory WAV wrapper
+/// (`asr::cloud::wav::pcm_to_wav`) — sibling modules with no existing
+/// dependency between them, so the shared policy lives here rather than one
+/// importing the other (mirrors [`hex_encode`]'s placement).
+pub(crate) fn f32_sample_to_i16(s: f32) -> i16 {
+    (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16
+}
+
 /// Builds the candle embedder for a fastembed-coordinate spec on Apple Silicon
 /// (issue #91): Metal for Bulk, CPU for Interactive. Returns `None` — falling back
 /// to fastembed — for unsupported models or any candle init failure.

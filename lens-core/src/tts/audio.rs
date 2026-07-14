@@ -133,7 +133,7 @@ pub(crate) fn stitch_turns(buffers: &[(Speaker, AudioBuffer)]) -> Result<AudioBu
 }
 
 /// Encodes `buffer` as a single-channel 16-bit PCM WAV at `path` via hound.
-/// f32 samples are clamped to [−1, 1] and scaled to `i16`.
+/// Sample mapping is [`crate::f32_sample_to_i16`].
 pub(crate) fn write_wav_16bit(buffer: &AudioBuffer, path: &Path) -> Result<(), LensError> {
     let spec = hound::WavSpec {
         channels: 1,
@@ -143,8 +143,9 @@ pub(crate) fn write_wav_16bit(buffer: &AudioBuffer, path: &Path) -> Result<(), L
     };
     let mut writer = hound::WavWriter::create(path, spec).map_err(hound_err)?;
     for &s in &buffer.samples {
-        let v = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
-        writer.write_sample(v).map_err(hound_err)?;
+        writer
+            .write_sample(crate::f32_sample_to_i16(s))
+            .map_err(hound_err)?;
     }
     writer.finalize().map_err(hound_err)?;
     Ok(())
