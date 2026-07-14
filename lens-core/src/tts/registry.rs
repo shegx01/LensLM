@@ -23,7 +23,7 @@ pub static TTS_REGISTRY: &[TtsModelSpec] = &[
         relpath: KOKORO_MODEL_RELPATH,
     },
     // issue #191 [161c]: SNAC 24 kHz neural-codec decoder weights (upstream
-    // PyTorch `.bin`, loaded by candle via `VarBuilder::from_pth`).
+    // PyTorch `.bin`; load mechanism documented at the snac.rs call site).
     TtsModelSpec {
         id: SNAC_MODEL_ID,
         url: SNAC_MODEL_URL,

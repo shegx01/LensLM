@@ -4,9 +4,8 @@
 //! audio-token stream → three hierarchical codebook frames → 24 kHz mono PCM.
 //! The encoder/quantizer-search paths are not needed (we only decode).
 //!
-//! Weight-norm is folded at load (`w = v · g / ‖v‖`) so no runtime norm param is
-//! kept; the checkpoint stores the new-parametrization keys `original0` (g) and
-//! `original1` (v). Decode runs on CPU for cross-platform determinism.
+//! Weight-norm is folded at load so no runtime norm param is kept (see
+//! [`fold_weight_norm`]). Decode runs on CPU for cross-platform determinism.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -26,7 +25,7 @@ pub const SNAC_MODEL_SHA256_HEX: &str =
 pub const SNAC_MODEL_RELPATH: &str = "models/snac/pytorch_model.bin";
 
 // Orpheus audio-token framing (raw token-id math, from the spike reference decoder):
-// `code = raw_id - 128266 - ((kept_pos % 7) * 4096)`, kept iff `0 < code <= 4096`.
+// `code = raw_id - 128266 - ((kept_pos % 7) * 4096)`, kept iff `0 < code < 4096`.
 // The leading markers (start-of-AI 128261, start-of-audio 128257) and the
 // end-of-audio marker (128258) all fall out of range and are skipped naturally.
 const CUSTOM_TOKEN_BASE: i64 = 128266;
@@ -322,8 +321,10 @@ pub struct SnacDecoder {
 impl SnacDecoder {
     /// Loads the real `snac_24khz` decoder from the upstream PyTorch `.bin`.
     pub fn load(path: &Path) -> Result<Self, LensError> {
+        // Generic message: the underlying candle error embeds the on-disk path,
+        // which must not cross the IPC boundary.
         let tensors = candle_core::pickle::read_all(path)
-            .map_err(|e| LensError::Tts(format!("snac: reading weights failed: {e}")))?;
+            .map_err(|_| LensError::Tts("snac: reading weights failed".into()))?;
         let weights: Weights = tensors.into_iter().collect();
         Self::from_weights(weights, SnacConfig::snac_24khz(), Device::Cpu)
             .map_err(|e| LensError::Tts(format!("snac: building decoder failed: {e}")))
@@ -400,7 +401,11 @@ pub(crate) fn extract_codes(raw_ids: &[u32]) -> Vec<u32> {
     for &raw in raw_ids {
         let code =
             raw as i64 - CUSTOM_TOKEN_BASE - ((pos % TOKENS_PER_FRAME) as i64) * CODEBOOK_SPAN;
-        if code > 0 && code <= CODEBOOK_SPAN {
+        // Codebook indices are 0..CODEBOOK_SPAN-1; the upper bound is EXCLUSIVE so a
+        // stray `code == CODEBOOK_SPAN` is dropped gracefully here rather than aborting
+        // the whole overview at the codebook lookup. `code > 0` matches the reference
+        // `token > 0` filter, which intentionally drops code 0.
+        if code > 0 && code < CODEBOOK_SPAN {
             codes.push(code as u32);
             pos += 1;
         }
@@ -463,11 +468,16 @@ mod tests {
 
     #[test]
     fn extract_codes_keep_rule_boundaries() {
-        // code 0 (raw = base) is dropped; code == 4096 is kept; code 4097 dropped.
+        // Keep rule is `0 < code < 4096`: code 0 (raw = base) is dropped; code 4095
+        // (max valid index) is kept; code == 4096 and 4097 are dropped (out of range).
         assert_eq!(extract_codes(&[raw_id(0, 0)]), Vec::<u32>::new());
         assert_eq!(
+            extract_codes(&[CUSTOM_TOKEN_BASE as u32 + 4095]),
+            vec![4095]
+        );
+        assert_eq!(
             extract_codes(&[CUSTOM_TOKEN_BASE as u32 + 4096]),
-            vec![4096]
+            Vec::<u32>::new()
         );
         assert_eq!(
             extract_codes(&[CUSTOM_TOKEN_BASE as u32 + 4097]),

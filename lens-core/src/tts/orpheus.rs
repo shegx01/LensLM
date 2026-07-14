@@ -56,6 +56,8 @@ const MAX_RETRIES: usize = 2;
 const TOKENS_PER_WORD_EST: usize = 30;
 const EARLY_EOS_FRACTION: f64 = 0.35;
 
+// Backend-specific cancel message; intentionally distinct from the pipeline-level
+// `tts::CANCELLED_MSG` so the source of the cancellation is legible.
 const CANCELLED_MSG: &str = "orpheus generation cancelled";
 
 const ORPHEUS_VOICES: [&str; 8] = ["tara", "leah", "jess", "leo", "dan", "mia", "zac", "zoe"];
@@ -105,8 +107,10 @@ impl LoadedOrpheus {
             0
         };
         let model_params = LlamaModelParams::default().with_n_gpu_layers(n_gpu_layers);
+        // Generic message: the underlying llama.cpp error embeds the model path,
+        // which must not cross the IPC boundary.
         let model = LlamaModel::load_from_file(&backend, model_path, &model_params)
-            .map_err(|e| LensError::Tts(format!("orpheus: model load failed: {e}")))?;
+            .map_err(|_| LensError::Tts("orpheus: model load failed".into()))?;
         let snac = SnacDecoder::load(snac_path)?;
         Ok(Arc::new(Self {
             backend,
@@ -118,7 +122,8 @@ impl LoadedOrpheus {
 
 // The llama backend can be initialized only once per process; cache it (never
 // dropped) so multiple adapter instances share one global init. Any `&LlamaBackend`
-// satisfies `new_context`, so a single global suffices.
+// satisfies `new_context`, so a single global suffices. The init `Result` is cached:
+// a failed init is recorded once and never retried for the process lifetime.
 static LLAMA_BACKEND: OnceLock<Result<Arc<LlamaBackend>, String>> = OnceLock::new();
 
 fn llama_backend() -> Result<Arc<LlamaBackend>, LensError> {
