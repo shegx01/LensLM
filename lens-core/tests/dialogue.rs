@@ -383,7 +383,6 @@ async fn empty_notebook_errors_with_zero_llm_calls() {
     let engine = LensEngine::init(dir.path()).await.unwrap();
     let pool = engine.pool().await;
     let nb = engine.create_notebook("nb", None, None).await.unwrap().id;
-    // No selected+live sources.
     let ctx = build_ctx(
         dir.path(),
         &pool,

@@ -189,6 +189,13 @@ async fn tier1_sum(
     Ok(sum)
 }
 
+/// The selected+live corpus-scope predicate shared by every consumer that needs
+/// "this notebook's currently-grounded sources" (this fn, and the dialogue
+/// orchestrator's `LensEngine::selected_live_source_ids`, lib.rs). Single-sourced
+/// so the scope can't drift between callers.
+pub(crate) const SELECTED_LIVE_WHERE: &str =
+    "notebook_id = ? AND selected = 1 AND trashed_at IS NULL";
+
 /// Resolves the selected+live source ids (with cached token counts) for a notebook,
 /// using the exact predicate BM25 and `live_chunk_ids` use so all paths share one
 /// corpus scope. Ordered by `created_at` for a stable document order across sources.
@@ -196,14 +203,14 @@ async fn resolve_selected_sources(
     pool: &SqlitePool,
     notebook_id: &str,
 ) -> Result<Vec<(String, Option<i64>)>, LensError> {
-    let rows = sqlx::query_as::<_, (String, Option<i64>)>(
-        "SELECT id, token_count FROM sources \
-         WHERE notebook_id = ? AND selected = 1 AND trashed_at IS NULL \
-         ORDER BY created_at ASC, id ASC",
-    )
-    .bind(notebook_id)
-    .fetch_all(pool)
-    .await?;
+    let sql = format!(
+        "SELECT id, token_count FROM sources WHERE {SELECTED_LIVE_WHERE} \
+         ORDER BY created_at ASC, id ASC"
+    );
+    let rows = sqlx::query_as::<_, (String, Option<i64>)>(&sql)
+        .bind(notebook_id)
+        .fetch_all(pool)
+        .await?;
     Ok(rows)
 }
 

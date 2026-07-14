@@ -33,6 +33,19 @@ const DIALOGUE_TEMPERATURE: f32 = 0.7;
 /// notebook broadly, not a single user question.
 const OVERVIEW_QUERY: &str = "key topics, findings, and takeaways across these sources";
 
+/// The turn-object JSON schema, shared verbatim by the initial prompt and the
+/// repair instruction so a future schema change updates one place (cf.
+/// `citation::CITATION_PROMPT_INSTRUCTION`).
+const TURN_SCHEMA_HINT: &str = "{\"speaker\": \"host\"|\"guest\", \"text\": string, \"emotion\": string (optional), \"source_ids\": [string]}";
+
+/// The "emit only a bare JSON array of turn objects" instruction, shared by the
+/// initial prompt and the repair instruction.
+const JSON_ARRAY_ONLY_INSTRUCTION: &str = "Return ONLY a JSON array of turn objects — no prose, no markdown fences — where each object is";
+
+/// Cancellation message shared by every cancel check / `select!` arm in
+/// [`generate_dialogue`].
+const CANCELLED_MSG: &str = "dialogue generation cancelled";
+
 /// A validated two-speaker dialogue script. Serializes as `{ "turns": [...] }`; the
 /// model is prompted to emit the bare `turns` array, which [`parse_dialogue`]
 /// salvages into this shape.
@@ -64,7 +77,7 @@ pub enum Speaker {
     Guest,
 }
 
-/// Per-turn delivery hint (Kokoro ignores it; Orpheus #161 renders it).
+/// Per-turn delivery hint. See [`Turn::emotion`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Emotion {
@@ -175,9 +188,7 @@ fn build_dialogue_prompt(
          `source_ids` array; leave `source_ids` empty for pure transitions or \
          backchannels. Where a line is naturally delivered with feeling, set \
          `emotion` to one of: neutral, laugh, sigh, excited, thoughtful.\n\n\
-         Return ONLY a JSON array of turn objects — no prose, no markdown fences — \
-         where each object is {{\"speaker\": \"host\"|\"guest\", \"text\": string, \
-         \"emotion\": string (optional), \"source_ids\": [string]}}.\n\n\
+         {JSON_ARRAY_ONLY_INSTRUCTION} {TURN_SCHEMA_HINT}.\n\n\
          Source units:\n{blocks}",
         turns = preset.target_turns,
     );
@@ -407,8 +418,7 @@ fn build_repair_request(prior: &str, failure: &LensError, preset: &LengthPreset)
         "You are repairing a malformed dialogue-script response. {reason}. Here is \
          your previous output:\n\n{prior}\n\nReturn ONLY a corrected JSON array of \
          turn objects — no prose, no markdown fences — where each object is \
-         {{\"speaker\": \"host\"|\"guest\", \"text\": string, \"emotion\": string \
-         (optional), \"source_ids\": [string]}}."
+         {TURN_SCHEMA_HINT}."
     );
     base_request(
         system,
@@ -431,7 +441,7 @@ pub async fn generate_dialogue(
 
     on_phase(DialoguePhase::Retrieving);
     if cancel.is_cancelled() {
-        return Err(LensError::Cancelled("dialogue generation cancelled".into()));
+        return Err(LensError::Cancelled(CANCELLED_MSG.into()));
     }
 
     // Embed the overview query fully OFF the async runtime — the fastembed
@@ -445,7 +455,7 @@ pub async fn generate_dialogue(
     };
 
     if cancel.is_cancelled() {
-        return Err(LensError::Cancelled("dialogue generation cancelled".into()));
+        return Err(LensError::Cancelled(CANCELLED_MSG.into()));
     }
 
     let out = tiered_search(
@@ -477,7 +487,7 @@ pub async fn generate_dialogue(
     let titles = crate::citation::source_titles(&ctx.pool, &ids).await?;
 
     if cancel.is_cancelled() {
-        return Err(LensError::Cancelled("dialogue generation cancelled".into()));
+        return Err(LensError::Cancelled(CANCELLED_MSG.into()));
     }
 
     let (system, prompt) = build_dialogue_prompt(&out.units, &titles, &preset);
@@ -491,7 +501,7 @@ pub async fn generate_dialogue(
     let resp = tokio::select! {
         r = ctx.provider.generate(&req) => r?,
         _ = cancel.cancelled() => {
-            return Err(LensError::Cancelled("dialogue generation cancelled".into()));
+            return Err(LensError::Cancelled(CANCELLED_MSG.into()));
         }
     };
 
@@ -506,7 +516,7 @@ pub async fn generate_dialogue(
             let repaired = tokio::select! {
                 r = ctx.provider.generate(&repair) => r?,
                 _ = cancel.cancelled() => {
-                    return Err(LensError::Cancelled("dialogue generation cancelled".into()));
+                    return Err(LensError::Cancelled(CANCELLED_MSG.into()));
                 }
             };
             let script = parse_dialogue(&repaired.text)?;

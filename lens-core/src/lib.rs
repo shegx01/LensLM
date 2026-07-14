@@ -1413,22 +1413,22 @@ impl LensEngine {
         crate::dialogue::generate_dialogue(ctx, cancel, on_phase).await
     }
 
-    /// The selected + live (not-trashed) source ids for a notebook. Deliberately
-    /// duplicates `router::resolve_selected_sources`'s corpus-scope predicate (that
-    /// fn is private) — keep the two in sync. Backs the dialogue validator's
-    /// grounding set (#26).
+    /// The selected + live (not-trashed) source ids for a notebook, over the shared
+    /// `router::SELECTED_LIVE_WHERE` predicate `resolve_selected_sources` also uses.
+    /// Backs the dialogue validator's grounding set (#26).
     async fn selected_live_source_ids(
         &self,
         notebook_id: &str,
     ) -> Result<std::collections::HashSet<String>, LensError> {
         let pool = self.pool().await;
-        let rows = sqlx::query_scalar::<_, String>(
-            "SELECT id FROM sources \
-             WHERE notebook_id = ? AND selected = 1 AND trashed_at IS NULL",
-        )
-        .bind(notebook_id)
-        .fetch_all(&pool)
-        .await?;
+        let sql = format!(
+            "SELECT id FROM sources WHERE {}",
+            crate::retrieval::router::SELECTED_LIVE_WHERE
+        );
+        let rows = sqlx::query_scalar::<_, String>(&sql)
+            .bind(notebook_id)
+            .fetch_all(&pool)
+            .await?;
         Ok(rows.into_iter().collect())
     }
 
