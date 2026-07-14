@@ -595,7 +595,12 @@ async fn probe_embedding_model(
 }
 
 fn has_cloud_tts(config: &AppConfig) -> bool {
-    config.tts.provider.eq_ignore_ascii_case("elevenlabs") && !config.tts.api_key.is_empty()
+    matches!(config.tts.backend, crate::tts::TtsBackend::Cloud(_))
+        && config
+            .tts
+            .cloud
+            .as_ref()
+            .is_some_and(|c| !c.api_key.is_empty())
 }
 
 /// TTS readiness gate: passes when the Kokoro ONNX model is on disk AND both
@@ -603,7 +608,7 @@ fn has_cloud_tts(config: &AppConfig) -> bool {
 fn probe_text_to_speech(config: &AppConfig) -> CheckResult {
     let model_path = crate::tts::kokoro_model_path(Path::new(&config.paths.data_dir));
     let kokoro_on_disk = model_path.is_file();
-    let voices_set = !config.voices.host.is_empty() && !config.voices.guest.is_empty();
+    let voices_set = !config.voices.host.is_unset() && !config.voices.guest.is_unset();
 
     let (status, detail) = if kokoro_on_disk && voices_set {
         (CheckStatus::Pass, "Kokoro audio engine ready".to_string())
@@ -797,27 +802,33 @@ mod tests {
     }
 
     #[test]
-    fn has_cloud_tts_requires_elevenlabs_and_key() {
+    fn has_cloud_tts_requires_cloud_backend_and_key() {
+        use crate::config::{CloudTtsConfig, TtsConfig};
+        use crate::tts::{CloudTtsKind, TtsBackend};
+
         let mut config = AppConfig::default();
-        config.tts = crate::config::TtsConfig {
-            provider: "elevenlabs".to_string(),
-            api_key: String::new(),
+        // Kokoro (default) is not cloud.
+        assert!(!has_cloud_tts(&config));
+
+        // Cloud backend but empty key → not configured.
+        config.tts = TtsConfig {
+            version: 1,
+            backend: TtsBackend::Cloud(CloudTtsKind::ElevenLabs),
+            model: String::new(),
+            cloud: Some(CloudTtsConfig {
+                kind: CloudTtsKind::ElevenLabs,
+                api_key: String::new(),
+                base_url: String::new(),
+            }),
         };
         assert!(!has_cloud_tts(&config));
 
-        config.tts = crate::config::TtsConfig {
-            provider: "openai".to_string(),
+        // Cloud backend + key → configured.
+        config.tts.cloud = Some(CloudTtsConfig {
+            kind: CloudTtsKind::ElevenLabs,
             api_key: "sk-key".to_string(),
-        };
-        assert!(!has_cloud_tts(&config));
-
-        config.tts = crate::config::TtsConfig {
-            provider: "ElevenLabs".to_string(),
-            api_key: "sk-key".to_string(),
-        };
-        assert!(has_cloud_tts(&config));
-
-        config.tts.provider = "elevenlabs".to_string();
+            base_url: String::new(),
+        });
         assert!(has_cloud_tts(&config));
     }
 
@@ -1169,8 +1180,8 @@ mod tests {
         let mut config = AppConfig::default();
         config.paths.data_dir = dir.path().display().to_string();
         config.voices = crate::config::VoiceConfig {
-            host: "am_michael".to_string(),
-            guest: "af_heart".to_string(),
+            host: crate::config::VoiceRef::Named("am_michael".to_string()),
+            guest: crate::config::VoiceRef::Named("af_heart".to_string()),
         };
 
         let result = probe_text_to_speech(&config);
@@ -1186,8 +1197,8 @@ mod tests {
         let mut config = AppConfig::default();
         config.paths.data_dir = dir.path().display().to_string();
         config.voices = crate::config::VoiceConfig {
-            host: "am_michael".to_string(),
-            guest: String::new(),
+            host: crate::config::VoiceRef::Named("am_michael".to_string()),
+            guest: crate::config::VoiceRef::default(),
         };
 
         let result = probe_text_to_speech(&config);
@@ -1200,8 +1211,8 @@ mod tests {
         let mut config = AppConfig::default();
         config.paths.data_dir = dir.path().display().to_string();
         config.voices = crate::config::VoiceConfig {
-            host: "am_michael".to_string(),
-            guest: "af_heart".to_string(),
+            host: crate::config::VoiceRef::Named("am_michael".to_string()),
+            guest: crate::config::VoiceRef::Named("af_heart".to_string()),
         };
 
         let result = probe_text_to_speech(&config);
@@ -1214,8 +1225,14 @@ mod tests {
         let mut config = AppConfig::default();
         config.paths.data_dir = dir.path().display().to_string();
         config.tts = crate::config::TtsConfig {
-            provider: "elevenlabs".to_string(),
-            api_key: "sk-elevenlabs".to_string(),
+            version: 1,
+            backend: crate::tts::TtsBackend::Cloud(crate::tts::CloudTtsKind::ElevenLabs),
+            model: String::new(),
+            cloud: Some(crate::config::CloudTtsConfig {
+                kind: crate::tts::CloudTtsKind::ElevenLabs,
+                api_key: "sk-elevenlabs".to_string(),
+                base_url: String::new(),
+            }),
         };
 
         let result = probe_text_to_speech(&config);

@@ -49,6 +49,8 @@ petgraph = "0.8"
 serde_json = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# WAV (RIFF) encoding for the TTS overview audio pipeline (#190). Pure-Rust, no ABI lock.
+hound = "3.5"
 # Test-only dependencies (consumed via each crate's [dev-dependencies]).
 rstest = "0.26"
 insta = { version = "1", features = ["json"] }

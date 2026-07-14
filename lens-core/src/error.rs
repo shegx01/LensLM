@@ -69,6 +69,9 @@ pub enum LensError {
     /// internal detail leaks across the IPC boundary.
     #[error("cancelled: {0}")]
     Cancelled(String),
+
+    #[error("tts error: {0}")]
+    Tts(String),
 }
 
 // Manual `From` mappings (NOT `#[from]`): source error types are not `Serialize`
@@ -149,6 +152,7 @@ impl LensError {
             LensError::EmptyAudio(_) => "EmptyAudio",
             LensError::Transcription(_) => "Transcription",
             LensError::Cancelled(_) => "Cancelled",
+            LensError::Tts(_) => "Tts",
         }
     }
 
@@ -168,7 +172,8 @@ impl LensError {
             | LensError::MediaDecodeFailed(m)
             | LensError::EmptyAudio(m)
             | LensError::Transcription(m)
-            | LensError::Cancelled(m) => m,
+            | LensError::Cancelled(m)
+            | LensError::Tts(m) => m,
         }
     }
 }

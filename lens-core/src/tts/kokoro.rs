@@ -17,10 +17,13 @@ pub const KOKORO_MODEL_URL: &str =
 pub const KOKORO_MODEL_FILENAME: &str = "model_q8f16.onnx";
 pub const KOKORO_MODEL_RELPATH: &str = "models/kokoro/model_q8f16.onnx";
 
-/// SHA256 from the HuggingFace LFS `oid` (`lfs.oid` IS the file SHA256). Verified
-/// after download, before the `.part → final` rename, to reject a corrupted transfer.
-const KOKORO_MODEL_SHA256: Option<&str> =
-    Some("04c658aec1b6008857c2ad10f8c589d4180d0ec427e7e6118ceb487e215c3cd0");
+/// SHA256 from the HuggingFace LFS `oid` (`lfs.oid` IS the file SHA256), as raw hex.
+pub(crate) const KOKORO_MODEL_SHA256_HEX: &str =
+    "04c658aec1b6008857c2ad10f8c589d4180d0ec427e7e6118ceb487e215c3cd0";
+
+/// SHA256 verified after download, before the `.part → final` rename, to reject a
+/// corrupted transfer.
+const KOKORO_MODEL_SHA256: Option<&str> = Some(KOKORO_MODEL_SHA256_HEX);
 
 /// Single source of truth for the model path; shared by the system-check TTS probe and the
 /// downloader so they can never disagree about the location.

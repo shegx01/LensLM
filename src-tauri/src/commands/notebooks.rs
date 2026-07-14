@@ -4,7 +4,7 @@ use futures::StreamExt;
 use lens_core::{
     AddSourceOutcome, AnswerEvent, ChatFeedback, ChatMessage, DialoguePhase, DialogueScript,
     IngestProgress, Length, LensEngine, LensError, Notebook, NotebookId, NotebookSummary, Source,
-    TrashedSource,
+    TrashedSource, TtsPhase,
 };
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
@@ -536,6 +536,89 @@ pub async fn cancel_dialogue(
     engine: tauri::State<'_, LensEngine>,
 ) -> Result<bool, LensError> {
     Ok(engine.cancel_dialogue_generation(&notebook_id))
+}
+
+#[tracing::instrument(skip(on_progress, engine))]
+#[tauri::command]
+pub async fn synthesize_overview(
+    notebook_id: String,
+    on_progress: Channel<StreamEvent<TtsPhase>>,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<String, LensError> {
+    if let Err(e) = send_event(&on_progress, StreamEvent::Started) {
+        tracing::warn!("synthesize_overview: started event send failed: {e}");
+    }
+
+    let config = engine.config().await;
+
+    if !engine.tts_backend_available(&config.tts).await {
+        let err = LensError::Tts("no TTS backend available; install an engine".into());
+        if let Err(e) = send_event(&on_progress, StreamEvent::Failed(err.clone())) {
+            tracing::warn!("synthesize_overview: failed event send failed: {e}");
+        }
+        return Err(err);
+    }
+
+    let token = engine.register_tts(&notebook_id);
+    let _guard = engine.tts_cancel_guard(&notebook_id, token.clone());
+
+    let script = match engine
+        .generate_dialogue(
+            &NotebookId::from(notebook_id.clone()),
+            Length::Medium,
+            (*token).clone(),
+            |_phase| {},
+        )
+        .await
+    {
+        Ok(script) => script,
+        Err(err) => {
+            if let Err(e) = send_event(&on_progress, StreamEvent::Failed(err.clone())) {
+                tracing::warn!("synthesize_overview: failed event send failed: {e}");
+            }
+            return Err(err);
+        }
+    };
+
+    let on_progress_phase = on_progress.clone();
+    let result = engine
+        .synthesize_overview(
+            &notebook_id,
+            &script,
+            &config.voices,
+            &config.tts,
+            move |phase| {
+                if let Err(e) = send_event(&on_progress_phase, StreamEvent::Chunk(phase)) {
+                    tracing::warn!("synthesize_overview: phase send failed: {e}");
+                }
+            },
+            &token,
+        )
+        .await;
+
+    match result {
+        Ok(path) => {
+            if let Err(e) = send_event(&on_progress, StreamEvent::Done) {
+                tracing::warn!("synthesize_overview: done event send failed: {e}");
+            }
+            Ok(path.to_string_lossy().into_owned())
+        }
+        Err(err) => {
+            if let Err(e) = send_event(&on_progress, StreamEvent::Failed(err.clone())) {
+                tracing::warn!("synthesize_overview: failed event send failed: {e}");
+            }
+            Err(err)
+        }
+    }
+}
+
+#[tracing::instrument(skip(engine))]
+#[tauri::command]
+pub async fn cancel_synthesis(
+    notebook_id: String,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<bool, LensError> {
+    Ok(engine.cancel_synthesis(&notebook_id))
 }
 
 /// Persists a user chat message on send (#22). `turn_id` is minted by the frontend
