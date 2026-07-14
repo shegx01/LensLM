@@ -766,43 +766,87 @@ mod tests {
         );
     }
 
-    // Gated full golden (AC1.3): loads the REAL snac_24khz weights and decodes a
-    // fixed token stream. Requires both `LENS_RUN_MODEL_TESTS=1` and
-    // `LENS_SNAC_WEIGHTS` pointing at the upstream `pytorch_model.bin` (never
-    // committed). Asserts the decode produces a plausibly-scaled, finite, bounded
-    // speech signal of the exact expected length. A bit-exact committed PCM golden
-    // cross-checked against a zeroed-noise Python reference is a pre-merge follow-up.
+    fn read_le_u32(bytes: &[u8]) -> Vec<u32> {
+        bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
+    fn read_le_f32(bytes: &[u8]) -> Vec<f32> {
+        bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
+    // Bit-exact parity golden (AC1.3): loads the REAL snac_24khz weights and decodes
+    // the committed fixed Orpheus token stream, asserting per-sample agreement with a
+    // committed golden produced by the upstream Python `snac` decoder run with every
+    // NoiseBlock zeroed (identity forward) — the same determinism contract the port
+    // enforces. This exercises the whole chain (extract → regroup → compose → decode).
+    // Gated on `LENS_RUN_MODEL_TESTS=1` and `LENS_SNAC_WEIGHTS` (the upstream
+    // `pytorch_model.bin`, never committed).
+    //
+    // TOL is evidence-based: the measured max-abs diff vs the golden is ~2.2e-7
+    // (printed below) — i.e. bit-exact to f32 rounding. TOL keeps ~20× margin for
+    // cross-platform BLAS accumulation-order variance; a real port regression
+    // (padding, upsample, weight-norm dim, noise) would exceed it by many orders.
     #[test]
-    fn real_snac_decode_is_plausible_speech() {
+    fn real_snac_parity_golden() {
+        const TOL: f32 = 5.0e-6;
         if std::env::var("LENS_RUN_MODEL_TESTS").is_err() {
-            eprintln!("skipping real_snac_decode_is_plausible_speech (set LENS_RUN_MODEL_TESTS=1)");
+            eprintln!("skipping real_snac_parity_golden (set LENS_RUN_MODEL_TESTS=1)");
             return;
         }
         let Ok(path) = std::env::var("LENS_SNAC_WEIGHTS") else {
             eprintln!("skipping: set LENS_SNAC_WEIGHTS to the snac pytorch_model.bin path");
             return;
         };
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/");
+        let tokens = read_le_u32(
+            &std::fs::read(format!("{dir}snac_parity_tokens.u32")).expect("read tokens fixture"),
+        );
+        let golden = read_le_f32(
+            &std::fs::read(format!("{dir}snac_parity_golden.f32")).expect("read golden fixture"),
+        );
+
         let dec = SnacDecoder::load(Path::new(&path)).expect("load real snac weights");
-        let num_frames = 8usize;
-        let audio = dec.decode(&tiny_tokens(num_frames)).expect("decode");
-        let expected = 4
-            * num_frames
-            * SnacConfig::snac_24khz()
-                .decoder_rates
-                .iter()
-                .product::<usize>();
-        assert_eq!(audio.samples.len(), expected);
+        let audio = dec.decode(&tokens).expect("decode");
+        assert_eq!(
+            audio.samples.len(),
+            golden.len(),
+            "sample-count mismatch vs golden"
+        );
         assert!(
             audio
                 .samples
                 .iter()
                 .all(|s| s.is_finite() && s.abs() <= 1.0)
         );
+
+        let mut max_abs = 0.0f32;
+        let mut sum_abs = 0.0f64;
+        for (a, g) in audio.samples.iter().zip(golden.iter()) {
+            let d = (a - g).abs();
+            max_abs = max_abs.max(d);
+            sum_abs += d as f64;
+        }
+        let mean_abs = sum_abs / golden.len() as f64;
         let rms =
             (audio.samples.iter().map(|s| s * s).sum::<f32>() / audio.samples.len() as f32).sqrt();
+        eprintln!(
+            "snac parity: samples={} max_abs={max_abs:.6e} mean_abs={mean_abs:.6e} rms={rms:.6}",
+            audio.samples.len()
+        );
         assert!(
             rms > 1e-4,
             "decoded audio is effectively silent (rms {rms})"
+        );
+        assert!(
+            max_abs < TOL,
+            "max-abs error {max_abs:.6e} exceeds TOL {TOL:.6e} — likely a port regression \
+             (padding/output_padding, upsample, weight-norm dim, or NoiseBlock not zeroed)"
         );
     }
 }
