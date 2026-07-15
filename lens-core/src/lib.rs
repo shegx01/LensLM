@@ -111,11 +111,11 @@ pub use system_check::{
 };
 pub use transcription::{WindowConfig, decode_and_resample_audio, decode_resample_windows};
 pub use tts::{
-    ArtifactKind, AudioBuffer, CloudTtsKind, DownloadProgress, Gender, MOSS_REFERENCE_VOICES,
-    MossLocalAdapter, MossReferenceVoice, MossTtsdAdapter, TTS_REGISTRY, TtsBackend, TtsModelSpec,
-    TtsPhase, TtsProvider, TtsProviderInfo, TtsSidecar, TtsVoice, download_tts_model, emotion_tag,
+    ArtifactKind, AudioBuffer, CloudTtsKind, DownloadProgress, Gender, MOSS_MODEL_ID,
+    MOSS_SIDECAR_BIN_ID, MossReferenceVoice, TTS_REGISTRY, TtsBackend, TtsModelSpec, TtsPhase,
+    TtsProvider, TtsProviderInfo, TtsSidecar, TtsVoice, download_tts_model, emotion_tag,
     moss_reference_voice, read_wav_mono16, resolve_tts, resolve_tts_provider,
-    resolve_tts_provider_full, tts_model_downloaded, tts_model_path, unpack_zip,
+    resolve_tts_provider_full, tts_model_dir, tts_model_downloaded, tts_model_path,
 };
 pub use vector_store::{LanceVectorStore, VectorStore};
 
@@ -1314,12 +1314,9 @@ impl LensEngine {
     }
 
     pub async fn tts_backend_available(&self, cfg: &config::TtsConfig) -> bool {
-        // Cheap file probe (never a weight load, never a sidecar spawn — this gate
-        // fires on notebook open): a backend is available only when ALL its
-        // artifacts are on disk. MossLocal additionally requires an injected
-        // sidecar, but its health is NOT probed (would cost a spawn + multi-GB load
-        // here); a corrupt/unstartable binary surfaces at synth time as a typed
-        // `LensError::Tts`. Non-embedded backends name no artifacts.
+        // Cheap file probe only, no sidecar health check (would cost a spawn +
+        // multi-GB load here); a corrupt/unstartable binary surfaces at synth
+        // time as a typed `LensError::Tts` instead.
         if matches!(cfg.backend, tts::TtsBackend::MossLocal) && self.tts_sidecar().await.is_none() {
             return false;
         }

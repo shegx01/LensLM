@@ -10,9 +10,8 @@ use crate::tts::sidecar::TtsSidecar;
 use crate::tts::{AudioBuffer, Gender, TtsBackend, TtsProvider, TtsProviderInfo, TtsVoice};
 
 /// A bundled MOSS reference clip: the clone-only backend synthesizes each turn
-/// against one of these. Transcripts are static engine data; the clip file *path*
-/// is resolved by `src-tauri` (it owns the bundled resource dir), so only the
-/// filename lives here.
+/// against one of these. The clip file *path* is resolved by `src-tauri` (it owns
+/// the bundled resource dir), so only the filename lives here.
 pub struct MossReferenceVoice {
     pub id: &'static str,
     pub display_name: &'static str,
@@ -71,8 +70,7 @@ pub fn moss_reference_voice(id: &str) -> Option<&'static MossReferenceVoice> {
 
 /// In-process adapter for MOSS-TTS-Local. Owns no model weights: every turn is
 /// delegated to an out-of-process MLX sidecar (`src-tauri`), so `lens-core` stays
-/// headless. Reuses the default [`TtsProvider::synthesize_script`] stitch/cancel
-/// pipeline; voices are the bundled clone-reference clips ([`MOSS_REFERENCE_VOICES`]).
+/// headless. Voices are the bundled clone-reference clips ([`MOSS_REFERENCE_VOICES`]).
 pub struct MossLocalAdapter {
     sidecar: Arc<dyn TtsSidecar>,
 }

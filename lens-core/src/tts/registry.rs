@@ -23,8 +23,7 @@ pub struct TtsModelSpec {
     /// `download_verified` destination (a file path, incl. the `.zip` for archives).
     pub relpath: &'static str,
     pub kind: ArtifactKind,
-    /// Post-unpack availability key for `Archive` (a file that exists only after a
-    /// complete unpack). `None` for `File`, whose availability is `relpath` itself.
+    /// Post-unpack availability key for Archive; see [`ArtifactKind`].
     pub sentinel: Option<&'static str>,
 }
 
@@ -97,10 +96,17 @@ pub fn tts_model_path(data_dir: &Path, id: &str) -> Option<PathBuf> {
     resolve_tts(id).map(|spec| data_dir.join(spec.relpath))
 }
 
+/// Resolved on-disk artifact location for `id`: the unpacked dir for `Archive`
+/// specs, `relpath` as-is for `File` specs. `None` for unknown ids.
+pub fn tts_model_dir(data_dir: &Path, id: &str) -> Option<PathBuf> {
+    resolve_tts(id).map(|spec| match spec.kind {
+        ArtifactKind::Archive => data_dir.join(spec.relpath).with_extension(""),
+        ArtifactKind::File => data_dir.join(spec.relpath),
+    })
+}
+
 pub fn tts_model_downloaded(data_dir: &Path, id: &str) -> bool {
     match resolve_tts(id) {
-        // For archives the download destination (`relpath`) is a transient `.zip`;
-        // availability is the post-unpack sentinel.
         Some(spec) => data_dir
             .join(spec.sentinel.unwrap_or(spec.relpath))
             .is_file(),
@@ -214,7 +220,7 @@ where
 /// Unpacks a Store/Deflate `.zip` into `dest_dir`. Zip-slip guard: any entry whose
 /// normalized path is not safely contained (`..`, absolute) is rejected via
 /// `enclosed_name()` → [`LensError::Validation`].
-pub fn unpack_zip(zip_path: &Path, dest_dir: &Path) -> Result<(), LensError> {
+pub(crate) fn unpack_zip(zip_path: &Path, dest_dir: &Path) -> Result<(), LensError> {
     let file =
         std::fs::File::open(zip_path).map_err(|e| LensError::Io(format!("open archive: {e}")))?;
     let mut archive = zip::ZipArchive::new(file)
@@ -330,6 +336,19 @@ mod tests {
     fn path_joins_under_data_dir() {
         let p = tts_model_path(Path::new("/data"), "orpheus").expect("known id resolves");
         assert!(p.ends_with("models/orpheus/orpheus-3b-0.1-ft-Q4_K_M.gguf"));
+    }
+
+    #[test]
+    fn model_dir_resolves_archive_unpacked_and_file_relpath() {
+        let dir = Path::new("/data");
+        let archive = tts_model_dir(dir, "moss_model").expect("archive id resolves");
+        assert_eq!(archive, dir.join("models/moss"));
+        let file = tts_model_dir(dir, "orpheus").expect("file id resolves");
+        assert_eq!(
+            file,
+            dir.join("models/orpheus/orpheus-3b-0.1-ft-Q4_K_M.gguf")
+        );
+        assert!(tts_model_dir(dir, "does-not-exist").is_none());
     }
 
     #[test]
@@ -454,10 +473,8 @@ mod tests {
 
         assert_eq!(out, dir.path().join("models/moss"));
         assert!(tts_model_downloaded(dir.path(), "moss_model"));
-        // The transient zip is removed after a successful unpack.
         assert!(!dir.path().join("models/moss.zip").exists());
         assert!(!dir.path().join("models/moss.partial").exists());
-        // Exactly one terminal `done` and it is the last event.
         assert!(events.last().unwrap().done);
         assert_eq!(events.iter().filter(|e| e.done).count(), 1);
 

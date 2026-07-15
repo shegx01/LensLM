@@ -18,13 +18,10 @@ pub mod snac;
 
 pub(crate) use audio::write_wav_16bit;
 pub use audio::{AudioBuffer, read_wav_mono16};
-pub use moss::{
-    MOSS_REFERENCE_VOICES, MossLocalAdapter, MossReferenceVoice, MossTtsdAdapter,
-    moss_reference_voice,
-};
+pub use moss::{MossReferenceVoice, moss_reference_voice};
 pub use registry::{
-    ArtifactKind, TTS_REGISTRY, TtsModelSpec, download_tts_model, resolve_tts,
-    tts_model_downloaded, tts_model_path, unpack_zip,
+    ArtifactKind, MOSS_MODEL_ID, MOSS_SIDECAR_BIN_ID, TTS_REGISTRY, TtsModelSpec,
+    download_tts_model, resolve_tts, tts_model_dir, tts_model_downloaded, tts_model_path,
 };
 pub use sidecar::TtsSidecar;
 
@@ -194,12 +191,8 @@ pub trait TtsProvider: Send + Sync {
 }
 
 /// Resolves a [`TtsProvider`] for `backend`, given an optional injected `sidecar`.
-/// This is the single dispatch path; both [`resolve_tts_provider`] (the `None`
-/// wrapper) and `synthesize_overview` route through it so the two entry points
-/// cannot diverge. Construction is cheap: an embedded provider (Orpheus) holds
-/// only its model paths and lazy-loads weights on first synth. Sidecar-backed
-/// backends (MossLocal) resolve only when a sidecar is present; a missing artifact
-/// surfaces as a lazy-load `LensError::Tts`, never a silent `None`.
+/// Single dispatch path — [`resolve_tts_provider`] and `synthesize_overview` both
+/// route through it so the two entry points cannot diverge.
 pub fn resolve_tts_provider_full(
     backend: TtsBackend,
     _cfg: &TtsConfig,
@@ -220,10 +213,8 @@ pub fn resolve_tts_provider_full(
     }
 }
 
-/// Thin wrapper over [`resolve_tts_provider_full`] with no sidecar. Sidecar-backed
-/// backends (MossLocal) therefore return `None` here by design; call `_full` with
-/// the injected sidecar when one is required (see `synthesize_overview`). Keeps the
-/// 3-arg signature used by `system.rs` voice resolution and existing tests.
+/// Thin wrapper over [`resolve_tts_provider_full`] with no sidecar; sidecar-backed
+/// backends (MossLocal) return `None` here by design — call `_full` when one is needed.
 pub fn resolve_tts_provider(
     backend: TtsBackend,
     cfg: &TtsConfig,
@@ -276,11 +267,9 @@ mod tests {
     fn resolve_full_moss_local_needs_sidecar() {
         let cfg = TtsConfig::default();
         let data_dir = Path::new("/data");
-        // No sidecar → the wrapper's behavior: MossLocal is None.
         assert!(resolve_tts_provider_full(TtsBackend::MossLocal, &cfg, data_dir, None).is_none());
         assert!(resolve_tts_provider(TtsBackend::MossLocal, &cfg, data_dir).is_none());
 
-        // With an injected sidecar → the MossLocal adapter.
         let sidecar: Arc<dyn TtsSidecar> = Arc::new(NoopSidecar);
         let provider =
             resolve_tts_provider_full(TtsBackend::MossLocal, &cfg, data_dir, Some(sidecar))
@@ -306,7 +295,6 @@ mod tests {
 
     #[test]
     fn resolve_orpheus_via_wrapper_ignores_absent_sidecar() {
-        // Orpheus resolves through the None-wrapper with no sidecar injected.
         let cfg = TtsConfig::default();
         let provider = resolve_tts_provider(TtsBackend::Orpheus, &cfg, Path::new("/data"))
             .expect("orpheus resolves without a sidecar");
