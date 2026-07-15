@@ -3,9 +3,9 @@
 Apple-Silicon-only Python sidecar for the `MossLocal` TTS backend (#193 /
 161e). `src-tauri`'s `MossSidecar` spawns this process and drives it over
 stdio with line-delimited JSON; it never enters `lens-core`, and MLX/Python
-never leave this process. See
-`.omc/plans/issue-193-moss-local-consensus-plan.md` §B1/B2/C7 for the full
-design; this file only covers building and running the sidecar itself.
+never leave this process. This file covers building and running the sidecar
+itself; the stdio contract it must honor is specified in the Contract section
+below.
 
 ## Requirements
 
