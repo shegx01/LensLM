@@ -20,8 +20,8 @@ pub(crate) use audio::write_wav_16bit;
 pub use audio::{AudioBuffer, read_wav_mono16};
 pub use moss::{MossReferenceVoice, moss_reference_voice};
 pub use registry::{
-    ArtifactKind, MOSS_MODEL_ID, MOSS_SIDECAR_BIN_ID, TTS_REGISTRY, TtsModelSpec,
-    download_tts_model, resolve_tts, tts_model_dir, tts_model_downloaded, tts_model_path,
+    TTS_REGISTRY, TtsModelSpec, download_tts_model, resolve_tts, tts_model_downloaded,
+    tts_model_path,
 };
 pub use sidecar::TtsSidecar;
 
@@ -94,11 +94,12 @@ impl TtsBackend {
 
     /// Registry ids of every model artifact this backend needs on disk to be
     /// usable. Non-embedded backends (cloud, not-yet-wired local) return `&[]`.
+    /// MossLocal has none: `mlx-speech` fetches its model lazily on first synth,
+    /// not via the Rust registry.
     pub fn required_model_ids(&self) -> &'static [&'static str] {
         match self {
             TtsBackend::Orpheus => &["orpheus", "snac"],
-            TtsBackend::MossLocal => &["moss_sidecar_bin", "moss_model"],
-            TtsBackend::MossTtsd | TtsBackend::Cloud(_) => &[],
+            TtsBackend::MossLocal | TtsBackend::MossTtsd | TtsBackend::Cloud(_) => &[],
         }
     }
 }

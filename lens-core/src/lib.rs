@@ -111,11 +111,10 @@ pub use system_check::{
 };
 pub use transcription::{WindowConfig, decode_and_resample_audio, decode_resample_windows};
 pub use tts::{
-    ArtifactKind, AudioBuffer, CloudTtsKind, DownloadProgress, Gender, MOSS_MODEL_ID,
-    MOSS_SIDECAR_BIN_ID, MossReferenceVoice, TTS_REGISTRY, TtsBackend, TtsModelSpec, TtsPhase,
-    TtsProvider, TtsProviderInfo, TtsSidecar, TtsVoice, download_tts_model, emotion_tag,
-    moss_reference_voice, read_wav_mono16, resolve_tts, resolve_tts_provider,
-    resolve_tts_provider_full, tts_model_dir, tts_model_downloaded, tts_model_path,
+    AudioBuffer, CloudTtsKind, DownloadProgress, Gender, MossReferenceVoice, TTS_REGISTRY,
+    TtsBackend, TtsModelSpec, TtsPhase, TtsProvider, TtsProviderInfo, TtsSidecar, TtsVoice,
+    download_tts_model, emotion_tag, moss_reference_voice, read_wav_mono16, resolve_tts,
+    resolve_tts_provider, resolve_tts_provider_full, tts_model_downloaded, tts_model_path,
 };
 pub use vector_store::{LanceVectorStore, VectorStore};
 
@@ -1314,11 +1313,11 @@ impl LensEngine {
     }
 
     pub async fn tts_backend_available(&self, cfg: &config::TtsConfig) -> bool {
-        // Cheap file probe only, no sidecar health check (would cost a spawn +
-        // multi-GB load here); a corrupt/unstartable binary surfaces at synth
-        // time as a typed `LensError::Tts` instead.
-        if matches!(cfg.backend, tts::TtsBackend::MossLocal) && self.tts_sidecar().await.is_none() {
-            return false;
+        // MossLocal has no registry-managed model: `mlx-speech` fetches it lazily
+        // on first synth, so availability is just "is a sidecar injected" — no
+        // spawn/health probe (that would cost a multi-GB load on a UI gate).
+        if matches!(cfg.backend, tts::TtsBackend::MossLocal) {
+            return self.tts_sidecar().await.is_some();
         }
         let data_dir = self.data_dir().await;
         let required = cfg.backend.required_model_ids();
