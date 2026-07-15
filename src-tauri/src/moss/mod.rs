@@ -1,28 +1,16 @@
-//! MOSS-TTS-Local sidecar host (issue #193, [161e]): [`MossSidecar`] drives an
-//! out-of-process MLX Python sidecar (`sidecar/mlx-speech`, frozen to a binary)
-//! over line-delimited JSON-over-stdio, implementing lens-core's [`TtsSidecar`]
-//! trait so the headless engine synthesizes a #26 `DialogueScript` without ever
-//! seeing Python/MLX. This whole module is gated to `aarch64-apple-darwin` (the
-//! only target MLX runs on); it compiles out everywhere else.
+//! MOSS-TTS-Local sidecar host (issue #193, [161e]): drives an out-of-process
+//! MLX Python sidecar over line-delimited JSON-over-stdio as lens-core's
+//! [`TtsSidecar`]. Gated to `aarch64-apple-darwin` (the only target MLX runs on).
 //!
-//! IPC invariant: all process/IO/parse failures map to a GENERIC
-//! [`LensError::Tts`] with no binary path or internal detail — the error crosses
-//! the Tauri boundary, so it must never leak host internals. Audio never rides
-//! the pipe: a synth reply carries a temp-WAV path, decoded here via lens-core's
-//! `read_wav_mono16` and deleted (best-effort) after read.
-//!
-//! Teardown: the child is spawned with `kill_on_drop(true)` (backstop) and an
-//! explicit `stop()` reap. A stale/truncated reply line after a mid-turn cancel is
-//! NOT a poison event — the correlation-id drain skips it against the still-warm
-//! child; only true child death (EOF / broken pipe / exit / start timeout) clears
-//! the cell so the next turn respawns a clean process.
+//! All failures map to a generic [`LensError::Tts`] (no path/internal detail —
+//! it crosses the Tauri IPC boundary); real errors are logged server-side only.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 use tokio::time::{Duration, timeout};
@@ -37,6 +25,15 @@ use lens_core::{
 /// cold load can take tens of seconds; a generous ceiling avoids a false failure
 /// while still guaranteeing the lazy `start` cannot hang forever.
 const READY_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Per-turn reply-read ceiling. A mid-write cancel can leave the child mid-synth;
+/// without a bound the read (and the whole overview) would hang forever, so on
+/// elapse we treat the child as dead and respawn a clean one for the next turn.
+const SYNTH_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Byte ceiling on a single reply line so a runaway/never-newline child cannot
+/// OOM the host; a real reply (id + temp-WAV path) is well under this.
+const MAX_REPLY_BYTES: u64 = 64 * 1024;
 
 /// A live sidecar: the child process plus its owned stdin sink and buffered stdout
 /// source. Held together so acquiring the cell's guard grants exclusive IO access.
@@ -54,6 +51,7 @@ pub fn default_moss_voices() -> VoiceConfig {
 
 /// Distinguishes a recoverable sidecar-side failure (child stays warm) from true
 /// child death (must respawn) so `synthesize_turn` reacts correctly.
+#[derive(Debug)]
 enum TurnError {
     /// Child died (EOF / broken pipe / exit): kill+clear the cell, respawn next turn.
     Dead,
@@ -89,9 +87,8 @@ pub struct MossSidecar {
     resource_dir: PathBuf,
     child: Mutex<Option<ChildTriple>>,
     ready: AtomicBool,
-    /// Lifetime-monotonic request id. Never resets — it outlives any child, so a
-    /// stale reply from a respawned-over turn always carries a strictly smaller id
-    /// and is skipped by the correlation drain.
+    /// Lifetime-monotonic request id; never resets. See `run_turn_locked`/
+    /// [`drain_until`] for how stale (smaller-id) replies are drained.
     next_id: AtomicU64,
     invocation_id: String,
 }
@@ -109,10 +106,9 @@ impl MossSidecar {
         }
     }
 
-    /// Resolves the per-speaker voice to `(clip_path, transcript)`. A `Named(id)`
-    /// maps through lens-core's static catalog (transcript) + this host's bundled
-    /// resource dir (path); a `Reference` passes through directly. An unset ref
-    /// falls back to [`default_moss_voices`]; an unknown id is a generic error.
+    /// Resolves the per-speaker voice to `(clip_path, transcript)`: a `Named(id)`
+    /// maps through lens-core's catalog + this host's resource dir, a `Reference`
+    /// passes through, an unset ref falls back to [`default_moss_voices`].
     fn resolve_voice(
         &self,
         speaker: Speaker,
@@ -148,12 +144,9 @@ impl MossSidecar {
         }
     }
 
-    /// Spawns the child and awaits its `{"ready":true}` line, operating on the
-    /// already-held cell guard. Lock-free by construction — the caller holds the
-    /// guard — so it is the shared init for both `start` and the lazy synth path
-    /// with no reentrant lock. On timeout/handshake failure the local `child`
-    /// drops (killed via `kill_on_drop`) and the cell stays empty for a clean
-    /// respawn.
+    /// Spawns the child and awaits its `{"ready":true}` line on the already-held
+    /// cell guard (shared init for both `start` and the lazy synth path). On
+    /// handshake failure the local `child` drops (kill_on_drop) and the cell stays empty.
     async fn spawn_locked(&self, cell: &mut Option<ChildTriple>) -> Result<(), LensError> {
         if cell.is_some() {
             return Ok(());
@@ -170,7 +163,10 @@ impl MossSidecar {
             .stderr(Stdio::inherit())
             .kill_on_drop(true)
             .spawn()
-            .map_err(|_| tts_err())?;
+            .map_err(|e| {
+                tracing::warn!(error = %e, "failed to spawn MOSS sidecar");
+                tts_err()
+            })?;
 
         let stdin = child.stdin.take().ok_or_else(tts_err)?;
         let stdout = child.stdout.take().ok_or_else(tts_err)?;
@@ -180,9 +176,22 @@ impl MossSidecar {
             let mut line = String::new();
             loop {
                 line.clear();
-                let n = reader.read_line(&mut line).await.map_err(|_| tts_err())?;
+                // Cap the handshake line so a never-newline child can't OOM us.
+                let n = (&mut reader)
+                    .take(MAX_REPLY_BYTES)
+                    .read_line(&mut line)
+                    .await
+                    .map_err(|e| {
+                        tracing::warn!(error = %e, "MOSS handshake read failed");
+                        tts_err()
+                    })?;
                 if n == 0 {
+                    tracing::warn!("MOSS sidecar closed stdout before ready (EOF)");
                     return Err(tts_err()); // EOF before ready — model load failed/exited
+                }
+                if !line.ends_with('\n') {
+                    tracing::warn!(bytes = n, "MOSS handshake line exceeded cap or truncated");
+                    return Err(tts_err());
                 }
                 if let Ok(msg) = serde_json::from_str::<ReadyMsg>(line.trim())
                     && msg.ready
@@ -195,6 +204,7 @@ impl MossSidecar {
         .await;
 
         if !matches!(handshake, Ok(Ok(()))) {
+            tracing::warn!(invocation_id = %self.invocation_id, "MOSS sidecar handshake failed (timeout/EOF/over-cap)");
             return Err(tts_err());
         }
 
@@ -203,19 +213,38 @@ impl MossSidecar {
         Ok(())
     }
 
-    /// Kills and clears the child so the next turn respawns cleanly. Reserved for
-    /// true child death — a merely stale reply is skipped, not a poison event.
+    /// Kills and clears the child so the next turn respawns cleanly.
     fn kill_locked(&self, cell: &mut Option<ChildTriple>) {
         self.ready.store(false, Ordering::SeqCst);
-        if let Some((mut child, _stdin, _reader)) = cell.take() {
-            let _ = child.start_kill();
+        if let Some((mut child, _stdin, _reader)) = cell.take()
+            && let Err(e) = child.start_kill()
+        {
+            tracing::warn!(error = %e, "failed to kill MOSS sidecar child");
         }
     }
 
-    /// Writes one synth request and drains replies until the echoed id matches.
-    /// Unparseable lines (a truncated tail from a cancelled turn) and replies with
-    /// a smaller id (stale, since ids strictly increase) are skipped against the
-    /// still-warm child; EOF/broken-pipe map to [`TurnError::Dead`].
+    /// Validates a sidecar-returned WAV path before any read/delete: it must be a
+    /// `moss-turn-*.wav` whose canonical location lives under the OS temp dir.
+    /// Anything else is rejected untouched (defends against arbitrary-file access).
+    fn is_valid_turn_wav(path: &Path) -> bool {
+        let name_ok = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.starts_with("moss-turn-") && n.ends_with(".wav"))
+            .unwrap_or(false);
+        if !name_ok {
+            return false;
+        }
+        let (Ok(canon), Ok(tmp)) = (path.canonicalize(), std::env::temp_dir().canonicalize())
+        else {
+            return false;
+        };
+        canon.starts_with(&tmp)
+    }
+
+    /// Writes one synth request and drains replies (via [`drain_until`]) until the
+    /// echoed id matches, bounded by [`SYNTH_TIMEOUT`]. Stale/unparseable lines are
+    /// skipped against the still-warm child; EOF/timeout/over-cap map to [`TurnError::Dead`].
     async fn run_turn_locked(
         &self,
         cell: &mut Option<ChildTriple>,
@@ -235,38 +264,94 @@ impl MossSidecar {
             "ref_transcript": transcript,
             "audio_temperature": 1.0,
         });
-        let mut line = serde_json::to_string(&request).map_err(|_| TurnError::Failed)?;
+        let mut line = serde_json::to_string(&request).map_err(|e| {
+            tracing::warn!(error = %e, "failed to serialize MOSS synth request");
+            TurnError::Failed
+        })?;
         line.push('\n');
-        stdin
-            .write_all(line.as_bytes())
-            .await
-            .map_err(|_| TurnError::Dead)?;
-        stdin.flush().await.map_err(|_| TurnError::Dead)?;
+        stdin.write_all(line.as_bytes()).await.map_err(|e| {
+            tracing::warn!(error = %e, "failed to write MOSS synth request");
+            TurnError::Dead
+        })?;
+        stdin.flush().await.map_err(|e| {
+            tracing::warn!(error = %e, "failed to flush MOSS synth request");
+            TurnError::Dead
+        })?;
 
-        loop {
-            let mut buf = String::new();
-            let n = reader
-                .read_line(&mut buf)
-                .await
-                .map_err(|_| TurnError::Dead)?;
-            if n == 0 {
-                return Err(TurnError::Dead); // EOF — child exited
+        // Bound the drain so a mid-synth child (e.g. after a mid-write cancel)
+        // cannot hang the overview forever; on elapse treat as a dead child.
+        let reply = match timeout(SYNTH_TIMEOUT, drain_until(reader, id)).await {
+            Ok(r) => r?,
+            Err(_) => {
+                tracing::warn!(id, "MOSS synth reply timed out");
+                return Err(TurnError::Dead);
             }
-            let reply: SynthReply = match serde_json::from_str(buf.trim()) {
-                Ok(r) => r,
-                Err(_) => continue, // truncated tail from a cancelled turn — resync next line
-            };
-            if reply.id != id {
-                continue; // stale reply from a previously cancelled turn
-            }
-            if !reply.ok {
-                return Err(TurnError::Failed);
-            }
-            let path = reply.path.ok_or(TurnError::Failed)?;
-            let audio = read_wav_mono16(Path::new(&path));
-            let _ = std::fs::remove_file(&path); // best-effort cleanup, both paths
-            return audio.map_err(|_| TurnError::Failed);
+        };
+
+        if !reply.ok {
+            tracing::warn!(id, "MOSS sidecar returned ok:false for synth");
+            return Err(TurnError::Failed);
         }
+        let path = reply.path.ok_or(TurnError::Failed)?;
+        if !Self::is_valid_turn_wav(Path::new(&path)) {
+            tracing::warn!("MOSS sidecar returned an out-of-policy WAV path; rejecting");
+            return Err(TurnError::Failed);
+        }
+        let audio = read_wav_mono16(Path::new(&path));
+        let _ = std::fs::remove_file(&path); // best-effort cleanup, both paths
+        audio.map_err(|e| {
+            tracing::warn!(error = %e, "failed to decode MOSS turn WAV");
+            TurnError::Failed
+        })
+    }
+}
+
+/// Pure reply-drain: reads lines from `reader` until one echoes `id`, against a
+/// still-warm child. Unparseable lines (a truncated JSON tail from a cancelled
+/// turn) resync on the next newline; stale replies (a mismatched id) are skipped
+/// and their temp WAV best-effort deleted so a cancelled turn's file does not
+/// leak. EOF and an over-cap line (no newline within [`MAX_REPLY_BYTES`]) map to
+/// [`TurnError::Dead`]. Extracted from `run_turn_locked` for deterministic tests;
+/// the [`SYNTH_TIMEOUT`] bound stays in the caller so this fn stays pure.
+async fn drain_until<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    id: u64,
+) -> Result<SynthReply, TurnError> {
+    loop {
+        let mut buf = String::new();
+        let n = (&mut *reader)
+            .take(MAX_REPLY_BYTES)
+            .read_line(&mut buf)
+            .await
+            .map_err(|e| {
+                tracing::warn!(error = %e, "MOSS sidecar reply read failed");
+                TurnError::Dead
+            })?;
+        if n == 0 {
+            tracing::warn!("MOSS sidecar closed stdout (EOF) awaiting reply");
+            return Err(TurnError::Dead); // EOF — child exited
+        }
+        if !buf.ends_with('\n') {
+            tracing::warn!(
+                bytes = n,
+                "MOSS reply exceeded cap or truncated; treating as dead"
+            );
+            return Err(TurnError::Dead);
+        }
+        let reply: SynthReply = match serde_json::from_str(buf.trim()) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!(error = %e, "skipping unparseable MOSS reply line");
+                continue; // truncated tail from a cancelled turn — resync next line
+            }
+        };
+        if reply.id != id {
+            if let Some(p) = &reply.path {
+                let _ = std::fs::remove_file(p); // cancelled turn's WAV — don't leak it
+            }
+            continue; // stale reply from a previously cancelled turn
+        }
+        return Ok(reply);
     }
 }
 
@@ -284,7 +369,9 @@ impl TtsSidecar for MossSidecar {
             // Closing stdin ends the sidecar's read loop (graceful); the kill+wait
             // then guarantees a reap so no zombie survives shutdown.
             drop(stdin);
-            let _ = child.kill().await;
+            if let Err(e) = child.kill().await {
+                tracing::warn!(error = %e, "failed to reap MOSS sidecar on stop");
+            }
         }
         Ok(())
     }
@@ -414,6 +501,91 @@ mod tests {
         assert!(moss_reference_voice("librivox-chenevert").is_some());
         assert!(moss_reference_voice("librivox-klett").is_some());
     }
+
+    #[tokio::test]
+    async fn drain_skips_stale_complete_reply_then_matches() {
+        let data = concat!(
+            r#"{"id":1,"ok":true,"path":"/nonexistent/moss-turn-stale.wav"}"#,
+            "\n",
+            r#"{"id":2,"ok":true,"path":"/nonexistent/moss-turn-live.wav"}"#,
+            "\n",
+        );
+        let mut reader = data.as_bytes();
+        let reply = drain_until(&mut reader, 2).await.expect("matches id 2");
+        assert_eq!(reply.id, 2);
+        assert!(reply.ok);
+    }
+
+    #[tokio::test]
+    async fn drain_resyncs_after_truncated_line() {
+        // A truncated JSON tail (still newline-terminated) fails parse and is
+        // skipped; the drain resyncs on the next complete line.
+        let data = concat!(
+            r#"{"id":2,"ok":tru"#,
+            "\n",
+            r#"{"id":2,"ok":true,"path":"/nonexistent/moss-turn-x.wav"}"#,
+            "\n",
+        );
+        let mut reader = data.as_bytes();
+        let reply = drain_until(&mut reader, 2)
+            .await
+            .expect("resyncs to the valid line");
+        assert_eq!(reply.id, 2);
+        assert!(reply.ok);
+    }
+
+    #[tokio::test]
+    async fn drain_eof_maps_to_dead() {
+        // A stale line then EOF before the awaited id → Dead (respawn).
+        let data = concat!(r#"{"id":1,"ok":true}"#, "\n");
+        let mut reader = data.as_bytes();
+        assert!(matches!(
+            drain_until(&mut reader, 2).await,
+            Err(TurnError::Dead)
+        ));
+    }
+
+    #[tokio::test]
+    async fn drain_over_cap_line_maps_to_dead() {
+        // A single line larger than the cap with no newline is a runaway child.
+        let big = "x".repeat((MAX_REPLY_BYTES as usize) + 1024);
+        let mut reader = big.as_bytes();
+        assert!(matches!(
+            drain_until(&mut reader, 1).await,
+            Err(TurnError::Dead)
+        ));
+    }
+
+    #[tokio::test]
+    async fn drain_returns_matching_ok_false_reply() {
+        // A matching-id `ok:false` is returned to the caller, which maps it to
+        // `TurnError::Failed` (child stays warm) — the pure fn just surfaces it.
+        let data = concat!(r#"{"id":5,"ok":false}"#, "\n");
+        let mut reader = data.as_bytes();
+        let reply = drain_until(&mut reader, 5)
+            .await
+            .expect("matching id returns the reply");
+        assert_eq!(reply.id, 5);
+        assert!(!reply.ok);
+    }
+
+    #[test]
+    fn valid_turn_wav_accepts_temp_and_rejects_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("moss-turn-abc.wav");
+        std::fs::write(&good, b"riff").unwrap();
+        assert!(MossSidecar::is_valid_turn_wav(&good));
+
+        // Wrong name in temp: rejected without touching the fs.
+        let bad_name = dir.path().join("evil.wav");
+        std::fs::write(&bad_name, b"riff").unwrap();
+        assert!(!MossSidecar::is_valid_turn_wav(&bad_name));
+
+        // Correct name but outside the OS temp dir: rejected.
+        assert!(!MossSidecar::is_valid_turn_wav(Path::new(
+            "/etc/moss-turn-x.wav"
+        )));
+    }
 }
 
 /// End-to-end correctness harness: drives the REAL `MossSidecar` (real
@@ -541,7 +713,12 @@ for line in sys.stdin:
         let cancel = CancellationToken::new();
 
         let buf = provider
-            .synthesize_script(&two_turn_script(), &VoiceConfig::default(), &on_phase, &cancel)
+            .synthesize_script(
+                &two_turn_script(),
+                &VoiceConfig::default(),
+                &on_phase,
+                &cancel,
+            )
             .await
             .expect("real subprocess synthesis + stitch succeeds");
 

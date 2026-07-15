@@ -95,25 +95,28 @@ fn main() {
                 }
             }
 
-            // Inject the MOSS-TTS-Local sidecar host (issue #193, [161e]) on
-            // Apple Silicon. Mirrors `set_asr_engine` above. `start()` stays LAZY
-            // (it spawns on the first synth, and needs the lazily-downloaded
-            // binary/model), so a missing binary surfaces later as a generic
-            // `LensError::Tts` via the synth stream — never a panic at startup.
-            // The frozen binary + int8 model live under app-data (registry ids
-            // `moss_sidecar_bin` / `moss_model`); the reference clips are bundled
-            // resources (dev: the crate's `resources/`; release: the app resource dir).
+            // Inject the MOSS-TTS-Local sidecar host (issue #193) on Apple Silicon.
+            // `start()` is LAZY (spawns on first synth), so a missing binary
+            // surfaces as a generic `LensError::Tts` at synth time — never a startup panic.
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             {
-                let binary_path = data_dir.join("bin/mlx-speech-sidecar");
-                let model_dir = data_dir.join("models/moss");
-                let resource_dir = if cfg!(debug_assertions) {
-                    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources")
-                } else {
-                    app.path().resource_dir()?.join("resources")
-                };
-                let moss = moss::MossSidecar::new(binary_path, model_dir, resource_dir);
-                tauri::async_runtime::block_on(engine_state.set_tts_sidecar(Some(Arc::new(moss))));
+                match (
+                    lens_core::tts_model_dir(&data_dir, lens_core::MOSS_SIDECAR_BIN_ID),
+                    lens_core::tts_model_dir(&data_dir, lens_core::MOSS_MODEL_ID),
+                ) {
+                    (Some(binary_path), Some(model_dir)) => {
+                        let resource_dir = if cfg!(debug_assertions) {
+                            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources")
+                        } else {
+                            app.path().resource_dir()?.join("resources")
+                        };
+                        let moss = moss::MossSidecar::new(binary_path, model_dir, resource_dir);
+                        tauri::async_runtime::block_on(
+                            engine_state.set_tts_sidecar(Some(Arc::new(moss))),
+                        );
+                    }
+                    _ => tracing::warn!("MOSS sidecar paths unresolved; skipping TTS injection"),
+                }
             }
 
             Ok(())
