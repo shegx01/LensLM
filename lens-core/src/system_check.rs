@@ -607,13 +607,20 @@ fn has_cloud_tts(config: &AppConfig) -> bool {
 /// disk AND both voices are saved, OR a cloud TTS provider is configured.
 fn probe_text_to_speech(config: &AppConfig) -> CheckResult {
     let data_dir = Path::new(&config.paths.data_dir);
-    // A backend is local-model-ready only when it names artifacts AND all of them
-    // are on disk. An empty list (cloud / not-yet-wired) is never engine-ready.
-    let required = config.tts.backend.required_model_ids();
-    let engine_ready = !required.is_empty()
-        && required
-            .iter()
-            .all(|id| crate::tts::tts_model_downloaded(data_dir, id));
+    // MossLocal provisions its runtime (uv) + model (mlx-speech, lazy) on demand,
+    // so there are no on-disk artifacts to gate on here — treat it as engine-ready
+    // and let the voices gate below decide. Other local backends are ready only
+    // when they name artifacts AND all are on disk (an empty list is never ready).
+    let engine_ready = match config.tts.backend {
+        crate::tts::TtsBackend::MossLocal => true,
+        _ => {
+            let required = config.tts.backend.required_model_ids();
+            !required.is_empty()
+                && required
+                    .iter()
+                    .all(|id| crate::tts::tts_model_downloaded(data_dir, id))
+        }
+    };
     let voices_set = !config.voices.host.is_unset() && !config.voices.guest.is_unset();
 
     let (status, detail) = if engine_ready && voices_set {
