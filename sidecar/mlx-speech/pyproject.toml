@@ -4,14 +4,11 @@ version = "0.1.0"
 description = "MOSS-TTS-Local IPC sidecar spawned by src-tauri's MossSidecar (#193 / 161e). Apple-Silicon-only."
 requires-python = ">=3.13"
 dependencies = [
-    # Pin exact: PyInstaller freezes a specific installed build; an unpinned
-    # range would make the frozen binary's behavior float across dev machines.
-    "mlx-speech==0.4.2",
+    # Pin exact: the sidecar runs via `uv run` against this lockfile, so an
+    # unpinned range would let behavior float across machines/time.
+    "mlx-speech==0.4.3",
     "numpy>=1.26,<3",
 ]
-
-[project.optional-dependencies]
-freeze = ["pyinstaller>=6.10,<7"]
 
 [tool.uv]
 package = false

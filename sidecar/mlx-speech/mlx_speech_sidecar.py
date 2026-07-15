@@ -1,27 +1,42 @@
 #!/usr/bin/env python3
 """MOSS-TTS-Local (mlx-speech) IPC sidecar for LensLM (#193 / 161e).
 
-Spawned by src-tauri's MossSidecar and driven over stdio as line-delimited
-JSON. Audio never rides the pipe — a "synth" reply carries a path to a temp
-WAV file that the Rust side reads and deletes. Contract (must match
-lens-core/src-tauri MossSidecar byte-for-byte):
+Spawned by src-tauri's MossSidecar as `uv run --project <this dir> python
+mlx_speech_sidecar.py` and driven over stdio as line-delimited JSON. Audio
+never rides the pipe — a "synth" reply carries a path to a temp WAV file
+that the Rust side reads and deletes. Contract (must match lens-core/
+src-tauri MossSidecar byte-for-byte):
 
   startup:  load the model once, then print exactly one line {"ready": true}
   request:  {"id": <int>, "op": "ping"}
             {"id": <int>, "op": "synth", "text": str, "emotion": str|null,
-             "ref_clip": str, "ref_transcript": str, "audio_temperature": float}
+             "ref_clip": str, "ref_transcript": str|null, "audio_temperature": float}
   reply:    {"id": <echo>, "ok": true, "pong": true}                    (ping)
             {"id": <echo>, "ok": true, "path": "<temp wav path>"}       (synth)
             {"id": <echo>, "ok": false, "error": "<short message>"}     (either, on failure)
 
 Every reply echoes the request id and is flushed immediately so the Rust
-side can resync on the next newline after a mid-line cancel. Apple-Silicon
-only (MLX requires it); see README.md for the PyInstaller-onefile freeze.
+side can resync on the next newline after a mid-line cancel.
+
+Cloning uses the mlx-speech CONVERSATION API
+(`synthesize_moss_tts_local_conversations`) — the simpler `generate(
+reference_audio=...)` path is inert at every layer in mlx-speech 0.4.2/0.4.3
+(verified against source). MOSS clones from the reference audio clip alone;
+it does not use a reference transcript, so `ref_transcript` is accepted for
+wire compatibility but otherwise unused.
+
+The TTS transformer and audio codec live in two separate HuggingFace repos.
+`mlx_speech.tts.load()` only takes a single `revision` kwarg, which cannot
+pin both repos independently, so this sidecar resolves each repo directly
+via `mlx_speech._hub.get_model_path()` with its own pinned revision and
+constructs the adapter directly (see `load_moss_local()` below).
+
+Apple-Silicon only (MLX requires it); see README.md for the uv-provisioned
+runtime this sidecar runs under.
 """
 
 import argparse
 import json
-import os
 import sys
 import tempfile
 import wave
@@ -30,26 +45,46 @@ import numpy as np
 
 TARGET_SAMPLE_RATE = 24_000
 
+# Pinned HF revisions (commit SHAs, not branches) so the sidecar's model
+# behavior doesn't float across machines/time. ~5.27 GB combined.
+MOSS_TTS_REPO = "appautomaton/openmoss-tts-local-mlx"
+MOSS_TTS_REVISION = "c4951c75b9b44be20a87d0444b3638597e020ca0"
+MOSS_CODEC_REPO = "appautomaton/openmoss-audio-tokenizer-mlx"
+MOSS_CODEC_REVISION = "5d0020462d191cdf67c362ee0a9da1775666923e"
 
-def load_model(model_dir: str):
-    import mlx_speech
 
-    # TODO(A0): verify mlx_speech.tts.load() accepts a local directory path
-    # for the pre-downloaded int8 model (not just a registered alias/HF repo id).
-    return mlx_speech.tts.load(model_dir)
+def load_moss_local():
+    """Load the MOSS-TTS-Local transformer + audio codec with pinned revisions.
+
+    Bypasses `mlx_speech.tts.load()` (single `revision` kwarg can't pin two
+    repos independently) and instead resolves each repo via the hub helper,
+    then builds the adapter directly to reach its held `_model`/`_processor`/
+    `_codec`, which the conversation API needs as separate arguments.
+    """
+    from mlx_speech._hub import get_model_path
+    from mlx_speech.generation.moss_local import MossTTSLocalGenerationConfig
+    from mlx_speech.tts._adapters.moss_local import MossLocalAdapter
+
+    model_dir = get_model_path(MOSS_TTS_REPO, revision=MOSS_TTS_REVISION)
+    codec_dir = get_model_path(MOSS_CODEC_REPO, revision=MOSS_CODEC_REVISION)
+    adapter = MossLocalAdapter.from_dir(model_dir, codec_dir=codec_dir)
+    config = MossTTSLocalGenerationConfig.app_defaults()
+    return adapter._model, adapter._processor, adapter._codec, config
 
 
 def write_wav_mono24k(waveform: np.ndarray, sample_rate: int) -> str:
     if sample_rate != TARGET_SAMPLE_RATE:
-        # TODO(A0): confirm MOSS-TTS-Local always emits 24 kHz on real hardware;
-        # resampling here is out of scope for #193 if it doesn't.
+        # TODO(A0): confirm on hardware that the downloaded checkpoint's
+        # audio-codec config keeps the library default of 24 kHz (it is the
+        # documented rate, but the pinned revision's config.json is the
+        # ground truth and isn't inspectable offline).
         raise RuntimeError(f"unexpected sample rate {sample_rate}, expected {TARGET_SAMPLE_RATE}")
 
     samples = np.asarray(waveform, dtype=np.float32).reshape(-1)
     pcm16 = (np.clip(samples, -1.0, 1.0) * 32767.0).astype("<i2")
 
-    fd, path = tempfile.mkstemp(prefix="moss-turn-", suffix=".wav")
-    os.close(fd)
+    with tempfile.NamedTemporaryFile(prefix="moss-turn-", suffix=".wav", delete=False) as f:
+        path = f.name
     with wave.open(path, "wb") as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)
@@ -63,39 +98,40 @@ def send(obj: dict) -> None:
     sys.stdout.flush()
 
 
-def handle_synth(model, req: dict) -> str:
+def handle_synth(model, processor, codec, config, req: dict) -> str:
     text = req["text"]
     ref_clip = req["ref_clip"]
-    ref_transcript = req["ref_transcript"]
-    audio_temperature = req.get("audio_temperature", 1.0)
-    # emotion fidelity is deferred for #193 (plan C8) — accepted, not forwarded.
-    # TODO(A0): if mlx-speech exposes a cheap emotion/tag kwarg, wire
-    # req.get("emotion") through as a follow-up; do not block #193 on it.
+    # emotion + ref_transcript are accepted for wire compatibility but unused:
+    # MOSS clones from the reference clip alone (no transcript), and emotion
+    # fidelity is out of scope for #193 (plan C8).
 
-    # TODO(A0): confirm generate()'s kwarg names (reference_audio/reference_text/
-    # temperature) and return shape (result.waveform/result.sample_rate) against
-    # the installed mlx-speech version.
-    result = model.generate(
-        text,
-        reference_audio=ref_clip,
-        reference_text=ref_transcript,
-        temperature=audio_temperature,
+    from mlx_speech.generation.moss_local import synthesize_moss_tts_local_conversations
+
+    result = synthesize_moss_tts_local_conversations(
+        model,
+        processor,
+        codec,
+        conversations=[[processor.build_user_message(text=text, reference=[ref_clip])]],
+        mode="generation",
+        config=config,
     )
-
-    return write_wav_mono24k(np.array(result.waveform), int(result.sample_rate))
+    output = result.outputs[0]
+    return write_wav_mono24k(np.array(output.waveform), int(output.sample_rate))
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="MOSS-TTS-Local mlx-speech sidecar")
     parser.add_argument(
         "--model-dir",
-        required=True,
-        help="Directory containing the downloaded MOSS-TTS-Local int8 model",
+        default=None,
+        help="Deprecated/ignored: the model is fetched via pinned HF revisions "
+        "under HF_HOME, not a caller-supplied directory. Kept for wire/test compat.",
     )
-    args = parser.parse_args()
+    args, _unknown = parser.parse_known_args()
+    _ = args
 
     try:
-        model = load_model(args.model_dir)
+        model, processor, codec, config = load_moss_local()
     except Exception as exc:
         sys.stderr.write(f"model load failed: {exc}\n")
         sys.stderr.flush()
@@ -121,7 +157,7 @@ def main() -> None:
             if op == "ping":
                 send({"id": req_id, "ok": True, "pong": True})
             elif op == "synth":
-                path = handle_synth(model, req)
+                path = handle_synth(model, processor, codec, config, req)
                 send({"id": req_id, "ok": True, "path": path})
             else:
                 send({"id": req_id, "ok": False, "error": f"unknown op: {op}"})
