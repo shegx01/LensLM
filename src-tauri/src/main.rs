@@ -18,6 +18,11 @@
 mod asr;
 
 mod commands;
+// The MOSS-TTS-Local sidecar host (issue #193, [161e]): `MossSidecar` is injected
+// into the engine in the `.setup` block below. Apple-Silicon macOS only — MLX
+// lives in the frozen sidecar binary, so the module compiles out elsewhere.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod moss;
 // The offscreen SPA-render impl (issue #78). Its `TauriJsRenderer` is injected
 // into the engine in the `.setup` block below (Layer f), so its items are live.
 mod render;
@@ -88,6 +93,27 @@ fn main() {
                         engine_state.set_asr_engine(Some(Arc::new(apple))),
                     );
                 }
+            }
+
+            // Inject the MOSS-TTS-Local sidecar host (issue #193, [161e]) on
+            // Apple Silicon. Mirrors `set_asr_engine` above. `start()` stays LAZY
+            // (it spawns on the first synth, and needs the lazily-downloaded
+            // binary/model), so a missing binary surfaces later as a generic
+            // `LensError::Tts` via the synth stream — never a panic at startup.
+            // The frozen binary + int8 model live under app-data (registry ids
+            // `moss_sidecar_bin` / `moss_model`); the reference clips are bundled
+            // resources (dev: the crate's `resources/`; release: the app resource dir).
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            {
+                let binary_path = data_dir.join("bin/mlx-speech-sidecar");
+                let model_dir = data_dir.join("models/moss");
+                let resource_dir = if cfg!(debug_assertions) {
+                    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources")
+                } else {
+                    app.path().resource_dir()?.join("resources")
+                };
+                let moss = moss::MossSidecar::new(binary_path, model_dir, resource_dir);
+                tauri::async_runtime::block_on(engine_state.set_tts_sidecar(Some(Arc::new(moss))));
             }
 
             Ok(())

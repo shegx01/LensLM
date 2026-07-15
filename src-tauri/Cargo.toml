@@ -78,6 +78,13 @@ objc2 = "0.6"
 # out and the router on Whisper — the accepted fallback in the #42 plan (§3).
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 lens-core = { path = "../lens-core", features = ["native-ml-metal", "local-whisper"] }
+# issue #193: the MOSS-TTS-Local sidecar host (`moss` module, aarch64-macOS only).
+# `process`/`io-util` add `tokio::process::Command` + async `BufReader`/line IO for
+# the JSON-over-stdio pipe; `tokio-util` supplies the `CancellationToken` the
+# `TtsSidecar::synthesize_turn` signature takes. All source-level (no MLX crate —
+# MLX lives in the frozen binary), so MOSS compiles out on every other target.
+tokio = { workspace = true, features = ["process", "io-util"] }
+tokio-util = { workspace = true }
 
 [dev-dependencies]
 # The `test` feature (mock runtime) is unioned in only for test builds.
