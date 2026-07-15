@@ -111,9 +111,11 @@ pub use system_check::{
 };
 pub use transcription::{WindowConfig, decode_and_resample_audio, decode_resample_windows};
 pub use tts::{
-    AudioBuffer, CloudTtsKind, DownloadProgress, Gender, TTS_REGISTRY, TtsBackend, TtsModelSpec,
-    TtsPhase, TtsProvider, TtsProviderInfo, TtsSidecar, TtsVoice, download_tts_model, emotion_tag,
-    resolve_tts, resolve_tts_provider, tts_model_downloaded, tts_model_path,
+    ArtifactKind, AudioBuffer, CloudTtsKind, DownloadProgress, Gender, MossLocalAdapter,
+    MossTtsdAdapter, TTS_REGISTRY, TtsBackend, TtsModelSpec, TtsPhase, TtsProvider, TtsProviderInfo,
+    TtsSidecar, TtsVoice, download_tts_model, emotion_tag, read_wav_mono16, resolve_tts,
+    resolve_tts_provider, resolve_tts_provider_full, tts_model_downloaded, tts_model_path,
+    unpack_zip,
 };
 pub use vector_store::{LanceVectorStore, VectorStore};
 
@@ -1312,14 +1314,17 @@ impl LensEngine {
     }
 
     pub async fn tts_backend_available(&self, cfg: &config::TtsConfig) -> bool {
-        if let Some(sidecar) = self.tts_sidecar().await
-            && sidecar.health().await
+        // Cheap file probe (never a weight load, never a sidecar spawn — this gate
+        // fires on notebook open): a backend is available only when ALL its
+        // artifacts are on disk. MossLocal additionally requires an injected
+        // sidecar, but its health is NOT probed (would cost a spawn + multi-GB load
+        // here); a corrupt/unstartable binary surfaces at synth time as a typed
+        // `LensError::Tts`. Non-embedded backends name no artifacts.
+        if matches!(cfg.backend, tts::TtsBackend::MossLocal)
+            && self.tts_sidecar().await.is_none()
         {
-            return true;
+            return false;
         }
-        // Cheap file probe (never a weight load): an embedded backend is available
-        // only when ALL its artifacts are on disk — a one-file state must not
-        // over-report available. Non-embedded backends name no artifacts.
         let data_dir = self.data_dir().await;
         let required = cfg.backend.required_model_ids();
         !required.is_empty()
@@ -1337,30 +1342,16 @@ impl LensEngine {
         on_phase: impl Fn(tts::TtsPhase) + Send + Sync,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<std::path::PathBuf, LensError> {
-        let sidecar = self.tts_sidecar().await;
-        let healthy_sidecar = match &sidecar {
-            Some(s) if s.health().await => Some(s.clone()),
-            _ => None,
-        };
-
-        // Resolve `data_dir` before the resolve call: an embedded provider
-        // (Orpheus) needs it to construct its model paths (#191 B0 seam change).
+        // Single dispatch path (#193): `_full` returns the sidecar-backed adapter
+        // (MossLocal) when a sidecar is injected, else the embedded provider
+        // (Orpheus). `data_dir` supplies embedded model paths.
         let data_dir = self.data_dir().await;
-
-        let buffer: tts::AudioBuffer = if let Some(sidecar) = healthy_sidecar {
-            tts::synthesize_and_stitch(&script.turns, &on_phase, cancel, |turn| {
-                sidecar.synthesize_turn(turn, voices, cancel)
-            })
-            .await?
-        } else if let Some(provider) = tts::resolve_tts_provider(cfg.backend, cfg, &data_dir) {
-            provider
-                .synthesize_script(script, voices, &on_phase, cancel)
-                .await?
-        } else {
-            return Err(LensError::Tts(
-                "no TTS backend available; install an engine".into(),
-            ));
-        };
+        let provider =
+            tts::resolve_tts_provider_full(cfg.backend, cfg, &data_dir, self.tts_sidecar().await)
+                .ok_or_else(|| LensError::Tts("no TTS backend available".into()))?;
+        let buffer: tts::AudioBuffer = provider
+            .synthesize_script(script, voices, &on_phase, cancel)
+            .await?;
 
         on_phase(tts::TtsPhase::Encoding);
         let path = notebook_audio_path(&data_dir, notebook_id)?;

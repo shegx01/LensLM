@@ -104,6 +104,27 @@ pub(crate) fn stitch_turns(buffers: &[(Speaker, AudioBuffer)]) -> Result<AudioBu
     Ok(AudioBuffer::mono(out, TARGET_RATE))
 }
 
+/// Reads a 16-bit PCM WAV as a mono `f32` [`AudioBuffer`]. Multi-channel input is
+/// downmixed by averaging. Public so the `src-tauri` MOSS sidecar can decode the
+/// per-turn WAV it receives without adding an audio dependency of its own.
+pub fn read_wav_mono16(path: &Path) -> Result<AudioBuffer, LensError> {
+    let mut reader = hound::WavReader::open(path).map_err(hound_err)?;
+    let spec = reader.spec();
+    let channels = spec.channels.max(1) as usize;
+    let raw: Vec<f32> = reader
+        .samples::<i16>()
+        .map(|s| s.map(|v| v as f32 / i16::MAX as f32).map_err(hound_err))
+        .collect::<Result<_, _>>()?;
+    let samples = if channels <= 1 {
+        raw
+    } else {
+        raw.chunks(channels)
+            .map(|frame| frame.iter().sum::<f32>() / channels as f32)
+            .collect()
+    };
+    Ok(AudioBuffer::mono(samples, spec.sample_rate))
+}
+
 pub(crate) fn write_wav_16bit(buffer: &AudioBuffer, path: &Path) -> Result<(), LensError> {
     let spec = hound::WavSpec {
         channels: 1,
@@ -257,6 +278,23 @@ mod tests {
         assert_eq!(read.len(), samples.len());
         for (got, want) in read.iter().zip(samples.iter()) {
             assert!((got - want).abs() < 1.0 / 32_000.0, "got {got} want {want}");
+        }
+    }
+
+    #[test]
+    fn read_wav_mono16_round_trips_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt.wav");
+        let samples = vec![0.0, 0.5, -0.5, 1.0, -1.0, 0.25];
+        let src = AudioBuffer::mono(samples.clone(), TARGET_RATE);
+        write_wav_16bit(&src, &path).unwrap();
+
+        let got = read_wav_mono16(&path).unwrap();
+        assert_eq!(got.sample_rate, TARGET_RATE);
+        assert_eq!(got.channels, 1);
+        assert_eq!(got.samples.len(), samples.len());
+        for (g, w) in got.samples.iter().zip(samples.iter()) {
+            assert!((g - w).abs() < 1.0 / 32_000.0, "got {g} want {w}");
         }
     }
 }

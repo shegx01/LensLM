@@ -10,16 +10,18 @@ use crate::dialogue::{DialogueScript, Emotion, Speaker, Turn};
 use crate::error::LensError;
 
 pub mod audio;
+pub mod moss;
 pub mod orpheus;
 pub mod registry;
 pub mod sidecar;
 pub mod snac;
 
-pub use audio::AudioBuffer;
+pub use audio::{AudioBuffer, read_wav_mono16};
 pub(crate) use audio::write_wav_16bit;
+pub use moss::{MossLocalAdapter, MossTtsdAdapter};
 pub use registry::{
-    TTS_REGISTRY, TtsModelSpec, download_tts_model, resolve_tts, tts_model_downloaded,
-    tts_model_path,
+    ArtifactKind, TTS_REGISTRY, TtsModelSpec, download_tts_model, resolve_tts,
+    tts_model_downloaded, tts_model_path, unpack_zip,
 };
 pub use sidecar::TtsSidecar;
 
@@ -95,7 +97,8 @@ impl TtsBackend {
     pub fn required_model_ids(&self) -> &'static [&'static str] {
         match self {
             TtsBackend::Orpheus => &["orpheus", "snac"],
-            TtsBackend::MossLocal | TtsBackend::MossTtsd | TtsBackend::Cloud(_) => &[],
+            TtsBackend::MossLocal => &["moss_sidecar_bin", "moss_model"],
+            TtsBackend::MossTtsd | TtsBackend::Cloud(_) => &[],
         }
     }
 }
@@ -187,16 +190,18 @@ pub trait TtsProvider: Send + Sync {
     }
 }
 
-/// Resolves a [`TtsProvider`] for `backend`. Construction is cheap: an embedded
-/// provider (Orpheus) holds only its model paths + config and lazy-loads weights
-/// on first synth (see [`orpheus::OrpheusAdapter`]). `data_dir` supplies the
-/// model relpaths; availability (whether those files exist) is a separate cheap
-/// probe (`tts_model_downloaded`), so a missing artifact surfaces as a lazy-load
-/// `LensError::Tts`, never a silent `None`.
-pub fn resolve_tts_provider(
+/// Resolves a [`TtsProvider`] for `backend`, given an optional injected `sidecar`.
+/// This is the single dispatch path; both [`resolve_tts_provider`] (the `None`
+/// wrapper) and `synthesize_overview` route through it so the two entry points
+/// cannot diverge. Construction is cheap: an embedded provider (Orpheus) holds
+/// only its model paths and lazy-loads weights on first synth. Sidecar-backed
+/// backends (MossLocal) resolve only when a sidecar is present; a missing artifact
+/// surfaces as a lazy-load `LensError::Tts`, never a silent `None`.
+pub fn resolve_tts_provider_full(
     backend: TtsBackend,
     _cfg: &TtsConfig,
     data_dir: &Path,
+    sidecar: Option<Arc<dyn TtsSidecar>>,
 ) -> Option<Arc<dyn TtsProvider>> {
     match backend {
         TtsBackend::Orpheus => {
@@ -204,10 +209,24 @@ pub fn resolve_tts_provider(
             let snac = tts_model_path(data_dir, "snac")?;
             Some(Arc::new(orpheus::OrpheusAdapter::new(orpheus, snac)))
         }
-        TtsBackend::MossLocal => None,
+        TtsBackend::MossLocal => {
+            sidecar.map(|s| Arc::new(moss::MossLocalAdapter::new(s)) as Arc<dyn TtsProvider>)
+        }
         TtsBackend::MossTtsd => None,
         TtsBackend::Cloud(_) => None,
     }
+}
+
+/// Thin wrapper over [`resolve_tts_provider_full`] with no sidecar. Sidecar-backed
+/// backends (MossLocal) therefore return `None` here by design; call `_full` with
+/// the injected sidecar when one is required (see `synthesize_overview`). Keeps the
+/// 3-arg signature used by `system.rs` voice resolution and existing tests.
+pub fn resolve_tts_provider(
+    backend: TtsBackend,
+    cfg: &TtsConfig,
+    data_dir: &Path,
+) -> Option<Arc<dyn TtsProvider>> {
+    resolve_tts_provider_full(backend, cfg, data_dir, None)
 }
 
 pub fn emotion_tag(emotion: Emotion, backend: TtsBackend) -> Option<String> {
@@ -248,6 +267,65 @@ mod tests {
         let provider = resolve_tts_provider(TtsBackend::Orpheus, &cfg, Path::new("/data"))
             .expect("orpheus resolves to an adapter");
         assert_eq!(provider.info().backend, TtsBackend::Orpheus);
+    }
+
+    #[test]
+    fn resolve_full_moss_local_needs_sidecar() {
+        let cfg = TtsConfig::default();
+        let data_dir = Path::new("/data");
+        // No sidecar → the wrapper's behavior: MossLocal is None.
+        assert!(resolve_tts_provider_full(TtsBackend::MossLocal, &cfg, data_dir, None).is_none());
+        assert!(resolve_tts_provider(TtsBackend::MossLocal, &cfg, data_dir).is_none());
+
+        // With an injected sidecar → the MossLocal adapter.
+        let sidecar: Arc<dyn TtsSidecar> = Arc::new(NoopSidecar);
+        let provider =
+            resolve_tts_provider_full(TtsBackend::MossLocal, &cfg, data_dir, Some(sidecar))
+                .expect("moss_local resolves with a sidecar");
+        assert_eq!(provider.info().backend, TtsBackend::MossLocal);
+        assert_eq!(provider.info().model, "moss-tts-local-int8");
+    }
+
+    #[test]
+    fn resolve_full_moss_ttsd_is_none_even_with_sidecar() {
+        let cfg = TtsConfig::default();
+        let sidecar: Arc<dyn TtsSidecar> = Arc::new(NoopSidecar);
+        assert!(
+            resolve_tts_provider_full(TtsBackend::MossTtsd, &cfg, Path::new("/data"), Some(sidecar))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn resolve_orpheus_via_wrapper_ignores_absent_sidecar() {
+        // Orpheus resolves through the None-wrapper with no sidecar injected.
+        let cfg = TtsConfig::default();
+        let provider = resolve_tts_provider(TtsBackend::Orpheus, &cfg, Path::new("/data"))
+            .expect("orpheus resolves without a sidecar");
+        assert_eq!(provider.info().backend, TtsBackend::Orpheus);
+    }
+
+    struct NoopSidecar;
+
+    #[async_trait]
+    impl crate::tts::sidecar::TtsSidecar for NoopSidecar {
+        async fn start(&self) -> Result<(), LensError> {
+            Ok(())
+        }
+        async fn stop(&self) -> Result<(), LensError> {
+            Ok(())
+        }
+        async fn health(&self) -> bool {
+            true
+        }
+        async fn synthesize_turn(
+            &self,
+            _turn: &Turn,
+            _voices: &VoiceConfig,
+            _cancel: &CancellationToken,
+        ) -> Result<AudioBuffer, LensError> {
+            Ok(AudioBuffer::mono(vec![0.0; 8], audio::TARGET_RATE))
+        }
     }
 
     #[test]
