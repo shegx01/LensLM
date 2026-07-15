@@ -2,11 +2,17 @@
 //! MLX Python sidecar over line-delimited JSON-over-stdio as lens-core's
 //! [`TtsSidecar`]. Gated to `aarch64-apple-darwin` (the only target MLX runs on).
 //!
+//! The sidecar runs under `uv` (`uv run` against the bundled `pyproject.toml`);
+//! `mlx-speech` auto-downloads the model into the `HF_HOME` cache passed in the
+//! [`SidecarSpawn`]. Launch details are resolved lazily via an injected resolver
+//! (see [`resolver::resolve_sidecar_spawn`]) so provisioning never blocks startup.
+//!
 //! All failures map to a generic [`LensError::Tts`] (no path/internal detail —
 //! it crosses the Tauri IPC boundary); real errors are logged server-side only.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use async_trait::async_trait;
@@ -21,10 +27,27 @@ use lens_core::{
     read_wav_mono16,
 };
 
-/// Bound on the one-time model-load handshake. The int8 model is ~3.3 GB, so a
-/// cold load can take tens of seconds; a generous ceiling avoids a false failure
-/// while still guaranteeing the lazy `start` cannot hang forever.
-const READY_TIMEOUT: Duration = Duration::from_secs(300);
+mod resolver;
+pub use resolver::resolve_sidecar_spawn;
+
+/// A fully-resolved sidecar launch: the program to exec, its args, and the extra
+/// environment it needs (e.g. `HF_HOME` so `huggingface_hub` caches into app-data).
+/// Produced by a [`SpawnResolver`] so [`MossSidecar`] stays testable with a stub.
+pub struct SidecarSpawn {
+    pub program: PathBuf,
+    pub args: Vec<String>,
+    pub envs: Vec<(String, String)>,
+}
+
+/// Lazily produces the [`SidecarSpawn`]. Resolution may download `uv`, so it is
+/// invoked off the async runtime (via `spawn_blocking`) on first spawn, never at
+/// app startup. Tests inject a resolver returning a stub spec.
+pub type SpawnResolver = Arc<dyn Fn() -> Result<SidecarSpawn, LensError> + Send + Sync>;
+
+/// Bound on the one-time model-load handshake. A cold first run also provisions
+/// the `uv` env and `mlx-speech` lazily fetches ~5 GB of weights, so the ceiling
+/// is generous; it only guarantees the lazy `start` cannot hang forever.
+const READY_TIMEOUT: Duration = Duration::from_secs(900);
 
 /// Per-turn reply-read ceiling. A mid-write cancel can leave the child mid-synth;
 /// without a bound the read (and the whole overview) would hang forever, so on
@@ -81,8 +104,8 @@ struct SynthReply {
 }
 
 pub struct MossSidecar {
-    binary_path: PathBuf,
-    model_dir: PathBuf,
+    /// Yields the launch spec on first spawn (may download `uv`); see [`SpawnResolver`].
+    resolver: SpawnResolver,
     /// Directory containing the bundled `voices/` reference clips.
     resource_dir: PathBuf,
     child: Mutex<Option<ChildTriple>>,
@@ -94,10 +117,9 @@ pub struct MossSidecar {
 }
 
 impl MossSidecar {
-    pub fn new(binary_path: PathBuf, model_dir: PathBuf, resource_dir: PathBuf) -> Self {
+    pub fn new(resolver: SpawnResolver, resource_dir: PathBuf) -> Self {
         Self {
-            binary_path,
-            model_dir,
+            resolver,
             resource_dir,
             child: Mutex::new(None),
             ready: AtomicBool::new(false),
@@ -154,9 +176,19 @@ impl MossSidecar {
         self.ready.store(false, Ordering::SeqCst);
         tracing::debug!(invocation_id = %self.invocation_id, "spawning MOSS-TTS-Local sidecar");
 
-        let mut child = Command::new(&self.binary_path)
-            .arg("--model-dir")
-            .arg(&self.model_dir)
+        // Resolve the launch spec off the async runtime: the first resolution may
+        // download `uv`, which must not stall a runtime worker thread.
+        let resolver = self.resolver.clone();
+        let spec = tokio::task::spawn_blocking(move || resolver())
+            .await
+            .map_err(|e| {
+                tracing::warn!(error = %e, "MOSS spawn resolver task panicked/cancelled");
+                tts_err()
+            })??;
+
+        let mut child = Command::new(&spec.program)
+            .args(&spec.args)
+            .envs(spec.envs)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // Sidecar diagnostics go to our stderr — never onto the JSON pipe.
@@ -429,11 +461,16 @@ mod tests {
     use super::*;
 
     fn sidecar_with_resources(resource_dir: PathBuf) -> MossSidecar {
-        MossSidecar::new(
-            PathBuf::from("/nonexistent/bin/mlx-speech-sidecar"),
-            PathBuf::from("/nonexistent/models/moss"),
-            resource_dir,
-        )
+        // These tests exercise only `resolve_voice`, which never spawns, so the
+        // resolver is a stub that is never invoked.
+        let resolver: SpawnResolver = Arc::new(|| {
+            Ok(SidecarSpawn {
+                program: PathBuf::from("/nonexistent/uv"),
+                args: vec![],
+                envs: vec![],
+            })
+        });
+        MossSidecar::new(resolver, resource_dir)
     }
 
     #[test]
@@ -606,18 +643,13 @@ mod e2e_tests {
     use std::time::Duration;
 
     /// Stub sidecar: honors the exact wire contract (ready line, id-echoed
-    /// ping/synth replies, temp-WAV path). Sleeps per-synth only when a `SLOW`
-    /// marker file exists in `--model-dir` (parallel-safe, no shared env).
+    /// ping/synth replies, temp-WAV path). Sleeps per-synth only when the `slow`
+    /// argv marker is present (the cancel test injects it; no `uv`/MLX needed).
     const STUB: &str = r#"#!/usr/bin/env python3
 import sys, json, os, struct, wave, tempfile, math, time
 def emit(o):
     sys.stdout.write(json.dumps(o) + "\n"); sys.stdout.flush()
-model_dir = ""
-argv = sys.argv[1:]
-for i, x in enumerate(argv):
-    if x == "--model-dir" and i + 1 < len(argv):
-        model_dir = argv[i + 1]
-slow = os.path.exists(os.path.join(model_dir, "SLOW"))
+slow = "slow" in sys.argv[1:]
 def make_wav():
     fd, p = tempfile.mkstemp(prefix="moss-turn-", suffix=".wav"); os.close(fd)
     r = 24000; n = int(0.4 * r)
@@ -648,8 +680,8 @@ for line in sys.stdin:
         emit({"id": rid, "ok": False, "error": "unknown op"})
 "#;
 
-    /// Writes the stub to `dir/stub.py` (chmod +x) so `MossSidecar` can spawn it
-    /// directly via its shebang, and returns the path.
+    /// Writes the stub to `dir/stub.py` (chmod +x, harmless — it is run as an
+    /// argument to `python3`) and returns the path.
     fn write_stub(dir: &Path) -> PathBuf {
         let path = dir.join("stub.py");
         let mut f = std::fs::File::create(&path).unwrap();
@@ -680,13 +712,21 @@ for line in sys.stdin:
 
     fn provider_over_stub(tmp: &Path, slow: bool) -> Arc<dyn lens_core::TtsProvider> {
         let stub = write_stub(tmp);
-        let model_dir = tmp.join("model");
-        std::fs::create_dir_all(&model_dir).unwrap();
+        // Inject a resolver that returns the "direct spawn" spec: run the stdlib
+        // stub under the system `python3` (no `uv`/MLX). `slow` is passed as an
+        // argv marker so the cancel test can force a mid-turn sleep.
+        let mut args = vec![stub.to_string_lossy().into_owned()];
         if slow {
-            std::fs::write(model_dir.join("SLOW"), b"1").unwrap();
+            args.push("slow".to_string());
         }
-        let sidecar: Arc<dyn TtsSidecar> =
-            Arc::new(MossSidecar::new(stub, model_dir, tmp.to_path_buf()));
+        let resolver: SpawnResolver = Arc::new(move || {
+            Ok(SidecarSpawn {
+                program: PathBuf::from("python3"),
+                args: args.clone(),
+                envs: vec![],
+            })
+        });
+        let sidecar: Arc<dyn TtsSidecar> = Arc::new(MossSidecar::new(resolver, tmp.to_path_buf()));
         resolve_tts_provider_full(
             TtsBackend::MossLocal,
             &TtsConfig::default(),

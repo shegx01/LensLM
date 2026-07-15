@@ -85,6 +85,13 @@ lens-core = { path = "../lens-core", features = ["native-ml-metal", "local-whisp
 # MLX lives in the frozen binary), so MOSS compiles out on every other target.
 tokio = { workspace = true, features = ["process", "io-util"] }
 tokio-util = { workspace = true }
+# issue #193: the resolver's one-time `uv` provisioning download. `blocking`
+# because the resolver is a sync `Fn` driven via `spawn_blocking`; `rustls` (no
+# OpenSSL) mirrors the workspace HTTP policy. Same `=0.13.4` pin as elsewhere so
+# no second reqwest copy is added; extraction uses the OS `tar` (no tar/flate2).
+reqwest = { version = "=0.13.4", default-features = false, features = ["rustls", "blocking"] }
+# SHA256 integrity check on the downloaded `uv` archive (same pin as lens-core).
+sha2 = "=0.10.9"
 
 [dev-dependencies]
 # The `test` feature (mock runtime) is unioned in only for test builds.
