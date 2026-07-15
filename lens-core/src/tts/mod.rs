@@ -16,9 +16,12 @@ pub mod registry;
 pub mod sidecar;
 pub mod snac;
 
-pub use audio::{AudioBuffer, read_wav_mono16};
 pub(crate) use audio::write_wav_16bit;
-pub use moss::{MossLocalAdapter, MossTtsdAdapter};
+pub use audio::{AudioBuffer, read_wav_mono16};
+pub use moss::{
+    MOSS_REFERENCE_VOICES, MossLocalAdapter, MossReferenceVoice, MossTtsdAdapter,
+    moss_reference_voice,
+};
 pub use registry::{
     ArtifactKind, TTS_REGISTRY, TtsModelSpec, download_tts_model, resolve_tts,
     tts_model_downloaded, tts_model_path, unpack_zip,
@@ -291,8 +294,13 @@ mod tests {
         let cfg = TtsConfig::default();
         let sidecar: Arc<dyn TtsSidecar> = Arc::new(NoopSidecar);
         assert!(
-            resolve_tts_provider_full(TtsBackend::MossTtsd, &cfg, Path::new("/data"), Some(sidecar))
-                .is_none()
+            resolve_tts_provider_full(
+                TtsBackend::MossTtsd,
+                &cfg,
+                Path::new("/data"),
+                Some(sidecar)
+            )
+            .is_none()
         );
     }
 

@@ -7,12 +7,72 @@ use crate::config::VoiceConfig;
 use crate::dialogue::Turn;
 use crate::error::LensError;
 use crate::tts::sidecar::TtsSidecar;
-use crate::tts::{AudioBuffer, TtsBackend, TtsProvider, TtsProviderInfo, TtsVoice};
+use crate::tts::{AudioBuffer, Gender, TtsBackend, TtsProvider, TtsProviderInfo, TtsVoice};
+
+/// A bundled MOSS reference clip: the clone-only backend synthesizes each turn
+/// against one of these. Transcripts are static engine data; the clip file *path*
+/// is resolved by `src-tauri` (it owns the bundled resource dir), so only the
+/// filename lives here.
+pub struct MossReferenceVoice {
+    pub id: &'static str,
+    pub display_name: &'static str,
+    pub gender: Gender,
+    pub transcript: &'static str,
+    pub clip_filename: &'static str,
+}
+
+/// The four bundled MOSS reference voices. Transcripts are provisional pending a
+/// human clip-alignment audition (#193 A0/audition).
+pub static MOSS_REFERENCE_VOICES: &[MossReferenceVoice] = &[
+    MossReferenceVoice {
+        id: "librivox-clarke",
+        display_name: "David (measured)",
+        gender: Gender::Male,
+        clip_filename: "librivox-clarke.wav",
+        transcript: "To Sherlock Holmes she is always the woman. I have seldom heard him mention \
+                     her under any other name. In his eyes she eclipses and predominates the \
+                     whole of her sex.",
+    },
+    MossReferenceVoice {
+        id: "librivox-chenevert",
+        display_name: "Phil (warm)",
+        gender: Gender::Male,
+        clip_filename: "librivox-chenevert.wav",
+        transcript: "Chapter One, In Jolly Kimbaloo. The King of Kimbaloo was kinda jolly, and \
+                     kinda jolly was the King of Kimbaloo.",
+    },
+    MossReferenceVoice {
+        id: "librivox-klett",
+        display_name: "Elizabeth (clear)",
+        gender: Gender::Female,
+        clip_filename: "librivox-klett.wav",
+        transcript: "No one who had ever seen Catherine Morland in her infancy would have \
+                     supposed her born to be an heroine. Her situation in life, the character of \
+                     her father and mother, her own person and disposition, were all equally \
+                     against her.",
+    },
+    MossReferenceVoice {
+        id: "librivox-savage",
+        display_name: "Karen (expressive)",
+        gender: Gender::Female,
+        clip_filename: "librivox-savage.wav",
+        transcript: "Paris, September, 1792. A surging, seething, murmuring crowd of beings that \
+                     are human only in name, for to the eye and ear they seem naught but savage \
+                     creatures, animated by vile passions and by the lust of vengeance and of \
+                     hate.",
+    },
+];
+
+/// Resolves a bundled reference voice by id (used by `src-tauri` to map a
+/// `VoiceRef::Named(id)` to its transcript + clip filename).
+pub fn moss_reference_voice(id: &str) -> Option<&'static MossReferenceVoice> {
+    MOSS_REFERENCE_VOICES.iter().find(|v| v.id == id)
+}
 
 /// In-process adapter for MOSS-TTS-Local. Owns no model weights: every turn is
 /// delegated to an out-of-process MLX sidecar (`src-tauri`), so `lens-core` stays
 /// headless. Reuses the default [`TtsProvider::synthesize_script`] stitch/cancel
-/// pipeline; MOSS is clone-only, hence no named-voice catalog.
+/// pipeline; voices are the bundled clone-reference clips ([`MOSS_REFERENCE_VOICES`]).
 pub struct MossLocalAdapter {
     sidecar: Arc<dyn TtsSidecar>,
 }
@@ -33,7 +93,10 @@ impl TtsProvider for MossLocalAdapter {
     }
 
     fn voices(&self) -> Vec<TtsVoice> {
-        Vec::new()
+        MOSS_REFERENCE_VOICES
+            .iter()
+            .map(|v| TtsVoice::new(v.id, v.display_name, v.gender))
+            .collect()
     }
 
     async fn synthesize_turn(
@@ -153,7 +216,36 @@ mod tests {
         let adapter = MossLocalAdapter::new(Arc::new(MockSidecar::new(None)));
         assert_eq!(adapter.info().backend, TtsBackend::MossLocal);
         assert_eq!(adapter.info().model, "moss-tts-local-int8");
-        assert!(adapter.voices().is_empty());
+
+        let voices = adapter.voices();
+        assert_eq!(voices.len(), 4);
+        let ids: Vec<&str> = voices.iter().map(|v| v.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "librivox-clarke",
+                "librivox-chenevert",
+                "librivox-klett",
+                "librivox-savage"
+            ]
+        );
+        assert_eq!(
+            voices.iter().filter(|v| v.gender == Gender::Male).count(),
+            2
+        );
+        assert_eq!(
+            voices.iter().filter(|v| v.gender == Gender::Female).count(),
+            2
+        );
+    }
+
+    #[test]
+    fn reference_voice_lookup_resolves_transcript_and_clip() {
+        let v = moss_reference_voice("librivox-klett").expect("known voice");
+        assert_eq!(v.gender, Gender::Female);
+        assert_eq!(v.clip_filename, "librivox-klett.wav");
+        assert!(v.transcript.contains("Catherine Morland"));
+        assert!(moss_reference_voice("nope").is_none());
     }
 
     #[tokio::test]

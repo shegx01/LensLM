@@ -111,11 +111,11 @@ pub use system_check::{
 };
 pub use transcription::{WindowConfig, decode_and_resample_audio, decode_resample_windows};
 pub use tts::{
-    ArtifactKind, AudioBuffer, CloudTtsKind, DownloadProgress, Gender, MossLocalAdapter,
-    MossTtsdAdapter, TTS_REGISTRY, TtsBackend, TtsModelSpec, TtsPhase, TtsProvider, TtsProviderInfo,
-    TtsSidecar, TtsVoice, download_tts_model, emotion_tag, read_wav_mono16, resolve_tts,
-    resolve_tts_provider, resolve_tts_provider_full, tts_model_downloaded, tts_model_path,
-    unpack_zip,
+    ArtifactKind, AudioBuffer, CloudTtsKind, DownloadProgress, Gender, MOSS_REFERENCE_VOICES,
+    MossLocalAdapter, MossReferenceVoice, MossTtsdAdapter, TTS_REGISTRY, TtsBackend, TtsModelSpec,
+    TtsPhase, TtsProvider, TtsProviderInfo, TtsSidecar, TtsVoice, download_tts_model, emotion_tag,
+    moss_reference_voice, read_wav_mono16, resolve_tts, resolve_tts_provider,
+    resolve_tts_provider_full, tts_model_downloaded, tts_model_path, unpack_zip,
 };
 pub use vector_store::{LanceVectorStore, VectorStore};
 
@@ -1320,9 +1320,7 @@ impl LensEngine {
         // sidecar, but its health is NOT probed (would cost a spawn + multi-GB load
         // here); a corrupt/unstartable binary surfaces at synth time as a typed
         // `LensError::Tts`. Non-embedded backends name no artifacts.
-        if matches!(cfg.backend, tts::TtsBackend::MossLocal)
-            && self.tts_sidecar().await.is_none()
-        {
+        if matches!(cfg.backend, tts::TtsBackend::MossLocal) && self.tts_sidecar().await.is_none() {
             return false;
         }
         let data_dir = self.data_dir().await;

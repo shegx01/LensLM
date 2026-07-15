@@ -101,7 +101,9 @@ pub fn tts_model_downloaded(data_dir: &Path, id: &str) -> bool {
     match resolve_tts(id) {
         // For archives the download destination (`relpath`) is a transient `.zip`;
         // availability is the post-unpack sentinel.
-        Some(spec) => data_dir.join(spec.sentinel.unwrap_or(spec.relpath)).is_file(),
+        Some(spec) => data_dir
+            .join(spec.sentinel.unwrap_or(spec.relpath))
+            .is_file(),
         None => false,
     }
 }
@@ -205,10 +207,7 @@ where
         .map_err(|e| LensError::Io(format!("finalize model unpack: {e}")))?;
     let _ = std::fs::remove_file(&zip_dest);
 
-    on_progress(DownloadProgress {
-        done: true,
-        ..last
-    });
+    on_progress(DownloadProgress { done: true, ..last });
     Ok(final_dir)
 }
 
@@ -216,8 +215,8 @@ where
 /// normalized path is not safely contained (`..`, absolute) is rejected via
 /// `enclosed_name()` → [`LensError::Validation`].
 pub fn unpack_zip(zip_path: &Path, dest_dir: &Path) -> Result<(), LensError> {
-    let file = std::fs::File::open(zip_path)
-        .map_err(|e| LensError::Io(format!("open archive: {e}")))?;
+    let file =
+        std::fs::File::open(zip_path).map_err(|e| LensError::Io(format!("open archive: {e}")))?;
     let mut archive = zip::ZipArchive::new(file)
         .map_err(|e| LensError::Validation(format!("invalid zip archive: {e}")))?;
     for i in 0..archive.len() {
