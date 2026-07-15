@@ -30,7 +30,7 @@ reads and deletes it.
 ## A0 freeze spike — human sign-off required
 
 The three `# TODO(A0): ...` comments in `mlx_speech_sidecar.py` mark API
-surface written against the *documented* `mlx-speech` shape without a real
+surface written against the _documented_ `mlx-speech` shape without a real
 Apple-Silicon machine to run it on. Before this sidecar is trusted:
 
 1. Run it unfrozen (see below) against a real downloaded MOSS int8 model dir

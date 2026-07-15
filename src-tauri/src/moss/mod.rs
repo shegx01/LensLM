@@ -415,3 +415,201 @@ mod tests {
         assert!(moss_reference_voice("librivox-klett").is_some());
     }
 }
+
+/// End-to-end correctness harness: drives the REAL `MossSidecar` (real
+/// `tokio::process` spawn + JSON-over-stdio + correlation-id drain +
+/// `read_wav_mono16` + stitch) through the production `resolve_tts_provider_full`
+/// dispatch, against a stdlib-only Python stub that speaks the sidecar contract
+/// but needs no MLX. Validates every line of net-new plumbing offline; only real
+/// MLX voice quality (D4 audition) remains human-gated. Requires `python3`.
+#[cfg(test)]
+mod e2e_tests {
+    use super::*;
+    use lens_core::{
+        DialogueScript, Speaker, TtsBackend, TtsConfig, TtsPhase, Turn, resolve_tts_provider_full,
+    };
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Arc, Mutex as StdMutex};
+    use std::time::Duration;
+
+    /// Stub sidecar: honors the exact wire contract (ready line, id-echoed
+    /// ping/synth replies, temp-WAV path). Sleeps per-synth only when a `SLOW`
+    /// marker file exists in `--model-dir` (parallel-safe, no shared env).
+    const STUB: &str = r#"#!/usr/bin/env python3
+import sys, json, os, struct, wave, tempfile, math, time
+def emit(o):
+    sys.stdout.write(json.dumps(o) + "\n"); sys.stdout.flush()
+model_dir = ""
+argv = sys.argv[1:]
+for i, x in enumerate(argv):
+    if x == "--model-dir" and i + 1 < len(argv):
+        model_dir = argv[i + 1]
+slow = os.path.exists(os.path.join(model_dir, "SLOW"))
+def make_wav():
+    fd, p = tempfile.mkstemp(prefix="moss-turn-", suffix=".wav"); os.close(fd)
+    r = 24000; n = int(0.4 * r)
+    with wave.open(p, "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(r)
+        w.writeframes(b"".join(struct.pack("<h", int(3000 * math.sin(2*math.pi*220*i/r))) for i in range(n)))
+    return p
+emit({"ready": True})
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        req = json.loads(line)
+    except Exception:
+        continue
+    rid = req.get("id"); op = req.get("op")
+    if op == "ping":
+        emit({"id": rid, "ok": True, "pong": True})
+    elif op == "synth":
+        if slow:
+            time.sleep(1.2)
+        try:
+            emit({"id": rid, "ok": True, "path": make_wav()})
+        except Exception as e:
+            emit({"id": rid, "ok": False, "error": str(e)[:200]})
+    else:
+        emit({"id": rid, "ok": False, "error": "unknown op"})
+"#;
+
+    /// Writes the stub to `dir/stub.py` (chmod +x) so `MossSidecar` can spawn it
+    /// directly via its shebang, and returns the path.
+    fn write_stub(dir: &Path) -> PathBuf {
+        let path = dir.join("stub.py");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(STUB.as_bytes()).unwrap();
+        f.flush().unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn two_turn_script() -> DialogueScript {
+        DialogueScript {
+            turns: vec![
+                Turn {
+                    speaker: Speaker::Host,
+                    text: "Welcome to the overview.".to_string(),
+                    emotion: None,
+                    source_ids: vec![],
+                },
+                Turn {
+                    speaker: Speaker::Guest,
+                    text: "Glad to be here.".to_string(),
+                    emotion: None,
+                    source_ids: vec![],
+                },
+            ],
+        }
+    }
+
+    fn provider_over_stub(tmp: &Path, slow: bool) -> Arc<dyn lens_core::TtsProvider> {
+        let stub = write_stub(tmp);
+        let model_dir = tmp.join("model");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        if slow {
+            std::fs::write(model_dir.join("SLOW"), b"1").unwrap();
+        }
+        let sidecar: Arc<dyn TtsSidecar> =
+            Arc::new(MossSidecar::new(stub, model_dir, tmp.to_path_buf()));
+        resolve_tts_provider_full(
+            TtsBackend::MossLocal,
+            &TtsConfig::default(),
+            Path::new("/unused"),
+            Some(sidecar),
+        )
+        .expect("MossLocal resolves to an adapter when a sidecar is present")
+    }
+
+    fn phase_sink() -> (
+        Arc<StdMutex<Vec<TtsPhase>>>,
+        impl Fn(TtsPhase) + Send + Sync,
+    ) {
+        let phases = Arc::new(StdMutex::new(Vec::new()));
+        let sink = phases.clone();
+        (phases, move |p: TtsPhase| sink.lock().unwrap().push(p))
+    }
+
+    #[tokio::test]
+    async fn e2e_two_turn_synthesizes_stitched_24k() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = provider_over_stub(tmp.path(), false);
+        let (phases, on_phase) = phase_sink();
+        let cancel = CancellationToken::new();
+
+        let buf = provider
+            .synthesize_script(&two_turn_script(), &VoiceConfig::default(), &on_phase, &cancel)
+            .await
+            .expect("real subprocess synthesis + stitch succeeds");
+
+        assert_eq!(buf.sample_rate, 24_000);
+        // Two ~0.4s turns + an inter-speaker gap — comfortably over one turn.
+        assert!(
+            buf.samples.len() > (0.4 * 24_000.0) as usize,
+            "stitched output too short: {} samples",
+            buf.samples.len()
+        );
+        let recorded = phases.lock().unwrap().clone();
+        assert_eq!(recorded[0], TtsPhase::Synthesizing { turn: 1, total: 2 });
+        assert_eq!(recorded[1], TtsPhase::Synthesizing { turn: 2, total: 2 });
+        assert_eq!(recorded[2], TtsPhase::Stitching);
+    }
+
+    #[tokio::test]
+    async fn e2e_warm_child_serves_two_scripts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = provider_over_stub(tmp.path(), false);
+        let cancel = CancellationToken::new();
+        let (_p1, cb1) = phase_sink();
+        let (_p2, cb2) = phase_sink();
+
+        provider
+            .synthesize_script(&two_turn_script(), &VoiceConfig::default(), &cb1, &cancel)
+            .await
+            .expect("first script");
+        // Same warm child (monotonic ids continue) serves a second script.
+        provider
+            .synthesize_script(&two_turn_script(), &VoiceConfig::default(), &cb2, &cancel)
+            .await
+            .expect("second script on the warm child");
+    }
+
+    #[tokio::test]
+    async fn e2e_midturn_cancel_then_clean_rerun() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = provider_over_stub(tmp.path(), true); // slow sidecar
+        let script = two_turn_script();
+
+        // Cancel while turn 1 is in flight (child sleeping 1.2s).
+        let cancel = CancellationToken::new();
+        let fire = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            fire.cancel();
+        });
+        let (_p, cb) = phase_sink();
+        let cancelled = provider
+            .synthesize_script(&script, &VoiceConfig::default(), &cb, &cancel)
+            .await;
+        assert!(
+            matches!(cancelled, Err(lens_core::LensError::Cancelled(_))),
+            "mid-turn cancel must abort, got {cancelled:?}"
+        );
+
+        // The stale reply from the cancelled turn is still in the pipe; a fresh
+        // run must drain past it (by id) against the still-warm child and succeed.
+        let fresh = CancellationToken::new();
+        let (_p2, cb2) = phase_sink();
+        let recovered = provider
+            .synthesize_script(&script, &VoiceConfig::default(), &cb2, &fresh)
+            .await;
+        assert!(
+            recovered.is_ok(),
+            "run after cancel must recover via correlation-id drain, got {recovered:?}"
+        );
+        assert_eq!(recovered.unwrap().sample_rate, 24_000);
+    }
+}
