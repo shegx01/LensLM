@@ -60,6 +60,10 @@ pub fn resolve_sidecar_spawn(
     let script = sidecar_dir.join("mlx_speech_sidecar.py");
     let args = vec![
         "run".to_string(),
+        // `--frozen`: use uv.lock verbatim — never re-resolve (which would bypass
+        // the lock's pinned hashes) and never try to rewrite the lock inside the
+        // read-only .app bundle.
+        "--frozen".to_string(),
         "--project".to_string(),
         sidecar_dir.to_string_lossy().into_owned(),
         "python".to_string(),
@@ -126,7 +130,9 @@ fn system_uv() -> Option<PathBuf> {
     }
 }
 
-/// Parses `uv --version` output (e.g. `uv 0.11.29 (…)`) and accepts `>= 0.5.0`.
+/// Parses `uv --version` output (e.g. `uv 0.11.29 (…)`) and accepts `>= 0.8.0` —
+/// the floor that reads the bundled `uv.lock` (revision 3). Older `uv` would fail
+/// to parse the lock (or try to rewrite it), so it falls through to the pin.
 fn uv_version_supported(version_line: &str) -> bool {
     version_line
         .split_whitespace()
@@ -136,7 +142,7 @@ fn uv_version_supported(version_line: &str) -> bool {
             let minor = parts.next()?.parse::<u32>().ok()?;
             Some((major, minor))
         })
-        .is_some_and(|(major, minor)| major > 0 || minor >= 5)
+        .is_some_and(|(major, minor)| major > 0 || minor >= 8)
 }
 
 /// True if `uv_path --version` runs successfully (a cheap install-integrity check;
@@ -255,9 +261,11 @@ mod tests {
     #[test]
     fn version_gate_accepts_recent_and_rejects_old_or_garbage() {
         assert!(uv_version_supported("uv 0.11.29 (abc 2026-01-01)"));
-        assert!(uv_version_supported("uv 0.5.0"));
+        assert!(uv_version_supported("uv 0.8.0"));
         assert!(uv_version_supported("uv 1.0.0"));
-        assert!(!uv_version_supported("uv 0.4.30"));
+        // Below the revision-3 lock floor (0.8.0) — must fall through to the pin.
+        assert!(!uv_version_supported("uv 0.7.20"));
+        assert!(!uv_version_supported("uv 0.5.0"));
         assert!(!uv_version_supported("uv 0.1.2"));
         assert!(!uv_version_supported("not a version"));
         assert!(!uv_version_supported(""));

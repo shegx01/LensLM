@@ -387,7 +387,12 @@ async fn drain_until<R: tokio::io::AsyncBufRead + Unpin>(
             }
         };
         if reply.id != id {
-            if let Some(p) = &reply.path {
+            // Same allow-list as the matching path: only delete a validated
+            // moss-turn temp WAV, so a rogue/buggy sidecar can't unlink an
+            // arbitrary file via a stale reply.
+            if let Some(p) = reply.path.as_deref().map(Path::new)
+                && MossSidecar::is_valid_turn_wav(p)
+            {
                 let _ = std::fs::remove_file(p); // cancelled turn's WAV — don't leak it
             }
             continue; // stale reply from a previously cancelled turn
