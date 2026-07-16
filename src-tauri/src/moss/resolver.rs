@@ -44,6 +44,19 @@ pub fn resolve_sidecar_spawn(
         tts_err()
     })?;
 
+    // `uv run --project <dir>` writes its virtualenv to `<dir>/.venv` by default;
+    // in a packaged app `<dir>` is inside the read-only, signed .app bundle, so uv
+    // could not create it and the sidecar would never start. Redirect both the
+    // project env and uv's cache into writable app-data.
+    let venv_dir = app_data_dir.join("moss-venv");
+    let uv_cache_dir = app_data_dir.join("uv-cache");
+    for dir in [&venv_dir, &uv_cache_dir] {
+        std::fs::create_dir_all(dir).map_err(|e| {
+            tracing::warn!(error = %e, "failed to create uv runtime dir");
+            tts_err()
+        })?;
+    }
+
     let script = sidecar_dir.join("mlx_speech_sidecar.py");
     let args = vec![
         "run".to_string(),
@@ -53,10 +66,20 @@ pub fn resolve_sidecar_spawn(
         // Absolute so the launch is independent of the child's working directory.
         script.to_string_lossy().into_owned(),
     ];
-    let envs = vec![(
-        "HF_HOME".to_string(),
-        hf_cache_dir.to_string_lossy().into_owned(),
-    )];
+    let envs = vec![
+        (
+            "HF_HOME".to_string(),
+            hf_cache_dir.to_string_lossy().into_owned(),
+        ),
+        (
+            "UV_PROJECT_ENVIRONMENT".to_string(),
+            venv_dir.to_string_lossy().into_owned(),
+        ),
+        (
+            "UV_CACHE_DIR".to_string(),
+            uv_cache_dir.to_string_lossy().into_owned(),
+        ),
+    ];
 
     Ok(SidecarSpawn {
         program: uv,
@@ -66,15 +89,21 @@ pub fn resolve_sidecar_spawn(
 }
 
 /// Prefer a system `uv`; else reuse a previously provisioned one; else download it.
+///
+/// A system `uv` on PATH is trusted the same as any developer tool (a PATH-hijack
+/// is out of scope). A previously-provisioned `uv` is re-checked with `--version`
+/// before reuse so a truncated/broken install self-heals via re-provision rather
+/// than being executed forever (bare `is_file()` would accept a partial binary).
 fn find_or_provision_uv(app_data_dir: &Path) -> Result<PathBuf, LensError> {
-    if system_uv_present() {
-        return Ok(PathBuf::from("uv"));
+    if let Some(uv) = system_uv() {
+        return Ok(uv);
     }
     let bin_dir = app_data_dir.join("bin");
     let uv_path = bin_dir.join("uv");
-    if uv_path.is_file() {
+    if uv_path.is_file() && uv_runs(&uv_path) {
         return Ok(uv_path);
     }
+    let _ = std::fs::remove_file(&uv_path);
     tracing::info!(
         version = UV_VERSION,
         "provisioning Astral uv for MOSS sidecar"
@@ -82,8 +111,39 @@ fn find_or_provision_uv(app_data_dir: &Path) -> Result<PathBuf, LensError> {
     download_uv(&bin_dir)
 }
 
-fn system_uv_present() -> bool {
-    std::process::Command::new("uv")
+/// A system `uv` whose version is recent enough to support `uv run --project` and
+/// the pinned lockfile format; older ones fall through to the pinned download.
+fn system_uv() -> Option<PathBuf> {
+    let out = std::process::Command::new("uv")
+        .arg("--version")
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if out.status.success() && uv_version_supported(&String::from_utf8_lossy(&out.stdout)) {
+        Some(PathBuf::from("uv"))
+    } else {
+        None
+    }
+}
+
+/// Parses `uv --version` output (e.g. `uv 0.11.29 (…)`) and accepts `>= 0.5.0`.
+fn uv_version_supported(version_line: &str) -> bool {
+    version_line
+        .split_whitespace()
+        .find_map(|tok| {
+            let mut parts = tok.split('.');
+            let major = parts.next()?.parse::<u32>().ok()?;
+            let minor = parts.next()?.parse::<u32>().ok()?;
+            Some((major, minor))
+        })
+        .is_some_and(|(major, minor)| major > 0 || minor >= 5)
+}
+
+/// True if `uv_path --version` runs successfully (a cheap install-integrity check;
+/// re-hashing is not possible here — `UV_SHA256` is over the tarball, not the
+/// extracted binary. Tamper by another same-user process is out of scope).
+fn uv_runs(uv_path: &Path) -> bool {
+    std::process::Command::new(uv_path)
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -146,6 +206,9 @@ fn download_uv(bin_dir: &Path) -> Result<PathBuf, LensError> {
         tracing::warn!(error = %e, "failed to create uv extract dir");
         tts_err()
     })?;
+    // Unsandboxed extraction is safe because the archive bytes were SHA256-pinned
+    // above: `tar` only ever sees the known-good Astral release, and we copy out
+    // only the fixed `UV_ARCHIVE_BIN` path afterward.
     let status = std::process::Command::new("tar")
         .arg("xzf")
         .arg(&tar_path)
@@ -161,18 +224,42 @@ fn download_uv(bin_dir: &Path) -> Result<PathBuf, LensError> {
         return Err(tts_err());
     }
 
+    // Atomic install: copy+chmod a staging file, then rename onto the final path,
+    // so a crash mid-install never leaves a truncated `uv` that `is_file()` would
+    // accept and execute forever.
     let extracted = extract_dir.join(UV_ARCHIVE_BIN);
     let uv_path = bin_dir.join("uv");
-    std::fs::copy(&extracted, &uv_path).map_err(|e| {
+    let staged = bin_dir.join("uv.partial");
+    std::fs::copy(&extracted, &staged).map_err(|e| {
         tracing::warn!(error = %e, "failed to install uv binary");
         tts_err()
     })?;
-    std::fs::set_permissions(&uv_path, std::fs::Permissions::from_mode(0o755)).map_err(|e| {
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).map_err(|e| {
         tracing::warn!(error = %e, "failed to chmod uv binary");
+        tts_err()
+    })?;
+    std::fs::rename(&staged, &uv_path).map_err(|e| {
+        tracing::warn!(error = %e, "failed to finalize uv binary");
         tts_err()
     })?;
 
     let _ = std::fs::remove_file(&tar_path);
     let _ = std::fs::remove_dir_all(&extract_dir);
     Ok(uv_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::uv_version_supported;
+
+    #[test]
+    fn version_gate_accepts_recent_and_rejects_old_or_garbage() {
+        assert!(uv_version_supported("uv 0.11.29 (abc 2026-01-01)"));
+        assert!(uv_version_supported("uv 0.5.0"));
+        assert!(uv_version_supported("uv 1.0.0"));
+        assert!(!uv_version_supported("uv 0.4.30"));
+        assert!(!uv_version_supported("uv 0.1.2"));
+        assert!(!uv_version_supported("not a version"));
+        assert!(!uv_version_supported(""));
+    }
 }

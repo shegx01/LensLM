@@ -46,8 +46,12 @@ pub type SpawnResolver = Arc<dyn Fn() -> Result<SidecarSpawn, LensError> + Send 
 
 /// Bound on the one-time model-load handshake. A cold first run also provisions
 /// the `uv` env and `mlx-speech` lazily fetches ~5 GB of weights, so the ceiling
-/// is generous; it only guarantees the lazy `start` cannot hang forever.
-const READY_TIMEOUT: Duration = Duration::from_secs(900);
+/// is deliberately large (30 min) to survive a slow first-run download on a
+/// modest link; a genuine hang is still bounded, and user-cancel interrupts it.
+/// A warm restart returns as soon as `{"ready":true}` prints, so the large
+/// ceiling only caps the worst case. Interrupted first runs resume from the
+/// `HF_HOME`/uv caches on retry rather than re-downloading.
+const READY_TIMEOUT: Duration = Duration::from_secs(1800);
 
 /// Per-turn reply-read ceiling. A mid-write cancel can leave the child mid-synth;
 /// without a bound the read (and the whole overview) would hang forever, so on
@@ -204,6 +208,11 @@ impl MossSidecar {
         let stdout = child.stdout.take().ok_or_else(tts_err)?;
         let mut reader = BufReader::new(stdout);
 
+        // The first run downloads the uv env + ~5 GB of weights before the child
+        // prints `{"ready":true}` (progress goes to inherited stderr). We hold the
+        // cell guard across this bounded, cancellable wait — acceptable for a
+        // one-time cold start; app-quit force-kills via `kill_on_drop`.
+        tracing::info!(invocation_id = %self.invocation_id, "awaiting MOSS sidecar readiness (first run may download ~5 GB)");
         let handshake = timeout(READY_TIMEOUT, async {
             let mut line = String::new();
             loop {
