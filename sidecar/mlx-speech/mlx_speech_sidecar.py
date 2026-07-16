@@ -31,14 +31,12 @@ def load_moss_local():
     `_codec`, which the conversation API needs as separate arguments.
     """
     from mlx_speech._hub import get_model_path
-    from mlx_speech.generation.moss_local import MossTTSLocalGenerationConfig
     from mlx_speech.tts._adapters.moss_local import MossLocalAdapter
 
     model_dir = get_model_path(MOSS_TTS_REPO, revision=MOSS_TTS_REVISION)
     codec_dir = get_model_path(MOSS_CODEC_REPO, revision=MOSS_CODEC_REVISION)
     adapter = MossLocalAdapter.from_dir(model_dir, codec_dir=codec_dir)
-    config = MossTTSLocalGenerationConfig.app_defaults()
-    return adapter._model, adapter._processor, adapter._codec, config
+    return adapter._model, adapter._processor, adapter._codec
 
 
 def write_wav_mono(waveform: np.ndarray, sample_rate: int) -> str:
@@ -62,14 +60,30 @@ def send(obj: dict) -> None:
     sys.stdout.flush()
 
 
-def handle_synth(model, processor, codec, config, req: dict) -> str:
+def handle_synth(model, processor, codec, req: dict) -> str:
     text = req["text"]
     ref_clip = req["ref_clip"]
     # emotion + ref_transcript are accepted for wire compatibility but unused:
     # MOSS clones from the reference clip alone (no transcript), and emotion
     # fidelity is out of scope for #193 (plan C8).
 
-    from mlx_speech.generation.moss_local import synthesize_moss_tts_local_conversations
+    from mlx_speech.generation.moss_local import (
+        MossTTSLocalGenerationConfig,
+        synthesize_moss_tts_local_conversations,
+    )
+
+    # Bound generation near the turn's length so a missed stochastic EOS can't
+    # ramble past the text. `app_defaults()` leaves max_new_tokens=1024 (~82s);
+    # the codec is ~12.5 rows/s and speech ~2.5 words/s (~5 rows/word), so cap at
+    # ~2x the estimate, floored at the library's canonical clone cap (160 ≈ 12.8s).
+    max_rows = max(160, len(text.split()) * 10)
+    config = MossTTSLocalGenerationConfig(
+        max_new_tokens=max_rows,
+        audio_temperature=1.7,
+        audio_top_k=25,
+        audio_top_p=0.8,
+        audio_repetition_penalty=1.0,
+    )
 
     result = synthesize_moss_tts_local_conversations(
         model,
@@ -95,7 +109,7 @@ def main() -> None:
     _ = args
 
     try:
-        model, processor, codec, config = load_moss_local()
+        model, processor, codec = load_moss_local()
     except Exception as exc:
         sys.stderr.write(f"model load failed: {exc}\n")
         sys.stderr.flush()
@@ -121,7 +135,7 @@ def main() -> None:
             if op == "ping":
                 send({"id": req_id, "ok": True, "pong": True})
             elif op == "synth":
-                path = handle_synth(model, processor, codec, config, req)
+                path = handle_synth(model, processor, codec, req)
                 send({"id": req_id, "ok": True, "path": path})
             else:
                 send({"id": req_id, "ok": False, "error": f"unknown op: {op}"})
