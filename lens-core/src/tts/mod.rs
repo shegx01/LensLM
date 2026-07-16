@@ -414,6 +414,9 @@ mod tests {
 
     #[test]
     fn backend_as_str_and_from_opt_str_round_trip() {
+        // The MOSS variants are cfg-gated, so off Apple Silicon this array is a
+        // single element — the loop shape is target-dependent, not a mistake.
+        #[allow(clippy::single_element_loop)]
         for b in [
             TtsBackend::Orpheus,
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
