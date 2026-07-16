@@ -63,10 +63,10 @@ type ChildTriple = (Child, ChildStdin, BufReader<ChildStdout>);
 
 /// The default host/guest preset voices (stable ids; the picker to switch among
 /// the presets is #194). Applied when the config leaves a voice unset — a male
-/// host (`dylan`) and a female guest (`serena`), the provisional podcast pair.
+/// host (`aiden`) and a female guest (`serena`), the audition-selected pair.
 pub fn default_qwen_voices() -> VoiceConfig {
     VoiceConfig {
-        host: VoiceRef::Named("dylan".to_string()),
+        host: VoiceRef::Named("aiden".to_string()),
         guest: VoiceRef::Named("serena".to_string()),
     }
 }
@@ -493,7 +493,7 @@ mod tests {
         let (host_speaker, _) = qwen
             .resolve_voice(Speaker::Host, &voices)
             .expect("unset host falls back");
-        assert_eq!(host_speaker, "dylan");
+        assert_eq!(host_speaker, "aiden");
 
         let (guest_speaker, _) = qwen
             .resolve_voice(Speaker::Guest, &voices)
@@ -534,10 +534,10 @@ mod tests {
     #[test]
     fn default_qwen_voices_uses_preset_ids() {
         let voices = default_qwen_voices();
-        assert_eq!(voices.host, VoiceRef::Named("dylan".to_string()));
+        assert_eq!(voices.host, VoiceRef::Named("aiden".to_string()));
         assert_eq!(voices.guest, VoiceRef::Named("serena".to_string()));
         // Both defaults must resolve against the static preset catalog.
-        assert!(qwen_voice("dylan").is_some());
+        assert!(qwen_voice("aiden").is_some());
         assert!(qwen_voice("serena").is_some());
     }
 
