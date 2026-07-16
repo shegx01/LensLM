@@ -9,7 +9,6 @@
   import Download from '@lucide/svelte/icons/download';
   import {
     downloadTtsModel,
-    listTtsVoices,
     ttsModelDownloaded,
     saveTtsProvider,
     nextTtsConfig,
@@ -73,8 +72,8 @@
   let femaleVoice = $state('');
   let savingVoices = $state(false);
   let saveError = $state<string | null>(null);
-  // True once a download completed but listTtsVoices() returned nothing — we
-  // surface an inline error and disable Save rather than persisting fake IDs.
+  // True only if the catalog carries no preset voices for the engine — surface
+  // an inline error and disable Save rather than persisting fake IDs.
   let voicesUnavailable = $state(false);
 
   const maleVoices = $derived(voices.filter((v) => v.gender === 'male'));
@@ -122,7 +121,7 @@
       // host/guest voices.
       if (await engineDownloaded()) {
         downloaded = true;
-        voices = (await listTtsVoices()) ?? [];
+        voices = selectedEntry?.preset_voices ?? [];
         voicesUnavailable = voices.length === 0;
         const host = cfg.voices?.host;
         const guest = cfg.voices?.guest;
@@ -134,9 +133,8 @@
     }
   });
 
-  /** Switch the Local-tab engine. Persists the selection immediately (best-effort) so a
-   *  subsequent `listTtsVoices()` reflects the newly-selected backend, not the stale saved one;
-   *  the final "Save voice settings" write is the source of truth regardless. */
+  /** Switch the Local-tab engine. Selection stays in-memory; the "Save voice settings"
+   *  write is the source of truth (no persist-on-click, so it can't clobber a saved key). */
   async function pickEngine(id: TtsEngineId): Promise<void> {
     if (id === 'cloud' || id === selectedEngine) return;
     const entry = catalog.find((e) => e.id === id);
@@ -151,20 +149,9 @@
     maleVoice = '';
     femaleVoice = '';
 
-    try {
-      await saveTtsProvider({ provider: engineToProvider(id), apiKey: '' });
-    } catch (err) {
-      // Best-effort — the final Save write persists the engine regardless.
-      console.warn('TtsConfigPanel: eager engine persist failed', err);
-    }
-
     if (await engineDownloaded()) {
       downloaded = true;
-      try {
-        voices = (await listTtsVoices()) ?? [];
-      } catch {
-        voices = [];
-      }
+      voices = selectedEntry?.preset_voices ?? [];
       voicesUnavailable = voices.length === 0;
       if (maleVoices.length > 0) maleVoice = maleVoices[0].id;
       if (femaleVoices.length > 0) femaleVoice = femaleVoices[0].id;
@@ -190,9 +177,9 @@
       }
       downloadProgress = 100;
       downloaded = true;
-      // Load available voices from the engine. No stubs: if the catalog comes
-      // back empty the engine isn't really available, so we flag it.
-      voices = (await listTtsVoices()) ?? [];
+      // Preset voices come from the static catalog (list_tts_voices is reserved
+      // for runtime synthesis — the sidecar may not be running during setup).
+      voices = selectedEntry?.preset_voices ?? [];
       voicesUnavailable = voices.length === 0;
       if (maleVoices.length > 0) maleVoice = maleVoices[0].id;
       if (femaleVoices.length > 0) femaleVoice = femaleVoices[0].id;

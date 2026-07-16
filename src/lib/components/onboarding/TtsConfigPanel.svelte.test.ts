@@ -3,14 +3,27 @@ import { mockIPC, clearMocks } from '@tauri-apps/api/mocks';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AppConfig } from '$lib/theme/types.js';
 import { baseAppConfig } from '$lib/test-fixtures.js';
-import type { TtsEngineCatalogEntry } from '$lib/onboarding/system-check.js';
+import type { TtsEngineCatalogEntry, TtsVoice } from '$lib/onboarding/system-check.js';
 import TtsConfigPanel from './TtsConfigPanel.svelte';
 
 const baseConfig = baseAppConfig;
 
-/** A 3-engine catalog fixture mirroring lens-core's `tts_catalog_serialized` shape (#194). */
-function catalogFixture(overrides?: { qwenAvailable?: boolean }): TtsEngineCatalogEntry[] {
+const DEFAULT_PRESET_VOICES: TtsVoice[] = [
+  { id: 'leo', name: 'Leo', gender: 'male' },
+  { id: 'tara', name: 'Tara', gender: 'female' }
+];
+
+/** A 3-engine catalog fixture mirroring lens-core's `tts_catalog_serialized` shape (#194).
+ *  Orpheus and Qwen3Local both carry preset voices by default — the voice picker (#194)
+ *  reads them straight from this static catalog, never from `list_tts_voices`. */
+function catalogFixture(overrides?: {
+  qwenAvailable?: boolean;
+  orpheusVoices?: TtsVoice[];
+  qwenVoices?: TtsVoice[];
+}): TtsEngineCatalogEntry[] {
   const qwenAvailable = overrides?.qwenAvailable ?? false;
+  const orpheusVoices = overrides?.orpheusVoices ?? DEFAULT_PRESET_VOICES;
+  const qwenVoices = overrides?.qwenVoices ?? DEFAULT_PRESET_VOICES;
   return [
     {
       id: 'orpheus',
@@ -20,7 +33,7 @@ function catalogFixture(overrides?: { qwenAvailable?: boolean }): TtsEngineCatal
       unavailable_reason: null,
       multilingual: false,
       supported_languages: ['english'],
-      preset_voices: [],
+      preset_voices: orpheusVoices,
       model_size_bytes: 2_300_000_000,
       language_capability_label: 'English only',
       required_model_ids: ['orpheus', 'snac']
@@ -33,7 +46,7 @@ function catalogFixture(overrides?: { qwenAvailable?: boolean }): TtsEngineCatal
       unavailable_reason: qwenAvailable ? null : 'Requires Apple Silicon',
       multilingual: false,
       supported_languages: ['chinese', 'english'],
-      preset_voices: [],
+      preset_voices: qwenVoices,
       model_size_bytes: 4_500_000_000,
       language_capability_label: '10 languages',
       required_model_ids: []
@@ -75,14 +88,14 @@ describe('TtsConfigPanel — voices', () => {
     let written: AppConfig | null = null;
     const oncheck = vi.fn().mockResolvedValue(undefined);
     const oncollapse = vi.fn();
+    const listVoicesSpy = vi.fn();
     mockIPC((cmd, args) => {
       if (cmd === 'download_tts_model') return driveDownload(args);
       if (cmd === 'tts_engine_catalog') return catalogFixture();
-      if (cmd === 'list_tts_voices')
-        return [
-          { id: 'tara', name: 'Tara', gender: 'female' },
-          { id: 'leo', name: 'Leo', gender: 'male' }
-        ];
+      if (cmd === 'list_tts_voices') {
+        listVoicesSpy();
+        return [];
+      }
       if (cmd === 'get_config') return baseConfig();
       if (cmd === 'set_config') {
         written = (args as { config: AppConfig }).config;
@@ -91,6 +104,9 @@ describe('TtsConfigPanel — voices', () => {
     });
 
     render(TtsConfigPanel, { props: { oncheck, oncollapse } });
+    // Wait for the catalog fetch to resolve so `selectedEntry` (and its preset_voices) is populated
+    // before Download runs.
+    await waitFor(() => expect(screen.getAllByText(/english only/i).length).toBeGreaterThan(0));
     await fireEvent.click(screen.getByRole('button', { name: /download voice engine/i }));
     await waitFor(() => expect(screen.getByText(/voice engine ready/i)).toBeInTheDocument());
 
@@ -102,15 +118,16 @@ describe('TtsConfigPanel — voices', () => {
       guest: 'tara'
     });
     expect(oncollapse).toHaveBeenCalledOnce();
+    // Preset voices come from the catalog, not a runtime IPC round trip.
+    expect(listVoicesSpy).not.toHaveBeenCalled();
   });
 
   it('shows an inline error and disables Save when the voice list is empty (no stub voices)', async () => {
     const setConfig = vi.fn();
     mockIPC((cmd, args) => {
       if (cmd === 'download_tts_model') return driveDownload(args);
-      if (cmd === 'tts_engine_catalog') return catalogFixture();
+      if (cmd === 'tts_engine_catalog') return catalogFixture({ orpheusVoices: [] });
       if (cmd === 'get_config') return baseConfig();
-      if (cmd === 'list_tts_voices') return [];
       if (cmd === 'set_config') {
         setConfig(args);
         return null;
@@ -238,11 +255,7 @@ describe('TtsConfigPanel — local engine detection', () => {
     mockIPC((cmd) => {
       if (cmd === 'get_config') return { ...baseConfig(), voices: { host: 'leo', guest: 'tara' } };
       if (cmd === 'tts_model_downloaded') return true;
-      if (cmd === 'list_tts_voices')
-        return [
-          { id: 'tara', name: 'Tara', gender: 'female' },
-          { id: 'leo', name: 'Leo', gender: 'male' }
-        ];
+      if (cmd === 'tts_engine_catalog') return catalogFixture();
     });
 
     render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
@@ -296,11 +309,6 @@ describe('TtsConfigPanel — engine selector from the catalog (#194)', () => {
       if (cmd === 'get_config') return baseConfig();
       if (cmd === 'tts_engine_catalog') return catalogFixture({ qwenAvailable: true });
       if (cmd === 'tts_model_downloaded') return true;
-      if (cmd === 'list_tts_voices')
-        return [
-          { id: 'tara', name: 'Tara', gender: 'female' },
-          { id: 'leo', name: 'Leo', gender: 'male' }
-        ];
       if (cmd === 'set_config') {
         written = (args as { config: AppConfig }).config;
         return null;
@@ -314,7 +322,7 @@ describe('TtsConfigPanel — engine selector from the catalog (#194)', () => {
     const qwenRadio = await screen.findByRole('radio', { name: /qwen3-tts/i });
     await fireEvent.click(qwenRadio);
 
-    // Wait for the post-switch voice list (Qwen preset voices) to resolve and prefill the pickers.
+    // Wait for the post-switch voice list (Qwen preset voices, straight from the catalog) to prefill the pickers.
     await waitFor(() => expect(screen.getByLabelText(/^host voice/i)).toHaveValue('leo'));
     await fireEvent.click(screen.getByRole('button', { name: /save voice settings/i }));
 
@@ -334,11 +342,6 @@ describe('TtsConfigPanel — engine selector from the catalog (#194)', () => {
         };
       if (cmd === 'tts_engine_catalog') return catalogFixture({ qwenAvailable: true });
       if (cmd === 'tts_model_downloaded') return true;
-      if (cmd === 'list_tts_voices')
-        return [
-          { id: 'tara', name: 'Tara', gender: 'female' },
-          { id: 'leo', name: 'Leo', gender: 'male' }
-        ];
       if (cmd === 'set_config') {
         written = (args as { config: AppConfig }).config;
         return null;
@@ -358,5 +361,30 @@ describe('TtsConfigPanel — engine selector from the catalog (#194)', () => {
     // Local engine is active, but the stored Cloud key survives (not wiped to null).
     expect((written as unknown as AppConfig).tts.backend).toBe('qwen3_local');
     expect((written as unknown as AppConfig).tts.cloud).toEqual(savedCloud);
+  });
+
+  it('selecting Qwen3Local populates voice dropdowns from catalog preset_voices, with no list_tts_voices call and no load error', async () => {
+    const listVoicesSpy = vi.fn();
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return baseConfig();
+      if (cmd === 'tts_engine_catalog') return catalogFixture({ qwenAvailable: true });
+      if (cmd === 'tts_model_downloaded') return true;
+      if (cmd === 'list_tts_voices') {
+        listVoicesSpy();
+        return [];
+      }
+    });
+
+    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+
+    const qwenRadio = await screen.findByRole('radio', { name: /qwen3-tts/i });
+    await fireEvent.click(qwenRadio);
+
+    await waitFor(() => expect(screen.getByLabelText(/^host voice/i)).toHaveValue('leo'));
+    expect(screen.getByLabelText(/co-host voice/i)).toHaveValue('tara');
+    expect(
+      screen.queryByText(/couldn't load voices — is the engine installed\?/i)
+    ).not.toBeInTheDocument();
+    expect(listVoicesSpy).not.toHaveBeenCalled();
   });
 });
