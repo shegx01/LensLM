@@ -45,7 +45,8 @@ always echoing the request's `id`:
 
 - `{"id", "op": "ping"}` → `{"id", "ok": true, "pong": true}`
 - `{"id", "op": "synth", "text", "emotion", "ref_clip", "ref_transcript", "audio_temperature"}`
-  → `{"id", "ok": true, "path": "<temp wav path>"}` (24 kHz mono WAV)
+  → `{"id", "ok": true, "path": "<temp wav path>"}` (mono WAV at the model's
+  native sample rate; the Rust side resamples)
 - any failure → `{"id", "ok": false, "error": "<short message>"}`
 
 Cloning uses `ref_clip` (an audio path) only — MOSS does not use a reference

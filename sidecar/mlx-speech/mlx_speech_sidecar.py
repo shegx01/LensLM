@@ -43,8 +43,6 @@ import wave
 
 import numpy as np
 
-TARGET_SAMPLE_RATE = 24_000
-
 # Pinned HF revisions (commit SHAs, not branches) so the sidecar's model
 # behavior doesn't float across machines/time. ~5.27 GB combined.
 MOSS_TTS_REPO = "appautomaton/openmoss-tts-local-mlx"
@@ -72,14 +70,9 @@ def load_moss_local():
     return adapter._model, adapter._processor, adapter._codec, config
 
 
-def write_wav_mono24k(waveform: np.ndarray, sample_rate: int) -> str:
-    if sample_rate != TARGET_SAMPLE_RATE:
-        # TODO(A0): confirm on hardware that the downloaded checkpoint's
-        # audio-codec config keeps the library default of 24 kHz (it is the
-        # documented rate, but the pinned revision's config.json is the
-        # ground truth and isn't inspectable offline).
-        raise RuntimeError(f"unexpected sample rate {sample_rate}, expected {TARGET_SAMPLE_RATE}")
-
+def write_wav_mono(waveform: np.ndarray, sample_rate: int) -> str:
+    # Writes at the model's actual rate; the Rust side resamples to its
+    # target (AudioBuffer::resample_to / stitch_turns), so no rate guard here.
     samples = np.asarray(waveform, dtype=np.float32).reshape(-1)
     pcm16 = (np.clip(samples, -1.0, 1.0) * 32767.0).astype("<i2")
 
@@ -116,7 +109,7 @@ def handle_synth(model, processor, codec, config, req: dict) -> str:
         config=config,
     )
     output = result.outputs[0]
-    return write_wav_mono24k(np.array(output.waveform), int(output.sample_rate))
+    return write_wav_mono(np.array(output.waveform), int(output.sample_rate))
 
 
 def main() -> None:
