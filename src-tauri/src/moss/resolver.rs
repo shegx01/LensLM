@@ -39,10 +39,8 @@ pub fn resolve_sidecar_spawn(
 
     // huggingface_hub reads HF_HOME at import → the dir must exist and be in the
     // spawned process env (see `envs` below), not just the parent's.
-    std::fs::create_dir_all(hf_cache_dir).map_err(|e| {
-        tracing::warn!(error = %e, "failed to create MOSS HF cache dir");
-        tts_err()
-    })?;
+    std::fs::create_dir_all(hf_cache_dir)
+        .map_err(warn_tts("failed to create MOSS HF cache dir"))?;
 
     // `uv run --project <dir>` writes its virtualenv to `<dir>/.venv` by default;
     // in a packaged app `<dir>` is inside the read-only, signed .app bundle, so uv
@@ -51,10 +49,7 @@ pub fn resolve_sidecar_spawn(
     let venv_dir = app_data_dir.join("moss-venv");
     let uv_cache_dir = app_data_dir.join("uv-cache");
     for dir in [&venv_dir, &uv_cache_dir] {
-        std::fs::create_dir_all(dir).map_err(|e| {
-            tracing::warn!(error = %e, "failed to create uv runtime dir");
-            tts_err()
-        })?;
+        std::fs::create_dir_all(dir).map_err(warn_tts("failed to create uv runtime dir"))?;
     }
 
     let script = sidecar_dir.join("mlx_speech_sidecar.py");
@@ -90,6 +85,15 @@ pub fn resolve_sidecar_spawn(
         args,
         envs,
     })
+}
+
+/// Builds a `map_err` closure that logs `msg` at `warn` and maps to [`tts_err`],
+/// folding the repeated log-then-map-to-generic-error boilerplate at each fallible step.
+fn warn_tts<E: std::fmt::Display>(msg: &'static str) -> impl FnOnce(E) -> LensError {
+    move |e| {
+        tracing::warn!(error = %e, "{msg}");
+        tts_err()
+    }
 }
 
 /// Prefer a system `uv`; else reuse a previously provisioned one; else download it.
@@ -165,27 +169,18 @@ fn uv_runs(uv_path: &Path) -> bool {
 fn download_uv(bin_dir: &Path) -> Result<PathBuf, LensError> {
     use std::os::unix::fs::PermissionsExt;
 
-    std::fs::create_dir_all(bin_dir).map_err(|e| {
-        tracing::warn!(error = %e, "failed to create uv bin dir");
-        tts_err()
-    })?;
+    std::fs::create_dir_all(bin_dir).map_err(warn_tts("failed to create uv bin dir"))?;
 
     let client = reqwest::blocking::Client::builder()
         .timeout(UV_DOWNLOAD_TIMEOUT)
         .build()
-        .map_err(|e| {
-            tracing::warn!(error = %e, "failed to build uv download client");
-            tts_err()
-        })?;
+        .map_err(warn_tts("failed to build uv download client"))?;
     let bytes = client
         .get(UV_URL)
         .send()
         .and_then(|r| r.error_for_status())
         .and_then(|r| r.bytes())
-        .map_err(|e| {
-            tracing::warn!(error = %e, "uv download failed");
-            tts_err()
-        })?;
+        .map_err(warn_tts("uv download failed"))?;
 
     // Integrity gate: reject the bytes unless they match the pinned release SHA.
     let mut hasher = Sha256::new();
@@ -201,17 +196,11 @@ fn download_uv(bin_dir: &Path) -> Result<PathBuf, LensError> {
     }
 
     let tar_path = bin_dir.join("uv-download.tar.gz");
-    std::fs::write(&tar_path, &bytes).map_err(|e| {
-        tracing::warn!(error = %e, "failed to write uv archive");
-        tts_err()
-    })?;
+    std::fs::write(&tar_path, &bytes).map_err(warn_tts("failed to write uv archive"))?;
 
     let extract_dir = bin_dir.join("uv-extract");
     let _ = std::fs::remove_dir_all(&extract_dir);
-    std::fs::create_dir_all(&extract_dir).map_err(|e| {
-        tracing::warn!(error = %e, "failed to create uv extract dir");
-        tts_err()
-    })?;
+    std::fs::create_dir_all(&extract_dir).map_err(warn_tts("failed to create uv extract dir"))?;
     // Unsandboxed extraction is safe because the archive bytes were SHA256-pinned
     // above: `tar` only ever sees the known-good Astral release, and we copy out
     // only the fixed `UV_ARCHIVE_BIN` path afterward.
@@ -221,10 +210,7 @@ fn download_uv(bin_dir: &Path) -> Result<PathBuf, LensError> {
         .arg("-C")
         .arg(&extract_dir)
         .status()
-        .map_err(|e| {
-            tracing::warn!(error = %e, "failed to run tar for uv extract");
-            tts_err()
-        })?;
+        .map_err(warn_tts("failed to run tar for uv extract"))?;
     if !status.success() {
         tracing::warn!("tar failed to extract uv archive");
         return Err(tts_err());
@@ -236,18 +222,10 @@ fn download_uv(bin_dir: &Path) -> Result<PathBuf, LensError> {
     let extracted = extract_dir.join(UV_ARCHIVE_BIN);
     let uv_path = bin_dir.join("uv");
     let staged = bin_dir.join("uv.partial");
-    std::fs::copy(&extracted, &staged).map_err(|e| {
-        tracing::warn!(error = %e, "failed to install uv binary");
-        tts_err()
-    })?;
-    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).map_err(|e| {
-        tracing::warn!(error = %e, "failed to chmod uv binary");
-        tts_err()
-    })?;
-    std::fs::rename(&staged, &uv_path).map_err(|e| {
-        tracing::warn!(error = %e, "failed to finalize uv binary");
-        tts_err()
-    })?;
+    std::fs::copy(&extracted, &staged).map_err(warn_tts("failed to install uv binary"))?;
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))
+        .map_err(warn_tts("failed to chmod uv binary"))?;
+    std::fs::rename(&staged, &uv_path).map_err(warn_tts("failed to finalize uv binary"))?;
 
     let _ = std::fs::remove_file(&tar_path);
     let _ = std::fs::remove_dir_all(&extract_dir);
