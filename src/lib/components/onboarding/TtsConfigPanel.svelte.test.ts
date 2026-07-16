@@ -122,6 +122,53 @@ describe('TtsConfigPanel — voices', () => {
     expect(listVoicesSpy).not.toHaveBeenCalled();
   });
 
+  it('opens the host-voice picker, lists options from preset_voices, and selecting one updates the binding', async () => {
+    let written: AppConfig | null = null;
+    mockIPC((cmd, args) => {
+      if (cmd === 'download_tts_model') return driveDownload(args);
+      if (cmd === 'tts_engine_catalog')
+        return catalogFixture({
+          orpheusVoices: [
+            { id: 'leo', name: 'Leo', gender: 'male' },
+            { id: 'milo', name: 'Milo', gender: 'male' }
+          ]
+        });
+      if (cmd === 'get_config') return baseConfig();
+      if (cmd === 'set_config') {
+        written = (args as { config: AppConfig }).config;
+        return null;
+      }
+    });
+
+    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+    await waitFor(() => expect(screen.getAllByText(/english only/i).length).toBeGreaterThan(0));
+    await fireEvent.click(screen.getByRole('button', { name: /download voice engine/i }));
+    await waitFor(() => expect(screen.getByText(/voice engine ready/i)).toBeInTheDocument());
+
+    // Defaults to the first preset voice until the user picks another.
+    const trigger = screen.getByLabelText(/^host voice/i);
+    expect(trigger).toHaveTextContent('Leo');
+
+    // bits-ui Select opens on trigger keydown (Enter/Space/Arrow) — this avoids
+    // relying on PointerEvent pointer-capture semantics happy-dom doesn't model.
+    await fireEvent.keyDown(trigger, { key: 'Enter' });
+
+    // Both preset voices render as options, sourced straight from preset_voices.
+    const leoOption = await screen.findByRole('option', { name: 'Leo' });
+    const miloOption = screen.getByRole('option', { name: 'Milo' });
+    expect(leoOption).toBeInTheDocument();
+    expect(miloOption).toBeInTheDocument();
+
+    // Selection fires on `pointerup` (bits-ui's item handler), not `click`.
+    await fireEvent.pointerUp(miloOption);
+
+    await waitFor(() => expect(trigger).toHaveTextContent('Milo'));
+
+    await fireEvent.click(screen.getByRole('button', { name: /save voice settings/i }));
+    await waitFor(() => expect(written).not.toBeNull());
+    expect((written as unknown as AppConfig).voices.host).toBe('milo');
+  });
+
   it('shows an inline error and disables Save when the voice list is empty (no stub voices)', async () => {
     const setConfig = vi.fn();
     mockIPC((cmd, args) => {
@@ -323,7 +370,9 @@ describe('TtsConfigPanel — engine selector from the catalog (#194)', () => {
     await fireEvent.click(qwenRadio);
 
     // Wait for the post-switch voice list (Qwen preset voices, straight from the catalog) to prefill the pickers.
-    await waitFor(() => expect(screen.getByLabelText(/^host voice/i)).toHaveValue('leo'));
+    // The picker is a bits-ui Select now: the trigger's label-associated element is a button
+    // (no native `.value`), so assert the displayed voice name instead of a form value.
+    await waitFor(() => expect(screen.getByLabelText(/^host voice/i)).toHaveTextContent('Leo'));
     await fireEvent.click(screen.getByRole('button', { name: /save voice settings/i }));
 
     await waitFor(() => expect(written).not.toBeNull());
@@ -354,7 +403,7 @@ describe('TtsConfigPanel — engine selector from the catalog (#194)', () => {
 
     const qwenRadio = await screen.findByRole('radio', { name: /qwen3-tts/i });
     await fireEvent.click(qwenRadio);
-    await waitFor(() => expect(screen.getByLabelText(/^host voice/i)).toHaveValue('leo'));
+    await waitFor(() => expect(screen.getByLabelText(/^host voice/i)).toHaveTextContent('Leo'));
     await fireEvent.click(screen.getByRole('button', { name: /save voice settings/i }));
 
     await waitFor(() => expect(written).not.toBeNull());
@@ -380,8 +429,8 @@ describe('TtsConfigPanel — engine selector from the catalog (#194)', () => {
     const qwenRadio = await screen.findByRole('radio', { name: /qwen3-tts/i });
     await fireEvent.click(qwenRadio);
 
-    await waitFor(() => expect(screen.getByLabelText(/^host voice/i)).toHaveValue('leo'));
-    expect(screen.getByLabelText(/co-host voice/i)).toHaveValue('tara');
+    await waitFor(() => expect(screen.getByLabelText(/^host voice/i)).toHaveTextContent('Leo'));
+    expect(screen.getByLabelText(/co-host voice/i)).toHaveTextContent('Tara');
     expect(
       screen.queryByText(/couldn't load voices — is the engine installed\?/i)
     ).not.toBeInTheDocument();

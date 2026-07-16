@@ -19,7 +19,13 @@
     type TtsProvider
   } from '$lib/onboarding/system-check.js';
   import type { AppConfig } from '$lib/theme/types.js';
-  import { SELECT_CLASS } from './styles.js';
+  import {
+    Select,
+    SelectTrigger,
+    SelectValue,
+    SelectContent,
+    SelectItem
+  } from '$lib/components/ui/select/index.js';
   import { updateConfig } from '$lib/config.js';
 
   let {
@@ -364,11 +370,20 @@
           >
             Host voice (male)
           </label>
-          <select id="tts-male-voice" bind:value={maleVoice} class={SELECT_CLASS}>
-            {#each maleVoices as voice (voice.id)}
-              <option value={voice.id}>{voice.name}</option>
-            {/each}
-          </select>
+          <Select
+            type="single"
+            bind:value={maleVoice}
+            items={maleVoices.map((voice) => ({ value: voice.id, label: voice.name }))}
+          >
+            <SelectTrigger id="tts-male-voice">
+              <SelectValue placeholder="Select a voice" />
+            </SelectTrigger>
+            <SelectContent>
+              {#each maleVoices as voice (voice.id)}
+                <SelectItem value={voice.id} label={voice.name}>{voice.name}</SelectItem>
+              {/each}
+            </SelectContent>
+          </Select>
         </div>
 
         <div class="flex flex-col gap-1.5">
@@ -378,11 +393,20 @@
           >
             Co-host voice (female)
           </label>
-          <select id="tts-female-voice" bind:value={femaleVoice} class={SELECT_CLASS}>
-            {#each femaleVoices as voice (voice.id)}
-              <option value={voice.id}>{voice.name}</option>
-            {/each}
-          </select>
+          <Select
+            type="single"
+            bind:value={femaleVoice}
+            items={femaleVoices.map((voice) => ({ value: voice.id, label: voice.name }))}
+          >
+            <SelectTrigger id="tts-female-voice">
+              <SelectValue placeholder="Select a voice" />
+            </SelectTrigger>
+            <SelectContent>
+              {#each femaleVoices as voice (voice.id)}
+                <SelectItem value={voice.id} label={voice.name}>{voice.name}</SelectItem>
+              {/each}
+            </SelectContent>
+          </Select>
         </div>
       {/if}
 
