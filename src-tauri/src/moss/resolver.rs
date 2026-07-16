@@ -4,8 +4,7 @@
 //! otherwise Astral's pre-signed static `uv` is downloaded into `<app_data>/bin/`
 //! (SHA-pinned) and reused thereafter. The sidecar then runs via `uv run` against
 //! the bundled project, with `HF_HOME` pointed at an app-data cache so
-//! `mlx-speech` auto-downloads the model there. All failures map to the generic
-//! [`tts_err`] so no path/internal detail crosses the IPC boundary.
+//! `mlx-speech` auto-downloads the model there. All failures map through [`tts_err`].
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;

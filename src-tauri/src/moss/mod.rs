@@ -7,8 +7,7 @@
 //! [`SidecarSpawn`]. Launch details are resolved lazily via an injected resolver
 //! (see [`resolver::resolve_sidecar_spawn`]) so provisioning never blocks startup.
 //!
-//! All failures map to a generic [`LensError::Tts`] (no path/internal detail —
-//! it crosses the Tauri IPC boundary); real errors are logged server-side only.
+//! All failures map through [`tts_err`].
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -44,13 +43,9 @@ pub struct SidecarSpawn {
 /// app startup. Tests inject a resolver returning a stub spec.
 pub type SpawnResolver = Arc<dyn Fn() -> Result<SidecarSpawn, LensError> + Send + Sync>;
 
-/// Bound on the one-time model-load handshake. A cold first run also provisions
-/// the `uv` env and `mlx-speech` lazily fetches ~5 GB of weights, so the ceiling
-/// is deliberately large (30 min) to survive a slow first-run download on a
-/// modest link; a genuine hang is still bounded, and user-cancel interrupts it.
-/// A warm restart returns as soon as `{"ready":true}` prints, so the large
-/// ceiling only caps the worst case. Interrupted first runs resume from the
-/// `HF_HOME`/uv caches on retry rather than re-downloading.
+/// Bound on the one-time model-load handshake: large (30 min) to survive a slow
+/// first-run ~5 GB download over a modest link; a warm restart returns as soon
+/// as `{"ready":true}` prints, so the ceiling only caps the worst case.
 const READY_TIMEOUT: Duration = Duration::from_secs(1800);
 
 /// Per-turn reply-read ceiling. A mid-write cancel can leave the child mid-synth;
@@ -208,10 +203,8 @@ impl MossSidecar {
         let stdout = child.stdout.take().ok_or_else(tts_err)?;
         let mut reader = BufReader::new(stdout);
 
-        // The first run downloads the uv env + ~5 GB of weights before the child
-        // prints `{"ready":true}` (progress goes to inherited stderr). We hold the
-        // cell guard across this bounded, cancellable wait — acceptable for a
-        // one-time cold start; app-quit force-kills via `kill_on_drop`.
+        // We hold the cell guard across this bounded, cancellable wait (acceptable
+        // for a one-time cold start); app-quit force-kills via `kill_on_drop`.
         tracing::info!(invocation_id = %self.invocation_id, "awaiting MOSS sidecar readiness (first run may download ~5 GB)");
         let handshake = timeout(READY_TIMEOUT, async {
             let mut line = String::new();
@@ -283,9 +276,8 @@ impl MossSidecar {
         canon.starts_with(&tmp)
     }
 
-    /// Writes one synth request and drains replies (via [`drain_until`]) until the
-    /// echoed id matches, bounded by [`SYNTH_TIMEOUT`]. Stale/unparseable lines are
-    /// skipped against the still-warm child; EOF/timeout/over-cap map to [`TurnError::Dead`].
+    /// Writes one synth request, then drains the reply via [`drain_until`] (see
+    /// its doc for the stale/EOF/timeout handling), bounded by [`SYNTH_TIMEOUT`].
     async fn run_turn_locked(
         &self,
         cell: &mut Option<ChildTriple>,
@@ -319,8 +311,6 @@ impl MossSidecar {
             TurnError::Dead
         })?;
 
-        // Bound the drain so a mid-synth child (e.g. after a mid-write cancel)
-        // cannot hang the overview forever; on elapse treat as a dead child.
         let reply = match timeout(SYNTH_TIMEOUT, drain_until(reader, id)).await {
             Ok(r) => r?,
             Err(_) => {
@@ -352,8 +342,8 @@ impl MossSidecar {
 /// turn) resync on the next newline; stale replies (a mismatched id) are skipped
 /// and their temp WAV best-effort deleted so a cancelled turn's file does not
 /// leak. EOF and an over-cap line (no newline within [`MAX_REPLY_BYTES`]) map to
-/// [`TurnError::Dead`]. Extracted from `run_turn_locked` for deterministic tests;
-/// the [`SYNTH_TIMEOUT`] bound stays in the caller so this fn stays pure.
+/// [`TurnError::Dead`]. The [`SYNTH_TIMEOUT`] bound stays in the caller so this
+/// fn stays pure (and deterministically testable without it).
 async fn drain_until<R: tokio::io::AsyncBufRead + Unpin>(
     reader: &mut R,
     id: u64,

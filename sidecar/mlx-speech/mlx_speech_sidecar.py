@@ -2,37 +2,8 @@
 """MOSS-TTS-Local (mlx-speech) IPC sidecar for LensLM (#193 / 161e).
 
 Spawned by src-tauri's MossSidecar as `uv run --project <this dir> python
-mlx_speech_sidecar.py` and driven over stdio as line-delimited JSON. Audio
-never rides the pipe — a "synth" reply carries a path to a temp WAV file
-that the Rust side reads and deletes. Contract (must match lens-core/
-src-tauri MossSidecar byte-for-byte):
-
-  startup:  load the model once, then print exactly one line {"ready": true}
-  request:  {"id": <int>, "op": "ping"}
-            {"id": <int>, "op": "synth", "text": str, "emotion": str|null,
-             "ref_clip": str, "ref_transcript": str|null, "audio_temperature": float}
-  reply:    {"id": <echo>, "ok": true, "pong": true}                    (ping)
-            {"id": <echo>, "ok": true, "path": "<temp wav path>"}       (synth)
-            {"id": <echo>, "ok": false, "error": "<short message>"}     (either, on failure)
-
-Every reply echoes the request id and is flushed immediately so the Rust
-side can resync on the next newline after a mid-line cancel.
-
-Cloning uses the mlx-speech CONVERSATION API
-(`synthesize_moss_tts_local_conversations`) — the simpler `generate(
-reference_audio=...)` path is inert at every layer in mlx-speech 0.4.2/0.4.3
-(verified against source). MOSS clones from the reference audio clip alone;
-it does not use a reference transcript, so `ref_transcript` is accepted for
-wire compatibility but otherwise unused.
-
-The TTS transformer and audio codec live in two separate HuggingFace repos.
-`mlx_speech.tts.load()` only takes a single `revision` kwarg, which cannot
-pin both repos independently, so this sidecar resolves each repo directly
-via `mlx_speech._hub.get_model_path()` with its own pinned revision and
-constructs the adapter directly (see `load_moss_local()` below).
-
-Apple-Silicon only (MLX requires it); see README.md for the uv-provisioned
-runtime this sidecar runs under.
+mlx_speech_sidecar.py`, driven over stdio as line-delimited JSON. Apple-Silicon
+only (MLX requires it). See README.md for the wire contract and runtime.
 """
 
 import argparse
