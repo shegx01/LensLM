@@ -24,7 +24,7 @@ export type CloudTtsKind = 'open_ai_compatible' | 'deepgram' | 'eleven_labs';
 
 // SYNC-CHECK: must match lens-core/src/tts/mod.rs TtsBackend — externally tagged: unit
 // variants round-trip as bare strings, `Cloud(CloudTtsKind)` as `{ cloud: CloudTtsKind }`.
-export type TtsBackend = 'orpheus' | 'moss_local' | 'moss_ttsd' | { cloud: CloudTtsKind };
+export type TtsBackend = 'orpheus' | 'qwen3_local' | { cloud: CloudTtsKind };
 
 // SYNC-CHECK: must match lens-core/src/config.rs CloudTtsConfig — update both together.
 export interface CloudTtsConfig {

@@ -1,0 +1,17 @@
+[project]
+name = "qwen3-tts-sidecar"
+version = "0.1.0"
+description = "Qwen3-TTS CustomVoice IPC sidecar spawned by src-tauri's QwenSidecar (161e). Apple-Silicon-only."
+requires-python = ">=3.13"
+dependencies = [
+    # Pin exact: the sidecar runs via `uv run --frozen` against this lockfile, so
+    # an unpinned range would let behavior float across machines/time.
+    "mlx-audio==0.4.5",
+    "numpy>=1.26,<3",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.uv]
+package = false

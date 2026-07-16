@@ -80,7 +80,7 @@ fn sanitize_url_for_log(raw: &str) -> String {
 
 /// Returns the currently selected TTS backend's named-voice catalog, adapter-driven
 /// via `TtsProvider::voices()`. Empty only when no provider resolves for the backend
-/// (e.g. cloud/moss backends not yet wired).
+/// (e.g. cloud, or the sidecar-backed Qwen3Local without a sidecar).
 #[tracing::instrument(skip_all)]
 #[tauri::command]
 pub async fn list_tts_voices(
@@ -579,9 +579,11 @@ mod tests {
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
-    fn resolve_voices_non_embedded_backend_is_empty() {
+    fn resolve_voices_sidecar_backend_is_empty_without_sidecar() {
+        // Qwen3Local resolves a provider only with an injected sidecar; the
+        // no-sidecar `resolve_voices` path yields an empty catalog.
         let cfg = lens_core::TtsConfig {
-            backend: lens_core::TtsBackend::MossLocal,
+            backend: lens_core::TtsBackend::Qwen3Local,
             ..lens_core::TtsConfig::default()
         };
         let voices = resolve_voices(&cfg, std::path::Path::new("/data"));

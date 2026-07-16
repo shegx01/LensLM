@@ -608,11 +608,11 @@ fn has_cloud_tts(config: &AppConfig) -> bool {
 fn probe_text_to_speech(config: &AppConfig) -> CheckResult {
     let data_dir = Path::new(&config.paths.data_dir);
 
-    // MossLocal (Apple-Silicon only) provisions runtime + model on demand and
+    // Qwen3Local (Apple-Silicon only) provisions runtime + model on demand and
     // ships default voices, so it is ready with no prefetch. Off Apple Silicon
     // the variant does not exist, so this block compiles out.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    if matches!(config.tts.backend, crate::tts::TtsBackend::MossLocal) {
+    if matches!(config.tts.backend, crate::tts::TtsBackend::Qwen3Local) {
         return CheckResult {
             id: CheckId::TextToSpeech,
             label: "Text-to-speech".to_string(),
