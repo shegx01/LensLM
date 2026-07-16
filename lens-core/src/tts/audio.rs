@@ -104,10 +104,21 @@ pub(crate) fn stitch_turns(buffers: &[(Speaker, AudioBuffer)]) -> Result<AudioBu
     Ok(AudioBuffer::mono(out, TARGET_RATE))
 }
 
+/// Ceiling on a single sidecar-provided turn WAV (a few seconds of 24 kHz mono is
+/// well under this) so a runaway/malicious sidecar reply can't be read fully into
+/// memory unbounded.
+const MAX_TURN_WAV_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Reads a 16-bit PCM WAV as a mono `f32` [`AudioBuffer`]. Multi-channel input is
 /// downmixed by averaging. Public so the `src-tauri` MOSS sidecar can decode the
 /// per-turn WAV it receives without adding an audio dependency of its own.
 pub fn read_wav_mono16(path: &Path) -> Result<AudioBuffer, LensError> {
+    let size = std::fs::metadata(path)
+        .map_err(|e| LensError::Io(e.to_string()))?
+        .len();
+    if size > MAX_TURN_WAV_BYTES {
+        return Err(LensError::Internal("turn WAV exceeds size ceiling".into()));
+    }
     let mut reader = hound::WavReader::open(path).map_err(hound_err)?;
     let spec = reader.spec();
     let channels = spec.channels.max(1) as usize;
@@ -296,5 +307,15 @@ mod tests {
         for (g, w) in got.samples.iter().zip(samples.iter()) {
             assert!((g - w).abs() < 1.0 / 32_000.0, "got {g} want {w}");
         }
+    }
+
+    #[test]
+    fn read_wav_mono16_rejects_over_cap_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.wav");
+        std::fs::write(&path, vec![0u8; (MAX_TURN_WAV_BYTES + 1) as usize]).unwrap();
+
+        let err = read_wav_mono16(&path).expect_err("over-cap file must be rejected");
+        assert!(matches!(err, LensError::Internal(_)));
     }
 }
