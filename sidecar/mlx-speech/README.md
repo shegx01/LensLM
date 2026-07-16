@@ -31,11 +31,11 @@ the Python side never sets it itself.
 ## Model download
 
 On first run the sidecar pulls two pinned HuggingFace revisions (~5.27 GB
-combined, both Apache-2.0), matching the exact commits baked into
-`mlx_speech_sidecar.py`:
+combined, both Apache-2.0), pinned to the exact commits in
+`mlx_speech_sidecar.py` (`MOSS_TTS_REVISION` / `MOSS_CODEC_REVISION`):
 
-- `appautomaton/openmoss-tts-local-mlx` @ `c4951c75b9b44be20a87d0444b3638597e020ca0` (~3.26 GB)
-- `appautomaton/openmoss-audio-tokenizer-mlx` @ `5d0020462d191cdf67c362ee0a9da1775666923e` (~2.0 GB, mandatory codec)
+- `appautomaton/openmoss-tts-local-mlx` (~3.26 GB)
+- `appautomaton/openmoss-audio-tokenizer-mlx` (~2.0 GB, mandatory codec)
 
 ## Contract
 
