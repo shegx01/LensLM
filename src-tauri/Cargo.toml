@@ -81,8 +81,9 @@ lens-core = { path = "../lens-core", features = ["native-ml-metal", "local-whisp
 # issue #193: the MOSS-TTS-Local sidecar host (`moss` module, aarch64-macOS only).
 # `process`/`io-util` add `tokio::process::Command` + async `BufReader`/line IO for
 # the JSON-over-stdio pipe; `tokio-util` supplies the `CancellationToken` the
-# `TtsSidecar::synthesize_turn` signature takes. All source-level (no MLX crate —
-# MLX lives in the frozen binary), so MOSS compiles out on every other target.
+# `TtsSidecar::synthesize_turn` signature takes. MLX itself lives in the
+# uv-managed sidecar venv (sidecar/mlx-speech), fetched on first run — no MLX
+# crate here, so this module compiles out on every other target.
 tokio = { workspace = true, features = ["process", "io-util"] }
 tokio-util = { workspace = true }
 # issue #193: the resolver's one-time `uv` provisioning download. `blocking`
