@@ -12,6 +12,7 @@
     listTtsVoices,
     ttsModelDownloaded,
     saveTtsProvider,
+    nextTtsConfig,
     ttsEngineCatalog,
     type TtsVoice,
     type TtsEngineCatalogEntry,
@@ -38,12 +39,6 @@
   const localEngines = $derived(catalog.filter((e) => e.id !== 'cloud'));
   const selectedEntry = $derived(catalog.find((e) => e.id === selectedEngine) ?? null);
 
-  /** Registry ids the engine needs on disk. Qwen3Local has none — mlx-audio fetches its weights
-   *  lazily on first synth, not through this download flow (mirrors TtsBackend::required_model_ids). */
-  function modelIdsFor(id: TtsEngineId): readonly string[] {
-    return id === 'orpheus' ? ['orpheus', 'snac'] : [];
-  }
-
   function engineLabel(id: TtsEngineId): string {
     if (id === 'orpheus') return 'Orpheus';
     if (id === 'qwen3_local') return 'Qwen3-TTS';
@@ -62,7 +57,9 @@
     return `~${(bytes / 1_000_000_000).toFixed(1)} GB`;
   }
 
-  const modelIds = $derived(modelIdsFor(selectedEngine));
+  // Registry ids the selected engine needs on disk, from the catalog DTO (authority:
+  // TtsBackend::required_model_ids). Empty for engines that fetch weights lazily (Qwen3Local).
+  const modelIds = $derived<readonly string[]>(selectedEntry?.required_model_ids ?? []);
 
   type TtsTab = 'local' | 'cloud';
   let activeTab = $state<TtsTab>('local');
@@ -125,7 +122,7 @@
       // host/guest voices.
       if (await engineDownloaded()) {
         downloaded = true;
-        voices = await listTtsVoices();
+        voices = (await listTtsVoices()) ?? [];
         voicesUnavailable = voices.length === 0;
         const host = cfg.voices?.host;
         const guest = cfg.voices?.guest;
@@ -156,14 +153,15 @@
 
     try {
       await saveTtsProvider({ provider: engineToProvider(id), apiKey: '' });
-    } catch {
+    } catch (err) {
       // Best-effort — the final Save write persists the engine regardless.
+      console.warn('TtsConfigPanel: eager engine persist failed', err);
     }
 
     if (await engineDownloaded()) {
       downloaded = true;
       try {
-        voices = await listTtsVoices();
+        voices = (await listTtsVoices()) ?? [];
       } catch {
         voices = [];
       }
@@ -194,7 +192,7 @@
       downloaded = true;
       // Load available voices from the engine. No stubs: if the catalog comes
       // back empty the engine isn't really available, so we flag it.
-      voices = await listTtsVoices();
+      voices = (await listTtsVoices()) ?? [];
       voicesUnavailable = voices.length === 0;
       if (maleVoices.length > 0) maleVoice = maleVoices[0].id;
       if (femaleVoices.length > 0) femaleVoice = femaleVoices[0].id;
@@ -208,15 +206,12 @@
     savingVoices = true;
     saveError = null;
     try {
+      // Route the tts write through the shared cloud-preserving helper (single owner
+      // of the backend/cloud rule) so a saved Cloud key survives a local-engine save.
       await updateConfig((cfg) => ({
         ...cfg,
         voices: { host: maleVoice, guest: femaleVoice },
-        tts: {
-          ...cfg.tts,
-          version: 1,
-          backend: selectedEngine === 'qwen3_local' ? 'qwen3_local' : 'orpheus',
-          cloud: null
-        }
+        tts: nextTtsConfig(cfg.tts, { provider: engineToProvider(selectedEngine), apiKey: '' })
       }));
       await oncheck();
       oncollapse();

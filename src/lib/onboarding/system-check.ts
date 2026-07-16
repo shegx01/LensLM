@@ -44,9 +44,8 @@ export async function detectLlm(baseUrl: string): Promise<LlmDetection> {
 }
 
 /**
- * Run all system probes. Filters out the legacy `text_to_speech` gate — onboarding
- * readiness is LLM + embeddings only; TTS setup lives in Settings (#194). Returns
- * `[]` outside a Tauri host.
+ * Run all system probes, filtering out the legacy `text_to_speech` gate (see
+ * [`RawCheckResult`]). Returns `[]` outside a Tauri host.
  */
 export async function runSystemCheck(): Promise<CheckResult[]> {
   if (!isTauri()) return [];
@@ -155,6 +154,9 @@ export interface TtsEngineCatalogEntry {
   preset_voices: TtsVoice[];
   model_size_bytes: number | null;
   language_capability_label: string;
+  // SYNC-CHECK: authority is lens-core `TtsBackend::required_model_ids` (tts/mod.rs).
+  /** Registry model ids the engine needs on disk (empty when none, e.g. Qwen/Cloud). */
+  required_model_ids: string[];
 }
 
 /** The static per-engine TTS capability catalog for the Settings selector. Returns `[]` outside Tauri. */
@@ -176,8 +178,8 @@ export type TtsProvider = 'orpheus' | 'qwen3' | 'cloud';
 
 /**
  * Persist a TTS backend/provider selection into the current `TtsConfig` shape
- * (read-modify-write). The panel's Cloud tab is ElevenLabs-only for now; full
- * multi-backend/provider selection is deferred to #194.
+ * (read-modify-write). The panel's Cloud tab is ElevenLabs-only for now; the
+ * full local engine selector ships in #194.
  */
 export async function saveTtsProvider(input: {
   provider: TtsProvider;
@@ -189,16 +191,20 @@ export async function saveTtsProvider(input: {
   }));
 }
 
-function nextTtsConfig(
+/**
+ * Compute the next `TtsConfig` for a provider selection. A local backend
+ * deactivates cloud (the active `backend` no longer points at it) but PRESERVES
+ * the saved key so switching back to Cloud doesn't lose it.
+ */
+export function nextTtsConfig(
   prev: TtsConfig,
   input: { provider: TtsProvider; apiKey: string }
 ): TtsConfig {
-  // Local backends clear any lingering cloud config; the full local picker is deferred to #194.
   if (input.provider === 'orpheus') {
-    return { ...prev, version: 1, backend: 'orpheus', cloud: null };
+    return { ...prev, version: 1, backend: 'orpheus' };
   }
   if (input.provider === 'qwen3') {
-    return { ...prev, version: 1, backend: 'qwen3_local', cloud: null };
+    return { ...prev, version: 1, backend: 'qwen3_local' };
   }
   return {
     version: 1,

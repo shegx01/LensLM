@@ -749,7 +749,6 @@ async fn migration_0009_renames_file_hash_to_raw_content_hash() {
         "old idx_sources_notebook_file_hash must be gone after 0009"
     );
 
-    // Migration count reflects all applied migrations.
     assert_eq!(engine.migration_count().await.unwrap(), 21);
 }
 

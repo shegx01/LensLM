@@ -20,9 +20,7 @@ pub mod snac;
 
 pub(crate) use audio::write_wav_16bit;
 pub use audio::{AudioBuffer, read_wav_mono16};
-// Voice metadata + the capability catalog live in `catalog` (non-cfg-gated) so
-// they are enumerable on every platform; the Apple-Silicon `qwen` adapter imports
-// the voice list from here.
+// Voice metadata + capability catalog live in the non-cfg-gated `catalog` module.
 pub use catalog::{
     EngineCapability, EngineCatalogEntry, GuardVerdict, Lang, LanguageSupport, OffendingSource,
     Platform, QwenVoice, TtsEngineId, code_to_lang, evaluate_language_guard, lang_to_qwen_name,

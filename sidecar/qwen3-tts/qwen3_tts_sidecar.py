@@ -97,7 +97,6 @@ def handle_synth(model, speaker_map: dict, req: dict) -> str:
 
     instruct = req.get("instruct")
     # Language is driven by the Rust host (#194); "auto" lets Qwen3-TTS detect it.
-    # No longer hardcoded to English — Qwen3Local is multilingual.
     language = req.get("language", "auto")
     temperature, max_tokens = resolve_gen_params(req)
 

@@ -22,7 +22,8 @@ function catalogFixture(overrides?: { qwenAvailable?: boolean }): TtsEngineCatal
       supported_languages: ['english'],
       preset_voices: [],
       model_size_bytes: 2_300_000_000,
-      language_capability_label: 'English only'
+      language_capability_label: 'English only',
+      required_model_ids: ['orpheus', 'snac']
     },
     {
       id: 'qwen3_local',
@@ -34,7 +35,8 @@ function catalogFixture(overrides?: { qwenAvailable?: boolean }): TtsEngineCatal
       supported_languages: ['chinese', 'english'],
       preset_voices: [],
       model_size_bytes: 4_500_000_000,
-      language_capability_label: '10 languages'
+      language_capability_label: '10 languages',
+      required_model_ids: []
     },
     {
       id: 'cloud',
@@ -46,7 +48,8 @@ function catalogFixture(overrides?: { qwenAvailable?: boolean }): TtsEngineCatal
       supported_languages: [],
       preset_voices: [],
       model_size_bytes: null,
-      language_capability_label: 'Multilingual (cloud)'
+      language_capability_label: 'Multilingual (cloud)',
+      required_model_ids: []
     }
   ];
 }
@@ -74,6 +77,7 @@ describe('TtsConfigPanel — voices', () => {
     const oncollapse = vi.fn();
     mockIPC((cmd, args) => {
       if (cmd === 'download_tts_model') return driveDownload(args);
+      if (cmd === 'tts_engine_catalog') return catalogFixture();
       if (cmd === 'list_tts_voices')
         return [
           { id: 'tara', name: 'Tara', gender: 'female' },
@@ -104,6 +108,8 @@ describe('TtsConfigPanel — voices', () => {
     const setConfig = vi.fn();
     mockIPC((cmd, args) => {
       if (cmd === 'download_tts_model') return driveDownload(args);
+      if (cmd === 'tts_engine_catalog') return catalogFixture();
+      if (cmd === 'get_config') return baseConfig();
       if (cmd === 'list_tts_voices') return [];
       if (cmd === 'set_config') {
         setConfig(args);
@@ -315,5 +321,42 @@ describe('TtsConfigPanel — engine selector from the catalog (#194)', () => {
     await waitFor(() => expect(written).not.toBeNull());
     expect((written as unknown as AppConfig).tts.backend).toBe('qwen3_local');
     expect((written as unknown as AppConfig).voices).toEqual({ host: 'leo', guest: 'tara' });
+  });
+
+  it('preserves a previously-saved Cloud API key when saving a local engine', async () => {
+    const savedCloud = { kind: 'eleven_labs' as const, api_key: 'sk-keep-me', base_url: '' };
+    let written: AppConfig | null = null;
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config')
+        return {
+          ...baseConfig(),
+          tts: { version: 1, backend: 'orpheus' as const, model: '', cloud: savedCloud }
+        };
+      if (cmd === 'tts_engine_catalog') return catalogFixture({ qwenAvailable: true });
+      if (cmd === 'tts_model_downloaded') return true;
+      if (cmd === 'list_tts_voices')
+        return [
+          { id: 'tara', name: 'Tara', gender: 'female' },
+          { id: 'leo', name: 'Leo', gender: 'male' }
+        ];
+      if (cmd === 'set_config') {
+        written = (args as { config: AppConfig }).config;
+        return null;
+      }
+    });
+
+    render(TtsConfigPanel, {
+      props: { oncheck: vi.fn().mockResolvedValue(undefined), oncollapse: vi.fn() }
+    });
+
+    const qwenRadio = await screen.findByRole('radio', { name: /qwen3-tts/i });
+    await fireEvent.click(qwenRadio);
+    await waitFor(() => expect(screen.getByLabelText(/^host voice/i)).toHaveValue('leo'));
+    await fireEvent.click(screen.getByRole('button', { name: /save voice settings/i }));
+
+    await waitFor(() => expect(written).not.toBeNull());
+    // Local engine is active, but the stored Cloud key survives (not wiped to null).
+    expect((written as unknown as AppConfig).tts.backend).toBe('qwen3_local');
+    expect((written as unknown as AppConfig).tts.cloud).toEqual(savedCloud);
   });
 });

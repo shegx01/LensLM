@@ -1,24 +1,23 @@
 //! Static per-engine TTS capability catalog + language model (#194 / 161f).
 //!
-//! Single source of truth for BOTH the engine selector (platform, needs_key,
-//! model size, language label, preset voices) AND the engine-aware language
-//! guard. Keyed by a NON-cfg-gated [`TtsEngineId`] so every engine (incl.
-//! `Qwen3Local` off Apple Silicon) is enumerable on every platform — the
-//! cfg-gated [`TtsBackend`] is used only for dispatch. `list_tts_voices` stays
-//! reserved for runtime synthesis; the selector reads THIS catalog.
+//! Single source of truth for both the engine selector and the language guard.
+//! Keyed by a NON-cfg-gated [`TtsEngineId`] so every engine (incl. `Qwen3Local`
+//! off Apple Silicon) is enumerable on every platform; the cfg-gated
+//! [`TtsBackend`] is used only for dispatch.
+//!
+//! The guard/validation/mapping `pub` symbols are exercised by tests and
+//! re-exported for callers; they are wired into the live synth path in #28/#161.
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::LensError;
 use crate::tts::{CloudTtsKind, Gender, TtsBackend, TtsVoice};
 
-/// A Qwen3-TTS CustomVoice preset: a fixed speaker selected by `id` whose
-/// delivery is steered by an `instruct` string. No reference clip and no
-/// transcript — CustomVoice is a preset+instruct engine, not a cloning one.
+/// A Qwen3-TTS CustomVoice preset: a fixed speaker selected by `id`, delivery
+/// steered by an `instruct` string (no reference clip, no transcript).
 ///
-/// Lives here (not in the Apple-Silicon-gated `qwen` adapter module) so the
-/// catalog can enumerate Qwen presets on every platform; the gated adapter
-/// imports this list.
+/// Lives here (not the Apple-Silicon-gated `qwen` adapter) so the catalog can
+/// enumerate presets on every platform.
 pub struct QwenVoice {
     pub id: &'static str,
     pub display_name: &'static str,
@@ -67,10 +66,9 @@ pub fn qwen_voice(id: &str) -> Option<&'static QwenVoice> {
     QWEN_VOICES.iter().find(|v| v.id == id)
 }
 
-/// A guard-comparable language. Covers Qwen3-TTS's 10 supported languages plus a
-/// few common others so the guard can CONFIRM (and, for English-only engines,
-/// block) them. whatlang languages outside this set map to `None` and are treated
-/// permissively (see [`evaluate_language_guard`]).
+/// A guard-comparable language: Qwen3-TTS's 10 plus a few common others. Anything
+/// outside this set maps to `None` and is treated permissively (see
+/// [`evaluate_language_guard`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Lang {
@@ -150,10 +148,10 @@ pub fn lang_to_qwen_name(lang: Lang) -> Option<&'static str> {
     })
 }
 
-/// Validates a language against Qwen3-TTS's supported set at the trust boundary.
-/// Supported → the lowercase Qwen name; unsupported → [`LensError::Tts`]. Pure,
-/// no IO. The Rust adapter calls this BEFORE the sidecar so mlx-audio never
-/// silently no-ops on an unknown `language=` value.
+/// Validates a language against Qwen3-TTS's supported set at the trust boundary:
+/// supported → the lowercase Qwen name; unsupported → [`LensError::Tts`]. Pure,
+/// no IO. Once #28/#161 threads a real `Turn.language`, the adapter WILL call this
+/// before the sidecar; until then the request sends `"auto"`.
 pub fn validate_qwen_language(lang: Lang) -> Result<&'static str, LensError> {
     lang_to_qwen_name(lang).ok_or_else(|| {
         LensError::Tts(format!(
@@ -162,10 +160,8 @@ pub fn validate_qwen_language(lang: Lang) -> Result<&'static str, LensError> {
     })
 }
 
-/// A non-cfg-gated engine identity. Distinct from the cfg-gated [`TtsBackend`]
-/// (dispatch enum): this is enumerable on EVERY platform so the selector can list
-/// Qwen "Apple Silicon only" off-target and the guard can reason about Qwen's
-/// language set regardless of build target.
+/// A non-cfg-gated engine identity, enumerable on every platform. Distinct from
+/// the cfg-gated [`TtsBackend`] dispatch enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TtsEngineId {
@@ -315,6 +311,8 @@ pub struct EngineCatalogEntry {
     pub preset_voices: Vec<TtsVoice>,
     pub model_size_bytes: Option<u64>,
     pub language_capability_label: String,
+    /// Registry model ids this engine needs on disk (authority: [`TtsBackend::required_model_ids`]).
+    pub required_model_ids: Vec<String>,
 }
 
 impl EngineCatalogEntry {
@@ -342,6 +340,16 @@ impl EngineCatalogEntry {
             preset_voices: cap.id.preset_voices(),
             model_size_bytes: cap.model_size_bytes,
             language_capability_label: cap.language_capability_label.to_string(),
+            required_model_ids: cap
+                .id
+                .to_backend()
+                .map(|b| {
+                    b.required_model_ids()
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect()
+                })
+                .unwrap_or_default(),
         }
     }
 }
@@ -371,11 +379,9 @@ pub struct GuardVerdict {
     pub offending: Vec<OffendingSource>,
 }
 
-/// Subset check: allow iff every source's CONFIRMED language is in `engine`'s
-/// supported set. Blocks ONLY on a confirmed out-of-set language; `None`/unknown
-/// is PERMISSIVE (never blocks) — pre-migration sources have no detected language,
-/// so a blocking default would retroactively disable synthesis everywhere. Pure,
-/// no IO.
+/// Allow iff every source's CONFIRMED language is in `engine`'s supported set.
+/// `None`/unknown is PERMISSIVE (never blocks): pre-migration sources have no
+/// detected language, so a blocking default would disable synthesis everywhere.
 pub fn evaluate_language_guard(
     engine: TtsEngineId,
     sources: &[(String, Option<Lang>)],
@@ -601,6 +607,50 @@ mod tests {
         assert!(TtsEngineId::Cloud.preset_voices().is_empty());
     }
 
+    /// Every guard-comparable `Lang`, so drift checks can enumerate the full set.
+    const ALL_LANGS: &[Lang] = &[
+        Lang::English,
+        Lang::Chinese,
+        Lang::German,
+        Lang::Italian,
+        Lang::Portuguese,
+        Lang::Spanish,
+        Lang::Japanese,
+        Lang::Korean,
+        Lang::French,
+        Lang::Russian,
+        Lang::Dutch,
+        Lang::Arabic,
+        Lang::Hindi,
+    ];
+
+    #[test]
+    fn catalog_language_view_agrees_with_guard() {
+        // The "one catalog, no drift" invariant: each entry's stored language view
+        // must equal the guard's `language_support()` view for the same engine.
+        for cap in tts_catalog() {
+            assert_eq!(
+                cap.languages,
+                cap.id.language_support(),
+                "catalog vs guard language drift for {:?}",
+                cap.id
+            );
+        }
+    }
+
+    #[test]
+    fn qwen_langs_and_qwen_names_do_not_drift() {
+        // Guard-allows must never exceed adapter-accepts: every QWEN_LANGS entry
+        // maps to a valid Qwen name...
+        assert!(QWEN_LANGS.iter().all(|l| lang_to_qwen_name(*l).is_some()));
+        // ...and no Qwen name exists for a language outside QWEN_LANGS.
+        let named = ALL_LANGS
+            .iter()
+            .filter(|l| lang_to_qwen_name(**l).is_some())
+            .count();
+        assert_eq!(named, QWEN_LANGS.len());
+    }
+
     #[test]
     fn qwen_voice_lookup_resolves_preset() {
         let v = qwen_voice("serena").expect("known voice");
@@ -623,6 +673,7 @@ mod tests {
         assert_eq!(orpheus.preset_voices.len(), 8);
         assert!(!orpheus.multilingual);
         assert_eq!(orpheus.supported_languages, vec![Lang::English]);
+        assert_eq!(orpheus.required_model_ids, vec!["orpheus", "snac"]);
 
         let cloud = entries.iter().find(|e| e.id == TtsEngineId::Cloud).unwrap();
         assert!(!cloud.available, "cloud without a key is unavailable");
@@ -632,6 +683,7 @@ mod tests {
         );
         assert!(cloud.multilingual);
         assert!(cloud.supported_languages.is_empty());
+        assert!(cloud.required_model_ids.is_empty());
 
         // With a key, Cloud becomes available.
         let with_key = tts_catalog_serialized(true);

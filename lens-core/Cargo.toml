@@ -243,9 +243,7 @@ tokenizers = "0.22"
 # async fn in the VectorStore trait.
 async-trait = "0.1"
 
-# issue #194 [161f]: offline language detection at ingest (per-source `language`
-# column feeding the engine-aware TTS guard). Pure-Rust, in-process; version +
-# pin inherited from the workspace entry. MIT — deny.toml allowlist.
+# issue #194 [161f]: offline language detection at ingest (see workspace entry).
 whatlang = { workspace = true }
 
 # --- issue #191 [161c]: SNAC neural-codec decoder (candle) ---

@@ -910,9 +910,8 @@ impl IngestContext<'_> {
             sha256_hex(raw)
         };
 
-        // Offline, deterministic language detection from the canonical text, computed
-        // ONCE here (before the empty/degenerate early-return below) so both the
-        // empty-source and the normal indexed path persist a language (#194).
+        // Computed ONCE here (before the empty/degenerate early-return below) so both
+        // the empty-source and the normal indexed path persist a language (#194).
         let detected_language = detect_language(canonical);
 
         let store = LanceVectorStore::new(data_dir, pool.clone());
