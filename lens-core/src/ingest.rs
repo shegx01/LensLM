@@ -910,6 +910,11 @@ impl IngestContext<'_> {
             sha256_hex(raw)
         };
 
+        // Offline, deterministic language detection from the canonical text, computed
+        // ONCE here (before the empty/degenerate early-return below) so both the
+        // empty-source and the normal indexed path persist a language (#194).
+        let detected_language = detect_language(canonical);
+
         let store = LanceVectorStore::new(data_dir, pool.clone());
         let notebook = source.notebook_id.clone();
         // Resolve the notebook's embedding coordinate once; threaded into every drop/add below.
@@ -973,7 +978,7 @@ impl IngestContext<'_> {
         // Empty source: zero chunks to embed; skip embedder load to avoid a spurious
         // ~130 MB model download. Finalize as an empty-but-indexed row.
         if chunks.is_empty() {
-            repo.update_source_metadata(source_id, 0, &content_hash)
+            repo.update_source_metadata(source_id, 0, &content_hash, detected_language.as_deref())
                 .await?;
             repo.update_source_status(source_id, crate::notebooks::SourceStatus::Indexed.as_str())
                 .await?;
@@ -1096,8 +1101,13 @@ impl IngestContext<'_> {
             on_progress(IngestProgress::new(ingest_phase::INDEXING, 1, Some(1)));
         }
 
-        repo.update_source_metadata(source_id, total_tokens, &content_hash)
-            .await?;
+        repo.update_source_metadata(
+            source_id,
+            total_tokens,
+            &content_hash,
+            detected_language.as_deref(),
+        )
+        .await?;
         repo.update_source_status(source_id, crate::notebooks::SourceStatus::Indexed.as_str())
             .await?;
         // A successful (re-)ingest wipes any stale failure reason (#73).
@@ -1105,6 +1115,18 @@ impl IngestContext<'_> {
         on_progress(IngestProgress::new(ingest_phase::DONE, 1, Some(1)));
         Ok(())
     }
+}
+
+/// Offline language detection over the canonical extracted text. Returns the
+/// whatlang ISO 639-3 code (e.g. `eng`, `cmn`) only when detection is RELIABLE;
+/// short/mixed/code-heavy text yields `None` (left NULL). Deterministic, in-process,
+/// µs-scale — never LLM enrichment. No panics.
+fn detect_language(text: &str) -> Option<String> {
+    let info = whatlang::detect(text)?;
+    if !info.is_reliable() {
+        return None;
+    }
+    Some(info.lang().code().to_string())
 }
 
 /// SHA-256 of `bytes`, lowercase hex.
@@ -1913,6 +1935,21 @@ async fn download_tokenizer_inner(
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn detect_language_reliable_english_returns_eng() {
+        let text = "The quick brown fox jumps over the lazy dog. This is a longer \
+             English passage so whatlang can classify it with confidence and mark \
+             the detection as reliable.";
+        assert_eq!(detect_language(text).as_deref(), Some("eng"));
+    }
+
+    #[test]
+    fn detect_language_unreliable_or_empty_is_none() {
+        // Empty and ultra-short/ambiguous input yield no reliable detection.
+        assert_eq!(detect_language(""), None);
+        assert_eq!(detect_language("a"), None);
+    }
 
     #[test]
     fn kind_detection_json_vs_jsonl_sniff() {

@@ -274,6 +274,9 @@ pub struct Source {
     /// Serialized [`ErrorMeta`](crate::error::ErrorMeta) from the last ingest
     /// failure (#73). `None` unless currently errored; cleared on success.
     pub error_meta: Option<String>,
+    /// whatlang ISO 639-3 language code detected at index time (#194); `None` for
+    /// pre-migration rows and text where detection was unreliable/undetermined.
+    pub language: Option<String>,
 }
 
 /// A trashed source with its parent notebook's title, used by the Trash modal.
@@ -451,7 +454,7 @@ fn validate_title(title: &str) -> Result<String, LensError> {
 /// `(notebook_id, raw_content_hash)` over live rows; returns at most one row.
 const SOURCE_DEDUP_SELECT: &str = "SELECT id, notebook_id, kind, title, status, locator, \
      selected, token_count, content_hash, raw_content_hash, created_at, trashed_at, \
-     enrichment_status, enrichment_meta, force_js_render, error_meta \
+     enrichment_status, enrichment_meta, force_js_render, error_meta, language \
      FROM sources WHERE notebook_id = ? AND raw_content_hash = ? AND trashed_at IS NULL LIMIT 1";
 
 /// Applies `updates` (composed `embedding_text`, plus `enrichment` JSON on parent
@@ -640,7 +643,7 @@ impl<'a> NotebookRepo<'a> {
             "SELECT s.id, s.notebook_id, s.kind, s.title, s.status, s.locator, s.selected, \
                     s.token_count, s.content_hash, s.raw_content_hash, s.created_at, s.trashed_at, \
                     s.enrichment_status, s.enrichment_meta, s.force_js_render, s.error_meta, \
-                    n.title AS notebook_title \
+                    s.language, n.title AS notebook_title \
              FROM sources s \
              JOIN notebooks n ON n.id = s.notebook_id \
              WHERE s.trashed_at IS NOT NULL AND n.trashed_at IS NULL \
@@ -675,6 +678,7 @@ impl<'a> NotebookRepo<'a> {
                         enrichment_meta: row.try_get("enrichment_meta").map_err(LensError::from)?,
                         force_js_render: row.try_get("force_js_render").map_err(LensError::from)?,
                         error_meta: row.try_get("error_meta").map_err(LensError::from)?,
+                        language: row.try_get("language").map_err(LensError::from)?,
                     },
                     notebook_title: row.try_get("notebook_title").map_err(LensError::from)?,
                 })
@@ -960,6 +964,7 @@ impl<'a> NotebookRepo<'a> {
                 enrichment_meta: None,
                 force_js_render: 0,
                 error_meta: None,
+                language: None,
             },
             was_existing: false,
         })
@@ -1082,6 +1087,7 @@ impl<'a> NotebookRepo<'a> {
                 enrichment_meta: None,
                 force_js_render: 0,
                 error_meta: None,
+                language: None,
             },
             was_existing: false,
         })
@@ -1235,6 +1241,7 @@ impl<'a> NotebookRepo<'a> {
                 enrichment_meta: None,
                 force_js_render: 0,
                 error_meta: None,
+                language: None,
             },
             was_existing: false,
         })
@@ -1328,6 +1335,7 @@ impl<'a> NotebookRepo<'a> {
                 enrichment_meta: None,
                 force_js_render: i64::from(force_js_render),
                 error_meta: None,
+                language: None,
             },
             was_existing: false,
         })
@@ -1702,14 +1710,17 @@ impl<'a> NotebookRepo<'a> {
         id: &str,
         token_count: i64,
         content_hash: &str,
+        language: Option<&str>,
     ) -> Result<(), LensError> {
-        let result =
-            sqlx::query("UPDATE sources SET token_count = ?, content_hash = ? WHERE id = ?")
-                .bind(token_count)
-                .bind(content_hash)
-                .bind(id)
-                .execute(self.pool)
-                .await?;
+        let result = sqlx::query(
+            "UPDATE sources SET token_count = ?, content_hash = ?, language = ? WHERE id = ?",
+        )
+        .bind(token_count)
+        .bind(content_hash)
+        .bind(language)
+        .bind(id)
+        .execute(self.pool)
+        .await?;
         if result.rows_affected() == 0 {
             return Err(LensError::Validation(format!("no source with id {id}")));
         }
@@ -1720,7 +1731,7 @@ impl<'a> NotebookRepo<'a> {
         let row = sqlx::query_as::<_, Source>(
             "SELECT id, notebook_id, kind, title, status, locator, selected, token_count, \
              content_hash, raw_content_hash, created_at, trashed_at, enrichment_status, \
-             enrichment_meta, force_js_render, error_meta \
+             enrichment_meta, force_js_render, error_meta, language \
              FROM sources WHERE id = ?",
         )
         .bind(id)
@@ -1733,7 +1744,7 @@ impl<'a> NotebookRepo<'a> {
         let rows = sqlx::query_as::<_, Source>(
             "SELECT id, notebook_id, kind, title, status, locator, selected, token_count, \
              content_hash, raw_content_hash, created_at, trashed_at, enrichment_status, \
-             enrichment_meta, force_js_render, error_meta \
+             enrichment_meta, force_js_render, error_meta, language \
              FROM sources WHERE notebook_id = ? AND trashed_at IS NULL ORDER BY created_at DESC",
         )
         .bind(notebook_id)

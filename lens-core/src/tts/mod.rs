@@ -10,6 +10,7 @@ use crate::dialogue::{DialogueScript, Emotion, Speaker, Turn};
 use crate::error::LensError;
 
 pub mod audio;
+pub mod catalog;
 pub mod orpheus;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub mod qwen;
@@ -19,8 +20,14 @@ pub mod snac;
 
 pub(crate) use audio::write_wav_16bit;
 pub use audio::{AudioBuffer, read_wav_mono16};
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub use qwen::{QwenVoice, qwen_voice};
+// Voice metadata + the capability catalog live in `catalog` (non-cfg-gated) so
+// they are enumerable on every platform; the Apple-Silicon `qwen` adapter imports
+// the voice list from here.
+pub use catalog::{
+    EngineCapability, EngineCatalogEntry, GuardVerdict, Lang, LanguageSupport, OffendingSource,
+    Platform, QwenVoice, TtsEngineId, code_to_lang, evaluate_language_guard, lang_to_qwen_name,
+    qwen_voice, tts_catalog, tts_catalog_serialized, validate_qwen_language,
+};
 pub use registry::{
     TTS_REGISTRY, TtsModelSpec, download_tts_model, resolve_tts, tts_model_downloaded,
     tts_model_path,

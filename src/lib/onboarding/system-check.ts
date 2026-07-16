@@ -5,7 +5,7 @@ import { Channel, invoke, isTauri } from '@tauri-apps/api/core';
 import { updateConfig } from '$lib/config.js';
 import type { TtsConfig } from '$lib/theme/types.js';
 
-export type CheckId = 'llm_runtime' | 'embedding_model' | 'text_to_speech';
+export type CheckId = 'llm_runtime' | 'embedding_model';
 
 export type CheckStatus = 'pass' | 'fail';
 
@@ -18,6 +18,15 @@ export interface CheckResult {
   status: CheckStatus;
   detail: string;
   action: CheckAction | null;
+}
+
+/**
+ * The raw backend row shape: still includes the legacy `text_to_speech` gate
+ * (lens-core/src/system_check.rs unchanged) even though onboarding no longer
+ * blocks on it — TTS setup moved to Settings (#194). Filtered out below.
+ */
+interface RawCheckResult extends Omit<CheckResult, 'id'> {
+  id: CheckId | 'text_to_speech';
 }
 
 // SYNC-CHECK: must match lens-core/src/system_check.rs LlmDetection
@@ -34,10 +43,15 @@ export async function detectLlm(baseUrl: string): Promise<LlmDetection> {
   return invoke<LlmDetection>('detect_llm', { base_url: baseUrl });
 }
 
-/** Run all system probes. Returns `[]` outside a Tauri host. */
+/**
+ * Run all system probes. Filters out the legacy `text_to_speech` gate — onboarding
+ * readiness is LLM + embeddings only; TTS setup lives in Settings (#194). Returns
+ * `[]` outside a Tauri host.
+ */
 export async function runSystemCheck(): Promise<CheckResult[]> {
   if (!isTauri()) return [];
-  return invoke<CheckResult[]>('run_system_check');
+  const results = await invoke<RawCheckResult[]>('run_system_check');
+  return results.filter((r): r is CheckResult => r.id !== 'text_to_speech');
 }
 
 // SYNC-CHECK: contract — Rust side to implement invoke('list_tts_voices')
@@ -119,6 +133,34 @@ export async function downloadTtsModel(
 export async function listTtsVoices(): Promise<TtsVoice[]> {
   if (!isTauri()) return [];
   return invoke<TtsVoice[]>('list_tts_voices');
+}
+
+/** TTS engine identity. Mirrors lens-core `TtsEngineId` (serde snake_case). */
+export type TtsEngineId = 'orpheus' | 'qwen3_local' | 'cloud';
+
+// SYNC-CHECK: must match lens-core/src/tts/catalog.rs EngineCatalogEntry (serde snake_case).
+/** One engine in the static capability catalog — the selector's single source of truth. */
+export interface TtsEngineCatalogEntry {
+  id: TtsEngineId;
+  platform: 'cross_platform' | 'apple_silicon';
+  needs_key: boolean;
+  /** Selectable on this build with the current config (Qwen needs Apple Silicon; Cloud needs a key). */
+  available: boolean;
+  /** Why not, when `available` is false. */
+  unavailable_reason: string | null;
+  /** `true` for the Cloud reserved slot (provider-defined language set). */
+  multilingual: boolean;
+  /** Concrete supported languages (whatlang-comparable, snake_case); empty when `multilingual`. */
+  supported_languages: string[];
+  preset_voices: TtsVoice[];
+  model_size_bytes: number | null;
+  language_capability_label: string;
+}
+
+/** The static per-engine TTS capability catalog for the Settings selector. Returns `[]` outside Tauri. */
+export async function ttsEngineCatalog(): Promise<TtsEngineCatalogEntry[]> {
+  if (!isTauri()) return [];
+  return invoke<TtsEngineCatalogEntry[]>('tts_engine_catalog');
 }
 
 /** Whether the given TTS model artifact is already on disk (skip the download step). */

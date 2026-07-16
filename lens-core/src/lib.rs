@@ -110,14 +110,17 @@ pub use system_check::{
     list_ollama_models, ollama_base_url, validate_model_interactive,
 };
 pub use transcription::{WindowConfig, decode_and_resample_audio, decode_resample_windows};
+// NOTE: `Lang`/`Platform`/`LanguageSupport` are intentionally NOT re-exported at
+// the crate root — `asr::{Lang, Platform}` already own those names here. The TTS
+// language types stay reachable via `lens_core::tts::{Lang, Platform, ...}`.
 pub use tts::{
-    AudioBuffer, CloudTtsKind, DownloadProgress, Gender, TTS_REGISTRY, TtsBackend, TtsModelSpec,
-    TtsPhase, TtsProvider, TtsProviderInfo, TtsSidecar, TtsVoice, download_tts_model, emotion_tag,
-    read_wav_mono16, resolve_tts, resolve_tts_provider, resolve_tts_provider_full,
-    tts_model_downloaded, tts_model_path,
+    AudioBuffer, CloudTtsKind, DownloadProgress, EngineCapability, EngineCatalogEntry, Gender,
+    GuardVerdict, OffendingSource, QwenVoice, TTS_REGISTRY, TtsBackend, TtsEngineId, TtsModelSpec,
+    TtsPhase, TtsProvider, TtsProviderInfo, TtsSidecar, TtsVoice, code_to_lang, download_tts_model,
+    emotion_tag, evaluate_language_guard, lang_to_qwen_name, qwen_voice, read_wav_mono16,
+    resolve_tts, resolve_tts_provider, resolve_tts_provider_full, tts_catalog,
+    tts_catalog_serialized, tts_model_downloaded, tts_model_path, validate_qwen_language,
 };
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub use tts::{QwenVoice, qwen_voice};
 pub use vector_store::{LanceVectorStore, VectorStore};
 
 /// Re-exported so the integration-test crate can re-run the migrator against a

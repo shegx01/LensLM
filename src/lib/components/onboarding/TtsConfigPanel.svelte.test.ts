@@ -3,9 +3,53 @@ import { mockIPC, clearMocks } from '@tauri-apps/api/mocks';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AppConfig } from '$lib/theme/types.js';
 import { baseAppConfig } from '$lib/test-fixtures.js';
+import type { TtsEngineCatalogEntry } from '$lib/onboarding/system-check.js';
 import TtsConfigPanel from './TtsConfigPanel.svelte';
 
 const baseConfig = baseAppConfig;
+
+/** A 3-engine catalog fixture mirroring lens-core's `tts_catalog_serialized` shape (#194). */
+function catalogFixture(overrides?: { qwenAvailable?: boolean }): TtsEngineCatalogEntry[] {
+  const qwenAvailable = overrides?.qwenAvailable ?? false;
+  return [
+    {
+      id: 'orpheus',
+      platform: 'cross_platform',
+      needs_key: false,
+      available: true,
+      unavailable_reason: null,
+      multilingual: false,
+      supported_languages: ['english'],
+      preset_voices: [],
+      model_size_bytes: 2_300_000_000,
+      language_capability_label: 'English only'
+    },
+    {
+      id: 'qwen3_local',
+      platform: 'apple_silicon',
+      needs_key: false,
+      available: qwenAvailable,
+      unavailable_reason: qwenAvailable ? null : 'Requires Apple Silicon',
+      multilingual: false,
+      supported_languages: ['chinese', 'english'],
+      preset_voices: [],
+      model_size_bytes: 4_500_000_000,
+      language_capability_label: '10 languages'
+    },
+    {
+      id: 'cloud',
+      platform: 'cross_platform',
+      needs_key: true,
+      available: false,
+      unavailable_reason: 'Requires an API key',
+      multilingual: true,
+      supported_languages: [],
+      preset_voices: [],
+      model_size_bytes: null,
+      language_capability_label: 'Multilingual (cloud)'
+    }
+  ];
+}
 
 /** Drive the download progress channel to completion. */
 function driveDownload(args: unknown): null {
@@ -201,5 +245,75 @@ describe('TtsConfigPanel — local engine detection', () => {
     expect(
       screen.queryByRole('button', { name: /download voice engine/i })
     ).not.toBeInTheDocument();
+  });
+});
+
+describe('TtsConfigPanel — engine selector from the catalog (#194)', () => {
+  it('renders engines from the catalog with capability gating (Qwen disabled off Apple Silicon)', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return baseConfig();
+      if (cmd === 'tts_engine_catalog') return catalogFixture({ qwenAvailable: false });
+      if (cmd === 'tts_model_downloaded') return false;
+    });
+
+    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+
+    const orpheusRadio = await screen.findByRole('radio', { name: /orpheus/i });
+    expect(orpheusRadio).not.toBeDisabled();
+
+    const qwenRadio = screen.getByRole('radio', { name: /qwen3-tts/i });
+    expect(qwenRadio).toBeDisabled();
+    expect(screen.getByText(/requires apple silicon/i)).toBeInTheDocument();
+
+    // Cloud is its own tab, not a Local-selector entry.
+    expect(screen.queryByRole('radio', { name: /^cloud$/i })).not.toBeInTheDocument();
+  });
+
+  it('shows model size + language-capability label next to Download, before first fetch', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return baseConfig();
+      if (cmd === 'tts_engine_catalog') return catalogFixture();
+      if (cmd === 'tts_model_downloaded') return false;
+    });
+
+    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+
+    await waitFor(() => expect(screen.getByText('~2.3 GB')).toBeInTheDocument());
+    expect(screen.getAllByText(/english only/i).length).toBeGreaterThan(0);
+    // Still pre-fetch: Download is offered, no progress yet.
+    expect(screen.getByRole('button', { name: /download voice engine/i })).toBeInTheDocument();
+  });
+
+  it('persists the selected engine into AppConfig.tts.backend alongside voices on Save', async () => {
+    let written: AppConfig | null = null;
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return baseConfig();
+      if (cmd === 'tts_engine_catalog') return catalogFixture({ qwenAvailable: true });
+      if (cmd === 'tts_model_downloaded') return true;
+      if (cmd === 'list_tts_voices')
+        return [
+          { id: 'tara', name: 'Tara', gender: 'female' },
+          { id: 'leo', name: 'Leo', gender: 'male' }
+        ];
+      if (cmd === 'set_config') {
+        written = (args as { config: AppConfig }).config;
+        return null;
+      }
+    });
+
+    render(TtsConfigPanel, {
+      props: { oncheck: vi.fn().mockResolvedValue(undefined), oncollapse: vi.fn() }
+    });
+
+    const qwenRadio = await screen.findByRole('radio', { name: /qwen3-tts/i });
+    await fireEvent.click(qwenRadio);
+
+    // Wait for the post-switch voice list (Qwen preset voices) to resolve and prefill the pickers.
+    await waitFor(() => expect(screen.getByLabelText(/^host voice/i)).toHaveValue('leo'));
+    await fireEvent.click(screen.getByRole('button', { name: /save voice settings/i }));
+
+    await waitFor(() => expect(written).not.toBeNull());
+    expect((written as unknown as AppConfig).tts.backend).toBe('qwen3_local');
+    expect((written as unknown as AppConfig).voices).toEqual({ host: 'leo', guest: 'tara' });
   });
 });

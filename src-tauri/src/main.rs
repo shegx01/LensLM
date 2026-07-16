@@ -179,6 +179,7 @@ fn main() {
             commands::system::run_system_check,
             commands::system::detect_llm,
             commands::system::list_tts_voices,
+            commands::system::tts_engine_catalog,
             commands::system::install_embedding_model,
             commands::system::download_tts_model,
             commands::system::tts_model_downloaded,

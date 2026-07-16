@@ -84,6 +84,9 @@ export interface Source {
   /** Parsed ingest failure reason. `null` for non-errored or pre-migration rows.
    * Gate error UI on `status === 'error'`, NOT on this field being non-null. */
   error_meta: ErrorMeta | null;
+  /** whatlang ISO 639-3 language code detected at ingest (#194); `null` for
+   * pre-migration rows and text where detection was unreliable/undetermined. */
+  language?: string | null;
 }
 
 /** Return type of add-source IPC calls. `wasExisting = true` means a dedup hit; existing source returned. */

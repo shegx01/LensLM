@@ -71,6 +71,11 @@ whisper-rs = { version = "=0.16.0", default-features = false }
 # build. MIT OR Apache-2.0 — allowlisted in deny.toml.
 llama-cpp-2 = { version = "=0.1.151", default-features = false, features = ["sampler"] }
 
+# issue #194 [161f]: offline, deterministic language detection at ingest for the
+# engine-aware TTS language guard. Pure-Rust, in-process, no network/model.
+# Pinned per workspace convention. MIT — allowlisted in deny.toml.
+whatlang = "=0.16.4"
+
 # Shared lint policy across the workspace.
 [workspace.lints.clippy]
 all = "warn"

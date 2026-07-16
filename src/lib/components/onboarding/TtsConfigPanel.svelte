@@ -12,7 +12,11 @@
     listTtsVoices,
     ttsModelDownloaded,
     saveTtsProvider,
-    type TtsVoice
+    ttsEngineCatalog,
+    type TtsVoice,
+    type TtsEngineCatalogEntry,
+    type TtsEngineId,
+    type TtsProvider
   } from '$lib/onboarding/system-check.js';
   import type { AppConfig } from '$lib/theme/types.js';
   import { SELECT_CLASS } from './styles.js';
@@ -26,11 +30,39 @@
     oncollapse: () => void;
   } = $props();
 
-  // Orpheus is the current default local backend (#192); it needs both the
-  // GGUF weights and the SNAC decoder. Full multi-engine selection is #194.
-  // SYNC-CHECK: ids must match lens-core TTS_REGISTRY / TtsBackend::required_model_ids (orpheus, snac).
-  const TTS_ENGINE = 'orpheus';
-  const TTS_MODEL_IDS = ['orpheus', 'snac'] as const;
+  // The static capability catalog (#194) is the single source of truth for the
+  // selector's engines/gating/size/language label — never `list_tts_voices`.
+  let catalog = $state<TtsEngineCatalogEntry[]>([]);
+  let selectedEngine = $state<TtsEngineId>('orpheus');
+
+  const localEngines = $derived(catalog.filter((e) => e.id !== 'cloud'));
+  const selectedEntry = $derived(catalog.find((e) => e.id === selectedEngine) ?? null);
+
+  /** Registry ids the engine needs on disk. Qwen3Local has none — mlx-audio fetches its weights
+   *  lazily on first synth, not through this download flow (mirrors TtsBackend::required_model_ids). */
+  function modelIdsFor(id: TtsEngineId): readonly string[] {
+    return id === 'orpheus' ? ['orpheus', 'snac'] : [];
+  }
+
+  function engineLabel(id: TtsEngineId): string {
+    if (id === 'orpheus') return 'Orpheus';
+    if (id === 'qwen3_local') return 'Qwen3-TTS';
+    return 'Cloud';
+  }
+
+  function engineToProvider(id: TtsEngineId): TtsProvider {
+    if (id === 'qwen3_local') return 'qwen3';
+    if (id === 'cloud') return 'cloud';
+    return 'orpheus';
+  }
+
+  /** Human-readable on-disk size for the always-visible label, e.g. "~2.3 GB". */
+  function formatSize(bytes: number | null): string | null {
+    if (bytes === null || bytes <= 0) return null;
+    return `~${(bytes / 1_000_000_000).toFixed(1)} GB`;
+  }
+
+  const modelIds = $derived(modelIdsFor(selectedEngine));
 
   type TtsTab = 'local' | 'cloud';
   let activeTab = $state<TtsTab>('local');
@@ -65,10 +97,11 @@
     savingCloud || (hasSavedKey ? !editingKey || !cloudApiKey.trim() : !cloudApiKey.trim())
   );
 
-  /** True once every model artifact the local engine needs is on disk. */
+  /** True once every model artifact the selected local engine needs is on disk
+   *  (trivially true for an engine with no registry-tracked artifacts, e.g. Qwen3Local). */
   async function engineDownloaded(): Promise<boolean> {
-    for (const model of TTS_MODEL_IDS) {
-      if (!(await ttsModelDownloaded(TTS_ENGINE, model))) return false;
+    for (const model of modelIds) {
+      if (!(await ttsModelDownloaded(selectedEngine, model))) return false;
     }
     return true;
   }
@@ -76,11 +109,17 @@
   onMount(async () => {
     if (!isTauri()) return;
     try {
+      catalog = (await ttsEngineCatalog()) ?? [];
+    } catch {
+      catalog = [];
+    }
+    try {
       const cfg = await invoke<AppConfig>('get_config');
       if (cfg.tts?.cloud && cfg.tts.cloud.api_key.trim() !== '') {
         hasSavedKey = true;
         cloudApiKey = '';
       }
+      selectedEngine = cfg.tts?.backend === 'qwen3_local' ? 'qwen3_local' : 'orpheus';
       // If the local engine is already on disk, skip the download step and go
       // straight to voice selection — pre-filled from any previously saved
       // host/guest voices.
@@ -98,6 +137,42 @@
     }
   });
 
+  /** Switch the Local-tab engine. Persists the selection immediately (best-effort) so a
+   *  subsequent `listTtsVoices()` reflects the newly-selected backend, not the stale saved one;
+   *  the final "Save voice settings" write is the source of truth regardless. */
+  async function pickEngine(id: TtsEngineId): Promise<void> {
+    if (id === 'cloud' || id === selectedEngine) return;
+    const entry = catalog.find((e) => e.id === id);
+    if (entry && !entry.available) return;
+
+    selectedEngine = id;
+    downloaded = false;
+    downloadProgress = null;
+    downloadError = null;
+    voices = [];
+    voicesUnavailable = false;
+    maleVoice = '';
+    femaleVoice = '';
+
+    try {
+      await saveTtsProvider({ provider: engineToProvider(id), apiKey: '' });
+    } catch {
+      // Best-effort — the final Save write persists the engine regardless.
+    }
+
+    if (await engineDownloaded()) {
+      downloaded = true;
+      try {
+        voices = await listTtsVoices();
+      } catch {
+        voices = [];
+      }
+      voicesUnavailable = voices.length === 0;
+      if (maleVoices.length > 0) maleVoice = maleVoices[0].id;
+      if (femaleVoices.length > 0) femaleVoice = femaleVoices[0].id;
+    }
+  }
+
   // Entering "editing" mode clears the masked field so the user types a fresh key.
   function startEditingKey(): void {
     if (hasSavedKey && !editingKey) {
@@ -110,9 +185,9 @@
     downloadError = null;
     downloadProgress = 0;
     try {
-      for (const [i, model] of TTS_MODEL_IDS.entries()) {
-        await downloadTtsModel(TTS_ENGINE, model, (pct) => {
-          downloadProgress = Math.round(((i + pct / 100) / TTS_MODEL_IDS.length) * 100);
+      for (const [i, model] of modelIds.entries()) {
+        await downloadTtsModel(selectedEngine, model, (pct) => {
+          downloadProgress = Math.round(((i + pct / 100) / modelIds.length) * 100);
         });
       }
       downloadProgress = 100;
@@ -135,7 +210,13 @@
     try {
       await updateConfig((cfg) => ({
         ...cfg,
-        voices: { host: maleVoice, guest: femaleVoice }
+        voices: { host: maleVoice, guest: femaleVoice },
+        tts: {
+          ...cfg.tts,
+          version: 1,
+          backend: selectedEngine === 'qwen3_local' ? 'qwen3_local' : 'orpheus',
+          cloud: null
+        }
       }));
       await oncheck();
       oncollapse();
@@ -206,6 +287,41 @@
     tabindex={activeTab === 'local' ? 0 : -1}
     class={cn('mt-3 flex flex-col gap-3', activeTab !== 'local' && 'hidden')}
   >
+    {#if localEngines.length > 0}
+      <div class="flex flex-col gap-1.5" role="radiogroup" aria-label="Local voice engine">
+        {#each localEngines as entry (entry.id)}
+          {@const isSel = selectedEngine === entry.id}
+          {@const isAvailable = entry.available}
+          <button
+            type="button"
+            role="radio"
+            aria-checked={isSel}
+            aria-disabled={!isAvailable}
+            disabled={!isAvailable}
+            onclick={() => pickEngine(entry.id)}
+            class={cn(
+              'flex w-full items-center justify-between rounded-lg border px-3 py-2 text-left transition-colors',
+              'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+              isSel
+                ? 'border-primary bg-primary/10 ring-1 ring-primary'
+                : 'border-border bg-card hover:text-foreground',
+              !isAvailable && 'cursor-not-allowed opacity-60'
+            )}
+          >
+            <span class="flex flex-col">
+              <span class="text-[0.78rem] font-bold text-foreground">{engineLabel(entry.id)}</span>
+              {#if !isAvailable && entry.unavailable_reason}
+                <span class="text-[0.68rem] text-destructive">{entry.unavailable_reason}</span>
+              {/if}
+            </span>
+            <span class="text-[0.68rem] text-muted-foreground">
+              {entry.language_capability_label}
+            </span>
+          </button>
+        {/each}
+      </div>
+    {/if}
+
     {#if !downloaded}
       <div class="flex flex-col gap-2">
         <p class="text-muted-foreground text-[0.78rem] leading-relaxed">
@@ -213,8 +329,9 @@
           for synthesis.
         </p>
         <div class="flex items-center justify-between text-[0.75rem] text-muted-foreground">
-          <span>Local voice engine</span>
-          <span>On-device · Offline</span>
+          <span>{selectedEntry?.language_capability_label ?? 'Local voice engine'}</span>
+          <span>{formatSize(selectedEntry?.model_size_bytes ?? null) ?? 'On-device · Offline'}</span
+          >
         </div>
 
         {#if downloadProgress !== null && downloadProgress < 100}

@@ -278,12 +278,17 @@ impl QwenSidecar {
     ) -> Result<AudioBuffer, TurnError> {
         let (_, stdin, reader) = cell.as_mut().ok_or(TurnError::Dead)?;
 
+        // `language` defaults to "auto" (Qwen3-TTS auto-detects) until #28/#161 threads a
+        // notebook-resolved language down the synthesis path; the sidecar reads this key
+        // (no longer hardcoded to English). A real value is validated in lens-core via
+        // `validate_qwen_language` before it reaches this request.
         let request = serde_json::json!({
             "id": id,
             "op": "synth",
             "text": text,
             "speaker": speaker,
             "instruct": instruct,
+            "language": "auto",
         });
         let mut line = serde_json::to_string(&request).map_err(|e| {
             tracing::warn!(error = %e, "failed to serialize Qwen synth request");

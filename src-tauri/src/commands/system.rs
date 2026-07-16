@@ -102,6 +102,26 @@ fn resolve_voices(cfg: &lens_core::TtsConfig, data_dir: &std::path::Path) -> Vec
         .unwrap_or_default()
 }
 
+/// Returns the static per-engine TTS capability catalog (#194) for the Settings
+/// engine selector: platform, needs_key, availability (Qwen off Apple Silicon,
+/// Cloud without a key), supported languages, preset voices, model size, and the
+/// language-capability label. This is the selector's single source of truth —
+/// distinct from `list_tts_voices` (reserved for runtime synthesis).
+#[tracing::instrument(skip_all)]
+#[tauri::command]
+pub async fn tts_engine_catalog(
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<Vec<lens_core::EngineCatalogEntry>, LensError> {
+    let config = engine.config().await;
+    let cloud_key_present = config
+        .tts
+        .cloud
+        .as_ref()
+        .map(|c| !c.api_key.is_empty())
+        .unwrap_or(false);
+    Ok(lens_core::tts_catalog_serialized(cloud_key_present))
+}
+
 /// Installs an embedding model via Ollama `POST /api/pull`, streaming NDJSON progress.
 /// `model` is validated against the registry allowlist before any network call.
 /// RESERVED FOR FUTURE USE (M5+): registered but has no frontend caller — onboarding
@@ -521,7 +541,7 @@ mod tests {
 
         let status = health_check(engine).await.unwrap();
         assert!(status.db_ok);
-        assert_eq!(status.migration_count, 20);
+        assert_eq!(status.migration_count, 21);
     }
 
     #[tokio::test]
