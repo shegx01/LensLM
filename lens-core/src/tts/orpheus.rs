@@ -386,15 +386,14 @@ fn voice_id(voice: &VoiceRef, speaker: Speaker) -> Result<&'static str, LensErro
     match voice {
         VoiceRef::Reference { .. } => Err(LensError::Tts(
             "voice cloning (VoiceRef::Reference) is unsupported by the Orpheus backend; \
-             use the MOSS backend (#161e) or a named Orpheus voice \
-             (tara/leah/jess/leo/dan/mia/zac/zoe)"
+             use a named Orpheus voice (tara/leah/jess/leo/dan/mia/zac/zoe)"
                 .into(),
         )),
         VoiceRef::Named(name) if name.is_empty() => Ok(default_voice(speaker)),
         VoiceRef::Named(name) => orpheus_voice(name).ok_or_else(|| {
             LensError::Tts(format!(
                 "unknown Orpheus voice {name:?}; valid voices are \
-                 tara/leah/jess/leo/dan/mia/zac/zoe (use the MOSS backend #161e for cloning)"
+                 tara/leah/jess/leo/dan/mia/zac/zoe"
             ))
         }),
     }

@@ -1,10 +1,10 @@
-//! Runtime resolution of the MOSS sidecar launch spec (issue #193, [161e]).
+//! Runtime resolution of the Qwen sidecar launch spec ([161e]).
 //!
 //! Finds a usable `uv`: a system install (`uv --version` on PATH) is preferred;
 //! otherwise Astral's pre-signed static `uv` is downloaded into `<app_data>/bin/`
 //! (SHA-pinned) and reused thereafter. The sidecar then runs via `uv run` against
 //! the bundled project, with `HF_HOME` pointed at an app-data cache so
-//! `mlx-speech` auto-downloads the model there. All failures map through [`tts_err`].
+//! `mlx-audio` auto-downloads the model there. All failures map through [`tts_err`].
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -39,19 +39,19 @@ pub fn resolve_sidecar_spawn(
     // huggingface_hub reads HF_HOME at import → the dir must exist and be in the
     // spawned process env (see `envs` below), not just the parent's.
     std::fs::create_dir_all(hf_cache_dir)
-        .map_err(warn_tts("failed to create MOSS HF cache dir"))?;
+        .map_err(warn_tts("failed to create Qwen HF cache dir"))?;
 
     // `uv run --project <dir>` writes its virtualenv to `<dir>/.venv` by default;
     // in a packaged app `<dir>` is inside the read-only, signed .app bundle, so uv
     // could not create it and the sidecar would never start. Redirect both the
     // project env and uv's cache into writable app-data.
-    let venv_dir = app_data_dir.join("moss-venv");
+    let venv_dir = app_data_dir.join("qwen-venv");
     let uv_cache_dir = app_data_dir.join("uv-cache");
     for dir in [&venv_dir, &uv_cache_dir] {
         std::fs::create_dir_all(dir).map_err(warn_tts("failed to create uv runtime dir"))?;
     }
 
-    let script = sidecar_dir.join("mlx_speech_sidecar.py");
+    let script = sidecar_dir.join("qwen3_tts_sidecar.py");
     let args = vec![
         "run".to_string(),
         // `--frozen`: use uv.lock verbatim — never re-resolve (which would bypass
@@ -69,6 +69,9 @@ pub fn resolve_sidecar_spawn(
             "HF_HOME".to_string(),
             hf_cache_dir.to_string_lossy().into_owned(),
         ),
+        // Xet-backed transfer stalls the model pull on some networks; the plain
+        // HTTPS path is reliable, so disable Xet for the sidecar's downloads.
+        ("HF_HUB_DISABLE_XET".to_string(), "1".to_string()),
         (
             "UV_PROJECT_ENVIRONMENT".to_string(),
             venv_dir.to_string_lossy().into_owned(),
@@ -114,7 +117,7 @@ fn find_or_provision_uv(app_data_dir: &Path) -> Result<PathBuf, LensError> {
     let _ = std::fs::remove_file(&uv_path);
     tracing::info!(
         version = UV_VERSION,
-        "provisioning Astral uv for MOSS sidecar"
+        "provisioning Astral uv for Qwen sidecar"
     );
     download_uv(&bin_dir)
 }

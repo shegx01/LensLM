@@ -24,7 +24,7 @@ export type ModelConfig = {
 export type VoiceRef = string | { clip_path: string; transcript: string };
 export type VoiceConfig = { host: VoiceRef; guest: VoiceRef };
 export type CloudTtsKind = 'open_ai_compatible' | 'deepgram' | 'eleven_labs';
-export type TtsBackend = 'orpheus' | 'moss_local' | 'moss_ttsd' | { cloud: CloudTtsKind };
+export type TtsBackend = 'orpheus' | 'qwen3_local' | { cloud: CloudTtsKind };
 export type CloudTtsConfig = { kind: CloudTtsKind; api_key: string; base_url: string };
 export type TtsConfig = {
   version: number;

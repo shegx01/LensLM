@@ -128,9 +128,9 @@ export async function ttsModelDownloaded(engine: string, model: string): Promise
 }
 
 // SYNC-CHECK: a UI selector mapped to the wire `TtsBackend` (lens-core/src/tts/mod.rs) by
-// `nextTtsConfig` — NOT the wire type itself: it collapses moss_local/moss_ttsd → 'moss'
-// and every Cloud kind → 'cloud'.
-export type TtsProvider = 'orpheus' | 'moss' | 'cloud';
+// `nextTtsConfig` — NOT the wire type itself: it maps 'qwen3' → qwen3_local and every
+// Cloud kind → 'cloud'.
+export type TtsProvider = 'orpheus' | 'qwen3' | 'cloud';
 
 /**
  * Persist a TTS backend/provider selection into the current `TtsConfig` shape
@@ -155,8 +155,8 @@ function nextTtsConfig(
   if (input.provider === 'orpheus') {
     return { ...prev, version: 1, backend: 'orpheus', cloud: null };
   }
-  if (input.provider === 'moss') {
-    return { ...prev, version: 1, backend: 'moss_local', cloud: null };
+  if (input.provider === 'qwen3') {
+    return { ...prev, version: 1, backend: 'qwen3_local', cloud: null };
   }
   return {
     version: 1,

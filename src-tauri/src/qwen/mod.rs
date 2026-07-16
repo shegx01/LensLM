@@ -1,9 +1,9 @@
-//! MOSS-TTS-Local sidecar host (issue #193, [161e]): drives an out-of-process
-//! MLX Python sidecar over line-delimited JSON-over-stdio as lens-core's
+//! Qwen3-TTS CustomVoice sidecar host ([161e]): drives an out-of-process MLX
+//! Python sidecar over line-delimited JSON-over-stdio as lens-core's
 //! [`TtsSidecar`]. Gated to `aarch64-apple-darwin` (the only target MLX runs on).
 //!
 //! The sidecar runs under `uv` (`uv run` against the bundled `pyproject.toml`);
-//! `mlx-speech` auto-downloads the model into the `HF_HOME` cache passed in the
+//! `mlx-audio` auto-downloads the model into the `HF_HOME` cache passed in the
 //! [`SidecarSpawn`]. Launch details are resolved lazily via an injected resolver
 //! (see [`resolver::resolve_sidecar_spawn`]) so provisioning never blocks startup.
 //!
@@ -22,7 +22,7 @@ use tokio::time::{Duration, timeout};
 use tokio_util::sync::CancellationToken;
 
 use lens_core::{
-    AudioBuffer, LensError, Speaker, TtsSidecar, Turn, VoiceConfig, VoiceRef, moss_reference_voice,
+    AudioBuffer, LensError, Speaker, TtsSidecar, Turn, VoiceConfig, VoiceRef, qwen_voice,
     read_wav_mono16,
 };
 
@@ -31,7 +31,7 @@ pub use resolver::resolve_sidecar_spawn;
 
 /// A fully-resolved sidecar launch: the program to exec, its args, and the extra
 /// environment it needs (e.g. `HF_HOME` so `huggingface_hub` caches into app-data).
-/// Produced by a [`SpawnResolver`] so [`MossSidecar`] stays testable with a stub.
+/// Produced by a [`SpawnResolver`] so [`QwenSidecar`] stays testable with a stub.
 pub struct SidecarSpawn {
     pub program: PathBuf,
     pub args: Vec<String>,
@@ -61,13 +61,13 @@ const MAX_REPLY_BYTES: u64 = 64 * 1024;
 /// source. Held together so acquiring the cell's guard grants exclusive IO access.
 type ChildTriple = (Child, ChildStdin, BufReader<ChildStdout>);
 
-/// The bundled default host/guest voices (stable ids, not paths — the picker to
-/// switch among the four bundled clips is #194). Applied when the config leaves a
-/// voice unset: MOSS is clone-only, so every turn needs a real reference clip.
-pub fn default_moss_voices() -> VoiceConfig {
+/// The default host/guest preset voices (stable ids; the picker to switch among
+/// the presets is #194). Applied when the config leaves a voice unset — a male
+/// host (`aiden`) and a female guest (`serena`), the audition-selected pair.
+pub fn default_qwen_voices() -> VoiceConfig {
     VoiceConfig {
-        host: VoiceRef::Named("librivox-chenevert".to_string()),
-        guest: VoiceRef::Named("librivox-klett".to_string()),
+        host: VoiceRef::Named("aiden".to_string()),
+        guest: VoiceRef::Named("serena".to_string()),
     }
 }
 
@@ -102,11 +102,9 @@ struct SynthReply {
     path: Option<String>,
 }
 
-pub struct MossSidecar {
+pub struct QwenSidecar {
     /// Yields the launch spec on first spawn (may download `uv`); see [`SpawnResolver`].
     resolver: SpawnResolver,
-    /// Directory containing the bundled `voices/` reference clips.
-    resource_dir: PathBuf,
     child: Mutex<Option<ChildTriple>>,
     ready: AtomicBool,
     /// Lifetime-monotonic request id; never resets. See `run_turn_locked`/
@@ -115,21 +113,20 @@ pub struct MossSidecar {
     invocation_id: String,
 }
 
-impl MossSidecar {
-    pub fn new(resolver: SpawnResolver, resource_dir: PathBuf) -> Self {
+impl QwenSidecar {
+    pub fn new(resolver: SpawnResolver) -> Self {
         Self {
             resolver,
-            resource_dir,
             child: Mutex::new(None),
             ready: AtomicBool::new(false),
             next_id: AtomicU64::new(1),
-            invocation_id: format!("moss-sidecar-{}", uuid::Uuid::now_v7()),
+            invocation_id: format!("qwen-sidecar-{}", uuid::Uuid::now_v7()),
         }
     }
 
-    /// Resolves the per-speaker voice to `(clip_path, transcript)`: a `Named(id)`
-    /// maps through lens-core's catalog + this host's resource dir, a `Reference`
-    /// passes through, an unset ref falls back to [`default_moss_voices`].
+    /// Resolves the per-speaker voice to `(speaker_id, instruct)`: a `Named(id)`
+    /// maps through lens-core's preset catalog, an unset ref falls back to
+    /// [`default_qwen_voices`]. A `Reference` clip is a typed error (unsupported).
     fn resolve_voice(
         &self,
         speaker: Speaker,
@@ -140,7 +137,7 @@ impl MossSidecar {
             Speaker::Guest => &voices.guest,
         };
         let effective = if requested.is_unset() {
-            let defaults = default_moss_voices();
+            let defaults = default_qwen_voices();
             match speaker {
                 Speaker::Host => defaults.host,
                 Speaker::Guest => defaults.guest,
@@ -151,17 +148,10 @@ impl MossSidecar {
 
         match effective {
             VoiceRef::Named(id) => {
-                let voice = moss_reference_voice(&id).ok_or_else(tts_err)?;
-                let clip = self.resource_dir.join("voices").join(voice.clip_filename);
-                Ok((
-                    clip.to_string_lossy().into_owned(),
-                    voice.transcript.to_string(),
-                ))
+                let voice = qwen_voice(&id).ok_or_else(tts_err)?;
+                Ok((voice.id.to_string(), voice.instruct.to_string()))
             }
-            VoiceRef::Reference {
-                clip_path,
-                transcript,
-            } => Ok((clip_path.to_string_lossy().into_owned(), transcript)),
+            VoiceRef::Reference { .. } => Err(tts_err()),
         }
     }
 
@@ -173,7 +163,7 @@ impl MossSidecar {
             return Ok(());
         }
         self.ready.store(false, Ordering::SeqCst);
-        tracing::debug!(invocation_id = %self.invocation_id, "spawning MOSS-TTS-Local sidecar");
+        tracing::debug!(invocation_id = %self.invocation_id, "spawning Qwen3-TTS sidecar");
 
         // Resolve the launch spec off the async runtime: the first resolution may
         // download `uv`, which must not stall a runtime worker thread.
@@ -181,7 +171,7 @@ impl MossSidecar {
         let spec = tokio::task::spawn_blocking(move || resolver())
             .await
             .map_err(|e| {
-                tracing::warn!(error = %e, "MOSS spawn resolver task panicked/cancelled");
+                tracing::warn!(error = %e, "Qwen spawn resolver task panicked/cancelled");
                 tts_err()
             })??;
 
@@ -195,7 +185,7 @@ impl MossSidecar {
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| {
-                tracing::warn!(error = %e, "failed to spawn MOSS sidecar");
+                tracing::warn!(error = %e, "failed to spawn Qwen sidecar");
                 tts_err()
             })?;
 
@@ -205,7 +195,7 @@ impl MossSidecar {
 
         // We hold the cell guard across this bounded, cancellable wait (acceptable
         // for a one-time cold start); app-quit force-kills via `kill_on_drop`.
-        tracing::info!(invocation_id = %self.invocation_id, "awaiting MOSS sidecar readiness (first run may download ~5 GB)");
+        tracing::info!(invocation_id = %self.invocation_id, "awaiting Qwen sidecar readiness (first run may download ~5 GB)");
         let handshake = timeout(READY_TIMEOUT, async {
             let mut line = String::new();
             loop {
@@ -216,15 +206,15 @@ impl MossSidecar {
                     .read_line(&mut line)
                     .await
                     .map_err(|e| {
-                        tracing::warn!(error = %e, "MOSS handshake read failed");
+                        tracing::warn!(error = %e, "Qwen handshake read failed");
                         tts_err()
                     })?;
                 if n == 0 {
-                    tracing::warn!("MOSS sidecar closed stdout before ready (EOF)");
+                    tracing::warn!("Qwen sidecar closed stdout before ready (EOF)");
                     return Err(tts_err()); // EOF before ready — model load failed/exited
                 }
                 if !line.ends_with('\n') {
-                    tracing::warn!(bytes = n, "MOSS handshake line exceeded cap or truncated");
+                    tracing::warn!(bytes = n, "Qwen handshake line exceeded cap or truncated");
                     return Err(tts_err());
                 }
                 if let Ok(msg) = serde_json::from_str::<ReadyMsg>(line.trim())
@@ -238,7 +228,7 @@ impl MossSidecar {
         .await;
 
         if !matches!(handshake, Ok(Ok(()))) {
-            tracing::warn!(invocation_id = %self.invocation_id, "MOSS sidecar handshake failed (timeout/EOF/over-cap)");
+            tracing::warn!(invocation_id = %self.invocation_id, "Qwen sidecar handshake failed (timeout/EOF/over-cap)");
             return Err(tts_err());
         }
 
@@ -253,18 +243,18 @@ impl MossSidecar {
         if let Some((mut child, _stdin, _reader)) = cell.take()
             && let Err(e) = child.start_kill()
         {
-            tracing::warn!(error = %e, "failed to kill MOSS sidecar child");
+            tracing::warn!(error = %e, "failed to kill Qwen sidecar child");
         }
     }
 
     /// Validates a sidecar-returned WAV path before any read/delete: it must be a
-    /// `moss-turn-*.wav` whose canonical location lives under the OS temp dir.
+    /// `qwen-turn-*.wav` whose canonical location lives under the OS temp dir.
     /// Anything else is rejected untouched (defends against arbitrary-file access).
     fn is_valid_turn_wav(path: &Path) -> bool {
         let name_ok = path
             .file_name()
             .and_then(|n| n.to_str())
-            .map(|n| n.starts_with("moss-turn-") && n.ends_with(".wav"))
+            .map(|n| n.starts_with("qwen-turn-") && n.ends_with(".wav"))
             .unwrap_or(false);
         if !name_ok {
             return false;
@@ -283,8 +273,8 @@ impl MossSidecar {
         cell: &mut Option<ChildTriple>,
         id: u64,
         text: &str,
-        clip: &str,
-        transcript: &str,
+        speaker: &str,
+        instruct: &str,
     ) -> Result<AudioBuffer, TurnError> {
         let (_, stdin, reader) = cell.as_mut().ok_or(TurnError::Dead)?;
 
@@ -292,46 +282,44 @@ impl MossSidecar {
             "id": id,
             "op": "synth",
             "text": text,
-            "emotion": serde_json::Value::Null,
-            "ref_clip": clip,
-            "ref_transcript": transcript,
-            "audio_temperature": 1.0,
+            "speaker": speaker,
+            "instruct": instruct,
         });
         let mut line = serde_json::to_string(&request).map_err(|e| {
-            tracing::warn!(error = %e, "failed to serialize MOSS synth request");
+            tracing::warn!(error = %e, "failed to serialize Qwen synth request");
             TurnError::Failed
         })?;
         line.push('\n');
         stdin.write_all(line.as_bytes()).await.map_err(|e| {
-            tracing::warn!(error = %e, "failed to write MOSS synth request");
+            tracing::warn!(error = %e, "failed to write Qwen synth request");
             TurnError::Dead
         })?;
         stdin.flush().await.map_err(|e| {
-            tracing::warn!(error = %e, "failed to flush MOSS synth request");
+            tracing::warn!(error = %e, "failed to flush Qwen synth request");
             TurnError::Dead
         })?;
 
         let reply = match timeout(SYNTH_TIMEOUT, drain_until(reader, id)).await {
             Ok(r) => r?,
             Err(_) => {
-                tracing::warn!(id, "MOSS synth reply timed out");
+                tracing::warn!(id, "Qwen synth reply timed out");
                 return Err(TurnError::Dead);
             }
         };
 
         if !reply.ok {
-            tracing::warn!(id, "MOSS sidecar returned ok:false for synth");
+            tracing::warn!(id, "Qwen sidecar returned ok:false for synth");
             return Err(TurnError::Failed);
         }
         let path = reply.path.ok_or(TurnError::Failed)?;
         if !Self::is_valid_turn_wav(Path::new(&path)) {
-            tracing::warn!("MOSS sidecar returned an out-of-policy WAV path; rejecting");
+            tracing::warn!("Qwen sidecar returned an out-of-policy WAV path; rejecting");
             return Err(TurnError::Failed);
         }
         let audio = read_wav_mono16(Path::new(&path));
         let _ = std::fs::remove_file(&path); // best-effort cleanup, both paths
         audio.map_err(|e| {
-            tracing::warn!(error = %e, "failed to decode MOSS turn WAV");
+            tracing::warn!(error = %e, "failed to decode Qwen turn WAV");
             TurnError::Failed
         })
     }
@@ -355,33 +343,33 @@ async fn drain_until<R: tokio::io::AsyncBufRead + Unpin>(
             .read_line(&mut buf)
             .await
             .map_err(|e| {
-                tracing::warn!(error = %e, "MOSS sidecar reply read failed");
+                tracing::warn!(error = %e, "Qwen sidecar reply read failed");
                 TurnError::Dead
             })?;
         if n == 0 {
-            tracing::warn!("MOSS sidecar closed stdout (EOF) awaiting reply");
+            tracing::warn!("Qwen sidecar closed stdout (EOF) awaiting reply");
             return Err(TurnError::Dead); // EOF — child exited
         }
         if !buf.ends_with('\n') {
             tracing::warn!(
                 bytes = n,
-                "MOSS reply exceeded cap or truncated; treating as dead"
+                "Qwen reply exceeded cap or truncated; treating as dead"
             );
             return Err(TurnError::Dead);
         }
         let reply: SynthReply = match serde_json::from_str(buf.trim()) {
             Ok(r) => r,
             Err(e) => {
-                tracing::debug!(error = %e, "skipping unparseable MOSS reply line");
+                tracing::debug!(error = %e, "skipping unparseable Qwen reply line");
                 continue; // truncated tail from a cancelled turn — resync next line
             }
         };
         if reply.id != id {
             // Same allow-list as the matching path: only delete a validated
-            // moss-turn temp WAV, so a rogue/buggy sidecar can't unlink an
+            // qwen-turn temp WAV, so a rogue/buggy sidecar can't unlink an
             // arbitrary file via a stale reply.
             if let Some(p) = reply.path.as_deref().map(Path::new)
-                && MossSidecar::is_valid_turn_wav(p)
+                && QwenSidecar::is_valid_turn_wav(p)
             {
                 let _ = std::fs::remove_file(p); // cancelled turn's WAV — don't leak it
             }
@@ -392,7 +380,7 @@ async fn drain_until<R: tokio::io::AsyncBufRead + Unpin>(
 }
 
 #[async_trait]
-impl TtsSidecar for MossSidecar {
+impl TtsSidecar for QwenSidecar {
     async fn start(&self) -> Result<(), LensError> {
         let mut guard = self.child.lock().await;
         self.spawn_locked(&mut guard).await
@@ -406,7 +394,7 @@ impl TtsSidecar for MossSidecar {
             // then guarantees a reap so no zombie survives shutdown.
             drop(stdin);
             if let Err(e) = child.kill().await {
-                tracing::warn!(error = %e, "failed to reap MOSS sidecar on stop");
+                tracing::warn!(error = %e, "failed to reap Qwen sidecar on stop");
             }
         }
         Ok(())
@@ -432,7 +420,7 @@ impl TtsSidecar for MossSidecar {
         if cancel.is_cancelled() {
             return Err(LensError::Cancelled("tts synthesis cancelled".into()));
         }
-        let (clip, transcript) = self.resolve_voice(turn.speaker, voices)?;
+        let (speaker, instruct) = self.resolve_voice(turn.speaker, voices)?;
 
         // One guard for the whole turn: turns are sequential in the caller's
         // stitch loop, so a single acquisition prevents request interleaving.
@@ -447,7 +435,7 @@ impl TtsSidecar for MossSidecar {
 
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         match self
-            .run_turn_locked(&mut guard, id, &turn.text, &clip, &transcript)
+            .run_turn_locked(&mut guard, id, &turn.text, &speaker, &instruct)
             .await
         {
             Ok(audio) => Ok(audio),
@@ -464,7 +452,7 @@ impl TtsSidecar for MossSidecar {
 mod tests {
     use super::*;
 
-    fn sidecar_with_resources(resource_dir: PathBuf) -> MossSidecar {
+    fn sidecar() -> QwenSidecar {
         // These tests exercise only `resolve_voice`, which never spawns, so the
         // resolver is a stub that is never invoked.
         let resolver: SpawnResolver = Arc::new(|| {
@@ -474,81 +462,91 @@ mod tests {
                 envs: vec![],
             })
         });
-        MossSidecar::new(resolver, resource_dir)
+        QwenSidecar::new(resolver)
     }
 
     #[test]
-    fn resolve_named_voice_maps_path_and_transcript() {
-        let resource_dir = PathBuf::from("/fake/resources");
-        let moss = sidecar_with_resources(resource_dir.clone());
+    fn resolve_named_voice_maps_speaker_and_instruct() {
+        let qwen = sidecar();
         let voices = VoiceConfig {
-            host: VoiceRef::Named("librivox-clarke".to_string()),
-            guest: VoiceRef::Named("librivox-savage".to_string()),
+            host: VoiceRef::Named("dylan".to_string()),
+            guest: VoiceRef::Named("serena".to_string()),
         };
 
-        let (clip, transcript) = moss
+        let (speaker, instruct) = qwen
             .resolve_voice(Speaker::Host, &voices)
             .expect("known host id resolves");
-        assert_eq!(clip, "/fake/resources/voices/librivox-clarke.wav");
-        assert_eq!(
-            transcript,
-            moss_reference_voice("librivox-clarke").unwrap().transcript
-        );
+        assert_eq!(speaker, "dylan");
+        assert!(!instruct.is_empty());
 
-        let (guest_clip, _) = moss
+        let (guest_speaker, _) = qwen
             .resolve_voice(Speaker::Guest, &voices)
             .expect("known guest id resolves");
-        assert_eq!(guest_clip, "/fake/resources/voices/librivox-savage.wav");
+        assert_eq!(guest_speaker, "serena");
     }
 
     #[test]
     fn resolve_unset_voice_falls_back_to_defaults() {
-        let moss = sidecar_with_resources(PathBuf::from("/fake/resources"));
+        let qwen = sidecar();
         let voices = VoiceConfig::default(); // both refs unset
 
-        let (host_clip, _) = moss
+        let (host_speaker, _) = qwen
             .resolve_voice(Speaker::Host, &voices)
             .expect("unset host falls back");
-        assert_eq!(host_clip, "/fake/resources/voices/librivox-chenevert.wav");
+        assert_eq!(host_speaker, "aiden");
 
-        let (guest_clip, _) = moss
+        let (guest_speaker, _) = qwen
             .resolve_voice(Speaker::Guest, &voices)
             .expect("unset guest falls back");
-        assert_eq!(guest_clip, "/fake/resources/voices/librivox-klett.wav");
+        assert_eq!(guest_speaker, "serena");
     }
 
     #[test]
     fn resolve_unknown_voice_id_errors() {
-        let moss = sidecar_with_resources(PathBuf::from("/fake/resources"));
+        let qwen = sidecar();
         let voices = VoiceConfig {
             host: VoiceRef::Named("not-a-voice".to_string()),
-            guest: VoiceRef::Named("librivox-klett".to_string()),
+            guest: VoiceRef::Named("serena".to_string()),
         };
         assert!(matches!(
-            moss.resolve_voice(Speaker::Host, &voices),
+            qwen.resolve_voice(Speaker::Host, &voices),
             Err(LensError::Tts(_))
         ));
     }
 
     #[test]
-    fn default_moss_voices_uses_bundled_ids() {
-        let voices = default_moss_voices();
-        assert_eq!(
-            voices.host,
-            VoiceRef::Named("librivox-chenevert".to_string())
-        );
-        assert_eq!(voices.guest, VoiceRef::Named("librivox-klett".to_string()));
-        // Both defaults must resolve against the static catalog.
-        assert!(moss_reference_voice("librivox-chenevert").is_some());
-        assert!(moss_reference_voice("librivox-klett").is_some());
+    fn resolve_reference_clip_is_unsupported() {
+        // A `Reference` voice is a typed error, not a silent fallback.
+        let qwen = sidecar();
+        let voices = VoiceConfig {
+            host: VoiceRef::Reference {
+                clip_path: PathBuf::from("/some/clip.wav"),
+                transcript: "hello".to_string(),
+            },
+            guest: VoiceRef::Named("serena".to_string()),
+        };
+        assert!(matches!(
+            qwen.resolve_voice(Speaker::Host, &voices),
+            Err(LensError::Tts(_))
+        ));
+    }
+
+    #[test]
+    fn default_qwen_voices_uses_preset_ids() {
+        let voices = default_qwen_voices();
+        assert_eq!(voices.host, VoiceRef::Named("aiden".to_string()));
+        assert_eq!(voices.guest, VoiceRef::Named("serena".to_string()));
+        // Both defaults must resolve against the static preset catalog.
+        assert!(qwen_voice("aiden").is_some());
+        assert!(qwen_voice("serena").is_some());
     }
 
     #[tokio::test]
     async fn drain_skips_stale_complete_reply_then_matches() {
         let data = concat!(
-            r#"{"id":1,"ok":true,"path":"/nonexistent/moss-turn-stale.wav"}"#,
+            r#"{"id":1,"ok":true,"path":"/nonexistent/qwen-turn-stale.wav"}"#,
             "\n",
-            r#"{"id":2,"ok":true,"path":"/nonexistent/moss-turn-live.wav"}"#,
+            r#"{"id":2,"ok":true,"path":"/nonexistent/qwen-turn-live.wav"}"#,
             "\n",
         );
         let mut reader = data.as_bytes();
@@ -564,7 +562,7 @@ mod tests {
         let data = concat!(
             r#"{"id":2,"ok":tru"#,
             "\n",
-            r#"{"id":2,"ok":true,"path":"/nonexistent/moss-turn-x.wav"}"#,
+            r#"{"id":2,"ok":true,"path":"/nonexistent/qwen-turn-x.wav"}"#,
             "\n",
         );
         let mut reader = data.as_bytes();
@@ -613,23 +611,23 @@ mod tests {
     #[test]
     fn valid_turn_wav_accepts_temp_and_rejects_others() {
         let dir = tempfile::tempdir().unwrap();
-        let good = dir.path().join("moss-turn-abc.wav");
+        let good = dir.path().join("qwen-turn-abc.wav");
         std::fs::write(&good, b"riff").unwrap();
-        assert!(MossSidecar::is_valid_turn_wav(&good));
+        assert!(QwenSidecar::is_valid_turn_wav(&good));
 
         // Wrong name in temp: rejected without touching the fs.
         let bad_name = dir.path().join("evil.wav");
         std::fs::write(&bad_name, b"riff").unwrap();
-        assert!(!MossSidecar::is_valid_turn_wav(&bad_name));
+        assert!(!QwenSidecar::is_valid_turn_wav(&bad_name));
 
         // Correct name but outside the OS temp dir: rejected.
-        assert!(!MossSidecar::is_valid_turn_wav(Path::new(
-            "/etc/moss-turn-x.wav"
+        assert!(!QwenSidecar::is_valid_turn_wav(Path::new(
+            "/etc/qwen-turn-x.wav"
         )));
     }
 }
 
-/// End-to-end correctness harness: drives the REAL `MossSidecar` (real
+/// End-to-end correctness harness: drives the REAL `QwenSidecar` (real
 /// `tokio::process` spawn + JSON-over-stdio + correlation-id drain +
 /// `read_wav_mono16` + stitch) through the production `resolve_tts_provider_full`
 /// dispatch, against a stdlib-only Python stub that speaks the sidecar contract
@@ -655,7 +653,7 @@ def emit(o):
     sys.stdout.write(json.dumps(o) + "\n"); sys.stdout.flush()
 slow = "slow" in sys.argv[1:]
 def make_wav():
-    fd, p = tempfile.mkstemp(prefix="moss-turn-", suffix=".wav"); os.close(fd)
+    fd, p = tempfile.mkstemp(prefix="qwen-turn-", suffix=".wav"); os.close(fd)
     r = 24000; n = int(0.4 * r)
     with wave.open(p, "wb") as w:
         w.setnchannels(1); w.setsampwidth(2); w.setframerate(r)
@@ -674,6 +672,9 @@ for line in sys.stdin:
     if op == "ping":
         emit({"id": rid, "ok": True, "pong": True})
     elif op == "synth":
+        # Pin the wire field name: a renamed `speaker` field must fail the e2e.
+        if not isinstance(req.get("speaker"), str) or not req.get("speaker"):
+            emit({"id": rid, "ok": False, "error": "missing speaker"}); continue
         if slow:
             time.sleep(1.2)
         try:
@@ -730,14 +731,14 @@ for line in sys.stdin:
                 envs: vec![],
             })
         });
-        let sidecar: Arc<dyn TtsSidecar> = Arc::new(MossSidecar::new(resolver, tmp.to_path_buf()));
+        let sidecar: Arc<dyn TtsSidecar> = Arc::new(QwenSidecar::new(resolver));
         resolve_tts_provider_full(
-            TtsBackend::MossLocal,
+            TtsBackend::Qwen3Local,
             &TtsConfig::default(),
             Path::new("/unused"),
             Some(sidecar),
         )
-        .expect("MossLocal resolves to an adapter when a sidecar is present")
+        .expect("Qwen3Local resolves to an adapter when a sidecar is present")
     }
 
     fn phase_sink() -> (

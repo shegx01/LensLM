@@ -18,11 +18,11 @@
 mod asr;
 
 mod commands;
-// The MOSS-TTS-Local sidecar host (issue #193, [161e]): `MossSidecar` is injected
-// into the engine in the `.setup` block below. Apple-Silicon macOS only — MLX runs
-// in an out-of-process Python sidecar (via `uv`), so the module compiles out elsewhere.
+// The Qwen3-TTS CustomVoice sidecar host ([161e]): `QwenSidecar` is injected into
+// the engine in the `.setup` block below. Apple-Silicon macOS only — MLX runs in
+// an out-of-process Python sidecar (via `uv`), so the module compiles out elsewhere.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-mod moss;
+mod qwen;
 // The offscreen SPA-render impl (issue #78). Its `TauriJsRenderer` is injected
 // into the engine in the `.setup` block below (Layer f), so its items are live.
 mod render;
@@ -95,33 +95,29 @@ fn main() {
                 }
             }
 
-            // Inject the MOSS-TTS-Local sidecar host (issue #193) on Apple Silicon.
+            // Inject the Qwen3-TTS CustomVoice sidecar host (161e) on Apple Silicon.
             // The resolver closure defers `uv` detection/provisioning + HF-cache
             // creation to first synth, so nothing here downloads or blocks
             // startup. `start()` is LAZY, so an unavailable runtime surfaces as a
             // generic `LensError::Tts` at synth time — never a startup panic.
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             {
-                // Resolve bundled dirs eagerly (cheap path math). Dev reads the
-                // source tree; release reads the bundled resources (tauri maps a
-                // `../sidecar/...` resource under `<resource_dir>/_up_/sidecar/...`).
+                // Resolve the bundled sidecar dir eagerly (cheap path math). Dev
+                // reads the source tree; release reads the bundled resources (tauri
+                // maps a `../sidecar/...` resource under `<resource_dir>/_up_/sidecar/...`).
                 let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-                let (resource_dir, sidecar_dir) = if cfg!(debug_assertions) {
-                    (
-                        manifest.join("resources"),
-                        manifest.join("../sidecar/mlx-speech"),
-                    )
+                let sidecar_dir = if cfg!(debug_assertions) {
+                    manifest.join("../sidecar/qwen3-tts")
                 } else {
-                    let res = app.path().resource_dir()?;
-                    (res.join("resources"), res.join("_up_/sidecar/mlx-speech"))
+                    app.path().resource_dir()?.join("_up_/sidecar/qwen3-tts")
                 };
                 let hf_cache_dir = data_dir.join("hf-cache");
                 let app_data = data_dir.clone();
-                let resolver: moss::SpawnResolver = Arc::new(move || {
-                    moss::resolve_sidecar_spawn(&app_data, &sidecar_dir, &hf_cache_dir)
+                let resolver: qwen::SpawnResolver = Arc::new(move || {
+                    qwen::resolve_sidecar_spawn(&app_data, &sidecar_dir, &hf_cache_dir)
                 });
-                let moss = moss::MossSidecar::new(resolver, resource_dir);
-                tauri::async_runtime::block_on(engine_state.set_tts_sidecar(Some(Arc::new(moss))));
+                let qwen = qwen::QwenSidecar::new(resolver);
+                tauri::async_runtime::block_on(engine_state.set_tts_sidecar(Some(Arc::new(qwen))));
             }
 
             Ok(())

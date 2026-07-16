@@ -31,10 +31,9 @@
     "active": true,
     "targets": "all",
     "resources": [
-      "resources/voices/*.wav",
-      "../sidecar/mlx-speech/mlx_speech_sidecar.py",
-      "../sidecar/mlx-speech/pyproject.toml",
-      "../sidecar/mlx-speech/uv.lock"
+      "../sidecar/qwen3-tts/qwen3_tts_sidecar.py",
+      "../sidecar/qwen3-tts/pyproject.toml",
+      "../sidecar/qwen3-tts/uv.lock"
     ],
     "icon": [
       "icons/32x32.png",

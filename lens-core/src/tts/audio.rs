@@ -110,7 +110,7 @@ pub(crate) fn stitch_turns(buffers: &[(Speaker, AudioBuffer)]) -> Result<AudioBu
 const MAX_TURN_WAV_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Reads a 16-bit PCM WAV as a mono `f32` [`AudioBuffer`]. Multi-channel input is
-/// downmixed by averaging. Public so the `src-tauri` MOSS sidecar can decode the
+/// downmixed by averaging. Public so the `src-tauri` Qwen sidecar can decode the
 /// per-turn WAV it receives without adding an audio dependency of its own.
 pub fn read_wav_mono16(path: &Path) -> Result<AudioBuffer, LensError> {
     let size = std::fs::metadata(path)

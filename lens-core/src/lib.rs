@@ -117,7 +117,7 @@ pub use tts::{
     tts_model_downloaded, tts_model_path,
 };
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub use tts::{MossReferenceVoice, moss_reference_voice};
+pub use tts::{QwenVoice, qwen_voice};
 pub use vector_store::{LanceVectorStore, VectorStore};
 
 /// Re-exported so the integration-test crate can re-run the migrator against a
@@ -1315,11 +1315,11 @@ impl LensEngine {
     }
 
     pub async fn tts_backend_available(&self, cfg: &config::TtsConfig) -> bool {
-        // MossLocal has no registry-managed model: `mlx-speech` fetches it lazily
+        // Qwen3Local has no registry-managed model: `mlx-audio` fetches it lazily
         // on first synth, so availability is just "is a sidecar injected" — no
         // spawn/health probe (that would cost a multi-GB load on a UI gate).
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        if matches!(cfg.backend, tts::TtsBackend::MossLocal) {
+        if matches!(cfg.backend, tts::TtsBackend::Qwen3Local) {
             return self.tts_sidecar().await.is_some();
         }
         let data_dir = self.data_dir().await;
@@ -1339,8 +1339,8 @@ impl LensEngine {
         on_phase: impl Fn(tts::TtsPhase) + Send + Sync,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<std::path::PathBuf, LensError> {
-        // Single dispatch path (#193): `_full` returns the sidecar-backed adapter
-        // (MossLocal) when a sidecar is injected, else the embedded provider
+        // Single dispatch path (161e): `_full` returns the sidecar-backed adapter
+        // (Qwen3Local) when a sidecar is injected, else the embedded provider
         // (Orpheus). `data_dir` supplies embedded model paths.
         let data_dir = self.data_dir().await;
         let provider =
