@@ -10,6 +10,7 @@ use crate::dialogue::{DialogueScript, Emotion, Speaker, Turn};
 use crate::error::LensError;
 
 pub mod audio;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub mod moss;
 pub mod orpheus;
 pub mod registry;
@@ -18,6 +19,7 @@ pub mod snac;
 
 pub(crate) use audio::write_wav_16bit;
 pub use audio::{AudioBuffer, read_wav_mono16};
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use moss::{MossReferenceVoice, moss_reference_voice};
 pub use registry::{
     TTS_REGISTRY, TtsModelSpec, download_tts_model, resolve_tts, tts_model_downloaded,
@@ -62,21 +64,46 @@ pub struct DownloadProgress {
     pub done: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TtsBackend {
     #[default]
     Orpheus,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     MossLocal,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     MossTtsd,
     Cloud(CloudTtsKind),
+}
+
+// `MossLocal`/`MossTtsd` are cfg-gated to Apple Silicon; the derived impl would
+// reject `"moss_local"` as unknown off-target. Route strings through
+// `from_opt_str` (unknown -> default) and keep `{"cloud": ...}` for the kind.
+impl<'de> Deserialize<'de> for TtsBackend {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Tag(String),
+            Cloud { cloud: CloudTtsKind },
+        }
+        Ok(match Wire::deserialize(deserializer)? {
+            Wire::Tag(s) => TtsBackend::from_opt_str(Some(&s)),
+            Wire::Cloud { cloud } => TtsBackend::Cloud(cloud),
+        })
+    }
 }
 
 impl TtsBackend {
     pub fn as_str(&self) -> &'static str {
         match self {
             TtsBackend::Orpheus => "orpheus",
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             TtsBackend::MossLocal => "moss_local",
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             TtsBackend::MossTtsd => "moss_ttsd",
             TtsBackend::Cloud(_) => "cloud",
         }
@@ -85,7 +112,9 @@ impl TtsBackend {
     pub fn from_opt_str(s: Option<&str>) -> Self {
         match s.unwrap_or("") {
             "orpheus" => TtsBackend::Orpheus,
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             "moss_local" => TtsBackend::MossLocal,
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             "moss_ttsd" => TtsBackend::MossTtsd,
             "cloud" => TtsBackend::Cloud(CloudTtsKind::default()),
             _ => TtsBackend::default(),
@@ -99,7 +128,9 @@ impl TtsBackend {
     pub fn required_model_ids(&self) -> &'static [&'static str] {
         match self {
             TtsBackend::Orpheus => &["orpheus", "snac"],
-            TtsBackend::MossLocal | TtsBackend::MossTtsd | TtsBackend::Cloud(_) => &[],
+            TtsBackend::Cloud(_) => &[],
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            TtsBackend::MossLocal | TtsBackend::MossTtsd => &[],
         }
     }
 }
@@ -198,6 +229,11 @@ pub fn resolve_tts_provider_full(
     backend: TtsBackend,
     _cfg: &TtsConfig,
     data_dir: &Path,
+    // Consumed only by the Apple-Silicon-gated `MossLocal` arm below.
+    #[cfg_attr(
+        not(all(target_os = "macos", target_arch = "aarch64")),
+        allow(unused_variables)
+    )]
     sidecar: Option<Arc<dyn TtsSidecar>>,
 ) -> Option<Arc<dyn TtsProvider>> {
     match backend {
@@ -206,9 +242,11 @@ pub fn resolve_tts_provider_full(
             let snac = tts_model_path(data_dir, "snac")?;
             Some(Arc::new(orpheus::OrpheusAdapter::new(orpheus, snac)))
         }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         TtsBackend::MossLocal => {
             sidecar.map(|s| Arc::new(moss::MossLocalAdapter::new(s)) as Arc<dyn TtsProvider>)
         }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         TtsBackend::MossTtsd => None,
         TtsBackend::Cloud(_) => None,
     }
@@ -244,7 +282,9 @@ mod tests {
         let cfg = TtsConfig::default();
         let data_dir = Path::new("/data");
         for backend in [
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             TtsBackend::MossLocal,
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             TtsBackend::MossTtsd,
             TtsBackend::Cloud(CloudTtsKind::OpenAiCompatible),
             TtsBackend::Cloud(CloudTtsKind::Deepgram),
@@ -264,6 +304,7 @@ mod tests {
         assert_eq!(provider.info().backend, TtsBackend::Orpheus);
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn resolve_full_moss_local_needs_sidecar() {
         let cfg = TtsConfig::default();
@@ -279,6 +320,7 @@ mod tests {
         assert_eq!(provider.info().model, "moss-tts-local-int8");
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn resolve_full_moss_ttsd_is_none_even_with_sidecar() {
         let cfg = TtsConfig::default();
@@ -302,8 +344,10 @@ mod tests {
         assert_eq!(provider.info().backend, TtsBackend::Orpheus);
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     struct NoopSidecar;
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[async_trait]
     impl crate::tts::sidecar::TtsSidecar for NoopSidecar {
         async fn start(&self) -> Result<(), LensError> {
@@ -340,6 +384,7 @@ mod tests {
         assert_eq!(emotion_tag(Emotion::Thoughtful, TtsBackend::Orpheus), None);
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn emotion_tag_none_for_non_orpheus_backends() {
         for emotion in [
@@ -371,7 +416,9 @@ mod tests {
     fn backend_as_str_and_from_opt_str_round_trip() {
         for b in [
             TtsBackend::Orpheus,
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             TtsBackend::MossLocal,
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             TtsBackend::MossTtsd,
         ] {
             assert_eq!(TtsBackend::from_opt_str(Some(b.as_str())), b);
@@ -393,6 +440,7 @@ mod tests {
     fn backend_serde_round_trips_including_cloud() {
         for b in [
             TtsBackend::Orpheus,
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             TtsBackend::MossLocal,
             TtsBackend::Cloud(CloudTtsKind::ElevenLabs),
         ] {

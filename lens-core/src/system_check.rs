@@ -608,24 +608,16 @@ fn has_cloud_tts(config: &AppConfig) -> bool {
 fn probe_text_to_speech(config: &AppConfig) -> CheckResult {
     let data_dir = Path::new(&config.paths.data_dir);
 
-    // MossLocal is Apple-Silicon-only (the sidecar host target). There it
-    // provisions runtime + model on demand and ships default voices, so it is
-    // ready with no prefetch and no voices config; elsewhere it is unavailable.
-    // Mirrors `LensEngine::tts_backend_available` (sidecar injected only on aarch64).
+    // MossLocal (Apple-Silicon only) provisions runtime + model on demand and
+    // ships default voices, so it is ready with no prefetch. Off Apple Silicon
+    // the variant does not exist, so this block compiles out.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if matches!(config.tts.backend, crate::tts::TtsBackend::MossLocal) {
-        let (status, detail) = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-            (CheckStatus::Pass, "Audio engine ready".to_string())
-        } else {
-            (
-                CheckStatus::Fail,
-                "MOSS-TTS-Local requires Apple Silicon".to_string(),
-            )
-        };
         return CheckResult {
             id: CheckId::TextToSpeech,
             label: "Text-to-speech".to_string(),
-            status,
-            detail,
+            status: CheckStatus::Pass,
+            detail: "Audio engine ready".to_string(),
             action: Some(CheckAction::Choose),
         };
     }

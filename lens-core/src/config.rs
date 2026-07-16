@@ -976,6 +976,29 @@ mod tests {
         assert!(cfg.cloud.is_none());
     }
 
+    // The `MossLocal`/`MossTtsd` variants are cfg-gated to Apple Silicon. A config
+    // naming them must still deserialize on every target: to the variant on Apple
+    // Silicon, to the default backend (Orpheus) elsewhere — never an error.
+    #[test]
+    fn moss_local_config_deserializes_on_all_targets() {
+        let json = r#"{ "version": 1, "backend": "moss_local", "model": "" }"#;
+        let cfg: TtsConfig = serde_json::from_str(json).unwrap();
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        assert_eq!(cfg.backend, TtsBackend::MossLocal);
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        assert_eq!(cfg.backend, TtsBackend::Orpheus);
+    }
+
+    #[test]
+    fn moss_ttsd_config_deserializes_on_all_targets() {
+        let json = r#"{ "version": 1, "backend": "moss_ttsd", "model": "" }"#;
+        let cfg: TtsConfig = serde_json::from_str(json).unwrap();
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        assert_eq!(cfg.backend, TtsBackend::MossTtsd);
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        assert_eq!(cfg.backend, TtsBackend::Orpheus);
+    }
+
     #[test]
     fn voice_ref_untagged_round_trips() {
         let named = VoiceRef::Named("af_heart".to_string());

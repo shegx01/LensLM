@@ -111,11 +111,13 @@ pub use system_check::{
 };
 pub use transcription::{WindowConfig, decode_and_resample_audio, decode_resample_windows};
 pub use tts::{
-    AudioBuffer, CloudTtsKind, DownloadProgress, Gender, MossReferenceVoice, TTS_REGISTRY,
-    TtsBackend, TtsModelSpec, TtsPhase, TtsProvider, TtsProviderInfo, TtsSidecar, TtsVoice,
-    download_tts_model, emotion_tag, moss_reference_voice, read_wav_mono16, resolve_tts,
-    resolve_tts_provider, resolve_tts_provider_full, tts_model_downloaded, tts_model_path,
+    AudioBuffer, CloudTtsKind, DownloadProgress, Gender, TTS_REGISTRY, TtsBackend, TtsModelSpec,
+    TtsPhase, TtsProvider, TtsProviderInfo, TtsSidecar, TtsVoice, download_tts_model, emotion_tag,
+    read_wav_mono16, resolve_tts, resolve_tts_provider, resolve_tts_provider_full,
+    tts_model_downloaded, tts_model_path,
 };
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub use tts::{MossReferenceVoice, moss_reference_voice};
 pub use vector_store::{LanceVectorStore, VectorStore};
 
 /// Re-exported so the integration-test crate can re-run the migrator against a
@@ -1316,6 +1318,7 @@ impl LensEngine {
         // MossLocal has no registry-managed model: `mlx-speech` fetches it lazily
         // on first synth, so availability is just "is a sidecar injected" — no
         // spawn/health probe (that would cost a multi-GB load on a UI gate).
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         if matches!(cfg.backend, tts::TtsBackend::MossLocal) {
             return self.tts_sidecar().await.is_some();
         }
