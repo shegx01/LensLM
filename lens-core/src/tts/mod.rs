@@ -10,13 +10,17 @@ use crate::dialogue::{DialogueScript, Emotion, Speaker, Turn};
 use crate::error::LensError;
 
 pub mod audio;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub mod moss;
 pub mod orpheus;
 pub mod registry;
 pub mod sidecar;
 pub mod snac;
 
-pub use audio::AudioBuffer;
 pub(crate) use audio::write_wav_16bit;
+pub use audio::{AudioBuffer, read_wav_mono16};
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub use moss::{MossReferenceVoice, moss_reference_voice};
 pub use registry::{
     TTS_REGISTRY, TtsModelSpec, download_tts_model, resolve_tts, tts_model_downloaded,
     tts_model_path,
@@ -60,21 +64,46 @@ pub struct DownloadProgress {
     pub done: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TtsBackend {
     #[default]
     Orpheus,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     MossLocal,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     MossTtsd,
     Cloud(CloudTtsKind),
+}
+
+// `MossLocal`/`MossTtsd` are cfg-gated to Apple Silicon; the derived impl would
+// reject `"moss_local"` as unknown off-target. Route strings through
+// `from_opt_str` (unknown -> default) and keep `{"cloud": ...}` for the kind.
+impl<'de> Deserialize<'de> for TtsBackend {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Tag(String),
+            Cloud { cloud: CloudTtsKind },
+        }
+        Ok(match Wire::deserialize(deserializer)? {
+            Wire::Tag(s) => TtsBackend::from_opt_str(Some(&s)),
+            Wire::Cloud { cloud } => TtsBackend::Cloud(cloud),
+        })
+    }
 }
 
 impl TtsBackend {
     pub fn as_str(&self) -> &'static str {
         match self {
             TtsBackend::Orpheus => "orpheus",
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             TtsBackend::MossLocal => "moss_local",
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             TtsBackend::MossTtsd => "moss_ttsd",
             TtsBackend::Cloud(_) => "cloud",
         }
@@ -83,7 +112,9 @@ impl TtsBackend {
     pub fn from_opt_str(s: Option<&str>) -> Self {
         match s.unwrap_or("") {
             "orpheus" => TtsBackend::Orpheus,
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             "moss_local" => TtsBackend::MossLocal,
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             "moss_ttsd" => TtsBackend::MossTtsd,
             "cloud" => TtsBackend::Cloud(CloudTtsKind::default()),
             _ => TtsBackend::default(),
@@ -92,10 +123,14 @@ impl TtsBackend {
 
     /// Registry ids of every model artifact this backend needs on disk to be
     /// usable. Non-embedded backends (cloud, not-yet-wired local) return `&[]`.
+    /// MossLocal has none: `mlx-speech` fetches its model lazily on first synth,
+    /// not via the Rust registry.
     pub fn required_model_ids(&self) -> &'static [&'static str] {
         match self {
             TtsBackend::Orpheus => &["orpheus", "snac"],
-            TtsBackend::MossLocal | TtsBackend::MossTtsd | TtsBackend::Cloud(_) => &[],
+            TtsBackend::Cloud(_) => &[],
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            TtsBackend::MossLocal | TtsBackend::MossTtsd => &[],
         }
     }
 }
@@ -187,16 +222,19 @@ pub trait TtsProvider: Send + Sync {
     }
 }
 
-/// Resolves a [`TtsProvider`] for `backend`. Construction is cheap: an embedded
-/// provider (Orpheus) holds only its model paths + config and lazy-loads weights
-/// on first synth (see [`orpheus::OrpheusAdapter`]). `data_dir` supplies the
-/// model relpaths; availability (whether those files exist) is a separate cheap
-/// probe (`tts_model_downloaded`), so a missing artifact surfaces as a lazy-load
-/// `LensError::Tts`, never a silent `None`.
-pub fn resolve_tts_provider(
+/// Resolves a [`TtsProvider`] for `backend`, given an optional injected `sidecar`.
+/// Single dispatch path — [`resolve_tts_provider`] and `synthesize_overview` both
+/// route through it so the two entry points cannot diverge.
+pub fn resolve_tts_provider_full(
     backend: TtsBackend,
     _cfg: &TtsConfig,
     data_dir: &Path,
+    // Consumed only by the Apple-Silicon-gated `MossLocal` arm below.
+    #[cfg_attr(
+        not(all(target_os = "macos", target_arch = "aarch64")),
+        allow(unused_variables)
+    )]
+    sidecar: Option<Arc<dyn TtsSidecar>>,
 ) -> Option<Arc<dyn TtsProvider>> {
     match backend {
         TtsBackend::Orpheus => {
@@ -204,10 +242,24 @@ pub fn resolve_tts_provider(
             let snac = tts_model_path(data_dir, "snac")?;
             Some(Arc::new(orpheus::OrpheusAdapter::new(orpheus, snac)))
         }
-        TtsBackend::MossLocal => None,
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        TtsBackend::MossLocal => {
+            sidecar.map(|s| Arc::new(moss::MossLocalAdapter::new(s)) as Arc<dyn TtsProvider>)
+        }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         TtsBackend::MossTtsd => None,
         TtsBackend::Cloud(_) => None,
     }
+}
+
+/// Thin wrapper over [`resolve_tts_provider_full`] with no sidecar; sidecar-backed
+/// backends (MossLocal) return `None` here by design — call `_full` when one is needed.
+pub fn resolve_tts_provider(
+    backend: TtsBackend,
+    cfg: &TtsConfig,
+    data_dir: &Path,
+) -> Option<Arc<dyn TtsProvider>> {
+    resolve_tts_provider_full(backend, cfg, data_dir, None)
 }
 
 pub fn emotion_tag(emotion: Emotion, backend: TtsBackend) -> Option<String> {
@@ -230,7 +282,9 @@ mod tests {
         let cfg = TtsConfig::default();
         let data_dir = Path::new("/data");
         for backend in [
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             TtsBackend::MossLocal,
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             TtsBackend::MossTtsd,
             TtsBackend::Cloud(CloudTtsKind::OpenAiCompatible),
             TtsBackend::Cloud(CloudTtsKind::Deepgram),
@@ -250,6 +304,71 @@ mod tests {
         assert_eq!(provider.info().backend, TtsBackend::Orpheus);
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn resolve_full_moss_local_needs_sidecar() {
+        let cfg = TtsConfig::default();
+        let data_dir = Path::new("/data");
+        assert!(resolve_tts_provider_full(TtsBackend::MossLocal, &cfg, data_dir, None).is_none());
+        assert!(resolve_tts_provider(TtsBackend::MossLocal, &cfg, data_dir).is_none());
+
+        let sidecar: Arc<dyn TtsSidecar> = Arc::new(NoopSidecar);
+        let provider =
+            resolve_tts_provider_full(TtsBackend::MossLocal, &cfg, data_dir, Some(sidecar))
+                .expect("moss_local resolves with a sidecar");
+        assert_eq!(provider.info().backend, TtsBackend::MossLocal);
+        assert_eq!(provider.info().model, "moss-tts-local-int8");
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn resolve_full_moss_ttsd_is_none_even_with_sidecar() {
+        let cfg = TtsConfig::default();
+        let sidecar: Arc<dyn TtsSidecar> = Arc::new(NoopSidecar);
+        assert!(
+            resolve_tts_provider_full(
+                TtsBackend::MossTtsd,
+                &cfg,
+                Path::new("/data"),
+                Some(sidecar)
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn resolve_orpheus_via_wrapper_ignores_absent_sidecar() {
+        let cfg = TtsConfig::default();
+        let provider = resolve_tts_provider(TtsBackend::Orpheus, &cfg, Path::new("/data"))
+            .expect("orpheus resolves without a sidecar");
+        assert_eq!(provider.info().backend, TtsBackend::Orpheus);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    struct NoopSidecar;
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[async_trait]
+    impl crate::tts::sidecar::TtsSidecar for NoopSidecar {
+        async fn start(&self) -> Result<(), LensError> {
+            Ok(())
+        }
+        async fn stop(&self) -> Result<(), LensError> {
+            Ok(())
+        }
+        async fn health(&self) -> bool {
+            true
+        }
+        async fn synthesize_turn(
+            &self,
+            _turn: &Turn,
+            _voices: &VoiceConfig,
+            _cancel: &CancellationToken,
+        ) -> Result<AudioBuffer, LensError> {
+            Ok(AudioBuffer::mono(vec![0.0; 8], audio::TARGET_RATE))
+        }
+    }
+
     #[test]
     fn emotion_tag_orpheus_table() {
         assert_eq!(emotion_tag(Emotion::Neutral, TtsBackend::Orpheus), None);
@@ -265,6 +384,7 @@ mod tests {
         assert_eq!(emotion_tag(Emotion::Thoughtful, TtsBackend::Orpheus), None);
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn emotion_tag_none_for_non_orpheus_backends() {
         for emotion in [
@@ -294,9 +414,14 @@ mod tests {
 
     #[test]
     fn backend_as_str_and_from_opt_str_round_trip() {
+        // The MOSS variants are cfg-gated, so off Apple Silicon this array is a
+        // single element — the loop shape is target-dependent, not a mistake.
+        #[allow(clippy::single_element_loop)]
         for b in [
             TtsBackend::Orpheus,
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             TtsBackend::MossLocal,
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             TtsBackend::MossTtsd,
         ] {
             assert_eq!(TtsBackend::from_opt_str(Some(b.as_str())), b);
@@ -318,6 +443,7 @@ mod tests {
     fn backend_serde_round_trips_including_cloud() {
         for b in [
             TtsBackend::Orpheus,
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             TtsBackend::MossLocal,
             TtsBackend::Cloud(CloudTtsKind::ElevenLabs),
         ] {

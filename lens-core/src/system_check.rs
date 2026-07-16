@@ -607,8 +607,23 @@ fn has_cloud_tts(config: &AppConfig) -> bool {
 /// disk AND both voices are saved, OR a cloud TTS provider is configured.
 fn probe_text_to_speech(config: &AppConfig) -> CheckResult {
     let data_dir = Path::new(&config.paths.data_dir);
-    // A backend is local-model-ready only when it names artifacts AND all of them
-    // are on disk. An empty list (cloud / not-yet-wired) is never engine-ready.
+
+    // MossLocal (Apple-Silicon only) provisions runtime + model on demand and
+    // ships default voices, so it is ready with no prefetch. Off Apple Silicon
+    // the variant does not exist, so this block compiles out.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if matches!(config.tts.backend, crate::tts::TtsBackend::MossLocal) {
+        return CheckResult {
+            id: CheckId::TextToSpeech,
+            label: "Text-to-speech".to_string(),
+            status: CheckStatus::Pass,
+            detail: "Audio engine ready".to_string(),
+            action: Some(CheckAction::Choose),
+        };
+    }
+
+    // Other local backends are ready only when they name artifacts AND all are on
+    // disk (an empty list is never ready).
     let required = config.tts.backend.required_model_ids();
     let engine_ready = !required.is_empty()
         && required

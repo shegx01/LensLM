@@ -577,6 +577,7 @@ mod tests {
         assert!(voices.iter().any(|v| v.id == "tara"));
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn resolve_voices_non_embedded_backend_is_empty() {
         let cfg = lens_core::TtsConfig {
