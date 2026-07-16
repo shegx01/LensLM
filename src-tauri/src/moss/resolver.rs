@@ -99,16 +99,17 @@ fn warn_tts<E: std::fmt::Display>(msg: &'static str) -> impl FnOnce(E) -> LensEr
 /// Prefer a system `uv`; else reuse a previously provisioned one; else download it.
 ///
 /// A system `uv` on PATH is trusted the same as any developer tool (a PATH-hijack
-/// is out of scope). A previously-provisioned `uv` is re-checked with `--version`
-/// before reuse so a truncated/broken install self-heals via re-provision rather
-/// than being executed forever (bare `is_file()` would accept a partial binary).
+/// is out of scope). A previously-provisioned `uv` is reused only when its
+/// `--version` still matches the pinned [`UV_VERSION`] — a truncated/broken
+/// install, or one left over from before a pin bump, falls through and
+/// re-provisions instead of being executed forever.
 fn find_or_provision_uv(app_data_dir: &Path) -> Result<PathBuf, LensError> {
     if let Some(uv) = system_uv() {
         return Ok(uv);
     }
     let bin_dir = app_data_dir.join("bin");
     let uv_path = bin_dir.join("uv");
-    if uv_path.is_file() && uv_runs(&uv_path) {
+    if uv_path.is_file() && uv_is_pinned(&uv_path) {
         return Ok(uv_path);
     }
     let _ = std::fs::remove_file(&uv_path);
@@ -149,18 +150,18 @@ fn uv_version_supported(version_line: &str) -> bool {
         .is_some_and(|(major, minor)| major > 0 || minor >= 8)
 }
 
-/// True if `uv_path --version` runs successfully (a cheap install-integrity check;
-/// re-hashing is not possible here — `UV_SHA256` is over the tarball, not the
-/// extracted binary. Tamper by another same-user process is out of scope).
-fn uv_runs(uv_path: &Path) -> bool {
+/// True if `uv_path --version` runs successfully AND its output contains the
+/// pinned [`UV_VERSION`] (re-hashing is not possible here — `UV_SHA256` is over
+/// the tarball, not the extracted binary; a version mismatch after a pin bump
+/// is the case this exists to catch).
+fn uv_is_pinned(uv_path: &Path) -> bool {
     std::process::Command::new(uv_path)
         .arg("--version")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .output()
+        .is_ok_and(|out| {
+            out.status.success() && String::from_utf8_lossy(&out.stdout).contains(UV_VERSION)
+        })
 }
 
 /// Downloads the pinned `uv` archive, verifies its SHA256, extracts the binary
@@ -234,7 +235,29 @@ fn download_uv(bin_dir: &Path) -> Result<PathBuf, LensError> {
 
 #[cfg(test)]
 mod tests {
-    use super::uv_version_supported;
+    use super::{uv_is_pinned, uv_version_supported};
+
+    /// Writes an executable shell stub at `dir/uv` that prints `version_line` to
+    /// stdout for `--version` and exits 0, mimicking a real `uv` binary closely
+    /// enough for `uv_is_pinned`'s output-matching to exercise.
+    fn stub_uv(dir: &std::path::Path, version_line: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("uv");
+        std::fs::write(&path, format!("#!/bin/sh\necho '{version_line}'\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[test]
+    fn uv_is_pinned_accepts_matching_version_and_rejects_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let matching = stub_uv(dir.path(), "uv 0.11.29 (abc 2026-01-01)");
+        assert!(uv_is_pinned(&matching));
+
+        let drifted_dir = tempfile::tempdir().unwrap();
+        let drifted = stub_uv(drifted_dir.path(), "uv 0.9.0 (abc 2025-01-01)");
+        assert!(!uv_is_pinned(&drifted));
+    }
 
     #[test]
     fn version_gate_accepts_recent_and_rejects_old_or_garbage() {
