@@ -31,9 +31,24 @@ mod stream;
 use std::sync::Arc;
 
 use lens_core::LensEngine;
-use tauri::Manager;
+use tauri::{Manager, WebviewWindowBuilder};
 
 use crate::render::TauriJsRenderer;
+
+fn main_nav_allowed(url: &tauri::Url) -> bool {
+    if cfg!(dev) {
+        return url.scheme() == "http"
+            && url.host_str() == Some("localhost")
+            && url.port() == Some(1420);
+    }
+    match url.scheme() {
+        "tauri" => url.host_str() == Some("localhost"),
+        "http" if cfg!(windows) || cfg!(target_os = "android") => {
+            url.host_str() == Some("tauri.localhost")
+        }
+        _ => false,
+    }
+}
 
 fn main() {
     // Initialize a tracing subscriber so engine/command spans are visible.
@@ -58,6 +73,18 @@ fn main() {
         // Resolve the OS app-data dir, init the engine (open db + migrate +
         // load config) on it, and store the handle in Tauri managed state.
         .setup(|app| {
+            let main_cfg = app
+                .config()
+                .app
+                .windows
+                .iter()
+                .find(|w| w.label == "main")
+                .ok_or("`main` window must stay declared in tauri.conf.json")?
+                .clone();
+            WebviewWindowBuilder::from_config(app.handle(), &main_cfg)?
+                .on_navigation(main_nav_allowed)
+                .build()?;
+
             let data_dir = app.path().app_data_dir()?;
             let engine = tauri::async_runtime::block_on(LensEngine::init(&data_dir))?;
             app.manage(engine);
@@ -198,4 +225,31 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("Fatal Error: Failed to launch the LensLM application context.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::main_nav_allowed;
+
+    fn allow(s: &str) -> bool {
+        main_nav_allowed(&tauri::Url::parse(s).unwrap())
+    }
+
+    #[test]
+    fn main_nav_rejects_foreign_and_untrusted_origins() {
+        assert!(!allow("https://evil.com/phish"));
+        assert!(!allow("http://localhost:9999/x"));
+        assert!(!allow("file:///etc/passwd"));
+        assert!(!allow("data:text/html,<h1>x</h1>"));
+        assert!(!allow("tauri://evil.example/x"));
+    }
+
+    #[test]
+    fn main_nav_allows_own_origin() {
+        if cfg!(dev) {
+            assert!(allow("http://localhost:1420/"));
+        } else {
+            assert!(allow("tauri://localhost/index.html"));
+        }
+    }
 }

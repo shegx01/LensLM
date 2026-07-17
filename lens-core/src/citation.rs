@@ -12,13 +12,17 @@
 //! 1-based [`Citation::ordinal`] (fresh first-appearance rank over surviving
 //! citations; dropped markers do not consume an ordinal).
 //!
-//! Grammar (strict ASCII, hand-rolled scan — no `regex` dep): `[` then one or more
-//! ASCII `0-9` then `]`. `[1,2]`/`[1-3]`/`[ 1 ]` are dropped (not the grammar);
+//! Grammar (ASCII, hand-rolled scan — no `regex` dep): `[`, then a comma-separated
+//! list of one or more base-10 numbers with optional surrounding/internal
+//! whitespace, then `]`. So `[1]`, `[1,2]`, `[1, 2]`, and `[ 1 ]` all parse (models
+//! emit these despite the preferred `[1][2]` instruction, and dropping them silently
+//! loses citations). A marker parses only when EVERY bracketed part is a bare
+//! integer — `[1-3]` ranges, prose, empty parts, non-ASCII digits, and
+//! `usize`-overflow reject the marker WHOLESALE (never a partial/false citation).
 //! `[[1]]` matches the inner `[1]`; `[1](url)` yields `n=1` (the paren is not
-//! consumed — not markdown-link aware); non-ASCII digits and `usize`-overflow are
-//! dropped. A `[1]` echoed inside a code fence IS scanned (the scanner is
-//! context-free by design). Out-of-range/malformed markers are dropped and logged
-//! at `debug`, never `Err`, never `panic!`.
+//! consumed — not markdown-link aware). A `[1]` echoed inside a code fence IS
+//! scanned (the scanner is context-free by design). Out-of-range/malformed markers
+//! are dropped and logged at `debug`, never `Err`, never `panic!`.
 
 use std::collections::HashMap;
 
@@ -73,8 +77,10 @@ pub struct ChunkLocatorRow {
     pub char_end: Option<usize>,
 }
 
-/// Scans `answer` for `[digits]` markers, returning `(byte_pos, n)` in appearance
-/// order. Non-ASCII digits, empty brackets, and `usize`-overflow are dropped.
+/// Scans `answer` for citation markers, returning `(byte_pos, n)` for every source
+/// number referenced, in appearance order (a list marker like `[1,2]` yields one
+/// entry per number, all sharing the marker's byte position). See the module header
+/// for the accepted grammar.
 fn parse_markers(answer: &str) -> Vec<(usize, usize)> {
     let bytes = answer.as_bytes();
     let mut markers = Vec::new();
@@ -85,30 +91,48 @@ fn parse_markers(answer: &str) -> Vec<(usize, usize)> {
             continue;
         }
         let start = i;
-        let mut j = i + 1;
-        while j < bytes.len() && bytes[j].is_ascii_digit() {
-            j += 1;
-        }
-        // Require at least one digit and a closing bracket immediately after.
-        if j > i + 1 && j < bytes.len() && bytes[j] == b']' {
-            // Digits are ASCII 0-9 only, so this is valid UTF-8.
-            let digits = &answer[i + 1..j];
-            match digits.parse::<usize>() {
-                Ok(n) => {
-                    markers.push((start, n));
-                    i = j + 1;
-                    continue;
-                }
-                Err(_) => {
-                    tracing::debug!(marker = %digits, "malformed marker: digits overflow usize");
-                }
+        // Scan to the first closing bracket after this `[`.
+        let close = match answer[start + 1..].find(']') {
+            Some(off) => start + 1 + off,
+            None => {
+                i = start + 1;
+                continue;
             }
+        };
+        match parse_marker_list(&answer[start + 1..close]) {
+            Some(ns) => {
+                for n in ns {
+                    markers.push((start, n));
+                }
+                i = close + 1;
+            }
+            // Not a marker: step past this `[` so `[[1]]` still finds the inner `[1]`.
+            None => i = start + 1,
         }
-        // Not a valid marker: advance past this `[` and keep scanning (so `[[1]]`
-        // finds the inner `[1]`).
-        i = start + 1;
     }
     markers
+}
+
+/// Parses the text between `[` and `]` as a comma-separated list of base-10 source
+/// numbers, tolerating whitespace. Returns `None` unless EVERY part is a bare
+/// integer, so ranges (`1-3`), prose, and empty parts reject the whole marker rather
+/// than emit a partial/false citation. `usize`-overflow is dropped (logged `debug`).
+fn parse_marker_list(inner: &str) -> Option<Vec<usize>> {
+    let mut ns = Vec::new();
+    for part in inner.split(',') {
+        let t = part.trim();
+        if t.is_empty() || !t.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        match t.parse::<usize>() {
+            Ok(n) => ns.push(n),
+            Err(_) => {
+                tracing::debug!(marker = %t, "malformed marker: digits overflow usize");
+                return None;
+            }
+        }
+    }
+    (!ns.is_empty()).then_some(ns)
 }
 
 /// Extracts citations from a grounded `answer` by parsing `[n]` markers and mapping
@@ -264,10 +288,30 @@ mod tests {
     }
 
     #[test]
-    fn drops_comma_dash_and_internal_whitespace() {
-        assert!(parse_markers("[1,2]").is_empty());
+    fn parses_comma_separated_list() {
+        assert_eq!(ns(&parse_markers("[1,2]")), vec![1, 2]);
+        assert_eq!(ns(&parse_markers("[1, 2]")), vec![1, 2]);
+        assert_eq!(ns(&parse_markers("[10, 2, 3]")), vec![10, 2, 3]);
+    }
+
+    #[test]
+    fn parses_internal_and_surrounding_whitespace() {
+        assert_eq!(ns(&parse_markers("[ 1 ]")), vec![1]);
+        assert_eq!(ns(&parse_markers("[  12  ]")), vec![12]);
+    }
+
+    #[test]
+    fn drops_range_markers() {
+        // Ranges are ambiguous to expand, so a `-` rejects the whole marker.
         assert!(parse_markers("[1-3]").is_empty());
-        assert!(parse_markers("[ 1 ]").is_empty());
+    }
+
+    #[test]
+    fn mixed_valid_and_prose_rejects_whole_marker() {
+        // Every comma part must be a bare integer — no partial/false citation.
+        assert!(parse_markers("[1, and more]").is_empty());
+        assert!(parse_markers("[1,]").is_empty());
+        assert!(parse_markers("[see 1, 2 below]").is_empty());
     }
 
     #[test]
