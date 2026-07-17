@@ -109,11 +109,11 @@
   <div class="px-4 pt-3" in:enterRise={{ y: finalized ? 6 : 0 }}>
     <div class="flex flex-col gap-2">
       <div
-        class="ai-avatar flex size-6 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground"
+        class="ai-avatar inline-flex text-primary"
         data-streaming={!finalized}
         aria-hidden="true"
       >
-        <Sparkles class="size-3.5" strokeWidth={1.75} />
+        <Sparkles class="size-4" strokeWidth={2} />
       </div>
 
       <div class="min-w-0 flex-1">
@@ -167,10 +167,10 @@
 {/if}
 
 <style>
-  /* While streaming, the ✦ avatar breathes a soft primary glow so the answer
+  /* While streaming, the bare ✦ glyph breathes a soft glow + pulse so the answer
      reads as actively arriving. Gated by --rail-motion (calm on reduce-motion). */
   .ai-avatar[data-streaming='true'] {
-    animation: aiPulse calc(1.8s / max(var(--rail-motion, 1), 0.0001)) var(--ease-out, ease)
+    animation: aiPulse calc(1.6s / max(var(--rail-motion, 1), 0.0001)) var(--ease-out, ease)
       infinite;
   }
   :global([data-motion='off']) .ai-avatar[data-streaming='true'],
@@ -180,10 +180,12 @@
   @keyframes aiPulse {
     0%,
     100% {
-      box-shadow: 0 0 0 0 color-mix(in oklch, var(--primary) 40%, transparent);
+      opacity: 0.5;
+      filter: drop-shadow(0 0 0 transparent);
     }
     50% {
-      box-shadow: 0 0 0 4px color-mix(in oklch, var(--primary) 0%, transparent);
+      opacity: 1;
+      filter: drop-shadow(0 0 5px color-mix(in oklch, var(--primary) 55%, transparent));
     }
   }
 
