@@ -9,6 +9,7 @@
   import Download from '@lucide/svelte/icons/download';
   import {
     downloadTtsModel,
+    prepareQwenModel,
     ttsModelDownloaded,
     saveTtsProvider,
     nextTtsConfig,
@@ -98,9 +99,13 @@
     savingCloud || (hasSavedKey ? !editingKey || !cloudApiKey.trim() : !cloudApiKey.trim())
   );
 
-  /** True once every model artifact the selected local engine needs is on disk
-   *  (trivially true for an engine with no registry-tracked artifacts, e.g. Qwen3Local). */
+  /** True once the selected local engine's weights are on disk. Qwen has no
+   *  registry-tracked artifacts (`required_model_ids` is empty) — presence is
+   *  instead an HF-snapshot check via `tts_model_downloaded`. */
   async function engineDownloaded(): Promise<boolean> {
+    if (selectedEngine === 'qwen3_local') {
+      return ttsModelDownloaded('qwen3_local', '');
+    }
     for (const model of modelIds) {
       if (!(await ttsModelDownloaded(selectedEngine, model))) return false;
     }
@@ -177,10 +182,16 @@
     downloadError = null;
     downloadProgress = 0;
     try {
-      for (const [i, model] of modelIds.entries()) {
-        await downloadTtsModel(selectedEngine, model, (pct) => {
-          downloadProgress = Math.round(((i + pct / 100) / modelIds.length) * 100);
+      if (selectedEngine === 'qwen3_local') {
+        await prepareQwenModel((pct) => {
+          downloadProgress = pct;
         });
+      } else {
+        for (const [i, model] of modelIds.entries()) {
+          await downloadTtsModel(selectedEngine, model, (pct) => {
+            downloadProgress = Math.round(((i + pct / 100) / modelIds.length) * 100);
+          });
+        }
       }
       downloadProgress = 100;
       downloaded = true;

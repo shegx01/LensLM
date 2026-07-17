@@ -8,12 +8,19 @@ only (MLX requires it). See README.md for the wire contract and runtime.
 CustomVoice is a fixed-preset-speaker + instruct-string engine: no reference
 clip, no transcript, no ASR — the speaker id selects a bundled voice and the
 instruct string steers its delivery.
+
+Two modes: the default serve loop (synthesis over stdio), and a one-shot
+`--prepare` mode (#194) that explicitly downloads the model, streaming
+`{"progress":{"received","total"}}` lines and a final `{"done":true}`, then
+exits — without importing MLX or loading the model.
 """
 
 import json
 import math
+import os
 import sys
 import tempfile
+import threading
 import wave
 
 import numpy as np
@@ -22,10 +29,20 @@ import numpy as np
 # HF cache on first synth (~4.5 GB); the Rust side sets HF_HOME to app-data.
 MODEL_ID = "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-bf16"
 
+# huggingface_hub's on-disk cache subdir for MODEL_ID (under `$HF_HOME/hub`).
+# Kept in lockstep with the Rust presence check (`qwen::QWEN_SNAPSHOT_DIR`).
+CACHE_SUBDIR = "models--mlx-community--Qwen3-TTS-12Hz-1.7B-CustomVoice-bf16"
+
 # Symmetric guards fall back to these when a request omits or malforms a param.
 # The Rust host currently sends neither, so these are the effective values.
 DEFAULT_TEMPERATURE = 0.9
 DEFAULT_MAX_TOKENS = 4096
+
+# Prepare-mode progress cadence: poll the cache dir this often (seconds) and emit
+# only when cumulative bytes advanced by at least this many bytes, so a multi-GB
+# pull streams ~progress without spamming the pipe.
+PREPARE_POLL_INTERVAL = 1.0
+PREPARE_MIN_EMIT_BYTES = 2 * 1024 * 1024
 
 
 def load_qwen():
@@ -114,7 +131,8 @@ def handle_synth(model, speaker_map: dict, req: dict) -> str:
     return write_wav_mono(np.array(output.audio), int(output.sample_rate))
 
 
-def main() -> None:
+def serve() -> None:
+    """Default mode: load the model, announce readiness, then serve synth over stdio."""
     try:
         model, speaker_map = load_qwen()
     except Exception as exc:
@@ -148,6 +166,105 @@ def main() -> None:
                 send({"id": req_id, "ok": False, "error": f"unknown op: {op}"})
         except Exception as exc:
             send({"id": req_id, "ok": False, "error": str(exc)[:200]})
+
+
+def parse_prepare(argv: list) -> bool:
+    """True when invoked in one-shot prepare (download) mode."""
+    return "--prepare" in argv
+
+
+def dir_size_bytes(path: str) -> int:
+    """Cumulative size of every file under `path` (incl. huggingface_hub's
+    `blobs/*.incomplete` partials). Best-effort: unreadable entries count as 0."""
+    total = 0
+    try:
+        for root, _dirs, files in os.walk(path):
+            for name in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, name))
+                except OSError:
+                    continue
+    except OSError:
+        return total
+    return total
+
+
+def model_cache_dir() -> str:
+    """The on-disk cache dir for MODEL_ID under `$HF_HOME/hub` (the Rust resolver
+    sets HF_HOME; snapshot_download honors it). Falls back to the HF default home."""
+    hf_home = os.environ.get("HF_HOME") or os.path.join(
+        os.path.expanduser("~"), ".cache", "huggingface"
+    )
+    return os.path.join(hf_home, "hub", CACHE_SUBDIR)
+
+
+def _poll_progress(cache_dir, total, stop_event, emit, interval) -> None:
+    """Poll `cache_dir` size until `stop_event`, emitting throttled cumulative
+    byte progress. Byte counts (not huggingface_hub's per-file tqdm) are the
+    source of truth: in huggingface_hub 1.x, `snapshot_download`'s `tqdm_class`
+    drives only the outer file-count bar, so disk polling is what yields bytes."""
+    last = -1
+    while not stop_event.wait(interval):
+        received = dir_size_bytes(cache_dir)
+        if received > 0 and (last < 0 or received - last >= PREPARE_MIN_EMIT_BYTES):
+            last = received
+            emit({"progress": {"received": received, "total": total}})
+
+
+def _compute_total_bytes(hf):
+    """Best-effort total download size (bytes); None when metadata is unavailable
+    (the Rust/UI side then shows an indeterminate bar)."""
+    try:
+        info = hf.HfApi().model_info(MODEL_ID, files_metadata=True)
+        total = sum(s.size for s in (info.siblings or []) if getattr(s, "size", None))
+        return total or None
+    except Exception:
+        return None
+
+
+def run_prepare(hf=None, emit=send, interval=PREPARE_POLL_INTERVAL) -> int:
+    """One-shot: download the MODEL_ID snapshot into `$HF_HOME`, streaming
+    cumulative byte progress, then a final `{"done":true}`. Returns the intended
+    process exit code (0 ok, 1 error). MLX is never imported. `hf`/`interval` are
+    injectable for offline tests."""
+    if hf is None:
+        try:
+            import huggingface_hub as hf  # noqa: PLC0415 (lazy: avoid MLX/env cost in serve mode)
+        except Exception as exc:
+            emit({"error": f"huggingface_hub import failed: {exc}"[:200]})
+            return 1
+
+    total = _compute_total_bytes(hf)
+    cache_dir = model_cache_dir()
+    stop_event = threading.Event()
+    poller = threading.Thread(
+        target=_poll_progress,
+        args=(cache_dir, total, stop_event, emit, interval),
+        daemon=True,
+    )
+    poller.start()
+    try:
+        # snapshot_download honors HF_HOME (set by the resolver) → no explicit cache_dir.
+        hf.snapshot_download(MODEL_ID)
+    except Exception as exc:
+        stop_event.set()
+        poller.join(timeout=2)
+        emit({"error": str(exc)[:200]})
+        return 1
+
+    stop_event.set()
+    poller.join(timeout=2)
+    # Deterministic final tick at the true on-disk size, then completion.
+    emit({"progress": {"received": dir_size_bytes(cache_dir), "total": total}})
+    emit({"done": True})
+    return 0
+
+
+def main(argv=None) -> None:
+    argv = sys.argv[1:] if argv is None else argv
+    if parse_prepare(argv):
+        sys.exit(run_prepare())
+    serve()
 
 
 if __name__ == "__main__":

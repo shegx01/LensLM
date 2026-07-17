@@ -128,6 +128,22 @@ export async function downloadTtsModel(
   await invoke<void>('download_tts_model', { engine, model, onProgress: channel });
 }
 
+/**
+ * Prepare (download) the Qwen3-TTS MLX model, streaming 0–100% progress. Apple-Silicon
+ * only — the backing command is absent elsewhere. No-op outside Tauri. Mirrors
+ * `downloadTtsModel`.
+ */
+export async function prepareQwenModel(onProgress: (pct: number) => void): Promise<void> {
+  if (!isTauri()) return;
+  const channel = new Channel<DownloadProgress>();
+  channel.onmessage = (p) => {
+    const pct = toPct(p.received, p.total);
+    if (pct !== null) onProgress(pct);
+    else if (p.done) onProgress(100);
+  };
+  await invoke<void>('prepare_qwen_model', { onProgress: channel });
+}
+
 /** List the active backend's named-voice catalog. Adapter-driven — empty when no provider resolves. */
 export async function listTtsVoices(): Promise<TtsVoice[]> {
   if (!isTauri()) return [];

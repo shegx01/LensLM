@@ -173,7 +173,12 @@ pub async fn download_tts_model(
 }
 
 /// Returns whether the given TTS model artifact is already on disk, so the
-/// onboarding UI can skip the download step. Mirrors `whisper_model_downloaded`.
+/// onboarding/Settings UI can skip the download step. Mirrors `whisper_model_downloaded`.
+///
+/// `engine == "qwen3_local"` (#194) is special-cased: Qwen's MLX weights live in
+/// the huggingface_hub cache (not the `models/<id>/` registry), so presence is the
+/// HF-snapshot check under `HF_HOME` and `model` is ignored. Apple-Silicon only;
+/// off-target the engine does not exist, so it falls through to the registry probe.
 #[tracing::instrument(skip_all, fields(engine = %engine, model = %model))]
 #[tauri::command(rename_all = "snake_case")]
 pub async fn tts_model_downloaded(
@@ -181,11 +186,37 @@ pub async fn tts_model_downloaded(
     model: String,
     app: tauri::AppHandle,
 ) -> Result<bool, LensError> {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if engine == "qwen3_local" {
+        let paths = crate::qwen::sidecar_paths(&app)?;
+        return Ok(crate::qwen::qwen_snapshot_present(&paths.hf_cache_dir));
+    }
     let data_dir = app
         .path()
         .app_data_dir()
         .map_err(|e| LensError::Io(e.to_string()))?;
     Ok(lens_core::tts_model_downloaded(&data_dir, &model))
+}
+
+/// Explicitly downloads the Qwen3-TTS MLX model (~4.5 GB) via a one-shot sidecar
+/// `--prepare` process, streaming byte progress on `on_progress` (#194). Mirrors
+/// `download_tts_model`'s Channel contract; Qwen's weights are otherwise fetched
+/// lazily by the sidecar on first synth. Apple-Silicon only (the Qwen target).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[tracing::instrument(skip_all)]
+#[tauri::command]
+pub async fn prepare_qwen_model(
+    on_progress: Channel<DownloadProgress>,
+    app: tauri::AppHandle,
+) -> Result<(), LensError> {
+    let paths = crate::qwen::sidecar_paths(&app)?;
+    let resolver = crate::qwen::spawn_resolver(&paths);
+    crate::qwen::run_prepare(resolver, move |progress| {
+        if let Err(e) = on_progress.send(progress) {
+            tracing::warn!("prepare_qwen_model: progress channel send failed: {e}");
+        }
+    })
+    .await
 }
 
 /// UI representation of a Whisper model entry from the registry.
