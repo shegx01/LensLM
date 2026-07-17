@@ -7,6 +7,7 @@ vi.mock('./ipc.js', () => ({
   cancelAsk: vi.fn().mockResolvedValue(true),
   saveChatUser: vi.fn(),
   saveChatAssistant: vi.fn(),
+  saveChatMarker: vi.fn(),
   setChatFeedback: vi.fn().mockResolvedValue(undefined),
   listChatMessages: vi.fn()
 }));
@@ -26,6 +27,7 @@ import {
   cancelAsk,
   saveChatUser,
   saveChatAssistant,
+  saveChatMarker,
   listChatMessages
 } from './ipc.js';
 import type { AskNotebookHandlers } from './ipc.js';
@@ -37,10 +39,18 @@ const NB = 'nb-001';
 beforeEach(() => {
   vi.clearAllMocks();
   resetChatStore();
+  // rAF-coalesced deltas (FE-3): stub requestAnimationFrame to run synchronously so
+  // TextDelta events land in answerBuffer deterministically without a real frame tick.
+  vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback): number => {
+    cb(0);
+    return 0;
+  });
+  vi.stubGlobal('cancelAnimationFrame', (): void => {});
 });
 
 afterEach(() => {
   resetChatStore();
+  vi.unstubAllGlobals();
 });
 
 describe('hydrate / grouping', () => {
@@ -103,11 +113,11 @@ describe('send / persist-exactly-once fixture', () => {
     const citations: Citation[] = [{ source_id: 'src-1', ordinal: 1, locators: [] }];
 
     vi.mocked(askNotebook).mockImplementation(
-      async (_nb: string, _q: string, handlers: AskNotebookHandlers) => {
+      async (_nb: string, _turnId: string, _q: string, handlers: AskNotebookHandlers) => {
         handlers.onEvent({ TextDelta: 'a' });
         handlers.onEvent({ TextDelta: 'b' });
         handlers.onEvent({ Citations: citations });
-        handlers.onEvent({ Done: { tokens_used: 42 } });
+        handlers.onEvent({ Done: { tokens_used: 42, grounded: true, citation_count: 0 } });
         handlers.onStreamDone();
       }
     );
@@ -145,10 +155,10 @@ describe('send / persist-exactly-once fixture', () => {
     );
 
     vi.mocked(askNotebook).mockImplementation(
-      async (_nb: string, _q: string, handlers: AskNotebookHandlers) => {
+      async (_nb: string, _turnId: string, _q: string, handlers: AskNotebookHandlers) => {
         handlers.onEvent({ TextDelta: 'answer' });
         handlers.onEvent({ Citations: citations });
-        handlers.onEvent({ Done: { tokens_used: 7 } });
+        handlers.onEvent({ Done: { tokens_used: 7, grounded: true, citation_count: 0 } });
         handlers.onStreamDone();
       }
     );
@@ -166,7 +176,7 @@ describe('send / persist-exactly-once fixture', () => {
     // First send's stream never reaches Done/onStreamDone/onFailed, so `streaming`
     // stays true after it resolves — simulating a still-in-flight turn.
     vi.mocked(askNotebook).mockImplementationOnce(
-      async (_nb: string, _q: string, handlers: AskNotebookHandlers) => {
+      async (_nb: string, _turnId: string, _q: string, handlers: AskNotebookHandlers) => {
         handlers.onEvent({ Stage: 'Retrieving' });
       }
     );
@@ -175,8 +185,8 @@ describe('send / persist-exactly-once fixture', () => {
     expect(chatStore.streaming(NB)).toBe(true);
 
     vi.mocked(askNotebook).mockImplementationOnce(
-      async (_nb: string, _q: string, handlers: AskNotebookHandlers) => {
-        handlers.onEvent({ Done: { tokens_used: 1 } });
+      async (_nb: string, _turnId: string, _q: string, handlers: AskNotebookHandlers) => {
+        handlers.onEvent({ Done: { tokens_used: 1, grounded: true, citation_count: 0 } });
         handlers.onStreamDone();
       }
     );
@@ -195,7 +205,7 @@ describe('send / persist-exactly-once fixture', () => {
     // First send's askNotebook captures its handlers but never calls them —
     // simulating a cancel command that resolves before the prior stream drains.
     vi.mocked(askNotebook).mockImplementationOnce(
-      async (_nb: string, _q: string, handlers: AskNotebookHandlers) => {
+      async (_nb: string, _turnId: string, _q: string, handlers: AskNotebookHandlers) => {
         staleHandlers = handlers;
         handlers.onEvent({ TextDelta: 'stale-first-turn-text' });
       }
@@ -207,7 +217,7 @@ describe('send / persist-exactly-once fixture', () => {
     // Second send's stream stays in-flight (never reaches Done) so we can
     // observe corruption from the stale handler if the guard were absent.
     vi.mocked(askNotebook).mockImplementationOnce(
-      async (_nb: string, _q: string, handlers: AskNotebookHandlers) => {
+      async (_nb: string, _turnId: string, _q: string, handlers: AskNotebookHandlers) => {
         handlers.onEvent({ TextDelta: 'second-turn-text' });
       }
     );
@@ -230,7 +240,7 @@ describe('cancel path', () => {
   it('keeps partial answerBuffer in-session and persists nothing', async () => {
     vi.mocked(saveChatUser).mockResolvedValue(makeChatMessage({ id: 'u1' }));
     vi.mocked(askNotebook).mockImplementation(
-      async (_nb: string, _q: string, handlers: AskNotebookHandlers) => {
+      async (_nb: string, _turnId: string, _q: string, handlers: AskNotebookHandlers) => {
         handlers.onEvent({ TextDelta: 'partial' });
         handlers.onFailed({ kind: 'Cancelled', message: 'answer generation cancelled' });
       }
@@ -243,13 +253,50 @@ describe('cancel path', () => {
     expect(chatStore.streaming(NB)).toBe(false);
     expect(chatStore.error(NB)).toBeNull();
   });
+
+  it('persists a cancelled marker with the partial answer and pushes it as a version (PC-1)', async () => {
+    vi.mocked(saveChatUser).mockResolvedValue(makeChatMessage({ id: 'u1' }));
+    vi.mocked(saveChatMarker).mockResolvedValue(
+      makeChatMessage({
+        id: 'm1',
+        role: 'assistant',
+        state: 'cancelled',
+        content: 'partial answer'
+      })
+    );
+    vi.mocked(askNotebook).mockImplementation(
+      async (_nb: string, _turnId: string, _q: string, handlers: AskNotebookHandlers) => {
+        handlers.onEvent({ TextDelta: 'partial' });
+        handlers.onEvent({ TextDelta: ' answer' });
+        handlers.onFailed({ kind: 'Cancelled', message: 'answer generation cancelled' });
+        // persistTerminalMarker is fire-and-forget from onFailed; flush microtasks
+        // so its saveChatMarker call + in-session version push settle before we assert.
+        await Promise.resolve();
+        await Promise.resolve();
+      }
+    );
+
+    await send(NB, 'q');
+
+    expect(saveChatMarker).toHaveBeenCalledTimes(1);
+    const [notebookId, turnId, content, state, errorKind] = vi.mocked(saveChatMarker).mock.calls[0];
+    expect(notebookId).toBe(NB);
+    expect(typeof turnId).toBe('string');
+    expect(content).toBe('partial answer');
+    expect(state).toBe('cancelled');
+    expect(errorKind).toBeNull();
+
+    const turns = chatStore.turns(NB);
+    expect(turns[0].versions).toHaveLength(1);
+    expect(turns[0].versions[0].state).toBe('cancelled');
+  });
 });
 
 describe('error path', () => {
   it('sets error state and persists nothing on a non-cancel failure', async () => {
     vi.mocked(saveChatUser).mockResolvedValue(makeChatMessage({ id: 'u1' }));
     vi.mocked(askNotebook).mockImplementation(
-      async (_nb: string, _q: string, handlers: AskNotebookHandlers) => {
+      async (_nb: string, _turnId: string, _q: string, handlers: AskNotebookHandlers) => {
         handlers.onEvent({ TextDelta: 'x' });
         handlers.onFailed({ kind: 'Internal', message: 'boom' });
       }
@@ -266,9 +313,9 @@ describe('error path', () => {
     vi.mocked(saveChatUser).mockResolvedValue(makeChatMessage({ id: 'u1' }));
     vi.mocked(saveChatAssistant).mockRejectedValue(new Error('save failed'));
     vi.mocked(askNotebook).mockImplementation(
-      async (_nb: string, _q: string, handlers: AskNotebookHandlers) => {
+      async (_nb: string, _turnId: string, _q: string, handlers: AskNotebookHandlers) => {
         handlers.onEvent({ TextDelta: 'partial answer' });
-        handlers.onEvent({ Done: { tokens_used: 5 } });
+        handlers.onEvent({ Done: { tokens_used: 5, grounded: true, citation_count: 0 } });
         handlers.onStreamDone();
         // persistOnce is fire-and-forget from the Done handler; flush microtasks
         // so its rejection settles before we assert.
@@ -287,6 +334,39 @@ describe('error path', () => {
     expect(turnId).toBeTruthy();
     expect(chatStore.currentTurnId(NB)).toBe(turnId);
   });
+
+  it('persists an errored marker with the errorKind and the partial answer (PC-1)', async () => {
+    vi.mocked(saveChatUser).mockResolvedValue(makeChatMessage({ id: 'u1' }));
+    vi.mocked(saveChatMarker).mockResolvedValue(
+      makeChatMessage({
+        id: 'm2',
+        role: 'assistant',
+        state: 'errored',
+        error_kind: 'Model',
+        content: 'partial'
+      })
+    );
+    vi.mocked(askNotebook).mockImplementation(
+      async (_nb: string, _turnId: string, _q: string, handlers: AskNotebookHandlers) => {
+        handlers.onEvent({ TextDelta: 'partial' });
+        handlers.onFailed({ kind: 'Model', message: 'the model backend failed' });
+        await Promise.resolve();
+        await Promise.resolve();
+      }
+    );
+
+    await send(NB, 'q');
+
+    expect(saveChatMarker).toHaveBeenCalledTimes(1);
+    const [notebookId, turnId, content, state, errorKind] = vi.mocked(saveChatMarker).mock.calls[0];
+    expect(notebookId).toBe(NB);
+    expect(typeof turnId).toBe('string');
+    expect(content).toBe('partial');
+    expect(state).toBe('errored');
+    expect(errorKind).toBe('Model');
+
+    expect(chatStore.error(NB)).toEqual({ kind: 'Model', message: 'the model backend failed' });
+  });
 });
 
 describe('regenerate', () => {
@@ -304,10 +384,10 @@ describe('regenerate', () => {
     vi.mocked(saveChatAssistant).mockResolvedValue(savedAssistant);
 
     vi.mocked(askNotebook).mockImplementation(
-      async (_nb: string, question: string, handlers: AskNotebookHandlers) => {
+      async (_nb: string, _turnId: string, question: string, handlers: AskNotebookHandlers) => {
         expect(question).toBe('original q');
         handlers.onEvent({ TextDelta: 'answer v1' });
-        handlers.onEvent({ Done: { tokens_used: 10 } });
+        handlers.onEvent({ Done: { tokens_used: 10, grounded: true, citation_count: 0 } });
         handlers.onStreamDone();
       }
     );
@@ -374,5 +454,142 @@ describe('feedback toggle', () => {
 
     const turns = chatStore.turns(NB);
     expect(turns[0].versions[0].feedback).toBe('up');
+  });
+});
+
+describe('superseded turn (FE-2)', () => {
+  it('persists a cancelled marker for the in-flight turn before the new turn starts', async () => {
+    vi.mocked(saveChatUser)
+      .mockResolvedValueOnce(makeChatMessage({ id: 'u1', turn_id: 't1' }))
+      .mockResolvedValueOnce(makeChatMessage({ id: 'u2', turn_id: 't2' }));
+    vi.mocked(saveChatMarker).mockResolvedValue(
+      makeChatMessage({
+        id: 'm1',
+        role: 'assistant',
+        state: 'cancelled',
+        content: 'partial-first'
+      })
+    );
+
+    let firstTurnId = '';
+    // First send's stream never reaches Done/onStreamDone/onFailed — it stays
+    // in-flight (streaming stays true) so the second send must supersede it.
+    vi.mocked(askNotebook).mockImplementationOnce(
+      async (_nb: string, turnId: string, _q: string, handlers: AskNotebookHandlers) => {
+        firstTurnId = turnId;
+        handlers.onEvent({ TextDelta: 'partial-first' });
+      }
+    );
+
+    await send(NB, 'first');
+    expect(chatStore.streaming(NB)).toBe(true);
+
+    vi.mocked(askNotebook).mockImplementationOnce(
+      async (_nb: string, _turnId: string, _q: string, handlers: AskNotebookHandlers) => {
+        handlers.onEvent({ Done: { tokens_used: 1, grounded: true, citation_count: 0 } });
+        handlers.onStreamDone();
+      }
+    );
+    vi.mocked(saveChatAssistant).mockResolvedValue(
+      makeChatMessage({ id: 'a-second', role: 'assistant' })
+    );
+
+    await send(NB, 'second');
+
+    expect(saveChatMarker).toHaveBeenCalledTimes(1);
+    const [notebookId, turnId, content, state, errorKind] = vi.mocked(saveChatMarker).mock.calls[0];
+    expect(notebookId).toBe(NB);
+    expect(turnId).toBe(firstTurnId);
+    expect(content).toBe('partial-first');
+    expect(state).toBe('cancelled');
+    expect(errorKind).toBeNull();
+
+    // markSuperseded runs BEFORE cancelAsk in `send` (see chat-state.svelte.ts),
+    // so the marker call must be ordered ahead of the cancel call.
+    const markerOrder = vi.mocked(saveChatMarker).mock.invocationCallOrder[0];
+    const cancelOrder = vi.mocked(cancelAsk).mock.invocationCallOrder[0];
+    expect(markerOrder).toBeLessThan(cancelOrder);
+  });
+});
+
+describe('marker idempotency (terminalMarked dedupe)', () => {
+  it('persists the marker at most once even if the supersede path and a later cancel callback both fire for the same turn', async () => {
+    vi.mocked(saveChatUser).mockResolvedValue(makeChatMessage({ id: 'u1' }));
+    vi.mocked(saveChatMarker).mockResolvedValue(
+      makeChatMessage({ id: 'm1', role: 'assistant', state: 'cancelled' })
+    );
+
+    let staleHandlers: AskNotebookHandlers | undefined;
+    // First send's askNotebook captures its handlers but never resolves the
+    // terminal callbacks itself — simulating a still-in-flight stream.
+    vi.mocked(askNotebook).mockImplementationOnce(
+      async (_nb: string, _turnId: string, _q: string, handlers: AskNotebookHandlers) => {
+        staleHandlers = handlers;
+        handlers.onEvent({ TextDelta: 'stale-first-turn-text' });
+      }
+    );
+
+    await send(NB, 'first');
+    expect(chatStore.streaming(NB)).toBe(true);
+
+    vi.mocked(askNotebook).mockImplementationOnce(
+      async (_nb: string, _turnId: string, _q: string, handlers: AskNotebookHandlers) => {
+        handlers.onEvent({ TextDelta: 'second-turn-text' });
+      }
+    );
+
+    // Supersede path (FE-2): marks+persists the first turn as cancelled.
+    await send(NB, 'second');
+    expect(saveChatMarker).toHaveBeenCalledTimes(1);
+
+    // The stale first-turn stream's own onFailed('Cancelled') arrives late, after
+    // the supersede already marked+persisted this turn — it must be a no-op, so
+    // the marker is never persisted twice for the same turn_id.
+    staleHandlers?.onFailed({ kind: 'Cancelled', message: 'answer generation cancelled' });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(saveChatMarker).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('grounded flag (SP-3)', () => {
+  it('sets ungroundedTurnId to the turn id when Done arrives with grounded: false', async () => {
+    vi.mocked(saveChatUser).mockResolvedValue(makeChatMessage({ id: 'u1' }));
+    vi.mocked(saveChatAssistant).mockResolvedValue(
+      makeChatMessage({ id: 'a1', role: 'assistant' })
+    );
+    let capturedTurnId = '';
+    vi.mocked(askNotebook).mockImplementation(
+      async (_nb: string, turnId: string, _q: string, handlers: AskNotebookHandlers) => {
+        capturedTurnId = turnId;
+        handlers.onEvent({ TextDelta: 'answer' });
+        handlers.onEvent({ Done: { tokens_used: 3, grounded: false, citation_count: 0 } });
+        handlers.onStreamDone();
+      }
+    );
+
+    await send(NB, 'q');
+
+    expect(capturedTurnId).not.toBe('');
+    expect(chatStore.ungroundedTurnId(NB)).toBe(capturedTurnId);
+  });
+
+  it('leaves ungroundedTurnId null when Done arrives with grounded: true', async () => {
+    vi.mocked(saveChatUser).mockResolvedValue(makeChatMessage({ id: 'u1' }));
+    vi.mocked(saveChatAssistant).mockResolvedValue(
+      makeChatMessage({ id: 'a1', role: 'assistant' })
+    );
+    vi.mocked(askNotebook).mockImplementation(
+      async (_nb: string, _turnId: string, _q: string, handlers: AskNotebookHandlers) => {
+        handlers.onEvent({ TextDelta: 'answer' });
+        handlers.onEvent({ Done: { tokens_used: 3, grounded: true, citation_count: 0 } });
+        handlers.onStreamDone();
+      }
+    );
+
+    await send(NB, 'q');
+
+    expect(chatStore.ungroundedTurnId(NB)).toBeNull();
   });
 });

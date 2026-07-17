@@ -337,6 +337,7 @@ async fn cloud_probe(provider: &dyn crate::llm::LlmProvider, err_prefix: &str) -
         json: false,
         thinking: false,
         reasoning_effort: None,
+        messages: Vec::new(),
     };
     match tokio::time::timeout(CLOUD_PROBE_TIMEOUT, provider.generate(&req)).await {
         Ok(Ok(_)) => ModelValidation::Pass,

@@ -5,7 +5,7 @@
 
 import { Channel, invoke, isTauri } from '@tauri-apps/api/core';
 import type { StreamEvent } from '$lib/sources/types.js';
-import type { AnswerEvent, ChatMessage, ChatFeedback, Citation } from './types.js';
+import type { AnswerEvent, ChatMessage, ChatFeedback, ChatState, Citation } from './types.js';
 
 export interface AskNotebookHandlers {
   /** One `AnswerEvent` per `chunk` frame (Stage/ThinkingDelta/TextDelta/Citations/Done). */
@@ -24,6 +24,7 @@ export interface AskNotebookHandlers {
  */
 export async function askNotebook(
   notebookId: string,
+  turnId: string,
   question: string,
   handlers: AskNotebookHandlers
 ): Promise<void> {
@@ -34,7 +35,7 @@ export async function askNotebook(
     else if (ev.type === 'done') handlers.onStreamDone();
     else if (ev.type === 'failed') handlers.onFailed(ev.data);
   };
-  await invoke<void>('ask_notebook', { notebookId, question, onAnswer: channel });
+  await invoke<void>('ask_notebook', { notebookId, turnId, question, onAnswer: channel });
 }
 
 /** Cancels the in-flight grounded answer for a notebook. Returns `false` outside Tauri. */
@@ -68,6 +69,28 @@ export async function saveChatAssistant(
     content,
     citations,
     tokensUsed
+  });
+}
+
+/**
+ * Persists a terminal-state marker for a cancelled/errored turn (Plan 2 / PC-1).
+ * `content` may carry the partial answer streamed so far. Throws outside Tauri (the
+ * caller only invokes it after a real stream).
+ */
+export async function saveChatMarker(
+  notebookId: string,
+  turnId: string,
+  content: string,
+  state: Exclude<ChatState, null>,
+  errorKind: string | null
+): Promise<ChatMessage> {
+  if (!isTauri()) throw new Error('saveChatMarker: not running under Tauri');
+  return invoke<ChatMessage>('save_chat_marker', {
+    notebookId,
+    turnId,
+    content,
+    state,
+    errorKind
   });
 }
 

@@ -177,6 +177,7 @@ fn main() {
             commands::notebooks::cancel_synthesis,
             commands::notebooks::save_chat_user,
             commands::notebooks::save_chat_assistant,
+            commands::notebooks::save_chat_marker,
             commands::notebooks::set_chat_feedback,
             commands::notebooks::list_chat_messages,
             commands::notes::save_chat_note,

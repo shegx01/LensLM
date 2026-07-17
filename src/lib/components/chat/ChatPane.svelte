@@ -34,7 +34,9 @@
   const stage = $derived(chatStore.stage(notebookId));
   const thinkingBuffer = $derived(chatStore.thinkingBuffer(notebookId));
   const answerBuffer = $derived(chatStore.answerBuffer(notebookId));
+  const pendingCitations = $derived(chatStore.pendingCitations(notebookId));
   const currentTurnId = $derived(chatStore.currentTurnId(notebookId));
+  const ungroundedTurnId = $derived(chatStore.ungroundedTurnId(notebookId));
   const error = $derived(chatStore.error(notebookId));
   const pinnedToBottom = $derived(chatStore.pinnedToBottom(notebookId));
 
@@ -61,7 +63,9 @@
     {stage}
     {thinkingBuffer}
     {answerBuffer}
+    {pendingCitations}
     {currentTurnId}
+    {ungroundedTurnId}
     {error}
     {pinnedToBottom}
     bottomInset={overlayHeight}

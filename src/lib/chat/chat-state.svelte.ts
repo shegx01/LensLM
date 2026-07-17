@@ -2,18 +2,25 @@
 // notebooks-state.svelte.ts's shape (module-level $state + exported getters).
 //
 // Persistence contract (plan Step 6 / Risk R9 — the highest-risk seam):
-// the INNER `AnswerEvent::Done{tokens_used}` delivered inside a `chunk` frame is
-// the SOLE finalize+persist trigger — it is where `saveChatAssistant` is called,
-// exactly once. The OUTER stream-closed terminator (`StreamEvent::Done`, surfaced
-// here as `onStreamDone`) is a no-op for persistence; it must never re-trigger a
-// save (that would double-persist or persist without tokens_used). A cancelled or
-// errored turn persists nothing — only the user row (written on send) survives.
+// the INNER `AnswerEvent::Done{...}` delivered inside a `chunk` frame is the SOLE
+// finalize+persist trigger for a SUCCESSFUL answer — it is where `saveChatAssistant`
+// is called, exactly once. The OUTER stream-closed terminator (`StreamEvent::Done`,
+// surfaced here as `onStreamDone`) is a no-op for persistence; it must never
+// re-trigger a save.
+//
+// Plan 2 (PC-1) change: a cancelled/errored turn no longer persists NOTHING — it
+// writes ONE terminal marker row (partial answer as content, `state` =
+// cancelled/errored) via `saveChatMarker`, so a reload renders a "Stopped"/"Couldn't
+// complete" line instead of a bare, dangling question. `terminalMarked` dedupes the
+// marker across the two paths that can fire for one turn (the Stop/error callback,
+// and `markSuperseded` when a new send cancels an in-flight turn).
 
 import {
   askNotebook,
   cancelAsk,
   saveChatUser,
   saveChatAssistant,
+  saveChatMarker,
   setChatFeedback,
   listChatMessages
 } from './ipc.js';
@@ -23,6 +30,7 @@ import type {
   AnswerStage,
   ChatMessage,
   ChatFeedback,
+  ChatState,
   Citation,
   Turn
 } from './types.js';
@@ -38,6 +46,10 @@ interface NotebookChatState {
   error: { kind: string; message: string } | null;
   pinnedToBottom: boolean;
   streamGeneration: number;
+  /** Turn whose just-finished answer was ungrounded (text, zero citations). Drives
+   * a subtle live badge (Plan 2 / SP-3); `null` when the last answer was grounded
+   * or none is fresh. Live-only — cleared on the next send, not persisted. */
+  ungroundedTurnId: string | null;
 }
 
 function emptyNotebookState(): NotebookChatState {
@@ -51,11 +63,18 @@ function emptyNotebookState(): NotebookChatState {
     currentTurnId: null,
     error: null,
     pinnedToBottom: true,
-    streamGeneration: 0
+    streamGeneration: 0,
+    ungroundedTurnId: null
   };
 }
 
 let byNotebook = $state<Record<string, NotebookChatState>>({});
+
+// Turn ids that already have a persisted terminal marker (Plan 2). Guards against a
+// double marker when both the stream callback and `markSuperseded` fire for one turn
+// (the check+add is synchronous, so the two callbacks can't both pass it). Module-
+// scoped and small (opaque UUIDs); cleared in `resetChatStore`.
+const terminalMarked = new Set<string>();
 
 function ensure(notebookId: string): NotebookChatState {
   let s = byNotebook[notebookId];
@@ -130,8 +149,65 @@ function toLensError(err: unknown): { kind: string; message: string } {
   return { kind: 'Internal', message: err instanceof Error ? err.message : String(err) };
 }
 
+/**
+ * Persists a terminal marker for `turnId` (Plan 2 / PC-1), idempotent across the two
+ * callbacks that can fire for one turn (`terminalMarked` guards it; the check+add is
+ * synchronous). `pushInSession` appends the returned row as a version so the partial
+ * answer stays visible immediately — `true` for cancel (the marker IS the in-session
+ * rendering), `false` for stream errors (the ErrorCard already renders in-session; the
+ * marker is only for reload). On IPC failure the guard is released so a later path may
+ * retry, and the error is swallowed (never throw from a stream callback).
+ */
+async function persistTerminalMarker(
+  state: NotebookChatState,
+  notebookId: string,
+  turnId: string,
+  markerState: Exclude<ChatState, null>,
+  errorKind: string | null,
+  content: string,
+  pushInSession: boolean
+): Promise<void> {
+  if (terminalMarked.has(turnId)) return;
+  terminalMarked.add(turnId);
+  let saved: ChatMessage;
+  try {
+    saved = await saveChatMarker(notebookId, turnId, content, markerState, errorKind);
+  } catch (err) {
+    terminalMarked.delete(turnId);
+    console.warn('persistTerminalMarker: save failed', err);
+    return;
+  }
+  if (!pushInSession) return;
+  const turn = state.turns.find((t) => t.turn_id === turnId);
+  if (turn && !turn.versions.some((v) => v.id === saved.id)) {
+    turn.versions.push(saved);
+  }
+}
+
+/**
+ * When a new send/regenerate supersedes an in-flight turn, capture its partial answer
+ * into a cancelled marker BEFORE the new stream resets the buffers, so the superseded
+ * turn is never left a bare question (FE-2). The later `onFailed('Cancelled')` from
+ * the cancelled stream is then a no-op (already marked).
+ */
+async function markSuperseded(state: NotebookChatState, notebookId: string): Promise<void> {
+  if (!state.streaming || !state.currentTurnId) return;
+  await persistTerminalMarker(
+    state,
+    notebookId,
+    state.currentTurnId,
+    'cancelled',
+    null,
+    state.answerBuffer,
+    true
+  );
+}
+
 async function runStream(notebookId: string, turnId: string, question: string): Promise<void> {
   const state = ensure(notebookId);
+  // Fresh attempt for this turn — clear any prior terminal marker (e.g. regenerating
+  // a previously-cancelled turn) so this run can record its own outcome.
+  terminalMarked.delete(turnId);
   // Bump so late callbacks from a superseded/cancelled stream no-op.
   const gen = ++state.streamGeneration;
   state.streaming = true;
@@ -141,9 +217,41 @@ async function runStream(notebookId: string, turnId: string, question: string): 
   state.pendingCitations = null;
   state.currentTurnId = turnId;
   state.error = null;
+  state.ungroundedTurnId = null;
   state.pinnedToBottom = true;
 
   let persisted = false;
+
+  // rAF-coalesce streaming text (FE-3): buffer deltas and flush to the reactive
+  // answerBuffer at most once per frame, so the markdown re-render runs ~60fps
+  // instead of once per token (previously O(n²) over the growing answer).
+  let pendingDelta = '';
+  let rafHandle: number | null = null;
+  const hasRaf = typeof requestAnimationFrame !== 'undefined';
+  const flushDelta = (): void => {
+    rafHandle = null;
+    if (!pendingDelta) return;
+    if (state.streamGeneration !== gen) {
+      pendingDelta = '';
+      return;
+    }
+    state.answerBuffer += pendingDelta;
+    pendingDelta = '';
+  };
+  const scheduleFlush = (): void => {
+    if (!hasRaf) {
+      flushDelta();
+      return;
+    }
+    if (rafHandle === null) rafHandle = requestAnimationFrame(flushDelta);
+  };
+  const flushNow = (): void => {
+    if (rafHandle !== null && typeof cancelAnimationFrame !== 'undefined') {
+      cancelAnimationFrame(rafHandle);
+      rafHandle = null;
+    }
+    flushDelta();
+  };
 
   const persistOnce = async (tokensUsed: number): Promise<void> => {
     if (state.streamGeneration !== gen) return;
@@ -162,7 +270,10 @@ async function runStream(notebookId: string, turnId: string, question: string): 
     state.streaming = false;
   };
 
-  await askNotebook(notebookId, question, {
+  // A pre-stream ctx/provider error rejects the invoke AND delivers a `failed`
+  // frame; `onFailed` owns the state transition, so swallow the rejection here to
+  // avoid an unhandled-rejection surfacing through the caller's `void send(...)`.
+  await askNotebook(notebookId, turnId, question, {
     onEvent: (event: AnswerEvent) => {
       if (state.streamGeneration !== gen) return;
       if ('Stage' in event) {
@@ -170,19 +281,36 @@ async function runStream(notebookId: string, turnId: string, question: string): 
       } else if ('ThinkingDelta' in event) {
         state.thinkingBuffer += event.ThinkingDelta;
       } else if ('TextDelta' in event) {
-        state.answerBuffer += event.TextDelta;
+        pendingDelta += event.TextDelta;
+        scheduleFlush();
       } else if ('Citations' in event) {
         state.pendingCitations = event.Citations;
       } else if ('Done' in event) {
-        // Sole finalize+persist trigger (see header). Fire-and-forget from the
-        // sync handler; errors surface as a store error, not thrown to askNotebook.
+        flushNow(); // ensure the whole answer is in answerBuffer before persisting
+        // Ungrounded flag (SP-3): substantive text that cited nothing.
+        if (!event.Done.grounded) state.ungroundedTurnId = turnId;
+        // Claim the turn synchronously so a concurrent markSuperseded cannot slip a
+        // cancelled marker in during the save's IPC window (a successful answer needs
+        // no marker). The save-failure catch releases the claim to record an error.
+        terminalMarked.add(turnId);
+        // Sole finalize+persist trigger for a SUCCESSFUL answer (see header).
         void persistOnce(event.Done.tokens_used).catch((err) => {
           if (state.streamGeneration !== gen) return;
-          // Mirror onFailed's contract: keep currentTurnId so the ErrorCard gate
-          // (error && currentTurnId === turn) matches for this path too (AC7/AC21).
+          // Save failed after a complete stream: surface the error AND persist an
+          // errored marker so a reload isn't left with a bare question (PC-1).
           state.error = toLensError(err);
           state.streaming = false;
           state.stage = null;
+          terminalMarked.delete(turnId); // release so the errored marker can record
+          void persistTerminalMarker(
+            state,
+            notebookId,
+            turnId,
+            'errored',
+            state.error.kind,
+            state.answerBuffer,
+            false
+          );
         });
       }
     },
@@ -196,17 +324,40 @@ async function runStream(notebookId: string, turnId: string, question: string): 
     },
     onFailed: (err) => {
       if (state.streamGeneration !== gen) return;
+      flushNow();
       if (err.kind === 'Cancelled') {
-        // AC8: keep partial answerBuffer in-session, persist nothing.
+        // Stop button (FE-1/PC-1): keep the partial answer as a cancelled marker so
+        // it survives reload, and surface it in-session as a "Stopped" version.
+        void persistTerminalMarker(
+          state,
+          notebookId,
+          turnId,
+          'cancelled',
+          null,
+          state.answerBuffer,
+          true
+        );
         state.streaming = false;
         state.stage = null;
       } else {
-        // AC7/AC21: sanitized error, persist nothing.
+        // Stream error (AC7/AC21): sanitized error → ErrorCard (retry) in-session;
+        // persist an errored marker (backend only) so reload shows a terminal line.
+        void persistTerminalMarker(
+          state,
+          notebookId,
+          turnId,
+          'errored',
+          err.kind,
+          state.answerBuffer,
+          false
+        );
         state.error = err;
         state.streaming = false;
         state.stage = null;
       }
     }
+  }).catch(() => {
+    // Rejection already reflected via onFailed above (or a superseded gen). Swallow.
   });
 }
 
@@ -219,6 +370,8 @@ async function runStream(notebookId: string, turnId: string, question: string): 
 export async function send(notebookId: string, question: string): Promise<void> {
   const state = ensure(notebookId);
   if (state.streaming) {
+    // Mark the superseded turn (FE-2) BEFORE cancel resets its buffers.
+    await markSuperseded(state, notebookId);
     await cancelAsk(notebookId);
   }
 
@@ -246,6 +399,7 @@ export async function regenerate(notebookId: string, turnId: string): Promise<vo
   const turn = state.turns.find((t) => t.turn_id === turnId);
   if (!turn) return;
   if (state.streaming) {
+    await markSuperseded(state, notebookId);
     await cancelAsk(notebookId);
   }
   await runStream(notebookId, turnId, turn.user.content);
@@ -312,6 +466,9 @@ export const chatStore = {
   answerBuffer(notebookId: string): string {
     return byNotebook[notebookId]?.answerBuffer ?? '';
   },
+  pendingCitations(notebookId: string): Citation[] | null {
+    return byNotebook[notebookId]?.pendingCitations ?? null;
+  },
   currentTurnId(notebookId: string): string | null {
     return byNotebook[notebookId]?.currentTurnId ?? null;
   },
@@ -320,10 +477,14 @@ export const chatStore = {
   },
   pinnedToBottom(notebookId: string): boolean {
     return byNotebook[notebookId]?.pinnedToBottom ?? true;
+  },
+  ungroundedTurnId(notebookId: string): string | null {
+    return byNotebook[notebookId]?.ungroundedTurnId ?? null;
   }
 };
 
 /** Reset all state. Call in `afterEach` to prevent cross-test bleed. */
 export function resetChatStore(): void {
   byNotebook = {};
+  terminalMarked.clear();
 }

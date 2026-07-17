@@ -1,7 +1,7 @@
 //! Integration tests for chat persistence (#22): the `chat_messages` table,
 //! `ChatRepo`, and the `LensEngine` chat methods. Offline (tempfile scratch DB).
 
-use lens_core::{ChatFeedback, ChatRole, Citation, LensEngine, Locator};
+use lens_core::{ChatFeedback, ChatRole, ChatState, Citation, LensEngine, Locator};
 
 /// A user then an assistant message round-trip through the engine in order, and
 /// the citation payload survives DB → hydrate intact (AC16, AC17).
@@ -153,6 +153,117 @@ async fn purging_notebook_cascades_chat_messages() {
     assert_eq!(
         after, 0,
         "ON DELETE CASCADE must leave zero orphan chat rows"
+    );
+}
+
+/// `insert_terminal_marker` (Plan 2 / PC-1) after a user row persists a marker
+/// that reloads with the given state and partial content; a normal user row in
+/// the same turn still reloads with `state = None`.
+#[tokio::test]
+async fn terminal_marker_persists_state_and_reloads() {
+    let engine = LensEngine::for_test().await;
+    let nb = engine.create_notebook("chat", None, None).await.unwrap();
+    let turn = "turn-1";
+
+    engine
+        .save_chat_user(&nb.id, turn, "what is it?")
+        .await
+        .unwrap();
+    let marker = engine
+        .save_chat_marker(
+            &nb.id,
+            turn,
+            "partial answer so f",
+            ChatState::Cancelled,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(marker.state, Some(ChatState::Cancelled));
+    assert_eq!(marker.content, "partial answer so f");
+
+    let listed = engine.list_chat_messages(&nb.id).await.unwrap();
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0].role, ChatRole::User);
+    assert_eq!(
+        listed[0].state, None,
+        "a normal user row must reload with no state"
+    );
+    assert_eq!(listed[1].id, marker.id);
+    assert_eq!(listed[1].state, Some(ChatState::Cancelled));
+    assert_eq!(listed[1].content, "partial answer so f");
+}
+
+/// An `Errored` marker persists `error_kind` alongside `state` and both reload
+/// intact.
+#[tokio::test]
+async fn errored_marker_persists_error_kind() {
+    let engine = LensEngine::for_test().await;
+    let nb = engine.create_notebook("chat", None, None).await.unwrap();
+    let turn = "turn-1";
+
+    engine.save_chat_user(&nb.id, turn, "q").await.unwrap();
+    let marker = engine
+        .save_chat_marker(&nb.id, turn, "", ChatState::Errored, Some("Network"))
+        .await
+        .unwrap();
+    assert_eq!(marker.state, Some(ChatState::Errored));
+    assert_eq!(marker.error_kind, Some("Network".to_string()));
+
+    let listed = engine.list_chat_messages(&nb.id).await.unwrap();
+    let reloaded = listed.iter().find(|m| m.id == marker.id).unwrap();
+    assert_eq!(reloaded.state, Some(ChatState::Errored));
+    assert_eq!(reloaded.error_kind, Some("Network".to_string()));
+}
+
+/// `insert_terminal_marker` for a turn with no user row is rejected, mirroring
+/// `insert_assistant`'s turn-integrity guard.
+#[tokio::test]
+async fn terminal_marker_without_user_row_is_rejected() {
+    let engine = LensEngine::for_test().await;
+    let nb = engine.create_notebook("chat", None, None).await.unwrap();
+
+    let err = engine
+        .save_chat_marker(&nb.id, "orphan-turn", "", ChatState::Cancelled, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, lens_core::LensError::Validation(_)));
+    assert!(engine.list_chat_messages(&nb.id).await.unwrap().is_empty());
+}
+
+/// `ChatRepo::history` excludes the current turn's rows and skips marker rows:
+/// a cancelled marker from an earlier turn must not surface as prior context.
+#[tokio::test]
+async fn history_excludes_current_turn_and_skips_marker_rows() {
+    let engine = LensEngine::for_test().await;
+    let nb = engine.create_notebook("chat", None, None).await.unwrap();
+
+    engine.save_chat_user(&nb.id, "t1", "q1").await.unwrap();
+    engine
+        .save_chat_marker(&nb.id, "t1", "partial", ChatState::Cancelled, None)
+        .await
+        .unwrap();
+
+    engine.save_chat_user(&nb.id, "t2", "q2").await.unwrap();
+    engine
+        .save_chat_assistant(&nb.id, "t2", "a2", None, 0)
+        .await
+        .unwrap();
+
+    engine.save_chat_user(&nb.id, "t3", "q3").await.unwrap();
+
+    let pool = engine.pool().await;
+    let history = lens_core::chat::ChatRepo::new(&pool)
+        .history(nb.id.as_str(), "t3", 10)
+        .await
+        .unwrap();
+
+    let contents: Vec<&str> = history.iter().map(|m| m.content.as_str()).collect();
+    assert_eq!(
+        contents,
+        vec!["q2", "a2"],
+        "t1 is incomplete (only a cancelled marker, no real answer) so its user row is \
+         dropped WHOLE — no dangling question; t3 (current turn) excluded"
     );
 }
 

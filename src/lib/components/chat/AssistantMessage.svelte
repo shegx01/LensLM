@@ -50,6 +50,15 @@
   });
 
   const current = $derived(versions[selectedIndex]);
+  // Terminal-marker versions (Plan 2): a cancelled/errored turn shows a muted status
+  // line and hides the action row — a partial/stopped answer is not one to rate/save.
+  const markerLabel = $derived(
+    current?.state === 'cancelled'
+      ? 'Stopped'
+      : current?.state === 'errored'
+        ? "Couldn't complete"
+        : null
+  );
   const citations = $derived(current ? messageCitations(current) : null);
   const html = $derived(
     current ? renderMarkdown(current.content, { highlight: highlightCode }) : ''
@@ -122,45 +131,49 @@
           {@html html}
         </div>
 
-        <div class="mt-1.5 flex items-center gap-2">
-          <MessageActions
-            feedback={current.feedback}
-            saved={notesStore.savedMessageIds(notebookId).has(current.id)}
-            disabled={regenerateDisabled}
-            {finalized}
-            oncopy={() => oncopy(current.content)}
-            {onregenerate}
-            onfeedback={(next) => onfeedback(current.id, next)}
-            onsave={() => void toggleSave(notebookId, current)}
-          />
+        {#if markerLabel}
+          <p class="mt-1 text-xs font-medium text-muted-foreground/70">{markerLabel}</p>
+        {:else}
+          <div class="mt-1.5 flex items-center gap-2">
+            <MessageActions
+              feedback={current.feedback}
+              saved={notesStore.savedMessageIds(notebookId).has(current.id)}
+              disabled={regenerateDisabled}
+              {finalized}
+              oncopy={() => oncopy(current.content)}
+              {onregenerate}
+              onfeedback={(next) => onfeedback(current.id, next)}
+              onsave={() => void toggleSave(notebookId, current)}
+            />
 
-          {#if versions.length > 1}
-            <div
-              class="flex items-center gap-0.5 text-xs text-muted-foreground/70"
-              aria-label="Answer version {selectedIndex + 1} of {versions.length}"
-            >
-              <button
-                type="button"
-                aria-label="Previous version"
-                disabled={selectedIndex === 0}
-                onclick={prevVersion}
-                class="flex size-5 items-center justify-center rounded disabled:opacity-30 hover:bg-muted"
+            {#if versions.length > 1}
+              <div
+                class="flex items-center gap-0.5 text-xs text-muted-foreground/70"
+                aria-label="Answer version {selectedIndex + 1} of {versions.length}"
               >
-                <ChevronLeft class="size-3" strokeWidth={2.5} />
-              </button>
-              <span class="tabular-nums">{selectedIndex + 1}/{versions.length}</span>
-              <button
-                type="button"
-                aria-label="Next version"
-                disabled={selectedIndex === versions.length - 1}
-                onclick={nextVersion}
-                class="flex size-5 items-center justify-center rounded disabled:opacity-30 hover:bg-muted"
-              >
-                <ChevronRight class="size-3" strokeWidth={2.5} />
-              </button>
-            </div>
-          {/if}
-        </div>
+                <button
+                  type="button"
+                  aria-label="Previous version"
+                  disabled={selectedIndex === 0}
+                  onclick={prevVersion}
+                  class="flex size-5 items-center justify-center rounded disabled:opacity-30 hover:bg-muted"
+                >
+                  <ChevronLeft class="size-3" strokeWidth={2.5} />
+                </button>
+                <span class="tabular-nums">{selectedIndex + 1}/{versions.length}</span>
+                <button
+                  type="button"
+                  aria-label="Next version"
+                  disabled={selectedIndex === versions.length - 1}
+                  onclick={nextVersion}
+                  class="flex size-5 items-center justify-center rounded disabled:opacity-30 hover:bg-muted"
+                >
+                  <ChevronRight class="size-3" strokeWidth={2.5} />
+                </button>
+              </div>
+            {/if}
+          </div>
+        {/if}
       </div>
     </div>
   </div>

@@ -13,6 +13,8 @@ function userMsg(turnId: string, content: string): ChatMessage {
     citations: null,
     feedback: null,
     tokens_used: null,
+    state: null,
+    error_kind: null,
     created_at: '2026-07-12T00:00:00Z'
   };
 }

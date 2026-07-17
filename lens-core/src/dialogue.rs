@@ -406,6 +406,7 @@ fn base_request(system: String, prompt: String, preset: &LengthPreset) -> LlmReq
         json: true,
         thinking: false,
         reasoning_effort: None,
+        messages: Vec::new(),
     }
 }
 
@@ -485,6 +486,7 @@ pub async fn generate_dialogue(
         Some(ctx.retrieval.graph_retrieval_enabled),
         &ctx.thresholds,
         ctx.tokenizer.as_deref(),
+        0, // dialogue is single-shot — no conversation history claims budget
     )
     .await?;
 

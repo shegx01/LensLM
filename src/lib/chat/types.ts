@@ -35,13 +35,20 @@ export type AnswerEvent =
   | { ThinkingDelta: string }
   | { TextDelta: string }
   | { Citations: Citation[] }
-  | { Done: { tokens_used: number } };
+  | { Done: { tokens_used: number; grounded: boolean; citation_count: number } };
 
 /** `chat_messages.role`. Mirrors `lens-core/src/chat.rs` `ChatRole`. */
 export type ChatRole = 'user' | 'assistant';
 
 /** `chat_messages.feedback`. Mirrors `lens-core/src/chat.rs` `ChatFeedback`; `null` = no feedback. */
 export type ChatFeedback = 'up' | 'down' | null;
+
+/**
+ * `chat_messages.state`. Mirrors `lens-core/src/chat.rs` `ChatState`; `null` on a
+ * normal (Done) assistant row and all user rows. A marker row carries `cancelled`
+ * (Stop / superseded) or `errored`.
+ */
+export type ChatState = 'cancelled' | 'errored' | null;
 
 /**
  * Wire shape from the chat commands. ASYMMETRY: citations is a JSON string on this
@@ -57,6 +64,10 @@ export interface ChatMessage {
   citations: string | null;
   feedback: ChatFeedback;
   tokens_used: number | null;
+  /** Terminal marker state (Plan 2); `null` on normal rows. */
+  state: ChatState;
+  /** Sanitized LensError kind on an errored marker; `null` otherwise. */
+  error_kind: string | null;
   created_at: string;
 }
 

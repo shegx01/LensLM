@@ -2,9 +2,9 @@
 
 use futures::StreamExt;
 use lens_core::{
-    AddSourceOutcome, AnswerEvent, ChatFeedback, ChatMessage, DialoguePhase, DialogueScript,
-    IngestProgress, Length, LensEngine, LensError, Notebook, NotebookId, NotebookSummary, Source,
-    TrashedSource, TtsPhase,
+    AddSourceOutcome, AnswerEvent, ChatFeedback, ChatMessage, ChatState, DialoguePhase,
+    DialogueScript, IngestProgress, Length, LensEngine, LensError, Notebook, NotebookId,
+    NotebookSummary, Source, TrashedSource, TtsPhase,
 };
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
@@ -403,6 +403,7 @@ pub async fn cancel_media_ingest(
 #[tauri::command]
 pub async fn ask_notebook(
     notebook_id: String,
+    turn_id: String,
     question: String,
     on_answer: Channel<StreamEvent<AnswerEvent>>,
     engine: tauri::State<'_, LensEngine>,
@@ -417,8 +418,14 @@ pub async fn ask_notebook(
     let _guard = engine.ask_cancel_guard(&notebook_id, token.clone());
 
     // Ctx-gathering / provider-None errors surface HERE, before any stream is built.
+    // `turn_id` scopes history loading so the current turn is excluded from it.
     let stream = match engine
-        .answer_notebook(&NotebookId::from(notebook_id), question, (*token).clone())
+        .answer_notebook(
+            &NotebookId::from(notebook_id),
+            &turn_id,
+            question,
+            (*token).clone(),
+        )
         .await
     {
         Ok(s) => s,
@@ -655,6 +662,30 @@ pub async fn save_chat_assistant(
             &content,
             citations.as_deref(),
             tokens_used,
+        )
+        .await
+}
+
+/// Persists a terminal-state marker for a cancelled/errored turn (Plan 2 / PC-1).
+/// `content` may carry the partial answer streamed so far so a reload shows it under
+/// a "Stopped"/"Couldn't complete" line instead of a bare, dangling question.
+#[tracing::instrument(skip(content, engine))]
+#[tauri::command]
+pub async fn save_chat_marker(
+    notebook_id: String,
+    turn_id: String,
+    content: String,
+    state: ChatState,
+    error_kind: Option<String>,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<ChatMessage, LensError> {
+    engine
+        .save_chat_marker(
+            &NotebookId::from(notebook_id),
+            &turn_id,
+            &content,
+            state,
+            error_kind.as_deref(),
         )
         .await
 }

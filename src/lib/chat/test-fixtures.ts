@@ -13,6 +13,8 @@ export function makeChatMessage(overrides?: Partial<ChatMessage>): ChatMessage {
     citations: null,
     feedback: null,
     tokens_used: null,
+    state: null,
+    error_kind: null,
     created_at: '2026-07-12T00:00:00Z',
     ...overrides
   };

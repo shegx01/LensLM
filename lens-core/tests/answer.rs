@@ -52,7 +52,11 @@ fn answer_event_serde_round_trip() {
         AnswerEvent::ThinkingDelta("thinking".into()),
         AnswerEvent::TextDelta("answer".into()),
         AnswerEvent::Citations(Vec::new()),
-        AnswerEvent::Done { tokens_used: 42 },
+        AnswerEvent::Done {
+            tokens_used: 42,
+            grounded: true,
+            citation_count: 0,
+        },
     ];
     for ev in events {
         let json = serde_json::to_string(&ev).unwrap();
@@ -230,6 +234,8 @@ fn build_ctx(
         thresholds: TierThresholds::default(),
         tokenizer: None,
         question: question.to_string(),
+        history: Vec::new(),
+        chat: lens_core::ChatConfig::default(),
     }
 }
 
@@ -322,7 +328,11 @@ async fn happy_path_ordering_accumulation_citations_and_done() {
 
     assert_eq!(
         events.last(),
-        Some(&AnswerEvent::Done { tokens_used: 99 }),
+        Some(&AnswerEvent::Done {
+            tokens_used: 99,
+            grounded: true,
+            citation_count: 2,
+        }),
         "Done passes the mock tokens_used through and is last"
     );
 }
@@ -349,7 +359,14 @@ async fn full_ordering_contract_no_stray_events() {
         stages,
         vec![&AnswerStage::Retrieving, &AnswerStage::Answering]
     );
-    assert_eq!(events.last(), Some(&AnswerEvent::Done { tokens_used: 5 }));
+    assert_eq!(
+        events.last(),
+        Some(&AnswerEvent::Done {
+            tokens_used: 5,
+            grounded: true,
+            citation_count: 1,
+        })
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -370,7 +387,14 @@ async fn empty_context_short_circuits_without_calling_provider() {
     assert_eq!(events[1], AnswerEvent::Stage(AnswerStage::Answering));
     assert!(matches!(events[2], AnswerEvent::TextDelta(_)));
     assert_eq!(events[3], AnswerEvent::Citations(Vec::new()));
-    assert_eq!(events[4], AnswerEvent::Done { tokens_used: 0 });
+    assert_eq!(
+        events[4],
+        AnswerEvent::Done {
+            tokens_used: 0,
+            grounded: true,
+            citation_count: 0,
+        }
+    );
     assert_eq!(events.len(), 5);
 }
 
@@ -474,7 +498,7 @@ async fn answer_notebook_errors_when_no_provider_before_any_stream() {
     let nb = engine.create_notebook("nb", None, None).await.unwrap().id;
     // No provider installed → Err before any stream is built.
     let res = engine
-        .answer_notebook(&nb, "q".into(), CancellationToken::new())
+        .answer_notebook(&nb, "turn-1", "q".into(), CancellationToken::new())
         .await;
     match res {
         Err(lens_core::LensError::Model(_)) => {}
@@ -547,7 +571,7 @@ async fn answer_notebook_selects_embedder_matched_coordinate() {
     insert_chunk(&pool, "sA", "c1", "alpha content", 1).await;
 
     let stream = engine
-        .answer_notebook(&nb, "q".into(), CancellationToken::new())
+        .answer_notebook(&nb, "turn-1", "q".into(), CancellationToken::new())
         .await
         .expect("stream builds with a provider present");
     let events = collect(stream).await;
