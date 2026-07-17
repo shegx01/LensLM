@@ -94,7 +94,6 @@
   // the user re-typing it, so masking never risks writing a blank key over a
   // real one (see the #194 Cloud-key-wipe regression this mirrors the fix for).
   let savedCloudApiKey = $state('');
-  let savingCloud = $state(false);
   let cloudError = $state<string | null>(null);
 
   // Saved key is masked; Save re-enables only after the user enters a fresh key.
@@ -123,15 +122,6 @@
     cloudFemaleVoices.length > 0 && cloudGuestPreset !== CUSTOM_VOICE
       ? cloudGuestPreset
       : cloudGuestCustom.trim()
-  );
-
-  // Save requires a base URL always, and a usable key: either freshly typed
-  // (first-time setup, or actively editing) or the already-persisted one for
-  // edits that only touch base URL/voices.
-  const cloudSaveDisabled = $derived(
-    savingCloud ||
-      !cloudBaseUrl.trim() ||
-      (editingKey ? !cloudApiKey.trim() : !hasSavedKey && !cloudApiKey.trim())
   );
 
   /** Splits a saved voice id into {preset, custom}: a known curated id selects
@@ -314,10 +304,17 @@
     }
   }
 
-  async function handleSaveCloud(): Promise<void> {
-    savingCloud = true;
+  /** Reactive Cloud persist — mirrors `persistLocalTts`: every field writes
+   *  through immediately (Select) or on blur (text inputs), no Save button.
+   *  Deliberately does NOT call `oncheck()`/`oncollapse()` — those were
+   *  Save-button-only side effects; a reactive edit must not collapse the panel
+   *  or re-run the system check on every keystroke-adjacent write. */
+  async function persistCloud(): Promise<void> {
     cloudError = null;
     try {
+      // Resend the already-saved key when the user isn't actively replacing it
+      // (base URL/voice-only edits), but still send a freshly-typed key on the
+      // very first save (before any key has ever been persisted).
       const apiKey = editingKey || !hasSavedKey ? cloudApiKey : savedCloudApiKey;
       await saveTtsProvider({
         provider: 'cloud',
@@ -330,12 +327,21 @@
       hasSavedKey = apiKey.trim() !== '';
       editingKey = false;
       await refreshCatalog();
-      await oncheck();
-      oncollapse();
     } catch (err) {
       cloudError = err instanceof Error ? err.message : 'Could not save configuration.';
-    } finally {
-      savingCloud = false;
+    }
+  }
+
+  /** API-key field's blur handler: persists a freshly-typed key (first-time
+   *  entry or an explicit replace), but blurring an emptied "replace" field
+   *  re-masks instead of persisting — never wipes a real saved key with blank. */
+  function handleKeyBlur(): void {
+    if (editingKey && !cloudApiKey.trim()) {
+      editingKey = false;
+      return;
+    }
+    if (editingKey || (!hasSavedKey && cloudApiKey.trim())) {
+      void persistCloud();
     }
   }
 </script>
@@ -547,8 +553,9 @@
     class={cn('mt-3 flex flex-col gap-4', activeTab !== 'cloud' && 'hidden')}
   >
     <p class="text-muted-foreground text-pretty text-[0.78rem] leading-relaxed">
-      Connect an OpenAI-compatible cloud text-to-speech endpoint — OpenAI itself, or any self-hosted
-      server speaking the same API. No local download required.
+      Connect any endpoint that implements OpenAI's speech API (POST /v1/audio/speech) — OpenAI
+      itself, hosted providers like Groq or DeepInfra, or a self-hosted server such as LocalAI.
+      Enter the API root; no local model download required.
     </p>
 
     {#if cloudEntry}
@@ -596,6 +603,7 @@
           autocomplete="new-password"
           onfocus={startEditingKey}
           oninput={startEditingKey}
+          onblur={handleKeyBlur}
         />
         {#if hasSavedKey && !editingKey}
           <p
@@ -620,6 +628,7 @@
           bind:value={cloudBaseUrl}
           placeholder="https://api.openai.com"
           autocomplete="off"
+          onblur={() => void persistCloud()}
         />
         <p class="text-muted-foreground text-pretty text-[0.72rem] leading-relaxed">
           API root only — no trailing <code>/v1</code>; it's appended automatically.
@@ -631,7 +640,7 @@
       <h3
         class="text-muted-foreground text-balance text-[0.68rem] font-semibold tracking-widest uppercase"
       >
-        Voices
+        OpenAI voices
       </h3>
 
       <div class="flex flex-col gap-1.5">
@@ -646,7 +655,10 @@
             type="single"
             value={cloudHostPreset}
             onValueChange={(v) => {
-              if (v) cloudHostPreset = v;
+              if (v) {
+                cloudHostPreset = v;
+                void persistCloud();
+              }
             }}
             items={[
               ...cloudMaleVoices.map((voice) => ({ value: voice.id, label: voice.name })),
@@ -673,6 +685,7 @@
               bind:value={cloudHostCustom}
               placeholder="e.g. alloy"
               autocomplete="off"
+              onblur={() => void persistCloud()}
             />
           {/if}
         {:else}
@@ -682,6 +695,7 @@
             bind:value={cloudHostCustom}
             placeholder="Voice ID (e.g. alloy)"
             autocomplete="off"
+            onblur={() => void persistCloud()}
           />
         {/if}
       </div>
@@ -698,7 +712,10 @@
             type="single"
             value={cloudGuestPreset}
             onValueChange={(v) => {
-              if (v) cloudGuestPreset = v;
+              if (v) {
+                cloudGuestPreset = v;
+                void persistCloud();
+              }
             }}
             items={[
               ...cloudFemaleVoices.map((voice) => ({ value: voice.id, label: voice.name })),
@@ -725,6 +742,7 @@
               bind:value={cloudGuestCustom}
               placeholder="e.g. onyx"
               autocomplete="off"
+              onblur={() => void persistCloud()}
             />
           {/if}
         {:else}
@@ -734,17 +752,18 @@
             bind:value={cloudGuestCustom}
             placeholder="Voice ID (e.g. onyx)"
             autocomplete="off"
+            onblur={() => void persistCloud()}
           />
         {/if}
       </div>
+
+      <p class="text-muted-foreground text-pretty text-[0.72rem] leading-relaxed">
+        Using another provider? Enter its own voice IDs.
+      </p>
     </section>
 
     {#if cloudError}
       <p class="text-destructive text-[0.75rem]" role="alert">{cloudError}</p>
     {/if}
-
-    <Button class="h-10 w-full" onclick={handleSaveCloud} disabled={cloudSaveDisabled}>
-      {savingCloud ? 'Saving…' : 'Save'}
-    </Button>
   </div>
 </div>
