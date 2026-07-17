@@ -1,7 +1,7 @@
-<!-- StudioPanel — non-functional visual shell (M4). All actions are disabled and
-     labelled "coming soon"; the section reads as an intentional preview, not a
-     broken control. TODO(M6/M7): study tools land with M6 (Notes), Audio Overview
-     lands with M7. Tokens only — no hardcoded hex. -->
+<!-- StudioPanel — a "coming soon" preview (M4). The tools aren't wired yet, so every
+     action is aria-disabled and tagged "Coming soon"; the hover/press states are the
+     designed preview feel, not a working control. TODO(M6/M7): study tools land with
+     M6 (Notes), Audio Overview lands with M7. Tokens only — no hardcoded hex. -->
 <script lang="ts">
   import Headphones from '@lucide/svelte/icons/headphones';
   import BookOpen from '@lucide/svelte/icons/book-open';
@@ -49,7 +49,7 @@
 </script>
 
 <section
-  class="no-scrollbar flex min-h-0 flex-[0_1_auto] flex-col gap-3 overflow-y-auto border-t border-border px-3 py-3"
+  class="studio-tray no-scrollbar flex min-h-0 flex-[0_1_auto] flex-col gap-3 overflow-y-auto px-3 py-3"
   aria-label="Studio"
 >
   <div class="flex items-center gap-2">
@@ -82,8 +82,8 @@
 
     <button
       type="button"
-      class="mt-3 flex w-full items-center justify-center gap-1.5 rounded-lg bg-primary px-3 py-2 text-sm font-semibold text-primary-foreground opacity-70 transition-opacity disabled:cursor-not-allowed"
-      disabled
+      class="mt-3 flex w-full items-center justify-center gap-1.5 rounded-lg bg-primary px-3 py-2 text-sm font-semibold text-primary-foreground transition-[opacity,transform] hover:opacity-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring active:scale-[0.98]"
+      aria-disabled="true"
       aria-label="Generate Audio Overview (coming soon)"
       title="Coming soon"
       style="-webkit-app-region: no-drag;"
@@ -101,8 +101,8 @@
       {#each heroTools as tool (tool.label)}
         <button
           type="button"
-          class="tool-tile hero-tile flex w-full items-center gap-2.5 px-2.5 py-2 text-left disabled:cursor-not-allowed"
-          disabled
+          class="tool-tile hero-tile flex w-full items-center gap-2.5 px-2.5 py-2.5 text-left"
+          aria-disabled="true"
           aria-label="{tool.label} (coming soon)"
           title="Coming soon"
           style="-webkit-app-region: no-drag;"
@@ -126,14 +126,14 @@
       {#each gridTools as tool (tool.label)}
         <button
           type="button"
-          class="tool-tile flex items-center gap-2 px-2.5 py-2 text-left disabled:cursor-not-allowed"
-          disabled
+          class="tool-tile flex items-center gap-2 px-2.5 py-2.5 text-left"
+          aria-disabled="true"
           aria-label="{tool.label} (coming soon)"
           title="Coming soon"
           style="-webkit-app-region: no-drag;"
         >
           <span class="tool-icon-sm" aria-hidden="true">
-            <tool.icon class="size-[13px] text-muted-foreground" strokeWidth={1.75} />
+            <tool.icon class="size-[13px]" strokeWidth={1.75} />
           </span>
           <span class="min-w-0">
             <span class="block truncate text-xs font-semibold leading-tight text-foreground"
@@ -174,16 +174,44 @@
     background: color-mix(in oklch, var(--primary) 12%, transparent);
   }
 
-  /* Study-tool tiles — a locked preview: clean surface (not a 60% grey wash),
-     but non-interactive. */
+  /* Studio reads as a distinct recessed tray beneath the (card) sources list:
+     a sunken surface + a defined top edge, so the card-coloured tiles pop as raised
+     elements on it. */
+  .studio-tray {
+    background: var(--surface-sunken);
+    border-top: 1px solid var(--border);
+    box-shadow: inset 0 10px 14px -14px oklch(0 0 0 / 0.18);
+  }
+
+  /* Study-tool tiles — raised cards on the tray, with an interactive hover/press
+     feel. The action is still "coming soon" (aria-disabled on the button); this is
+     the designed preview state. */
   .tool-tile {
     border-radius: 10px;
     border: 1px solid var(--border);
     background: var(--card);
-    opacity: 0.85;
+    cursor: pointer;
+    transition:
+      background-color 0.16s var(--ease-out, ease),
+      border-color 0.16s var(--ease-out, ease),
+      transform 0.16s var(--ease-out, ease);
+  }
+  .tool-tile:hover {
+    border-color: color-mix(in oklch, var(--primary) 32%, var(--border));
+    background: color-mix(in oklch, var(--primary) 5%, var(--card));
+  }
+  .tool-tile:active {
+    transform: scale(calc(1 - 0.02 * var(--rail-motion, 1)));
+  }
+  .tool-tile:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 2px var(--ring);
   }
   .hero-tile {
     background: color-mix(in oklch, var(--muted) 40%, var(--card));
+  }
+  .hero-tile:hover {
+    background: color-mix(in oklch, var(--primary) 6%, var(--card));
   }
   .tool-icon {
     display: grid;
@@ -198,5 +226,10 @@
     display: grid;
     place-items: center;
     flex: none;
+    color: var(--muted-foreground);
+    transition: color 0.16s var(--ease-out, ease);
+  }
+  .tool-tile:hover .tool-icon-sm {
+    color: var(--primary);
   }
 </style>
