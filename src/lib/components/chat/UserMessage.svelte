@@ -11,7 +11,7 @@
 
 <div class="flex justify-end px-4 pt-4" in:enterRise>
   <div
-    class="max-w-[75%] rounded-2xl rounded-br-md bg-muted px-4 py-2.5 text-sm text-foreground [text-wrap:pretty] whitespace-pre-wrap break-words"
+    class="max-w-[75%] rounded-2xl rounded-br-md border border-dashed border-muted-foreground/30 bg-transparent px-4 py-2.5 text-sm text-foreground [text-wrap:pretty] whitespace-pre-wrap break-words"
   >
     {content}
   </div>
