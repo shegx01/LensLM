@@ -1,14 +1,12 @@
 <script lang="ts">
-  // Floating card top bar — same family as the left rail: bg-card surface, the
-  // layered --shadow-bar lift, and a Chat/Notes segmented control whose active
-  // pill SLIDES on the rail's spring (--ease-spring, gated by --rail-motion). The
-  // whole bar is a Tauri drag region; interactive children (toggle, buttons) opt
-  // out by being real controls, which still receive pointer events.
+  // Compact floating pill header — right-aligned, hugging its contents. Same
+  // family as the left rail: bg-card surface + the layered --shadow-bar lift, and
+  // a Chat/Notes segmented control whose active pill SLIDES on the rail's spring
+  // (--ease-spring, gated by --rail-motion). The outer row + pill are Tauri drag
+  // regions; interactive children (toggle, buttons) stay real controls.
 
-  import BookOpen from '@lucide/svelte/icons/book-open';
   import Share2 from '@lucide/svelte/icons/share-2';
   import Settings from '@lucide/svelte/icons/settings';
-  import { cn } from '$lib/utils.js';
   import { Button } from '$lib/components/ui/button/index.js';
   import {
     Tooltip,
@@ -16,52 +14,39 @@
     TooltipTrigger,
     TooltipProvider
   } from '$lib/components/ui/tooltip/index.js';
-  import { notebookStore, notebookColorClass } from '$lib/notebooks/index.js';
+  import { notebookStore } from '$lib/notebooks/index.js';
 
   const activeNotebook = $derived(notebookStore.activeNotebook);
   const activeTab = $derived(notebookStore.activeTab);
-  const accentClass = $derived(activeNotebook ? notebookColorClass(activeNotebook.id) : '');
 
   function setTab(tab: 'chat' | 'notes'): void {
     notebookStore.activeTab = tab;
   }
 </script>
 
-<div data-tauri-drag-region class="shrink-0 px-3 pt-2.5 pb-1">
+<div data-tauri-drag-region class="flex shrink-0 justify-end px-3 pt-2.5 pb-1">
   <div
     data-tauri-drag-region
     role="toolbar"
     aria-label="Notebook toolbar"
-    class="flex h-12 items-center gap-2 rounded-2xl bg-card pr-1.5 pl-2 shadow-[var(--shadow-bar)]"
+    class="inline-flex items-center gap-1 rounded-full bg-card py-1 pr-1 shadow-[var(--shadow-bar)] {activeNotebook
+      ? 'pl-3.5'
+      : 'pl-1'}"
   >
-    <!-- Identity — colored icon tile + title, echoing the rail's notebook rows. -->
     {#if activeNotebook}
-      <div class={cn('nb-mark', accentClass)} aria-hidden="true">
-        <BookOpen class="size-4" />
-      </div>
       <span
         data-tauri-drag-region
-        class="min-w-0 flex-1 truncate text-[13px] font-semibold tracking-[-0.01em] text-card-foreground"
+        class="max-w-[180px] truncate pr-1 text-xs font-semibold tracking-[-0.1px] text-card-foreground"
         title={activeNotebook.title}
       >
         {activeNotebook.title}
-      </span>
-    {:else}
-      <div class="nb-mark nb-mark--muted" aria-hidden="true">
-        <BookOpen class="size-4" />
-      </div>
-      <span
-        data-tauri-drag-region
-        class="min-w-0 flex-1 truncate text-[13px] text-muted-foreground"
-      >
-        No notebook selected
       </span>
     {/if}
 
     <TooltipProvider>
       <!-- Segmented toggle: absolutely-positioned pill slides between the two
-           tabs on the rail spring. Equal-width tabs → translateX(100%) lands
-           the pill exactly on the second tab (its own width == a tab's width). -->
+           tabs on the rail spring. Equal-width tabs → translateX(100%) lands the
+           pill exactly on the second tab (its own width == a tab's width). -->
       <div class="seg" role="group" aria-label="View toggle" data-tab={activeTab}>
         <span class="seg-ind" aria-hidden="true"></span>
         <button
@@ -94,10 +79,10 @@
             variant="ghost"
             size="icon"
             disabled
-            class="size-8 rounded-full text-muted-foreground transition-transform hover:bg-muted active:scale-[0.96]"
+            class="size-[30px] rounded-full bg-muted text-muted-foreground transition-transform hover:bg-muted/70 active:scale-[0.96]"
             aria-label="Share notebook (available soon)"
           >
-            <Share2 class="size-[15px]" strokeWidth={2} />
+            <Share2 class="size-[13px]" strokeWidth={2} />
           </Button>
         </TooltipTrigger>
         <TooltipContent side="bottom">Available soon</TooltipContent>
@@ -109,11 +94,11 @@
             <Button
               variant="ghost"
               size="icon"
-              class="size-8 rounded-full text-muted-foreground transition-transform hover:bg-muted hover:text-foreground active:scale-[0.96]"
+              class="size-[30px] rounded-full bg-muted text-muted-foreground transition-transform hover:bg-muted/70 hover:text-foreground active:scale-[0.96]"
               aria-label="Notebook settings"
               onclick={() => (notebookStore.notebookSettingsOpen = true)}
             >
-              <Settings class="size-[15px]" strokeWidth={2} />
+              <Settings class="size-[13px]" strokeWidth={2} />
             </Button>
           </TooltipTrigger>
           <TooltipContent side="bottom">Notebook settings</TooltipContent>
@@ -125,10 +110,10 @@
               variant="ghost"
               size="icon"
               disabled
-              class="size-8 rounded-full text-muted-foreground hover:bg-muted"
+              class="size-[30px] rounded-full bg-muted text-muted-foreground hover:bg-muted/70"
               aria-label="Notebook settings (no active notebook)"
             >
-              <Settings class="size-[15px]" strokeWidth={2} />
+              <Settings class="size-[13px]" strokeWidth={2} />
             </Button>
           </TooltipTrigger>
           <TooltipContent side="bottom">Select a notebook</TooltipContent>
@@ -139,42 +124,23 @@
 </div>
 
 <style>
-  /* Icon tile — matches the rail's 30px accented notebook tile (concentric 9px). */
-  .nb-mark {
-    width: 30px;
-    height: 30px;
-    flex: none;
-    display: grid;
-    place-items: center;
-    border-radius: 9px;
-    transition: transform calc(0.5s * var(--rail-motion, 1)) var(--ease-spring, ease);
-  }
-  .nb-mark--muted {
-    background: var(--muted);
-    color: var(--muted-foreground);
-  }
-  /* Playful nod to the rail's logo-rotate on hover. */
-  [role='toolbar']:hover .nb-mark {
-    transform: rotate(calc(-4deg * var(--rail-motion, 1)));
-  }
-
   /* ---- segmented toggle ---- */
   .seg {
     position: relative;
     display: grid;
     grid-auto-flow: column;
     grid-auto-columns: 1fr;
-    padding: 3px;
-    border-radius: 13px;
+    padding: 2px;
+    border-radius: 999px;
     background: var(--muted);
   }
   .seg-ind {
     position: absolute;
-    top: 3px;
-    left: 3px;
-    height: calc(100% - 6px);
-    width: calc(50% - 3px);
-    border-radius: 10px;
+    top: 2px;
+    left: 2px;
+    height: calc(100% - 4px);
+    width: calc(50% - 2px);
+    border-radius: 999px;
     background: var(--card);
     box-shadow:
       0 1px 2px oklch(0.2 0.02 293 / 0.12),
@@ -188,13 +154,13 @@
   .seg-btn {
     position: relative;
     z-index: 1;
-    min-width: 58px;
-    height: 28px;
-    padding: 0 12px;
+    min-width: 52px;
+    height: 26px;
+    padding: 0 13px;
     border: 0;
     background: transparent;
-    border-radius: 10px;
-    font-size: 11.5px;
+    border-radius: 999px;
+    font-size: 11px;
     font-weight: 600;
     letter-spacing: -0.01em;
     cursor: pointer;
