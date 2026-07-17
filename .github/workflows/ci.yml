@@ -22,9 +22,10 @@ env:
 
 jobs:
   # ─────────────────────────── Rust ───────────────────────────
-  # CI runs fmt + clippy (the Linux compile/lint canary — clippy --all-targets
-  # also compiles the test code). The Rust test SUITE runs locally and is gated
-  # by a `signoff` commit status (gh-signoff); see docs/ci.md.
+  # fmt / clippy / 3 test shards fan out over one shared cargo cache.
+  # Why no prebuilt "archive" hand-off: the nextest archive of this workspace is
+  # ~6 GB (debug binaries + stdlib); re-downloading it per shard cost more than
+  # recompiling from the warm cache does.
 
   rust-fmt:
     name: Rust (fmt)
@@ -51,14 +52,42 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-      # The only Rust compile job now, so it writes the shared cache.
+      # Reads the shared cache; the test shards keep it warm (save-if there).
       - name: Set up Rust environment
         uses: ./.github/actions/rust-env
         with:
-          save-cache: 'true'
           fetch-pdfium: 'true'
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+  rust-test:
+    name: Rust (test/${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      # One shard failing shouldn't cancel the others — we want the full picture.
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    env:
+      # Gates the test-binary compile on rustc warnings (was `cargo test`'s job).
+      RUSTFLAGS: '-D warnings'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      # Shard 1 is the sole cache writer so the parallel shards don't race on the key.
+      - name: Set up Rust environment
+        uses: ./.github/actions/rust-env
+        with:
+          save-cache: ${{ matrix.shard == 1 }}
+          fetch-pdfium: 'true'
+          install-nextest: 'true'
+      # strategy.job-total is the matrix length, so the partition denominator
+      # tracks the shard list automatically — no separate count to keep in sync.
+      - name: Run test shard
+        run: >-
+          cargo nextest run --workspace
+          --partition count:${{ matrix.shard }}/${{ strategy.job-total }}
 
   # ───────────────────────── Frontend ─────────────────────────
   frontend:
