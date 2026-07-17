@@ -1,8 +1,6 @@
-//! One-shot Qwen model "prepare" (#194): an explicit, progress-streamed download
-//! of the MLX model, plus an on-disk presence check. Deliberately separate from
-//! the persistent synth protocol in `mod.rs` (spawn → stream JSON → exit; never a
-//! long-lived child + id-correlated drain), so it cannot perturb
-//! `run_turn_locked`/`drain_until`.
+//! One-shot Qwen model "prepare" (#194): explicit progress-streamed download of
+//! the MLX model plus an on-disk presence check. Kept separate from the persistent
+//! synth protocol in `mod.rs` so it can't perturb `run_turn_locked`/`drain_until`.
 
 use std::path::Path;
 use std::process::Stdio;
@@ -38,11 +36,8 @@ struct PrepareProgress {
 }
 
 /// Drives the one-shot `--prepare` sidecar, forwarding streamed byte progress to
-/// `on_progress` and a terminal `done:true`. Reuses the serve resolver (hence
-/// [`resolve_sidecar_spawn`](super::resolve_sidecar_spawn)), appending
-/// `--prepare`. Every failure (sidecar `{"error"}`, non-zero exit,
-/// EOF-without-done, over-cap line, timeout) maps to a detail-free
-/// [`LensError::Tts`].
+/// `on_progress` then a terminal `done:true`. Reuses the serve resolver, appending
+/// `--prepare`; every failure maps to a detail-free [`LensError::Tts`].
 pub async fn run_prepare<F>(resolver: SpawnResolver, mut on_progress: F) -> Result<(), LensError>
 where
     F: FnMut(DownloadProgress) + Send,
@@ -162,9 +157,10 @@ where
 }
 
 /// Whether the Qwen model snapshot is present AND complete under `hf_cache_dir`
-/// (which the resolver points `HF_HOME` at). Complete means: a snapshot revision
-/// dir holds a resolvable `config.json` sentinel AND no `blobs/*.incomplete`
-/// partial remains (huggingface_hub leaves those mid-download).
+/// (which the resolver points `HF_HOME` at): a revision must resolve BOTH
+/// `config.json` and a `*.safetensors` weight through its symlinks, with no
+/// `blobs/*.incomplete` partial (huggingface_hub leaves those mid-download).
+/// Assumes the plain-HTTPS cache layout forced by `HF_HUB_DISABLE_XET=1`.
 pub fn qwen_snapshot_present(hf_cache_dir: &Path) -> bool {
     let model_dir = hf_cache_dir.join("hub").join(QWEN_SNAPSHOT_DIR);
     if has_incomplete_blob(&model_dir.join("blobs")) {
@@ -175,13 +171,32 @@ pub fn qwen_snapshot_present(hf_cache_dir: &Path) -> bool {
     };
     for entry in entries.flatten() {
         let rev = entry.path();
-        // `exists()` follows the symlink into `blobs/`, so a dangling link (blob
+        // Require BOTH the config sentinel and a weight file: an interrupt between
+        // files (config symlinked, weights not yet started → no `.incomplete`)
+        // must read as absent, not silently re-fetch multi-GB at first synth.
+        // `exists()` follows each symlink into `blobs/`, so a dangling link (blob
         // not yet downloaded) correctly reads as absent.
-        if rev.is_dir() && rev.join("config.json").exists() {
+        if rev.is_dir() && rev.join("config.json").exists() && has_resolvable_safetensors(&rev) {
             return true;
         }
     }
     false
+}
+
+/// Whether the revision dir holds at least one `*.safetensors` file that resolves
+/// through its symlink — covers both single-file `model.safetensors` and a sharded
+/// `model-0000N-of-...safetensors` layout.
+fn has_resolvable_safetensors(rev: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(rev) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        let p = e.path();
+        e.file_name()
+            .to_str()
+            .is_some_and(|n| n.ends_with(".safetensors"))
+            && p.exists()
+    })
 }
 
 fn has_incomplete_blob(blobs: &Path) -> bool {
@@ -326,6 +341,9 @@ mod tests {
         let blob = blobs.join("deadbeef");
         std::fs::write(&blob, b"{}").unwrap();
         std::os::unix::fs::symlink(&blob, rev.join("config.json")).unwrap();
+        let weight = blobs.join("cafef00d");
+        std::fs::write(&weight, b"weights").unwrap();
+        std::os::unix::fs::symlink(&weight, rev.join("model.safetensors")).unwrap();
     }
 
     #[test]
@@ -342,6 +360,22 @@ mod tests {
         // A partial blob from an interrupted pull invalidates the cache.
         let blobs = tmp.path().join("hub").join(QWEN_SNAPSHOT_DIR).join("blobs");
         std::fs::write(blobs.join("deadbeef.incomplete"), b"partial").unwrap();
+        assert!(!qwen_snapshot_present(tmp.path()));
+    }
+
+    #[test]
+    fn snapshot_present_false_when_weights_missing() {
+        // The exact between-files gap: config.json resolves + NO `*.incomplete`,
+        // but the weight artifact was never fetched → must NOT report ready.
+        let tmp = tempfile::tempdir().unwrap();
+        let model = tmp.path().join("hub").join(QWEN_SNAPSHOT_DIR);
+        let blobs = model.join("blobs");
+        let rev = model.join("snapshots").join("abc123");
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::create_dir_all(&rev).unwrap();
+        let blob = blobs.join("deadbeef");
+        std::fs::write(&blob, b"{}").unwrap();
+        std::os::unix::fs::symlink(&blob, rev.join("config.json")).unwrap();
         assert!(!qwen_snapshot_present(tmp.path()));
     }
 

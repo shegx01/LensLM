@@ -102,10 +102,8 @@ fn main() {
             // generic `LensError::Tts` at synth time — never a startup panic.
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             {
-                // Paths (sidecar dir, HF cache) come from the single source of
-                // truth `qwen::sidecar_paths` so this injection and the on-demand
-                // `prepare_qwen_model` command can never resolve divergent
-                // locations. Resolution is deferred inside the closure.
+                // Resolution is deferred inside the closure; see
+                // `qwen::sidecar_paths` for the shared-path rationale.
                 let paths = qwen::sidecar_paths(app.handle())?;
                 let resolver = qwen::spawn_resolver(&paths);
                 let qwen = qwen::QwenSidecar::new(resolver);

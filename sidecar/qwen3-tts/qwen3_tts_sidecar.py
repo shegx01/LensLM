@@ -31,7 +31,7 @@ MODEL_ID = "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-bf16"
 
 # huggingface_hub's on-disk cache subdir for MODEL_ID (under `$HF_HOME/hub`).
 # Kept in lockstep with the Rust presence check (`qwen::QWEN_SNAPSHOT_DIR`).
-CACHE_SUBDIR = "models--mlx-community--Qwen3-TTS-12Hz-1.7B-CustomVoice-bf16"
+CACHE_SUBDIR = "models--" + MODEL_ID.replace("/", "--")
 
 # Symmetric guards fall back to these when a request omits or malforms a param.
 # The Rust host currently sends neither, so these are the effective values.
@@ -169,7 +169,6 @@ def serve() -> None:
 
 
 def parse_prepare(argv: list) -> bool:
-    """True when invoked in one-shot prepare (download) mode."""
     return "--prepare" in argv
 
 

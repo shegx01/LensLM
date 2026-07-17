@@ -177,8 +177,7 @@ pub async fn download_tts_model(
 ///
 /// `engine == "qwen3_local"` (#194) is special-cased: Qwen's MLX weights live in
 /// the huggingface_hub cache (not the `models/<id>/` registry), so presence is the
-/// HF-snapshot check under `HF_HOME` and `model` is ignored. Apple-Silicon only;
-/// off-target the engine does not exist, so it falls through to the registry probe.
+/// HF-snapshot check under `HF_HOME` and `model` is ignored. Apple-Silicon only.
 #[tracing::instrument(skip_all, fields(engine = %engine, model = %model))]
 #[tauri::command(rename_all = "snake_case")]
 pub async fn tts_model_downloaded(
@@ -199,9 +198,10 @@ pub async fn tts_model_downloaded(
 }
 
 /// Explicitly downloads the Qwen3-TTS MLX model (~4.5 GB) via a one-shot sidecar
-/// `--prepare` process, streaming byte progress on `on_progress` (#194). Mirrors
-/// `download_tts_model`'s Channel contract; Qwen's weights are otherwise fetched
-/// lazily by the sidecar on first synth. Apple-Silicon only (the Qwen target).
+/// `--prepare` process, streaming byte progress on `on_progress` (#194) using the
+/// same `Channel<DownloadProgress>` progress contract as `download_tts_model` (not
+/// its arg casing — this command takes camelCase `onProgress`). Qwen's weights are
+/// otherwise fetched lazily by the sidecar on first synth. Apple-Silicon only.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[tracing::instrument(skip_all)]
 #[tauri::command]
