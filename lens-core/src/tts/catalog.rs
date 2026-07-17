@@ -195,7 +195,7 @@ impl TtsEngineId {
 
     /// Preset named voices for this engine's selector display. Derived from the
     /// canonical voice lists (no duplication): Orpheus from its adapter catalog,
-    /// Qwen from [`QWEN_VOICES`]. Cloud has no local presets.
+    /// Qwen from [`QWEN_VOICES`], Cloud from the curated OpenAI set.
     pub fn preset_voices(self) -> Vec<TtsVoice> {
         match self {
             TtsEngineId::Orpheus => crate::tts::orpheus::ORPHEUS_VOICES
@@ -206,7 +206,10 @@ impl TtsEngineId {
                 .iter()
                 .map(|v| TtsVoice::new(v.id, v.display_name, v.gender))
                 .collect(),
-            TtsEngineId::Cloud => Vec::new(),
+            TtsEngineId::Cloud => crate::tts::cloud::OPENAI_VOICES
+                .iter()
+                .map(|&(id, name, gender)| TtsVoice::new(id, name, gender))
+                .collect(),
         }
     }
 }
@@ -590,7 +593,9 @@ mod tests {
         assert_eq!(qwen.len(), QWEN_VOICES.len());
         assert!(qwen.iter().any(|v| v.id == "dylan"));
 
-        assert!(TtsEngineId::Cloud.preset_voices().is_empty());
+        let cloud = TtsEngineId::Cloud.preset_voices();
+        assert_eq!(cloud.len(), crate::tts::cloud::OPENAI_VOICES.len());
+        assert!(cloud.iter().any(|v| v.id == "alloy"));
     }
 
     /// Every guard-comparable `Lang`, so drift checks can enumerate the full set.

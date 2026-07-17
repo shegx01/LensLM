@@ -13,17 +13,30 @@ const DEFAULT_PRESET_VOICES: TtsVoice[] = [
   { id: 'tara', name: 'Tara', gender: 'female' }
 ];
 
+/** A sample of the curated OpenAI-compatible cloud voice set (#195), mirroring
+ *  the real gender buckets from `lens-core/src/tts/cloud/mod.rs::OPENAI_VOICES`. */
+const CLOUD_VOICES: TtsVoice[] = [
+  { id: 'alloy', name: 'Alloy', gender: 'female' },
+  { id: 'onyx', name: 'Onyx', gender: 'male' }
+];
+
 /** A 3-engine catalog fixture mirroring lens-core's `tts_catalog_serialized` shape (#194).
  *  Orpheus and Qwen3Local both carry preset voices by default — the voice picker (#194)
- *  reads them straight from this static catalog, never from `list_tts_voices`. */
+ *  reads them straight from this static catalog, never from `list_tts_voices`. Cloud's
+ *  `available`/`preset_voices` are overridable (#195) so tests can exercise both the
+ *  no-key/no-presets state and the post-save/curated-voices state. */
 function catalogFixture(overrides?: {
   qwenAvailable?: boolean;
   orpheusVoices?: TtsVoice[];
   qwenVoices?: TtsVoice[];
+  cloudAvailable?: boolean;
+  cloudVoices?: TtsVoice[];
 }): TtsEngineCatalogEntry[] {
   const qwenAvailable = overrides?.qwenAvailable ?? false;
   const orpheusVoices = overrides?.orpheusVoices ?? DEFAULT_PRESET_VOICES;
   const qwenVoices = overrides?.qwenVoices ?? DEFAULT_PRESET_VOICES;
+  const cloudAvailable = overrides?.cloudAvailable ?? false;
+  const cloudVoices = overrides?.cloudVoices ?? [];
   return [
     {
       id: 'orpheus',
@@ -55,16 +68,35 @@ function catalogFixture(overrides?: {
       id: 'cloud',
       platform: 'cross_platform',
       needs_key: true,
-      available: false,
-      unavailable_reason: 'Requires an API key',
+      available: cloudAvailable,
+      unavailable_reason: cloudAvailable ? null : 'Requires an API key',
       multilingual: true,
       supported_languages: [],
-      preset_voices: [],
+      preset_voices: cloudVoices,
       model_size_bytes: null,
       language_capability_label: 'Multilingual (cloud)',
       required_model_ids: []
     }
   ];
+}
+
+/** A config with a saved cloud key. Reactive voice/base-URL edits only persist
+ *  once a key exists — the panel's validity gate blocks persisting an unusable
+ *  (keyless) cloud backend, so voice-persistence tests seed a key here. */
+function cloudKeyedConfig(): AppConfig {
+  return {
+    ...baseConfig(),
+    tts: {
+      version: 1,
+      backend: { cloud: 'open_ai_compatible' as const },
+      model: '',
+      cloud: {
+        kind: 'open_ai_compatible' as const,
+        api_key: 'sk-already-saved',
+        base_url: 'https://api.openai.com'
+      }
+    }
+  };
 }
 
 /** Drive the download progress channel to completion. */
@@ -97,8 +129,15 @@ describe('TtsConfigPanel — voices', () => {
     const oncheck = vi.fn().mockResolvedValue(undefined);
     const oncollapse = vi.fn();
     const listVoicesSpy = vi.fn();
+    // The panel re-checks on-disk presence after a download reports done, so a
+    // genuinely-complete download must flip `tts_model_downloaded` to true.
+    let modelOnDisk = false;
     mockIPC((cmd, args) => {
-      if (cmd === 'download_tts_model') return driveDownload(args);
+      if (cmd === 'download_tts_model') {
+        modelOnDisk = true;
+        return driveDownload(args);
+      }
+      if (cmd === 'tts_model_downloaded') return modelOnDisk;
       if (cmd === 'tts_engine_catalog') return catalogFixture();
       if (cmd === 'list_tts_voices') {
         listVoicesSpy();
@@ -136,8 +175,13 @@ describe('TtsConfigPanel — voices', () => {
 
   it('opens the host-voice picker, lists options from preset_voices, and selecting one persists immediately', async () => {
     let written: AppConfig | null = null;
+    let modelOnDisk = false;
     mockIPC((cmd, args) => {
-      if (cmd === 'download_tts_model') return driveDownload(args);
+      if (cmd === 'download_tts_model') {
+        modelOnDisk = true;
+        return driveDownload(args);
+      }
+      if (cmd === 'tts_model_downloaded') return modelOnDisk;
       if (cmd === 'tts_engine_catalog')
         return catalogFixture({
           orpheusVoices: [
@@ -184,8 +228,13 @@ describe('TtsConfigPanel — voices', () => {
 
   it('shows an inline error and no voice picker when the voice list is empty (no stub voices, no persist)', async () => {
     const setConfig = vi.fn();
+    let modelOnDisk = false;
     mockIPC((cmd, args) => {
-      if (cmd === 'download_tts_model') return driveDownload(args);
+      if (cmd === 'download_tts_model') {
+        modelOnDisk = true;
+        return driveDownload(args);
+      }
+      if (cmd === 'tts_model_downloaded') return modelOnDisk;
       if (cmd === 'tts_engine_catalog') return catalogFixture({ orpheusVoices: [] });
       if (cmd === 'get_config') return baseConfig();
       if (cmd === 'set_config') {
@@ -209,56 +258,97 @@ describe('TtsConfigPanel — voices', () => {
   });
 });
 
-describe('TtsConfigPanel — cloud (ElevenLabs)', () => {
-  it('persists the ElevenLabs provider + entered key to AppConfig.tts (RMW), then re-checks and collapses', async () => {
+describe('TtsConfigPanel — cloud (OpenAI-compatible, reactive, #195)', () => {
+  it('has no Save button — the Cloud tab persists reactively like the Local tab', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return baseConfig();
+      if (cmd === 'tts_engine_catalog') return catalogFixture();
+    });
+
+    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+    await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
+
+    expect(screen.queryByRole('button', { name: /^save$/i })).not.toBeInTheDocument();
+  });
+
+  it('names the endpoint as any OpenAI-speech-API-compatible provider (Groq/DeepInfra/self-hosted), not just OpenAI', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return baseConfig();
+      if (cmd === 'tts_engine_catalog') return catalogFixture();
+    });
+
+    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+    await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
+
+    expect(screen.getByText(/groq/i)).toBeInTheDocument();
+    expect(screen.getByText(/deepinfra/i)).toBeInTheDocument();
+    expect(screen.getByText(/localai/i)).toBeInTheDocument();
+  });
+
+  it('labels the curated preset pickers as OpenAI-specific and hints non-OpenAI providers to use free-text voice ids', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return baseConfig();
+      if (cmd === 'tts_engine_catalog') return catalogFixture({ cloudVoices: CLOUD_VOICES });
+    });
+
+    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+    await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
+
+    await screen.findByLabelText(/host speaker/i);
+    expect(screen.getByRole('heading', { name: /openai voices/i })).toBeInTheDocument();
+    expect(
+      screen.getByText(/using another provider\? enter its own voice ids\./i)
+    ).toBeInTheDocument();
+  });
+
+  it('entering a fresh key and blurring persists it and flips Cloud from unavailable to available (catalog re-fetch)', async () => {
     let written: AppConfig | null = null;
+    let keySaved = false;
     const oncheck = vi.fn().mockResolvedValue(undefined);
     const oncollapse = vi.fn();
     mockIPC((cmd, args) => {
       if (cmd === 'get_config') return baseConfig();
+      // Mirrors the real backend: `tts_engine_catalog` re-derives `available` from
+      // whatever key is currently persisted, every time it is invoked.
+      if (cmd === 'tts_engine_catalog') return catalogFixture({ cloudAvailable: keySaved });
       if (cmd === 'set_config') {
+        keySaved = true;
         written = (args as { config: AppConfig }).config;
         return null;
       }
     });
 
     render(TtsConfigPanel, { props: { oncheck, oncollapse } });
-
-    // Switch to the Cloud tab.
     await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
 
-    // Enter an ElevenLabs API key.
-    const keyField = screen.getByLabelText(/api key/i);
-    await fireEvent.input(keyField, { target: { value: 'sk-elevenlabs-1234' } });
+    await waitFor(() => expect(screen.getByText(/requires an api key/i)).toBeInTheDocument());
 
-    // Save.
-    await fireEvent.click(screen.getByRole('button', { name: /^save$/i }));
+    const keyField = screen.getByLabelText(/api key/i);
+    await fireEvent.input(keyField, { target: { value: 'sk-openai-1234' } });
+    await fireEvent.blur(keyField);
 
     await waitFor(() => expect(written).not.toBeNull());
-    // Standard client-side RMW: set_config receives the whole config with `tts`
-    // populated and every other field round-tripped untouched.
+    // `open_ai_compatible` is the only kind the backend adapter dispatches (#195).
     expect((written as unknown as AppConfig).tts).toEqual({
       version: 1,
-      backend: { cloud: 'eleven_labs' },
+      backend: { cloud: 'open_ai_compatible' },
       model: '',
-      cloud: { kind: 'eleven_labs', api_key: 'sk-elevenlabs-1234', base_url: '' }
+      cloud: {
+        kind: 'open_ai_compatible',
+        api_key: 'sk-openai-1234',
+        base_url: 'https://api.openai.com'
+      }
     });
-    await waitFor(() => expect(oncheck).toHaveBeenCalledOnce());
-    expect(oncollapse).toHaveBeenCalledOnce();
+
+    await waitFor(() => expect(screen.getByText(/cloud is available/i)).toBeInTheDocument());
+    expect(screen.queryByText(/requires an api key/i)).not.toBeInTheDocument();
+
+    // A reactive persist is not a Save-button submit: no re-check, no collapse.
+    expect(oncheck).not.toHaveBeenCalled();
+    expect(oncollapse).not.toHaveBeenCalled();
   });
 
-  it('disables Save until a key is entered', async () => {
-    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
-    await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
-
-    const save = screen.getByRole('button', { name: /^save$/i });
-    expect(save).toBeDisabled();
-
-    await fireEvent.input(screen.getByLabelText(/api key/i), { target: { value: 'sk-x' } });
-    expect(save).not.toBeDisabled();
-  });
-
-  it('masks a previously-saved ElevenLabs key: Save disabled initially, enabled after editing', async () => {
+  it('masks a previously-saved key and clears it for fresh entry on focus', async () => {
     mockIPC((cmd) => {
       if (cmd === 'get_config') {
         const cfg = baseConfig();
@@ -266,9 +356,9 @@ describe('TtsConfigPanel — cloud (ElevenLabs)', () => {
           ...cfg,
           tts: {
             version: 1,
-            backend: { cloud: 'eleven_labs' },
+            backend: { cloud: 'open_ai_compatible' },
             model: '',
-            cloud: { kind: 'eleven_labs', api_key: 'sk-saved-eleven', base_url: '' }
+            cloud: { kind: 'open_ai_compatible', api_key: 'sk-saved-openai', base_url: '' }
           }
         };
       }
@@ -279,34 +369,257 @@ describe('TtsConfigPanel — cloud (ElevenLabs)', () => {
     await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
 
     const keyField = screen.getByLabelText(/api key/i);
-    const save = screen.getByRole('button', { name: /^save$/i });
 
-    // Real key kept out of the DOM; masked placeholder shown.
-    await waitFor(() => expect(keyField).toHaveValue(''));
-    expect(keyField).not.toHaveValue('sk-saved-eleven');
-    expect(keyField).toHaveAttribute('placeholder', expect.stringMatching(/saved/i));
-
-    expect(save).toBeDisabled();
+    // Real key kept out of the DOM; masked placeholder shown once onMount's
+    // `get_config` fetch resolves.
+    await waitFor(() =>
+      expect(keyField).toHaveAttribute('placeholder', expect.stringMatching(/saved/i))
+    );
+    expect(keyField).toHaveValue('');
+    expect(keyField).not.toHaveValue('sk-saved-openai');
 
     await fireEvent.focus(keyField);
-    await fireEvent.input(keyField, { target: { value: 'sk-new-eleven' } });
-    expect(save).not.toBeDisabled();
+    expect(keyField).toHaveValue('');
   });
 
-  it('surfaces an inline error and does NOT collapse when the save fails', async () => {
-    const oncheck = vi.fn().mockResolvedValue(undefined);
-    const oncollapse = vi.fn();
+  it('blurring the key field empty while editing does NOT wipe the saved key', async () => {
+    let written: AppConfig | null = null;
+    const setConfigSpy = vi.fn();
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') {
+        const cfg = baseConfig();
+        return {
+          ...cfg,
+          tts: {
+            version: 1,
+            backend: { cloud: 'open_ai_compatible' },
+            model: '',
+            cloud: { kind: 'open_ai_compatible', api_key: 'sk-saved-openai', base_url: '' }
+          }
+        };
+      }
+      if (cmd === 'tts_engine_catalog') return catalogFixture({ cloudAvailable: true });
+      if (cmd === 'set_config') {
+        setConfigSpy();
+        written = (args as { config: AppConfig }).config;
+        return null;
+      }
+    });
+
+    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+    await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
+
+    const keyField = screen.getByLabelText(/api key/i);
+    // Wait for onMount's `get_config` fetch to resolve (hasSavedKey/masked
+    // placeholder loaded) before racing focus/blur against it.
+    await waitFor(() =>
+      expect(keyField).toHaveAttribute('placeholder', expect.stringMatching(/saved/i))
+    );
+
+    // Focus enters "replace" mode (clears the masked field); blurring without
+    // typing anything must re-mask, not persist a blank key over the real one.
+    await fireEvent.focus(keyField);
+    await fireEvent.blur(keyField);
+
+    expect(setConfigSpy).not.toHaveBeenCalled();
+    expect(written).toBeNull();
+    // Re-masked: focusing again still shows the empty/masked state, not a wiped key.
+    expect(keyField).toHaveAttribute('placeholder', expect.stringMatching(/saved/i));
+  });
+
+  it('surfaces an inline error when a reactive persist fails', async () => {
     mockIPC((cmd) => {
       if (cmd === 'get_config') throw new Error('disk full');
     });
 
-    render(TtsConfigPanel, { props: { oncheck, oncollapse } });
+    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
     await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
-    await fireEvent.input(screen.getByLabelText(/api key/i), { target: { value: 'sk-x' } });
-    await fireEvent.click(screen.getByRole('button', { name: /^save$/i }));
+
+    const keyField = screen.getByLabelText(/api key/i);
+    await fireEvent.input(keyField, { target: { value: 'sk-x' } });
+    await fireEvent.blur(keyField);
 
     await waitFor(() => expect(screen.getByRole('alert')).toBeInTheDocument());
-    expect(oncollapse).not.toHaveBeenCalled();
+  });
+
+  it('shows the unavailable banner until a key exists', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return baseConfig();
+      if (cmd === 'tts_engine_catalog') return catalogFixture();
+    });
+
+    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+    await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
+
+    await waitFor(() => expect(screen.getByText(/requires an api key/i)).toBeInTheDocument());
+  });
+
+  it('editing the base URL and blurring persists it, resending the already-saved key', async () => {
+    let written: AppConfig | null = null;
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config')
+        return {
+          ...baseConfig(),
+          tts: {
+            version: 1,
+            backend: { cloud: 'open_ai_compatible' as const },
+            model: '',
+            cloud: {
+              kind: 'open_ai_compatible' as const,
+              api_key: 'sk-already-saved',
+              base_url: 'https://api.openai.com'
+            }
+          }
+        };
+      if (cmd === 'tts_engine_catalog') return catalogFixture({ cloudAvailable: true });
+      if (cmd === 'set_config') {
+        written = (args as { config: AppConfig }).config;
+        return null;
+      }
+    });
+
+    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+    await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
+
+    const baseUrlField = screen.getByLabelText(/base url/i);
+    await waitFor(() => expect(baseUrlField).toHaveValue('https://api.openai.com'));
+
+    await fireEvent.input(baseUrlField, { target: { value: 'https://my-gateway.example.com' } });
+    await fireEvent.blur(baseUrlField);
+
+    await waitFor(() => expect(written).not.toBeNull());
+    // The real key is resent untouched — masking never risks wiping it.
+    expect((written as unknown as AppConfig).tts.cloud?.api_key).toBe('sk-already-saved');
+    expect((written as unknown as AppConfig).tts.cloud?.base_url).toBe(
+      'https://my-gateway.example.com'
+    );
+  });
+
+  it('does NOT persist a keyless cloud backend when a base-URL/voice edit happens before a key', async () => {
+    let written: AppConfig | null = null;
+    const setConfigSpy = vi.fn();
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return baseConfig(); // no cloud key saved
+      if (cmd === 'tts_engine_catalog') return catalogFixture();
+      if (cmd === 'set_config') {
+        setConfigSpy();
+        written = (args as { config: AppConfig }).config;
+        return null;
+      }
+    });
+
+    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+    await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
+
+    const baseUrlField = screen.getByLabelText(/base url/i);
+    await waitFor(() => expect(baseUrlField).toHaveValue('https://api.openai.com'));
+    await fireEvent.input(baseUrlField, { target: { value: 'https://my-gateway.example.com' } });
+    await fireEvent.blur(baseUrlField);
+
+    // The validity gate blocks activating a cloud backend with no usable key —
+    // editing a field before entering a key must not persist anything.
+    expect(setConfigSpy).not.toHaveBeenCalled();
+    expect(written).toBeNull();
+  });
+
+  it('accepts free-text voice ids for host/guest on blur when no curated cloud voices exist', async () => {
+    let written: AppConfig | null = null;
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return cloudKeyedConfig();
+      if (cmd === 'tts_engine_catalog') return catalogFixture();
+      if (cmd === 'set_config') {
+        written = (args as { config: AppConfig }).config;
+        return null;
+      }
+    });
+
+    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+    await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
+
+    const hostField = screen.getByLabelText(/host speaker/i);
+    // Let onMount's async config fetch settle first — it unconditionally (re)sets
+    // the free-text voice fields from the fetched config, which would otherwise
+    // race with and clobber a value typed immediately after render.
+    await waitFor(() => expect(hostField).toHaveValue(''));
+    await fireEvent.input(hostField, { target: { value: 'my-host-voice' } });
+    await fireEvent.blur(hostField);
+
+    await waitFor(() => expect(written).not.toBeNull());
+    expect((written as unknown as AppConfig).voices.host).toBe('my-host-voice');
+
+    written = null;
+    const guestField = screen.getByLabelText(/guest speaker/i);
+    await fireEvent.input(guestField, { target: { value: 'my-guest-voice' } });
+    await fireEvent.blur(guestField);
+
+    await waitFor(() => expect(written).not.toBeNull());
+    expect((written as unknown as AppConfig).voices.guest).toBe('my-guest-voice');
+  });
+
+  it('changing a curated voice picker persists immediately (no blur needed)', async () => {
+    let written: AppConfig | null = null;
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return cloudKeyedConfig();
+      if (cmd === 'tts_engine_catalog') return catalogFixture({ cloudVoices: CLOUD_VOICES });
+      if (cmd === 'set_config') {
+        written = (args as { config: AppConfig }).config;
+        return null;
+      }
+    });
+
+    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+    await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
+
+    const hostTrigger = await screen.findByLabelText(/host speaker/i);
+    const guestTrigger = screen.getByLabelText(/guest speaker/i);
+    // Male voice (Onyx) defaults into Host, female (Alloy) into Guest — same
+    // gender-bucket convention as the Local engine pickers. Mount-time defaulting
+    // doesn't itself persist (mirrors Local's onMount, which doesn't either) —
+    // only an explicit pick does.
+    await waitFor(() => expect(hostTrigger).toHaveTextContent('Onyx'));
+    expect(guestTrigger).toHaveTextContent('Alloy');
+    expect(written).toBeNull();
+
+    // bits-ui Select opens on trigger keydown; selection fires on `pointerup`.
+    await fireEvent.keyDown(guestTrigger, { key: 'Enter' });
+    // Only one non-custom female voice in this fixture — pick the custom escape
+    // hatch instead to prove a *different* selection re-persists immediately.
+    const customOption = await screen.findByRole('option', { name: /custom voice id/i });
+    await fireEvent.pointerUp(customOption);
+
+    await waitFor(() => expect(written).not.toBeNull());
+    // Selecting "Custom voice ID…" resolves to an empty voice id until the
+    // escape-hatch text field is filled in — still persisted immediately.
+    expect((written as unknown as AppConfig).voices.guest).toBe('');
+  });
+
+  it('lets the user override a curated pick with a free-text custom voice ID, persisted on blur', async () => {
+    let written: AppConfig | null = null;
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return cloudKeyedConfig();
+      if (cmd === 'tts_engine_catalog') return catalogFixture({ cloudVoices: CLOUD_VOICES });
+      if (cmd === 'set_config') {
+        written = (args as { config: AppConfig }).config;
+        return null;
+      }
+    });
+
+    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+    await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
+
+    const hostTrigger = await screen.findByLabelText(/host speaker/i);
+    await waitFor(() => expect(hostTrigger).toHaveTextContent('Onyx'));
+
+    await fireEvent.keyDown(hostTrigger, { key: 'Enter' });
+    const customOption = await screen.findByRole('option', { name: /custom voice id/i });
+    await fireEvent.pointerUp(customOption);
+
+    const customInput = await screen.findByPlaceholderText(/e\.g\. alloy/i);
+    await fireEvent.input(customInput, { target: { value: 'my-self-hosted-voice' } });
+    await fireEvent.blur(customInput);
+
+    await waitFor(() => expect(written).not.toBeNull());
+    expect((written as unknown as AppConfig).voices.host).toBe('my-self-hosted-voice');
   });
 });
 
@@ -479,13 +792,17 @@ describe('TtsConfigPanel — Qwen3-TTS prepare/download (#194)', () => {
   it('clicking Download for Qwen invokes prepare_qwen_model, drives the progress bar, then reveals catalog voices and persists', async () => {
     let written: AppConfig | null = null;
     const prepareSpy = vi.fn();
+    // The Qwen snapshot only reads present after prepare completes; the panel's
+    // post-download re-check must see that flip before revealing voices.
+    let qwenReady = false;
     mockIPC((cmd, args) => {
       if (cmd === 'get_config') return baseConfig();
       if (cmd === 'tts_engine_catalog') return catalogFixture({ qwenAvailable: true });
       if (cmd === 'tts_model_downloaded')
-        return (args as { engine: string }).engine !== 'qwen3_local';
+        return (args as { engine: string }).engine !== 'qwen3_local' || qwenReady;
       if (cmd === 'prepare_qwen_model') {
         prepareSpy();
+        qwenReady = true;
         return drivePrepare(args);
       }
       if (cmd === 'set_config') {
@@ -551,5 +868,108 @@ describe('TtsConfigPanel — Qwen3-TTS prepare/download (#194)', () => {
 
     await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent(/download failed/i));
     expect(screen.getByRole('button', { name: /download voice engine/i })).toBeInTheDocument();
+  });
+});
+
+describe('TtsConfigPanel — incomplete-model re-download affordance', () => {
+  it('surfaces a "Model incomplete — re-download" affordance when a finished download fails its presence re-check', async () => {
+    // download_tts_model reports done, but the on-disk presence check keeps
+    // returning false (a truncated/partial artifact) — the panel must NOT flip
+    // to ready; it must offer a re-download instead.
+    mockIPC((cmd, args) => {
+      if (cmd === 'download_tts_model') return driveDownload(args);
+      if (cmd === 'tts_model_downloaded') return false;
+      if (cmd === 'tts_engine_catalog') return catalogFixture();
+      if (cmd === 'get_config') return baseConfig();
+      if (cmd === 'set_config') return null;
+    });
+
+    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+    await waitFor(() => expect(screen.getAllByText(/english only/i).length).toBeGreaterThan(0));
+    await fireEvent.click(screen.getByRole('button', { name: /download voice engine/i }));
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole('button', { name: /model incomplete — re-download/i })
+      ).toBeInTheDocument()
+    );
+    expect(screen.getByRole('alert')).toHaveTextContent(/didn't complete/i);
+    // Never falsely reports ready.
+    expect(screen.queryByText(/voice engine ready/i)).not.toBeInTheDocument();
+  });
+
+  it('hides the re-download affordance and shows "ready" when the engine is genuinely on disk', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return { ...baseConfig(), voices: { host: 'leo', guest: 'tara' } };
+      if (cmd === 'tts_model_downloaded') return true;
+      if (cmd === 'tts_engine_catalog') return catalogFixture();
+    });
+
+    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+
+    await waitFor(() => expect(screen.getByText(/voice engine ready/i)).toBeInTheDocument());
+    expect(screen.queryByRole('button', { name: /re-download/i })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: /download voice engine/i })
+    ).not.toBeInTheDocument();
+  });
+
+  it('shows no re-download button while a download is in flight (only a disabled "Downloading…")', async () => {
+    // A download that reports partial progress and never resolves keeps the
+    // panel in the in-flight state — the re-download label must not appear.
+    mockIPC((cmd, args) => {
+      if (cmd === 'download_tts_model') {
+        const ch = (args as { onProgress?: { onmessage?: (m: unknown) => void } }).onProgress;
+        ch?.onmessage?.({ received: 50, total: 100, done: false });
+        return new Promise(() => {});
+      }
+      if (cmd === 'tts_model_downloaded') return false;
+      if (cmd === 'tts_engine_catalog') return catalogFixture();
+      if (cmd === 'get_config') return baseConfig();
+    });
+
+    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+    await waitFor(() => expect(screen.getAllByText(/english only/i).length).toBeGreaterThan(0));
+    await fireEvent.click(screen.getByRole('button', { name: /download voice engine/i }));
+
+    await waitFor(() => {
+      const btn = screen.getByRole('button', { name: /downloading/i });
+      expect(btn).toBeDisabled();
+    });
+    expect(screen.queryByRole('button', { name: /re-download/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+});
+
+describe('TtsConfigPanel — incomplete local download (#195)', () => {
+  it('shows a re-download affordance for a partially-downloaded engine (present but incomplete)', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return baseConfig();
+      if (cmd === 'tts_engine_catalog') return catalogFixture();
+      if (cmd === 'tts_model_downloaded') return false;
+      if (cmd === 'tts_model_incomplete') return true;
+    });
+
+    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+
+    expect(
+      await screen.findByRole('button', { name: /model incomplete.*re-download/i })
+    ).toBeInTheDocument();
+  });
+
+  it('shows a plain download button when nothing is on disk (absent, not partial)', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return baseConfig();
+      if (cmd === 'tts_engine_catalog') return catalogFixture();
+      if (cmd === 'tts_model_downloaded') return false;
+      if (cmd === 'tts_model_incomplete') return false;
+    });
+
+    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+
+    expect(
+      await screen.findByRole('button', { name: /download voice engine/i })
+    ).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /re-download/i })).not.toBeInTheDocument();
   });
 });

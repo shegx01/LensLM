@@ -28,7 +28,7 @@ use lens_core::{
 
 mod prepare;
 mod resolver;
-pub use prepare::{qwen_snapshot_present, run_prepare};
+pub use prepare::{qwen_snapshot_dir_present, qwen_snapshot_present, run_prepare};
 pub use resolver::resolve_sidecar_spawn;
 
 /// The app-data-derived paths the Qwen sidecar launches against. Single source of

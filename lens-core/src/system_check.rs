@@ -1159,7 +1159,12 @@ mod tests {
         for id in ["orpheus", "snac"] {
             let model_path = crate::tts::tts_model_path(data_dir, id).unwrap();
             std::fs::create_dir_all(model_path.parent().unwrap()).unwrap();
-            std::fs::write(&model_path, b"fake-model-bytes").unwrap();
+            // Size-checked presence gate: the file must match the registry's exact
+            // `size_bytes`. `set_len` makes a sparse file of that logical length
+            // without allocating multi-GB on disk.
+            let expected = crate::tts::resolve_tts(id).unwrap().size_bytes;
+            let file = std::fs::File::create(&model_path).unwrap();
+            file.set_len(expected).unwrap();
         }
     }
 

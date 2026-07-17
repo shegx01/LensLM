@@ -48,12 +48,53 @@ pub async fn health_check(engine: tauri::State<'_, LensEngine>) -> Result<Health
 
 /// Runs the three onboarding readiness gates (LLM runtime, embedding model,
 /// text-to-speech) and returns the ordered results for the system-check screen.
+/// On Apple Silicon, Qwen3Local readiness is finalized by [`override_qwen_tts_readiness`].
 #[tracing::instrument(skip_all)]
 #[tauri::command]
 pub async fn run_system_check(
     engine: tauri::State<'_, LensEngine>,
+    #[allow(unused_variables)] app: tauri::AppHandle,
 ) -> Result<Vec<CheckResult>, LensError> {
-    engine.run_system_check().await
+    #[allow(unused_mut)]
+    let mut checks = engine.run_system_check().await?;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    override_qwen_tts_readiness(&mut checks, &engine.config().await, &app)?;
+    Ok(checks)
+}
+
+/// Desktop-side authority for Qwen3-TTS readiness: if the active backend is
+/// `Qwen3Local` and its HF snapshot is missing/incomplete, downgrade the
+/// `TextToSpeech` row to `Fail`. Kept here (not in lens-core) so the headless
+/// engine never gains an HF-cache dependency.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn override_qwen_tts_readiness(
+    checks: &mut [CheckResult],
+    config: &lens_core::AppConfig,
+    app: &tauri::AppHandle,
+) -> Result<(), LensError> {
+    if !matches!(config.tts.backend, lens_core::TtsBackend::Qwen3Local) {
+        return Ok(());
+    }
+    let paths = crate::qwen::sidecar_paths(app)?;
+    downgrade_tts_if_qwen_snapshot_absent(checks, &paths.hf_cache_dir);
+    Ok(())
+}
+
+/// Testable core of [`override_qwen_tts_readiness`], without the `AppHandle`.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn downgrade_tts_if_qwen_snapshot_absent(
+    checks: &mut [CheckResult],
+    hf_cache_dir: &std::path::Path,
+) {
+    use lens_core::{CheckId, CheckStatus};
+
+    if crate::qwen::qwen_snapshot_present(hf_cache_dir) {
+        return;
+    }
+    if let Some(tts) = checks.iter_mut().find(|c| c.id == CheckId::TextToSpeech) {
+        tts.status = CheckStatus::Fail;
+        tts.detail = "Qwen model incomplete — re-download in Settings".to_string();
+    }
 }
 
 /// Probes `base_url` for Ollama-style and OpenAI-compatible endpoints. Never returns
@@ -191,6 +232,30 @@ pub async fn tts_model_downloaded(
         .app_data_dir()
         .map_err(|e| LensError::Io(e.to_string()))?;
     Ok(lens_core::tts_model_downloaded(&data_dir, &model))
+}
+
+/// Whether the selected engine's model is PARTIALLY present — on disk but not
+/// complete (a truncated/interrupted download) — vs never downloaded.
+/// Mirrors `tts_model_downloaded`'s per-engine dispatch.
+#[tracing::instrument(skip_all, fields(engine = %engine, model = %model))]
+#[tauri::command(rename_all = "snake_case")]
+pub async fn tts_model_incomplete(
+    engine: String,
+    model: String,
+    app: tauri::AppHandle,
+) -> Result<bool, LensError> {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if engine == "qwen3_local" {
+        let paths = crate::qwen::sidecar_paths(&app)?;
+        return Ok(crate::qwen::qwen_snapshot_dir_present(&paths.hf_cache_dir)
+            && !crate::qwen::qwen_snapshot_present(&paths.hf_cache_dir));
+    }
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| LensError::Io(e.to_string()))?;
+    Ok(lens_core::tts_model_file_present(&data_dir, &model)
+        && !lens_core::tts_model_downloaded(&data_dir, &model))
 }
 
 /// Explicitly downloads the Qwen3-TTS MLX model (~4.5 GB) via a one-shot sidecar
@@ -576,7 +641,10 @@ mod tests {
         app.manage(LensEngine::for_test().await);
         let engine = app.state::<LensEngine>();
 
-        let checks = run_system_check(engine).await.unwrap();
+        // `run_system_check` the command only wraps this engine call plus the
+        // Apple-Silicon Qwen override (covered by the pure-core tests below); it
+        // takes an `AppHandle<Wry>` that can't be built under the mock runtime.
+        let checks = engine.run_system_check().await.unwrap();
         let ids: Vec<CheckId> = checks.iter().map(|c| c.id).collect();
         assert_eq!(
             ids,
@@ -600,6 +668,55 @@ mod tests {
                 "{id:?} must be a binary gate, got {status:?}"
             );
         }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn tts_check(status: CheckStatus) -> CheckResult {
+        CheckResult {
+            id: CheckId::TextToSpeech,
+            label: "Text-to-speech".to_string(),
+            status,
+            detail: "Audio engine ready".to_string(),
+            action: None,
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn qwen_override_downgrades_tts_when_snapshot_absent() {
+        // Empty cache dir → snapshot missing → TextToSpeech must flip to Fail.
+        let dir = tempfile::tempdir().unwrap();
+        let mut checks = vec![tts_check(CheckStatus::Pass)];
+        downgrade_tts_if_qwen_snapshot_absent(&mut checks, dir.path());
+        assert_eq!(checks[0].status, CheckStatus::Fail);
+        assert!(checks[0].detail.contains("re-download"));
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn qwen_override_leaves_tts_untouched_when_snapshot_present() {
+        // A complete HF snapshot layout (config.json + resolvable weight, no
+        // `.incomplete`) must leave a passing TextToSpeech row unchanged.
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir
+            .path()
+            .join("hub")
+            .join("models--mlx-community--Qwen3-TTS-12Hz-1.7B-CustomVoice-bf16");
+        let blobs = model.join("blobs");
+        let rev = model.join("snapshots").join("abc123");
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::create_dir_all(&rev).unwrap();
+        let cfg_blob = blobs.join("deadbeef");
+        std::fs::write(&cfg_blob, b"{}").unwrap();
+        std::os::unix::fs::symlink(&cfg_blob, rev.join("config.json")).unwrap();
+        let weight = blobs.join("cafef00d");
+        std::fs::write(&weight, b"weights").unwrap();
+        std::os::unix::fs::symlink(&weight, rev.join("model.safetensors")).unwrap();
+
+        let mut checks = vec![tts_check(CheckStatus::Pass)];
+        downgrade_tts_if_qwen_snapshot_absent(&mut checks, dir.path());
+        assert_eq!(checks[0].status, CheckStatus::Pass);
+        assert_eq!(checks[0].detail, "Audio engine ready");
     }
 
     #[tokio::test]
