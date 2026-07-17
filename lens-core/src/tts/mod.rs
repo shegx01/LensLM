@@ -11,6 +11,7 @@ use crate::error::LensError;
 
 pub mod audio;
 pub mod catalog;
+pub mod cloud;
 pub mod orpheus;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub mod qwen;
@@ -143,6 +144,19 @@ pub enum CloudTtsKind {
     ElevenLabs,
 }
 
+impl CloudTtsKind {
+    /// Whether this provider accepts W3C SSML in the synthesis input. OpenAI takes
+    /// plain text + an `instructions` hint (not SSML); ElevenLabs supports SSML;
+    /// Deepgram does not. Consulted per-provider — not surfaced in the static
+    /// `TtsEngineId`-keyed catalog DTO (see #195 ADR).
+    pub fn supports_ssml(self) -> bool {
+        match self {
+            CloudTtsKind::OpenAiCompatible | CloudTtsKind::Deepgram => false,
+            CloudTtsKind::ElevenLabs => true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TtsProviderInfo {
     pub backend: TtsBackend,
@@ -226,7 +240,7 @@ pub trait TtsProvider: Send + Sync {
 /// route through it so the two entry points cannot diverge.
 pub fn resolve_tts_provider_full(
     backend: TtsBackend,
-    _cfg: &TtsConfig,
+    cfg: &TtsConfig,
     data_dir: &Path,
     // Consumed only by the Apple-Silicon-gated `Qwen3Local` arm below.
     #[cfg_attr(
@@ -245,7 +259,23 @@ pub fn resolve_tts_provider_full(
         TtsBackend::Qwen3Local => {
             sidecar.map(|s| Arc::new(qwen::QwenLocalAdapter::new(s)) as Arc<dyn TtsProvider>)
         }
-        TtsBackend::Cloud(_) => None,
+        TtsBackend::Cloud(kind) => {
+            // `Some` iff a cloud config exists; the empty-key case still constructs
+            // and fails clearly at `synthesize_turn` (a real `Validation` error the
+            // FE "add an API key" UX is backed by).
+            let cloud = cfg.cloud.as_ref()?;
+            let model = if cfg.model.is_empty() {
+                cloud::DEFAULT_CLOUD_TTS_MODEL.to_string()
+            } else {
+                cfg.model.clone()
+            };
+            Some(Arc::new(cloud::CloudTtsAdapter::new(
+                kind,
+                cloud.base_url.clone(),
+                cloud.api_key.clone(),
+                model,
+            )))
+        }
     }
 }
 
@@ -276,6 +306,7 @@ mod tests {
 
     #[test]
     fn resolve_returns_none_for_non_embedded_backends() {
+        // Default config has `cloud: None`, so every Cloud kind dispatches to `None`.
         let cfg = TtsConfig::default();
         let data_dir = Path::new("/data");
         for backend in [
@@ -286,6 +317,33 @@ mod tests {
             TtsBackend::Cloud(CloudTtsKind::ElevenLabs),
         ] {
             assert!(resolve_tts_provider(backend, &cfg, data_dir).is_none());
+        }
+    }
+
+    #[test]
+    fn resolve_returns_some_for_cloud_with_config() {
+        use crate::config::CloudTtsConfig;
+        let data_dir = Path::new("/data");
+        for kind in [
+            CloudTtsKind::OpenAiCompatible,
+            CloudTtsKind::Deepgram,
+            CloudTtsKind::ElevenLabs,
+        ] {
+            let cfg = TtsConfig {
+                version: 1,
+                backend: TtsBackend::Cloud(kind),
+                model: String::new(),
+                cloud: Some(CloudTtsConfig {
+                    kind,
+                    api_key: "sk-test".into(),
+                    base_url: "https://api.example.com".into(),
+                }),
+            };
+            let provider = resolve_tts_provider(TtsBackend::Cloud(kind), &cfg, data_dir)
+                .expect("cloud resolves with a cloud config");
+            assert_eq!(provider.info().backend, TtsBackend::Cloud(kind));
+            // Empty `cfg.model` falls back to the default cloud model.
+            assert_eq!(provider.info().model, cloud::DEFAULT_CLOUD_TTS_MODEL);
         }
     }
 
@@ -380,6 +438,13 @@ mod tests {
     #[test]
     fn backend_default_is_orpheus() {
         assert_eq!(TtsBackend::default(), TtsBackend::Orpheus);
+    }
+
+    #[test]
+    fn cloud_kind_ssml_capability() {
+        assert!(!CloudTtsKind::OpenAiCompatible.supports_ssml());
+        assert!(!CloudTtsKind::Deepgram.supports_ssml());
+        assert!(CloudTtsKind::ElevenLabs.supports_ssml());
     }
 
     #[test]

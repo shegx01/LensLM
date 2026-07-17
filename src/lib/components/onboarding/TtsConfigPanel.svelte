@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { fade } from 'svelte/transition';
   import { invoke, isTauri } from '@tauri-apps/api/core';
   import { Input } from '$lib/components/ui/input/index.js';
   import { Button } from '$lib/components/ui/button/index.js';
@@ -85,19 +86,80 @@
   const maleVoices = $derived(voices.filter((v) => v.gender === 'male'));
   const femaleVoices = $derived(voices.filter((v) => v.gender === 'female'));
 
+  const CUSTOM_VOICE = '__custom__';
+
   let cloudApiKey = $state('');
+  // The real, currently-persisted key. Never bound to an input — only used to
+  // resend the key on saves that touch other fields (base URL/voices) without
+  // the user re-typing it, so masking never risks writing a blank key over a
+  // real one (see the #194 Cloud-key-wipe regression this mirrors the fix for).
+  let savedCloudApiKey = $state('');
   let savingCloud = $state(false);
   let cloudError = $state<string | null>(null);
 
-  // Saved ElevenLabs key is masked; Save re-enables only after the user enters a fresh key.
+  // Saved key is masked; Save re-enables only after the user enters a fresh key.
   let hasSavedKey = $state(false);
   let editingKey = $state(false);
 
-  // Identical gate to LlmConfigPanel's cloud Save: disabled until a non-empty
-  // key is typed; when a key is saved, masking re-requires fresh entry.
-  const cloudSaveDisabled = $derived(
-    savingCloud || (hasSavedKey ? !editingKey || !cloudApiKey.trim() : !cloudApiKey.trim())
+  let cloudBaseUrl = $state('https://api.openai.com');
+  let cloudHostPreset = $state('');
+  let cloudGuestPreset = $state('');
+  let cloudHostCustom = $state('');
+  let cloudGuestCustom = $state('');
+
+  const cloudEntry = $derived(catalog.find((e) => e.id === 'cloud') ?? null);
+  const cloudVoices = $derived(cloudEntry?.preset_voices ?? []);
+  const cloudMaleVoices = $derived(cloudVoices.filter((v) => v.gender === 'male'));
+  const cloudFemaleVoices = $derived(cloudVoices.filter((v) => v.gender === 'female'));
+
+  // The resolved host/guest voice id to persist: the curated pick, unless the
+  // user chose the free-text escape hatch (or no curated voices exist yet).
+  const cloudHostVoice = $derived(
+    cloudMaleVoices.length > 0 && cloudHostPreset !== CUSTOM_VOICE
+      ? cloudHostPreset
+      : cloudHostCustom.trim()
   );
+  const cloudGuestVoice = $derived(
+    cloudFemaleVoices.length > 0 && cloudGuestPreset !== CUSTOM_VOICE
+      ? cloudGuestPreset
+      : cloudGuestCustom.trim()
+  );
+
+  // Save requires a base URL always, and a usable key: either freshly typed
+  // (first-time setup, or actively editing) or the already-persisted one for
+  // edits that only touch base URL/voices.
+  const cloudSaveDisabled = $derived(
+    savingCloud ||
+      !cloudBaseUrl.trim() ||
+      (editingKey ? !cloudApiKey.trim() : !hasSavedKey && !cloudApiKey.trim())
+  );
+
+  /** Splits a saved voice id into {preset, custom}: a known curated id selects
+   *  itself; anything else (or no curated list yet) falls back to free-text. */
+  function classifyCloudVoice(
+    saved: string,
+    presets: TtsVoice[]
+  ): { preset: string; custom: string } {
+    // Nothing saved yet: leave `preset` empty so the caller's `|| presets[0]?.id`
+    // fallback picks the default — CUSTOM_VOICE here would short-circuit that `||`.
+    if (!saved) return { preset: '', custom: '' };
+    if (presets.some((v) => v.id === saved)) return { preset: saved, custom: '' };
+    return { preset: presets.length > 0 ? CUSTOM_VOICE : '', custom: saved };
+  }
+
+  function prefersReducedMotion(): boolean {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return false;
+    try {
+      return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Crossfade duration, collapsed to 0 under reduced-motion. */
+  function motionMs(ms: number): number {
+    return prefersReducedMotion() ? 0 : ms;
+  }
 
   /** True once the selected local engine's weights are on disk. Qwen has no
    *  registry-tracked artifacts (`required_model_ids` is empty) — presence is
@@ -123,8 +185,27 @@
       const cfg = await invoke<AppConfig>('get_config');
       if (cfg.tts?.cloud && cfg.tts.cloud.api_key.trim() !== '') {
         hasSavedKey = true;
+        savedCloudApiKey = cfg.tts.cloud.api_key;
         cloudApiKey = '';
       }
+      cloudBaseUrl = cfg.tts?.cloud?.base_url?.trim() || 'https://api.openai.com';
+      // Voices are shared across engines; only trust them as Cloud picks when
+      // Cloud is the currently-active backend (otherwise they belong to whatever
+      // local engine is active and would be nonsense cloud voice ids).
+      const backendIsCloud =
+        typeof cfg.tts?.backend === 'object' &&
+        cfg.tts.backend !== null &&
+        'cloud' in cfg.tts.backend;
+      const savedHost =
+        backendIsCloud && typeof cfg.voices?.host === 'string' ? cfg.voices.host : '';
+      const savedGuest =
+        backendIsCloud && typeof cfg.voices?.guest === 'string' ? cfg.voices.guest : '';
+      const hostClass = classifyCloudVoice(savedHost, cloudMaleVoices);
+      cloudHostPreset = hostClass.preset || cloudMaleVoices[0]?.id || '';
+      cloudHostCustom = hostClass.custom;
+      const guestClass = classifyCloudVoice(savedGuest, cloudFemaleVoices);
+      cloudGuestPreset = guestClass.preset || cloudFemaleVoices[0]?.id || '';
+      cloudGuestCustom = guestClass.custom;
       selectedEngine = cfg.tts?.backend === 'qwen3_local' ? 'qwen3_local' : 'orpheus';
       // If the local engine is already on disk, skip the download step and go
       // straight to voice selection — pre-filled from any previously saved
@@ -222,11 +303,33 @@
     }
   }
 
+  /** Re-fetch the catalog so Cloud's backend-derived `available` reflects the
+   *  just-saved key immediately (Critic #3) — without this the user saves a
+   *  valid key but Cloud stays reported unselectable until app restart. */
+  async function refreshCatalog(): Promise<void> {
+    try {
+      catalog = (await ttsEngineCatalog()) ?? [];
+    } catch {
+      // Keep the previous catalog on a transient re-fetch failure.
+    }
+  }
+
   async function handleSaveCloud(): Promise<void> {
     savingCloud = true;
     cloudError = null;
     try {
-      await saveTtsProvider({ provider: 'cloud', apiKey: cloudApiKey });
+      const apiKey = editingKey || !hasSavedKey ? cloudApiKey : savedCloudApiKey;
+      await saveTtsProvider({
+        provider: 'cloud',
+        apiKey,
+        baseUrl: cloudBaseUrl,
+        hostVoice: cloudHostVoice,
+        guestVoice: cloudGuestVoice
+      });
+      savedCloudApiKey = apiKey;
+      hasSavedKey = apiKey.trim() !== '';
+      editingKey = false;
+      await refreshCatalog();
       await oncheck();
       oncollapse();
     } catch (err) {
@@ -325,7 +428,8 @@
         </p>
         <div class="flex items-center justify-between text-[0.75rem] text-muted-foreground">
           <span>{selectedEntry?.language_capability_label ?? 'Local voice engine'}</span>
-          <span>{formatSize(selectedEntry?.model_size_bytes ?? null) ?? 'On-device · Offline'}</span
+          <span class="tabular-nums"
+            >{formatSize(selectedEntry?.model_size_bytes ?? null) ?? 'On-device · Offline'}</span
           >
         </div>
 
@@ -440,37 +544,200 @@
     role="tabpanel"
     aria-labelledby="tts-tab-cloud"
     tabindex={activeTab === 'cloud' ? 0 : -1}
-    class={cn('mt-3 flex flex-col gap-3', activeTab !== 'cloud' && 'hidden')}
+    class={cn('mt-3 flex flex-col gap-4', activeTab !== 'cloud' && 'hidden')}
   >
-    <p class="text-muted-foreground text-[0.78rem] leading-relaxed">
-      ElevenLabs synthesizes high-quality voices in the cloud. Paste your API key to enable it — no
-      local download required.
+    <p class="text-muted-foreground text-pretty text-[0.78rem] leading-relaxed">
+      Connect an OpenAI-compatible cloud text-to-speech endpoint — OpenAI itself, or any self-hosted
+      server speaking the same API. No local download required.
     </p>
 
-    <div class="flex flex-col gap-1.5">
-      <label
-        for="tts-cloud-key"
-        class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase"
-      >
-        API Key
-      </label>
-      <Input
-        id="tts-cloud-key"
-        type="password"
-        bind:value={cloudApiKey}
-        placeholder={hasSavedKey && !editingKey
-          ? '•••••••••• saved — click to replace'
-          : 'Paste API key…'}
-        autocomplete="new-password"
-        onfocus={startEditingKey}
-        oninput={startEditingKey}
-      />
-      {#if hasSavedKey && !editingKey}
-        <p class="text-muted-foreground text-[0.72rem] leading-relaxed">
-          A key is already saved. Click the field to replace it.
+    {#if cloudEntry}
+      {#if !cloudEntry.available}
+        <p
+          transition:fade={{ duration: motionMs(160) }}
+          class="rounded-lg px-3 py-2 text-[0.75rem] text-destructive ring-1 ring-destructive/30 bg-destructive/10"
+          role="status"
+        >
+          {cloudEntry.unavailable_reason ?? 'Cloud is unavailable.'} Add an API key below to enable it.
+        </p>
+      {:else}
+        <p
+          transition:fade={{ duration: motionMs(160) }}
+          class="flex items-center gap-2 rounded-lg px-3 py-2 text-[0.75rem] text-primary ring-1 ring-primary/30 bg-primary/10"
+          role="status"
+        >
+          <CircleCheck class="size-3.5" />
+          Cloud is available
         </p>
       {/if}
-    </div>
+    {/if}
+
+    <section class="flex flex-col gap-3 rounded-xl p-3 shadow-xs ring-1 ring-foreground/10">
+      <h3
+        class="text-muted-foreground text-balance text-[0.68rem] font-semibold tracking-widest uppercase"
+      >
+        Connection
+      </h3>
+
+      <div class="flex flex-col gap-1.5">
+        <label
+          for="tts-cloud-key"
+          class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase"
+        >
+          API Key
+        </label>
+        <Input
+          id="tts-cloud-key"
+          type="password"
+          bind:value={cloudApiKey}
+          placeholder={hasSavedKey && !editingKey
+            ? '•••••••••• saved — click to replace'
+            : 'Paste API key…'}
+          autocomplete="new-password"
+          onfocus={startEditingKey}
+          oninput={startEditingKey}
+        />
+        {#if hasSavedKey && !editingKey}
+          <p
+            transition:fade={{ duration: motionMs(160) }}
+            class="text-muted-foreground text-pretty text-[0.72rem] leading-relaxed"
+          >
+            A key is already saved. Click the field to replace it.
+          </p>
+        {/if}
+      </div>
+
+      <div class="flex flex-col gap-1.5">
+        <label
+          for="tts-cloud-base-url"
+          class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase"
+        >
+          Base URL
+        </label>
+        <Input
+          id="tts-cloud-base-url"
+          type="text"
+          bind:value={cloudBaseUrl}
+          placeholder="https://api.openai.com"
+          autocomplete="off"
+        />
+        <p class="text-muted-foreground text-pretty text-[0.72rem] leading-relaxed">
+          API root only — no trailing <code>/v1</code>; it's appended automatically.
+        </p>
+      </div>
+    </section>
+
+    <section class="flex flex-col gap-3 rounded-xl p-3 shadow-xs ring-1 ring-foreground/10">
+      <h3
+        class="text-muted-foreground text-balance text-[0.68rem] font-semibold tracking-widest uppercase"
+      >
+        Voices
+      </h3>
+
+      <div class="flex flex-col gap-1.5">
+        <label
+          for="tts-cloud-host-voice"
+          class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase"
+        >
+          Host speaker
+        </label>
+        {#if cloudMaleVoices.length > 0}
+          <Select
+            type="single"
+            value={cloudHostPreset}
+            onValueChange={(v) => {
+              if (v) cloudHostPreset = v;
+            }}
+            items={[
+              ...cloudMaleVoices.map((voice) => ({ value: voice.id, label: voice.name })),
+              { value: CUSTOM_VOICE, label: 'Custom voice ID…' }
+            ]}
+          >
+            <SelectTrigger id="tts-cloud-host-voice" class="w-full">
+              <SelectValue placeholder="Select a voice" />
+            </SelectTrigger>
+            <SelectContent
+              class="origin-(--bits-select-content-transform-origin) duration-200 ease-[cubic-bezier(0.23,1,0.32,1)]"
+            >
+              {#each cloudMaleVoices as voice (voice.id)}
+                <SelectItem value={voice.id} label={voice.name}>{voice.name}</SelectItem>
+              {/each}
+              <SelectItem value={CUSTOM_VOICE} label="Custom voice ID…">Custom voice ID…</SelectItem
+              >
+            </SelectContent>
+          </Select>
+          {#if cloudHostPreset === CUSTOM_VOICE}
+            <Input
+              id="tts-cloud-host-voice-custom"
+              type="text"
+              bind:value={cloudHostCustom}
+              placeholder="e.g. alloy"
+              autocomplete="off"
+            />
+          {/if}
+        {:else}
+          <Input
+            id="tts-cloud-host-voice"
+            type="text"
+            bind:value={cloudHostCustom}
+            placeholder="Voice ID (e.g. alloy)"
+            autocomplete="off"
+          />
+        {/if}
+      </div>
+
+      <div class="flex flex-col gap-1.5">
+        <label
+          for="tts-cloud-guest-voice"
+          class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase"
+        >
+          Guest speaker
+        </label>
+        {#if cloudFemaleVoices.length > 0}
+          <Select
+            type="single"
+            value={cloudGuestPreset}
+            onValueChange={(v) => {
+              if (v) cloudGuestPreset = v;
+            }}
+            items={[
+              ...cloudFemaleVoices.map((voice) => ({ value: voice.id, label: voice.name })),
+              { value: CUSTOM_VOICE, label: 'Custom voice ID…' }
+            ]}
+          >
+            <SelectTrigger id="tts-cloud-guest-voice" class="w-full">
+              <SelectValue placeholder="Select a voice" />
+            </SelectTrigger>
+            <SelectContent
+              class="origin-(--bits-select-content-transform-origin) duration-200 ease-[cubic-bezier(0.23,1,0.32,1)]"
+            >
+              {#each cloudFemaleVoices as voice (voice.id)}
+                <SelectItem value={voice.id} label={voice.name}>{voice.name}</SelectItem>
+              {/each}
+              <SelectItem value={CUSTOM_VOICE} label="Custom voice ID…">Custom voice ID…</SelectItem
+              >
+            </SelectContent>
+          </Select>
+          {#if cloudGuestPreset === CUSTOM_VOICE}
+            <Input
+              id="tts-cloud-guest-voice-custom"
+              type="text"
+              bind:value={cloudGuestCustom}
+              placeholder="e.g. onyx"
+              autocomplete="off"
+            />
+          {/if}
+        {:else}
+          <Input
+            id="tts-cloud-guest-voice"
+            type="text"
+            bind:value={cloudGuestCustom}
+            placeholder="Voice ID (e.g. onyx)"
+            autocomplete="off"
+          />
+        {/if}
+      </div>
+    </section>
 
     {#if cloudError}
       <p class="text-destructive text-[0.75rem]" role="alert">{cloudError}</p>

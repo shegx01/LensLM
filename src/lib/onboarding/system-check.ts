@@ -194,15 +194,24 @@ export type TtsProvider = 'orpheus' | 'qwen3' | 'cloud';
 
 /**
  * Persist a TTS backend/provider selection into the current `TtsConfig` shape
- * (read-modify-write). The panel's Cloud tab is ElevenLabs-only for now; the
- * full local engine selector ships in #194.
+ * (read-modify-write). The Cloud tab (#195) is OpenAI-compatible-first; `hostVoice`/
+ * `guestVoice`, when given, overwrite `AppConfig.voices` too — a Cloud save must
+ * replace whatever voice ids a previously-active local engine left behind (a
+ * stale id like "leo" would otherwise be sent verbatim to the cloud provider).
  */
 export async function saveTtsProvider(input: {
   provider: TtsProvider;
   apiKey: string;
+  baseUrl?: string;
+  hostVoice?: string;
+  guestVoice?: string;
 }): Promise<void> {
   await updateConfig((cfg) => ({
     ...cfg,
+    voices:
+      input.hostVoice !== undefined || input.guestVoice !== undefined
+        ? { host: input.hostVoice ?? cfg.voices.host, guest: input.guestVoice ?? cfg.voices.guest }
+        : cfg.voices,
     tts: nextTtsConfig(cfg.tts, input)
   }));
 }
@@ -210,11 +219,13 @@ export async function saveTtsProvider(input: {
 /**
  * Compute the next `TtsConfig` for a provider selection. A local backend
  * deactivates cloud (the active `backend` no longer points at it) but PRESERVES
- * the saved key so switching back to Cloud doesn't lose it.
+ * the saved key so switching back to Cloud doesn't lose it. Cloud kind defaults
+ * to OpenAI-compatible (#195) — the only kind the backend adapter dispatches;
+ * Deepgram/ElevenLabs are reserved but not user-selectable from this form.
  */
 export function nextTtsConfig(
   prev: TtsConfig,
-  input: { provider: TtsProvider; apiKey: string }
+  input: { provider: TtsProvider; apiKey: string; baseUrl?: string }
 ): TtsConfig {
   if (input.provider === 'orpheus') {
     return { ...prev, version: 1, backend: 'orpheus' };
@@ -224,8 +235,12 @@ export function nextTtsConfig(
   }
   return {
     version: 1,
-    backend: { cloud: 'eleven_labs' },
+    backend: { cloud: 'open_ai_compatible' },
     model: prev.model,
-    cloud: { kind: 'eleven_labs', api_key: input.apiKey, base_url: '' }
+    cloud: {
+      kind: 'open_ai_compatible',
+      api_key: input.apiKey,
+      base_url: input.baseUrl ?? ''
+    }
   };
 }

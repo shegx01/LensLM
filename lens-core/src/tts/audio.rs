@@ -107,7 +107,7 @@ pub(crate) fn stitch_turns(buffers: &[(Speaker, AudioBuffer)]) -> Result<AudioBu
 /// Ceiling on a single sidecar-provided turn WAV (a few seconds of 24 kHz mono is
 /// well under this) so a runaway/malicious sidecar reply can't be read fully into
 /// memory unbounded.
-const MAX_TURN_WAV_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_TURN_WAV_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Reads a 16-bit PCM WAV as a mono `f32` [`AudioBuffer`]. Multi-channel input is
 /// downmixed by averaging. Public so the `src-tauri` Qwen sidecar can decode the
@@ -119,7 +119,24 @@ pub fn read_wav_mono16(path: &Path) -> Result<AudioBuffer, LensError> {
     if size > MAX_TURN_WAV_BYTES {
         return Err(LensError::Internal("turn WAV exceeds size ceiling".into()));
     }
-    let mut reader = hound::WavReader::open(path).map_err(hound_err)?;
+    let reader = hound::WavReader::open(path).map_err(hound_err)?;
+    read_wav_reader(reader)
+}
+
+/// In-memory sibling of [`read_wav_mono16`] for a WAV received as raw bytes (e.g. a
+/// cloud TTS HTTP body). The size ceiling is re-applied as a byte-length check so
+/// the DoS guard is preserved without a filesystem round-trip.
+pub fn decode_wav_mono16(bytes: &[u8]) -> Result<AudioBuffer, LensError> {
+    if bytes.len() as u64 > MAX_TURN_WAV_BYTES {
+        return Err(LensError::Internal("turn WAV exceeds size ceiling".into()));
+    }
+    let reader = hound::WavReader::new(std::io::Cursor::new(bytes)).map_err(hound_err)?;
+    read_wav_reader(reader)
+}
+
+fn read_wav_reader<R: std::io::Read>(
+    mut reader: hound::WavReader<R>,
+) -> Result<AudioBuffer, LensError> {
     let spec = reader.spec();
     let channels = spec.channels.max(1) as usize;
     let raw: Vec<f32> = reader
@@ -316,6 +333,65 @@ mod tests {
         std::fs::write(&path, vec![0u8; (MAX_TURN_WAV_BYTES + 1) as usize]).unwrap();
 
         let err = read_wav_mono16(&path).expect_err("over-cap file must be rejected");
+        assert!(matches!(err, LensError::Internal(_)));
+    }
+
+    fn wav_bytes(samples: &[f32], sample_rate: u32, channels: u16) -> Vec<u8> {
+        let spec = hound::WavSpec {
+            channels,
+            sample_rate,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = hound::WavWriter::new(&mut buf, spec).unwrap();
+            for &s in samples {
+                writer.write_sample(crate::f32_sample_to_i16(s)).unwrap();
+            }
+            writer.finalize().unwrap();
+        }
+        buf.into_inner()
+    }
+
+    #[test]
+    fn decode_wav_mono16_reads_rate_and_samples() {
+        let samples = vec![0.0, 0.5, -0.5, 0.25];
+        let bytes = wav_bytes(&samples, 48_000, 1);
+        let got = decode_wav_mono16(&bytes).unwrap();
+        assert_eq!(got.sample_rate, 48_000);
+        assert_eq!(got.channels, 1);
+        assert_eq!(got.samples.len(), samples.len());
+        for (g, w) in got.samples.iter().zip(samples.iter()) {
+            assert!((g - w).abs() < 1.0 / 32_000.0, "got {g} want {w}");
+        }
+    }
+
+    #[test]
+    fn decode_wav_mono16_downmixes_stereo() {
+        // Interleaved L,R frames: (0.4,0.6) -> 0.5, (−0.2,0.2) -> 0.0.
+        let interleaved = vec![0.4, 0.6, -0.2, 0.2];
+        let bytes = wav_bytes(&interleaved, 24_000, 2);
+        let got = decode_wav_mono16(&bytes).unwrap();
+        assert_eq!(got.channels, 1);
+        assert_eq!(got.samples.len(), 2);
+        assert!((got.samples[0] - 0.5).abs() < 1.0 / 32_000.0);
+        assert!(got.samples[1].abs() < 1.0 / 32_000.0);
+    }
+
+    #[test]
+    fn decode_wav_mono16_rejects_undecodable_and_empty() {
+        assert!(matches!(
+            decode_wav_mono16(b"not a wav at all"),
+            Err(LensError::Io(_))
+        ));
+        assert!(matches!(decode_wav_mono16(&[]), Err(LensError::Io(_))));
+    }
+
+    #[test]
+    fn decode_wav_mono16_rejects_over_cap_bytes() {
+        let err = decode_wav_mono16(&vec![0u8; (MAX_TURN_WAV_BYTES + 1) as usize])
+            .expect_err("over-cap bytes must be rejected");
         assert!(matches!(err, LensError::Internal(_)));
     }
 }
