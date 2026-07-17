@@ -120,11 +120,16 @@ fn abs_cap(ctx: u32) -> usize {
     }
 }
 
+/// Fraction of `usable_input` history may reserve, so a large conversation can never
+/// starve retrieval to zero on a small-context model (a spurious "no sources" refusal
+/// otherwise, CX-3). The assembled-prompt guard downstream is authoritative for the
+/// real fit; this only bounds tier selection.
+const MAX_HISTORY_RESERVATION: f32 = 0.5;
+
 /// Derives the tier caps from a model context window. `reserved_history` is the
-/// token span already claimed by prior conversation turns (Plan 2 / CX-3): it is
-/// subtracted from `usable_input` so retrieval never claims space history occupies.
-/// `ctx == 0` (unknown context) falls back to the static [`TierThresholds`] (history
-/// is then bounded downstream by the assembled-prompt guard, not here).
+/// token span prior conversation turns claim (CX-3); it is subtracted from
+/// `usable_input` (capped at [`MAX_HISTORY_RESERVATION`] of it) so retrieval keeps a
+/// floor. `ctx == 0` (unknown) falls back to static [`TierThresholds`].
 fn derive_tier_caps(ctx: u32, reserved_history: usize, fallback: &TierThresholds) -> TierCap {
     if ctx == 0 {
         return TierCap {
@@ -132,9 +137,9 @@ fn derive_tier_caps(ctx: u32, reserved_history: usize, fallback: &TierThresholds
             tier2_cap: fallback.tier2_token_cap as usize,
         };
     }
-    let usable = token_budget(ctx)
-        .usable_input
-        .saturating_sub(reserved_history);
+    let usable_input = token_budget(ctx).usable_input;
+    let reserved = reserved_history.min((usable_input as f32 * MAX_HISTORY_RESERVATION) as usize);
+    let usable = usable_input.saturating_sub(reserved);
     let tier1_fraction = (TIER1_FRACTION * usable as f32) as usize;
     let tier1_cap = tier1_fraction.min(abs_cap(ctx));
     TierCap {
@@ -920,6 +925,25 @@ mod tests {
         let expected = (TIER1_FRACTION * budget.usable_input as f32) as usize;
         assert_eq!(caps.tier1_cap, expected);
         assert!(caps.tier1_cap < ABS_CAP_MEDIUM);
+    }
+
+    #[test]
+    fn history_reservation_never_starves_retrieval_on_small_context() {
+        // ctx 3072 → usable_input 512; a 1000-token history would floor caps to 0
+        // (spurious "no sources", CX-3). The reservation is capped at half of usable,
+        // so retrieval keeps a non-zero budget.
+        let caps = derive_tier_caps(3_072, 1_000, &thresholds());
+        assert!(
+            caps.tier2_cap > 0,
+            "tier2 cap starved to zero: {}",
+            caps.tier2_cap
+        );
+        // With no history the full usable budget is available.
+        let full = derive_tier_caps(3_072, 0, &thresholds());
+        assert!(
+            caps.tier2_cap < full.tier2_cap,
+            "history still reduces the budget"
+        );
     }
 
     #[test]

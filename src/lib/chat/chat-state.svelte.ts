@@ -11,9 +11,8 @@
 // Plan 2 (PC-1) change: a cancelled/errored turn no longer persists NOTHING — it
 // writes ONE terminal marker row (partial answer as content, `state` =
 // cancelled/errored) via `saveChatMarker`, so a reload renders a "Stopped"/"Couldn't
-// complete" line instead of a bare, dangling question. `terminalMarked` dedupes the
-// marker across the two paths that can fire for one turn (the Stop/error callback,
-// and `markSuperseded` when a new send cancels an in-flight turn).
+// complete" line instead of a bare, dangling question. `terminalSettled` dedupes the
+// marker across the two paths that can fire for one turn (see its declaration below).
 
 import {
   askNotebook,
@@ -74,7 +73,7 @@ let byNotebook = $state<Record<string, NotebookChatState>>({});
 // double marker when both the stream callback and `markSuperseded` fire for one turn
 // (the check+add is synchronous, so the two callbacks can't both pass it). Module-
 // scoped and small (opaque UUIDs); cleared in `resetChatStore`.
-const terminalMarked = new Set<string>();
+const terminalSettled = new Set<string>();
 
 function ensure(notebookId: string): NotebookChatState {
   let s = byNotebook[notebookId];
@@ -150,13 +149,12 @@ function toLensError(err: unknown): { kind: string; message: string } {
 }
 
 /**
- * Persists a terminal marker for `turnId` (Plan 2 / PC-1), idempotent across the two
- * callbacks that can fire for one turn (`terminalMarked` guards it; the check+add is
- * synchronous). `pushInSession` appends the returned row as a version so the partial
- * answer stays visible immediately — `true` for cancel (the marker IS the in-session
- * rendering), `false` for stream errors (the ErrorCard already renders in-session; the
- * marker is only for reload). On IPC failure the guard is released so a later path may
- * retry, and the error is swallowed (never throw from a stream callback).
+ * Persists a terminal marker for `turnId` (Plan 2 / PC-1); guarded by `terminalSettled`
+ * (see its declaration above). `pushInSession` appends the returned row as a version so
+ * the partial answer stays visible immediately — `true` for cancel (the marker IS the
+ * in-session rendering), `false` for stream errors (the ErrorCard already renders
+ * in-session; the marker is only for reload). On IPC failure the guard is released so a
+ * later path may retry, and the error is swallowed (never throw from a stream callback).
  */
 async function persistTerminalMarker(
   state: NotebookChatState,
@@ -167,13 +165,13 @@ async function persistTerminalMarker(
   content: string,
   pushInSession: boolean
 ): Promise<void> {
-  if (terminalMarked.has(turnId)) return;
-  terminalMarked.add(turnId);
+  if (terminalSettled.has(turnId)) return;
+  terminalSettled.add(turnId);
   let saved: ChatMessage;
   try {
     saved = await saveChatMarker(notebookId, turnId, content, markerState, errorKind);
   } catch (err) {
-    terminalMarked.delete(turnId);
+    terminalSettled.delete(turnId);
     console.warn('persistTerminalMarker: save failed', err);
     return;
   }
@@ -207,7 +205,7 @@ async function runStream(notebookId: string, turnId: string, question: string): 
   const state = ensure(notebookId);
   // Fresh attempt for this turn — clear any prior terminal marker (e.g. regenerating
   // a previously-cancelled turn) so this run can record its own outcome.
-  terminalMarked.delete(turnId);
+  terminalSettled.delete(turnId);
   // Bump so late callbacks from a superseded/cancelled stream no-op.
   const gen = ++state.streamGeneration;
   state.streaming = true;
@@ -292,25 +290,28 @@ async function runStream(notebookId: string, turnId: string, question: string): 
         // Claim the turn synchronously so a concurrent markSuperseded cannot slip a
         // cancelled marker in during the save's IPC window (a successful answer needs
         // no marker). The save-failure catch releases the claim to record an error.
-        terminalMarked.add(turnId);
+        terminalSettled.add(turnId);
         // Sole finalize+persist trigger for a SUCCESSFUL answer (see header).
         void persistOnce(event.Done.tokens_used).catch((err) => {
-          if (state.streamGeneration !== gen) return;
-          // Save failed after a complete stream: surface the error AND persist an
-          // errored marker so a reload isn't left with a bare question (PC-1).
-          state.error = toLensError(err);
-          state.streaming = false;
-          state.stage = null;
-          terminalMarked.delete(turnId); // release so the errored marker can record
+          const lensErr = toLensError(err);
+          // Persist the errored marker FIRST, independent of the generation guard:
+          // marker persistence is reload-safety, and a resend during the save window
+          // (which bumps the generation) must not leave a bare question (PC-1).
+          terminalSettled.delete(turnId); // release the success-claim so the marker records
           void persistTerminalMarker(
             state,
             notebookId,
             turnId,
             'errored',
-            state.error.kind,
+            lensErr.kind,
             state.answerBuffer,
             false
           );
+          // In-session UI mutations only apply to the still-current turn.
+          if (state.streamGeneration !== gen) return;
+          state.error = lensErr;
+          state.streaming = false;
+          state.stage = null;
         });
       }
     },
@@ -486,5 +487,5 @@ export const chatStore = {
 /** Reset all state. Call in `afterEach` to prevent cross-test bleed. */
 export function resetChatStore(): void {
   byNotebook = {};
-  terminalMarked.clear();
+  terminalSettled.clear();
 }

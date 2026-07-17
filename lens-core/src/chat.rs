@@ -465,7 +465,7 @@ impl<'a> ChatRepo<'a> {
 /// WHOLE — never leaving a dangling user message — so the result is strictly
 /// alternating and user-first, which alternation-strict providers require. Bounded to
 /// the newest `limit` messages, trimmed in whole pairs. Pure — unit-testable sans DB.
-pub fn history_messages(
+pub(crate) fn history_messages(
     rows: &[ChatMessage],
     current_turn_id: &str,
     limit: usize,

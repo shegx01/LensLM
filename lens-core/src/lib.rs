@@ -715,9 +715,8 @@ impl LensEngine {
     }
 
     /// Persists a terminal-state marker for a turn that ended without a normal
-    /// `Done` (Plan 2 / PC-1): `Cancelled` (Stop / superseded) or `Errored`.
-    /// `content` may carry the partial answer so a reload shows it under a
-    /// "Stopped"/"Couldn't complete" line instead of a bare, dangling question.
+    /// `Done` (Plan 2 / PC-1); see
+    /// [`ChatRepo::insert_terminal_marker`](crate::chat::ChatRepo::insert_terminal_marker).
     #[tracing::instrument(skip_all)]
     pub async fn save_chat_marker(
         &self,
@@ -1415,17 +1414,14 @@ impl LensEngine {
         let pool = self.pool().await;
         let config = self.config().await;
 
-        // Chat resolves its provider independently of `enrichment.enabled` (CX-5):
-        // disabling enrichment must not break chat.
+        // Resolves independently of enrichment (CX-5); see `chat_provider`.
         let provider = self
             .chat_provider()
             .await
             .ok_or_else(|| LensError::Model("no chat model configured".into()))?;
 
-        // Prior-conversation history (CX-1): messages before this turn, bounded to the
-        // configured window. `turn_id` identifies the current turn so its own rows
-        // (the just-inserted user row, and prior assistant versions on a regenerate)
-        // are excluded.
+        // Prior-conversation history (CX-1); see `ChatRepo::history` for the
+        // exclusion and ordering contract.
         let history = crate::chat::ChatRepo::new(&pool)
             .history(notebook_id.as_str(), turn_id, config.chat.history_turns)
             .await?;
@@ -1516,8 +1512,7 @@ impl LensEngine {
         let pool = self.pool().await;
         let config = self.config().await;
 
-        // Dialogue is interactive, not enrichment — resolve independently of the
-        // enrichment master toggle (CX-5), same as chat.
+        // Same CX-5 decoupling as chat; see `chat_provider`.
         let provider = self
             .chat_provider()
             .await

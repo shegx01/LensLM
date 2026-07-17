@@ -666,9 +666,8 @@ pub async fn save_chat_assistant(
         .await
 }
 
-/// Persists a terminal-state marker for a cancelled/errored turn (Plan 2 / PC-1).
-/// `content` may carry the partial answer streamed so far so a reload shows it under
-/// a "Stopped"/"Couldn't complete" line instead of a bare, dangling question.
+/// Persists a terminal-state marker for a cancelled/errored turn (Plan 2 / PC-1);
+/// see `LensEngine::save_chat_marker`.
 #[tracing::instrument(skip(content, engine))]
 #[tauri::command]
 pub async fn save_chat_marker(

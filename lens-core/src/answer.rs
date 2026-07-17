@@ -165,7 +165,7 @@ async fn load_source_titles(
 
 /// Token count of `text` — exact via the shared tokenizer when available, else the
 /// router's script-aware estimate. Drives the assembled-prompt overflow guard.
-fn count_tokens(tokenizer: Option<&Tokenizer>, text: &str) -> usize {
+fn measure_tokens(tokenizer: Option<&Tokenizer>, text: &str) -> usize {
     match tokenizer {
         Some(tk) => tk
             .encode(text, false)
@@ -188,10 +188,11 @@ fn history_as_text(history: &[LlmMessage]) -> String {
 /// Token budget a fraction of the context window may spend on history.
 const HISTORY_BUDGET_DIVISOR: usize = 3;
 
-/// Drop-oldest sliding window (CX-3): `history` is strictly `[user, assistant]…`
-/// pairs, so drop whole oldest pairs until it fits `context/HISTORY_BUDGET_DIVISOR`
-/// tokens (stays user-first). `context == 0` keeps all; the newest pair is always
-/// kept (bounded later by the assembled-prompt guard).
+/// Drop-oldest sliding window (CX-3): trims to `context/HISTORY_BUDGET_DIVISOR`
+/// tokens by dropping whole oldest pairs, preserving the `[user, assistant]` shape
+/// [`history_messages`](crate::chat::history_messages) already guarantees.
+/// `context == 0` keeps all; the newest pair is always kept (bounded later by the
+/// assembled-prompt guard).
 fn budget_history(
     history: &[LlmMessage],
     context: u32,
@@ -205,7 +206,7 @@ fn budget_history(
     while kept.len() > 2 {
         let used: usize = kept
             .iter()
-            .map(|m| count_tokens(tokenizer, &m.content))
+            .map(|m| measure_tokens(tokenizer, &m.content))
             .sum();
         if used <= cap {
             break;
@@ -213,6 +214,68 @@ fn budget_history(
         kept.drain(0..2);
     }
     kept
+}
+
+/// The assembled, budget-fitted prompt (output of [`fit_to_context`]).
+struct Fit {
+    units: Vec<ContextUnit>,
+    history: Vec<LlmMessage>,
+    system: String,
+    prompt: String,
+    max_tokens: u32,
+}
+
+/// Final assembled-prompt overflow guard (CX-3/CX-4): trims `system + history + user`
+/// to fit `ctx_limit` — lowest-priority source units first (trailing document order),
+/// then oldest history pairs once one unit remains — until a `MIN_OUTPUT_TOKENS`
+/// output budget fits, then derives `max_tokens` from the model. `ctx_limit == 0`
+/// skips it. Pure — unit-testable.
+fn fit_to_context(
+    mut units: Vec<ContextUnit>,
+    mut history: Vec<LlmMessage>,
+    titles: &HashMap<String, String>,
+    question: &str,
+    nonce: &str,
+    tokenizer: Option<&Tokenizer>,
+    ctx_limit: usize,
+) -> Fit {
+    let (mut system, prompt) = build_grounded_prompt(&units, titles, question, nonce);
+    let user_tokens = measure_tokens(tokenizer, &prompt);
+    if ctx_limit == 0 {
+        return Fit {
+            units,
+            history,
+            system,
+            prompt,
+            max_tokens: RESERVED_OUTPUT,
+        };
+    }
+    let mut hist_tokens = measure_tokens(tokenizer, &history_as_text(&history));
+    loop {
+        let assembled = measure_tokens(tokenizer, &system) + hist_tokens + user_tokens;
+        if assembled + MIN_OUTPUT_TOKENS as usize <= ctx_limit {
+            break;
+        }
+        if units.len() > 1 {
+            units.pop();
+            system = build_grounded_prompt(&units, titles, question, nonce).0;
+        } else if history.len() > 2 {
+            history.drain(0..2);
+            hist_tokens = measure_tokens(tokenizer, &history_as_text(&history));
+        } else {
+            break; // one unit + one history pair + system already exceeds ctx — the
+            // provider handles the residual over-limit edge (errored turn)
+        }
+    }
+    let assembled = measure_tokens(tokenizer, &system) + hist_tokens + user_tokens;
+    let max_tokens = (ctx_limit.saturating_sub(assembled) as u32).clamp(1, RESERVED_OUTPUT);
+    Fit {
+        units,
+        history,
+        system,
+        prompt,
+        max_tokens,
+    }
 }
 
 /// Rewrites an anaphoric follow-up into a standalone retrieval query using the
@@ -303,7 +366,7 @@ pub fn answer_stream(
         // Reserve the space prior turns occupy so retrieval does not claim it (CX-3).
         // Measured exactly with the shared tokenizer when available.
         let history_text = history_as_text(&history);
-        let reserved_history_tokens = count_tokens(ctx.tokenizer.as_deref(), &history_text);
+        let reserved_history_tokens = measure_tokens(ctx.tokenizer.as_deref(), &history_text);
 
         // Embed the (possibly condensed) retrieval query fully OFF the async runtime,
         // returning the owned Vec before any await — the fastembed `std::sync::Mutex`
@@ -378,46 +441,29 @@ pub fn answer_stream(
             return;
         }
 
-        // Assemble the prompt, then apply the final overflow guard (CX-3/CX-4):
-        // measure system + history + user against the model context and trim the
-        // lowest-priority units (interim: trailing document order; Plan 3 adds
-        // fused-score ranking) until a minimum output budget fits. `max_tokens` is
-        // then derived from the model, not a fixed constant.
+        // Final overflow guard (CX-3/CX-4): fit system + history + user into the model
+        // context and derive max_tokens. See `fit_to_context`.
         let nonce = fence_nonce();
-        let mut units = out.units;
-        let (mut system, prompt) = build_grounded_prompt(&units, &titles, &ctx.question, &nonce);
-        let tk = ctx.tokenizer.as_deref();
-        let user_tokens = count_tokens(tk, &prompt);
-        let ctx_limit = ctx.model.context as usize;
-        if ctx_limit > 0 {
-            while units.len() > 1 {
-                let assembled =
-                    count_tokens(tk, &system) + reserved_history_tokens + user_tokens;
-                if assembled + MIN_OUTPUT_TOKENS as usize <= ctx_limit {
-                    break;
-                }
-                units.pop();
-                let (s, _) = build_grounded_prompt(&units, &titles, &ctx.question, &nonce);
-                system = s;
-            }
-        }
-        let max_tokens = if ctx_limit > 0 {
-            let assembled = count_tokens(tk, &system) + reserved_history_tokens + user_tokens;
-            let avail = ctx_limit.saturating_sub(assembled) as u32;
-            avail.clamp(1, RESERVED_OUTPUT)
-        } else {
-            RESERVED_OUTPUT
-        };
-
+        let fit = fit_to_context(
+            out.units,
+            history,
+            &titles,
+            &ctx.question,
+            &nonce,
+            ctx.tokenizer.as_deref(),
+            ctx.model.context as usize,
+        );
+        // Trimmed units drive citation extraction below (valid ordinals = surviving units).
+        let units = fit.units;
         let req = LlmRequest {
-            system: Some(system),
-            prompt,
-            max_tokens,
+            system: Some(fit.system),
+            prompt: fit.prompt,
+            max_tokens: fit.max_tokens,
             temperature: ANSWER_TEMPERATURE,
             json: false,
             thinking: false,
             reasoning_effort: None,
-            messages: history,
+            messages: fit.history,
         };
 
         let mut stream = match ctx.provider.generate_stream(&req).await {
@@ -619,9 +665,9 @@ mod tests {
     }
 
     #[test]
-    fn count_tokens_without_tokenizer_uses_script_aware_estimate() {
-        assert_eq!(count_tokens(None, "abcdefgh"), 2); // 8 latin / 4
-        assert_eq!(count_tokens(None, "日本語"), 3); // CJK ≈ 1 each
+    fn measure_tokens_without_tokenizer_uses_script_aware_estimate() {
+        assert_eq!(measure_tokens(None, "abcdefgh"), 2); // 8 latin / 4
+        assert_eq!(measure_tokens(None, "日本語"), 3); // CJK ≈ 1 each
     }
 
     #[test]
@@ -658,6 +704,64 @@ mod tests {
         ];
         // A single oversized pair is still kept (bounded later by the prompt guard).
         assert_eq!(budget_history(&h, 100, None).len(), 2);
+    }
+
+    #[test]
+    fn fit_to_context_unknown_ctx_keeps_all_and_reserved_output() {
+        let units = vec![unit("s", "c", "hello world", 0)];
+        let fit = fit_to_context(units, Vec::new(), &HashMap::new(), "q", "n", None, 0);
+        assert_eq!(fit.units.len(), 1);
+        assert_eq!(fit.max_tokens, RESERVED_OUTPUT);
+    }
+
+    #[test]
+    fn fit_to_context_trims_units_and_holds_invariant() {
+        // Six ~1000-token units, tiny context → must trim; assembled + max_tokens
+        // must never exceed ctx_limit (CX-4 invariant).
+        let big = "x".repeat(4_000);
+        let units: Vec<_> = (0..6)
+            .map(|i| unit("s", &format!("c{i}"), &big, i))
+            .collect();
+        let ctx_limit = 3_000;
+        let fit = fit_to_context(
+            units,
+            Vec::new(),
+            &HashMap::new(),
+            "why?",
+            "n",
+            None,
+            ctx_limit,
+        );
+        assert!(fit.units.len() < 6, "units were trimmed");
+        let assembled = measure_tokens(None, &fit.system) + measure_tokens(None, &fit.prompt);
+        assert!(
+            assembled + fit.max_tokens as usize <= ctx_limit,
+            "assembled {assembled} + max_tokens {} exceeds ctx {ctx_limit}",
+            fit.max_tokens
+        );
+    }
+
+    #[test]
+    fn fit_to_context_trims_history_once_units_exhausted() {
+        // One small unit + a big oldest history pair → the unit can't shrink below 1,
+        // so the oldest history pair is dropped to fit.
+        let big = "y".repeat(4_000);
+        let history = vec![
+            msg(crate::chat::ChatRole::User, &big),
+            msg(crate::chat::ChatRole::Assistant, &big),
+            msg(crate::chat::ChatRole::User, "recent q"),
+            msg(crate::chat::ChatRole::Assistant, "recent a"),
+        ];
+        // Chosen so system + full history overflows but system + the newest pair fits,
+        // forcing exactly the oldest history pair to drop (units can't shrink below 1).
+        let ctx_limit = 2_200;
+        let units = vec![unit("s", "c", "small", 0)];
+        let fit = fit_to_context(units, history, &HashMap::new(), "q", "n", None, ctx_limit);
+        assert!(fit.history.len() < 4, "oldest history pair dropped");
+        let assembled = measure_tokens(None, &fit.system)
+            + measure_tokens(None, &fit.prompt)
+            + measure_tokens(None, &history_as_text(&fit.history));
+        assert!(assembled + fit.max_tokens as usize <= ctx_limit);
     }
 
     #[test]
