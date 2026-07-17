@@ -5,7 +5,7 @@
 // Mocks the $lib/notebooks module, mode-watcher, and $lib/theme to isolate the
 // component (the brand-row theme-cycle button is inlined and uses these).
 
-import { render, screen, fireEvent, waitFor } from '@testing-library/svelte';
+import { render, screen, fireEvent, waitFor, within } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const { storeProxy, mockOpenTrash, mockSelectNotebook, mockResetStore } = vi.hoisted(() => {
@@ -223,6 +223,54 @@ describe('NotebooksSidebar (collapsed)', () => {
   it('does NOT render "Sign out" in collapsed mode', () => {
     render(NotebooksSidebar, { props: { collapsed: true } });
     expect(screen.queryByText(/sign out/i)).not.toBeInTheDocument();
+  });
+
+  it('collapsed footer exposes Settings, theme, Embeddings Inspector (DEV), and account controls', () => {
+    // The collapsed footer replaces the AccountFooter popup with an icon stack.
+    // Scope the queries to the footer so the (display:none) brand theme button
+    // can't create a duplicate match.
+    const { container } = render(NotebooksSidebar, {
+      props: { collapsed: true, userName: 'Jamie Doe' }
+    });
+    const footer = container.querySelector('[data-collapsed-footer]') as HTMLElement;
+    expect(footer).not.toBeNull();
+    const scoped = within(footer);
+    expect(scoped.getByRole('button', { name: /^settings$/i })).toBeInTheDocument();
+    // ThemeCycleButton's accessible name always begins with "Theme: …".
+    expect(scoped.getByRole('button', { name: /^theme:/i })).toBeInTheDocument();
+    // Embeddings Inspector is DEV-only; vitest runs with import.meta.env.DEV true.
+    expect(scoped.getByRole('button', { name: /embeddings inspector/i })).toBeInTheDocument();
+    expect(scoped.getByRole('button', { name: /account:/i })).toBeInTheDocument();
+  });
+
+  it('clicking the collapsed account avatar expands the rail', async () => {
+    storeProxy.sidebarCollapsed = true;
+    const { container } = render(NotebooksSidebar, {
+      props: { collapsed: true, userName: 'Jamie Doe' }
+    });
+    const footer = container.querySelector('[data-collapsed-footer]') as HTMLElement;
+    await fireEvent.click(within(footer).getByRole('button', { name: /account:/i }));
+    expect(storeProxy.sidebarCollapsed).toBe(false);
+  });
+});
+
+describe('NotebooksSidebar (active row)', () => {
+  // happy-dom cannot measure layout (offsetTop = 0), so the sliding-indicator
+  // POSITION is verified visually, not here. Instead assert the active row's
+  // aria-pressed state and that clicking a row selects it.
+  it('marks the active notebook row with aria-pressed=true', () => {
+    storeProxy.notebooks = [makeNotebook('nb-1', 'Alpha'), makeNotebook('nb-2', 'Beta')];
+    storeProxy.activeNotebookId = 'nb-2';
+    render(NotebooksSidebar);
+    expect(screen.getByRole('button', { name: 'Beta' })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('button', { name: 'Alpha' })).toHaveAttribute('aria-pressed', 'false');
+  });
+
+  it('clicking a notebook row selects it', async () => {
+    storeProxy.notebooks = [makeNotebook('nb-1', 'Alpha')];
+    render(NotebooksSidebar);
+    await fireEvent.click(screen.getByRole('button', { name: 'Alpha' }));
+    expect(mockSelectNotebook).toHaveBeenCalledWith('nb-1');
   });
 });
 

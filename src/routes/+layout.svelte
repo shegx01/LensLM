@@ -45,6 +45,10 @@
       // Validate accent against known IDs; hand-edited or unknown values fall back to 'purple'.
       const accent = (ACCENT_IDS as readonly string[]).includes(cfg.accent) ? cfg.accent : 'purple';
       document.documentElement.dataset.accent = accent;
+      // Motion preference → data-motion (runtime only; no pre-paint step so the
+      // app.html CSP hash is unchanged). Unknown/hand-edited values fall back to 'system'.
+      const motion = ['system', 'on', 'off'].includes(cfg.animations) ? cfg.animations : 'system';
+      document.documentElement.dataset.motion = motion;
       onboardingComplete = cfg.onboarding_complete;
       // Seed the draft from persisted values so personalize screens start pre-filled.
       draft.userName = cfg.user_name ?? '';

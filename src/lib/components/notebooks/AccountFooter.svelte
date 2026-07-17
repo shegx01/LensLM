@@ -92,6 +92,7 @@
       aria-label="Account menu"
       data-account-menu
       class={cn(
+        'account-menu',
         'absolute bottom-full left-0 right-0 mb-1.5 z-50',
         'rounded-xl border border-sidebar-border bg-sidebar shadow-lg',
         'overflow-hidden py-1'
@@ -171,3 +172,24 @@
     </div>
   {/if}
 </div>
+
+<style>
+  /* Materialize enter from the bottom-left origin (the trigger sits below).
+     Gated by --rail-motion: calm mode zeroes the duration so it just appears. */
+  .account-menu {
+    transform-origin: bottom left;
+    animation: accountMenuIn calc(0.26s * var(--rail-motion, 1)) var(--ease-spring, ease);
+  }
+  @keyframes accountMenuIn {
+    from {
+      opacity: 0;
+      transform: scale(0.94) translateY(8px);
+      filter: blur(4px);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+      filter: blur(0);
+    }
+  }
+</style>

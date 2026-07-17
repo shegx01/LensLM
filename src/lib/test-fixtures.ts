@@ -32,6 +32,7 @@ export function baseAppConfig(overrides?: Partial<AppConfig>): AppConfig {
     audio_cloud_consent: false,
     js_render_enabled: true,
     reopen_last_notebook: true,
+    animations: 'system',
     ...overrides
   };
 }
