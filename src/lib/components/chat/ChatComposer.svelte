@@ -217,22 +217,22 @@
 <AddSourcesModal open={addOpen} onclose={() => (addOpen = false)} />
 
 <style>
-  /* Rests as a hairline-outlined card; on focus it lifts a touch and the brand
-     ring blooms. Transform/box-shadow only (never `all`), so it stays smooth. */
+  /* Floats on a soft layered shadow (same family as the header pill / rail) —
+     elevation, not a border. On focus it lifts a touch and the brand ring blooms
+     over the float. Transform/box-shadow only (never `all`), so it stays smooth. */
   .composer {
-    box-shadow:
-      0 0 0 1px var(--border),
-      0 1px 2px oklch(0.2 0.02 293 / 0.04);
+    box-shadow: var(--shadow-bar);
     transform: translateY(0);
     transition:
       box-shadow 0.22s var(--ease-out, ease),
       transform 0.22s var(--ease-out, ease);
   }
   .composer:focus-within {
-    transform: translateY(calc(-1px * var(--rail-motion, 1)));
+    transform: translateY(calc(-2px * var(--rail-motion, 1)));
     box-shadow:
-      0 0 0 1px color-mix(in oklch, var(--ring) 45%, transparent),
-      0 0 0 4px color-mix(in oklch, var(--ring) 16%, transparent),
-      0 8px 22px oklch(0.2 0.02 293 / 0.08);
+      0 0 0 1px color-mix(in oklch, var(--ring) 40%, transparent),
+      0 0 0 4px color-mix(in oklch, var(--ring) 15%, transparent),
+      var(--shadow-bar),
+      0 14px 32px oklch(0.2 0.02 293 / 0.1);
   }
 </style>
