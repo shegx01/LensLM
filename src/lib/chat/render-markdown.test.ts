@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 // Unit tests for render-markdown: the sanitized markdown renderer.
 // (Inline `[n]` citation markers are no longer stripped here — they are converted
 // to inline chips post-render by enhanceCitations; see citation-inline.test.ts.)
