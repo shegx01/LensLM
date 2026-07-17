@@ -117,16 +117,25 @@
   // keeps that first placement instant regardless.
   let prevTurnsLen = -1;
   let prevStage: AnswerStage | null = null;
+  let prevPinned = false;
   let hasSettled = false;
   $effect(() => {
     const turnsLen = turns.length;
     const curStage = stage;
+    const pinned = pinnedToBottom;
     void answerBuffer;
     void thinkingBuffer;
-    const structural = turnsLen !== prevTurnsLen || (curStage !== null && prevStage === null);
+    // Discrete (smooth) events: a new turn arrives, the status line first
+    // appears, or the view re-pins (Jump to latest). Token deltas stay instant so
+    // the pin can't lag a fast stream.
+    const structural =
+      turnsLen !== prevTurnsLen ||
+      (curStage !== null && prevStage === null) ||
+      (pinned && !prevPinned);
     prevTurnsLen = turnsLen;
     prevStage = curStage;
-    if (pinnedToBottom) {
+    prevPinned = pinned;
+    if (pinned) {
       tick().then(() => scrollToBottom(hasSettled && structural));
     }
     tick().then(() => {
