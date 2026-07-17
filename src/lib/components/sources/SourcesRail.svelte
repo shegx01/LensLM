@@ -353,12 +353,12 @@
           <li
             data-source-id={source.id}
             data-pulsing={pulsingId === source.id}
-            class="src-row group flex items-start gap-2.5 rounded-[10px] px-2.5 py-2.5"
+            class="src-row group flex items-center gap-2.5 rounded-[10px] px-2.5 py-2.5"
             use:fadeRise={{ y: 6, duration: 0.34, delay: Math.min(i, 8) * 0.035 }}
           >
             <button
               class={cn(
-                'checkbox-box mt-0.5 size-[16px] transition-[background-color,border-color,transform] duration-150 active:scale-90',
+                'checkbox-box size-[16px] transition-[background-color,border-color,transform] duration-150 active:scale-90',
                 source.selected === 1
                   ? 'border-primary bg-primary'
                   : 'border-border bg-transparent hover:border-primary/60'
@@ -381,13 +381,15 @@
               <div class="truncate text-sm font-medium leading-tight text-foreground">
                 {source.title}
               </div>
-              <div class="mt-0.5 flex flex-wrap items-center gap-1.5">
+              <div class="mt-0.5 flex flex-wrap items-center gap-1">
                 <span
-                  class="inline-flex items-center rounded-[4px] bg-muted px-[5px] py-px text-[0.6875rem] font-semibold uppercase tracking-wide text-muted-foreground"
+                  class="text-[0.6875rem] font-semibold uppercase tracking-wide text-muted-foreground"
                 >
                   {badge}
                 </span>
                 {#if meta}
+                  <span class="text-[0.6875rem] text-muted-foreground/40" aria-hidden="true">·</span
+                  >
                   <span class="text-xs text-muted-foreground/50">{meta}</span>
                 {/if}
               </div>
@@ -398,7 +400,7 @@
                  All buttons are no-drag so the titlebar region doesn't swallow clicks. -->
             <div
               class={cn(
-                'relative mt-1 flex shrink-0 items-center justify-end gap-0.5',
+                'relative flex shrink-0 items-center justify-end gap-0.5',
                 status === 'error' ? 'w-auto' : 'size-5'
               )}
               aria-label="Status: {statusDotLabel(status)}"
