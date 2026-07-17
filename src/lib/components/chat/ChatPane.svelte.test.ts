@@ -13,6 +13,8 @@ const failedTurn = makeTurn({
     citations: null,
     feedback: null,
     tokens_used: null,
+    state: null,
+    error_kind: null,
     created_at: '2026-07-12T00:00:00Z'
   },
   versions: []
@@ -27,7 +29,9 @@ vi.mock('$lib/chat/chat-state.svelte.js', () => ({
     stage: vi.fn(() => null),
     thinkingBuffer: vi.fn(() => ''),
     answerBuffer: vi.fn(() => ''),
+    pendingCitations: vi.fn(() => null),
     currentTurnId: vi.fn(() => 'turn-failed'),
+    ungroundedTurnId: vi.fn(() => null),
     error: vi.fn(() => ({ kind: 'Internal', message: 'stream failed' })),
     pinnedToBottom: vi.fn(() => true)
   },

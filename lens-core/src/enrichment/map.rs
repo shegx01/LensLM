@@ -101,6 +101,7 @@ pub(crate) async fn run_llm_with_retries<T>(
             json: true,
             thinking: false,
             reasoning_effort: None,
+            messages: Vec::new(),
         };
         let resp = provider.generate(&req).await?;
         budget.record(resp.tokens_used);

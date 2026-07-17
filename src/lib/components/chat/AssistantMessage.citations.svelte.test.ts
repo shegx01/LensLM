@@ -61,6 +61,8 @@ function makeAssistant(content: string, citations: Citation[] | null): ChatMessa
     citations: citations === null ? null : JSON.stringify(citations),
     feedback: null,
     tokens_used: 10,
+    state: null,
+    error_kind: null,
     created_at: '2026-07-12T00:00:00Z'
   };
 }

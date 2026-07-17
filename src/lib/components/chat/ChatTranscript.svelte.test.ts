@@ -41,6 +41,8 @@ const baseProps = {
   answerBuffer: '',
   currentTurnId: null,
   error: null,
+  pendingCitations: null,
+  ungroundedTurnId: null,
   pinnedToBottom: true,
   oncopy: vi.fn(),
   onregenerate: vi.fn(),

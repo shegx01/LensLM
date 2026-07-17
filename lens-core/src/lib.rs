@@ -60,14 +60,14 @@ pub use asr::{
     download_whisper_model, resolve_whisper, select_asr_backend, whisper_model_downloaded,
     whisper_model_path,
 };
-pub use chat::{ChatFeedback, ChatMessage, ChatRole};
+pub use chat::{ChatFeedback, ChatMessage, ChatRole, ChatState};
 pub use citation::{
     CITATION_PROMPT_INSTRUCTION, ChunkLocatorRow, Citation, Locator, extract_citations,
     hydrate_locators, load_chunk_locators,
 };
 pub use config::{
-    AppConfig, CloudAsrProvider, CloudTtsConfig, EnrichmentConfig, RerankerConfig, RerankerModel,
-    RetrievalConfig, TaskModel, TtsConfig, VoiceConfig, VoiceRef,
+    AppConfig, ChatConfig, CloudAsrProvider, CloudTtsConfig, EnrichmentConfig, RerankerConfig,
+    RerankerModel, RetrievalConfig, TaskModel, TtsConfig, VoiceConfig, VoiceRef,
 };
 #[cfg(feature = "test-util")]
 pub use dialogue::{DialogueCtx, generate_dialogue};
@@ -714,6 +714,24 @@ impl LensEngine {
             .await
     }
 
+    /// Persists a terminal-state marker for a turn that ended without a normal
+    /// `Done` (Plan 2 / PC-1); see
+    /// [`ChatRepo::insert_terminal_marker`](crate::chat::ChatRepo::insert_terminal_marker).
+    #[tracing::instrument(skip_all)]
+    pub async fn save_chat_marker(
+        &self,
+        notebook_id: &NotebookId,
+        turn_id: &str,
+        content: &str,
+        state: crate::chat::ChatState,
+        error_kind: Option<&str>,
+    ) -> Result<ChatMessage, LensError> {
+        let pool = self.pool().await;
+        crate::chat::ChatRepo::new(&pool)
+            .insert_terminal_marker(notebook_id.as_str(), turn_id, content, state, error_kind)
+            .await
+    }
+
     /// Sets or clears (`None`) feedback on a chat message (#22, toggleable thumbs).
     #[tracing::instrument(skip_all)]
     pub async fn set_chat_feedback(
@@ -1055,6 +1073,18 @@ impl LensEngine {
         self.llm_provider.read().await.clone()
     }
 
+    /// Resolves the provider for interactive CHAT/dialogue (CX-5), decoupled from
+    /// `enrichment.enabled` (that flag gates only the enrichment worker). Reuses the
+    /// installed enrichment provider when present, else builds one from config
+    /// regardless of the master toggle. `None` only when no model is configured.
+    pub async fn chat_provider(&self) -> Option<Arc<dyn LlmProvider>> {
+        if let Some(p) = self.llm_provider().await {
+            return Some(p);
+        }
+        let config = self.config().await;
+        crate::llm::provider_from_config(&config, config.enrichment.cloud_consent)
+    }
+
     /// Installs (or replaces) the JS renderer for SPA URL-render fallback (issue
     /// #78). `None` degrades to `needs_js`. The concrete `TauriJsRenderer` is
     /// injected here because `lens-core` cannot depend on `tauri`.
@@ -1374,6 +1404,7 @@ impl LensEngine {
     pub async fn answer_notebook(
         &self,
         notebook_id: &NotebookId,
+        turn_id: &str,
         question: String,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<
@@ -1383,10 +1414,17 @@ impl LensEngine {
         let pool = self.pool().await;
         let config = self.config().await;
 
+        // Resolves independently of enrichment (CX-5); see `chat_provider`.
         let provider = self
-            .llm_provider()
+            .chat_provider()
             .await
             .ok_or_else(|| LensError::Model("no chat model configured".into()))?;
+
+        // Prior-conversation history (CX-1); see `ChatRepo::history` for the
+        // exclusion and ordering contract.
+        let history = crate::chat::ChatRepo::new(&pool)
+            .history(notebook_id.as_str(), turn_id, config.chat.history_turns)
+            .await?;
 
         // Coordinate + query embedder resolve from ONE tuple (plan §10): the same
         // (model_id, backend, dim) feeds both the embedder and the search Coordinate,
@@ -1450,6 +1488,8 @@ impl LensEngine {
             thresholds: config.tier_thresholds,
             tokenizer,
             question,
+            history,
+            chat: config.chat,
         };
 
         Ok(crate::answer::answer_stream(ctx, cancel))
@@ -1472,8 +1512,9 @@ impl LensEngine {
         let pool = self.pool().await;
         let config = self.config().await;
 
+        // Same CX-5 decoupling as chat; see `chat_provider`.
         let provider = self
-            .llm_provider()
+            .chat_provider()
             .await
             .ok_or_else(|| LensError::Model("no chat model configured".into()))?;
 

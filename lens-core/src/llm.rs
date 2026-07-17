@@ -71,6 +71,16 @@ impl ReasoningEffort {
     }
 }
 
+/// One prior conversation turn fed into a completion request as context (Plan 2 /
+/// CX-1). Role reuses [`crate::chat::ChatRole`] so the wire strings stay `user`/
+/// `assistant` and no stringly-typed role leaks in. Ordered oldest→newest; assembled
+/// between the system message and the final user `prompt` in [`GenaiProvider::map_request`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LlmMessage {
+    pub role: crate::chat::ChatRole,
+    pub content: String,
+}
+
 /// A single completion request to an [`LlmProvider`].
 /// `temperature` is `f32`, so only `PartialEq` (no `Eq`/`Hash`): transient value, never a
 /// map key. Enrichment pins `temperature: 0.0, json: true, thinking: false`.
@@ -89,6 +99,11 @@ pub struct LlmRequest {
     /// back as `None`.
     #[serde(default)]
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Prior conversation turns (oldest→newest) injected before the final user
+    /// `prompt`. Empty for enrichment (single-shot) and legacy payloads via
+    /// `#[serde(default)]`; chat populates it from the persisted transcript.
+    #[serde(default)]
+    pub messages: Vec<LlmMessage>,
 }
 
 /// A completion response from an [`LlmProvider`].
@@ -297,6 +312,14 @@ impl GenaiProvider {
         let mut chat = ChatRequest::default();
         if let Some(system) = &req.system {
             chat = chat.with_system(system.clone());
+        }
+        // Prior turns (oldest→newest) precede the final user prompt so the model
+        // sees the conversation as [system, …history…, user(question)].
+        for msg in &req.messages {
+            chat = chat.append_message(match msg.role {
+                crate::chat::ChatRole::User => ChatMessage::user(msg.content.clone()),
+                crate::chat::ChatRole::Assistant => ChatMessage::assistant(msg.content.clone()),
+            });
         }
         chat = chat.append_message(ChatMessage::user(req.prompt.clone()));
 
@@ -718,6 +741,7 @@ mod tests {
             json: true,
             thinking: false,
             reasoning_effort: None,
+            messages: Vec::new(),
         }
     }
 

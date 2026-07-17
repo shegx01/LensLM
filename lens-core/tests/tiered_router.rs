@@ -119,6 +119,7 @@ async fn tier1_when_corpus_fits_cap() {
         None,
         &TierThresholds::default(),
         None,
+        0,
     )
     .await
     .unwrap();
@@ -154,6 +155,7 @@ async fn tier2_when_corpus_overflows_cap() {
         None,
         &TierThresholds::default(),
         None,
+        0,
     )
     .await
     .unwrap();
@@ -186,6 +188,7 @@ async fn single_oversized_source_forces_tier2() {
         None,
         &TierThresholds::default(),
         None,
+        0,
     )
     .await
     .unwrap();
@@ -225,6 +228,7 @@ async fn tier1_units_are_parent_chunks_in_doc_order() {
         None,
         &TierThresholds::default(),
         None,
+        0,
     )
     .await
     .unwrap();
@@ -319,6 +323,7 @@ async fn tier2_merges_parent_when_half_children_retrieved() {
         None,
         &TierThresholds::default(),
         None,
+        0,
     )
     .await
     .unwrap();
@@ -363,6 +368,7 @@ async fn tier2_no_merge_when_below_half() {
         None,
         &TierThresholds::default(),
         None,
+        0,
     )
     .await
     .unwrap();
@@ -438,6 +444,7 @@ async fn dense_prefilter_excludes_deselected_source_nearer_chunk() {
         None,
         &TierThresholds::default(),
         None,
+        0,
     )
     .await
     .unwrap();
@@ -489,6 +496,7 @@ async fn empty_selected_set_returns_empty_not_notebook_scope() {
         None,
         &TierThresholds::default(),
         None,
+        0,
     )
     .await
     .unwrap();
@@ -588,6 +596,7 @@ async fn assert_seam_parity(reranker_enabled: bool) {
         None,
         &TierThresholds::default(),
         None,
+        0,
     )
     .await
     .unwrap();
@@ -686,6 +695,7 @@ async fn prefilter_diverges_from_hybrid_on_deselected_source() {
         None,
         &TierThresholds::default(),
         None,
+        0,
     )
     .await
     .unwrap();
@@ -788,6 +798,7 @@ async fn graph_arm_folds_graph_only_chunk_tagged_graph() {
         Some(true),
         &TierThresholds::default(),
         None,
+        0,
     )
     .await
     .unwrap();
@@ -850,6 +861,7 @@ async fn graph_off_when_flag_disabled() {
         Some(false),
         &TierThresholds::default(),
         None,
+        0,
     )
     .await
     .unwrap();

@@ -120,27 +120,62 @@ fn abs_cap(ctx: u32) -> usize {
     }
 }
 
-/// Derives the tier caps from a model context window. `ctx == 0` (unknown context)
-/// falls back to the static [`TierThresholds`].
-fn derive_tier_caps(ctx: u32, fallback: &TierThresholds) -> TierCap {
+/// Fraction of `usable_input` history may reserve, so a large conversation can never
+/// starve retrieval to zero on a small-context model (a spurious "no sources" refusal
+/// otherwise, CX-3). The assembled-prompt guard downstream is authoritative for the
+/// real fit; this only bounds tier selection.
+const MAX_HISTORY_RESERVATION: f32 = 0.5;
+
+/// Derives the tier caps from a model context window. `reserved_history` is the
+/// token span prior conversation turns claim (CX-3); it is subtracted from
+/// `usable_input` (capped at [`MAX_HISTORY_RESERVATION`] of it) so retrieval keeps a
+/// floor. `ctx == 0` (unknown) falls back to static [`TierThresholds`].
+fn derive_tier_caps(ctx: u32, reserved_history: usize, fallback: &TierThresholds) -> TierCap {
     if ctx == 0 {
         return TierCap {
             tier1_cap: fallback.tier1_token_cap as usize,
             tier2_cap: fallback.tier2_token_cap as usize,
         };
     }
-    let budget = token_budget(ctx);
-    let tier1_fraction = (TIER1_FRACTION * budget.usable_input as f32) as usize;
+    let usable_input = token_budget(ctx).usable_input;
+    let reserved = reserved_history.min((usable_input as f32 * MAX_HISTORY_RESERVATION) as usize);
+    let usable = usable_input.saturating_sub(reserved);
+    let tier1_fraction = (TIER1_FRACTION * usable as f32) as usize;
     let tier1_cap = tier1_fraction.min(abs_cap(ctx));
     TierCap {
         tier1_cap,
-        tier2_cap: budget.usable_input,
+        tier2_cap: usable,
     }
 }
 
-/// Routing token estimate: `chars/4` (spec line 37). Cheap, deliberately rough.
-fn estimate_tokens(text: &str) -> usize {
-    text.chars().count() / 4
+/// True for CJK ideographs, kana, and hangul — scripts whose codepoints are roughly
+/// one token each (subword tokenizers rarely merge them), unlike the ~4-chars/token
+/// average for Latin/Cyrillic/etc.
+fn is_cjk(c: char) -> bool {
+    matches!(c as u32,
+        0x3040..=0x30FF   // Hiragana + Katakana
+        | 0x3400..=0x4DBF // CJK Unified Ideographs Extension A
+        | 0x4E00..=0x9FFF // CJK Unified Ideographs
+        | 0xF900..=0xFAFF // CJK Compatibility Ideographs
+        | 0xAC00..=0xD7AF // Hangul Syllables
+    )
+}
+
+/// Routing token estimate (spec line 37). Cheap, deliberately rough, but
+/// script-aware (CX-6): CJK codepoints count ~1 token each, other scripts ~4
+/// chars/token, so non-Latin text is no longer systematically undercounted (which
+/// caused tier misselection + overflow).
+pub(crate) fn estimate_tokens(text: &str) -> usize {
+    let mut cjk = 0usize;
+    let mut other = 0usize;
+    for c in text.chars() {
+        if is_cjk(c) {
+            cjk += 1;
+        } else {
+            other += 1;
+        }
+    }
+    cjk + other / 4
 }
 
 /// Exact token count via the shared tokenizer. Used only for a near-cap recount of
@@ -716,8 +751,9 @@ pub async fn tiered_search(
     notebook_graph_flag: Option<bool>,
     thresholds: &TierThresholds,
     tokenizer: Option<&Tokenizer>,
+    reserved_history_tokens: usize,
 ) -> Result<RouterOutput, LensError> {
-    let caps = derive_tier_caps(model.context, thresholds);
+    let caps = derive_tier_caps(model.context, reserved_history_tokens, thresholds);
     let sources = resolve_selected_sources(pool_db, &coord.notebook).await?;
 
     // Empty selected+live set → ground on nothing (do NOT fall back to notebook
@@ -861,19 +897,19 @@ mod tests {
 
     #[test]
     fn cap_small_band_is_bounded_by_4000() {
-        let caps = derive_tier_caps(8_192, &thresholds());
+        let caps = derive_tier_caps(8_192, 0, &thresholds());
         assert!(caps.tier1_cap <= ABS_CAP_SMALL, "{}", caps.tier1_cap);
     }
 
     #[test]
     fn cap_medium_band_is_bounded_by_20000() {
-        let caps = derive_tier_caps(32_000, &thresholds());
+        let caps = derive_tier_caps(32_000, 0, &thresholds());
         assert!(caps.tier1_cap <= ABS_CAP_MEDIUM, "{}", caps.tier1_cap);
     }
 
     #[test]
     fn cap_large_band_is_bounded_by_48000() {
-        let caps = derive_tier_caps(200_000, &thresholds());
+        let caps = derive_tier_caps(200_000, 0, &thresholds());
         assert!(caps.tier1_cap <= ABS_CAP_LARGE, "{}", caps.tier1_cap);
         // 0.65 * usable dominates below the abs cap for a very large window? No —
         // 0.65 * (200000-2560) ≈ 128k, so the abs cap binds.
@@ -884,7 +920,7 @@ mod tests {
     fn cap_fraction_binds_when_below_abs_cap() {
         // ctx 10000 -> usable 7440 -> 0.65*7440 = 4836, abs cap (medium band) 20000.
         // The fraction binds.
-        let caps = derive_tier_caps(10_000, &thresholds());
+        let caps = derive_tier_caps(10_000, 0, &thresholds());
         let budget = token_budget(10_000);
         let expected = (TIER1_FRACTION * budget.usable_input as f32) as usize;
         assert_eq!(caps.tier1_cap, expected);
@@ -892,8 +928,27 @@ mod tests {
     }
 
     #[test]
+    fn history_reservation_never_starves_retrieval_on_small_context() {
+        // ctx 3072 → usable_input 512; a 1000-token history would floor caps to 0
+        // (spurious "no sources", CX-3). The reservation is capped at half of usable,
+        // so retrieval keeps a non-zero budget.
+        let caps = derive_tier_caps(3_072, 1_000, &thresholds());
+        assert!(
+            caps.tier2_cap > 0,
+            "tier2 cap starved to zero: {}",
+            caps.tier2_cap
+        );
+        // With no history the full usable budget is available.
+        let full = derive_tier_caps(3_072, 0, &thresholds());
+        assert!(
+            caps.tier2_cap < full.tier2_cap,
+            "history still reduces the budget"
+        );
+    }
+
+    #[test]
     fn context_zero_falls_back_to_tier_thresholds() {
-        let caps = derive_tier_caps(0, &thresholds());
+        let caps = derive_tier_caps(0, 0, &thresholds());
         assert_eq!(caps.tier1_cap, 4_000);
         assert_eq!(caps.tier2_cap, 16_000);
     }
@@ -917,6 +972,18 @@ mod tests {
         assert_eq!(estimate_tokens("abcdefgh"), 2);
         assert_eq!(estimate_tokens(""), 0);
         assert_eq!(estimate_tokens("abc"), 0);
+    }
+
+    #[test]
+    fn estimate_tokens_counts_cjk_near_one_per_char() {
+        // 4 CJK ideographs ≈ 4 tokens (vs the old chars/4 = 1, a 4× undercount, CX-6).
+        assert_eq!(estimate_tokens("日本語訳"), 4);
+        // Hiragana + katakana + hangul are all treated as CJK.
+        assert_eq!(estimate_tokens("あ"), 1);
+        assert_eq!(estimate_tokens("カ"), 1);
+        assert_eq!(estimate_tokens("한"), 1);
+        // Mixed: 2 CJK (→2) + 9 non-CJK incl. the space (9/4 = 2) = 4.
+        assert_eq!(estimate_tokens("日本 abcdefgh"), 4);
     }
 
     #[test]

@@ -15,7 +15,7 @@
   import ErrorCard from './ErrorCard.svelte';
   import { fade } from 'svelte/transition';
   import { prefersReducedMotion } from '$lib/motion/index.js';
-  import type { AnswerStage, Turn } from '$lib/chat/types.js';
+  import type { AnswerStage, Citation, Turn } from '$lib/chat/types.js';
 
   interface Props {
     notebookId: string;
@@ -24,7 +24,13 @@
     stage: AnswerStage | null;
     thinkingBuffer: string;
     answerBuffer: string;
+    /** Citations resolved for the in-flight turn (arrive near the end of the
+     * stream); threaded into the streaming bubble so `[n]` chips resolve live (FE-4). */
+    pendingCitations: Citation[] | null;
     currentTurnId: string | null;
+    /** Turn whose finished answer was ungrounded (text, no citations) — drives the
+     * subtle live badge (SP-3); `null` otherwise. */
+    ungroundedTurnId: string | null;
     error: { kind: string; message: string } | null;
     pinnedToBottom: boolean;
     oncopy: (content: string) => void;
@@ -45,7 +51,9 @@
     stage,
     thinkingBuffer,
     answerBuffer,
+    pendingCitations,
     currentTurnId,
+    ungroundedTurnId,
     error,
     pinnedToBottom,
     oncopy,
@@ -60,6 +68,11 @@
   let viewportRef = $state<HTMLElement | null>(null);
   let activeTurnId = $state<string | null>(null);
   const isEmpty = $derived(turns.length === 0 && !streaming);
+  // Stringified pending citations for the streaming bubble (its `citations` field is
+  // the raw JSON string, mirroring a persisted row) so `[n]` chips resolve live.
+  const pendingCitationsJson = $derived(
+    pendingCitations && pendingCitations.length > 0 ? JSON.stringify(pendingCitations) : null
+  );
   // Treat within Npx of bottom as "at bottom" for autoscroll pin/unpin.
   const PIN_THRESHOLD_PX = 48;
   // A turn counts as "in view" for the scrubber once its top is within this many
@@ -211,30 +224,40 @@
             {#if thinkingBuffer.length > 0}
               <ThoughtsDisclosure thinking={thinkingBuffer} />
             {/if}
-            {#if answerBuffer.length > 0}
-              <AssistantMessage
-                {notebookId}
-                versions={[
-                  {
-                    id: `${turn.turn_id}-streaming`,
-                    notebook_id: turn.user.notebook_id,
-                    turn_id: turn.turn_id,
-                    role: 'assistant',
-                    content: answerBuffer,
-                    citations: null,
-                    feedback: null,
-                    tokens_used: null,
-                    created_at: turn.user.created_at
-                  }
-                ]}
-                oncopy={() => {}}
-                onregenerate={() => {}}
-                onfeedback={() => {}}
-                regenerateDisabled={true}
-                highlightCode={false}
-                finalized={false}
-              />
-            {/if}
+          {/if}
+          <!-- Partial-answer bubble, decoupled from `streaming` (FE-1): shown while
+               the turn has no persisted version yet, so a stopped/errored turn keeps
+               its partial text. A cancelled turn's marker version replaces it. -->
+          {#if answerBuffer.length > 0 && currentTurnId === turn.turn_id && turn.versions.length === 0}
+            <AssistantMessage
+              {notebookId}
+              versions={[
+                {
+                  id: `${turn.turn_id}-streaming`,
+                  notebook_id: turn.user.notebook_id,
+                  turn_id: turn.turn_id,
+                  role: 'assistant',
+                  content: answerBuffer,
+                  citations: pendingCitationsJson,
+                  feedback: null,
+                  tokens_used: null,
+                  state: null,
+                  error_kind: null,
+                  created_at: turn.user.created_at
+                }
+              ]}
+              oncopy={() => {}}
+              onregenerate={() => {}}
+              onfeedback={() => {}}
+              regenerateDisabled={true}
+              highlightCode={false}
+              finalized={false}
+            />
+          {/if}
+          {#if ungroundedTurnId === turn.turn_id && turn.versions.length > 0}
+            <p class="px-4 pt-1 text-xs text-muted-foreground/70">
+              Not grounded in the selected sources
+            </p>
           {/if}
           {#if error && currentTurnId === turn.turn_id}
             <ErrorCard {error} {onretry} />

@@ -973,6 +973,7 @@ async fn run_graph_gate(
             Some(true),
             &thresholds,
             None,
+            0, // eval measures single-query recall — no conversation history
         )
         .await?;
         let router_ids: Vec<String> = router_out.units.into_iter().map(|u| u.chunk_id).collect();

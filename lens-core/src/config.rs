@@ -462,6 +462,43 @@ impl Default for RetrievalConfig {
     }
 }
 
+/// Serde default for [`ChatConfig::history_turns`] (`6` = ~3 exchanges).
+fn default_history_turns() -> usize {
+    6
+}
+
+/// Serde default for [`ChatConfig::condense_followups`] (`true`).
+fn default_condense_followups() -> bool {
+    true
+}
+
+/// Chat context-management configuration (Plan 2). Additive `#[serde(default)]`
+/// struct; an absent `chat` key in an old `config.json` reads back as this default.
+/// A dedicated chat model/routing seam can grow here later (today chat reuses the
+/// enrichment routing, decoupled only from the `enrichment.enabled` flag).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatConfig {
+    /// Max prior turns (user+assistant messages) fed into the prompt and the
+    /// history-aware retrieval query, newest-first, further bounded by the token
+    /// budget. `0` disables history (stateless, pre-Plan-2 behavior).
+    #[serde(default = "default_history_turns")]
+    pub history_turns: usize,
+    /// Rewrite anaphoric follow-ups into a standalone retrieval query via one cheap
+    /// LLM call (falling back to the raw question on any error). `false` skips the
+    /// extra call and retrieves on the raw question.
+    #[serde(default = "default_condense_followups")]
+    pub condense_followups: bool,
+}
+
+impl Default for ChatConfig {
+    fn default() -> Self {
+        Self {
+            history_turns: default_history_turns(),
+            condense_followups: default_condense_followups(),
+        }
+    }
+}
+
 const DEFAULT_ACCENT: &str = "purple";
 
 /// Serde default: configs without an `accent` key read back as `"purple"`.
@@ -518,6 +555,10 @@ pub struct AppConfig {
     /// [`RetrievalConfig::default`] (hybrid on, reranker off).
     #[serde(default)]
     pub retrieval: RetrievalConfig,
+    /// Chat context-management configuration (Plan 2). Absent key reads as
+    /// [`ChatConfig::default`] (6 history turns, follow-up condensation on).
+    #[serde(default)]
+    pub chat: ChatConfig,
     /// Explicit consent to upload raw audio to a cloud ASR provider (#45). A NEW
     /// flag, SEPARATE from `EnrichmentConfig::cloud_consent` (audio is more
     /// sensitive than text). Cloud ASR is refused (falls back to local) unless true.
@@ -554,6 +595,7 @@ impl Default for AppConfig {
             enrichment: EnrichmentConfig::default(),
             asr: AsrConfig::default(),
             retrieval: RetrievalConfig::default(),
+            chat: ChatConfig::default(),
             audio_cloud_consent: false,
             js_render_enabled: default_js_render_enabled(),
             reopen_last_notebook: default_reopen_last_notebook(),
