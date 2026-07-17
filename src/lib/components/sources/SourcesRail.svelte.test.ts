@@ -468,17 +468,17 @@ describe('SourcesRail — Studio shell', () => {
     expect(screen.getByText(/1 of 2 sources selected/i)).toBeInTheDocument();
   });
 
-  it('the Generate Audio Overview button is disabled', () => {
+  it('the Generate Audio Overview button is marked coming-soon (aria-disabled)', () => {
     render(SourcesRail);
     const gen = screen.getByRole('button', { name: /generate audio overview/i });
-    expect(gen).toBeDisabled();
+    expect(gen).toHaveAttribute('aria-disabled', 'true');
   });
 
-  it('renders the study-tool actions and they are all disabled', () => {
+  it('renders the study-tool actions, each marked coming-soon (aria-disabled)', () => {
     render(SourcesRail);
     for (const label of ['Study Guide', 'Briefing Doc', 'Report', 'Slide Deck', 'Flashcards']) {
       const btn = screen.getByRole('button', { name: new RegExp(label, 'i') });
-      expect(btn).toBeDisabled();
+      expect(btn).toHaveAttribute('aria-disabled', 'true');
     }
   });
 
