@@ -28,21 +28,18 @@
     totalCount?: number;
   } = $props();
 
-  // Study Guide is the hero tool (full-width); remaining tools fill a 2-col grid.
-  /** The hero tool — rendered full-width above the grid. */
-  const heroTool: { label: string; sub: string; icon: Component } = {
-    label: 'Study Guide',
-    sub: 'Key terms & review Qs',
-    icon: BookOpen
-  };
+  // The study/learning trio renders as full-width rows for prominence; the
+  // remaining document/visual tools fill a 2-column grid below.
+  const heroTools: Array<{ label: string; sub: string; icon: Component }> = [
+    { label: 'Study Guide', sub: 'Key terms & review Qs', icon: BookOpen },
+    { label: 'Flashcards', sub: 'Spaced recall', icon: Layers },
+    { label: 'Quiz', sub: 'Self-test questions', icon: Sparkles }
+  ];
 
-  /** The remaining tools — rendered in a 2-column grid. */
   const gridTools: Array<{ label: string; sub: string; icon: Component }> = [
     { label: 'Briefing Doc', sub: 'One-page summary', icon: FileText },
     { label: 'Report', sub: 'Structured write-up', icon: FileChartColumn },
     { label: 'Slide Deck', sub: 'Presentation outline', icon: Presentation },
-    { label: 'Flashcards', sub: 'Spaced recall', icon: Layers },
-    { label: 'Quiz', sub: 'Self-test questions', icon: Sparkles },
     { label: 'Timeline', sub: 'Chronological view', icon: Clock },
     { label: 'FAQ', sub: 'Anticipated questions', icon: ChartBar },
     { label: 'Mind Map', sub: 'Concept graph', icon: Brain },
@@ -52,7 +49,7 @@
 </script>
 
 <section
-  class="no-scrollbar flex max-h-[64%] shrink-0 flex-col gap-3 overflow-y-auto border-t border-border px-3 py-3"
+  class="no-scrollbar flex min-h-0 flex-[0_1_auto] flex-col gap-3 overflow-y-auto border-t border-border px-3 py-3"
   aria-label="Studio"
 >
   <div class="flex items-center gap-2">
@@ -100,26 +97,30 @@
   </div>
 
   <div aria-label="Study tools" use:fadeRise={{ y: 8, duration: 0.36, delay: 0.05 }}>
-    <button
-      type="button"
-      class="tool-tile hero-tile mb-1.5 flex w-full items-center gap-2.5 px-2.5 py-2 text-left disabled:cursor-not-allowed"
-      disabled
-      aria-label="{heroTool.label} (coming soon)"
-      title="Coming soon"
-      style="-webkit-app-region: no-drag;"
-    >
-      <span class="tool-icon" aria-hidden="true">
-        <heroTool.icon class="size-[14px] text-primary" strokeWidth={1.75} />
-      </span>
-      <span class="min-w-0">
-        <span class="block truncate text-xs font-semibold leading-tight text-foreground"
-          >{heroTool.label}</span
+    <div class="mb-1.5 flex flex-col gap-1.5">
+      {#each heroTools as tool (tool.label)}
+        <button
+          type="button"
+          class="tool-tile hero-tile flex w-full items-center gap-2.5 px-2.5 py-2 text-left disabled:cursor-not-allowed"
+          disabled
+          aria-label="{tool.label} (coming soon)"
+          title="Coming soon"
+          style="-webkit-app-region: no-drag;"
         >
-        <span class="block truncate text-[0.6875rem] leading-tight text-muted-foreground/70"
-          >{heroTool.sub}</span
-        >
-      </span>
-    </button>
+          <span class="tool-icon" aria-hidden="true">
+            <tool.icon class="size-[14px] text-primary" strokeWidth={1.75} />
+          </span>
+          <span class="min-w-0">
+            <span class="block truncate text-xs font-semibold leading-tight text-foreground"
+              >{tool.label}</span
+            >
+            <span class="block truncate text-[0.6875rem] leading-tight text-muted-foreground/70"
+              >{tool.sub}</span
+            >
+          </span>
+        </button>
+      {/each}
+    </div>
 
     <div class="grid grid-cols-2 gap-1.5">
       {#each gridTools as tool (tool.label)}
