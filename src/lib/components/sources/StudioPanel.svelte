@@ -157,12 +157,12 @@
     background: color-mix(in oklch, var(--primary) 70%, transparent);
   }
 
-  /* Audio Overview: the one hero surface in Studio — tinted card with a soft
-     primary wash so it reads as the section's headline action. */
+  /* Audio Overview: the section's headline surface — an elevated card (stronger
+     shadow than the tool tiles) with the accent carried by its icon + CTA. */
   .audio-card {
     border-radius: 14px;
-    border: 1px solid color-mix(in oklch, var(--primary) 16%, var(--border));
-    background: color-mix(in oklch, var(--primary) 5%, var(--card));
+    background: var(--card);
+    box-shadow: var(--shadow-bar);
   }
   .audio-icon {
     display: grid;
@@ -183,22 +183,21 @@
     box-shadow: inset 0 10px 14px -14px oklch(0 0 0 / 0.18);
   }
 
-  /* Study-tool tiles — raised cards on the tray, with an interactive hover/press
-     feel. The action is still "coming soon" (aria-disabled on the button); this is
-     the designed preview state. */
+  /* Study-tool tiles — borderless cards that lift off the tray on a soft shadow;
+     hover deepens the shadow and raises them a hair. The action is still "coming
+     soon" (aria-disabled on the button); this is the designed preview state. */
   .tool-tile {
     border-radius: 10px;
-    border: 1px solid var(--border);
     background: var(--card);
+    box-shadow: var(--shadow-tile);
     cursor: pointer;
     transition:
-      background-color 0.16s var(--ease-out, ease),
-      border-color 0.16s var(--ease-out, ease),
-      transform 0.16s var(--ease-out, ease);
+      box-shadow 0.18s var(--ease-out, ease),
+      transform 0.18s var(--ease-out, ease);
   }
   .tool-tile:hover {
-    border-color: color-mix(in oklch, var(--primary) 32%, var(--border));
-    background: color-mix(in oklch, var(--primary) 5%, var(--card));
+    box-shadow: var(--shadow-bar);
+    transform: translateY(calc(-1px * var(--rail-motion, 1)));
   }
   .tool-tile:active {
     transform: scale(calc(1 - 0.02 * var(--rail-motion, 1)));
@@ -207,11 +206,9 @@
     outline: none;
     box-shadow: 0 0 0 2px var(--ring);
   }
+  /* The study trio rests a touch higher than the grid via a stronger shadow. */
   .hero-tile {
-    background: color-mix(in oklch, var(--muted) 40%, var(--card));
-  }
-  .hero-tile:hover {
-    background: color-mix(in oklch, var(--primary) 6%, var(--card));
+    box-shadow: var(--shadow-bar);
   }
   .tool-icon {
     display: grid;

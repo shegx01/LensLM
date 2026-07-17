@@ -189,6 +189,8 @@
   /* Same shadow family as --shadow-rail, tuned shallower for the short floating
      top bar so it lifts off the canvas without a heavy full-panel cast. */
   --shadow-bar: 0 1px 2px oklch(0.2 0.02 293 / 0.05), 0 6px 16px oklch(0.2 0.02 293 / 0.07);
+  /* Soft resting lift for small raised cards (Studio tiles); hover promotes to --shadow-bar. */
+  --shadow-tile: 0 1px 2px oklch(0.2 0.02 293 / 0.05), 0 2px 6px oklch(0.2 0.02 293 / 0.05);
   /* App-shell canvas: a hair below the elevated (white card) rail so the floating
      panel + its shadow still separate, but close to white. Dark = deepest ground. */
   --app-canvas: color-mix(in oklch, var(--neutral-0) 82%, var(--neutral-50));
@@ -295,6 +297,7 @@
   --shadow-rail:
     0 1px 2px oklch(0 0 0 / 0.3), 0 12px 32px oklch(0 0 0 / 0.4), 0 32px 64px oklch(0 0 0 / 0.35);
   --shadow-bar: 0 1px 2px oklch(0 0 0 / 0.35), 0 6px 16px oklch(0 0 0 / 0.4);
+  --shadow-tile: 0 1px 2px oklch(0 0 0 / 0.4), 0 3px 8px oklch(0 0 0 / 0.3);
   --app-canvas: var(--neutral-950);
 }
 
