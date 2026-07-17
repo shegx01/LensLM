@@ -19,7 +19,7 @@
 
 <aside
   data-sidebar-rail
-  class="m-2 flex flex-col overflow-hidden rounded-xl border border-sidebar-border bg-sidebar text-sidebar-foreground shadow-sm"
+  class="m-2 flex flex-col overflow-hidden rounded-xl bg-card text-sidebar-foreground shadow-[var(--shadow-rail)]"
 >
   <NotebooksSidebar {collapsed} {onnewnotebook} {userName} />
 </aside>

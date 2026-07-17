@@ -128,4 +128,7 @@ export interface AppConfig {
   js_render_enabled: boolean;
   // SYNC-CHECK: must match lens-core/src/config.rs AppConfig.reopen_last_notebook (default true).
   reopen_last_notebook: boolean;
+  // SYNC-CHECK: must match lens-core/src/config.rs AppConfig.animations (default "system").
+  // Applied as `data-motion` on <html>: 'system' | 'on' | 'off'.
+  animations: string;
 }

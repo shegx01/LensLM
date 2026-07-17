@@ -11,8 +11,16 @@ import { animate, inView } from 'motion';
 
 const REDUCE_MOTION_QUERY = '(prefers-reduced-motion: reduce)';
 
-/** True when the OS asks for reduced motion (or we're not in a browser). */
-function prefersReducedMotion(): boolean {
+/**
+ * True when motion should be reduced. `data-motion` on `<html>` overrides the OS
+ * query: `'on'` forces motion, `'off'` forces calm, `'system'`/unset defers to it.
+ */
+export function prefersReducedMotion(): boolean {
+  if (typeof document !== 'undefined') {
+    const motion = document.documentElement.dataset.motion;
+    if (motion === 'on') return false;
+    if (motion === 'off') return true;
+  }
   if (typeof window === 'undefined' || !window.matchMedia) return false;
   return window.matchMedia(REDUCE_MOTION_QUERY).matches;
 }

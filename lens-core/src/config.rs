@@ -479,6 +479,11 @@ fn default_reopen_last_notebook() -> bool {
     true
 }
 
+/// Serde default: `animations` is `"system"` when absent (follow OS Reduce-Motion).
+fn default_animations() -> String {
+    "system".to_string()
+}
+
 /// Top-level application configuration. Loaded from / saved to `{data_dir}/config.json`;
 /// missing file writes the default back; malformed file yields [`LensError::Parse`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -524,6 +529,10 @@ pub struct AppConfig {
     /// Auto-open most-recently-active notebook on cold launch. Defaults to `true`.
     #[serde(default = "default_reopen_last_notebook")]
     pub reopen_last_notebook: bool,
+    /// Motion preference applied as `data-motion` on `<html>`: `"system"` (follow
+    /// OS Reduce-Motion), `"on"`, or `"off"`. Absent key reads as `"system"`.
+    #[serde(default = "default_animations")]
+    pub animations: String,
     pub paths: PathConfig,
     pub tier_thresholds: TierThresholds,
     pub onboarding_complete: bool,
@@ -548,6 +557,7 @@ impl Default for AppConfig {
             audio_cloud_consent: false,
             js_render_enabled: default_js_render_enabled(),
             reopen_last_notebook: default_reopen_last_notebook(),
+            animations: default_animations(),
             paths: PathConfig::default(),
             tier_thresholds: TierThresholds::default(),
             onboarding_complete: false,
@@ -1433,5 +1443,45 @@ mod tests {
             config.reopen_last_notebook,
             "absent reopen_last_notebook key must read back as true"
         );
+    }
+
+    #[test]
+    fn default_animations_is_system() {
+        assert_eq!(AppConfig::default().animations, "system");
+    }
+
+    #[test]
+    fn missing_animations_deserializes_to_system() {
+        let json = r#"{
+            "theme": "dark",
+            "accent": "purple",
+            "user_name": "",
+            "embedding_model": "",
+            "embedding_backend": "",
+            "models": [],
+            "endpoints": {},
+            "voices": { "host": "", "guest": "" },
+            "tts": { "provider": "", "api_key": "" },
+            "paths": { "data_dir": "" },
+            "tier_thresholds": { "tier1_token_cap": 4000, "tier2_token_cap": 16000 },
+            "onboarding_complete": true
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            config.animations, "system",
+            "absent animations key must read back as \"system\""
+        );
+    }
+
+    #[test]
+    fn explicit_animations_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = AppConfig {
+            animations: "off".to_string(),
+            ..AppConfig::default()
+        };
+        config.save(dir.path()).unwrap();
+        let loaded = AppConfig::load(dir.path()).unwrap();
+        assert_eq!(loaded.animations, "off");
     }
 }
