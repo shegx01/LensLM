@@ -35,22 +35,14 @@ use tauri::{Manager, WebviewWindowBuilder};
 
 use crate::render::TauriJsRenderer;
 
-/// Top-level navigation guard for the main app window: allow only same-origin
-/// navigation, so an untrusted `https:` link in an answer cannot navigate the app
-/// webview away (phishing / UI-redress). Local-first: reject rather than open
-/// externally (no opener capability is wired). Mirrors the offscreen render
-/// webview's `nav_url_allowed` (render/mod.rs).
 fn main_nav_allowed(url: &tauri::Url) -> bool {
     if cfg!(dev) {
-        // `tauri dev` serves the frontend from build.devUrl (http://localhost:1420).
         return url.scheme() == "http"
             && url.host_str() == Some("localhost")
             && url.port() == Some(1420);
     }
     match url.scheme() {
-        // macOS / Linux production origin.
         "tauri" => url.host_str() == Some("localhost"),
-        // Windows / Android production origin (useHttpsScheme defaults to false).
         "http" if cfg!(windows) || cfg!(target_os = "android") => {
             url.host_str() == Some("tauri.localhost")
         }
@@ -81,10 +73,6 @@ fn main() {
         // Resolve the OS app-data dir, init the engine (open db + migrate +
         // load config) on it, and store the handle in Tauri managed state.
         .setup(|app| {
-            // Build the `main` window here (tauri.conf.json marks it `create: false`)
-            // so a top-level navigation guard can be attached — `on_navigation` is a
-            // build-time-only builder hook. Geometry/style still come from config via
-            // `from_config`; only the nav guard is added in Rust.
             let main_cfg = app
                 .config()
                 .app
@@ -250,7 +238,6 @@ mod tests {
 
     #[test]
     fn main_nav_rejects_foreign_and_untrusted_origins() {
-        // Rejected in both dev and production builds.
         assert!(!allow("https://evil.com/phish"));
         assert!(!allow("http://localhost:9999/x"));
         assert!(!allow("file:///etc/passwd"));
@@ -260,8 +247,6 @@ mod tests {
 
     #[test]
     fn main_nav_allows_own_origin() {
-        // The allowed origin differs by build profile: dev serves from devUrl,
-        // production from the tauri scheme.
         if cfg!(dev) {
             assert!(allow("http://localhost:1420/"));
         } else {
