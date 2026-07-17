@@ -121,7 +121,7 @@ describe('AppShell.svelte', () => {
   it('collapsed rail shows the icon-only layout (no hover behaviour)', () => {
     notebookStore.sidebarCollapsed = true;
     render(AppShell);
-    expect(screen.getByRole('button', { name: /expand sidebar/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Expand sidebar' })).toBeInTheDocument();
     expect(screen.queryByText('Notebooks')).not.toBeInTheDocument();
   });
 

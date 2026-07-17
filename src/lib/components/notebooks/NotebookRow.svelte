@@ -20,16 +20,21 @@
   let {
     notebook,
     active = false,
-    collapsed = false
+    collapsed = false,
+    triggerProps
   }: {
     notebook: NotebookSummary;
     active?: boolean;
     /**
      * When true the row renders as a compact 44×44 icon square (collapsed rail).
-     * The parent supplies collapsed=true when sidebarCollapsed is active. The DOM
-     * is the SAME in both states — layout responds via `data-collapsed` + CSS.
+     * The DOM is the SAME in both states — layout responds via `data-collapsed` + CSS.
      */
     collapsed?: boolean;
+    /**
+     * bits-ui Tooltip trigger props (collapsed rail only). Spread onto the row so
+     * the tooltip anchors to it without an extra wrapper element/button.
+     */
+    triggerProps?: Record<string, unknown>;
   } = $props();
 
   let renaming = $state(false);
@@ -106,15 +111,14 @@
 
 <!--
   Single-root row: the same DOM serves expanded and collapsed. `data-collapsed`
-  drives the label crossfade + 44×44 square via scoped CSS; all motion is gated
-  by `--rail-motion` so calm mode keeps opacity fades but drops springs/translate.
+  drives the label crossfade + 44×44 square via scoped CSS.
 -->
 <div
+  {...triggerProps}
   role="button"
   tabindex="0"
   aria-label={notebook.title}
   aria-pressed={active}
-  title={collapsed ? notebook.title : undefined}
   data-notebook-row
   data-collapsed={collapsed}
   data-active={active}
@@ -130,8 +134,7 @@
   }}
   class="nb-row group"
 >
-  <!-- Icon tile — active flips to the accent (primary) treatment; the tile pops
-       on selection. -->
+  <!-- Icon tile — active flips to the accent (primary) treatment. -->
   <div
     bind:this={tileEl}
     class={cn('nb-tile', active ? 'bg-primary text-primary-foreground' : accentClass)}
@@ -204,8 +207,7 @@
     font: inherit;
     text-align: left;
     outline: none;
-    /* Compose lean (hover) + press so they never overwrite each other; the
-       translate vars scale by --rail-motion so calm mode zeroes the movement. */
+    /* Compose lean (hover) + press so they never overwrite each other. */
     transform: translateX(calc(var(--row-x, 0px) * var(--rail-motion, 1)))
       translateY(calc(var(--row-y, 0px) * var(--rail-motion, 1))) scale(var(--row-s, 1));
     transition:
@@ -218,7 +220,7 @@
     background: color-mix(in oklch, var(--sidebar-accent) 60%, transparent);
     --row-x: 3px;
     --row-y: -1px;
-    box-shadow: 0 5px 16px rgb(0 0 0 / 0.07);
+    box-shadow: 0 2px 12px color-mix(in oklch, var(--sidebar-foreground) 12%, transparent);
   }
   .nb-row:active {
     --row-s: 0.975;
@@ -250,8 +252,7 @@
       0 2px 8px color-mix(in oklch, var(--primary) 14%, transparent),
       inset 0 0 0 1px color-mix(in oklch, var(--primary) 10%, transparent);
   }
-  /* Momentum pop when a notebook becomes active — a touch of overshoot is earned
-     on a real selection. Duration scales by --rail-motion (0 → no pop). */
+  /* Momentum pop when a notebook becomes active. */
   @keyframes nbTilePop {
     0% {
       transform: scale(1);
@@ -275,7 +276,6 @@
     overflow: hidden;
     max-width: 180px;
     opacity: 1;
-    /* Opacity fade stays in calm; the width collapse is spring-gated. */
     transition:
       opacity 0.28s var(--ease-out, ease),
       max-width calc(0.44s * var(--rail-motion, 1)) var(--ease-spring, ease);

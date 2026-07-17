@@ -108,37 +108,38 @@ describe('AccountFooter', () => {
     expect(screen.getByRole('menu')).toBeInTheDocument();
   });
 
-  it('contains a Switch theme entry in the menu', async () => {
+  it('contains a Switch theme segmented control in the menu', async () => {
     render(AccountFooter, { props: { userName: 'Jamie' } });
     await fireEvent.click(screen.getByRole('button', { name: /account menu/i }));
     await waitFor(() => screen.getByRole('menu'));
-    expect(screen.getByText(/switch theme/i)).toBeInTheDocument();
+    expect(screen.getByRole('group', { name: /switch theme/i })).toBeInTheDocument();
+    expect(screen.getByRole('menuitemradio', { name: /theme: system/i })).toBeInTheDocument();
   });
 
-  it('clicking the "Switch theme" row label (not the icon button) toggles the theme', async () => {
+  it('clicking a theme segment sets that mode exactly once', async () => {
     const { setMode } = await import('mode-watcher');
     render(AccountFooter, { props: { userName: 'Jamie' } });
     await fireEvent.click(screen.getByRole('button', { name: /account menu/i }));
     await waitFor(() => screen.getByRole('menu'));
 
-    const row = screen.getByText(/switch theme/i).closest('[data-switch-theme-item]')!;
-    expect(row).toBeInTheDocument();
-    // Clicking the row's text label (outside the inner icon button) must still
-    // forward to the real ThemeCycleButton and cycle the mode.
-    await fireEvent.click(screen.getByText(/^switch theme$/i));
+    await fireEvent.click(screen.getByRole('menuitemradio', { name: /theme: dark/i }));
+    expect(setMode).toHaveBeenCalledWith('dark');
     expect(setMode).toHaveBeenCalledOnce();
   });
 
-  it('clicking the inner theme icon button directly does not double-fire the row forward', async () => {
-    const { setMode } = await import('mode-watcher');
+  it('marks the current mode segment as checked', async () => {
     render(AccountFooter, { props: { userName: 'Jamie' } });
     await fireEvent.click(screen.getByRole('button', { name: /account menu/i }));
     await waitFor(() => screen.getByRole('menu'));
-
-    const row = screen.getByText(/switch theme/i).closest('[data-switch-theme-item]')!;
-    const themeButton = row.querySelector('button')!;
-    await fireEvent.click(themeButton);
-    expect(setMode).toHaveBeenCalledOnce();
+    // Mocked userPrefersMode.current === 'system'.
+    expect(screen.getByRole('menuitemradio', { name: /theme: system/i })).toHaveAttribute(
+      'aria-checked',
+      'true'
+    );
+    expect(screen.getByRole('menuitemradio', { name: /theme: light/i })).toHaveAttribute(
+      'aria-checked',
+      'false'
+    );
   });
 
   it('renders the Embeddings Inspector item in DEV, disabled when no active notebook', async () => {

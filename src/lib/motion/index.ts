@@ -12,11 +12,10 @@ import { animate, inView } from 'motion';
 const REDUCE_MOTION_QUERY = '(prefers-reduced-motion: reduce)';
 
 /**
- * True when motion should be reduced. The app `animations` preference (mirrored
- * to `data-motion` on `<html>`) overrides the OS query: `'on'` forces motion,
- * `'off'` forces calm, `'system'`/unset defers to the OS `prefers-reduced-motion`.
+ * True when motion should be reduced. `data-motion` on `<html>` overrides the OS
+ * query: `'on'` forces motion, `'off'` forces calm, `'system'`/unset defers to it.
  */
-function prefersReducedMotion(): boolean {
+export function prefersReducedMotion(): boolean {
   if (typeof document !== 'undefined') {
     const motion = document.documentElement.dataset.motion;
     if (motion === 'on') return false;

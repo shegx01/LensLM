@@ -284,9 +284,8 @@
   --surface-sunken: var(--neutral-950);
 }
 
-/* Calm triggers zero the motion scale: OS Reduce-Motion (unless the user forced
-   Animations=On) or an explicit Animations=Off. Opacity fades still play; springs,
-   overshoot, and translate collapse to a snap because their values scale by 0. */
+/* `:root:not([data-motion='on'])` lets an explicit Animations=On override the OS
+   Reduce-Motion query; Animations=Off always zeroes the scale. */
 @media (prefers-reduced-motion: reduce) {
   :root:not([data-motion='on']) {
     --rail-motion: 0;

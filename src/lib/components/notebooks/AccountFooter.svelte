@@ -2,9 +2,14 @@
   import ChevronUp from '@lucide/svelte/icons/chevron-up';
   import Settings from '@lucide/svelte/icons/settings';
   import Microscope from '@lucide/svelte/icons/microscope';
+  import Palette from '@lucide/svelte/icons/palette';
+  import Sun from '@lucide/svelte/icons/sun';
+  import Moon from '@lucide/svelte/icons/moon';
+  import Monitor from '@lucide/svelte/icons/monitor';
+  import { setMode, userPrefersMode } from 'mode-watcher';
+  import { persistTheme, type Mode } from '$lib/theme/index.js';
   import { cn } from '$lib/utils.js';
   import { getInitials, notebookStore } from '$lib/notebooks/index.js';
-  import ThemeCycleButton from '$lib/components/ThemeCycleButton.svelte';
   import {
     Tooltip,
     TooltipContent,
@@ -15,6 +20,17 @@
   let { userName = '' }: { userName?: string } = $props();
 
   const initials = $derived(getInitials(userName));
+
+  const currentMode = $derived((userPrefersMode.current ?? 'system') as Mode);
+  const THEME_OPTIONS: { value: Mode; icon: typeof Sun; label: string }[] = [
+    { value: 'light', icon: Sun, label: 'Light' },
+    { value: 'dark', icon: Moon, label: 'Dark' },
+    { value: 'system', icon: Monitor, label: 'System' }
+  ];
+  function selectTheme(mode: Mode): void {
+    setMode(mode);
+    persistTheme(mode);
+  }
 
   let open = $state(false);
   let containerEl = $state<HTMLDivElement | null>(null);
@@ -116,27 +132,34 @@
         <span>Settings</span>
       </button>
 
-      <div
-        role="menuitem"
-        data-switch-theme-item
-        class="flex items-center gap-2.5 px-3 py-2 hover:bg-sidebar-accent/60 transition-colors cursor-pointer"
-        tabindex="0"
-        onclick={(e) => {
-          if ((e.target as HTMLElement).closest('button')) return;
-          (e.currentTarget as HTMLElement).querySelector('button')?.click();
-        }}
-        onkeydown={(e) => {
-          if ((e.target as HTMLElement).closest('button')) return;
-          if (e.key === 'Enter' || e.key === ' ') {
-            const btn = (e.currentTarget as HTMLElement).querySelector('button');
-            btn?.click();
-          }
-        }}
-      >
-        <ThemeCycleButton
-          class="size-6 rounded-md border-0 bg-transparent shadow-none hover:bg-transparent"
-        />
-        <span class="text-sm text-sidebar-foreground">Switch theme</span>
+      <div data-switch-theme-item class="flex items-center gap-2.5 px-3 py-2">
+        <Palette class="size-4 shrink-0 text-sidebar-foreground/70" aria-hidden="true" />
+        <span class="text-sm text-sidebar-foreground">Theme</span>
+        <div
+          role="group"
+          aria-label="Switch theme"
+          class="ml-auto inline-flex items-center gap-0.5 rounded-lg bg-sidebar-accent/50 p-0.5"
+        >
+          {#each THEME_OPTIONS as opt (opt.value)}
+            {@const Icon = opt.icon}
+            <button
+              type="button"
+              role="menuitemradio"
+              aria-checked={currentMode === opt.value}
+              aria-label={`Theme: ${opt.label}`}
+              onclick={() => selectTheme(opt.value)}
+              class={cn(
+                'flex size-6 cursor-pointer items-center justify-center rounded-md border-0 outline-none transition-colors',
+                'focus-visible:ring-2 focus-visible:ring-sidebar-ring',
+                currentMode === opt.value
+                  ? 'bg-sidebar text-sidebar-foreground shadow-sm'
+                  : 'bg-transparent text-sidebar-foreground/50 hover:text-sidebar-foreground'
+              )}
+            >
+              <Icon class="size-3.5" />
+            </button>
+          {/each}
+        </div>
       </div>
 
       {#if import.meta.env.DEV}

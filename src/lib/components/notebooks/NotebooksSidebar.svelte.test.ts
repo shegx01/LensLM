@@ -191,17 +191,17 @@ describe('NotebooksSidebar (expanded)', () => {
 });
 
 describe('NotebooksSidebar (collapsed)', () => {
-  // Collapsed layout is now driven by the `collapsed` prop (AppShell supplies the
-  // hover-aware effective state). Pass `collapsed={true}` explicitly.
+  // Collapsed layout is driven by the `collapsed` prop (AppShell supplies the
+  // effective state; the rail is button-only, no hover). Pass `collapsed={true}`.
   it('renders expand button in collapsed state', () => {
     render(NotebooksSidebar, { props: { collapsed: true } });
-    expect(screen.getByRole('button', { name: /expand sidebar/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Expand sidebar' })).toBeInTheDocument();
   });
 
   it('collapse toggle flips sidebarCollapsed to false (expanding)', async () => {
     storeProxy.sidebarCollapsed = true;
     render(NotebooksSidebar, { props: { collapsed: true } });
-    const expandBtn = screen.getByRole('button', { name: /expand sidebar/i });
+    const expandBtn = screen.getByRole('button', { name: 'Expand sidebar' });
     await fireEvent.click(expandBtn);
     expect(storeProxy.sidebarCollapsed).toBe(false);
   });
@@ -280,7 +280,7 @@ describe('NotebooksSidebar (collapsed prop fallback)', () => {
   it('falls back to store sidebarCollapsed when collapsed prop is omitted', () => {
     storeProxy.sidebarCollapsed = true;
     render(NotebooksSidebar);
-    expect(screen.getByRole('button', { name: /expand sidebar/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Expand sidebar' })).toBeInTheDocument();
   });
 
   it('store-expanded layout when prop omitted and sidebarCollapsed is false', () => {

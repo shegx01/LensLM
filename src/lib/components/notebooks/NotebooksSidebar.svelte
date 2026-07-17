@@ -44,48 +44,54 @@
   // First placement snaps (no glide from y=0); every later one glides.
   let firstPosition = true;
 
-  // Slide the active indicator to the active row's offsetTop. Row height is
-  // constant, so offsetTop is stable across the width animation; we still
-  // recompute on collapse/resize for safety. happy-dom reports offsetTop=0, so
-  // the visual position is verified in the real webview, not in unit tests.
-  function positionIndicator(animate = true): void {
+  // Slide the active indicator to the active row using a rect delta against the
+  // list container (wrapper-agnostic). Row height is not transitioned, so the rect
+  // is settled when we measure. happy-dom returns 0 here; position is verified in-app.
+  // Returns true only when a row was actually positioned.
+  function positionIndicator(animate = true): boolean {
     const el = indicatorEl;
     const list = listEl;
-    if (!el || !list) return;
+    if (!el || !list) return false;
     const idx = notebooks.findIndex((n) => n.id === activeId);
     if (idx < 0) {
       el.style.opacity = '0';
-      return;
+      return false;
     }
     const rows = list.querySelectorAll<HTMLElement>('[data-notebook-row]');
     const row = rows[idx];
     if (!row) {
       el.style.opacity = '0';
-      return;
+      return false;
     }
+    const y = row.getBoundingClientRect().top - list.getBoundingClientRect().top + list.scrollTop;
     if (!animate) el.style.transition = 'none';
-    el.style.setProperty('--ind-y', `${row.offsetTop}px`);
+    el.style.setProperty('--ind-y', `${y}px`);
     el.style.opacity = '1';
     if (!animate) {
       void el.offsetHeight; // flush the no-transition write before restoring
       el.style.transition = '';
     }
+    return true;
   }
 
-  // Reposition on active-notebook change, collapse toggle, and list changes.
+  // Reposition on active-notebook change, collapse toggle, and list changes. The
+  // first SUCCESSFUL placement snaps (no glide from y=0); later ones glide. On cold
+  // start `notebooks` is [] so the early return keeps `firstPosition` true until a
+  // row actually places.
   $effect(() => {
     void activeId;
     void collapsed;
     void notebooks.length;
     const animate = !firstPosition;
-    firstPosition = false;
-    const raf = requestAnimationFrame(() => positionIndicator(animate));
+    const raf = requestAnimationFrame(() => {
+      if (positionIndicator(animate)) firstPosition = false;
+    });
     return () => cancelAnimationFrame(raf);
   });
 
   $effect(() => {
     if (typeof window === 'undefined') return;
-    const onResize = (): void => positionIndicator(false);
+    const onResize = (): void => void positionIndicator(false);
     window.addEventListener('resize', onResize);
     return () => window.removeEventListener('resize', onResize);
   });
@@ -115,8 +121,7 @@
 <!--
   Single unified rail skeleton: the SAME DOM serves expanded and collapsed.
   `data-collapsed` on the root drives the label crossfade, the uniform 44×44
-  collapsed boxes, and the sliding active indicator via scoped CSS. All motion is
-  gated by `--rail-motion` so calm mode keeps opacity fades but drops springs.
+  collapsed boxes, and the sliding active indicator via scoped CSS.
 -->
 <TooltipProvider>
   <div data-sidebar data-collapsed={collapsed} class={cn('rail-root', 'text-sidebar-foreground')}>
@@ -133,50 +138,54 @@
         <span class="brand-theme">
           <ThemeCycleButton variant="bare" />
         </span>
-        <button
-          type="button"
-          aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
-          title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
-          data-collapse-btn
-          onclick={toggleCollapse}
-          class={cn(
-            'flex size-[26px] shrink-0 items-center justify-center rounded-full',
-            'bg-muted text-sidebar-foreground/70 hover:text-sidebar-foreground hover:opacity-60',
-            'cursor-pointer border-0 transition-opacity',
-            'outline-none focus-visible:ring-2 focus-visible:ring-sidebar-ring'
-          )}
-        >
-          {#if collapsed}
-            <PanelLeft class="size-3.5" />
-          {:else}
-            <PanelLeftClose class="size-3.5" />
-          {/if}
-        </button>
+        <Tooltip disabled={!collapsed}>
+          <TooltipTrigger
+            aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            data-collapse-btn
+            onclick={toggleCollapse}
+            class={cn(
+              'flex size-[26px] shrink-0 items-center justify-center rounded-full',
+              'bg-muted text-sidebar-foreground/70 hover:text-sidebar-foreground hover:opacity-60',
+              'cursor-pointer border-0 transition-opacity',
+              'outline-none focus-visible:ring-2 focus-visible:ring-sidebar-ring'
+            )}
+          >
+            {#if collapsed}
+              <PanelLeft class="size-3.5" />
+            {:else}
+              <PanelLeftClose class="size-3.5" />
+            {/if}
+          </TooltipTrigger>
+          <TooltipContent side="right">
+            {collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+          </TooltipContent>
+        </Tooltip>
       </span>
     </div>
 
     <!-- search -->
-    <button
-      type="button"
-      aria-label="Search notebooks (⌘K)"
-      title={collapsed ? 'Search notebooks (⌘K)' : undefined}
-      data-search-trigger
-      onclick={openPalette}
-      class="search-trigger"
-    >
-      <Search class="size-4 shrink-0" aria-hidden="true" />
-      <span class="lbl flex-1 text-left">Search notebooks</span>
-      <kbd
-        class={cn(
-          'kbd inline-flex items-center gap-0.5 rounded px-1.5 py-0.5',
-          'border border-sidebar-border bg-sidebar text-[0.65rem]',
-          'font-medium text-sidebar-foreground/40'
-        )}
-        aria-hidden="true"
+    <Tooltip disabled={!collapsed}>
+      <TooltipTrigger
+        aria-label="Search notebooks (⌘K)"
+        data-search-trigger
+        onclick={openPalette}
+        class="search-trigger"
       >
-        ⌘K
-      </kbd>
-    </button>
+        <Search class="size-4 shrink-0" aria-hidden="true" />
+        <span class="lbl flex-1 text-left">Search notebooks</span>
+        <kbd
+          class={cn(
+            'kbd inline-flex items-center gap-0.5 rounded px-1.5 py-0.5',
+            'border border-sidebar-border bg-sidebar text-[0.65rem]',
+            'font-medium text-sidebar-foreground/40'
+          )}
+          aria-hidden="true"
+        >
+          ⌘K
+        </kbd>
+      </TooltipTrigger>
+      <TooltipContent side="right">Search notebooks (⌘K)</TooltipContent>
+    </Tooltip>
 
     {#if !collapsed}
       <p class="sect-label">Notebooks</p>
@@ -191,39 +200,59 @@
         <p class="px-2 py-4 text-center text-xs text-sidebar-foreground/40">No notebooks yet</p>
       {:else}
         {#each notebooks as nb (nb.id)}
-          <NotebookRow notebook={nb} active={nb.id === activeId} {collapsed} />
+          {#if collapsed}
+            <Tooltip>
+              <TooltipTrigger>
+                {#snippet child({ props })}
+                  <NotebookRow
+                    notebook={nb}
+                    active={nb.id === activeId}
+                    {collapsed}
+                    triggerProps={props}
+                  />
+                {/snippet}
+              </TooltipTrigger>
+              <TooltipContent side="right">{nb.title}</TooltipContent>
+            </Tooltip>
+          {:else}
+            <NotebookRow notebook={nb} active={nb.id === activeId} {collapsed} />
+          {/if}
         {/each}
       {/if}
     </div>
 
     <!-- actions -->
     <div class="actions">
-      <button
-        type="button"
-        aria-label="New notebook"
-        title={collapsed ? 'New notebook' : undefined}
-        data-new-notebook-btn
-        onclick={handleNewNotebook}
-        class="pill-btn primary"
-      >
-        <Plus class="size-4 shrink-0" aria-hidden="true" />
-        <span class="lbl">New notebook</span>
-      </button>
+      <Tooltip disabled={!collapsed}>
+        <TooltipTrigger
+          aria-label="New notebook"
+          data-new-notebook-btn
+          onclick={handleNewNotebook}
+          class="pill-btn primary"
+        >
+          <Plus class="size-4 shrink-0" aria-hidden="true" />
+          <span class="lbl">New notebook</span>
+        </TooltipTrigger>
+        <TooltipContent side="right">New notebook</TooltipContent>
+      </Tooltip>
 
-      <button
-        type="button"
-        aria-label={`Trash${trashCount > 0 ? ` (${trashCount} items)` : ''}`}
-        title={collapsed ? `Trash${trashCount > 0 ? ` (${trashCount})` : ''}` : undefined}
-        data-trash-entry
-        onclick={() => void openTrash()}
-        class="pill-btn"
-      >
-        <Trash class="size-4 shrink-0" aria-hidden="true" />
-        <span class="lbl">Trash</span>
-        {#if trashCount > 0}
-          <span class="count lbl" aria-hidden="true">{trashCount}</span>
-        {/if}
-      </button>
+      <Tooltip disabled={!collapsed}>
+        <TooltipTrigger
+          aria-label={`Trash${trashCount > 0 ? ` (${trashCount} items)` : ''}`}
+          data-trash-entry
+          onclick={() => void openTrash()}
+          class="pill-btn"
+        >
+          <Trash class="size-4 shrink-0" aria-hidden="true" />
+          <span class="lbl">Trash</span>
+          {#if trashCount > 0}
+            <span class="count lbl" aria-hidden="true">{trashCount}</span>
+          {/if}
+        </TooltipTrigger>
+        <TooltipContent side="right">
+          Trash{trashCount > 0 ? ` (${trashCount})` : ''}
+        </TooltipContent>
+      </Tooltip>
     </div>
 
     <!-- footer: expanded = AccountFooter popup; collapsed = icon stack -->
@@ -276,7 +305,7 @@
 
         <Tooltip>
           <TooltipTrigger
-            aria-label={`Account: ${userName || 'user'}`}
+            aria-label={`Account: ${userName || 'user'} — expand sidebar`}
             data-account-avatar
             onclick={toggleCollapse}
             class={cn(
@@ -303,8 +332,7 @@
     padding: 0 12px 0;
   }
 
-  /* Label crossfade — the heart of the collapse. Opacity fade stays in calm; the
-     horizontal collapse (max-width/transform/margin) is spring-gated. */
+  /* Label crossfade. */
   .lbl {
     overflow: hidden;
     white-space: nowrap;
@@ -423,6 +451,8 @@
   }
 
   /* ---- notebook list + sliding indicator ---- */
+  /* Native overflow (not the app ScrollArea): the indicator measures against this
+     position:relative container. */
   .list {
     position: relative;
     flex: 1;
@@ -438,8 +468,7 @@
   .rail-root[data-collapsed='true'] .list {
     align-items: center;
   }
-  /* The moving accent surface — spatial continuity between selections. Sits
-     behind the rows (z-order); the transform glide is --rail-motion-gated. */
+  /* The moving accent surface sits behind the rows via z-order. */
   .indicator {
     position: absolute;
     left: 2px;
