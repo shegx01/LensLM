@@ -48,12 +48,7 @@ pub async fn health_check(engine: tauri::State<'_, LensEngine>) -> Result<Health
 
 /// Runs the three onboarding readiness gates (LLM runtime, embedding model,
 /// text-to-speech) and returns the ordered results for the system-check screen.
-///
-/// The lens-core TTS probe unconditionally passes `Qwen3Local` (the headless
-/// engine can't see the huggingface_hub snapshot). This is the authoritative
-/// seam that owns the snapshot: it downgrades the `TextToSpeech` result to
-/// `Fail` when the ~4.5 GB Qwen model is missing or incomplete on disk, so an
-/// interrupted download never reads as ready.
+/// On Apple Silicon, Qwen3Local readiness is finalized by [`override_qwen_tts_readiness`].
 #[tracing::instrument(skip_all)]
 #[tauri::command]
 pub async fn run_system_check(
@@ -85,9 +80,7 @@ fn override_qwen_tts_readiness(
     Ok(())
 }
 
-/// Testable core of [`override_qwen_tts_readiness`] (no `AppHandle`): downgrades
-/// the `TextToSpeech` row to `Fail` when the Qwen snapshot under `hf_cache_dir`
-/// is missing or incomplete; a present snapshot leaves the row untouched.
+/// Testable core of [`override_qwen_tts_readiness`], without the `AppHandle`.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn downgrade_tts_if_qwen_snapshot_absent(
     checks: &mut [CheckResult],
@@ -242,11 +235,10 @@ pub async fn tts_model_downloaded(
 }
 
 /// Whether the selected engine's model is PARTIALLY present — on disk but not
-/// complete (a truncated/interrupted download) — as opposed to never downloaded.
-/// Drives the "Model incomplete — re-download" affordance vs a plain "Download".
+/// complete (a truncated/interrupted download) — vs never downloaded.
 /// Mirrors `tts_model_downloaded`'s per-engine dispatch.
-#[tracing::instrument(skip_all)]
-#[tauri::command]
+#[tracing::instrument(skip_all, fields(engine = %engine, model = %model))]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn tts_model_incomplete(
     engine: String,
     model: String,

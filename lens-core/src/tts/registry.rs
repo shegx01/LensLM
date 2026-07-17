@@ -12,16 +12,15 @@ pub struct TtsModelSpec {
     pub url: &'static str,
     pub sha256: &'static str,
     pub relpath: &'static str,
-    /// Exact size of the SHA256-pinned artifact in bytes. The readiness probe
-    /// (`tts_model_downloaded`) requires the on-disk file to match this exactly,
-    /// so a truncated/interrupted download never reads as ready.
+    /// Exact size (HTTP Content-Length) of the SHA256-pinned artifact in bytes.
+    /// The readiness probe (`tts_model_downloaded`) requires the on-disk file to
+    /// match this exactly, so a truncated/interrupted download never reads as ready.
     pub size_bytes: u64,
 }
 
 pub static TTS_REGISTRY: &[TtsModelSpec] = &[
     // issue #191 [161c]: SNAC 24 kHz neural-codec decoder weights (upstream
     // PyTorch `.bin`; load mechanism documented at the snac.rs call site).
-    // `size_bytes` is the exact Content-Length of the pinned artifact.
     TtsModelSpec {
         id: SNAC_MODEL_ID,
         url: SNAC_MODEL_URL,
@@ -97,7 +96,6 @@ mod tests {
         // Present on disk but the wrong size → partial (re-download), not complete.
         assert!(tts_model_file_present(dir.path(), "orpheus"));
         assert!(!tts_model_downloaded(dir.path(), "orpheus"));
-        // Never downloaded → not present at all.
         assert!(!tts_model_file_present(dir.path(), "snac"));
     }
 

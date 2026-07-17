@@ -64,22 +64,35 @@ pub async fn synthesize_turn(
         return Err(map_status_error(status.as_u16()));
     }
 
-    // Pre-check before buffering the body; the authoritative cap is re-applied
-    // by byte length inside `decode_wav_mono16`.
+    // Stream with a running byte cap. A Content-Length pre-check alone can't bound
+    // the read (the header may be absent or understated), so cap the accumulated
+    // body too — a hostile/buggy endpoint can't force an unbounded allocation.
     if let Some(len) = resp.content_length()
         && len > audio::MAX_TURN_WAV_BYTES
     {
         return Err(LensError::Validation("cloud TTS response too large".into()));
     }
-
-    let bytes = resp.bytes().await.map_err(|e| {
-        tracing::warn!(
-            timeout = e.is_timeout(),
-            connect = e.is_connect(),
-            "cloud TTS response read failed"
-        );
-        LensError::Tts("cloud TTS response read failed".into())
-    })?;
+    let mut resp = resp;
+    let mut bytes: Vec<u8> = Vec::new();
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                if bytes.len() as u64 + chunk.len() as u64 > audio::MAX_TURN_WAV_BYTES {
+                    return Err(LensError::Validation("cloud TTS response too large".into()));
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(e) => {
+                tracing::warn!(
+                    timeout = e.is_timeout(),
+                    connect = e.is_connect(),
+                    "cloud TTS response read failed"
+                );
+                return Err(LensError::Tts("cloud TTS response read failed".into()));
+            }
+        }
+    }
 
     audio::decode_wav_mono16(&bytes).map_err(|e| {
         tracing::warn!(error = %e, "cloud TTS audio decode failed");

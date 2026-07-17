@@ -80,6 +80,25 @@ function catalogFixture(overrides?: {
   ];
 }
 
+/** A config with a saved cloud key. Reactive voice/base-URL edits only persist
+ *  once a key exists — the panel's validity gate blocks persisting an unusable
+ *  (keyless) cloud backend, so voice-persistence tests seed a key here. */
+function cloudKeyedConfig(): AppConfig {
+  return {
+    ...baseConfig(),
+    tts: {
+      version: 1,
+      backend: { cloud: 'open_ai_compatible' as const },
+      model: '',
+      cloud: {
+        kind: 'open_ai_compatible' as const,
+        api_key: 'sk-already-saved',
+        base_url: 'https://api.openai.com'
+      }
+    }
+  };
+}
+
 /** Drive the download progress channel to completion. */
 function driveDownload(args: unknown): null {
   const ch = (args as { onProgress?: { onmessage?: (m: unknown) => void } }).onProgress;
@@ -476,10 +495,37 @@ describe('TtsConfigPanel — cloud (OpenAI-compatible, reactive, #195)', () => {
     );
   });
 
+  it('does NOT persist a keyless cloud backend when a base-URL/voice edit happens before a key', async () => {
+    let written: AppConfig | null = null;
+    const setConfigSpy = vi.fn();
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return baseConfig(); // no cloud key saved
+      if (cmd === 'tts_engine_catalog') return catalogFixture();
+      if (cmd === 'set_config') {
+        setConfigSpy();
+        written = (args as { config: AppConfig }).config;
+        return null;
+      }
+    });
+
+    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+    await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
+
+    const baseUrlField = screen.getByLabelText(/base url/i);
+    await waitFor(() => expect(baseUrlField).toHaveValue('https://api.openai.com'));
+    await fireEvent.input(baseUrlField, { target: { value: 'https://my-gateway.example.com' } });
+    await fireEvent.blur(baseUrlField);
+
+    // The validity gate blocks activating a cloud backend with no usable key —
+    // editing a field before entering a key must not persist anything.
+    expect(setConfigSpy).not.toHaveBeenCalled();
+    expect(written).toBeNull();
+  });
+
   it('accepts free-text voice ids for host/guest on blur when no curated cloud voices exist', async () => {
     let written: AppConfig | null = null;
     mockIPC((cmd, args) => {
-      if (cmd === 'get_config') return baseConfig();
+      if (cmd === 'get_config') return cloudKeyedConfig();
       if (cmd === 'tts_engine_catalog') return catalogFixture();
       if (cmd === 'set_config') {
         written = (args as { config: AppConfig }).config;
@@ -513,7 +559,7 @@ describe('TtsConfigPanel — cloud (OpenAI-compatible, reactive, #195)', () => {
   it('changing a curated voice picker persists immediately (no blur needed)', async () => {
     let written: AppConfig | null = null;
     mockIPC((cmd, args) => {
-      if (cmd === 'get_config') return baseConfig();
+      if (cmd === 'get_config') return cloudKeyedConfig();
       if (cmd === 'tts_engine_catalog') return catalogFixture({ cloudVoices: CLOUD_VOICES });
       if (cmd === 'set_config') {
         written = (args as { config: AppConfig }).config;
@@ -550,7 +596,7 @@ describe('TtsConfigPanel — cloud (OpenAI-compatible, reactive, #195)', () => {
   it('lets the user override a curated pick with a free-text custom voice ID, persisted on blur', async () => {
     let written: AppConfig | null = null;
     mockIPC((cmd, args) => {
-      if (cmd === 'get_config') return baseConfig();
+      if (cmd === 'get_config') return cloudKeyedConfig();
       if (cmd === 'tts_engine_catalog') return catalogFixture({ cloudVoices: CLOUD_VOICES });
       if (cmd === 'set_config') {
         written = (args as { config: AppConfig }).config;

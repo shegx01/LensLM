@@ -73,11 +73,11 @@
   let activeTab = $state<TtsTab>('local');
 
   let downloadProgress = $state<number | null>(null);
+  const isDownloading = $derived(downloadProgress !== null && downloadProgress < 100);
   let downloaded = $state(false);
   let downloadError = $state<string | null>(null);
-  // True when a finished download failed its post-download presence re-check
-  // (a truncated/partial artifact). Drives the "Model incomplete — re-download"
-  // affordance so an incomplete local model always has a recovery path.
+  // Set when a finished download fails its post-download presence re-check, or a
+  // persisted install no longer verifies — drives the "re-download" affordance.
   let incomplete = $state(false);
 
   let voices = $state<TtsVoice[]>([]);
@@ -227,8 +227,6 @@
         maleVoice = (typeof host === 'string' ? host : '') || maleVoices[0]?.id || '';
         femaleVoice = (typeof guest === 'string' ? guest : '') || femaleVoices[0]?.id || '';
       } else {
-        // A previously-downloaded engine that no longer verifies (truncated/partial)
-        // gets the explicit re-download affordance, distinct from a fresh download.
         incomplete = await engineIncomplete();
       }
     } catch {
@@ -338,18 +336,23 @@
     }
   }
 
-  /** Reactive Cloud persist — mirrors `persistLocalTts`: every field writes
-   *  through immediately (Select) or on blur (text inputs), no Save button.
-   *  Deliberately does NOT call `oncheck()`/`oncollapse()` — those were
-   *  Save-button-only side effects; a reactive edit must not collapse the panel
-   *  or re-run the system check on every keystroke-adjacent write. */
+  /** Reactive Cloud persist (mirrors persistLocalTts); no Save button.
+   *  Intentionally skips oncheck()/oncollapse() — those were Save-only; a
+   *  reactive edit must not collapse the panel or re-run the check per write. */
   async function persistCloud(): Promise<void> {
     cloudError = null;
+    // Don't activate an unusable cloud backend: require a base URL and either a
+    // saved key or a freshly-typed one (this is the guard the old Save gate gave).
+    if (!cloudBaseUrl.trim() || (!hasSavedKey && !cloudApiKey.trim())) return;
     try {
-      // Resend the already-saved key when the user isn't actively replacing it
-      // (base URL/voice-only edits), but still send a freshly-typed key on the
-      // very first save (before any key has ever been persisted).
-      const apiKey = editingKey || !hasSavedKey ? cloudApiKey : savedCloudApiKey;
+      // Only a freshly-typed key replaces the stored one; otherwise resend the
+      // saved key — a blank field can never overwrite a real key.
+      const apiKey =
+        editingKey && cloudApiKey.trim()
+          ? cloudApiKey
+          : hasSavedKey
+            ? savedCloudApiKey
+            : cloudApiKey;
       await saveTtsProvider({
         provider: 'cloud',
         apiKey,
@@ -473,7 +476,7 @@
           >
         </div>
 
-        {#if downloadProgress !== null && downloadProgress < 100}
+        {#if isDownloading}
           <div class="w-full bg-muted rounded-full h-1.5 overflow-hidden">
             <div
               class="bg-primary h-full rounded-full transition-all duration-300"
@@ -489,18 +492,14 @@
           <p class="text-destructive text-[0.75rem]" role="alert">{downloadError}</p>
         {/if}
 
-        {#if incomplete && !(downloadProgress !== null && downloadProgress < 100)}
+        {#if incomplete && !isDownloading}
           <p class="text-destructive text-[0.75rem]" role="alert">
             The download didn't complete. Re-download to finish setting up this voice engine.
           </p>
         {/if}
 
-        <Button
-          class="h-10 w-full"
-          onclick={handleDownload}
-          disabled={downloadProgress !== null && downloadProgress < 100}
-        >
-          {#if downloadProgress !== null && downloadProgress < 100}
+        <Button class="h-10 w-full" onclick={handleDownload} disabled={isDownloading}>
+          {#if isDownloading}
             <LoaderCircle class="size-4 animate-spin" />
             Downloading…
           {:else if incomplete}
