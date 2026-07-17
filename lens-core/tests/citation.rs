@@ -177,7 +177,10 @@ fn duplicate_markers_collapse_and_dedup_locators() {
 fn empty_and_all_malformed_yield_no_citations() {
     let units = [unit("src-a", "c1", None, 0)];
     assert!(extract_citations("no markers here", &units).is_empty());
-    assert!(extract_citations("[abc] [1,2] [ 1 ]", &units).is_empty());
+    // Prose, a range, and a trailing-empty comma part are all still rejected wholesale
+    // (comma lists and surrounding whitespace are now tolerated, so they can't stand
+    // in for "malformed" here).
+    assert!(extract_citations("[abc] [1-2] [1,]", &units).is_empty());
     assert!(extract_citations("", &units).is_empty());
 }
 

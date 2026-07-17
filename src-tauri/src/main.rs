@@ -31,9 +31,32 @@ mod stream;
 use std::sync::Arc;
 
 use lens_core::LensEngine;
-use tauri::Manager;
+use tauri::{Manager, WebviewWindowBuilder};
 
 use crate::render::TauriJsRenderer;
+
+/// Top-level navigation guard for the main app window: allow only same-origin
+/// navigation, so an untrusted `https:` link in an answer cannot navigate the app
+/// webview away (phishing / UI-redress). Local-first: reject rather than open
+/// externally (no opener capability is wired). Mirrors the offscreen render
+/// webview's `nav_url_allowed` (render/mod.rs).
+fn main_nav_allowed(url: &tauri::Url) -> bool {
+    if cfg!(dev) {
+        // `tauri dev` serves the frontend from build.devUrl (http://localhost:1420).
+        return url.scheme() == "http"
+            && url.host_str() == Some("localhost")
+            && url.port() == Some(1420);
+    }
+    match url.scheme() {
+        // macOS / Linux production origin.
+        "tauri" => url.host_str() == Some("localhost"),
+        // Windows / Android production origin (useHttpsScheme defaults to false).
+        "http" if cfg!(windows) || cfg!(target_os = "android") => {
+            url.host_str() == Some("tauri.localhost")
+        }
+        _ => false,
+    }
+}
 
 fn main() {
     // Initialize a tracing subscriber so engine/command spans are visible.
@@ -58,6 +81,22 @@ fn main() {
         // Resolve the OS app-data dir, init the engine (open db + migrate +
         // load config) on it, and store the handle in Tauri managed state.
         .setup(|app| {
+            // Build the `main` window here (tauri.conf.json marks it `create: false`)
+            // so a top-level navigation guard can be attached — `on_navigation` is a
+            // build-time-only builder hook. Geometry/style still come from config via
+            // `from_config`; only the nav guard is added in Rust.
+            let main_cfg = app
+                .config()
+                .app
+                .windows
+                .iter()
+                .find(|w| w.label == "main")
+                .ok_or("`main` window must stay declared in tauri.conf.json")?
+                .clone();
+            WebviewWindowBuilder::from_config(app.handle(), &main_cfg)?
+                .on_navigation(main_nav_allowed)
+                .build()?;
+
             let data_dir = app.path().app_data_dir()?;
             let engine = tauri::async_runtime::block_on(LensEngine::init(&data_dir))?;
             app.manage(engine);
@@ -199,4 +238,34 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("Fatal Error: Failed to launch the LensLM application context.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::main_nav_allowed;
+
+    fn allow(s: &str) -> bool {
+        main_nav_allowed(&tauri::Url::parse(s).unwrap())
+    }
+
+    #[test]
+    fn main_nav_rejects_foreign_and_untrusted_origins() {
+        // Rejected in both dev and production builds.
+        assert!(!allow("https://evil.com/phish"));
+        assert!(!allow("http://localhost:9999/x"));
+        assert!(!allow("file:///etc/passwd"));
+        assert!(!allow("data:text/html,<h1>x</h1>"));
+        assert!(!allow("tauri://evil.example/x"));
+    }
+
+    #[test]
+    fn main_nav_allows_own_origin() {
+        // The allowed origin differs by build profile: dev serves from devUrl,
+        // production from the tauri scheme.
+        if cfg!(dev) {
+            assert!(allow("http://localhost:1420/"));
+        } else {
+            assert!(allow("tauri://localhost/index.html"));
+        }
+    }
 }

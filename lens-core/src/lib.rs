@@ -30,6 +30,7 @@ pub mod model_catalog;
 pub mod notebooks;
 pub mod notes;
 pub mod parse;
+pub(crate) mod prompt;
 pub mod render;
 pub mod resolution;
 pub mod retrieval;
