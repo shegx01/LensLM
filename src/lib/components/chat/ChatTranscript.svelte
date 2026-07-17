@@ -141,7 +141,12 @@
       aria-hidden="true"
     ></div>
     <ScrollArea bind:viewportRef scrollbarYClasses="hidden" class="min-h-0 flex-1">
-      <div class="flex flex-col pb-2" role="log" aria-label="Chat transcript">
+      <!-- Optical gutter: message px-4 = 16px each side, then pr-2 adds 8px on the
+           right only → 24px right (clears the right-edge scrubber lane) vs 16px
+           left. The left rail floats with an 8px margin, so 16px + 8px reads the
+           same as the flush right side's 24px — content sits centered between the
+           two rails. Composer + EmptyState mirror this pl-4/pr-6 inset. -->
+      <div class="flex flex-col pr-2 pb-2" role="log" aria-label="Chat transcript">
         {#each turns as turn (turn.turn_id)}
           <div data-turn-id={turn.turn_id}>
             <UserMessage content={turn.user.content} />

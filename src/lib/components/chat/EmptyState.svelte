@@ -5,7 +5,7 @@
   import { fadeRise } from '$lib/motion/index.js';
 </script>
 
-<div class="flex flex-1 flex-col items-center justify-center gap-2.5 px-6 text-center">
+<div class="flex flex-1 flex-col items-center justify-center gap-2.5 pr-6 pl-4 text-center">
   <div class="hero" use:fadeRise={{ y: 10, delay: 0 }} aria-hidden="true">
     <span class="halo"></span>
     <span class="aperture">

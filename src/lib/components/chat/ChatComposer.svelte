@@ -49,7 +49,7 @@
   }
 </script>
 
-<div class="shrink-0 px-4 pb-4 pt-2">
+<div class="shrink-0 pt-2 pr-6 pb-4 pl-4">
   <div class="composer flex items-end gap-2 rounded-3xl bg-card px-2 py-2">
     <textarea
       bind:this={textareaRef}

@@ -24,7 +24,8 @@
   }
 </script>
 
-<div data-tauri-drag-region class="flex shrink-0 justify-end px-3 pt-2.5 pb-1">
+<!-- pr-6 lands the pill's right edge on the same 24px line as the composer + message content. -->
+<div data-tauri-drag-region class="flex shrink-0 justify-end pt-2.5 pr-6 pb-1 pl-3">
   <div
     data-tauri-drag-region
     role="toolbar"
