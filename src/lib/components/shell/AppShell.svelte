@@ -106,7 +106,7 @@
 
 <div
   class={[
-    'grid h-svh w-full bg-background transition-[grid-template-columns] duration-200 ease-out',
+    'grid h-svh w-full bg-[var(--app-canvas)] transition-[grid-template-columns] duration-200 ease-out',
     gridCols
   ].join(' ')}
 >

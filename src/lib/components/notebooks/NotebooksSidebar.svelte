@@ -169,7 +169,15 @@
         aria-label="Search notebooks (⌘K)"
         data-search-trigger
         onclick={openPalette}
-        class="search-trigger"
+        class={cn(
+          'flex items-center rounded-[11px] border border-sidebar-border bg-surface-raised text-sm outline-none',
+          'text-sidebar-foreground/55 cursor-text transition-[background,box-shadow,border-color]',
+          'hover:bg-sidebar-accent/50 hover:text-sidebar-foreground/80',
+          'focus-visible:border-sidebar-ring focus-visible:ring-[3px] focus-visible:ring-sidebar-ring/30',
+          collapsed
+            ? 'size-11 justify-center gap-0 self-center'
+            : 'mb-3.5 h-[38px] w-full gap-[9px] px-2.5'
+        )}
       >
         <Search class="size-4 shrink-0" aria-hidden="true" />
         <span class="lbl flex-1 text-left">Search notebooks</span>
@@ -228,7 +236,12 @@
           aria-label="New notebook"
           data-new-notebook-btn
           onclick={handleNewNotebook}
-          class="pill-btn primary"
+          class={cn(
+            'flex items-center rounded-[11px] text-[13px] font-semibold outline-none cursor-pointer',
+            'bg-primary text-primary-foreground shadow-sm transition-transform active:scale-[0.97]',
+            'focus-visible:ring-2 focus-visible:ring-sidebar-ring',
+            collapsed ? 'size-11 justify-center gap-0 self-center' : 'h-9 w-full gap-2.5 px-[11px]'
+          )}
         >
           <Plus class="size-4 shrink-0" aria-hidden="true" />
           <span class="lbl">New notebook</span>
@@ -241,7 +254,13 @@
           aria-label={`Trash${trashCount > 0 ? ` (${trashCount} items)` : ''}`}
           data-trash-entry
           onclick={() => void openTrash()}
-          class="pill-btn"
+          class={cn(
+            'flex items-center rounded-[11px] text-[13px] font-semibold outline-none cursor-pointer',
+            'border border-sidebar-border bg-surface-raised text-sidebar-foreground',
+            'transition-[transform,background] hover:bg-sidebar-accent/50 active:scale-[0.97]',
+            'focus-visible:ring-2 focus-visible:ring-sidebar-ring',
+            collapsed ? 'size-11 justify-center gap-0 self-center' : 'h-9 w-full gap-2.5 px-[11px]'
+          )}
         >
           <Trash class="size-4 shrink-0" aria-hidden="true" />
           <span class="lbl">Trash</span>
@@ -403,43 +422,6 @@
     margin-right: auto;
   }
 
-  /* ---- search ---- */
-  .search-trigger {
-    display: flex;
-    align-items: center;
-    gap: 9px;
-    height: 38px;
-    padding: 0 10px;
-    margin-bottom: 14px;
-    width: 100%;
-    border-radius: 11px;
-    border: 1px solid var(--sidebar-border);
-    background: var(--surface-raised);
-    color: color-mix(in oklch, var(--sidebar-foreground) 55%, transparent);
-    cursor: text;
-    font: inherit;
-    font-size: 13.5px;
-    text-align: left;
-    outline: none;
-    transition:
-      box-shadow 0.2s var(--ease-out, ease),
-      border-color 0.2s var(--ease-out, ease),
-      transform calc(0.14s * var(--rail-motion, 1)) var(--ease-out, ease),
-      background 0.2s var(--ease-out, ease),
-      gap 0.44s var(--ease-spring, ease);
-  }
-  .search-trigger:hover {
-    background: color-mix(in oklch, var(--sidebar-accent) 50%, transparent);
-    color: color-mix(in oklch, var(--sidebar-foreground) 80%, transparent);
-  }
-  .search-trigger:focus-visible {
-    border-color: var(--sidebar-ring);
-    box-shadow: 0 0 0 3px color-mix(in oklch, var(--sidebar-ring) 30%, transparent);
-  }
-  .search-trigger:active {
-    transform: scale(0.99);
-  }
-
   /* ---- section label ---- */
   .sect-label {
     font-size: 10.5px;
@@ -519,48 +501,6 @@
   .rail-root[data-collapsed='true'] .actions {
     align-items: center;
   }
-  .pill-btn {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    height: 36px;
-    padding: 0 11px;
-    width: 100%;
-    border-radius: 11px;
-    border: 1px solid var(--sidebar-border);
-    background: var(--surface-raised);
-    color: var(--sidebar-foreground);
-    font: inherit;
-    font-size: 13px;
-    font-weight: 600;
-    cursor: pointer;
-    outline: none;
-    transition:
-      background 0.18s var(--ease-out, ease),
-      transform calc(0.14s * var(--rail-motion, 1)) var(--ease-out, ease),
-      box-shadow 0.2s var(--ease-out, ease),
-      border-color 0.2s var(--ease-out, ease),
-      gap 0.44s var(--ease-spring, ease);
-  }
-  .pill-btn:hover {
-    background: color-mix(in oklch, var(--sidebar-accent) 50%, transparent);
-  }
-  .pill-btn:active {
-    transform: scale(0.97);
-  }
-  .pill-btn:focus-visible {
-    box-shadow: 0 0 0 2px var(--sidebar-ring);
-  }
-  .pill-btn.primary {
-    color: var(--primary-foreground);
-    border-color: transparent;
-    background: var(--primary);
-    box-shadow: 0 2px 10px color-mix(in oklch, var(--primary) 30%, transparent);
-  }
-  .pill-btn.primary:hover {
-    background: var(--primary);
-    box-shadow: 0 4px 16px color-mix(in oklch, var(--primary) 40%, transparent);
-  }
   .count {
     margin-left: auto;
     font-size: 11px;
@@ -574,18 +514,6 @@
     place-items: center;
     background: color-mix(in oklch, var(--sidebar-accent) 60%, transparent);
     color: color-mix(in oklch, var(--sidebar-foreground) 70%, transparent);
-  }
-
-  /* collapsed: search + actions become uniform 44×44 centered squares */
-  .rail-root[data-collapsed='true'] .search-trigger,
-  .rail-root[data-collapsed='true'] .pill-btn {
-    width: 44px;
-    height: 44px;
-    align-self: center;
-    justify-content: center;
-    padding: 0;
-    gap: 0;
-    border-radius: 12px;
   }
 
   /* ---- footer ---- */

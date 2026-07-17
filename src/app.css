@@ -182,6 +182,13 @@
   --ease-spring: cubic-bezier(0.32, 0.72, 0, 1);
   --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
   --rail-motion: 1;
+  /* Layered soft shadow that lifts the floating rail panel (no border). */
+  --shadow-rail:
+    0 1px 2px oklch(0.2 0.02 293 / 0.04), 0 8px 24px oklch(0.2 0.02 293 / 0.06),
+    0 24px 56px oklch(0.2 0.02 293 / 0.05);
+  /* App-shell canvas: recessed one step below the elevated (card) rail so the
+     floating panel pops. Light = soft grey under white cards; dark = deepest. */
+  --app-canvas: var(--neutral-50);
 
   /* --- Semantic tokens — LIGHT (shadcn names → primitives) --- */
   --background: var(--neutral-0);
@@ -282,6 +289,9 @@
   /* Reserved — layered surfaces (M5) */
   --surface-raised: var(--neutral-800);
   --surface-sunken: var(--neutral-950);
+  --shadow-rail:
+    0 1px 2px oklch(0 0 0 / 0.3), 0 12px 32px oklch(0 0 0 / 0.4), 0 32px 64px oklch(0 0 0 / 0.35);
+  --app-canvas: var(--neutral-950);
 }
 
 /* `:root:not([data-motion='on'])` lets an explicit Animations=On override the OS
