@@ -174,12 +174,13 @@
     background: color-mix(in oklch, var(--primary) 12%, transparent);
   }
 
-  /* Container and elements all share the card surface; a top edge marks the Studio
-     zone and the elements separate from it by elevation (layered shadows) alone —
-     no fills, no borders. See .tool-tile / .audio-card. */
+  /* Container and elements all share the card surface. The top edge combines a hairline
+     with an upward scroll-edge shadow, so the sources list reads as scrolling UNDER the
+     Studio panel rather than bleeding into it. Elements separate by elevation alone. */
   .studio-tray {
     background: var(--card);
     border-top: 1px solid var(--border);
+    box-shadow: var(--shadow-scroll-edge);
   }
 
   /* Study-tool tiles — borderless cards that lift off the tray on a soft shadow;

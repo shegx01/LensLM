@@ -191,6 +191,9 @@
   --shadow-bar: 0 1px 2px oklch(0.2 0.02 293 / 0.05), 0 6px 16px oklch(0.2 0.02 293 / 0.07);
   /* Soft resting lift for small raised cards (Studio tiles); hover promotes to --shadow-bar. */
   --shadow-tile: 0 1px 2px oklch(0.2 0.02 293 / 0.05), 0 2px 6px oklch(0.2 0.02 293 / 0.05);
+  /* Upward-cast scroll-edge shadow: a panel pinned below a scroll region uses it on
+     its top edge so scrolling content reads as tucking UNDER the panel. */
+  --shadow-scroll-edge: 0 -4px 8px -4px oklch(0.2 0.02 293 / 0.12);
   /* App-shell canvas: a hair below the elevated (white card) rail so the floating
      panel + its shadow still separate, but close to white. Dark = deepest ground. */
   --app-canvas: color-mix(in oklch, var(--neutral-0) 82%, var(--neutral-50));
@@ -298,6 +301,7 @@
     0 1px 2px oklch(0 0 0 / 0.3), 0 12px 32px oklch(0 0 0 / 0.4), 0 32px 64px oklch(0 0 0 / 0.35);
   --shadow-bar: 0 1px 2px oklch(0 0 0 / 0.35), 0 6px 16px oklch(0 0 0 / 0.4);
   --shadow-tile: 0 1px 2px oklch(0 0 0 / 0.4), 0 3px 8px oklch(0 0 0 / 0.3);
+  --shadow-scroll-edge: 0 -6px 10px -6px oklch(0 0 0 / 0.55);
   --app-canvas: var(--neutral-950);
 }
 
