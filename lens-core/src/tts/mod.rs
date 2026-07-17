@@ -29,7 +29,7 @@ pub use catalog::{
 };
 pub use registry::{
     TTS_REGISTRY, TtsModelSpec, download_tts_model, resolve_tts, tts_model_downloaded,
-    tts_model_path,
+    tts_model_file_present, tts_model_path,
 };
 pub use sidecar::TtsSidecar;
 

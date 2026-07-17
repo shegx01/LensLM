@@ -179,6 +179,16 @@ pub fn qwen_snapshot_present(hf_cache_dir: &Path) -> bool {
     false
 }
 
+/// Whether ANY Qwen snapshot content exists under `hf_cache_dir` (a snapshot
+/// revision or a downloaded blob), regardless of completeness. Lets the UI tell a
+/// partial/interrupted download apart from a never-downloaded engine.
+pub fn qwen_snapshot_dir_present(hf_cache_dir: &Path) -> bool {
+    let model_dir = hf_cache_dir.join("hub").join(QWEN_SNAPSHOT_DIR);
+    let has_entries =
+        |p: &Path| std::fs::read_dir(p).is_ok_and(|mut it| it.next().is_some_and(|e| e.is_ok()));
+    has_entries(&model_dir.join("snapshots")) || has_entries(&model_dir.join("blobs"))
+}
+
 /// Whether the revision dir holds at least one `*.safetensors` file that resolves
 /// through its symlink — covers both single-file `model.safetensors` and a sharded
 /// `model-0000N-of-...safetensors` layout.
@@ -340,6 +350,32 @@ mod tests {
         let weight = blobs.join("cafef00d");
         std::fs::write(&weight, b"weights").unwrap();
         std::os::unix::fs::symlink(&weight, rev.join("model.safetensors")).unwrap();
+    }
+
+    #[test]
+    fn snapshot_dir_present_true_with_content_false_when_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!qwen_snapshot_dir_present(tmp.path()));
+        write_complete_snapshot(tmp.path());
+        assert!(qwen_snapshot_dir_present(tmp.path()));
+    }
+
+    #[test]
+    fn snapshot_dir_present_true_but_snapshot_incomplete_for_partial_layout() {
+        // Partial download: a revision dir exists but has no resolvable weight —
+        // dir-present is true while snapshot-present is false, which is exactly the
+        // "incomplete — re-download" state (distinct from a never-downloaded engine).
+        let tmp = tempfile::tempdir().unwrap();
+        let rev = tmp
+            .path()
+            .join("hub")
+            .join(QWEN_SNAPSHOT_DIR)
+            .join("snapshots")
+            .join("abc123");
+        std::fs::create_dir_all(&rev).unwrap();
+        std::fs::write(rev.join("config.json"), b"{}").unwrap();
+        assert!(qwen_snapshot_dir_present(tmp.path()));
+        assert!(!qwen_snapshot_present(tmp.path()));
     }
 
     #[test]

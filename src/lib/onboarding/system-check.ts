@@ -187,6 +187,13 @@ export async function ttsModelDownloaded(engine: string, model: string): Promise
   return invoke<boolean>('tts_model_downloaded', { engine, model });
 }
 
+/** Whether the model is partially present (on disk but incomplete) rather than
+ *  absent — drives the "re-download" affordance vs a fresh "download". */
+export async function ttsModelIncomplete(engine: string, model: string): Promise<boolean> {
+  if (!isTauri()) return false;
+  return invoke<boolean>('tts_model_incomplete', { engine, model });
+}
+
 // SYNC-CHECK: a UI selector mapped to the wire `TtsBackend` (lens-core/src/tts/mod.rs) by
 // `nextTtsConfig` — NOT the wire type itself: it maps 'qwen3' → qwen3_local and every
 // Cloud kind → 'cloud'.

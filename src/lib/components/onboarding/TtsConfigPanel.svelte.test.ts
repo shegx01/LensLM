@@ -894,3 +894,36 @@ describe('TtsConfigPanel — incomplete-model re-download affordance', () => {
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 });
+
+describe('TtsConfigPanel — incomplete local download (#195)', () => {
+  it('shows a re-download affordance for a partially-downloaded engine (present but incomplete)', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return baseConfig();
+      if (cmd === 'tts_engine_catalog') return catalogFixture();
+      if (cmd === 'tts_model_downloaded') return false;
+      if (cmd === 'tts_model_incomplete') return true;
+    });
+
+    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+
+    expect(
+      await screen.findByRole('button', { name: /model incomplete.*re-download/i })
+    ).toBeInTheDocument();
+  });
+
+  it('shows a plain download button when nothing is on disk (absent, not partial)', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return baseConfig();
+      if (cmd === 'tts_engine_catalog') return catalogFixture();
+      if (cmd === 'tts_model_downloaded') return false;
+      if (cmd === 'tts_model_incomplete') return false;
+    });
+
+    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+
+    expect(
+      await screen.findByRole('button', { name: /download voice engine/i })
+    ).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /re-download/i })).not.toBeInTheDocument();
+  });
+});

@@ -119,7 +119,8 @@ pub use tts::{
     TtsPhase, TtsProvider, TtsProviderInfo, TtsSidecar, TtsVoice, code_to_lang, download_tts_model,
     emotion_tag, evaluate_language_guard, lang_to_qwen_name, qwen_voice, read_wav_mono16,
     resolve_tts, resolve_tts_provider, resolve_tts_provider_full, tts_catalog,
-    tts_catalog_serialized, tts_model_downloaded, tts_model_path, validate_qwen_language,
+    tts_catalog_serialized, tts_model_downloaded, tts_model_file_present, tts_model_path,
+    validate_qwen_language,
 };
 pub use vector_store::{LanceVectorStore, VectorStore};
 

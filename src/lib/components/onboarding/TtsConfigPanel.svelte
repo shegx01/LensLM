@@ -12,6 +12,7 @@
     downloadTtsModel,
     prepareQwenModel,
     ttsModelDownloaded,
+    ttsModelIncomplete,
     saveTtsProvider,
     nextTtsConfig,
     ttsEngineCatalog,
@@ -168,6 +169,19 @@
     return true;
   }
 
+  /** True when the selected engine is present on disk but incomplete (a partial /
+   *  interrupted download), as opposed to never downloaded — drives the
+   *  "Model incomplete — re-download" label vs a plain "Download". */
+  async function engineIncomplete(): Promise<boolean> {
+    if (selectedEngine === 'qwen3_local') {
+      return ttsModelIncomplete('qwen3_local', '');
+    }
+    for (const model of modelIds) {
+      if (await ttsModelIncomplete(selectedEngine, model)) return true;
+    }
+    return false;
+  }
+
   onMount(async () => {
     if (!isTauri()) return;
     try {
@@ -212,6 +226,10 @@
         const guest = cfg.voices?.guest;
         maleVoice = (typeof host === 'string' ? host : '') || maleVoices[0]?.id || '';
         femaleVoice = (typeof guest === 'string' ? guest : '') || femaleVoices[0]?.id || '';
+      } else {
+        // A previously-downloaded engine that no longer verifies (truncated/partial)
+        // gets the explicit re-download affordance, distinct from a fresh download.
+        incomplete = await engineIncomplete();
       }
     } catch {
       // Non-fatal: fall back to the default empty Cloud form / download prompt.
@@ -243,6 +261,8 @@
       if (femaleVoices.length > 0) femaleVoice = femaleVoices[0].id;
       // Don't persist fake/empty voice IDs when the catalog has none for this engine.
       if (!voicesUnavailable) void persistLocalTts();
+    } else {
+      incomplete = await engineIncomplete();
     }
   }
 

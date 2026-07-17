@@ -241,6 +241,31 @@ pub async fn tts_model_downloaded(
     Ok(lens_core::tts_model_downloaded(&data_dir, &model))
 }
 
+/// Whether the selected engine's model is PARTIALLY present — on disk but not
+/// complete (a truncated/interrupted download) — as opposed to never downloaded.
+/// Drives the "Model incomplete — re-download" affordance vs a plain "Download".
+/// Mirrors `tts_model_downloaded`'s per-engine dispatch.
+#[tracing::instrument(skip_all)]
+#[tauri::command]
+pub async fn tts_model_incomplete(
+    engine: String,
+    model: String,
+    app: tauri::AppHandle,
+) -> Result<bool, LensError> {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if engine == "qwen3_local" {
+        let paths = crate::qwen::sidecar_paths(&app)?;
+        return Ok(crate::qwen::qwen_snapshot_dir_present(&paths.hf_cache_dir)
+            && !crate::qwen::qwen_snapshot_present(&paths.hf_cache_dir));
+    }
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| LensError::Io(e.to_string()))?;
+    Ok(lens_core::tts_model_file_present(&data_dir, &model)
+        && !lens_core::tts_model_downloaded(&data_dir, &model))
+}
+
 /// Explicitly downloads the Qwen3-TTS MLX model (~4.5 GB) via a one-shot sidecar
 /// `--prepare` process, streaming progress via `on_progress` — NOTE: this command
 /// takes camelCase `onProgress`, unlike `download_tts_model`'s snake_case arg.

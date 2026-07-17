@@ -59,6 +59,13 @@ pub fn tts_model_downloaded(data_dir: &Path, id: &str) -> bool {
     std::fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() == spec.size_bytes)
 }
 
+/// Whether the artifact exists on disk at all, regardless of size. Distinguishes a
+/// partial/truncated download (present but wrong size) from a never-downloaded one,
+/// so the UI can offer "re-download" instead of a plain "download".
+pub fn tts_model_file_present(data_dir: &Path, id: &str) -> bool {
+    tts_model_path(data_dir, id).is_some_and(|path| path.is_file())
+}
+
 pub async fn download_tts_model<F>(
     data_dir: &Path,
     id: &str,
@@ -80,6 +87,19 @@ mod tests {
     use sha2::{Digest, Sha256};
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn file_present_ignores_size_but_downloaded_requires_exact_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = tts_model_path(dir.path(), "orpheus").unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"truncated").unwrap();
+        // Present on disk but the wrong size → partial (re-download), not complete.
+        assert!(tts_model_file_present(dir.path(), "orpheus"));
+        assert!(!tts_model_downloaded(dir.path(), "orpheus"));
+        // Never downloaded → not present at all.
+        assert!(!tts_model_file_present(dir.path(), "snac"));
+    }
 
     fn sha256_hex(bytes: &[u8]) -> String {
         crate::hex_encode(&Sha256::digest(bytes))
