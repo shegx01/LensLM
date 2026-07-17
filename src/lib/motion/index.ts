@@ -6,7 +6,7 @@
 
 import type { Action } from 'svelte/action';
 import type { TransitionConfig } from 'svelte/transition';
-import { cubicOut } from 'svelte/easing';
+import { cubicOut, expoOut } from 'svelte/easing';
 import { animate, inView } from 'motion';
 
 const REDUCE_MOTION_QUERY = '(prefers-reduced-motion: reduce)';
@@ -98,5 +98,52 @@ export function expandFade(
     duration,
     easing,
     css: (t) => `overflow: hidden; height: ${t * height}px; opacity: ${Math.min(1, t * 1.4)};`
+  };
+}
+
+export interface EnterRiseParams {
+  /** Vertical offset (px) the element rises from. Default 10. */
+  y?: number;
+  /** Duration in ms. Default 420. */
+  duration?: number;
+  /** Delay in ms — pass `index * step` for a staggered group. Default 0. */
+  delay?: number;
+}
+
+/**
+ * Svelte `in:` transition — transform+opacity rise. As an intro on a keyed
+ * `{#each}`, Svelte skips it for items present at initial mount and plays it only
+ * for items added later, which is exactly what chat wants: history renders
+ * instantly, new messages ease in. Transform/opacity only (never height), so it
+ * can't fight the transcript's scroll-height autoscroll. Honors "reduce motion"
+ * with a bare opacity fade (no movement).
+ */
+export function enterRise(
+  _node: HTMLElement,
+  { y = 10, duration = 420, delay = 0 }: EnterRiseParams = {}
+): TransitionConfig {
+  if (prefersReducedMotion()) return { duration: 160, delay, css: (t) => `opacity: ${t};` };
+  return {
+    duration,
+    delay,
+    easing: expoOut,
+    css: (t) => `opacity: ${t}; transform: translateY(${(1 - t) * y}px);`
+  };
+}
+
+/**
+ * Svelte `in:` transition — scale+opacity pop from 0.8 (never from 0; nothing in
+ * the real world appears from nothing). For swap flourishes like the composer's
+ * send↔stop morph. Skipped on initial mount by Svelte; plays on later swaps.
+ */
+export function popIn(
+  _node: HTMLElement,
+  { duration = 220 }: { duration?: number } = {}
+): TransitionConfig {
+  if (prefersReducedMotion()) return { duration: 120, css: (t) => `opacity: ${t};` };
+  return {
+    duration,
+    easing: expoOut,
+    css: (t) => `opacity: ${t}; transform: scale(${0.8 + 0.2 * t});`
   };
 }

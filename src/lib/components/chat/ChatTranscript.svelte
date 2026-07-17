@@ -13,6 +13,8 @@
   import ThoughtsDisclosure from './ThoughtsDisclosure.svelte';
   import EmptyState from './EmptyState.svelte';
   import ErrorCard from './ErrorCard.svelte';
+  import { fade } from 'svelte/transition';
+  import { prefersReducedMotion } from '$lib/motion/index.js';
   import type { AnswerStage, Turn } from '$lib/chat/types.js';
 
   interface Props {
@@ -31,6 +33,9 @@
     onretry: () => void;
     onunpin: () => void;
     onjumptolatest: () => void;
+    /** Px reserved at the bottom for the floating composer overlay, so the last
+     * turn rests above it and the jump pill clears it. Default 0. */
+    bottomInset?: number;
   }
 
   let {
@@ -48,7 +53,8 @@
     onfeedback,
     onretry,
     onunpin,
-    onjumptolatest
+    onjumptolatest,
+    bottomInset = 0
   }: Props = $props();
 
   let viewportRef = $state<HTMLElement | null>(null);
@@ -60,9 +66,17 @@
   // px below the viewport top (i.e. it's the turn you're currently reading).
   const ACTIVE_TOP_BAND_PX = 96;
 
-  function scrollToBottom(): void {
+  function scrollToBottom(smooth = false): void {
     if (!viewportRef) return;
-    viewportRef.scrollTop = viewportRef.scrollHeight;
+    // scrollTo isn't implemented in happy-dom (tests) — fall back to scrollTop.
+    if (typeof viewportRef.scrollTo === 'function') {
+      viewportRef.scrollTo({
+        top: viewportRef.scrollHeight,
+        behavior: smooth && !prefersReducedMotion() ? 'smooth' : 'auto'
+      });
+    } else {
+      viewportRef.scrollTop = viewportRef.scrollHeight;
+    }
   }
 
   /** Mark the last turn whose top has scrolled to/above the reading band. */
@@ -95,14 +109,39 @@
 
   // Re-pin follows content growth (streaming deltas, new turns) — but only
   // while pinned; an unpinned user stays put even as new content arrives.
+  // Smooth-scroll on discrete events (a new turn arrives, the status line
+  // appears) but stay instant for token deltas so the pin can't lag behind a
+  // fast stream. First placement after mount is always instant — no animated
+  // scroll when a notebook opens.
+  // Sentinels (not prop reads) — the first effect run seeds them, and `hasSettled`
+  // keeps that first placement instant regardless.
+  let prevTurnsLen = -1;
+  let prevStage: AnswerStage | null = null;
+  let prevPinned = false;
+  let hasSettled = false;
   $effect(() => {
-    void turns.length;
+    const turnsLen = turns.length;
+    const curStage = stage;
+    const pinned = pinnedToBottom;
     void answerBuffer;
     void thinkingBuffer;
-    if (pinnedToBottom) {
-      tick().then(scrollToBottom);
+    // Discrete (smooth) events: a new turn arrives, the status line first
+    // appears, or the view re-pins (Jump to latest). Token deltas stay instant so
+    // the pin can't lag a fast stream.
+    const structural =
+      turnsLen !== prevTurnsLen ||
+      (curStage !== null && prevStage === null) ||
+      (pinned && !prevPinned);
+    prevTurnsLen = turnsLen;
+    prevStage = curStage;
+    prevPinned = pinned;
+    if (pinned) {
+      tick().then(() => scrollToBottom(hasSettled && structural));
     }
-    tick().then(updateActiveTurn);
+    tick().then(() => {
+      updateActiveTurn();
+      hasSettled = true;
+    });
   });
 
   function handleScroll(e: Event): void {
@@ -116,7 +155,7 @@
 
   function handleJumpToLatest(): void {
     onjumptolatest();
-    tick().then(scrollToBottom);
+    tick().then(() => scrollToBottom(true));
   }
 
   // The ScrollArea wrapper doesn't forward `onscroll` to the Viewport (only
@@ -133,8 +172,24 @@
   {#if isEmpty}
     <EmptyState />
   {:else}
+    <!-- Scroll-edge fade: content dissolves into the canvas as it scrolls up
+         toward the floating top bar, instead of meeting a hard cut. -->
+    <div
+      class="pointer-events-none absolute inset-x-0 top-0 z-10 h-6 bg-gradient-to-b from-[var(--app-canvas)] to-transparent"
+      aria-hidden="true"
+    ></div>
     <ScrollArea bind:viewportRef scrollbarYClasses="hidden" class="min-h-0 flex-1">
-      <div class="flex flex-col pb-2" role="log" aria-label="Chat transcript">
+      <!-- Optical gutter: message px-4 = 16px each side, then pr-2 adds 8px on the
+           right only → 24px right (clears the right-edge scrubber lane) vs 16px
+           left. The left rail floats with an 8px margin, so 16px + 8px reads the
+           same as the flush right side's 24px — content sits centered between the
+           two rails. Composer + EmptyState mirror this pl-4/pr-6 inset. -->
+      <div
+        class="flex flex-col pr-2 pb-2"
+        role="log"
+        aria-label="Chat transcript"
+        style:padding-bottom={`${bottomInset + 8}px`}
+      >
         {#each turns as turn (turn.turn_id)}
           <div data-turn-id={turn.turn_id}>
             <UserMessage content={turn.user.content} />
@@ -193,9 +248,11 @@
     {#if !pinnedToBottom}
       <button
         type="button"
+        in:fade={{ duration: 150 }}
         onclick={handleJumpToLatest}
         aria-label="Jump to latest message"
-        class="absolute bottom-3 left-1/2 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-border bg-popover px-3 py-1.5 text-xs font-medium text-popover-foreground shadow-md transition-opacity hover:opacity-90"
+        style:bottom={`${bottomInset + 12}px`}
+        class="absolute left-1/2 z-30 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-border bg-popover px-3 py-1.5 text-xs font-medium text-popover-foreground shadow-[var(--shadow-bar)] transition-transform hover:-translate-y-px active:scale-[0.96]"
       >
         <ArrowDown class="size-3" strokeWidth={2.5} />
         Jump to latest

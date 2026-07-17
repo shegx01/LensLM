@@ -28,7 +28,7 @@
 
 <article
   data-note-id={note.id}
-  class="group/note relative rounded-lg border border-border bg-card p-4 text-card-foreground shadow-sm"
+  class="group/note relative rounded-lg border border-border bg-card p-4 text-card-foreground"
 >
   {#if !editing}
     <div class="absolute top-2 right-2 flex items-center gap-0.5">
