@@ -8,7 +8,7 @@
         "@codemirror/lang-markdown": "^6.5.0",
         "@codemirror/state": "^6.7.1",
         "@codemirror/view": "^6.43.6",
-        "@lucide/svelte": "^1.21.0",
+        "@lucide/svelte": "^1.24.0",
         "@tauri-apps/api": "^2.11.1",
         "@tauri-apps/plugin-clipboard-manager": "^2.3.2",
         "@tauri-apps/plugin-dialog": "^2.7.1",
@@ -28,6 +28,7 @@
         "tailwind-variants": "^3.2.2",
       },
       "devDependencies": {
+        "@internationalized/date": "^3.12.0",
         "@playwright/test": "^1.61.0",
         "@sveltejs/adapter-static": "^3.0.10",
         "@sveltejs/kit": "^2.66.0",
@@ -152,7 +153,7 @@
 
     "@lezer/markdown": ["@lezer/markdown@1.7.1", "", { "dependencies": { "@lezer/common": "^1.5.0", "@lezer/highlight": "^1.0.0" } }, "sha512-MEBZeFSBxgteUjEC3Wxg2Dwld5/JxRKG267L3bMFdibm8KjqSdiJYBeFw1Nt1CM8+zKMpSIEHblY8FD9z38sJQ=="],
 
-    "@lucide/svelte": ["@lucide/svelte@1.21.0", "", { "peerDependencies": { "svelte": "^5" } }, "sha512-MEv//A7Jv3kHukZowv/DWp1MAtUzJKYwtJsmnQ7X98lCgtac3z3NbaToDl3Q6jO3gS9sougFpcD+t+YuxOkRMw=="],
+    "@lucide/svelte": ["@lucide/svelte@1.24.0", "", { "peerDependencies": { "svelte": "^5" } }, "sha512-yXwewA7ANQ5hfaSDrvsecosWjZn5RglzeXUZRSnxeANBskpNwblOkEJTqD0ujDdNKIKL8E9eVc2U/P3ziJr7OA=="],
 
     "@marijn/find-cluster-break": ["@marijn/find-cluster-break@1.0.3", "", {}, "sha512-FY+MKLBoTsLNJF/eLWaOsXGdz6uh3Iu1axjPf6TUq92IYumcTcXWHoS747JARLkcdlJ/Waiaxc5wQfFO8jC6NA=="],
 

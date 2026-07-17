@@ -26,8 +26,53 @@ use lens_core::{
     read_wav_mono16,
 };
 
+mod prepare;
 mod resolver;
+pub use prepare::{qwen_snapshot_present, run_prepare};
 pub use resolver::resolve_sidecar_spawn;
+
+/// The app-data-derived paths the Qwen sidecar launches against. Single source of
+/// truth so both the startup injection (`main.rs`) and the on-demand `--prepare`
+/// command resolve identical `HF_HOME`/sidecar locations — never a divergent path.
+pub struct SidecarPaths {
+    pub app_data_dir: PathBuf,
+    pub sidecar_dir: PathBuf,
+    pub hf_cache_dir: PathBuf,
+}
+
+/// Resolves the [`SidecarPaths`] from an [`AppHandle`](tauri::AppHandle): app-data
+/// via Tauri, the bundled sidecar dir (source tree in dev, `_up_/sidecar` in a
+/// packaged build), and the `hf-cache` subdir the resolver points `HF_HOME` at.
+pub fn sidecar_paths(app: &tauri::AppHandle) -> Result<SidecarPaths, LensError> {
+    use tauri::Manager;
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| LensError::Io(e.to_string()))?;
+    let sidecar_dir = if cfg!(debug_assertions) {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../sidecar/qwen3-tts")
+    } else {
+        app.path()
+            .resource_dir()
+            .map_err(|e| LensError::Io(e.to_string()))?
+            .join("_up_/sidecar/qwen3-tts")
+    };
+    let hf_cache_dir = app_data_dir.join("hf-cache");
+    Ok(SidecarPaths {
+        app_data_dir,
+        sidecar_dir,
+        hf_cache_dir,
+    })
+}
+
+/// Builds the lazy [`SpawnResolver`] for [`resolve_sidecar_spawn`] from resolved
+/// [`SidecarPaths`]. Used by both the serve host and the `--prepare` one-shot.
+pub fn spawn_resolver(paths: &SidecarPaths) -> SpawnResolver {
+    let app_data = paths.app_data_dir.clone();
+    let sidecar_dir = paths.sidecar_dir.clone();
+    let hf_cache_dir = paths.hf_cache_dir.clone();
+    Arc::new(move || resolve_sidecar_spawn(&app_data, &sidecar_dir, &hf_cache_dir))
+}
 
 /// A fully-resolved sidecar launch: the program to exec, its args, and the extra
 /// environment it needs (e.g. `HF_HOME` so `huggingface_hub` caches into app-data).
@@ -278,12 +323,14 @@ impl QwenSidecar {
     ) -> Result<AudioBuffer, TurnError> {
         let (_, stdin, reader) = cell.as_mut().ok_or(TurnError::Dead)?;
 
+        // "auto" until #28/#161 — see validate_qwen_language in lens-core/src/tts/catalog.rs.
         let request = serde_json::json!({
             "id": id,
             "op": "synth",
             "text": text,
             "speaker": speaker,
             "instruct": instruct,
+            "language": "auto",
         });
         let mut line = serde_json::to_string(&request).map_err(|e| {
             tracing::warn!(error = %e, "failed to serialize Qwen synth request");

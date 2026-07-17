@@ -49,10 +49,10 @@ describe('SystemCheckRow', () => {
 
   it('renders configure DISABLED on non-expandable rows (Available in Settings), never a dead no-op', async () => {
     const onaction = vi.fn();
-    // configure on text_to_speech (only expandable via `choose`, not `configure`) → disabled
+    // configure on embedding_model (only expandable via `choose`, not `configure`) → disabled
     render(SystemCheckRow, {
       props: {
-        result: row({ id: 'text_to_speech', status: 'fail', action: 'configure' }),
+        result: row({ id: 'embedding_model', status: 'fail', action: 'configure' }),
         onaction
       }
     });

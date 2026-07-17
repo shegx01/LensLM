@@ -63,8 +63,9 @@ const EARLY_EOS_FRACTION: f64 = 0.35;
 const CANCELLED_MSG: &str = "orpheus generation cancelled";
 
 /// Single source of truth for the Orpheus named voices: (id, display name, gender).
-/// Both `voices()` (catalog) and `orpheus_voice()` (id resolution) derive from it.
-const CATALOG: &[(&str, &str, Gender)] = &[
+/// `voices()` (catalog), `orpheus_voice()` (id resolution), and the cross-engine
+/// TTS capability catalog (`tts::catalog`) all derive from it — hence `pub`.
+pub const ORPHEUS_VOICES: &[(&str, &str, Gender)] = &[
     ("tara", "Tara", Gender::Female),
     ("leah", "Leah", Gender::Female),
     ("jess", "Jess", Gender::Female),
@@ -184,7 +185,7 @@ impl TtsProvider for OrpheusAdapter {
     }
 
     fn voices(&self) -> Vec<TtsVoice> {
-        CATALOG
+        ORPHEUS_VOICES
             .iter()
             .map(|&(id, name, gender)| TtsVoice::new(id, name, gender))
             .collect()
@@ -407,7 +408,7 @@ fn default_voice(speaker: Speaker) -> &'static str {
 }
 
 fn orpheus_voice(name: &str) -> Option<&'static str> {
-    CATALOG
+    ORPHEUS_VOICES
         .iter()
         .find(|&&(id, _, _)| id == name)
         .map(|&(id, _, _)| id)
@@ -423,8 +424,8 @@ mod tests {
     fn voices_catalog_covers_all_named_voices() {
         let adapter = OrpheusAdapter::new(PathBuf::from("/x/orpheus"), PathBuf::from("/x/snac"));
         let voices = adapter.voices();
-        assert_eq!(voices.len(), CATALOG.len());
-        for &(id, _, _) in CATALOG {
+        assert_eq!(voices.len(), ORPHEUS_VOICES.len());
+        for &(id, _, _) in ORPHEUS_VOICES {
             assert!(voices.iter().any(|v| v.id == id), "missing voice {id}");
         }
         let female = voices.iter().filter(|v| v.gender == Gender::Female).count();
@@ -435,7 +436,7 @@ mod tests {
 
     #[test]
     fn voice_id_named_resolves_all_eight() {
-        for &(id, _, _) in CATALOG {
+        for &(id, _, _) in ORPHEUS_VOICES {
             let r = VoiceRef::Named(id.to_string());
             assert_eq!(voice_id(&r, Speaker::Host).unwrap(), id);
         }

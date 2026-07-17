@@ -10,7 +10,6 @@
   import type { CheckResult, CheckAction } from '$lib/onboarding/system-check.js';
   import LlmConfigPanel from './LlmConfigPanel.svelte';
   import EmbeddingConfigPanel from './EmbeddingConfigPanel.svelte';
-  import TtsConfigPanel from './TtsConfigPanel.svelte';
 
   let {
     result,
@@ -50,11 +49,10 @@
     choose: 'Choose'
   };
 
-  // llm_runtime+configure, embedding_model+choose, text_to_speech+choose expand inline.
+  // llm_runtime+configure, embedding_model+choose expand inline.
   const isExpandable = $derived(
     (result.id === 'llm_runtime' && result.action === 'configure') ||
-      (result.id === 'embedding_model' && result.action === 'choose') ||
-      (result.id === 'text_to_speech' && result.action === 'choose')
+      (result.id === 'embedding_model' && result.action === 'choose')
   );
 
   const available = $derived(isExpandable);
@@ -129,11 +127,6 @@
         />
       {:else if result.id === 'embedding_model'}
         <EmbeddingConfigPanel
-          oncheck={oncheck ?? (() => Promise.resolve())}
-          oncollapse={() => (expanded = false)}
-        />
-      {:else if result.id === 'text_to_speech'}
-        <TtsConfigPanel
           oncheck={oncheck ?? (() => Promise.resolve())}
           oncollapse={() => (expanded = false)}
         />

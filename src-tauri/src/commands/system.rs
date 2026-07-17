@@ -102,6 +102,24 @@ fn resolve_voices(cfg: &lens_core::TtsConfig, data_dir: &std::path::Path) -> Vec
         .unwrap_or_default()
 }
 
+/// Returns the static per-engine TTS capability catalog (#194) for the Settings
+/// engine selector — the selector's single source of truth, distinct from
+/// `list_tts_voices` (reserved for runtime synthesis).
+#[tracing::instrument(skip_all)]
+#[tauri::command]
+pub async fn tts_engine_catalog(
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<Vec<lens_core::EngineCatalogEntry>, LensError> {
+    let config = engine.config().await;
+    let cloud_key_present = config
+        .tts
+        .cloud
+        .as_ref()
+        .map(|c| !c.api_key.is_empty())
+        .unwrap_or(false);
+    Ok(lens_core::tts_catalog_serialized(cloud_key_present))
+}
+
 /// Installs an embedding model via Ollama `POST /api/pull`, streaming NDJSON progress.
 /// `model` is validated against the registry allowlist before any network call.
 /// RESERVED FOR FUTURE USE (M5+): registered but has no frontend caller — onboarding
@@ -153,7 +171,9 @@ pub async fn download_tts_model(
 }
 
 /// Returns whether the given TTS model artifact is already on disk, so the
-/// onboarding UI can skip the download step. Mirrors `whisper_model_downloaded`.
+/// onboarding/Settings UI can skip the download step. Mirrors `whisper_model_downloaded`.
+/// `engine == "qwen3_local"` (#194) is special-cased: Qwen's weights live in the
+/// huggingface_hub cache, so presence is an HF-snapshot check and `model` is ignored.
 #[tracing::instrument(skip_all, fields(engine = %engine, model = %model))]
 #[tauri::command(rename_all = "snake_case")]
 pub async fn tts_model_downloaded(
@@ -161,11 +181,37 @@ pub async fn tts_model_downloaded(
     model: String,
     app: tauri::AppHandle,
 ) -> Result<bool, LensError> {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if engine == "qwen3_local" {
+        let paths = crate::qwen::sidecar_paths(&app)?;
+        return Ok(crate::qwen::qwen_snapshot_present(&paths.hf_cache_dir));
+    }
     let data_dir = app
         .path()
         .app_data_dir()
         .map_err(|e| LensError::Io(e.to_string()))?;
     Ok(lens_core::tts_model_downloaded(&data_dir, &model))
+}
+
+/// Explicitly downloads the Qwen3-TTS MLX model (~4.5 GB) via a one-shot sidecar
+/// `--prepare` process, streaming progress via `on_progress` — NOTE: this command
+/// takes camelCase `onProgress`, unlike `download_tts_model`'s snake_case arg.
+/// Apple-Silicon only.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[tracing::instrument(skip_all)]
+#[tauri::command]
+pub async fn prepare_qwen_model(
+    on_progress: Channel<DownloadProgress>,
+    app: tauri::AppHandle,
+) -> Result<(), LensError> {
+    let paths = crate::qwen::sidecar_paths(&app)?;
+    let resolver = crate::qwen::spawn_resolver(&paths);
+    crate::qwen::run_prepare(resolver, move |progress| {
+        if let Err(e) = on_progress.send(progress) {
+            tracing::warn!("prepare_qwen_model: progress channel send failed: {e}");
+        }
+    })
+    .await
 }
 
 /// UI representation of a Whisper model entry from the registry.
@@ -521,7 +567,7 @@ mod tests {
 
         let status = health_check(engine).await.unwrap();
         assert!(status.db_ok);
-        assert_eq!(status.migration_count, 20);
+        assert_eq!(status.migration_count, 21);
     }
 
     #[tokio::test]

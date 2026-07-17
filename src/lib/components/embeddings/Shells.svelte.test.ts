@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/svelte';
+import { render, screen, waitFor, fireEvent } from '@testing-library/svelte';
 import { mockIPC, clearMocks } from '@tauri-apps/api/mocks';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { baseAppConfig } from '$lib/test-fixtures.js';
@@ -67,6 +67,18 @@ describe('PreferencesShell', () => {
     const general = screen.getByRole('button', { name: /general/i });
     expect(general).not.toHaveAttribute('aria-disabled', 'true');
     expect(screen.getByRole('heading', { name: 'Embeddings' })).toBeInTheDocument();
+  });
+
+  it('mounts TtsConfigPanel under the Text-to-Speech nav item (#194)', async () => {
+    notebookStore.settingsOpen = true;
+    render(PreferencesShell);
+
+    const ttsNav = screen.getByRole('button', { name: /text-to-speech/i });
+    expect(ttsNav).not.toHaveAttribute('aria-disabled', 'true');
+    await fireEvent.click(ttsNav);
+
+    expect(await screen.findByRole('tab', { name: /^local$/i })).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: /^cloud$/i })).toBeInTheDocument();
   });
 
   it('is hidden when settingsOpen is false', () => {

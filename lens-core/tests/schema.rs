@@ -63,7 +63,7 @@ async fn migration_is_idempotent_second_run_is_noop() {
         .unwrap();
 
     assert_eq!(count_before, count_after);
-    assert_eq!(count_after, 20, "all migration files applied (0001..0020)");
+    assert_eq!(count_after, 21, "all migration files applied (0001..0021)");
 }
 
 #[tokio::test]
@@ -601,7 +601,7 @@ async fn cold_init_under_budget_on_empty_temp_db() {
     let engine = LensEngine::init(dir.path()).await.unwrap();
     let elapsed = start.elapsed();
     // Sanity: the engine works.
-    assert_eq!(engine.migration_count().await.unwrap(), 20);
+    assert_eq!(engine.migration_count().await.unwrap(), 21);
     // Generous smoke guard against accidentally-expensive migrations (e.g. a
     // future migration that scans/rewrites large tables on cold start). This is
     // NOT a tight perf benchmark — the wide 2s budget keeps it non-flaky on
@@ -749,8 +749,7 @@ async fn migration_0009_renames_file_hash_to_raw_content_hash() {
         "old idx_sources_notebook_file_hash must be gone after 0009"
     );
 
-    // Migration count reflects all twenty migrations.
-    assert_eq!(engine.migration_count().await.unwrap(), 20);
+    assert_eq!(engine.migration_count().await.unwrap(), 21);
 }
 
 #[tokio::test]

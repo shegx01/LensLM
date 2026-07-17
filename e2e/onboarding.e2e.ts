@@ -7,7 +7,9 @@ import { installTauriStub, readSetConfigCalls } from './helpers/tauri-stub.js';
 // the SystemCheck screen vs. the app, with NO navigation. These tests therefore
 // assert RENDERED STATE at '/', never URLs — there is no goto()/redirect to race.
 
-test('first run renders the System check screen and all three rows at /', async ({ page }) => {
+test('first run renders the System check screen with the LLM + embedding rows at /', async ({
+  page
+}) => {
   await installTauriStub(page, { onboardingComplete: false });
 
   await page.goto('/');
@@ -17,7 +19,8 @@ test('first run renders the System check screen and all three rows at /', async 
   await expect(page.getByText('System check', { exact: true })).toBeVisible();
   await expect(page.getByText('LLM runtime', { exact: true })).toBeVisible();
   await expect(page.getByText('Embedding model', { exact: true })).toBeVisible();
-  await expect(page.getByText('Text-to-speech', { exact: true })).toBeVisible();
+  // TTS setup moved to Settings (#194): onboarding gates on LLM + embeddings only.
+  await expect(page.getByText('Text-to-speech', { exact: true })).toHaveCount(0);
 });
 
 test('Continue to setup advances to Make it yours WITHOUT completing onboarding', async ({

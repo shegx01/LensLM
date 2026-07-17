@@ -6,10 +6,48 @@ Imports the sidecar module directly; the MLX import is deferred inside
 """
 
 import math
+import os
 
 import pytest
 
-from qwen3_tts_sidecar import DEFAULT_MAX_TOKENS, DEFAULT_TEMPERATURE, resolve_gen_params
+from qwen3_tts_sidecar import (
+    DEFAULT_MAX_TOKENS,
+    DEFAULT_TEMPERATURE,
+    handle_synth,
+    resolve_gen_params,
+)
+
+
+class _FakeResult:
+    audio = [0.0, 0.0]
+    sample_rate = 24000
+
+
+class _FakeModel:
+    """Captures generate_custom_voice kwargs so language handling is assertable
+    without MLX (the real model import stays deferred inside load_qwen)."""
+
+    def __init__(self):
+        self.calls = []
+
+    def generate_custom_voice(self, **kwargs):
+        self.calls.append(kwargs)
+        return [_FakeResult()]
+
+
+def test_handle_synth_defaults_language_to_auto():
+    model = _FakeModel()
+    path = handle_synth(model, {"dylan": "dylan"}, {"text": "hi", "speaker": "dylan"})
+    assert model.calls[0]["language"] == "auto"
+    os.remove(path)
+
+
+def test_handle_synth_reads_language_from_request():
+    model = _FakeModel()
+    req = {"text": "hallo", "speaker": "dylan", "language": "german"}
+    path = handle_synth(model, {"dylan": "dylan"}, req)
+    assert model.calls[0]["language"] == "german"
+    os.remove(path)
 
 
 def test_absent_params_use_defaults():

@@ -102,20 +102,10 @@ fn main() {
             // generic `LensError::Tts` at synth time — never a startup panic.
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             {
-                // Resolve the bundled sidecar dir eagerly (cheap path math). Dev
-                // reads the source tree; release reads the bundled resources (tauri
-                // maps a `../sidecar/...` resource under `<resource_dir>/_up_/sidecar/...`).
-                let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-                let sidecar_dir = if cfg!(debug_assertions) {
-                    manifest.join("../sidecar/qwen3-tts")
-                } else {
-                    app.path().resource_dir()?.join("_up_/sidecar/qwen3-tts")
-                };
-                let hf_cache_dir = data_dir.join("hf-cache");
-                let app_data = data_dir.clone();
-                let resolver: qwen::SpawnResolver = Arc::new(move || {
-                    qwen::resolve_sidecar_spawn(&app_data, &sidecar_dir, &hf_cache_dir)
-                });
+                // Resolution is deferred inside the closure; see
+                // `qwen::sidecar_paths` for the shared-path rationale.
+                let paths = qwen::sidecar_paths(app.handle())?;
+                let resolver = qwen::spawn_resolver(&paths);
                 let qwen = qwen::QwenSidecar::new(resolver);
                 tauri::async_runtime::block_on(engine_state.set_tts_sidecar(Some(Arc::new(qwen))));
             }
@@ -179,9 +169,14 @@ fn main() {
             commands::system::run_system_check,
             commands::system::detect_llm,
             commands::system::list_tts_voices,
+            commands::system::tts_engine_catalog,
             commands::system::install_embedding_model,
             commands::system::download_tts_model,
             commands::system::tts_model_downloaded,
+            // Qwen3-TTS explicit model download (#194); Apple-Silicon only, like
+            // the sidecar it drives.
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            commands::system::prepare_qwen_model,
             commands::system::list_whisper_models,
             commands::system::download_whisper_model,
             commands::system::whisper_model_downloaded,

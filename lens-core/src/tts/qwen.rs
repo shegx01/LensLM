@@ -6,59 +6,9 @@ use tokio_util::sync::CancellationToken;
 use crate::config::VoiceConfig;
 use crate::dialogue::Turn;
 use crate::error::LensError;
+use crate::tts::catalog::QWEN_VOICES;
 use crate::tts::sidecar::TtsSidecar;
-use crate::tts::{AudioBuffer, Gender, TtsBackend, TtsProvider, TtsProviderInfo, TtsVoice};
-
-/// A Qwen3-TTS CustomVoice preset: a fixed speaker selected by `id` whose delivery
-/// is steered by an `instruct` string. No reference clip and no transcript —
-/// CustomVoice is a preset+instruct engine, not a cloning one.
-pub struct QwenVoice {
-    pub id: &'static str,
-    pub display_name: &'static str,
-    pub gender: Gender,
-    pub instruct: &'static str,
-}
-
-/// Default instruct applied to every preset until per-preset tuning lands: an
-/// energetic podcast-host delivery (the same string benchmarked in the spike).
-const DEFAULT_INSTRUCT: &str = "Upbeat, energetic podcast host, conversational and lively.";
-
-/// The four surfaced Qwen3-TTS CustomVoice presets (the model supports more via
-/// `get_supported_speakers()`). Ids are the model's canonical lowercase speaker
-/// ids; the sidecar resolves them case-insensitively.
-pub static QWEN_VOICES: &[QwenVoice] = &[
-    QwenVoice {
-        id: "dylan",
-        display_name: "Dylan",
-        gender: Gender::Male,
-        instruct: DEFAULT_INSTRUCT,
-    },
-    QwenVoice {
-        id: "aiden",
-        display_name: "Aiden",
-        gender: Gender::Male,
-        instruct: DEFAULT_INSTRUCT,
-    },
-    QwenVoice {
-        id: "serena",
-        display_name: "Serena",
-        gender: Gender::Female,
-        instruct: DEFAULT_INSTRUCT,
-    },
-    QwenVoice {
-        // Canonical model speaker id is "ono_anna" (not "anna") — do not normalize.
-        id: "ono_anna",
-        display_name: "Anna",
-        gender: Gender::Female,
-        instruct: DEFAULT_INSTRUCT,
-    },
-];
-
-/// Resolves a preset voice by id (used by `src-tauri` to map a `VoiceRef::Named(id)`
-/// to its speaker id + instruct string).
-pub fn qwen_voice(id: &str) -> Option<&'static QwenVoice> {
-    QWEN_VOICES.iter().find(|v| v.id == id)
-}
+use crate::tts::{AudioBuffer, TtsBackend, TtsProvider, TtsProviderInfo, TtsVoice};
 
 /// In-process adapter for Qwen3-TTS CustomVoice. Owns no model weights: every turn
 /// is delegated to an out-of-process MLX sidecar (`src-tauri`), so `lens-core` stays
@@ -103,8 +53,9 @@ impl TtsProvider for QwenLocalAdapter {
 mod tests {
     use super::*;
     use crate::dialogue::{DialogueScript, Speaker};
-    use crate::tts::TtsPhase;
     use crate::tts::audio::TARGET_RATE;
+    use crate::tts::catalog::qwen_voice;
+    use crate::tts::{Gender, TtsPhase};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

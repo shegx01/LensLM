@@ -32,9 +32,9 @@
     loading = true;
     checkError = null;
     try {
-      // run_system_check returns the three readiness gates (llm_runtime,
-      // embedding_model, text_to_speech) from the backend; render them directly.
-      // Re-checks (after a Configure/Choose save) flip a row's pass↔fail status.
+      // runSystemCheck returns the two onboarding readiness gates (llm_runtime,
+      // embedding_model); the legacy text_to_speech gate is filtered out (TTS
+      // setup moved to Settings).
       results = await runSystemCheck();
     } catch (err) {
       console.error('SystemCheck: runSystemCheck failed', err);

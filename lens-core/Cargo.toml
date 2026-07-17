@@ -243,6 +243,9 @@ tokenizers = "0.22"
 # async fn in the VectorStore trait.
 async-trait = "0.1"
 
+# issue #194 [161f]: offline language detection at ingest (see workspace entry).
+whatlang = { workspace = true }
+
 # --- issue #191 [161c]: SNAC neural-codec decoder (candle) ---
 # candle-core/candle-nn are NON-optional base deps: the SNAC decoder (tts/snac.rs)
 # decodes Orpheus audio tokens → 24 kHz PCM and MUST build on every platform (CPU
