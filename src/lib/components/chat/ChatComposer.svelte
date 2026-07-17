@@ -7,6 +7,7 @@
   import ArrowUp from '@lucide/svelte/icons/arrow-up';
   import Square from '@lucide/svelte/icons/square';
   import { cn } from '$lib/utils.js';
+  import { popIn } from '$lib/motion/index.js';
 
   interface Props {
     streaming: boolean;
@@ -49,9 +50,7 @@
 </script>
 
 <div class="shrink-0 px-4 pb-4 pt-2">
-  <div
-    class="flex items-end gap-2 rounded-3xl border border-border bg-card px-2 py-2 shadow-sm focus-within:ring-2 focus-within:ring-ring"
-  >
+  <div class="composer flex items-end gap-2 rounded-3xl bg-card px-2 py-2">
     <textarea
       bind:this={textareaRef}
       bind:value
@@ -68,22 +67,24 @@
     {#if streaming}
       <button
         type="button"
+        in:popIn
         aria-label="Stop generating"
         onclick={onstop}
-        class="flex size-9 shrink-0 items-center justify-center rounded-full bg-foreground text-background transition-opacity hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        class="flex size-9 shrink-0 items-center justify-center rounded-full bg-foreground text-background transition-[transform,opacity] hover:opacity-90 active:scale-[0.94] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
       >
         <Square class="size-3.5" fill="currentColor" strokeWidth={0} />
       </button>
     {:else}
       <button
         type="button"
+        in:popIn
         aria-label="Send question"
         disabled={!canSend}
         onclick={submit}
         class={cn(
-          'flex size-9 shrink-0 items-center justify-center rounded-full transition-opacity',
-          'bg-primary text-primary-foreground hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
-          'disabled:opacity-40'
+          'flex size-9 shrink-0 items-center justify-center rounded-full transition-[transform,opacity]',
+          'bg-primary text-primary-foreground hover:opacity-90 active:scale-[0.94] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+          'disabled:opacity-40 disabled:active:scale-100'
         )}
       >
         <ArrowUp class="size-4" strokeWidth={2.5} />
@@ -91,3 +92,24 @@
     {/if}
   </div>
 </div>
+
+<style>
+  /* Rests as a hairline-outlined card; on focus it lifts a touch and the brand
+     ring blooms. Transform/box-shadow only (never `all`), so it stays smooth. */
+  .composer {
+    box-shadow:
+      0 0 0 1px var(--border),
+      0 1px 2px oklch(0.2 0.02 293 / 0.04);
+    transform: translateY(0);
+    transition:
+      box-shadow 0.22s var(--ease-out, ease),
+      transform 0.22s var(--ease-out, ease);
+  }
+  .composer:focus-within {
+    transform: translateY(calc(-1px * var(--rail-motion, 1)));
+    box-shadow:
+      0 0 0 1px color-mix(in oklch, var(--ring) 45%, transparent),
+      0 0 0 4px color-mix(in oklch, var(--ring) 16%, transparent),
+      0 8px 22px oklch(0.2 0.02 293 / 0.08);
+  }
+</style>

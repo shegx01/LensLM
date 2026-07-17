@@ -13,6 +13,7 @@
   import ThoughtsDisclosure from './ThoughtsDisclosure.svelte';
   import EmptyState from './EmptyState.svelte';
   import ErrorCard from './ErrorCard.svelte';
+  import { fade } from 'svelte/transition';
   import type { AnswerStage, Turn } from '$lib/chat/types.js';
 
   interface Props {
@@ -133,6 +134,12 @@
   {#if isEmpty}
     <EmptyState />
   {:else}
+    <!-- Scroll-edge fade: content dissolves into the canvas as it scrolls up
+         toward the floating top bar, instead of meeting a hard cut. -->
+    <div
+      class="pointer-events-none absolute inset-x-0 top-0 z-10 h-6 bg-gradient-to-b from-[var(--app-canvas)] to-transparent"
+      aria-hidden="true"
+    ></div>
     <ScrollArea bind:viewportRef scrollbarYClasses="hidden" class="min-h-0 flex-1">
       <div class="flex flex-col pb-2" role="log" aria-label="Chat transcript">
         {#each turns as turn (turn.turn_id)}
@@ -193,9 +200,10 @@
     {#if !pinnedToBottom}
       <button
         type="button"
+        in:fade={{ duration: 150 }}
         onclick={handleJumpToLatest}
         aria-label="Jump to latest message"
-        class="absolute bottom-3 left-1/2 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-border bg-popover px-3 py-1.5 text-xs font-medium text-popover-foreground shadow-md transition-opacity hover:opacity-90"
+        class="absolute bottom-3 left-1/2 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-border bg-popover px-3 py-1.5 text-xs font-medium text-popover-foreground shadow-[var(--shadow-bar)] transition-transform hover:-translate-y-px active:scale-[0.96]"
       >
         <ArrowDown class="size-3" strokeWidth={2.5} />
         Jump to latest
