@@ -172,8 +172,7 @@ fn main() {
             commands::system::tts_engine_catalog,
             commands::system::install_embedding_model,
             commands::system::download_tts_model,
-            commands::system::tts_model_downloaded,
-            commands::system::tts_model_incomplete,
+            commands::system::tts_model_status,
             // Qwen3-TTS explicit model download (#194); Apple-Silicon only, like
             // the sidecar it drives.
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

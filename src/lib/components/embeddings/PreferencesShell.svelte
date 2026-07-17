@@ -57,7 +57,7 @@
         {:else if active === 'ingestion'}
           <IngestionSection />
         {:else if active === 'text_to_speech'}
-          <TtsConfigPanel oncheck={async () => {}} oncollapse={() => {}} />
+          <TtsConfigPanel />
         {/if}
       {/snippet}
     </SettingsShell>

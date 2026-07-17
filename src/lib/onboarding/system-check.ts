@@ -181,17 +181,14 @@ export async function ttsEngineCatalog(): Promise<TtsEngineCatalogEntry[]> {
   return invoke<TtsEngineCatalogEntry[]>('tts_engine_catalog');
 }
 
-/** Whether the given TTS model artifact is already on disk (skip the download step). */
-export async function ttsModelDownloaded(engine: string, model: string): Promise<boolean> {
-  if (!isTauri()) return false;
-  return invoke<boolean>('tts_model_downloaded', { engine, model });
-}
+// SYNC-CHECK: must match src-tauri/src/commands/system.rs TtsModelStatus (serde snake_case).
+/** Tri-state download status of a TTS model artifact. */
+export type TtsModelStatus = 'complete' | 'partial' | 'absent';
 
-/** Whether the model is partially present (on disk but incomplete) rather than
- *  absent — drives the "re-download" affordance vs a fresh "download". */
-export async function ttsModelIncomplete(engine: string, model: string): Promise<boolean> {
-  if (!isTauri()) return false;
-  return invoke<boolean>('tts_model_incomplete', { engine, model });
+/** Download status of the given TTS model artifact — drives the download/re-download affordance. */
+export async function ttsModelStatus(engine: string, model: string): Promise<TtsModelStatus> {
+  if (!isTauri()) return 'absent';
+  return invoke<TtsModelStatus>('tts_model_status', { engine, model });
 }
 
 // SYNC-CHECK: a UI selector mapped to the wire `TtsBackend` (lens-core/src/tts/mod.rs) by
