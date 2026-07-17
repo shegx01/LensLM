@@ -1,14 +1,17 @@
-<!-- SourcesRail — 320px right panel. Header is a drag region; all interactive children
+<!-- SourcesRail — the right rail. Header is a drag region; all interactive children
      carry -webkit-app-region: no-drag so clicks don't conflict with window drag.
+     Motion is gated through --rail-motion / --ease-out (shared with the left rail)
+     so it stays consistent and honors the Animations preference.
      All colours are CSS-variable tokens — no hardcoded hex. -->
 <script lang="ts" module>
-  /** How long (ms) the reveal pulse ring stays on a focused source row. */
+  /** How long (ms) the reveal highlight stays on a focused source row. */
   export const PULSE_MS = 1000;
 </script>
 
 <script lang="ts">
   import FileText from '@lucide/svelte/icons/file-text';
   import Check from '@lucide/svelte/icons/check';
+  import Minus from '@lucide/svelte/icons/minus';
   import Plus from '@lucide/svelte/icons/plus';
   import Trash from '@lucide/svelte/icons/trash';
   import RotateCcw from '@lucide/svelte/icons/rotate-ccw';
@@ -17,9 +20,11 @@
   import Headphones from '@lucide/svelte/icons/headphones';
   import { cn } from '$lib/utils.js';
   import { onDestroy, tick, untrack } from 'svelte';
+  import { fadeRise, popIn } from '$lib/motion/index.js';
   import {
     sourcesStore,
     toggleSelected,
+    toggleAllSelected,
     removeSource,
     undoRemove,
     disposeTrashTimers,
@@ -41,7 +46,7 @@
   onDestroy(disposeTrashTimers);
 
   // Reveal-in-rail (#23b): a citation chip sets sourcesStore.focusedSourceId;
-  // scroll that row into view and pulse it briefly. A single stored timer is
+  // scroll that row into view and highlight it briefly. A single stored timer is
   // cleared on re-fire and on destroy so it can't leak across notebook switches.
   let pulsingId = $state<string | null>(null);
   let pulseTimer: ReturnType<typeof setTimeout> | undefined;
@@ -83,6 +88,8 @@
   const sources = $derived(sourcesStore.sources);
   const totalCount = $derived(sources.length);
   const selectedCount = $derived(sources.filter((s) => s.selected === 1).length);
+  const allSelected = $derived(totalCount > 0 && selectedCount === totalCount);
+  const someSelected = $derived(selectedCount > 0 && selectedCount < totalCount);
 
   /** Short display badge derived from the source's kind + locator/title. */
   function typeBadge(kind: string, locator: string, title: string): string {
@@ -194,7 +201,7 @@
       aria-label="Expand sources"
       title="Expand sources"
       onclick={toggleCollapse}
-      class="flex size-8 items-center justify-center rounded-lg border-0 bg-transparent text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+      class="rail-icon-btn text-muted-foreground hover:bg-muted hover:text-foreground"
       style="-webkit-app-region: no-drag;"
     >
       <PanelRight class="size-4" strokeWidth={2} />
@@ -207,13 +214,13 @@
       aria-label="Sources ({totalCount})"
       title="Sources"
       onclick={toggleCollapse}
-      class="relative flex size-8 items-center justify-center rounded-lg border-0 bg-primary/10 text-primary transition-colors hover:bg-primary/15"
+      class="rail-icon-btn relative bg-primary/10 text-primary hover:bg-primary/15"
       style="-webkit-app-region: no-drag;"
     >
       <FileText class="size-4" strokeWidth={2} />
       {#if totalCount > 0}
         <span
-          class="absolute -top-0.5 -right-0.5 flex size-3.5 items-center justify-center rounded-full bg-primary text-[0.5rem] font-bold text-primary-foreground"
+          class="absolute -top-0.5 -right-0.5 flex size-3.5 items-center justify-center rounded-full bg-primary text-[0.5rem] font-bold tabular-nums text-primary-foreground"
           aria-hidden="true"
         >
           {totalCount > 9 ? '9+' : totalCount}
@@ -226,7 +233,7 @@
       aria-label="Add source"
       title="Add source"
       onclick={() => (modalOpen = true)}
-      class="flex size-8 items-center justify-center rounded-lg border-0 bg-transparent text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+      class="rail-icon-btn text-muted-foreground hover:bg-muted hover:text-foreground"
       style="-webkit-app-region: no-drag;"
     >
       <Plus class="size-4" strokeWidth={2.5} />
@@ -239,25 +246,41 @@
       aria-label="Studio"
       title="Studio"
       onclick={toggleCollapse}
-      class="mb-2 flex size-8 items-center justify-center rounded-lg border-0 bg-transparent text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+      class="rail-icon-btn mb-2 text-muted-foreground hover:bg-muted hover:text-foreground"
       style="-webkit-app-region: no-drag;"
     >
       <Headphones class="size-4" strokeWidth={2} />
     </button>
   </div>
 {:else}
-  <div data-tauri-drag-region class="flex h-14 shrink-0 items-center gap-2 px-3">
-    <button
-      type="button"
-      data-right-rail-collapse-btn
-      aria-label="Collapse sources"
-      title="Collapse sources"
-      onclick={toggleCollapse}
-      class="flex size-[26px] shrink-0 items-center justify-center rounded-full bg-muted text-muted-foreground/70 transition-colors hover:opacity-60 hover:text-foreground"
-      style="-webkit-app-region: no-drag;"
-    >
-      <PanelRightClose class="size-3.5" strokeWidth={2} />
-    </button>
+  <div data-tauri-drag-region class="flex h-14 shrink-0 items-center gap-2.5 px-3">
+    {#if totalCount > 0}
+      <button
+        type="button"
+        role="checkbox"
+        aria-checked={allSelected ? 'true' : someSelected ? 'mixed' : 'false'}
+        aria-label={allSelected ? 'Deselect all sources' : 'Select all sources'}
+        title={allSelected ? 'Deselect all' : 'Select all'}
+        onclick={() => void toggleAllSelected()}
+        class={cn(
+          'checkbox-box size-[18px] transition-transform active:scale-90',
+          allSelected || someSelected
+            ? 'border-primary bg-primary text-primary-foreground'
+            : 'border-border hover:border-primary/60'
+        )}
+        style="-webkit-app-region: no-drag;"
+      >
+        {#if allSelected}
+          <span class="flex" in:popIn={{ duration: 200 }}>
+            <Check class="size-[11px]" strokeWidth={3} />
+          </span>
+        {:else if someSelected}
+          <span class="flex" in:popIn={{ duration: 200 }}>
+            <Minus class="size-[11px]" strokeWidth={3} />
+          </span>
+        {/if}
+      </button>
+    {/if}
 
     <!-- Panel header — deliberately one notch below the app brand ("Lens",
          text-base) and the centered notebook title, so this reads as a panel
@@ -266,7 +289,7 @@
 
     {#if totalCount > 0}
       <span
-        class="inline-flex h-[18px] min-w-[30px] items-center justify-center rounded-full bg-muted px-1.5 text-xs font-semibold tabular-nums text-muted-foreground"
+        class="inline-flex h-[18px] min-w-[34px] items-center justify-center rounded-full bg-muted px-1.5 text-xs font-semibold tabular-nums text-muted-foreground"
         aria-label="{selectedCount} of {totalCount} sources selected"
         style="-webkit-app-region: no-drag;"
       >
@@ -275,33 +298,44 @@
     {/if}
 
     <button
-      class="flex size-[26px] shrink-0 items-center justify-center rounded-full bg-muted text-foreground transition-colors hover:opacity-80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      class="rail-pill-btn text-foreground"
       type="button"
       aria-label="Add source"
+      title="Add source"
       onclick={() => (modalOpen = true)}
       style="-webkit-app-region: no-drag;"
     >
       <Plus class="size-3.5" strokeWidth={2.5} />
     </button>
+
+    <button
+      type="button"
+      data-right-rail-collapse-btn
+      aria-label="Collapse sources"
+      title="Collapse sources"
+      onclick={toggleCollapse}
+      class="rail-pill-btn text-muted-foreground/70 hover:text-foreground"
+      style="-webkit-app-region: no-drag;"
+    >
+      <PanelRightClose class="size-3.5" strokeWidth={2} />
+    </button>
   </div>
 
   <div class="shrink-0 border-t border-border"></div>
 
-  <div data-sources-scroll class="no-scrollbar flex min-h-0 flex-1 flex-col overflow-y-auto">
+  <!-- min-h floor keeps a few rows visible+scrollable even when Studio is tall. -->
+  <div data-sources-scroll class="no-scrollbar flex min-h-[128px] flex-1 flex-col overflow-y-auto">
     {#if sources.length === 0}
       <div class="flex flex-1 flex-col items-center justify-center gap-2 px-4 py-12">
-        <div
-          class="flex size-10 items-center justify-center rounded-xl bg-muted"
-          aria-hidden="true"
-        >
-          <FileText class="size-4 text-muted-foreground/40" strokeWidth={1.5} />
+        <div class="empty-tile flex size-11 items-center justify-center" aria-hidden="true">
+          <FileText class="size-[18px] text-muted-foreground/40" strokeWidth={1.5} />
         </div>
         <p class="mt-1 text-center text-[12px] font-semibold text-foreground">No sources yet</p>
-        <p class="text-center text-[11px] text-muted-foreground/60 leading-relaxed max-w-[180px]">
+        <p class="max-w-[180px] text-center text-[11px] leading-relaxed text-muted-foreground/60">
           Add a file or paste text to ground this notebook.
         </p>
         <button
-          class="mt-2 flex items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-[12px] font-semibold text-primary-foreground transition-opacity hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          class="mt-2 flex items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-[12px] font-semibold text-primary-foreground transition-[opacity,transform] hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring active:scale-[0.97]"
           type="button"
           aria-label="Add first source"
           onclick={() => (modalOpen = true)}
@@ -312,21 +346,19 @@
       </div>
     {:else}
       <ul class="flex flex-col gap-px p-2" role="list" aria-label="Sources">
-        {#each sources as source (source.id)}
+        {#each sources as source, i (source.id)}
           {@const badge = typeBadge(source.kind, source.locator, source.title)}
           {@const meta = metaLine(source.token_count)}
           {@const status = source.status as SourceStatus}
           <li
             data-source-id={source.id}
             data-pulsing={pulsingId === source.id}
-            class={cn(
-              'group flex items-start gap-2.5 rounded-lg px-2.5 py-2.5 transition-colors duration-100 hover:bg-muted/50',
-              pulsingId === source.id && 'ring-2 ring-primary/60'
-            )}
+            class="src-row group flex items-start gap-2.5 rounded-[10px] px-2.5 py-2.5"
+            use:fadeRise={{ y: 6, duration: 0.34, delay: Math.min(i, 8) * 0.035 }}
           >
             <button
               class={cn(
-                'mt-0.5 flex size-[16px] shrink-0 cursor-pointer items-center justify-center rounded-[4px] transition-all duration-[130ms] border',
+                'checkbox-box mt-0.5 size-[16px] transition-[background-color,border-color,transform] duration-150 active:scale-90',
                 source.selected === 1
                   ? 'border-primary bg-primary'
                   : 'border-border bg-transparent hover:border-primary/60'
@@ -339,7 +371,9 @@
               aria-pressed={source.selected === 1}
             >
               {#if source.selected === 1}
-                <Check class="size-[9px] text-primary-foreground" strokeWidth={3} />
+                <span class="flex" in:popIn={{ duration: 200 }}>
+                  <Check class="size-[9px] text-primary-foreground" strokeWidth={3} />
+                </span>
               {/if}
             </button>
 
@@ -347,7 +381,7 @@
               <div class="truncate text-sm font-medium leading-tight text-foreground">
                 {source.title}
               </div>
-              <div class="mt-0.5 flex items-center gap-1.5 flex-wrap">
+              <div class="mt-0.5 flex flex-wrap items-center gap-1.5">
                 <span
                   class="inline-flex items-center rounded-[4px] bg-muted px-[5px] py-px text-[0.6875rem] font-semibold uppercase tracking-wide text-muted-foreground"
                 >
@@ -381,14 +415,14 @@
                   ></span>
                   <div
                     class={cn(
-                      'pointer-events-none absolute bottom-full right-0 z-10 mb-1.5',
+                      'pointer-events-none absolute right-0 bottom-full z-10 mb-1.5',
                       'w-max max-w-[200px] rounded-md border border-destructive/30 bg-popover px-2.5 py-1.5 shadow-md',
                       'opacity-0 transition-opacity duration-150 group-hover:opacity-100'
                     )}
                     role="tooltip"
                     data-error-tooltip
                   >
-                    <p class="text-[0.6875rem] font-medium text-destructive leading-snug">
+                    <p class="text-[0.6875rem] font-medium leading-snug text-destructive">
                       {source.error_meta
                         ? source.error_meta.message
                         : 'Ingest failed (no details captured)'}
@@ -413,10 +447,9 @@
                     void retrySource(source.id);
                   }}
                   class={cn(
-                    'flex size-5 items-center justify-center rounded-[5px]',
-                    'opacity-0 transition-opacity duration-150',
-                    'bg-transparent text-muted-foreground/40',
-                    'hover:bg-destructive/15 hover:text-destructive',
+                    'row-action flex size-5 items-center justify-center rounded-[6px]',
+                    'text-muted-foreground/40 opacity-0 transition-[opacity,background-color,transform] duration-150',
+                    'hover:bg-destructive/15 hover:text-destructive active:scale-90',
                     'focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
                     'group-hover:opacity-100'
                   )}
@@ -443,11 +476,10 @@
                   void removeSource(source.id);
                 }}
                 class={cn(
-                  'flex size-5 items-center justify-center rounded-[5px]',
+                  'row-action flex size-5 items-center justify-center rounded-[6px]',
                   status !== 'error' && 'absolute',
-                  'opacity-0 transition-opacity duration-150',
-                  'bg-transparent text-muted-foreground/40',
-                  'hover:bg-destructive/15 hover:text-destructive',
+                  'text-muted-foreground/40 opacity-0 transition-[opacity,background-color,transform] duration-150',
+                  'hover:bg-destructive/15 hover:text-destructive active:scale-90',
                   'focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
                   'group-hover:opacity-100'
                 )}
@@ -467,7 +499,7 @@
        Built inline (no toast primitive exists) using tokens only. no-drag. -->
   {#if sourcesStore.recentlyTrashed}
     <div
-      class="mx-2 mb-1.5 flex shrink-0 items-center justify-between gap-2 rounded-lg border border-border bg-muted/60 px-3 py-2 text-xs shadow-sm"
+      class="undo-bar mx-2 mb-1.5 flex shrink-0 items-center justify-between gap-2 rounded-lg border border-border bg-muted/60 px-3 py-2 text-xs shadow-sm"
       role="status"
       aria-live="polite"
       aria-label="Source moved to trash"
@@ -477,7 +509,7 @@
       <button
         type="button"
         onclick={() => void undoRemove(notebookStore.activeNotebookId ?? undefined)}
-        class="shrink-0 rounded-[5px] px-2 py-0.5 text-xs font-semibold text-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        class="shrink-0 rounded-[6px] px-2 py-0.5 text-xs font-semibold text-foreground transition-[background-color,transform] hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring active:scale-95"
         style="-webkit-app-region: no-drag;"
       >
         Undo
@@ -489,3 +521,113 @@
 {/if}
 
 <AddSourcesModal open={modalOpen} onclose={() => (modalOpen = false)} />
+
+<style>
+  /* Collapsed-strip icon buttons — uniform hit target + spring press, matching the
+     left rail's collapsed action feel. */
+  .rail-icon-btn {
+    display: flex;
+    width: 36px;
+    height: 36px;
+    align-items: center;
+    justify-content: center;
+    border: 0;
+    border-radius: 10px;
+    background: transparent;
+    cursor: pointer;
+    transition:
+      background-color 0.16s var(--ease-out, ease),
+      color 0.16s var(--ease-out, ease),
+      transform 0.16s var(--ease-out, ease);
+  }
+  .rail-icon-btn:active {
+    transform: scale(calc(1 - 0.06 * var(--rail-motion, 1)));
+  }
+  .rail-icon-btn:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 2px var(--ring);
+  }
+
+  /* Expanded-header round action pills (add / collapse). */
+  .rail-pill-btn {
+    display: flex;
+    width: 26px;
+    height: 26px;
+    flex: none;
+    align-items: center;
+    justify-content: center;
+    border: 0;
+    border-radius: 999px;
+    background: var(--muted);
+    cursor: pointer;
+    transition:
+      background-color 0.16s var(--ease-out, ease),
+      color 0.16s var(--ease-out, ease),
+      transform 0.16s var(--ease-out, ease);
+  }
+  .rail-pill-btn:hover {
+    background: color-mix(in oklch, var(--muted) 70%, transparent);
+  }
+  .rail-pill-btn:active {
+    transform: scale(calc(1 - 0.06 * var(--rail-motion, 1)));
+  }
+  .rail-pill-btn:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 2px var(--ring);
+  }
+
+  /* Shared checkbox chrome (header select-all + per-row). */
+  .checkbox-box {
+    display: flex;
+    flex: none;
+    align-items: center;
+    justify-content: center;
+    border-width: 1px;
+    border-style: solid;
+    border-radius: 5px;
+    cursor: pointer;
+    outline: none;
+  }
+  .checkbox-box:focus-visible {
+    box-shadow: 0 0 0 2px var(--ring);
+  }
+
+  .empty-tile {
+    border-radius: 14px;
+    background: var(--muted);
+  }
+
+  /* Source rows: fast hover, plus a reveal highlight (#23b) driven by data-pulsing.
+     The ring fades IN fast (0.18s, to catch the eye) and OUT slow (0.5s, gentle). */
+  .src-row {
+    position: relative;
+    transition:
+      background-color 0.16s var(--ease-out, ease),
+      box-shadow 0.5s var(--ease-out, ease);
+  }
+  .src-row:hover {
+    background-color: color-mix(in oklch, var(--muted) 50%, transparent);
+  }
+  .src-row[data-pulsing='true'] {
+    background-color: color-mix(in oklch, var(--primary) 9%, transparent);
+    box-shadow: inset 0 0 0 1.5px color-mix(in oklch, var(--primary) 55%, transparent);
+    transition:
+      background-color 0.18s var(--ease-out, ease),
+      box-shadow 0.18s var(--ease-out, ease);
+  }
+
+  /* row-action buttons already fade via Tailwind opacity; the press scale is gated
+     so calm mode drops the movement but keeps the hover affordance. */
+  .row-action:active {
+    transform: scale(calc(1 - 0.1 * var(--rail-motion, 1)));
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .src-row,
+    .src-row[data-pulsing='true'] {
+      transition:
+        background-color 0.16s ease,
+        box-shadow 0.16s ease;
+    }
+  }
+</style>

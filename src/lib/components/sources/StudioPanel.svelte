@@ -1,6 +1,7 @@
-<!-- StudioPanel — non-functional visual shell (M4). All actions are disabled.
-     TODO(M6/M7): study tools land with M6 (Notes), Audio Overview lands with M7.
-     Tokens only — no hardcoded hex. -->
+<!-- StudioPanel — non-functional visual shell (M4). All actions are disabled and
+     labelled "coming soon"; the section reads as an intentional preview, not a
+     broken control. TODO(M6/M7): study tools land with M6 (Notes), Audio Overview
+     lands with M7. Tokens only — no hardcoded hex. -->
 <script lang="ts">
   import Headphones from '@lucide/svelte/icons/headphones';
   import BookOpen from '@lucide/svelte/icons/book-open';
@@ -15,6 +16,7 @@
   import Image from '@lucide/svelte/icons/image';
   import Table2 from '@lucide/svelte/icons/table-2';
   import type { Component } from 'svelte';
+  import { fadeRise } from '$lib/motion/index.js';
 
   let {
     selectedCount = 0,
@@ -50,7 +52,7 @@
 </script>
 
 <section
-  class="no-scrollbar flex max-h-[55%] shrink-0 flex-col gap-3 overflow-y-auto border-t border-border px-3 py-3"
+  class="no-scrollbar flex max-h-[64%] shrink-0 flex-col gap-3 overflow-y-auto border-t border-border px-3 py-3"
   aria-label="Studio"
 >
   <div class="flex items-center gap-2">
@@ -60,19 +62,22 @@
     >
       Research
     </span>
+    <span
+      class="ml-auto inline-flex items-center gap-1 text-[0.625rem] font-medium text-muted-foreground/60"
+    >
+      <span class="soon-dot" aria-hidden="true"></span>
+      Coming soon
+    </span>
   </div>
 
-  <div class="rounded-xl border border-border bg-muted/30 p-3">
-    <div class="flex items-center gap-2">
-      <div
-        class="flex size-[26px] shrink-0 items-center justify-center rounded-lg bg-primary/10"
-        aria-hidden="true"
-      >
-        <Headphones class="size-[14px] text-primary" strokeWidth={2} />
+  <div class="audio-card p-3" use:fadeRise={{ y: 8, duration: 0.36 }}>
+    <div class="flex items-center gap-2.5">
+      <div class="audio-icon" aria-hidden="true">
+        <Headphones class="size-[15px] text-primary" strokeWidth={2} />
       </div>
       <div class="min-w-0">
         <p class="text-sm font-semibold leading-tight text-foreground">Audio Overview</p>
-        <p class="text-xs leading-tight text-muted-foreground">
+        <p class="text-xs leading-tight text-muted-foreground tabular-nums">
           {selectedCount} of {totalCount} sources selected
         </p>
       </div>
@@ -80,7 +85,7 @@
 
     <button
       type="button"
-      class="mt-3 flex w-full items-center justify-center gap-1.5 rounded-lg bg-primary px-3 py-2 text-sm font-semibold text-primary-foreground opacity-60 transition-opacity disabled:cursor-not-allowed"
+      class="mt-3 flex w-full items-center justify-center gap-1.5 rounded-lg bg-primary px-3 py-2 text-sm font-semibold text-primary-foreground opacity-70 transition-opacity disabled:cursor-not-allowed"
       disabled
       aria-label="Generate Audio Overview (coming soon)"
       title="Coming soon"
@@ -94,16 +99,18 @@
     </p>
   </div>
 
-  <div aria-label="Study tools">
+  <div aria-label="Study tools" use:fadeRise={{ y: 8, duration: 0.36, delay: 0.05 }}>
     <button
       type="button"
-      class="mb-1.5 flex w-full items-center gap-2 rounded-lg border border-border bg-card px-2.5 py-2 text-left opacity-60 transition-opacity disabled:cursor-not-allowed"
+      class="tool-tile hero-tile mb-1.5 flex w-full items-center gap-2.5 px-2.5 py-2 text-left disabled:cursor-not-allowed"
       disabled
       aria-label="{heroTool.label} (coming soon)"
       title="Coming soon"
       style="-webkit-app-region: no-drag;"
     >
-      <heroTool.icon class="size-[14px] shrink-0 text-muted-foreground" strokeWidth={1.75} />
+      <span class="tool-icon" aria-hidden="true">
+        <heroTool.icon class="size-[14px] text-primary" strokeWidth={1.75} />
+      </span>
       <span class="min-w-0">
         <span class="block truncate text-xs font-semibold leading-tight text-foreground"
           >{heroTool.label}</span
@@ -118,13 +125,15 @@
       {#each gridTools as tool (tool.label)}
         <button
           type="button"
-          class="flex items-center gap-2 rounded-lg border border-border bg-card px-2.5 py-2 text-left opacity-60 transition-opacity disabled:cursor-not-allowed"
+          class="tool-tile flex items-center gap-2 px-2.5 py-2 text-left disabled:cursor-not-allowed"
           disabled
           aria-label="{tool.label} (coming soon)"
           title="Coming soon"
           style="-webkit-app-region: no-drag;"
         >
-          <tool.icon class="size-[14px] shrink-0 text-muted-foreground" strokeWidth={1.75} />
+          <span class="tool-icon-sm" aria-hidden="true">
+            <tool.icon class="size-[13px] text-muted-foreground" strokeWidth={1.75} />
+          </span>
           <span class="min-w-0">
             <span class="block truncate text-xs font-semibold leading-tight text-foreground"
               >{tool.label}</span
@@ -138,3 +147,55 @@
     </div>
   </div>
 </section>
+
+<style>
+  .soon-dot {
+    width: 5px;
+    height: 5px;
+    border-radius: 999px;
+    background: color-mix(in oklch, var(--primary) 70%, transparent);
+  }
+
+  /* Audio Overview: the one hero surface in Studio — tinted card with a soft
+     primary wash so it reads as the section's headline action. */
+  .audio-card {
+    border-radius: 14px;
+    border: 1px solid color-mix(in oklch, var(--primary) 16%, var(--border));
+    background: color-mix(in oklch, var(--primary) 5%, var(--card));
+  }
+  .audio-icon {
+    display: grid;
+    place-items: center;
+    width: 30px;
+    height: 30px;
+    flex: none;
+    border-radius: 9px;
+    background: color-mix(in oklch, var(--primary) 12%, transparent);
+  }
+
+  /* Study-tool tiles — a locked preview: clean surface (not a 60% grey wash),
+     but non-interactive. */
+  .tool-tile {
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: var(--card);
+    opacity: 0.85;
+  }
+  .hero-tile {
+    background: color-mix(in oklch, var(--muted) 40%, var(--card));
+  }
+  .tool-icon {
+    display: grid;
+    place-items: center;
+    width: 24px;
+    height: 24px;
+    flex: none;
+    border-radius: 7px;
+    background: color-mix(in oklch, var(--primary) 10%, transparent);
+  }
+  .tool-icon-sm {
+    display: grid;
+    place-items: center;
+    flex: none;
+  }
+</style>

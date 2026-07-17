@@ -14,6 +14,7 @@ import {
   retrySource,
   retryAllFailed,
   toggleSelected,
+  toggleAllSelected,
   removeSource,
   undoRemove,
   disposeTrashTimers,
@@ -319,6 +320,77 @@ describe('toggleSelected', () => {
     await toggleSelected('src-unknown');
 
     expect(setSourceSelected).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// toggleAllSelected — master select-all
+// ---------------------------------------------------------------------------
+
+describe('toggleAllSelected', () => {
+  it('selects every source when some are unselected (partial → all)', async () => {
+    vi.mocked(listSources).mockResolvedValue([
+      makeSource({ id: 'src-001', selected: 1 }),
+      makeSource({ id: 'src-002', selected: 0 }),
+      makeSource({ id: 'src-003', selected: 0 })
+    ]);
+    await loadSources('nb-001');
+    vi.mocked(setSourceSelected).mockResolvedValue(undefined);
+
+    await toggleAllSelected();
+
+    expect(sourcesStore.sources.every((s) => s.selected === 1)).toBe(true);
+    // Only the two that changed hit the backend; the already-selected one is skipped.
+    expect(setSourceSelected).toHaveBeenCalledTimes(2);
+    expect(setSourceSelected).toHaveBeenCalledWith('src-002', true);
+    expect(setSourceSelected).toHaveBeenCalledWith('src-003', true);
+  });
+
+  it('deselects every source when all are selected (all → none)', async () => {
+    vi.mocked(listSources).mockResolvedValue([
+      makeSource({ id: 'src-001', selected: 1 }),
+      makeSource({ id: 'src-002', selected: 1 })
+    ]);
+    await loadSources('nb-001');
+    vi.mocked(setSourceSelected).mockResolvedValue(undefined);
+
+    await toggleAllSelected();
+
+    expect(sourcesStore.sources.every((s) => s.selected === 0)).toBe(true);
+    expect(setSourceSelected).toHaveBeenCalledWith('src-001', false);
+    expect(setSourceSelected).toHaveBeenCalledWith('src-002', false);
+  });
+
+  it('is a no-op on an empty source list', async () => {
+    await toggleAllSelected();
+    expect(setSourceSelected).not.toHaveBeenCalled();
+  });
+
+  it('calls setSourceSelected with booleans, not numbers', async () => {
+    vi.mocked(listSources).mockResolvedValue([makeSource({ id: 'src-001', selected: 0 })]);
+    await loadSources('nb-001');
+    vi.mocked(setSourceSelected).mockResolvedValue(undefined);
+
+    await toggleAllSelected();
+
+    expect(typeof vi.mocked(setSourceSelected).mock.calls[0][1]).toBe('boolean');
+  });
+
+  it('surfaces an error when a per-source update fails', async () => {
+    vi.mocked(listSources).mockResolvedValue([
+      makeSource({ id: 'src-001', selected: 0 }),
+      makeSource({ id: 'src-002', selected: 0 })
+    ]);
+    await loadSources('nb-001');
+    vi.mocked(setSourceSelected).mockRejectedValue(new Error('network error'));
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await toggleAllSelected();
+
+    // activeNotebookId is null in this suite's mock, so the reconcile is skipped
+    // and the error message survives.
+    expect(sourcesStore.error).toBeTruthy();
+    consoleSpy.mockRestore();
   });
 });
 

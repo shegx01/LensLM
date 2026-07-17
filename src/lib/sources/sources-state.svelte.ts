@@ -280,6 +280,32 @@ export async function toggleSelected(sourceId: string): Promise<void> {
   }
 }
 
+/**
+ * Master select-all toggle. If every source is already selected, deselects all;
+ * otherwise selects all. Optimistic; on any per-source IPC failure the whole set
+ * is reconciled from the backend (the canonical truth) rather than partially reverted.
+ */
+export async function toggleAllSelected(): Promise<void> {
+  if (sources.length === 0) return;
+  const target = sources.every((s) => s.selected === 1) ? 0 : 1;
+  const changedIds = sources.filter((s) => s.selected !== target).map((s) => s.id);
+  if (changedIds.length === 0) return;
+
+  sources = sources.map((s) => (s.selected === target ? s : { ...s, selected: target }));
+
+  const results = await Promise.allSettled(
+    changedIds.map((id) => setSourceSelected(id, target !== 0))
+  );
+  if (results.some((r) => r.status === 'rejected')) {
+    console.error('toggleAllSelected: one or more updates failed; reconciling from backend');
+    // Reconcile first: loadSources() clears `error` on entry, so the message must
+    // be set AFTER the reconcile or it would be wiped immediately.
+    const id = notebookStore.activeNotebookId;
+    if (id) await loadSources(id);
+    error = 'Failed to update some sources';
+  }
+}
+
 /** How long (ms) the Undo bar is shown before a stash entry is cleared. */
 const TRASH_UNDO_TTL_MS = 6_000;
 
