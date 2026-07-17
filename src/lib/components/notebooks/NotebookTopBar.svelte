@@ -2,8 +2,8 @@
   // Compact floating pill header — right-aligned, hugging its contents. Same
   // family as the left rail: bg-card surface + the layered --shadow-bar lift, and
   // a Chat/Notes segmented control whose active pill SLIDES on the rail's spring
-  // (--ease-spring, gated by --rail-motion). The outer row + pill are Tauri drag
-  // regions; interactive children (toggle, buttons) stay real controls.
+  // (--ease-spring, gated by --rail-motion). Only the outer row is a Tauri drag
+  // region; the pill stays undragged so its toggle/buttons never fight window-drag.
 
   import Share2 from '@lucide/svelte/icons/share-2';
   import Settings from '@lucide/svelte/icons/settings';
@@ -27,7 +27,6 @@
 <!-- pr-6 lands the pill's right edge on the same 24px line as the composer + message content. -->
 <div data-tauri-drag-region class="flex shrink-0 justify-end pt-2.5 pr-6 pb-1 pl-3">
   <div
-    data-tauri-drag-region
     role="toolbar"
     aria-label="Notebook toolbar"
     class="inline-flex items-center gap-1 rounded-full bg-card py-1 pr-1 shadow-[var(--shadow-bar)] {activeNotebook
@@ -36,7 +35,6 @@
   >
     {#if activeNotebook}
       <span
-        data-tauri-drag-region
         class="max-w-[180px] truncate pr-1 text-xs font-semibold tracking-[-0.1px] text-card-foreground"
         title={activeNotebook.title}
       >
