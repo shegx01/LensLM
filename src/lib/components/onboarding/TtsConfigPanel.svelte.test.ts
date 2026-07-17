@@ -126,18 +126,16 @@ afterEach(() => {
 describe('TtsConfigPanel — voices', () => {
   it('persists the default host/guest voices reactively right after download completes (no Save button)', async () => {
     let written: AppConfig | null = null;
-    const oncheck = vi.fn().mockResolvedValue(undefined);
-    const oncollapse = vi.fn();
     const listVoicesSpy = vi.fn();
     // The panel re-checks on-disk presence after a download reports done, so a
-    // genuinely-complete download must flip `tts_model_downloaded` to true.
+    // genuinely-complete download must flip `tts_model_status` to 'complete'.
     let modelOnDisk = false;
     mockIPC((cmd, args) => {
       if (cmd === 'download_tts_model') {
         modelOnDisk = true;
         return driveDownload(args);
       }
-      if (cmd === 'tts_model_downloaded') return modelOnDisk;
+      if (cmd === 'tts_model_status') return modelOnDisk ? 'complete' : 'absent';
       if (cmd === 'tts_engine_catalog') return catalogFixture();
       if (cmd === 'list_tts_voices') {
         listVoicesSpy();
@@ -150,7 +148,7 @@ describe('TtsConfigPanel — voices', () => {
       }
     });
 
-    render(TtsConfigPanel, { props: { oncheck, oncollapse } });
+    render(TtsConfigPanel);
     // Wait for the catalog fetch to resolve so `selectedEntry` (and its preset_voices) is populated
     // before Download runs.
     await waitFor(() => expect(screen.getAllByText(/english only/i).length).toBeGreaterThan(0));
@@ -166,9 +164,6 @@ describe('TtsConfigPanel — voices', () => {
       host: 'leo',
       guest: 'tara'
     });
-    // Reactive persist does not drive the onboarding re-check/collapse flow.
-    expect(oncheck).not.toHaveBeenCalled();
-    expect(oncollapse).not.toHaveBeenCalled();
     // Preset voices come from the catalog, not a runtime IPC round trip.
     expect(listVoicesSpy).not.toHaveBeenCalled();
   });
@@ -181,7 +176,7 @@ describe('TtsConfigPanel — voices', () => {
         modelOnDisk = true;
         return driveDownload(args);
       }
-      if (cmd === 'tts_model_downloaded') return modelOnDisk;
+      if (cmd === 'tts_model_status') return modelOnDisk ? 'complete' : 'absent';
       if (cmd === 'tts_engine_catalog')
         return catalogFixture({
           orpheusVoices: [
@@ -196,7 +191,7 @@ describe('TtsConfigPanel — voices', () => {
       }
     });
 
-    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+    render(TtsConfigPanel);
     await waitFor(() => expect(screen.getAllByText(/english only/i).length).toBeGreaterThan(0));
     await fireEvent.click(screen.getByRole('button', { name: /download voice engine/i }));
     await waitFor(() => expect(screen.getByText(/voice engine ready/i)).toBeInTheDocument());
@@ -234,7 +229,7 @@ describe('TtsConfigPanel — voices', () => {
         modelOnDisk = true;
         return driveDownload(args);
       }
-      if (cmd === 'tts_model_downloaded') return modelOnDisk;
+      if (cmd === 'tts_model_status') return modelOnDisk ? 'complete' : 'absent';
       if (cmd === 'tts_engine_catalog') return catalogFixture({ orpheusVoices: [] });
       if (cmd === 'get_config') return baseConfig();
       if (cmd === 'set_config') {
@@ -243,7 +238,7 @@ describe('TtsConfigPanel — voices', () => {
       }
     });
 
-    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+    render(TtsConfigPanel);
     await fireEvent.click(screen.getByRole('button', { name: /download voice engine/i }));
 
     await waitFor(() =>
@@ -265,7 +260,7 @@ describe('TtsConfigPanel — cloud (OpenAI-compatible, reactive, #195)', () => {
       if (cmd === 'tts_engine_catalog') return catalogFixture();
     });
 
-    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+    render(TtsConfigPanel);
     await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
 
     expect(screen.queryByRole('button', { name: /^save$/i })).not.toBeInTheDocument();
@@ -277,7 +272,7 @@ describe('TtsConfigPanel — cloud (OpenAI-compatible, reactive, #195)', () => {
       if (cmd === 'tts_engine_catalog') return catalogFixture();
     });
 
-    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+    render(TtsConfigPanel);
     await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
 
     expect(screen.getByText(/groq/i)).toBeInTheDocument();
@@ -291,7 +286,7 @@ describe('TtsConfigPanel — cloud (OpenAI-compatible, reactive, #195)', () => {
       if (cmd === 'tts_engine_catalog') return catalogFixture({ cloudVoices: CLOUD_VOICES });
     });
 
-    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+    render(TtsConfigPanel);
     await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
 
     await screen.findByLabelText(/host speaker/i);
@@ -304,8 +299,6 @@ describe('TtsConfigPanel — cloud (OpenAI-compatible, reactive, #195)', () => {
   it('entering a fresh key and blurring persists it and flips Cloud from unavailable to available (catalog re-fetch)', async () => {
     let written: AppConfig | null = null;
     let keySaved = false;
-    const oncheck = vi.fn().mockResolvedValue(undefined);
-    const oncollapse = vi.fn();
     mockIPC((cmd, args) => {
       if (cmd === 'get_config') return baseConfig();
       // Mirrors the real backend: `tts_engine_catalog` re-derives `available` from
@@ -318,7 +311,7 @@ describe('TtsConfigPanel — cloud (OpenAI-compatible, reactive, #195)', () => {
       }
     });
 
-    render(TtsConfigPanel, { props: { oncheck, oncollapse } });
+    render(TtsConfigPanel);
     await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
 
     await waitFor(() => expect(screen.getByText(/requires an api key/i)).toBeInTheDocument());
@@ -342,10 +335,6 @@ describe('TtsConfigPanel — cloud (OpenAI-compatible, reactive, #195)', () => {
 
     await waitFor(() => expect(screen.getByText(/cloud is available/i)).toBeInTheDocument());
     expect(screen.queryByText(/requires an api key/i)).not.toBeInTheDocument();
-
-    // A reactive persist is not a Save-button submit: no re-check, no collapse.
-    expect(oncheck).not.toHaveBeenCalled();
-    expect(oncollapse).not.toHaveBeenCalled();
   });
 
   it('masks a previously-saved key and clears it for fresh entry on focus', async () => {
@@ -365,7 +354,7 @@ describe('TtsConfigPanel — cloud (OpenAI-compatible, reactive, #195)', () => {
       if (cmd === 'set_config') return null;
     });
 
-    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+    render(TtsConfigPanel);
     await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
 
     const keyField = screen.getByLabelText(/api key/i);
@@ -406,7 +395,7 @@ describe('TtsConfigPanel — cloud (OpenAI-compatible, reactive, #195)', () => {
       }
     });
 
-    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+    render(TtsConfigPanel);
     await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
 
     const keyField = screen.getByLabelText(/api key/i);
@@ -432,7 +421,7 @@ describe('TtsConfigPanel — cloud (OpenAI-compatible, reactive, #195)', () => {
       if (cmd === 'get_config') throw new Error('disk full');
     });
 
-    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+    render(TtsConfigPanel);
     await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
 
     const keyField = screen.getByLabelText(/api key/i);
@@ -448,7 +437,7 @@ describe('TtsConfigPanel — cloud (OpenAI-compatible, reactive, #195)', () => {
       if (cmd === 'tts_engine_catalog') return catalogFixture();
     });
 
-    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+    render(TtsConfigPanel);
     await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
 
     await waitFor(() => expect(screen.getByText(/requires an api key/i)).toBeInTheDocument());
@@ -478,7 +467,7 @@ describe('TtsConfigPanel — cloud (OpenAI-compatible, reactive, #195)', () => {
       }
     });
 
-    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+    render(TtsConfigPanel);
     await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
 
     const baseUrlField = screen.getByLabelText(/base url/i);
@@ -508,7 +497,7 @@ describe('TtsConfigPanel — cloud (OpenAI-compatible, reactive, #195)', () => {
       }
     });
 
-    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+    render(TtsConfigPanel);
     await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
 
     const baseUrlField = screen.getByLabelText(/base url/i);
@@ -533,7 +522,7 @@ describe('TtsConfigPanel — cloud (OpenAI-compatible, reactive, #195)', () => {
       }
     });
 
-    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+    render(TtsConfigPanel);
     await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
 
     const hostField = screen.getByLabelText(/host speaker/i);
@@ -567,7 +556,7 @@ describe('TtsConfigPanel — cloud (OpenAI-compatible, reactive, #195)', () => {
       }
     });
 
-    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+    render(TtsConfigPanel);
     await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
 
     const hostTrigger = await screen.findByLabelText(/host speaker/i);
@@ -604,7 +593,7 @@ describe('TtsConfigPanel — cloud (OpenAI-compatible, reactive, #195)', () => {
       }
     });
 
-    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+    render(TtsConfigPanel);
     await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
 
     const hostTrigger = await screen.findByLabelText(/host speaker/i);
@@ -621,17 +610,39 @@ describe('TtsConfigPanel — cloud (OpenAI-compatible, reactive, #195)', () => {
     await waitFor(() => expect(written).not.toBeNull());
     expect((written as unknown as AppConfig).voices.host).toBe('my-self-hosted-voice');
   });
+
+  it('retains a typed-but-unblurred custom cloud voice across a tab switch (children stay mounted)', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return cloudKeyedConfig();
+      // No curated cloud voices → the host/guest pickers render as free-text inputs.
+      if (cmd === 'tts_engine_catalog') return catalogFixture();
+    });
+
+    render(TtsConfigPanel);
+    await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
+
+    const hostField = await screen.findByLabelText(/host speaker/i);
+    await waitFor(() => expect(hostField).toHaveValue(''));
+    // Type WITHOUT blurring — the value lives only in child $state.
+    await fireEvent.input(hostField, { target: { value: 'unsaved-voice' } });
+
+    // Switch away and back; always-mounted children must not lose the edit.
+    await fireEvent.click(screen.getByRole('tab', { name: /local/i }));
+    await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
+
+    expect(screen.getByLabelText(/host speaker/i)).toHaveValue('unsaved-voice');
+  });
 });
 
 describe('TtsConfigPanel — local engine detection', () => {
   it('skips the download step and shows voices when the engine is already on disk', async () => {
     mockIPC((cmd) => {
       if (cmd === 'get_config') return { ...baseConfig(), voices: { host: 'leo', guest: 'tara' } };
-      if (cmd === 'tts_model_downloaded') return true;
+      if (cmd === 'tts_model_status') return 'complete';
       if (cmd === 'tts_engine_catalog') return catalogFixture();
     });
 
-    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+    render(TtsConfigPanel);
 
     await waitFor(() => expect(screen.getByText(/voice engine ready/i)).toBeInTheDocument());
     expect(
@@ -645,10 +656,10 @@ describe('TtsConfigPanel — engine selector from the catalog (#194)', () => {
     mockIPC((cmd) => {
       if (cmd === 'get_config') return baseConfig();
       if (cmd === 'tts_engine_catalog') return catalogFixture({ qwenAvailable: false });
-      if (cmd === 'tts_model_downloaded') return false;
+      if (cmd === 'tts_model_status') return 'absent';
     });
 
-    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+    render(TtsConfigPanel);
 
     const orpheusRadio = await screen.findByRole('radio', { name: /orpheus/i });
     expect(orpheusRadio).not.toBeDisabled();
@@ -665,10 +676,10 @@ describe('TtsConfigPanel — engine selector from the catalog (#194)', () => {
     mockIPC((cmd) => {
       if (cmd === 'get_config') return baseConfig();
       if (cmd === 'tts_engine_catalog') return catalogFixture();
-      if (cmd === 'tts_model_downloaded') return false;
+      if (cmd === 'tts_model_status') return 'absent';
     });
 
-    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+    render(TtsConfigPanel);
 
     await waitFor(() => expect(screen.getByText('~2.3 GB')).toBeInTheDocument());
     expect(screen.getAllByText(/english only/i).length).toBeGreaterThan(0);
@@ -681,16 +692,14 @@ describe('TtsConfigPanel — engine selector from the catalog (#194)', () => {
     mockIPC((cmd, args) => {
       if (cmd === 'get_config') return baseConfig();
       if (cmd === 'tts_engine_catalog') return catalogFixture({ qwenAvailable: true });
-      if (cmd === 'tts_model_downloaded') return true;
+      if (cmd === 'tts_model_status') return 'complete';
       if (cmd === 'set_config') {
         written = (args as { config: AppConfig }).config;
         return null;
       }
     });
 
-    render(TtsConfigPanel, {
-      props: { oncheck: vi.fn().mockResolvedValue(undefined), oncollapse: vi.fn() }
-    });
+    render(TtsConfigPanel);
 
     const qwenRadio = await screen.findByRole('radio', { name: /qwen3-tts/i });
     await fireEvent.click(qwenRadio);
@@ -716,16 +725,14 @@ describe('TtsConfigPanel — engine selector from the catalog (#194)', () => {
           tts: { version: 1, backend: 'orpheus' as const, model: '', cloud: savedCloud }
         };
       if (cmd === 'tts_engine_catalog') return catalogFixture({ qwenAvailable: true });
-      if (cmd === 'tts_model_downloaded') return true;
+      if (cmd === 'tts_model_status') return 'complete';
       if (cmd === 'set_config') {
         written = (args as { config: AppConfig }).config;
         return null;
       }
     });
 
-    render(TtsConfigPanel, {
-      props: { oncheck: vi.fn().mockResolvedValue(undefined), oncollapse: vi.fn() }
-    });
+    render(TtsConfigPanel);
 
     const qwenRadio = await screen.findByRole('radio', { name: /qwen3-tts/i });
     await fireEvent.click(qwenRadio);
@@ -744,14 +751,14 @@ describe('TtsConfigPanel — engine selector from the catalog (#194)', () => {
     mockIPC((cmd) => {
       if (cmd === 'get_config') return baseConfig();
       if (cmd === 'tts_engine_catalog') return catalogFixture({ qwenAvailable: true });
-      if (cmd === 'tts_model_downloaded') return true;
+      if (cmd === 'tts_model_status') return 'complete';
       if (cmd === 'list_tts_voices') {
         listVoicesSpy();
         return [];
       }
     });
 
-    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+    render(TtsConfigPanel);
 
     const qwenRadio = await screen.findByRole('radio', { name: /qwen3-tts/i });
     await fireEvent.click(qwenRadio);
@@ -770,15 +777,15 @@ describe('TtsConfigPanel — Qwen3-TTS prepare/download (#194)', () => {
     mockIPC((cmd, args) => {
       if (cmd === 'get_config') return baseConfig();
       if (cmd === 'tts_engine_catalog') return catalogFixture({ qwenAvailable: true });
-      if (cmd === 'tts_model_downloaded') {
+      if (cmd === 'tts_model_status') {
         // Qwen presence check ignores `model` — assert it's called with the
         // empty-string sentinel from the handoff contract.
         expect((args as { engine: string; model: string }).model).toBe('');
-        return (args as { engine: string }).engine !== 'qwen3_local';
+        return (args as { engine: string }).engine !== 'qwen3_local' ? 'complete' : 'absent';
       }
     });
 
-    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+    render(TtsConfigPanel);
 
     const qwenRadio = await screen.findByRole('radio', { name: /qwen3-tts/i });
     await fireEvent.click(qwenRadio);
@@ -798,8 +805,10 @@ describe('TtsConfigPanel — Qwen3-TTS prepare/download (#194)', () => {
     mockIPC((cmd, args) => {
       if (cmd === 'get_config') return baseConfig();
       if (cmd === 'tts_engine_catalog') return catalogFixture({ qwenAvailable: true });
-      if (cmd === 'tts_model_downloaded')
-        return (args as { engine: string }).engine !== 'qwen3_local' || qwenReady;
+      if (cmd === 'tts_model_status')
+        return (args as { engine: string }).engine !== 'qwen3_local' || qwenReady
+          ? 'complete'
+          : 'absent';
       if (cmd === 'prepare_qwen_model') {
         prepareSpy();
         qwenReady = true;
@@ -811,7 +820,7 @@ describe('TtsConfigPanel — Qwen3-TTS prepare/download (#194)', () => {
       }
     });
 
-    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+    render(TtsConfigPanel);
 
     const qwenRadio = await screen.findByRole('radio', { name: /qwen3-tts/i });
     await fireEvent.click(qwenRadio);
@@ -838,10 +847,10 @@ describe('TtsConfigPanel — Qwen3-TTS prepare/download (#194)', () => {
           tts: { version: 1, backend: 'qwen3_local' as const, model: '', cloud: null }
         };
       if (cmd === 'tts_engine_catalog') return catalogFixture({ qwenAvailable: true });
-      if (cmd === 'tts_model_downloaded') return true;
+      if (cmd === 'tts_model_status') return 'complete';
     });
 
-    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+    render(TtsConfigPanel);
 
     await waitFor(() => expect(screen.getByText(/voice engine ready/i)).toBeInTheDocument());
     expect(
@@ -853,12 +862,12 @@ describe('TtsConfigPanel — Qwen3-TTS prepare/download (#194)', () => {
     mockIPC((cmd, args) => {
       if (cmd === 'get_config') return baseConfig();
       if (cmd === 'tts_engine_catalog') return catalogFixture({ qwenAvailable: true });
-      if (cmd === 'tts_model_downloaded')
-        return (args as { engine: string }).engine !== 'qwen3_local';
+      if (cmd === 'tts_model_status')
+        return (args as { engine: string }).engine !== 'qwen3_local' ? 'complete' : 'absent';
       if (cmd === 'prepare_qwen_model') throw new Error('download failed');
     });
 
-    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+    render(TtsConfigPanel);
 
     const qwenRadio = await screen.findByRole('radio', { name: /qwen3-tts/i });
     await fireEvent.click(qwenRadio);
@@ -874,17 +883,17 @@ describe('TtsConfigPanel — Qwen3-TTS prepare/download (#194)', () => {
 describe('TtsConfigPanel — incomplete-model re-download affordance', () => {
   it('surfaces a "Model incomplete — re-download" affordance when a finished download fails its presence re-check', async () => {
     // download_tts_model reports done, but the on-disk presence check keeps
-    // returning false (a truncated/partial artifact) — the panel must NOT flip
+    // returning absent (a truncated/partial artifact) — the panel must NOT flip
     // to ready; it must offer a re-download instead.
     mockIPC((cmd, args) => {
       if (cmd === 'download_tts_model') return driveDownload(args);
-      if (cmd === 'tts_model_downloaded') return false;
+      if (cmd === 'tts_model_status') return 'absent';
       if (cmd === 'tts_engine_catalog') return catalogFixture();
       if (cmd === 'get_config') return baseConfig();
       if (cmd === 'set_config') return null;
     });
 
-    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+    render(TtsConfigPanel);
     await waitFor(() => expect(screen.getAllByText(/english only/i).length).toBeGreaterThan(0));
     await fireEvent.click(screen.getByRole('button', { name: /download voice engine/i }));
 
@@ -901,11 +910,11 @@ describe('TtsConfigPanel — incomplete-model re-download affordance', () => {
   it('hides the re-download affordance and shows "ready" when the engine is genuinely on disk', async () => {
     mockIPC((cmd) => {
       if (cmd === 'get_config') return { ...baseConfig(), voices: { host: 'leo', guest: 'tara' } };
-      if (cmd === 'tts_model_downloaded') return true;
+      if (cmd === 'tts_model_status') return 'complete';
       if (cmd === 'tts_engine_catalog') return catalogFixture();
     });
 
-    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+    render(TtsConfigPanel);
 
     await waitFor(() => expect(screen.getByText(/voice engine ready/i)).toBeInTheDocument());
     expect(screen.queryByRole('button', { name: /re-download/i })).not.toBeInTheDocument();
@@ -923,12 +932,12 @@ describe('TtsConfigPanel — incomplete-model re-download affordance', () => {
         ch?.onmessage?.({ received: 50, total: 100, done: false });
         return new Promise(() => {});
       }
-      if (cmd === 'tts_model_downloaded') return false;
+      if (cmd === 'tts_model_status') return 'absent';
       if (cmd === 'tts_engine_catalog') return catalogFixture();
       if (cmd === 'get_config') return baseConfig();
     });
 
-    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+    render(TtsConfigPanel);
     await waitFor(() => expect(screen.getAllByText(/english only/i).length).toBeGreaterThan(0));
     await fireEvent.click(screen.getByRole('button', { name: /download voice engine/i }));
 
@@ -946,11 +955,10 @@ describe('TtsConfigPanel — incomplete local download (#195)', () => {
     mockIPC((cmd) => {
       if (cmd === 'get_config') return baseConfig();
       if (cmd === 'tts_engine_catalog') return catalogFixture();
-      if (cmd === 'tts_model_downloaded') return false;
-      if (cmd === 'tts_model_incomplete') return true;
+      if (cmd === 'tts_model_status') return 'partial';
     });
 
-    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+    render(TtsConfigPanel);
 
     expect(
       await screen.findByRole('button', { name: /model incomplete.*re-download/i })
@@ -961,11 +969,10 @@ describe('TtsConfigPanel — incomplete local download (#195)', () => {
     mockIPC((cmd) => {
       if (cmd === 'get_config') return baseConfig();
       if (cmd === 'tts_engine_catalog') return catalogFixture();
-      if (cmd === 'tts_model_downloaded') return false;
-      if (cmd === 'tts_model_incomplete') return false;
+      if (cmd === 'tts_model_status') return 'absent';
     });
 
-    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+    render(TtsConfigPanel);
 
     expect(
       await screen.findByRole('button', { name: /download voice engine/i })

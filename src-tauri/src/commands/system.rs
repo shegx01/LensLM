@@ -4,7 +4,7 @@ use lens_core::{
     CheckResult, DownloadProgress, InstallProgress, LensEngine, LensError, LlmDetection, TtsVoice,
     WHISPER_REGISTRY,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::Manager;
 use tauri::ipc::Channel;
 
@@ -211,51 +211,48 @@ pub async fn download_tts_model(
     .map(|_| ())
 }
 
-/// Returns whether the given TTS model artifact is already on disk, so the
-/// onboarding/Settings UI can skip the download step. Mirrors `whisper_model_downloaded`.
-/// `engine == "qwen3_local"` (#194) is special-cased: Qwen's weights live in the
-/// huggingface_hub cache, so presence is an HF-snapshot check and `model` is ignored.
-#[tracing::instrument(skip_all, fields(engine = %engine, model = %model))]
-#[tauri::command(rename_all = "snake_case")]
-pub async fn tts_model_downloaded(
-    engine: String,
-    model: String,
-    app: tauri::AppHandle,
-) -> Result<bool, LensError> {
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    if engine == "qwen3_local" {
-        let paths = crate::qwen::sidecar_paths(&app)?;
-        return Ok(crate::qwen::qwen_snapshot_present(&paths.hf_cache_dir));
-    }
-    let data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| LensError::Io(e.to_string()))?;
-    Ok(lens_core::tts_model_downloaded(&data_dir, &model))
+/// Tri-state download status of a TTS model artifact: fully downloaded, present
+/// but incomplete (a truncated/interrupted download), or not present at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TtsModelStatus {
+    Complete,
+    Partial,
+    Absent,
 }
 
-/// Whether the selected engine's model is PARTIALLY present — on disk but not
-/// complete (a truncated/interrupted download) — vs never downloaded.
-/// Mirrors `tts_model_downloaded`'s per-engine dispatch.
+/// Returns the download status of the given TTS model artifact so the UI can skip
+/// the download step or offer a re-download. `engine == "qwen3_local"` (#194) is
+/// special-cased: presence is an HF-snapshot check in the hub cache (`model` ignored).
 #[tracing::instrument(skip_all, fields(engine = %engine, model = %model))]
 #[tauri::command(rename_all = "snake_case")]
-pub async fn tts_model_incomplete(
+pub async fn tts_model_status(
     engine: String,
     model: String,
     app: tauri::AppHandle,
-) -> Result<bool, LensError> {
+) -> Result<TtsModelStatus, LensError> {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if engine == "qwen3_local" {
         let paths = crate::qwen::sidecar_paths(&app)?;
-        return Ok(crate::qwen::qwen_snapshot_dir_present(&paths.hf_cache_dir)
-            && !crate::qwen::qwen_snapshot_present(&paths.hf_cache_dir));
+        return Ok(if crate::qwen::qwen_snapshot_present(&paths.hf_cache_dir) {
+            TtsModelStatus::Complete
+        } else if crate::qwen::qwen_snapshot_dir_present(&paths.hf_cache_dir) {
+            TtsModelStatus::Partial
+        } else {
+            TtsModelStatus::Absent
+        });
     }
     let data_dir = app
         .path()
         .app_data_dir()
         .map_err(|e| LensError::Io(e.to_string()))?;
-    Ok(lens_core::tts_model_file_present(&data_dir, &model)
-        && !lens_core::tts_model_downloaded(&data_dir, &model))
+    Ok(if lens_core::tts_model_downloaded(&data_dir, &model) {
+        TtsModelStatus::Complete
+    } else if lens_core::tts_model_file_present(&data_dir, &model) {
+        TtsModelStatus::Partial
+    } else {
+        TtsModelStatus::Absent
+    })
 }
 
 /// Explicitly downloads the Qwen3-TTS MLX model (~4.5 GB) via a one-shot sidecar
@@ -329,7 +326,7 @@ pub async fn download_whisper_model(
 }
 
 /// Returns whether the given Whisper model is already on disk, so the
-/// onboarding UI can skip the download step. Mirrors `tts_model_downloaded`.
+/// onboarding UI can skip the download step.
 #[tracing::instrument(skip_all, fields(model = %model))]
 #[tauri::command(rename_all = "snake_case")]
 pub async fn whisper_model_downloaded(
