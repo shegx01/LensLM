@@ -1,11 +1,8 @@
-//! Offline integration tests for the per-source `language` column (#194 / 161f).
+//! Offline integration tests for the per-source `language` column (#194).
 //!
-//! Guards pre-mortem #2: adding `language` to the `Source` `FromRow` struct must
-//! not break any `SELECT ... FROM sources` mapped into `Source`. Exercises the
-//! runtime-caught listing paths (`list_sources` via `query_as`, and
-//! `list_trashed_sources` via the grep-missed manual `try_get` mapping) so a
-//! missing column surfaces here, not at app boot. Fully offline — no embedder,
-//! tokenizer, or network.
+//! Verifies that adding `language` to the `Source` mapping doesn't break any
+//! `SELECT ... FROM sources` query; exercises `list_sources` and
+//! `list_trashed_sources`. Fully offline — no embedder, tokenizer, or network.
 
 use lens_core::LensEngine;
 

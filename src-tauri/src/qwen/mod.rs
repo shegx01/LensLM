@@ -323,9 +323,7 @@ impl QwenSidecar {
     ) -> Result<AudioBuffer, TurnError> {
         let (_, stdin, reader) = cell.as_mut().ok_or(TurnError::Dead)?;
 
-        // `language` defaults to "auto" (Qwen3-TTS auto-detects) until #28/#161 threads a
-        // notebook-resolved language here; validation via `validate_qwen_language` in
-        // lens-core activates with that work.
+        // "auto" until #28/#161 — see validate_qwen_language in lens-core/src/tts/catalog.rs.
         let request = serde_json::json!({
             "id": id,
             "op": "synth",

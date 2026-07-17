@@ -168,7 +168,6 @@ describe('TtsConfigPanel — voices', () => {
     // relying on PointerEvent pointer-capture semantics happy-dom doesn't model.
     await fireEvent.keyDown(trigger, { key: 'Enter' });
 
-    // Both preset voices render as options, sourced straight from preset_voices.
     const leoOption = await screen.findByRole('option', { name: 'Leo' });
     const miloOption = screen.getByRole('option', { name: 'Milo' });
     expect(leoOption).toBeInTheDocument();
@@ -179,7 +178,6 @@ describe('TtsConfigPanel — voices', () => {
 
     await waitFor(() => expect(trigger).toHaveTextContent('Milo'));
 
-    // No Save click — selecting a voice persists on its own.
     await waitFor(() => expect(written).not.toBeNull());
     expect((written as unknown as AppConfig).voices.host).toBe('milo');
   });
@@ -389,7 +387,6 @@ describe('TtsConfigPanel — engine selector from the catalog (#194)', () => {
     // (no native `.value`), so assert the displayed voice name instead of a form value.
     await waitFor(() => expect(screen.getByLabelText(/^host voice/i)).toHaveTextContent('Leo'));
 
-    // Switching engine persists on its own — no Save button on the Local tab.
     expect(screen.queryByRole('button', { name: /save voice settings/i })).not.toBeInTheDocument();
     await waitFor(() => expect(written).not.toBeNull());
     expect((written as unknown as AppConfig).tts.backend).toBe('qwen3_local');
@@ -508,7 +505,6 @@ describe('TtsConfigPanel — Qwen3-TTS prepare/download (#194)', () => {
     expect(prepareSpy).toHaveBeenCalledOnce();
     await waitFor(() => expect(screen.getByText(/voice engine ready/i)).toBeInTheDocument());
 
-    // Voices come from the static catalog's preset_voices, same as Orpheus.
     await waitFor(() => expect(screen.getByLabelText(/^host voice/i)).toHaveTextContent('Leo'));
     expect(screen.getByLabelText(/co-host voice/i)).toHaveTextContent('Tara');
 

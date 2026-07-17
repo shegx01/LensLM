@@ -1118,8 +1118,7 @@ impl IngestContext<'_> {
 
 /// Offline language detection over the canonical extracted text. Returns the
 /// whatlang ISO 639-3 code (e.g. `eng`, `cmn`) only when detection is RELIABLE;
-/// short/mixed/code-heavy text yields `None` (left NULL). Deterministic, in-process,
-/// µs-scale — never LLM enrichment. No panics.
+/// short/mixed/code-heavy text yields `None` (left NULL). Deterministic and offline.
 fn detect_language(text: &str) -> Option<String> {
     let info = whatlang::detect(text)?;
     if !info.is_reliable() {

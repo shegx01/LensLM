@@ -157,10 +157,9 @@ where
 }
 
 /// Whether the Qwen model snapshot is present AND complete under `hf_cache_dir`
-/// (which the resolver points `HF_HOME` at): a revision must resolve BOTH
+/// (the resolver points `HF_HOME` here): a revision must resolve BOTH
 /// `config.json` and a `*.safetensors` weight through its symlinks, with no
-/// `blobs/*.incomplete` partial (huggingface_hub leaves those mid-download).
-/// Assumes the plain-HTTPS cache layout forced by `HF_HUB_DISABLE_XET=1`.
+/// `blobs/*.incomplete` partial. Assumes `HF_HUB_DISABLE_XET=1`'s plain-HTTPS layout.
 pub fn qwen_snapshot_present(hf_cache_dir: &Path) -> bool {
     let model_dir = hf_cache_dir.join("hub").join(QWEN_SNAPSHOT_DIR);
     if has_incomplete_blob(&model_dir.join("blobs")) {
@@ -171,9 +170,6 @@ pub fn qwen_snapshot_present(hf_cache_dir: &Path) -> bool {
     };
     for entry in entries.flatten() {
         let rev = entry.path();
-        // Require BOTH the config sentinel and a weight file: an interrupt between
-        // files (config symlinked, weights not yet started → no `.incomplete`)
-        // must read as absent, not silently re-fetch multi-GB at first synth.
         // `exists()` follows each symlink into `blobs/`, so a dangling link (blob
         // not yet downloaded) correctly reads as absent.
         if rev.is_dir() && rev.join("config.json").exists() && has_resolvable_safetensors(&rev) {

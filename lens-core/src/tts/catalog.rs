@@ -1,21 +1,14 @@
-//! Static per-engine TTS capability catalog + language model (#194 / 161f).
+//! Static per-engine TTS capability catalog + language model (#194).
 //!
-//! Single source of truth for both the engine selector and the language guard.
-//! Keyed by a NON-cfg-gated [`TtsEngineId`] so every engine (incl. `Qwen3Local`
-//! off Apple Silicon) is enumerable on every platform; the cfg-gated
-//! [`TtsBackend`] is used only for dispatch.
-//!
-//! The guard/validation/mapping `pub` symbols are exercised by tests and
-//! re-exported for callers; they are wired into the live synth path in #28/#161.
+//! Single source of truth for the engine selector and the language guard;
+//! keyed by a non-cfg-gated [`TtsEngineId`] so every engine is enumerable on
+//! every platform (the cfg-gated [`TtsBackend`] is used only for dispatch).
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::LensError;
 use crate::tts::{CloudTtsKind, Gender, TtsBackend, TtsVoice};
 
-/// A Qwen3-TTS CustomVoice preset: a fixed speaker selected by `id`, delivery
-/// steered by an `instruct` string (no reference clip, no transcript).
-///
 /// Lives here (not the Apple-Silicon-gated `qwen` adapter) so the catalog can
 /// enumerate presets on every platform.
 pub struct QwenVoice {
@@ -60,8 +53,7 @@ pub static QWEN_VOICES: &[QwenVoice] = &[
     },
 ];
 
-/// Resolves a preset voice by id (used by `src-tauri` to map a `VoiceRef::Named(id)`
-/// to its speaker id + instruct string).
+/// Used by `src-tauri` to map a `VoiceRef::Named(id)` to its speaker id + instruct string.
 pub fn qwen_voice(id: &str) -> Option<&'static QwenVoice> {
     QWEN_VOICES.iter().find(|v| v.id == id)
 }
@@ -92,10 +84,8 @@ pub enum Lang {
     Hindi,
 }
 
-/// Languages the Orpheus backend can synthesize. English only.
 const ORPHEUS_LANGS: &[Lang] = &[Lang::English];
 
-/// Languages the Qwen3Local backend can synthesize (the shipped 10).
 const QWEN_LANGS: &[Lang] = &[
     Lang::Chinese,
     Lang::English,
@@ -221,7 +211,6 @@ impl TtsEngineId {
     }
 }
 
-/// Platform on which an engine can run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Platform {
@@ -251,10 +240,8 @@ pub struct EngineCapability {
     pub language_capability_label: &'static str,
 }
 
-// Approximate download sizes for the always-visible size label (display only).
 // Orpheus = the Q4_K_M 3B GGUF (~2.3 GB; the paired SNAC decoder is small).
-// Qwen3Local = the mlx-community CustomVoice weights mlx-audio fetches lazily
-// (~4.5 GB, per the sidecar). Cloud downloads nothing.
+// Qwen3Local = the mlx-community CustomVoice weights mlx-audio fetches lazily (~4.5 GB).
 const ORPHEUS_SIZE_BYTES: u64 = 2_300_000_000;
 const QWEN_SIZE_BYTES: u64 = 4_500_000_000;
 
@@ -587,7 +574,6 @@ mod tests {
         let all_unknown = vec![("s1".to_string(), None), ("s2".to_string(), None)];
         assert!(evaluate_language_guard(TtsEngineId::Orpheus, &all_unknown).allow);
 
-        // One unknown among supported does not block either.
         let mixed = vec![
             ("s1".to_string(), Some(Lang::English)),
             ("s2".to_string(), None),
@@ -685,7 +671,6 @@ mod tests {
         assert!(cloud.supported_languages.is_empty());
         assert!(cloud.required_model_ids.is_empty());
 
-        // With a key, Cloud becomes available.
         let with_key = tts_catalog_serialized(true);
         let cloud = with_key
             .iter()

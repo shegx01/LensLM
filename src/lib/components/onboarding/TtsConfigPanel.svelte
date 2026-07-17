@@ -143,8 +143,8 @@
     }
   });
 
-  /** Switch the Local-tab engine. Selection persists reactively via persistLocalTts —
-   *  safe because nextTtsConfig preserves a saved Cloud key regardless of local writes. */
+  /** Switch the Local-tab engine. Selection persists reactively via persistLocalTts
+   *  (see nextTtsConfig in system-check.ts for the Cloud-key-preserving rule). */
   async function pickEngine(id: TtsEngineId): Promise<void> {
     if (id === 'cloud' || id === selectedEngine) return;
     const entry = catalog.find((e) => e.id === id);
@@ -195,13 +195,11 @@
       }
       downloadProgress = 100;
       downloaded = true;
-      // Preset voices come from the static catalog (list_tts_voices is reserved
-      // for runtime synthesis — the sidecar may not be running during setup).
+      // list_tts_voices is reserved for runtime synth — the sidecar may not be running during setup.
       voices = selectedEntry?.preset_voices ?? [];
       voicesUnavailable = voices.length === 0;
       if (maleVoices.length > 0) maleVoice = maleVoices[0].id;
       if (femaleVoices.length > 0) femaleVoice = femaleVoices[0].id;
-      // Don't persist fake/empty voice IDs when the catalog has none for this engine.
       if (!voicesUnavailable) void persistLocalTts();
     } catch (err) {
       downloadError = err instanceof Error ? err.message : 'Download failed.';
@@ -209,9 +207,8 @@
     }
   }
 
-  /** Persist the current host/guest voice + backend selection. Routed through the shared
-   *  cloud-preserving helper (single owner of the backend/cloud rule) so a saved Cloud key
-   *  survives a local-engine change. */
+  /** Persist the current host/guest voice + backend selection via the shared
+   *  cloud-preserving helper (see nextTtsConfig in system-check.ts). */
   async function persistLocalTts(): Promise<void> {
     saveError = null;
     try {

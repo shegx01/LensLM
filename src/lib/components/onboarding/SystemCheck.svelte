@@ -34,7 +34,7 @@
     try {
       // runSystemCheck returns the two onboarding readiness gates (llm_runtime,
       // embedding_model); the legacy text_to_speech gate is filtered out (TTS
-      // setup moved to Settings). Re-checks flip a row's pass↔fail status.
+      // setup moved to Settings).
       results = await runSystemCheck();
     } catch (err) {
       console.error('SystemCheck: runSystemCheck failed', err);

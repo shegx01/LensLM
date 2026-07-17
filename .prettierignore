@@ -9,3 +9,6 @@ bun.lock
 Cargo.lock
 # shadcn-svelte generated primitives — registry-owned, formatted upstream
 src/lib/components/ui/
+# Python sidecar virtualenv + pytest cache (local, gitignored) — third-party, never format
+**/.venv/
+**/.pytest_cache/

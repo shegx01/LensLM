@@ -113,7 +113,7 @@ def handle_synth(model, speaker_map: dict, req: dict) -> str:
         raise ValueError(f"unknown speaker: {speaker!r}")
 
     instruct = req.get("instruct")
-    # Language is driven by the Rust host (#194); "auto" lets Qwen3-TTS detect it.
+    # "auto" until #28/#161 — see validate_qwen_language in lens-core/src/tts/catalog.rs.
     language = req.get("language", "auto")
     temperature, max_tokens = resolve_gen_params(req)
 

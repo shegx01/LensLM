@@ -103,10 +103,8 @@ fn resolve_voices(cfg: &lens_core::TtsConfig, data_dir: &std::path::Path) -> Vec
 }
 
 /// Returns the static per-engine TTS capability catalog (#194) for the Settings
-/// engine selector: platform, needs_key, availability (Qwen off Apple Silicon,
-/// Cloud without a key), supported languages, preset voices, model size, and the
-/// language-capability label. This is the selector's single source of truth —
-/// distinct from `list_tts_voices` (reserved for runtime synthesis).
+/// engine selector — the selector's single source of truth, distinct from
+/// `list_tts_voices` (reserved for runtime synthesis).
 #[tracing::instrument(skip_all)]
 #[tauri::command]
 pub async fn tts_engine_catalog(
@@ -174,10 +172,8 @@ pub async fn download_tts_model(
 
 /// Returns whether the given TTS model artifact is already on disk, so the
 /// onboarding/Settings UI can skip the download step. Mirrors `whisper_model_downloaded`.
-///
-/// `engine == "qwen3_local"` (#194) is special-cased: Qwen's MLX weights live in
-/// the huggingface_hub cache (not the `models/<id>/` registry), so presence is the
-/// HF-snapshot check under `HF_HOME` and `model` is ignored. Apple-Silicon only.
+/// `engine == "qwen3_local"` (#194) is special-cased: Qwen's weights live in the
+/// huggingface_hub cache, so presence is an HF-snapshot check and `model` is ignored.
 #[tracing::instrument(skip_all, fields(engine = %engine, model = %model))]
 #[tauri::command(rename_all = "snake_case")]
 pub async fn tts_model_downloaded(
@@ -198,10 +194,9 @@ pub async fn tts_model_downloaded(
 }
 
 /// Explicitly downloads the Qwen3-TTS MLX model (~4.5 GB) via a one-shot sidecar
-/// `--prepare` process, streaming byte progress on `on_progress` (#194) using the
-/// same `Channel<DownloadProgress>` progress contract as `download_tts_model` (not
-/// its arg casing — this command takes camelCase `onProgress`). Qwen's weights are
-/// otherwise fetched lazily by the sidecar on first synth. Apple-Silicon only.
+/// `--prepare` process, streaming progress via `on_progress` — NOTE: this command
+/// takes camelCase `onProgress`, unlike `download_tts_model`'s snake_case arg.
+/// Apple-Silicon only.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[tracing::instrument(skip_all)]
 #[tauri::command]
