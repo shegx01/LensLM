@@ -110,8 +110,15 @@ describe('TtsConfigPanel — voices', () => {
     const oncheck = vi.fn().mockResolvedValue(undefined);
     const oncollapse = vi.fn();
     const listVoicesSpy = vi.fn();
+    // The panel re-checks on-disk presence after a download reports done, so a
+    // genuinely-complete download must flip `tts_model_downloaded` to true.
+    let modelOnDisk = false;
     mockIPC((cmd, args) => {
-      if (cmd === 'download_tts_model') return driveDownload(args);
+      if (cmd === 'download_tts_model') {
+        modelOnDisk = true;
+        return driveDownload(args);
+      }
+      if (cmd === 'tts_model_downloaded') return modelOnDisk;
       if (cmd === 'tts_engine_catalog') return catalogFixture();
       if (cmd === 'list_tts_voices') {
         listVoicesSpy();
@@ -149,8 +156,13 @@ describe('TtsConfigPanel — voices', () => {
 
   it('opens the host-voice picker, lists options from preset_voices, and selecting one persists immediately', async () => {
     let written: AppConfig | null = null;
+    let modelOnDisk = false;
     mockIPC((cmd, args) => {
-      if (cmd === 'download_tts_model') return driveDownload(args);
+      if (cmd === 'download_tts_model') {
+        modelOnDisk = true;
+        return driveDownload(args);
+      }
+      if (cmd === 'tts_model_downloaded') return modelOnDisk;
       if (cmd === 'tts_engine_catalog')
         return catalogFixture({
           orpheusVoices: [
@@ -197,8 +209,13 @@ describe('TtsConfigPanel — voices', () => {
 
   it('shows an inline error and no voice picker when the voice list is empty (no stub voices, no persist)', async () => {
     const setConfig = vi.fn();
+    let modelOnDisk = false;
     mockIPC((cmd, args) => {
-      if (cmd === 'download_tts_model') return driveDownload(args);
+      if (cmd === 'download_tts_model') {
+        modelOnDisk = true;
+        return driveDownload(args);
+      }
+      if (cmd === 'tts_model_downloaded') return modelOnDisk;
       if (cmd === 'tts_engine_catalog') return catalogFixture({ orpheusVoices: [] });
       if (cmd === 'get_config') return baseConfig();
       if (cmd === 'set_config') {
@@ -729,13 +746,17 @@ describe('TtsConfigPanel — Qwen3-TTS prepare/download (#194)', () => {
   it('clicking Download for Qwen invokes prepare_qwen_model, drives the progress bar, then reveals catalog voices and persists', async () => {
     let written: AppConfig | null = null;
     const prepareSpy = vi.fn();
+    // The Qwen snapshot only reads present after prepare completes; the panel's
+    // post-download re-check must see that flip before revealing voices.
+    let qwenReady = false;
     mockIPC((cmd, args) => {
       if (cmd === 'get_config') return baseConfig();
       if (cmd === 'tts_engine_catalog') return catalogFixture({ qwenAvailable: true });
       if (cmd === 'tts_model_downloaded')
-        return (args as { engine: string }).engine !== 'qwen3_local';
+        return (args as { engine: string }).engine !== 'qwen3_local' || qwenReady;
       if (cmd === 'prepare_qwen_model') {
         prepareSpy();
+        qwenReady = true;
         return drivePrepare(args);
       }
       if (cmd === 'set_config') {
@@ -801,5 +822,75 @@ describe('TtsConfigPanel — Qwen3-TTS prepare/download (#194)', () => {
 
     await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent(/download failed/i));
     expect(screen.getByRole('button', { name: /download voice engine/i })).toBeInTheDocument();
+  });
+});
+
+describe('TtsConfigPanel — incomplete-model re-download affordance', () => {
+  it('surfaces a "Model incomplete — re-download" affordance when a finished download fails its presence re-check', async () => {
+    // download_tts_model reports done, but the on-disk presence check keeps
+    // returning false (a truncated/partial artifact) — the panel must NOT flip
+    // to ready; it must offer a re-download instead.
+    mockIPC((cmd, args) => {
+      if (cmd === 'download_tts_model') return driveDownload(args);
+      if (cmd === 'tts_model_downloaded') return false;
+      if (cmd === 'tts_engine_catalog') return catalogFixture();
+      if (cmd === 'get_config') return baseConfig();
+      if (cmd === 'set_config') return null;
+    });
+
+    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+    await waitFor(() => expect(screen.getAllByText(/english only/i).length).toBeGreaterThan(0));
+    await fireEvent.click(screen.getByRole('button', { name: /download voice engine/i }));
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole('button', { name: /model incomplete — re-download/i })
+      ).toBeInTheDocument()
+    );
+    expect(screen.getByRole('alert')).toHaveTextContent(/didn't complete/i);
+    // Never falsely reports ready.
+    expect(screen.queryByText(/voice engine ready/i)).not.toBeInTheDocument();
+  });
+
+  it('hides the re-download affordance and shows "ready" when the engine is genuinely on disk', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return { ...baseConfig(), voices: { host: 'leo', guest: 'tara' } };
+      if (cmd === 'tts_model_downloaded') return true;
+      if (cmd === 'tts_engine_catalog') return catalogFixture();
+    });
+
+    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+
+    await waitFor(() => expect(screen.getByText(/voice engine ready/i)).toBeInTheDocument());
+    expect(screen.queryByRole('button', { name: /re-download/i })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: /download voice engine/i })
+    ).not.toBeInTheDocument();
+  });
+
+  it('shows no re-download button while a download is in flight (only a disabled "Downloading…")', async () => {
+    // A download that reports partial progress and never resolves keeps the
+    // panel in the in-flight state — the re-download label must not appear.
+    mockIPC((cmd, args) => {
+      if (cmd === 'download_tts_model') {
+        const ch = (args as { onProgress?: { onmessage?: (m: unknown) => void } }).onProgress;
+        ch?.onmessage?.({ received: 50, total: 100, done: false });
+        return new Promise(() => {});
+      }
+      if (cmd === 'tts_model_downloaded') return false;
+      if (cmd === 'tts_engine_catalog') return catalogFixture();
+      if (cmd === 'get_config') return baseConfig();
+    });
+
+    render(TtsConfigPanel, { props: { oncheck: vi.fn(), oncollapse: vi.fn() } });
+    await waitFor(() => expect(screen.getAllByText(/english only/i).length).toBeGreaterThan(0));
+    await fireEvent.click(screen.getByRole('button', { name: /download voice engine/i }));
+
+    await waitFor(() => {
+      const btn = screen.getByRole('button', { name: /downloading/i });
+      expect(btn).toBeDisabled();
+    });
+    expect(screen.queryByRole('button', { name: /re-download/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 });

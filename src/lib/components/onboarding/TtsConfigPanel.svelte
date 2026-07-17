@@ -74,6 +74,10 @@
   let downloadProgress = $state<number | null>(null);
   let downloaded = $state(false);
   let downloadError = $state<string | null>(null);
+  // True when a finished download failed its post-download presence re-check
+  // (a truncated/partial artifact). Drives the "Model incomplete — re-download"
+  // affordance so an incomplete local model always has a recovery path.
+  let incomplete = $state(false);
 
   let voices = $state<TtsVoice[]>([]);
   let maleVoice = $state('');
@@ -223,6 +227,7 @@
 
     selectedEngine = id;
     downloaded = false;
+    incomplete = false;
     downloadProgress = null;
     downloadError = null;
     voices = [];
@@ -251,6 +256,7 @@
 
   async function handleDownload(): Promise<void> {
     downloadError = null;
+    incomplete = false;
     downloadProgress = 0;
     try {
       if (selectedEngine === 'qwen3_local') {
@@ -265,6 +271,14 @@
         }
       }
       downloadProgress = 100;
+      // Re-run the on-disk presence check before flipping to "ready": a download
+      // that reported done can still be truncated/partial. If it isn't actually
+      // complete, surface the re-download affordance instead of a false-ready.
+      if (!(await engineDownloaded())) {
+        incomplete = true;
+        downloadProgress = null;
+        return;
+      }
       downloaded = true;
       // list_tts_voices is reserved for runtime synth — the sidecar may not be running during setup.
       voices = selectedEntry?.preset_voices ?? [];
@@ -455,6 +469,12 @@
           <p class="text-destructive text-[0.75rem]" role="alert">{downloadError}</p>
         {/if}
 
+        {#if incomplete && !(downloadProgress !== null && downloadProgress < 100)}
+          <p class="text-destructive text-[0.75rem]" role="alert">
+            The download didn't complete. Re-download to finish setting up this voice engine.
+          </p>
+        {/if}
+
         <Button
           class="h-10 w-full"
           onclick={handleDownload}
@@ -463,6 +483,9 @@
           {#if downloadProgress !== null && downloadProgress < 100}
             <LoaderCircle class="size-4 animate-spin" />
             Downloading…
+          {:else if incomplete}
+            <Download class="size-4" />
+            Model incomplete — re-download
           {:else}
             <Download class="size-4" />
             Download voice engine
