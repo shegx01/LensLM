@@ -11,36 +11,38 @@ app is ready to distribute.
 Runs on every pull request and on pushes to `main`. Linux-only (`ubuntu-latest`);
 cross-platform bundling is verified later at release time.
 
-| Job               | What it runs                                            | Blocks merge? |
-| ----------------- | ------------------------------------------------------- | ------------- |
-| **Rust (fmt)**    | `cargo fmt --all -- --check`                            | Yes           |
-| **Rust (clippy)** | `cargo clippy --workspace --all-targets -- -D warnings` | Yes           |
-| **Frontend**      | `bun run format:check`, `bun run check`, `bun run test` | Yes           |
-| **E2E**           | Playwright against the SvelteKit dev server             | Yes           |
-| **`signoff`**     | The Rust test suite, run locally — see below            | Yes           |
+| Job               | What it runs                                                     | Blocks merge? |
+| ----------------- | ---------------------------------------------------------------- | ------------- |
+| **Rust (fmt)**    | `cargo fmt --all -- --check`                                     | Yes           |
+| **Rust (clippy)** | `cargo clippy --workspace --all-targets -- -D warnings`          | Yes           |
+| **Rust (test/N)** | `cargo nextest run --workspace --partition count:N/3` (3 shards) | Yes           |
+| **Frontend**      | `bun run format:check`, `bun run check`, `bun run test`          | Yes           |
+| **E2E**           | Playwright against the SvelteKit dev server                      | No (advisory) |
+| **`signoff`**     | The macOS-only Apple-native ASR compile proof — see below        | Yes           |
 
-CI runs fmt + clippy (the Linux compile/lint canary; `clippy --all-targets` also
-compiles the test code) plus the frontend and E2E suites. The **Rust test suite
-runs locally** and is gated by the `signoff` commit status, not by a CI job —
-dev hardware runs it faster than a shared runner, and the macOS-gated tests only
-run there anyway. The shared `.github/actions/rust-env` composite installs the
-Tauri v2 WebKitGTK system libraries (cached) so `src-tauri` compiles; clippy is
-the sole Rust compile job, so it writes the shared cargo cache. Toolchains are
-pinned: Rust `1.94.1` (`rust-toolchain.toml`), Bun `1.2.15` and Node `22.16.0`
-(pinned in the workflow files, mirroring `.tool-versions`).
+CI runs fmt + clippy plus the full Rust test suite (fanned out across 3
+`ubuntu-latest` shards via `cargo nextest --partition`), the frontend suite, and
+E2E. The shared `.github/actions/rust-env` composite installs the Tauri v2
+WebKitGTK system libraries (cached) so `src-tauri` compiles; all Rust jobs share
+one warm cargo cache and test shard 1 is its sole writer. Toolchains are pinned:
+Rust `1.94.1` (`rust-toolchain.toml`), Bun `1.2.15` and Node `22.16.0` (pinned in
+the workflow files, mirroring `.tool-versions`).
 
 ## Local test signoff
 
-The Rust tests are gated by a `signoff` commit status posted with
-[gh-signoff](https://github.com/basecamp/gh-signoff). One-time: `gh extension
-install basecamp/gh-signoff`. Per change, after pushing:
+The bulk Rust suite runs in CI (above). The `signoff` commit status now covers
+only the **macOS-gated Apple-native ASR bridge** (`--features apple-native-asr`,
+aarch64-apple-darwin) — no Linux runner can build it, so it is proven on the
+maintainer's Mac. Posted with [gh-signoff](https://github.com/basecamp/gh-signoff);
+one-time: `gh extension install basecamp/gh-signoff`. Per change, after pushing:
 
 ```
-bun run signoff   # runs `cargo test --workspace`, then `gh signoff` on green
+bun run signoff   # compiles apple-native-asr (--no-run) on macOS, then `gh signoff`
 ```
 
-`gh signoff` refuses to sign a dirty or unpushed tree, so the status always
-matches pushed code. It is an honor-system attestation (no independent
+On a non-macOS host the compile step is skipped and `signoff` is a pure
+attestation. `gh signoff` refuses to sign a dirty or unpushed tree, so the status
+always matches pushed code. It is an honor-system attestation (no independent
 verification) — appropriate for this trusted, single-maintainer repo.
 
 > **Do NOT run `gh signoff install`.** It rewrites classic branch protection and
@@ -70,6 +72,7 @@ required:
 3. Add these checks (they appear after the first CI run):
    - `Rust (fmt)`
    - `Rust (clippy)`
+   - `Rust (test/1)`, `Rust (test/2)`, `Rust (test/3)`
    - `Frontend (format + check + unit tests)`
    - `E2E (Playwright, non-blocking)`
    - `signoff` (posted locally — see [Local test signoff](#local-test-signoff))
