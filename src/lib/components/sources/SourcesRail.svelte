@@ -263,7 +263,7 @@
         title={allSelected ? 'Deselect all' : 'Select all'}
         onclick={() => void toggleAllSelected()}
         class={cn(
-          'checkbox-box size-[18px] transition-transform active:scale-90',
+          'checkbox-box size-[18px] transition-transform',
           allSelected || someSelected
             ? 'border-primary bg-primary text-primary-foreground'
             : 'border-border hover:border-primary/60'
@@ -335,7 +335,7 @@
           Add a file or paste text to ground this notebook.
         </p>
         <button
-          class="mt-2 flex items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-[12px] font-semibold text-primary-foreground transition-[opacity,transform] hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring active:scale-[0.97]"
+          class="press mt-2 flex items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-[12px] font-semibold text-primary-foreground transition-[opacity,transform] hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           type="button"
           aria-label="Add first source"
           onclick={() => (modalOpen = true)}
@@ -358,7 +358,7 @@
           >
             <button
               class={cn(
-                'checkbox-box size-[16px] transition-[background-color,border-color,transform] duration-150 active:scale-90',
+                'checkbox-box size-[16px] transition-[background-color,border-color,transform] duration-150',
                 source.selected === 1
                   ? 'border-primary bg-primary'
                   : 'border-border bg-transparent hover:border-primary/60'
@@ -451,7 +451,7 @@
                   class={cn(
                     'row-action flex size-5 items-center justify-center rounded-[6px]',
                     'text-muted-foreground/40 opacity-0 transition-[opacity,background-color,transform] duration-150',
-                    'hover:bg-destructive/15 hover:text-destructive active:scale-90',
+                    'hover:bg-destructive/15 hover:text-destructive',
                     'focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
                     'group-hover:opacity-100'
                   )}
@@ -481,7 +481,7 @@
                   'row-action flex size-5 items-center justify-center rounded-[6px]',
                   status !== 'error' && 'absolute',
                   'text-muted-foreground/40 opacity-0 transition-[opacity,background-color,transform] duration-150',
-                  'hover:bg-destructive/15 hover:text-destructive active:scale-90',
+                  'hover:bg-destructive/15 hover:text-destructive',
                   'focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
                   'group-hover:opacity-100'
                 )}
@@ -511,7 +511,7 @@
       <button
         type="button"
         onclick={() => void undoRemove(notebookStore.activeNotebookId ?? undefined)}
-        class="shrink-0 rounded-[6px] px-2 py-0.5 text-xs font-semibold text-foreground transition-[background-color,transform] hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring active:scale-95"
+        class="press shrink-0 rounded-[6px] px-2 py-0.5 text-xs font-semibold text-foreground transition-[background-color,transform] hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
         style="-webkit-app-region: no-drag;"
       >
         Undo
@@ -592,6 +592,16 @@
   }
   .checkbox-box:focus-visible {
     box-shadow: 0 0 0 2px var(--ring);
+  }
+  .checkbox-box:active {
+    transform: scale(calc(1 - 0.1 * var(--rail-motion, 1)));
+  }
+
+  /* Gated press-scale for buttons styled with Tailwind utilities, so calm mode /
+     reduced-motion drops the movement like the scoped controls do (their existing
+     transition-[…,transform] utility animates it). */
+  .press:active {
+    transform: scale(calc(1 - 0.04 * var(--rail-motion, 1)));
   }
 
   .empty-tile {

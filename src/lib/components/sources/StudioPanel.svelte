@@ -82,7 +82,7 @@
 
     <button
       type="button"
-      class="mt-3 flex w-full items-center justify-center gap-1.5 rounded-lg bg-primary px-3 py-2 text-sm font-semibold text-primary-foreground transition-[opacity,transform] hover:opacity-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring active:scale-[0.98]"
+      class="press mt-3 flex w-full items-center justify-center gap-1.5 rounded-lg bg-primary px-3 py-2 text-sm font-semibold text-primary-foreground transition-[opacity,transform] hover:opacity-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
       aria-disabled="true"
       aria-label="Generate Audio Overview (coming soon)"
       title="Coming soon"
@@ -155,6 +155,12 @@
     height: 5px;
     border-radius: 999px;
     background: color-mix(in oklch, var(--primary) 70%, transparent);
+  }
+
+  /* Gated press-scale (calm mode / reduced-motion drops it); the button's
+     transition-[opacity,transform] utility animates it. */
+  .press:active {
+    transform: scale(calc(1 - 0.02 * var(--rail-motion, 1)));
   }
 
   /* Audio Overview: the section's headline surface — an elevated card (stronger
