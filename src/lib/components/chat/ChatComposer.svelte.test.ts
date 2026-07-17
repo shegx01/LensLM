@@ -50,4 +50,18 @@ describe('ChatComposer', () => {
     render(ChatComposer, { props: { streaming: true, onsend: vi.fn(), onstop: vi.fn() } });
     expect(screen.getByLabelText(/ask a question/i)).toBeDisabled();
   });
+
+  it('renders the add-source and sources-scope tools', () => {
+    render(ChatComposer, { props: { streaming: false, onsend: vi.fn(), onstop: vi.fn() } });
+    expect(screen.getByLabelText('Add source')).toBeInTheDocument();
+    // Empty store → honest "No sources yet" label on the scope chip.
+    expect(screen.getByLabelText('Sources used for this question')).toHaveTextContent(
+      /no sources yet/i
+    );
+  });
+
+  it('offers voice as an honestly-disabled affordance (STT not yet shipped)', () => {
+    render(ChatComposer, { props: { streaming: false, onsend: vi.fn(), onstop: vi.fn() } });
+    expect(screen.getByLabelText(/dictate question/i)).toBeDisabled();
+  });
 });
