@@ -161,7 +161,7 @@
      shadow than the tool tiles) with the accent carried by its icon + CTA. */
   .audio-card {
     border-radius: 14px;
-    background: var(--card);
+    background: var(--muted);
     box-shadow: var(--shadow-bar);
   }
   .audio-icon {
@@ -174,13 +174,12 @@
     background: color-mix(in oklch, var(--primary) 12%, transparent);
   }
 
-  /* Studio reads as a distinct recessed tray beneath the (card) sources list:
-     a sunken surface + a defined top edge, so the card-coloured tiles pop as raised
-     elements on it. */
+  /* Studio's container is the neutral card surface (a defined top edge marks the
+     zone); the interactive elements carry the distinct --muted fill so they, not the
+     tray, are what stands out. */
   .studio-tray {
-    background: var(--surface-sunken);
+    background: var(--card);
     border-top: 1px solid var(--border);
-    box-shadow: inset 0 10px 14px -14px oklch(0 0 0 / 0.18);
   }
 
   /* Study-tool tiles — borderless cards that lift off the tray on a soft shadow;
@@ -188,7 +187,7 @@
      soon" (aria-disabled on the button); this is the designed preview state. */
   .tool-tile {
     border-radius: 10px;
-    background: var(--card);
+    background: var(--muted);
     box-shadow: var(--shadow-tile);
     cursor: pointer;
     transition:
