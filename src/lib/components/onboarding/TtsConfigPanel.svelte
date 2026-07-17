@@ -76,7 +76,6 @@
   let voices = $state<TtsVoice[]>([]);
   let maleVoice = $state('');
   let femaleVoice = $state('');
-  let savingVoices = $state(false);
   let saveError = $state<string | null>(null);
   // True only if the catalog carries no preset voices for the engine — surface
   // an inline error and disable Save rather than persisting fake IDs.
@@ -139,8 +138,8 @@
     }
   });
 
-  /** Switch the Local-tab engine. Selection stays in-memory; the "Save voice settings"
-   *  write is the source of truth (no persist-on-click, so it can't clobber a saved key). */
+  /** Switch the Local-tab engine. Selection persists reactively via persistLocalTts —
+   *  safe because nextTtsConfig preserves a saved Cloud key regardless of local writes. */
   async function pickEngine(id: TtsEngineId): Promise<void> {
     if (id === 'cloud' || id === selectedEngine) return;
     const entry = catalog.find((e) => e.id === id);
@@ -161,6 +160,8 @@
       voicesUnavailable = voices.length === 0;
       if (maleVoices.length > 0) maleVoice = maleVoices[0].id;
       if (femaleVoices.length > 0) femaleVoice = femaleVoices[0].id;
+      // Don't persist fake/empty voice IDs when the catalog has none for this engine.
+      if (!voicesUnavailable) void persistLocalTts();
     }
   }
 
@@ -189,29 +190,27 @@
       voicesUnavailable = voices.length === 0;
       if (maleVoices.length > 0) maleVoice = maleVoices[0].id;
       if (femaleVoices.length > 0) femaleVoice = femaleVoices[0].id;
+      // Don't persist fake/empty voice IDs when the catalog has none for this engine.
+      if (!voicesUnavailable) void persistLocalTts();
     } catch (err) {
       downloadError = err instanceof Error ? err.message : 'Download failed.';
       downloadProgress = null;
     }
   }
 
-  async function handleSaveVoices(): Promise<void> {
-    savingVoices = true;
+  /** Persist the current host/guest voice + backend selection. Routed through the shared
+   *  cloud-preserving helper (single owner of the backend/cloud rule) so a saved Cloud key
+   *  survives a local-engine change. */
+  async function persistLocalTts(): Promise<void> {
     saveError = null;
     try {
-      // Route the tts write through the shared cloud-preserving helper (single owner
-      // of the backend/cloud rule) so a saved Cloud key survives a local-engine save.
       await updateConfig((cfg) => ({
         ...cfg,
         voices: { host: maleVoice, guest: femaleVoice },
         tts: nextTtsConfig(cfg.tts, { provider: engineToProvider(selectedEngine), apiKey: '' })
       }));
-      await oncheck();
-      oncollapse();
     } catch (err) {
       saveError = err instanceof Error ? err.message : 'Could not save voice settings.';
-    } finally {
-      savingVoices = false;
     }
   }
 
@@ -372,10 +371,16 @@
           </label>
           <Select
             type="single"
-            bind:value={maleVoice}
+            value={maleVoice}
+            onValueChange={(v) => {
+              if (v) {
+                maleVoice = v;
+                void persistLocalTts();
+              }
+            }}
             items={maleVoices.map((voice) => ({ value: voice.id, label: voice.name }))}
           >
-            <SelectTrigger id="tts-male-voice">
+            <SelectTrigger id="tts-male-voice" class="w-full">
               <SelectValue placeholder="Select a voice" />
             </SelectTrigger>
             <SelectContent>
@@ -395,10 +400,16 @@
           </label>
           <Select
             type="single"
-            bind:value={femaleVoice}
+            value={femaleVoice}
+            onValueChange={(v) => {
+              if (v) {
+                femaleVoice = v;
+                void persistLocalTts();
+              }
+            }}
             items={femaleVoices.map((voice) => ({ value: voice.id, label: voice.name }))}
           >
-            <SelectTrigger id="tts-female-voice">
+            <SelectTrigger id="tts-female-voice" class="w-full">
               <SelectValue placeholder="Select a voice" />
             </SelectTrigger>
             <SelectContent>
@@ -413,14 +424,6 @@
       {#if saveError}
         <p class="text-destructive text-[0.75rem]" role="alert">{saveError}</p>
       {/if}
-
-      <Button
-        class="h-10 w-full"
-        onclick={handleSaveVoices}
-        disabled={savingVoices || voicesUnavailable}
-      >
-        {savingVoices ? 'Saving…' : 'Save voice settings'}
-      </Button>
     {/if}
   </div>
 

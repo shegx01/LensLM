@@ -6,12 +6,8 @@
 import { render, screen, fireEvent, waitFor } from '@testing-library/svelte';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-// Stub ThemeCycleButton (avoids mode-watcher interaction in tests)
-vi.mock('$lib/components/ThemeCycleButton.svelte', () => ({
-  default: function ThemeCycleButtonStub() {}
-}));
-
-// Stub mode-watcher to prevent missing ESM module error in happy-dom
+// Stub mode-watcher to prevent missing ESM module error in happy-dom; ThemeCycleButton
+// is left real (unstubbed) so the row-forwarding click test below can drive its actual button.
 vi.mock('mode-watcher', () => ({
   userPrefersMode: { current: 'system' },
   setMode: vi.fn()
@@ -117,6 +113,32 @@ describe('AccountFooter', () => {
     await fireEvent.click(screen.getByRole('button', { name: /account menu/i }));
     await waitFor(() => screen.getByRole('menu'));
     expect(screen.getByText(/switch theme/i)).toBeInTheDocument();
+  });
+
+  it('clicking the "Switch theme" row label (not the icon button) toggles the theme', async () => {
+    const { setMode } = await import('mode-watcher');
+    render(AccountFooter, { props: { userName: 'Jamie' } });
+    await fireEvent.click(screen.getByRole('button', { name: /account menu/i }));
+    await waitFor(() => screen.getByRole('menu'));
+
+    const row = screen.getByText(/switch theme/i).closest('[data-switch-theme-item]')!;
+    expect(row).toBeInTheDocument();
+    // Clicking the row's text label (outside the inner icon button) must still
+    // forward to the real ThemeCycleButton and cycle the mode.
+    await fireEvent.click(screen.getByText(/^switch theme$/i));
+    expect(setMode).toHaveBeenCalledOnce();
+  });
+
+  it('clicking the inner theme icon button directly does not double-fire the row forward', async () => {
+    const { setMode } = await import('mode-watcher');
+    render(AccountFooter, { props: { userName: 'Jamie' } });
+    await fireEvent.click(screen.getByRole('button', { name: /account menu/i }));
+    await waitFor(() => screen.getByRole('menu'));
+
+    const row = screen.getByText(/switch theme/i).closest('[data-switch-theme-item]')!;
+    const themeButton = row.querySelector('button')!;
+    await fireEvent.click(themeButton);
+    expect(setMode).toHaveBeenCalledOnce();
   });
 
   it('renders the Embeddings Inspector item in DEV, disabled when no active notebook', async () => {

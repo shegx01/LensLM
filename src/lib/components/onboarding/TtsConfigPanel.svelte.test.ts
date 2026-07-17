@@ -84,7 +84,7 @@ afterEach(() => {
 });
 
 describe('TtsConfigPanel — voices', () => {
-  it('persists the picked host/guest voices to AppConfig.voices on save', async () => {
+  it('persists the default host/guest voices reactively right after download completes (no Save button)', async () => {
     let written: AppConfig | null = null;
     const oncheck = vi.fn().mockResolvedValue(undefined);
     const oncollapse = vi.fn();
@@ -110,19 +110,23 @@ describe('TtsConfigPanel — voices', () => {
     await fireEvent.click(screen.getByRole('button', { name: /download voice engine/i }));
     await waitFor(() => expect(screen.getByText(/voice engine ready/i)).toBeInTheDocument());
 
-    await fireEvent.click(screen.getByRole('button', { name: /save voice settings/i }));
+    // No explicit Save button on the Local tab — a freshly-downloaded engine's
+    // default voice selection persists on its own.
+    expect(screen.queryByRole('button', { name: /save voice settings/i })).not.toBeInTheDocument();
 
     await waitFor(() => expect(written).not.toBeNull());
     expect((written as unknown as AppConfig).voices).toEqual({
       host: 'leo',
       guest: 'tara'
     });
-    expect(oncollapse).toHaveBeenCalledOnce();
+    // Reactive persist does not drive the onboarding re-check/collapse flow.
+    expect(oncheck).not.toHaveBeenCalled();
+    expect(oncollapse).not.toHaveBeenCalled();
     // Preset voices come from the catalog, not a runtime IPC round trip.
     expect(listVoicesSpy).not.toHaveBeenCalled();
   });
 
-  it('opens the host-voice picker, lists options from preset_voices, and selecting one updates the binding', async () => {
+  it('opens the host-voice picker, lists options from preset_voices, and selecting one persists immediately', async () => {
     let written: AppConfig | null = null;
     mockIPC((cmd, args) => {
       if (cmd === 'download_tts_model') return driveDownload(args);
@@ -148,6 +152,9 @@ describe('TtsConfigPanel — voices', () => {
     // Defaults to the first preset voice until the user picks another.
     const trigger = screen.getByLabelText(/^host voice/i);
     expect(trigger).toHaveTextContent('Leo');
+    // Reset the write captured by the download-time default persist so the
+    // assertion below is scoped to the explicit voice-pick persist.
+    written = null;
 
     // bits-ui Select opens on trigger keydown (Enter/Space/Arrow) — this avoids
     // relying on PointerEvent pointer-capture semantics happy-dom doesn't model.
@@ -164,12 +171,12 @@ describe('TtsConfigPanel — voices', () => {
 
     await waitFor(() => expect(trigger).toHaveTextContent('Milo'));
 
-    await fireEvent.click(screen.getByRole('button', { name: /save voice settings/i }));
+    // No Save click — selecting a voice persists on its own.
     await waitFor(() => expect(written).not.toBeNull());
     expect((written as unknown as AppConfig).voices.host).toBe('milo');
   });
 
-  it('shows an inline error and disables Save when the voice list is empty (no stub voices)', async () => {
+  it('shows an inline error and no voice picker when the voice list is empty (no stub voices, no persist)', async () => {
     const setConfig = vi.fn();
     mockIPC((cmd, args) => {
       if (cmd === 'download_tts_model') return driveDownload(args);
@@ -189,9 +196,9 @@ describe('TtsConfigPanel — voices', () => {
         screen.getByText(/couldn't load voices — is the engine installed\?/i)
       ).toBeInTheDocument()
     );
-    // No fake voice IDs rendered, and Save is disabled.
+    // No fake voice IDs rendered, and there is nothing to persist.
     expect(screen.queryByRole('combobox')).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /save voice settings/i })).toBeDisabled();
+    expect(screen.queryByRole('button', { name: /save voice settings/i })).not.toBeInTheDocument();
     expect(setConfig).not.toHaveBeenCalled();
   });
 });
@@ -350,7 +357,7 @@ describe('TtsConfigPanel — engine selector from the catalog (#194)', () => {
     expect(screen.getByRole('button', { name: /download voice engine/i })).toBeInTheDocument();
   });
 
-  it('persists the selected engine into AppConfig.tts.backend alongside voices on Save', async () => {
+  it('persists the selected engine into AppConfig.tts.backend alongside voices reactively (no Save button)', async () => {
     let written: AppConfig | null = null;
     mockIPC((cmd, args) => {
       if (cmd === 'get_config') return baseConfig();
@@ -373,14 +380,15 @@ describe('TtsConfigPanel — engine selector from the catalog (#194)', () => {
     // The picker is a bits-ui Select now: the trigger's label-associated element is a button
     // (no native `.value`), so assert the displayed voice name instead of a form value.
     await waitFor(() => expect(screen.getByLabelText(/^host voice/i)).toHaveTextContent('Leo'));
-    await fireEvent.click(screen.getByRole('button', { name: /save voice settings/i }));
 
+    // Switching engine persists on its own — no Save button on the Local tab.
+    expect(screen.queryByRole('button', { name: /save voice settings/i })).not.toBeInTheDocument();
     await waitFor(() => expect(written).not.toBeNull());
     expect((written as unknown as AppConfig).tts.backend).toBe('qwen3_local');
     expect((written as unknown as AppConfig).voices).toEqual({ host: 'leo', guest: 'tara' });
   });
 
-  it('preserves a previously-saved Cloud API key when saving a local engine', async () => {
+  it('preserves a previously-saved Cloud API key when switching the local engine', async () => {
     const savedCloud = { kind: 'eleven_labs' as const, api_key: 'sk-keep-me', base_url: '' };
     let written: AppConfig | null = null;
     mockIPC((cmd, args) => {
@@ -404,8 +412,9 @@ describe('TtsConfigPanel — engine selector from the catalog (#194)', () => {
     const qwenRadio = await screen.findByRole('radio', { name: /qwen3-tts/i });
     await fireEvent.click(qwenRadio);
     await waitFor(() => expect(screen.getByLabelText(/^host voice/i)).toHaveTextContent('Leo'));
-    await fireEvent.click(screen.getByRole('button', { name: /save voice settings/i }));
 
+    // Reactive persist (triggered by pickEngine, no Save click) still round-trips
+    // through the cloud-preserving helper.
     await waitFor(() => expect(written).not.toBeNull());
     // Local engine is active, but the stored Cloud key survives (not wiped to null).
     expect((written as unknown as AppConfig).tts.backend).toBe('qwen3_local');

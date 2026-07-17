@@ -120,7 +120,12 @@
         data-switch-theme-item
         class="flex items-center gap-2.5 px-3 py-2 hover:bg-sidebar-accent/60 transition-colors cursor-pointer"
         tabindex="0"
+        onclick={(e) => {
+          if ((e.target as HTMLElement).closest('button')) return;
+          (e.currentTarget as HTMLElement).querySelector('button')?.click();
+        }}
         onkeydown={(e) => {
+          if ((e.target as HTMLElement).closest('button')) return;
           if (e.key === 'Enter' || e.key === ' ') {
             const btn = (e.currentTarget as HTMLElement).querySelector('button');
             btn?.click();
