@@ -20,7 +20,9 @@ use lens_core::LensEngine;
 use lens_core::asr::cloud::chunk::{split_if_needed, stitch_segments};
 use lens_core::asr::cloud::wav::{WAV_HEADER_BYTES, pcm_to_wav};
 use lens_core::asr::cloud::{CloudAsrEngine, preflight_check};
-use lens_core::asr::{AsrEngine, MockAsrEngine, TranscribeConfig, TranscriptSegment};
+use lens_core::asr::{
+    AsrEngine, MockAsrEngine, TranscribeConfig, TranscriptOutput, TranscriptSegment,
+};
 use lens_core::config::{AppConfig, AsrConfig, CloudAsrProvider};
 use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -612,7 +614,7 @@ async fn openai_happy_path_maps_segments_correctly() {
         reqwest::Client::new(),
     );
 
-    let out = engine
+    let TranscriptOutput { segments: out, .. } = engine
         .transcribe_pcm(&tiny_pcm(), &TranscribeConfig::default(), None)
         .await
         .expect("happy-path openai");
@@ -750,7 +752,7 @@ async fn deepgram_happy_path_maps_utterances_correctly() {
         reqwest::Client::new(),
     );
 
-    let out = engine
+    let TranscriptOutput { segments: out, .. } = engine
         .transcribe_pcm(&tiny_pcm(), &TranscribeConfig::default(), None)
         .await
         .expect("happy-path deepgram");
@@ -1275,7 +1277,7 @@ async fn chunked_transcription_calls_server_multiple_times_and_stitches() {
         reqwest::Client::new(),
     );
 
-    let out = engine
+    let TranscriptOutput { segments: out, .. } = engine
         .transcribe_pcm(&pcm, &TranscribeConfig::default(), None)
         .await
         .expect("chunked transcription");

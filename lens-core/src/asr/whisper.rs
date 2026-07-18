@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 use crate::LensError;
-use crate::asr::{AsrEngine, Lang, TranscribeConfig, TranscriptSegment};
+use crate::asr::{AsrEngine, Lang, TranscribeConfig, TranscriptOutput, TranscriptSegment};
 
 /// A loaded whisper.cpp model. The context sits behind `Arc<Mutex<..>>` so a
 /// clone can move into `spawn_blocking`; the `Mutex` serialises inference (a
@@ -179,8 +179,13 @@ impl AsrEngine for WhisperEngine {
         pcm: &[f32],
         config: &TranscribeConfig,
         progress_tx: Option<tokio::sync::mpsc::UnboundedSender<f32>>,
-    ) -> Result<Vec<TranscriptSegment>, LensError> {
-        self.transcribe_pcm_cancellable(pcm, config, progress_tx, None)
-            .await
+    ) -> Result<TranscriptOutput, LensError> {
+        let segments = self
+            .transcribe_pcm_cancellable(pcm, config, progress_tx, None)
+            .await?;
+        Ok(TranscriptOutput {
+            segments,
+            confidence: None,
+        })
     }
 }

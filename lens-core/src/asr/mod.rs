@@ -31,6 +31,14 @@ pub struct TranscriptSegment {
     pub end_second: f32,
 }
 
+/// Output of an ASR engine: the transcript plus an optional aggregate clip
+/// confidence in `0.0..=1.0` (`None` when the engine exposes none).
+#[derive(Debug, Clone)]
+pub struct TranscriptOutput {
+    pub segments: Vec<TranscriptSegment>,
+    pub confidence: Option<f32>,
+}
+
 /// Language selector. Enum, not a magic string (strong-typing rule). A minimal
 /// common set plus an `Other(String)` escape hatch; per-source language UI is #43.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,12 +105,23 @@ impl AsrBackend {
 /// mono f32 PCM; `progress_tx` (if any) receives values in `0.0..=1.0`.
 #[async_trait::async_trait]
 pub trait AsrEngine: Send + Sync {
+    /// Transcribes PCM to a [`TranscriptOutput`] (segments plus an optional
+    /// aggregate clip confidence in `0.0..=1.0`; `None` when the engine exposes
+    /// none — Whisper/cloud/mock).
     async fn transcribe_pcm(
         &self,
         pcm: &[f32],
         config: &TranscribeConfig,
         progress_tx: Option<tokio::sync::mpsc::UnboundedSender<f32>>,
-    ) -> Result<Vec<TranscriptSegment>, LensError>;
+    ) -> Result<TranscriptOutput, LensError>;
+
+    /// Whether this engine can transcribe `lang` on-device. Default `true`
+    /// (locale-unaware engines accept anything); the Apple engine overrides it
+    /// with the real OS probe. Sync, and impls may BLOCK on FFI (the Apple impl
+    /// does), so callers on an async runtime MUST invoke it via `spawn_blocking`.
+    fn supports_locale(&self, _lang: &Lang) -> bool {
+        true
+    }
 }
 
 /// Deterministic, model-free engine for offline tests (mirrors `CountingEmbedder`).
@@ -110,12 +129,30 @@ pub trait AsrEngine: Send + Sync {
 #[cfg(any(test, feature = "test-util"))]
 pub struct MockAsrEngine {
     segments: Vec<TranscriptSegment>,
+    confidence: Option<f32>,
+    supports_locale: bool,
 }
 
 #[cfg(any(test, feature = "test-util"))]
 impl MockAsrEngine {
     pub fn new(segments: Vec<TranscriptSegment>) -> Self {
-        Self { segments }
+        Self {
+            segments,
+            confidence: None,
+            supports_locale: true,
+        }
+    }
+
+    /// Sets the aggregate clip confidence this mock reports.
+    pub fn with_confidence(mut self, confidence: f32) -> Self {
+        self.confidence = Some(confidence);
+        self
+    }
+
+    /// Sets what [`supports_locale`](AsrEngine::supports_locale) returns.
+    pub fn with_locale_support(mut self, supported: bool) -> Self {
+        self.supports_locale = supported;
+        self
     }
 }
 
@@ -127,12 +164,19 @@ impl AsrEngine for MockAsrEngine {
         _pcm: &[f32],
         _config: &TranscribeConfig,
         progress_tx: Option<tokio::sync::mpsc::UnboundedSender<f32>>,
-    ) -> Result<Vec<TranscriptSegment>, LensError> {
+    ) -> Result<TranscriptOutput, LensError> {
         if let Some(tx) = progress_tx {
             let _ = tx.send(0.5);
             let _ = tx.send(1.0);
         }
-        Ok(self.segments.clone())
+        Ok(TranscriptOutput {
+            segments: self.segments.clone(),
+            confidence: self.confidence,
+        })
+    }
+
+    fn supports_locale(&self, _lang: &Lang) -> bool {
+        self.supports_locale
     }
 }
 
@@ -196,12 +240,16 @@ mod tests {
         let engine = MockAsrEngine::new(canned.clone());
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let out = engine
+        let TranscriptOutput {
+            segments: out,
+            confidence,
+        } = engine
             .transcribe_pcm(&[0.0_f32; 8], &TranscribeConfig::default(), Some(tx))
             .await
             .expect("mock transcribe");
 
         assert_eq!(out, canned);
+        assert_eq!(confidence, None, "mock reports no confidence by default");
         for seg in &out {
             assert!(seg.start_second < seg.end_second);
         }

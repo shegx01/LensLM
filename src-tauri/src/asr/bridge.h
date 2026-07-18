@@ -76,6 +76,10 @@ typedef struct LensAsrError {
  *   translate   non-zero → translate to English (best-effort; may be ignored if
  *               the Apple pipeline does not support translation for the locale).
  *   out_error   on NULL return, receives an owned LensAsrError* (clause a/b).
+ *   out_confidence on non-NULL return, receives the aggregate clip confidence in
+ *               0.0..=1.0, or a NEGATIVE sentinel when the transcriber exposed no
+ *               confidence for any run (absent). Scalar out-param — no allocation,
+ *               nothing to free. Untouched on the NULL/error return.
  *
  * Returns an owned LensAsrResult* on success (free via `lens_asr_free`), or NULL
  * on failure (then `*out_error` is set). Never traps (clause c).
@@ -85,7 +89,8 @@ LensAsrResult *lens_asr_transcribe(const float *pcm,
                                    int32_t sample_rate,
                                    const char *lang_code,
                                    int32_t translate,
-                                   LensAsrError **out_error);
+                                   LensAsrError **out_error,
+                                   double *out_confidence);
 
 /* Frees a LensAsrResult* returned by `lens_asr_transcribe` and everything it owns
  * (segments array + each segment's text bytes). No-op on NULL. Clause (a). */

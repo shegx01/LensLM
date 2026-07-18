@@ -15,7 +15,7 @@
 use std::path::Path;
 
 use lens_core::{
-    AsrEngine, DEFAULT_WHISPER_MODEL_ID, TranscribeConfig, WhisperEngine,
+    AsrEngine, DEFAULT_WHISPER_MODEL_ID, TranscribeConfig, TranscriptOutput, WhisperEngine,
     decode_and_resample_audio, download_whisper_model, whisper_model_path,
 };
 
@@ -63,7 +63,7 @@ async fn whisper_transcribes_fixture() {
     assert!(!pcm.is_empty(), "decoded PCM must be non-empty");
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let segments = engine
+    let TranscriptOutput { segments, .. } = engine
         .transcribe_pcm(&pcm, &TranscribeConfig::default(), Some(tx))
         .await
         .expect("transcribe");

@@ -56,7 +56,7 @@ pub use asr::WhisperEngine;
 pub use asr::cloud::CloudAsrEngine;
 pub use asr::{
     AsrBackend, AsrEngine, DEFAULT_WHISPER_MODEL_ID, Lang, MIN_MACOS_FOR_APPLE_ASR, Platform,
-    TranscribeConfig, TranscriptSegment, WHISPER_REGISTRY, WhisperModelSpec,
+    TranscribeConfig, TranscriptOutput, TranscriptSegment, WHISPER_REGISTRY, WhisperModelSpec,
     download_whisper_model, resolve_whisper, select_asr_backend, whisper_model_downloaded,
     whisper_model_path,
 };
@@ -1606,8 +1606,11 @@ impl LensEngine {
     /// override wins, else the injected Apple engine when present, else LocalWhisper.
     ///
     /// Returns the segments plus a `&'static str` label of the backend actually
-    /// used (`"cloud"`, `"apple_native"`, `"local_whisper"`, or a `"…(fallback)"`
-    /// variant) so ingest can surface it to the UI (#45).
+    /// used (`"cloud"`, `"apple_native"`, `"local_whisper"`, a `"…(fallback)"`
+    /// variant, or — when a low-confidence Apple result is re-transcribed on
+    /// Whisper — `"local_whisper (degraded)"` on success, or `"apple_native
+    /// (degraded)"` if the re-run fails and the Apple result is kept) so ingest
+    /// can surface it to the UI (#45).
     pub async fn transcribe(
         &self,
         pcm: &[f32],
@@ -1632,8 +1635,21 @@ impl LensEngine {
             is_apple_silicon_macos: apple_available,
             macos_major: apple_available.then_some(asr::MIN_MACOS_FOR_APPLE_ASR),
         };
-        // TODO(#43): replace with the real Apple locale-support predicate.
-        let apple_supports_locale = true;
+        // Probe the injected Apple engine for locale support, only for an explicit
+        // language, off the async runtime (the probe crosses blocking FFI in prod);
+        // auto-detect or no engine trusts Apple, with the downstream confidence
+        // check as the runtime backstop.
+        let apple_supports_locale = match (&config.language, &injected) {
+            (Some(lang), Some(engine)) => {
+                let (engine, lang) = (engine.clone(), lang.clone());
+                tokio::task::spawn_blocking(move || engine.supports_locale(&lang))
+                    .await
+                    .map_err(|e| {
+                        LensError::Transcription(format!("locale probe task failed: {e}"))
+                    })?
+            }
+            _ => true,
+        };
 
         let mut backend = asr::select_asr_backend(
             config_backend,
@@ -1655,7 +1671,33 @@ impl LensEngine {
         match (backend, injected) {
             (asr::AsrBackend::AppleNative, Some(engine)) => {
                 match engine.transcribe_pcm(pcm, config, progress_tx).await {
-                    Ok(segments) => Ok((segments, "apple_native")),
+                    // Apple succeeded but the aggregate confidence is below the
+                    // configured floor: re-transcribe the whole clip on Whisper when
+                    // a local model is available, else keep the low-confidence result.
+                    Ok(TranscriptOutput {
+                        segments,
+                        confidence,
+                    }) => {
+                        // `confidence` is the worst-span MIN for the clip (see the
+                        // `apple_min_confidence` field doc); clamp the floor so a
+                        // corrupt config value can neither force-degrade nor disable.
+                        let floor = asr_cfg.apple_min_confidence.clamp(0.0, 1.0);
+                        let degraded = confidence.is_some_and(|c| c < floor);
+                        if degraded && self.local_whisper_available(&asr_cfg).await {
+                            match self
+                                .transcribe_local_whisper(pcm, config, None, &asr_cfg, cancel)
+                                .await
+                            {
+                                Ok(segs) => Ok((segs, "local_whisper (degraded)")),
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "degraded whisper re-run failed; keeping low-confidence Apple result");
+                                    Ok((segments, "apple_native (degraded)"))
+                                }
+                            }
+                        } else {
+                            Ok((segments, "apple_native"))
+                        }
+                    }
                     // Apple runtime failure (e.g. a missing on-device asset) must not
                     // leave the user with no transcription — fall back to Whisper when
                     // a local model is available. Skip the fallback on a genuine
@@ -1736,7 +1778,9 @@ impl LensEngine {
             asr_cfg.cloud_model.clone(),
             asr_cfg.cloud_api_key.clone(),
         );
-        engine.transcribe_pcm(pcm, config, progress_tx).await
+        let TranscriptOutput { segments, .. } =
+            engine.transcribe_pcm(pcm, config, progress_tx).await?;
+        Ok(segments)
     }
 
     /// Cloud→local degradation cascade: Apple-if-injected, else Whisper. Returns
@@ -1754,7 +1798,9 @@ impl LensEngine {
     ) -> Result<(Vec<TranscriptSegment>, &'static str), LensError> {
         if let Some(engine) = injected {
             match engine.transcribe_pcm(pcm, config, progress_tx).await {
-                Ok(segs) => Ok((segs, "apple_native (fallback)")),
+                Ok(TranscriptOutput { segments: segs, .. }) => {
+                    Ok((segs, "apple_native (fallback)"))
+                }
                 Err(apple_err) => {
                     if !is_user_cancel(&apple_err) && self.local_whisper_available(asr_cfg).await {
                         let segs = self
@@ -2771,7 +2817,7 @@ mod transcribe_tests {
             _pcm: &[f32],
             _config: &TranscribeConfig,
             _progress_tx: Option<mpsc::UnboundedSender<f32>>,
-        ) -> Result<Vec<TranscriptSegment>, LensError> {
+        ) -> Result<TranscriptOutput, LensError> {
             Err(LensError::Transcription(self.message.clone()))
         }
     }
@@ -2928,6 +2974,210 @@ mod transcribe_tests {
             }
             other => panic!("expected Transcription error from LocalWhisper path, got: {other:?}"),
         }
+    }
+
+    fn canned_apple_segment() -> Vec<TranscriptSegment> {
+        vec![asr::TranscriptSegment {
+            text: "apple".to_string(),
+            start_second: 0.0,
+            end_second: 1.0,
+        }]
+    }
+
+    /// An explicit language the Apple engine does NOT support routes to
+    /// LocalWhisper (router gate 4). The Apple mock would return Ok segments, so an
+    /// error from the (undownloaded) whisper path proves Apple was not used.
+    #[tokio::test]
+    async fn explicit_unsupported_locale_routes_to_whisper() {
+        let engine = LensEngine::for_test().await;
+        engine
+            .set_asr_engine(Some(Arc::new(
+                asr::MockAsrEngine::new(canned_apple_segment()).with_locale_support(false),
+            )))
+            .await;
+
+        let config = TranscribeConfig {
+            language: Some(asr::Lang::De),
+            translate: false,
+        };
+        let pcm = vec![0.0_f32; 16];
+        let result = engine.transcribe(&pcm, &config, None, None).await;
+
+        match result {
+            Err(LensError::Transcription(msg)) => assert!(
+                msg.contains("local whisper")
+                    || msg.contains("not downloaded")
+                    || msg.contains("local-whisper"),
+                "expected a LocalWhisper error, got: {msg}"
+            ),
+            other => panic!("expected LocalWhisper Transcription error, got: {other:?}"),
+        }
+    }
+
+    /// An explicit language the Apple engine supports routes to AppleNative.
+    #[tokio::test]
+    async fn explicit_supported_locale_uses_apple() {
+        let engine = LensEngine::for_test().await;
+        let canned = canned_apple_segment();
+        engine
+            .set_asr_engine(Some(Arc::new(
+                asr::MockAsrEngine::new(canned.clone()).with_locale_support(true),
+            )))
+            .await;
+
+        let config = TranscribeConfig {
+            language: Some(asr::Lang::En),
+            translate: false,
+        };
+        let pcm = vec![0.0_f32; 16];
+        let (segs, label) = engine
+            .transcribe(&pcm, &config, None, None)
+            .await
+            .expect("apple transcription");
+        assert_eq!(label, "apple_native");
+        assert_eq!(segs, canned);
+    }
+
+    /// Auto-detect (language == None) trusts Apple and skips the locale probe
+    /// entirely — even a mock reporting no locale support still routes to Apple.
+    #[tokio::test]
+    async fn auto_detect_uses_apple_without_probing_locale() {
+        let engine = LensEngine::for_test().await;
+        let canned = canned_apple_segment();
+        engine
+            .set_asr_engine(Some(Arc::new(
+                asr::MockAsrEngine::new(canned.clone()).with_locale_support(false),
+            )))
+            .await;
+
+        let config = TranscribeConfig {
+            language: None,
+            translate: false,
+        };
+        let pcm = vec![0.0_f32; 16];
+        let (segs, label) = engine
+            .transcribe(&pcm, &config, None, None)
+            .await
+            .expect("apple transcription");
+        assert_eq!(label, "apple_native");
+        assert_eq!(segs, canned);
+    }
+
+    /// A low-confidence Apple result triggers a degraded Whisper re-run; a stub
+    /// (unloadable) model is seeded so the re-run is ATTEMPTED but fails, and the
+    /// fail-safe keeps the Apple segments labelled `"apple_native (degraded)"`.
+    /// (A successful `"local_whisper (degraded)"` path needs the non-injectable
+    /// internal WhisperEngine and a real model — left to the gated model track.)
+    #[cfg(feature = "local-whisper")]
+    #[tokio::test]
+    async fn low_confidence_apple_result_is_re_run_on_whisper() {
+        let engine = LensEngine::for_test().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_stub_whisper_model(&engine, dir.path()).await;
+        let canned = canned_apple_segment();
+        engine
+            .set_asr_engine(Some(Arc::new(
+                asr::MockAsrEngine::new(canned.clone()).with_confidence(0.1),
+            )))
+            .await;
+
+        let config = TranscribeConfig {
+            language: None,
+            translate: false,
+        };
+        let pcm = vec![0.0_f32; 16];
+        let (segs, label) = engine
+            .transcribe(&pcm, &config, None, None)
+            .await
+            .expect("degraded re-run fails safe and keeps the Apple result");
+
+        // The seeded stub is not a valid ggml model, so the re-run errors and the
+        // fail-safe keeps the Apple segments — proving the re-run was attempted.
+        assert_eq!(label, "apple_native (degraded)");
+        assert_eq!(
+            segs, canned,
+            "the failed re-run must keep the Apple segments"
+        );
+    }
+
+    /// Confidence exactly at the threshold (0.5) is NOT degraded — the gate is a
+    /// strict `<` — so the result is kept as `"apple_native"`.
+    #[tokio::test]
+    async fn at_threshold_confidence_apple_result_is_kept() {
+        let engine = LensEngine::for_test().await;
+        let canned = canned_apple_segment();
+        engine
+            .set_asr_engine(Some(Arc::new(
+                asr::MockAsrEngine::new(canned.clone()).with_confidence(0.5),
+            )))
+            .await;
+
+        let config = TranscribeConfig {
+            language: None,
+            translate: false,
+        };
+        let pcm = vec![0.0_f32; 16];
+        let (segs, label) = engine
+            .transcribe(&pcm, &config, None, None)
+            .await
+            .expect("apple transcription");
+        assert_eq!(label, "apple_native");
+        assert_eq!(segs, canned);
+    }
+
+    /// A low-confidence Apple result with NO local Whisper model available keeps
+    /// the Apple result (the else branch): degraded, but nothing to re-run on. The
+    /// data_dir points at an empty tempdir so the probe deterministically finds
+    /// no model regardless of the test cwd.
+    #[tokio::test]
+    async fn low_confidence_without_whisper_keeps_apple() {
+        let engine = LensEngine::for_test().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        engine.inner.write().await.config.paths.data_dir =
+            dir.path().to_string_lossy().into_owned();
+        let canned = canned_apple_segment();
+        engine
+            .set_asr_engine(Some(Arc::new(
+                asr::MockAsrEngine::new(canned.clone()).with_confidence(0.1),
+            )))
+            .await;
+
+        let config = TranscribeConfig {
+            language: None,
+            translate: false,
+        };
+        let pcm = vec![0.0_f32; 16];
+        let (segs, label) = engine
+            .transcribe(&pcm, &config, None, None)
+            .await
+            .expect("apple transcription kept when whisper unavailable");
+        assert_eq!(label, "apple_native");
+        assert_eq!(segs, canned);
+    }
+
+    /// A successful Apple result whose confidence is at/above the threshold is
+    /// kept as `"apple_native"` — no degraded re-run.
+    #[tokio::test]
+    async fn high_confidence_apple_result_is_kept() {
+        let engine = LensEngine::for_test().await;
+        let canned = canned_apple_segment();
+        engine
+            .set_asr_engine(Some(Arc::new(
+                asr::MockAsrEngine::new(canned.clone()).with_confidence(0.9),
+            )))
+            .await;
+
+        let config = TranscribeConfig {
+            language: None,
+            translate: false,
+        };
+        let pcm = vec![0.0_f32; 16];
+        let (segs, label) = engine
+            .transcribe(&pcm, &config, None, None)
+            .await
+            .expect("apple transcription");
+        assert_eq!(label, "apple_native");
+        assert_eq!(segs, canned);
     }
 }
 
