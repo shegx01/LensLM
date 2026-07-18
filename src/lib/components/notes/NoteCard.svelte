@@ -24,10 +24,21 @@
 
   let editing = $state(false);
   const edited = $derived(note.updated_at !== note.created_at);
+
+  // Additive to the hover pencil (which stays the keyboard-accessible path); skip when the
+  // target is an interactive control so a double-tap on pin/delete/link doesn't also edit.
+  function beginEditOnDblClick(e: MouseEvent): void {
+    if (editing) return;
+    if ((e.target as HTMLElement | null)?.closest('button, a, [role="button"], [contenteditable]'))
+      return;
+    editing = true;
+  }
 </script>
 
+<!-- svelte-ignore a11y_no_static_element_interactions -->
 <article
   data-note-id={note.id}
+  ondblclick={beginEditOnDblClick}
   class="group/note relative rounded-lg border border-border bg-card p-4 text-card-foreground"
 >
   {#if !editing}

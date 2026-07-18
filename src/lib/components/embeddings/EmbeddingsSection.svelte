@@ -278,13 +278,13 @@
           disabled={pickerDisabled}
           onclick={() => pickBackend(p.id as EmbeddingBackend)}
           class={cn(
-            'rounded-lg border px-3 text-sm font-semibold transition-colors',
+            'rounded-lg border px-3 text-sm font-semibold transition-[color,background-color,border-color,transform] duration-150',
             compact ? 'h-9' : 'h-10',
             'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
             isSel
               ? 'border-primary bg-primary/10 text-foreground ring-1 ring-primary'
               : 'border-border bg-card text-muted-foreground hover:text-foreground',
-            pickerDisabled && 'cursor-not-allowed opacity-60'
+            pickerDisabled ? 'cursor-not-allowed opacity-60' : 'active:scale-[0.97]'
           )}
         >
           {p.label}
@@ -309,8 +309,10 @@
       {@const isGpu = gpuModels.has(model.id)}
       <div
         class={cn(
-          'w-full rounded-[10px] border px-3 py-3 transition-colors',
-          isSelected ? 'border-primary bg-primary/10 ring-1 ring-primary' : 'border-border bg-card'
+          'w-full rounded-[10px] border px-3 py-3 transition-[border-color,background-color] duration-150',
+          isSelected
+            ? 'border-primary bg-primary/10 ring-1 ring-primary'
+            : 'border-border bg-card hover:border-primary/40'
         )}
       >
         <button
@@ -321,8 +323,8 @@
           disabled={pickerDisabled}
           onclick={() => pickModel(model.id)}
           class={cn(
-            'flex w-full items-center gap-2.5 text-left',
-            pickerDisabled && 'cursor-not-allowed'
+            'flex w-full items-center gap-2.5 text-left transition-transform duration-150',
+            pickerDisabled ? 'cursor-not-allowed' : 'active:scale-[0.99]'
           )}
         >
           <span class="min-w-0 flex-1">
@@ -371,7 +373,7 @@
     <div class="mt-4 flex items-center gap-2.5" aria-live="polite">
       <span class="size-2 shrink-0 rounded-full bg-amber-500 animate-pulse" aria-hidden="true"
       ></span>
-      <span class="text-[0.78rem] text-foreground">
+      <span class="text-[0.78rem] tabular-nums text-foreground">
         Re-embedding sources… {reembedTotal > 0
           ? `${reembedDone}/${reembedTotal} (${reembedPct}%)`
           : ''}

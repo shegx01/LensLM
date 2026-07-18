@@ -130,12 +130,16 @@ export const notebookStore = {
   },
   set settingsOpen(v: boolean) {
     settingsOpen = v;
+    // The two in-place settings surfaces are mutually exclusive — opening one closes the
+    // other, so closing it never re-reveals a stale sibling underneath.
+    if (v) notebookSettingsOpen = false;
   },
   get notebookSettingsOpen() {
     return notebookSettingsOpen;
   },
   set notebookSettingsOpen(v: boolean) {
     notebookSettingsOpen = v;
+    if (v) settingsOpen = false;
   },
   get sidebarCollapsed() {
     return sidebarCollapsed;
@@ -286,6 +290,8 @@ export async function trashNotebookAction(id: string): Promise<void> {
     await trashNotebook(id);
     if (activeNotebookId === id) {
       activeNotebookId = null;
+      // The active notebook is gone; drop its settings surface so it can't rebind.
+      notebookSettingsOpen = false;
     }
     await Promise.all([refreshNotebooks(), refreshTrashed(), refreshTrashedSources()]);
   } catch (err) {
@@ -332,6 +338,8 @@ export async function purgeNotebookAction(id: string): Promise<void> {
  */
 export function selectNotebook(id: string): void {
   activeNotebookId = id;
+  // Never let the per-notebook settings surface stay bound to the notebook we left.
+  notebookSettingsOpen = false;
   paletteOpen = false;
   paletteQuery = '';
   void touchNotebookActivity(id).catch(() => {});
@@ -439,6 +447,8 @@ export function resetNotebookStore(): void {
   trashedSources = [];
   activeNotebookId = null;
   activeTab = 'chat';
+  settingsOpen = false;
+  notebookSettingsOpen = false;
   trashOpen = false;
   inspectorOpen = false;
   sidebarCollapsed = false;

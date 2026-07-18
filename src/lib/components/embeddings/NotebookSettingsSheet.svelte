@@ -1,14 +1,13 @@
 <!--
-  NotebookSettingsSheet — per-notebook settings sheet (ADR B1). Hosts the shared
-  <SettingsShell> (Dialog mode: no Back, no label — the sheet owns its own header)
-  with live Embeddings + Retrieval sections; toggled by `notebookStore.notebookSettingsOpen`.
+  NotebookSettingsSheet — per-notebook Embeddings + Retrieval, hosted in <SettingsShell>.
+  The header owns Back, so the shell is given neither Back nor label.
 -->
 <script lang="ts">
   import { notebookStore } from '$lib/notebooks/index.js';
-  import { Dialog, DialogContent } from '$lib/components/ui/dialog/index.js';
   import SettingsShell, { type NavItem } from './SettingsShell.svelte';
   import EmbeddingsSection from './EmbeddingsSection.svelte';
   import RetrievalSection from './RetrievalSection.svelte';
+  import ArrowLeft from '@lucide/svelte/icons/arrow-left';
   import Share2 from '@lucide/svelte/icons/share-2';
   import Network from '@lucide/svelte/icons/network';
 
@@ -25,41 +24,54 @@
   function close(): void {
     notebookStore.notebookSettingsOpen = false;
   }
+
+  function onKeydown(e: KeyboardEvent): void {
+    if (e.key !== 'Escape' || !open) return;
+    // A nested overlay (e.g. the re-embed confirm dialog) preventDefaults its own Escape;
+    // don't also tear down the whole settings surface in that case.
+    if (e.defaultPrevented) return;
+    close();
+  }
 </script>
 
-<Dialog
-  {open}
-  onOpenChange={(v) => {
-    if (!v) close();
-  }}
->
-  <DialogContent
-    class="flex max-h-[calc(100vh-6rem)] min-h-[420px] w-[min(760px,calc(100vw-3rem))] max-w-none flex-col gap-0 overflow-hidden p-0 sm:max-w-none"
-    aria-label={activeNotebook ? `${activeNotebook.title} settings` : 'Notebook settings'}
+<svelte:window onkeydown={onKeydown} />
+
+{#if open && activeNotebook}
+  <section
+    class="flex h-full min-h-0 flex-1 flex-col overflow-hidden bg-background"
+    aria-label={`${activeNotebook.title} settings`}
     data-notebook-settings-sheet
   >
-    {#if activeNotebook}
-      <div class="shrink-0 border-b border-border px-7 pt-6 pb-4">
+    <div class="flex shrink-0 items-center gap-3 border-b border-border/70 px-6 pt-5 pb-4">
+      <button
+        type="button"
+        onclick={close}
+        class="flex size-9 shrink-0 items-center justify-center rounded-[11px] text-muted-foreground transition-[color,background-color,transform] duration-150 hover:bg-foreground/[0.05] hover:text-foreground active:scale-[0.96] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        aria-label="Back to notebook"
+      >
+        <ArrowLeft class="size-[18px]" strokeWidth={2} />
+      </button>
+      <div class="min-w-0">
         <p
-          class="truncate text-[0.7rem] font-bold uppercase tracking-[0.08em] text-muted-foreground/70"
+          class="truncate text-[0.62rem] font-bold uppercase tracking-[0.1em] text-muted-foreground/60"
         >
           {activeNotebook.title}
         </p>
-        <h1 class="mt-1 text-base font-bold tracking-[-0.3px] text-foreground">
+        <h1 class="mt-0.5 text-[0.95rem] font-bold tracking-[-0.3px] text-balance text-foreground">
           Notebook settings
         </h1>
       </div>
-      <div class="flex min-h-0 flex-1 overflow-hidden">
-        <SettingsShell nav={NAV} bind:active>
-          {#snippet content(active)}
-            {#if active === 'embeddings'}
-              <EmbeddingsSection mode="notebook" notebookId={activeNotebook.id} onchange={close} />
-            {:else if active === 'retrieval'}
-              <RetrievalSection notebookId={activeNotebook.id} />
-            {/if}
-          {/snippet}
-        </SettingsShell>
-      </div>
-    {/if}
-  </DialogContent>
-</Dialog>
+    </div>
+    <div class="flex min-h-0 flex-1 overflow-hidden">
+      <SettingsShell nav={NAV} bind:active>
+        {#snippet content(active)}
+          {#if active === 'embeddings'}
+            <EmbeddingsSection mode="notebook" notebookId={activeNotebook.id} onchange={close} />
+          {:else if active === 'retrieval'}
+            <RetrievalSection notebookId={activeNotebook.id} />
+          {/if}
+        {/snippet}
+      </SettingsShell>
+    </div>
+  </section>
+{/if}
