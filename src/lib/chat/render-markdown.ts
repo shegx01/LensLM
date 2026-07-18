@@ -136,7 +136,11 @@ function ensureKatexStyleHook(): void {
   });
 }
 
-/** Parses `source` as GFM markdown and sanitizes the resulting HTML for safe `{@html}` use. */
+/**
+ * SECURITY INVARIANT: model/assistant output is display-only and MUST NOT execute —
+ * it reaches `{@html}` only after this sanitize pass. Locked by *.no-exec.test.ts.
+ * Parses `source` as GFM markdown and sanitizes the resulting HTML for safe `{@html}` use.
+ */
 export function renderMarkdown(source: string, opts?: { highlight?: boolean }): string {
   ensureKatexStyleHook();
   const instance = opts?.highlight === false ? plainMarked : highlightMarked;
