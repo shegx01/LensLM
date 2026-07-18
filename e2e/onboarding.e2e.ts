@@ -23,9 +23,7 @@ test('first run renders the System check screen with the LLM + embedding rows at
   await expect(page.getByText('Text-to-speech', { exact: true })).toHaveCount(0);
 });
 
-test('Skip for now advances to Make it yours WITHOUT completing onboarding', async ({
-  page
-}) => {
+test('Skip for now advances to Make it yours WITHOUT completing onboarding', async ({ page }) => {
   await installTauriStub(page, { onboardingComplete: false });
 
   await page.goto('/');
