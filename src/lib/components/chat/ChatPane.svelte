@@ -15,6 +15,7 @@
     unpin
   } from '$lib/chat/chat-state.svelte.js';
   import { hydrate as hydrateNotes } from '$lib/notes/notes-state.svelte.js';
+  import { refreshChatProvider } from '$lib/models/chat-provider.svelte.js';
 
   interface Props {
     notebookId: string;
@@ -27,6 +28,8 @@
     // Save-button state (MessageActions) needs saved-state up front, not just
     // when the Notes tab is opened.
     void hydrateNotes(notebookId);
+    // AC-11: refresh the "is a chat model usable?" signal that gates Send / the CTA.
+    void refreshChatProvider();
   });
 
   const turns = $derived(chatStore.turns(notebookId));

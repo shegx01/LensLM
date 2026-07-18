@@ -66,6 +66,19 @@ function compareDateDesc(a: string | null | undefined, b: string | null | undefi
 }
 
 /**
+ * Wraps `has_chat_provider`; resolves `false` outside Tauri.
+ * See the chat-provider store for the usable-gate rationale.
+ */
+export async function hasChatProvider(): Promise<boolean> {
+  if (!isTauri()) return false;
+  try {
+    return await invoke<boolean>('has_chat_provider');
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Live catalog refresh from models.dev. Backend gates on staleness — no refetch
  * storm on repeated opens. Resolves `false` outside Tauri or on failure.
  */

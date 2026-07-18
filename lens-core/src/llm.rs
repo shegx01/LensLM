@@ -519,6 +519,27 @@ pub fn provider_from_config(
     select_provider(&config.models, &routing, cloud_consent, &catalog)
 }
 
+/// Resolves the interactive-chat provider (Variant B). A purpose-built
+/// `enrichment.chat_model` pin is authoritative when present: it builds a fresh provider
+/// for the matching `models[]` entry under the same consent + catalog gates as routing,
+/// and does NOT fall back to routing when the pin is unusable (so `has_chat_provider`
+/// reports absence). With no pin, defers to the routing-based [`provider_from_config`].
+pub fn chat_provider_from_config(
+    config: &AppConfig,
+    cloud_consent: bool,
+) -> Option<Arc<dyn LlmProvider>> {
+    match &config.enrichment.chat_model {
+        Some(chat_model) => build_pinned_provider(
+            &chat_model.provider,
+            &chat_model.model,
+            &config.models,
+            cloud_consent,
+            &ModelCatalog::bundled(),
+        ),
+        None => provider_from_config(config, cloud_consent),
+    }
+}
+
 /// Resolves a per-task enrichment provider, reusing `base`'s genai client (M4 Phase 3).
 /// When `task_model` resolves to a gated, usable entry, returns a sibling [`GenaiProvider`]
 /// pinned to that `(provider, model)` over the same client. Falls back to `base.clone()` on
@@ -606,15 +627,7 @@ fn select_provider(
 
     match routing {
         LlmRouting::Explicit { provider, model } => {
-            let want_provider = provider.to_ascii_lowercase();
-            models
-                .iter()
-                .find(|m| {
-                    m.provider.to_ascii_lowercase() == want_provider
-                        && m.model == *model
-                        && usable(m)
-                })
-                .and_then(build_provider)
+            build_pinned_provider(provider, model, models, cloud_consent, catalog)
         }
         LlmRouting::CloudFirst => models
             .iter()
@@ -635,6 +648,31 @@ fn select_provider(
             })
             .and_then(build_provider),
     }
+}
+
+/// Resolves the `models[]` entry pinned to `(provider, model)` and builds a fresh
+/// [`GenaiProvider`] for it under the same usable gates routing selection applies
+/// (endpoint present, non-empty model, `build_eligible` consent + catalog). Shared by
+/// `select_provider`'s Explicit arm and the chat-model pin in [`chat_provider_from_config`]
+/// so the gate lives in exactly one place.
+fn build_pinned_provider(
+    provider: &str,
+    model: &str,
+    models: &[crate::config::ModelConfig],
+    cloud_consent: bool,
+    catalog: &ModelCatalog,
+) -> Option<Arc<dyn LlmProvider>> {
+    let want_provider = provider.to_ascii_lowercase();
+    models
+        .iter()
+        .find(|m| {
+            m.provider.to_ascii_lowercase() == want_provider
+                && m.model == *model
+                && has_endpoint(m)
+                && !m.model.is_empty()
+                && build_eligible(m, cloud_consent, catalog)
+        })
+        .and_then(build_provider)
 }
 
 /// Whether an entry passes consent + catalog gates. Local Ollama is exempt from both;
@@ -1436,6 +1474,90 @@ mod tests {
             })
             .unwrap(),
             serde_json::json!({ "kind": "explicit", "provider": "anthropic", "model": "claude" })
+        );
+    }
+
+    // --- chat_model seam (Variant B) ----------------------------------------
+
+    fn config_with_chat(
+        models: Vec<ModelConfig>,
+        routing: LlmRouting,
+        chat_model: Option<crate::config::TaskModel>,
+    ) -> AppConfig {
+        AppConfig {
+            models,
+            enrichment: crate::config::EnrichmentConfig {
+                routing,
+                chat_model,
+                ..crate::config::EnrichmentConfig::default()
+            },
+            ..AppConfig::default()
+        }
+    }
+
+    #[test]
+    fn chat_model_pin_outranks_routing() {
+        // chat_model pins local Ollama while routing=CloudFirst + a consented cloud entry
+        // is present: the pin wins, not the routing-preferred cloud model.
+        let cloud = catalog_anthropic_model();
+        let cfg = config_with_chat(
+            vec![ollama_entry(), anthropic_entry(&cloud)],
+            LlmRouting::CloudFirst,
+            Some(crate::config::TaskModel {
+                provider: "ollama".to_string(),
+                model: "llama3".to_string(),
+            }),
+        );
+        let p = chat_provider_from_config(&cfg, true).expect("chat_model pin resolves");
+        assert_eq!(p.model_id(), "llama3", "chat_model pin outranks CloudFirst");
+    }
+
+    #[test]
+    fn chat_model_none_falls_back_to_routing() {
+        let cloud = catalog_anthropic_model();
+        let cfg = config_with_chat(
+            vec![ollama_entry(), anthropic_entry(&cloud)],
+            LlmRouting::CloudFirst,
+            None,
+        );
+        let p = chat_provider_from_config(&cfg, true).expect("routing fallback resolves");
+        assert_eq!(
+            p.model_id(),
+            cloud,
+            "no pin → routing (CloudFirst) selects cloud"
+        );
+    }
+
+    #[test]
+    fn chat_model_unusable_cloud_without_consent_is_none() {
+        let cloud = catalog_anthropic_model();
+        let cfg = config_with_chat(
+            vec![ollama_entry(), anthropic_entry(&cloud)],
+            LlmRouting::CloudFirst,
+            Some(crate::config::TaskModel {
+                provider: "anthropic".to_string(),
+                model: cloud,
+            }),
+        );
+        assert!(
+            chat_provider_from_config(&cfg, false).is_none(),
+            "cloud pin without consent must not report a provider (no routing fallback)"
+        );
+    }
+
+    #[test]
+    fn chat_model_unusable_empty_model_is_none() {
+        let cfg = config_with_chat(
+            vec![ollama_entry()],
+            LlmRouting::LocalFirst,
+            Some(crate::config::TaskModel {
+                provider: "ollama".to_string(),
+                model: String::new(),
+            }),
+        );
+        assert!(
+            chat_provider_from_config(&cfg, true).is_none(),
+            "empty-model pin must not report a provider"
         );
     }
 

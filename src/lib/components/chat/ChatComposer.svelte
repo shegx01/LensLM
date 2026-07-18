@@ -13,10 +13,13 @@
   import Mic from '@lucide/svelte/icons/mic';
   import ChevronDown from '@lucide/svelte/icons/chevron-down';
   import Check from '@lucide/svelte/icons/check';
+  import Settings2 from '@lucide/svelte/icons/settings-2';
   import { Popover } from 'bits-ui';
   import { cn } from '$lib/utils.js';
   import { popIn } from '$lib/motion/index.js';
   import { sourcesStore, toggleSelected } from '$lib/sources/index.js';
+  import { notebookStore } from '$lib/notebooks/index.js';
+  import { chatProviderStore } from '$lib/models/chat-provider.svelte.js';
   import {
     Tooltip,
     TooltipContent,
@@ -37,7 +40,9 @@
   let textareaRef = $state<HTMLTextAreaElement | null>(null);
   let addOpen = $state(false);
 
-  const canSend = $derived(value.trim().length > 0);
+  // AC-11: gate Send on a usable chat provider (engine `usable` signal), not just text.
+  const hasProvider = $derived(chatProviderStore.available);
+  const canSend = $derived(value.trim().length > 0 && hasProvider);
   const MAX_HEIGHT_PX = 200;
 
   const totalCount = $derived(sourcesStore.sources.length);
@@ -77,6 +82,17 @@
 <div class="shrink-0 pt-2 pr-6 pb-4 pl-4">
   <TooltipProvider>
     <div class="composer flex flex-col gap-1.5 rounded-3xl bg-card px-3 pt-2.5 pb-2">
+      {#if !hasProvider}
+        <!-- AC-11: no usable chat model → CTA that deep-links to Settings → AI Model. -->
+        <button
+          type="button"
+          onclick={() => notebookStore.openSettings('ai')}
+          class="flex items-center gap-2 rounded-2xl bg-primary/10 px-3 py-2 text-left text-xs font-semibold text-primary transition-[background,transform] hover:bg-primary/[0.16] active:scale-[0.99] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          <Settings2 class="size-[15px]" strokeWidth={2.25} />
+          Set up a model in Settings to start chatting
+        </button>
+      {/if}
       <textarea
         bind:this={textareaRef}
         bind:value

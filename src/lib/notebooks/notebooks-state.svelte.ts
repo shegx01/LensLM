@@ -46,6 +46,7 @@ let activeTab = $state<'chat' | 'notes'>('chat'); // session-only
 let trashOpen = $state(false); // Trash modal visibility (centered dialog)
 let inspectorOpen = $state(false); // dev/QA Embeddings Inspector overlay visibility
 let settingsOpen = $state(false); // global Preferences shell (Settings>Embeddings) visibility
+let settingsSection = $state<string | null>(null); // deep-link target section for the Preferences shell
 let notebookSettingsOpen = $state(false); // per-notebook "{notebook} settings" sheet visibility
 let sidebarCollapsed = $state(false); // session-only
 let rightRailCollapsed = $state(false); // session-only
@@ -133,6 +134,20 @@ export const notebookStore = {
     // The two in-place settings surfaces are mutually exclusive — opening one closes the
     // other, so closing it never re-reveals a stale sibling underneath.
     if (v) notebookSettingsOpen = false;
+    // A deep-link target only lives for the duration a surface is open.
+    if (!v) settingsSection = null;
+  },
+  get settingsSection() {
+    return settingsSection;
+  },
+  set settingsSection(id: string | null) {
+    settingsSection = id;
+  },
+  /** Open the global Preferences shell, optionally deep-linked to a section (e.g. `'ai'`). */
+  openSettings(section?: string) {
+    settingsSection = section ?? null;
+    settingsOpen = true;
+    notebookSettingsOpen = false;
   },
   get notebookSettingsOpen() {
     return notebookSettingsOpen;
@@ -448,6 +463,7 @@ export function resetNotebookStore(): void {
   activeNotebookId = null;
   activeTab = 'chat';
   settingsOpen = false;
+  settingsSection = null;
   notebookSettingsOpen = false;
   trashOpen = false;
   inspectorOpen = false;

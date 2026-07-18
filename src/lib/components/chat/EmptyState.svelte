@@ -2,7 +2,12 @@
      ties the chat back to the rail's wordmark; staggered reveal on mount. -->
 <script lang="ts">
   import Aperture from '@lucide/svelte/icons/aperture';
+  import Settings2 from '@lucide/svelte/icons/settings-2';
   import { fadeRise } from '$lib/motion/index.js';
+  import { notebookStore } from '$lib/notebooks/index.js';
+  import { chatProviderStore } from '$lib/models/chat-provider.svelte.js';
+
+  const hasProvider = $derived(chatProviderStore.available);
 </script>
 
 <div class="flex flex-1 flex-col items-center justify-center gap-2.5 pr-6 pl-4 text-center">
@@ -24,6 +29,18 @@
   >
     Answers are grounded in this notebook's selected sources.
   </p>
+  {#if !hasProvider}
+    <!-- AC-11: no usable chat model → CTA deep-linking to Settings → AI Model. -->
+    <button
+      type="button"
+      onclick={() => notebookStore.openSettings('ai')}
+      use:fadeRise={{ y: 8, delay: 0.18 }}
+      class="mt-1.5 inline-flex items-center gap-1.5 rounded-full bg-primary px-3.5 py-2 text-xs font-semibold text-primary-foreground transition-[transform,opacity] hover:opacity-90 active:scale-[0.97] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+    >
+      <Settings2 class="size-3.5" strokeWidth={2.25} />
+      Set up a model in Settings
+    </button>
+  {/if}
 </div>
 
 <style>
