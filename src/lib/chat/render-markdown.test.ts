@@ -93,6 +93,13 @@ describe('renderMarkdown', () => {
     expect(() => renderMarkdown('```js\n```', { highlight: false })).not.toThrow();
   });
 
+  it('preserves a real <pre><code> DOM structure for a fenced block', () => {
+    // Guards the `// @vitest-environment jsdom` pragma: happy-dom strips <pre>.
+    const el = document.createElement('div');
+    el.innerHTML = renderMarkdown('```js\nconst x = 1\n```');
+    expect(el.querySelector('pre code')).not.toBeNull();
+  });
+
   // KaTeX (C6, AC16): math renders only on the final (highlight) path, mirroring the
   // hljs/plain split; `\$` stays a literal dollar. Sanitization keeps KaTeX's inline
   // `style`; the no-exec proof lives in KeyInsightCard.no-exec.test.ts (jsdom).
