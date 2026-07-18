@@ -26,8 +26,11 @@
 
   const activeNotebook = $derived(notebookStore.activeNotebook);
 
-  // Preferences renders IN-PLACE (col-span-2), not as a floating overlay.
+  // Both the global Preferences and the per-notebook settings render IN-PLACE
+  // (col-span-2, replacing chat + sources), not as floating overlays — so they get
+  // the full page height and never scroll inside a cramped frame.
   const settingsOpen = $derived(notebookStore.settingsOpen);
+  const notebookSettingsOpen = $derived(notebookStore.notebookSettingsOpen);
 
   // Four combinations spelled out as STATIC class literals (not interpolated) so
   // Tailwind v4's static extractor emits each grid-cols rule. Collapsed = 104px
@@ -113,8 +116,12 @@
   <SidebarRail onnewnotebook={() => (createOpen = true)} {userName} />
 
   {#if settingsOpen}
-    <div class="col-span-2 flex min-w-0 overflow-hidden">
+    <div class="settings-enter col-span-2 flex min-w-0 overflow-hidden">
       <PreferencesShell />
+    </div>
+  {:else if notebookSettingsOpen && activeNotebook}
+    <div class="settings-enter col-span-2 flex min-w-0 overflow-hidden">
+      <NotebookSettingsSheet />
     </div>
   {:else}
     <main class="flex flex-col overflow-hidden">
@@ -153,11 +160,28 @@
 <TrashView />
 <NotebookCreateDialog open={createOpen} onOpenChange={(v) => (createOpen = v)} />
 
-<NotebookSettingsSheet />
-
 <!-- DEV-gated dynamic import: tree-shaken out of release bundles. -->
 {#if import.meta.env.DEV}
   {#await import('$lib/components/inspector/EmbeddingsInspector.svelte') then { default: Inspector }}
     <Inspector />
   {/await}
 {/if}
+
+<style>
+  /* One-shot entrance for the in-place settings surfaces (Preferences + notebook
+     settings). Fade always plays; the lift is gated by --rail-motion so reduced
+     motion resolves to a pure fade with no movement. */
+  .settings-enter {
+    animation: settings-enter 0.28s var(--ease-out, ease) both;
+  }
+  @keyframes settings-enter {
+    from {
+      opacity: 0;
+      transform: translateY(calc(8px * var(--rail-motion, 1)));
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+</style>

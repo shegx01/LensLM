@@ -119,7 +119,7 @@
     </p>
 
     <label
-      class="mt-3 flex cursor-pointer items-center justify-between gap-4 rounded-[10px] border border-border bg-card px-4 py-3.5 transition-colors hover:border-border/80"
+      class="mt-3 flex cursor-pointer items-center justify-between gap-4 rounded-xl border border-border bg-card px-4 py-3.5 transition-colors hover:border-primary/40"
     >
       <span class="min-w-0 flex-1">
         <span class="block text-[0.78rem] font-bold text-foreground">Use graph retrieval</span>
@@ -147,7 +147,9 @@
     </p>
 
     {#if report}
-      <div class="mt-3 rounded-[10px] border border-border bg-card px-4 py-3.5">
+      <div
+        class="mt-3 rounded-xl border border-border/60 bg-card px-4 py-3.5 shadow-[var(--shadow-tile)]"
+      >
         {#if report.passed}
           <p class="flex items-start gap-2 text-[0.8rem] font-bold text-foreground">
             <Network class="mt-0.5 size-4 shrink-0 text-primary" aria-hidden="true" />
@@ -162,7 +164,7 @@
           </p>
         {/if}
 
-        <dl class="mt-3 grid grid-cols-2 gap-x-6 gap-y-1.5 text-[0.7rem]">
+        <dl class="mt-3 grid grid-cols-2 gap-x-6 gap-y-1.5 text-[0.7rem] tabular-nums">
           <div class="flex justify-between gap-3">
             <dt class="text-muted-foreground">Graph recall@5</dt>
             <dd class="font-semibold text-foreground">{pct(report.graph_recall)}</dd>
@@ -184,7 +186,9 @@
             <dd class="font-semibold text-foreground">{report.sample_n}</dd>
           </div>
         </dl>
-        <p class="mt-2 text-[0.65rem] text-muted-foreground">ran {friendlyDate(report.ran_at)}</p>
+        <p class="mt-2 text-[0.65rem] tabular-nums text-muted-foreground">
+          ran {friendlyDate(report.ran_at)}
+        </p>
       </div>
     {:else}
       <p class="mt-3 text-[0.75rem] text-muted-foreground">
@@ -197,7 +201,7 @@
       type="button"
       onclick={runBenchmark}
       disabled={running}
-      class="mt-4 inline-flex h-9 items-center justify-center rounded-lg bg-primary px-4 text-[0.78rem] font-semibold text-primary-foreground transition-colors hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-60"
+      class="mt-4 inline-flex h-9 items-center justify-center rounded-lg bg-primary px-4 text-[0.78rem] font-semibold text-primary-foreground transition-[background-color,transform] duration-150 hover:bg-primary/90 active:scale-[0.97] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-60 disabled:active:scale-100"
     >
       {#if running}
         {progressLabel || 'Running…'}

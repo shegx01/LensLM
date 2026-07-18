@@ -163,11 +163,12 @@
     transform: scale(calc(1 - 0.02 * var(--rail-motion, 1)));
   }
 
-  /* Audio Overview: the section's headline surface — an elevated card (stronger
-     shadow than the tool tiles) with the accent carried by its icon + CTA. */
+  /* Audio Overview headline surface: the accent border is softened (not solid --primary)
+     so it reads as an accent frame, not a selected state. */
   .audio-card {
     border-radius: 14px;
     background: var(--card);
+    border: 1px solid color-mix(in oklch, var(--primary) 45%, transparent);
     box-shadow: var(--shadow-bar);
   }
   .audio-icon {
