@@ -147,11 +147,6 @@ export function formatSize(sizeMb: number): string {
   return sizeMb >= 1000 ? `${(sizeMb / 1000).toFixed(1)} GB` : `${sizeMb} MB`;
 }
 
-/** Per-model meta line: `768 dims · 274 MB · Fast · Best …`. */
-export function modelMeta(m: EmbeddingModelSpec): string {
-  return `${m.dims} dims · ${formatSize(m.sizeMb)} · ${m.speed} · ${m.desc}`;
-}
-
 /**
  * Whether an Ollama-reported model name matches a spec.
  *

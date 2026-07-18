@@ -22,13 +22,14 @@
   import CircleCheck from '@lucide/svelte/icons/circle-check';
   import type { AppConfig } from '$lib/theme/types.js';
   import { updateConfig } from '$lib/config.js';
+  import { prefersReducedMotion } from '$lib/motion/index.js';
   import {
     EMBEDDING_MODELS,
     DEFAULT_EMBEDDING_MODEL,
     DEFAULT_EMBEDDING_BACKEND,
     resolveModel,
     resolveBackend,
-    modelMeta,
+    formatSize,
     ollamaMatches,
     REEMBED_WARNING,
     type EmbeddingBackend,
@@ -174,10 +175,14 @@
     const phases = ['Downloading…', 'Extracting…', 'Configuring…', 'Almost ready…'];
     let i = 0;
     installPhase = phases[0];
-    phaseTimer = setInterval(() => {
-      i = Math.min(i + 1, phases.length - 1);
-      installPhase = phases[i];
-    }, 1200);
+    // Reduced motion renders a hard-coded "Installing…" label, so the phase
+    // ticker is dead work in that branch — skip scheduling it entirely.
+    if (!reduceMotion) {
+      phaseTimer = setInterval(() => {
+        i = Math.min(i + 1, phases.length - 1);
+        installPhase = phases[i];
+      }, 1200);
+    }
     try {
       await warmFastembedModel(selectedModel);
       await refreshFastembed();
@@ -250,9 +255,14 @@
   const isDirty = $derived(selectedModel !== activeModel || backend !== activeBackend);
   const needsInstall = $derived(backend === 'fastembed' && !selectedReady);
 
+  const reduceMotion = $derived(prefersReducedMotion());
+
   const reembedPct = $derived(
     reembedTotal > 0 ? Math.min(100, Math.round((reembedDone / reembedTotal) * 100)) : 0
   );
+
+  const CHIP =
+    'rounded-full bg-muted px-1.5 py-0.5 text-[0.62rem] font-semibold text-muted-foreground';
 </script>
 
 <section class="flex flex-col" aria-label="Embeddings settings">
@@ -329,8 +339,12 @@
         >
           <span class="min-w-0 flex-1">
             <span class="block text-[0.78rem] font-bold text-foreground">{model.label}</span>
-            <span class="mt-0.5 block text-[0.68rem] text-muted-foreground">{modelMeta(model)}</span
-            >
+            <span class="mt-1 flex flex-wrap items-center gap-1">
+              {#each [`${model.dims}d`, formatSize(model.sizeMb), model.speed] as chip (chip)}
+                <span class={CHIP}>{chip}</span>
+              {/each}
+            </span>
+            <span class="mt-1 block text-[0.68rem] text-muted-foreground">{model.desc}</span>
           </span>
           {#if isGpu}
             <span
@@ -413,20 +427,32 @@
       {/if}
     </div>
   {:else if needsInstall}
-    <Button
-      class="mt-4 h-10 w-full"
-      onclick={handleInstall}
-      disabled={installProgress !== null}
-      aria-label={`Install ${resolveModel(selectedModel).label}`}
-    >
+    <div class="mt-4 flex items-center gap-3">
+      <span class="relative inline-flex size-11 shrink-0 items-center justify-center">
+        {#if installProgress !== null}
+          <span
+            class={cn('absolute inset-0 rounded-full', !reduceMotion && 'animate-install-ring')}
+            style={`border: 2.5px solid color-mix(in oklch, var(--primary) ${reduceMotion ? '45' : '20'}%, transparent); border-top-color: ${reduceMotion ? 'color-mix(in oklch, var(--primary) 45%, transparent)' : 'var(--primary)'};`}
+            aria-hidden="true"
+          ></span>
+        {/if}
+        <Button
+          type="button"
+          size="icon"
+          onclick={handleInstall}
+          disabled={installProgress !== null}
+          aria-label={`Install ${resolveModel(selectedModel).label}`}
+          class="relative size-9 rounded-full transition-transform duration-150 active:scale-[0.97]"
+        >
+          <Download class="size-4" />
+        </Button>
+      </span>
       {#if installProgress !== null}
-        <LoaderCircle class="size-4 animate-spin" />
-        {installPhase}
-      {:else}
-        <Download class="size-4" />
-        Install {resolveModel(selectedModel).label}
+        <span class="text-[0.72rem] text-muted-foreground" aria-live="polite">
+          {reduceMotion ? 'Installing…' : installPhase}
+        </span>
       {/if}
-    </Button>
+    </div>
   {:else if isDirty}
     <Button class="mt-4 h-10 w-full" onclick={commitSelection} aria-label="Apply selected model">
       {mode === 'notebook' ? 'Switch model' : 'Set as default'}
@@ -455,3 +481,17 @@
     </DialogFooter>
   </DialogContent>
 </Dialog>
+
+<style>
+  /* Indeterminate install ring: gated by --rail-motion so a runtime "reduce
+     motion" toggle also stalls it, in addition to the reduceMotion JS check
+     that skips this class entirely. */
+  @keyframes install-ring-spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+  .animate-install-ring {
+    animation: install-ring-spin calc(0.9s / max(var(--rail-motion, 1), 0.0001)) linear infinite;
+  }
+</style>

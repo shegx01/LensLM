@@ -17,23 +17,21 @@ test('first run renders the System check screen with the LLM + embedding rows at
   // The layout reads get_config (onboarding_complete=false) and renders the
   // SystemCheck component in place — same URL, no redirect.
   await expect(page.getByText('System check', { exact: true })).toBeVisible();
-  await expect(page.getByText('LLM runtime', { exact: true })).toBeVisible();
+  await expect(page.getByText('Local AI', { exact: true })).toBeVisible();
   await expect(page.getByText('Embedding model', { exact: true })).toBeVisible();
   // TTS setup moved to Settings (#194): onboarding gates on LLM + embeddings only.
   await expect(page.getByText('Text-to-speech', { exact: true })).toHaveCount(0);
 });
 
-test('Continue to setup advances to Make it yours WITHOUT completing onboarding', async ({
-  page
-}) => {
+test('Skip for now advances to Make it yours WITHOUT completing onboarding', async ({ page }) => {
   await installTauriStub(page, { onboardingComplete: false });
 
   await page.goto('/');
   await expect(page.getByText('System check', { exact: true })).toBeVisible();
 
-  // "Continue to setup" now advances the step machine — it no longer persists
-  // onboarding_complete (that moves to the final step).
-  await page.getByRole('button', { name: 'Continue to setup' }).click();
+  // "Skip for now" advances the step machine without persisting anything —
+  // onboarding_complete is set only by the final Add Sources step.
+  await page.getByRole('button', { name: 'Skip for now' }).click();
 
   await expect(page.getByRole('heading', { name: 'Make it yours' })).toBeVisible();
   await expect(page.getByText('System check', { exact: true })).toBeHidden();
@@ -52,7 +50,7 @@ test('completes the full onboarding walk and swaps to the app (no URL change)', 
   await expect(page.getByText('System check', { exact: true })).toBeVisible();
 
   // Step 1 → Make it yours
-  await page.getByRole('button', { name: 'Continue to setup' }).click();
+  await page.getByRole('button', { name: 'Skip for now' }).click();
   await expect(page.getByRole('heading', { name: 'Make it yours' })).toBeVisible();
   await page.getByPlaceholder('e.g. Jamie or jdoe').fill('Jamie'); // name is required
   await page.getByRole('button', { name: 'Continue', exact: true }).click();

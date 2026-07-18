@@ -35,7 +35,7 @@ test('fresh_install_fastembed_only_passes_gate', async ({ page }) => {
   // The Continue gate is not blocked (all rows pass; fastembed satisfied the
   // embedding arm without Ollama). Advancing to "Make it yours" proves the gate
   // did not dead-end a fastembed-only machine.
-  await page.getByRole('button', { name: 'Continue to setup' }).click();
+  await page.getByRole('button', { name: 'Skip for now' }).click();
   await expect(page.getByRole('heading', { name: 'Make it yours' })).toBeVisible();
 });
 

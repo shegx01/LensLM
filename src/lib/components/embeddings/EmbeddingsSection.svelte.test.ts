@@ -352,3 +352,124 @@ describe('EmbeddingsSection — backend-filtered model picker (Step 8)', () => {
     expect(await screen.findByText(/ollama pull qwen3-embedding:4b/i)).toBeInTheDocument();
   });
 });
+
+describe('EmbeddingsSection — redesigned metadata chips + install ring (Step 6, #217)', () => {
+  it('AC15: shows dims/size/speed chips per model row from the models.ts catalog', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return baseAppConfig({ embedding_model: 'nomic-embed-text-v1.5' });
+      if (cmd === 'fastembed_models_cached') return [];
+      if (cmd === 'list_ollama_models') return [];
+    });
+
+    render(EmbeddingsSection, { props: { mode: 'global' } });
+
+    const row = (await screen.findByRole('radio', { name: /nomic-embed-text-v1\.5/i })).closest(
+      'div'
+    ) as HTMLElement;
+    expect(row).not.toBeNull();
+    expect(row).toHaveTextContent('768d');
+    expect(row).toHaveTextContent('274 MB');
+    expect(row).toHaveTextContent('Fast');
+    expect(row).toHaveTextContent(/best all-round local model/i);
+  });
+
+  it('AC16: an uninstalled fastembed model renders an icon-only circular install button, not the old full-width text button', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return baseAppConfig({ embedding_model: 'nomic-embed-text-v1.5' });
+      if (cmd === 'fastembed_models_cached') return [];
+      if (cmd === 'list_ollama_models') return [];
+    });
+
+    render(EmbeddingsSection, { props: { mode: 'global' } });
+
+    const install = await screen.findByRole('button', { name: /install nomic-embed-text-v1\.5/i });
+    expect(install).toBeInTheDocument();
+    // Icon-only: no visible "Install <label>" text content, just the accessible name.
+    expect(install.textContent?.trim()).toBe('');
+    expect(screen.queryByText(/^Install nomic-embed-text-v1\.5$/)).not.toBeInTheDocument();
+  });
+
+  it('AC17: clicking install shows the indeterminate ring + phase text (no percentage), then flips to Ready', async () => {
+    let resolveWarm: () => void = () => {};
+    const warmPromise = new Promise<void>((resolve) => {
+      resolveWarm = resolve;
+    });
+    let cached: string[] = [];
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return baseAppConfig({ embedding_model: 'nomic-embed-text-v1.5' });
+      if (cmd === 'fastembed_models_cached') return cached;
+      if (cmd === 'list_ollama_models') return [];
+      if (cmd === 'set_config') return null;
+      if (cmd === 'warm_fastembed_model') {
+        return warmPromise.then(() => {
+          cached = ['nomic-embed-text-v1.5'];
+        });
+      }
+    });
+
+    render(EmbeddingsSection, { props: { mode: 'global' } });
+
+    const install = await screen.findByRole('button', { name: /install nomic-embed-text-v1\.5/i });
+    await fireEvent.click(install);
+
+    await waitFor(() => expect(document.querySelector('.animate-install-ring')).toBeTruthy());
+    expect(await screen.findByText(/downloading…/i)).toBeInTheDocument();
+    expect(screen.queryByText(/%/)).not.toBeInTheDocument();
+
+    resolveWarm();
+
+    expect(await screen.findByLabelText(/nomic-embed-text-v1\.5 ready/i)).toBeInTheDocument();
+  });
+
+  it('AC18: under prefers-reduced-motion, the ring never spins and a static "Installing…" state renders', async () => {
+    const originalMatchMedia = window.matchMedia;
+    window.matchMedia = vi
+      .fn()
+      .mockReturnValue({ matches: true }) as unknown as typeof window.matchMedia;
+
+    try {
+      let resolveWarm: () => void = () => {};
+      const warmPromise = new Promise<void>((resolve) => {
+        resolveWarm = resolve;
+      });
+      mockIPC((cmd) => {
+        if (cmd === 'get_config')
+          return baseAppConfig({ embedding_model: 'nomic-embed-text-v1.5' });
+        if (cmd === 'fastembed_models_cached') return [];
+        if (cmd === 'list_ollama_models') return [];
+        if (cmd === 'set_config') return null;
+        if (cmd === 'warm_fastembed_model') return warmPromise;
+      });
+
+      render(EmbeddingsSection, { props: { mode: 'global' } });
+
+      const install = await screen.findByRole('button', {
+        name: /install nomic-embed-text-v1\.5/i
+      });
+      await fireEvent.click(install);
+
+      expect(await screen.findByText(/^Installing…$/)).toBeInTheDocument();
+      expect(document.querySelector('.animate-install-ring')).toBeNull();
+      expect(screen.queryByText(/downloading…/i)).not.toBeInTheDocument();
+
+      resolveWarm();
+    } finally {
+      window.matchMedia = originalMatchMedia;
+    }
+  });
+
+  it('AC20: ollama-backed models keep the pull hint and show no install ring', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config')
+        return baseAppConfig({ embedding_backend: 'ollama', embedding_model: 'embeddinggemma' });
+      if (cmd === 'fastembed_models_cached') return [];
+      if (cmd === 'list_ollama_models') return [];
+    });
+
+    render(EmbeddingsSection, { props: { mode: 'global' } });
+
+    expect(await screen.findByText(/ollama pull embeddinggemma/i)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^install /i })).not.toBeInTheDocument();
+    expect(document.querySelector('.animate-install-ring')).toBeNull();
+  });
+});
