@@ -69,7 +69,7 @@ describe('AiModelSection', () => {
     expect(screen.queryByRole('button', { name: /^save$/i })).not.toBeInTheDocument();
   });
 
-  it('initializes from the resolved provider and does NOT repin on open (deterministic init)', async () => {
+  it('initializes from enrichment.chat_model and does NOT repin on open (deterministic init)', async () => {
     const cfg = baseAppConfig({
       models: [
         {
@@ -89,14 +89,19 @@ describe('AiModelSection', () => {
           api_key: 'secret'
         }
       ],
-      enrichment: { enabled: true, coref_strategy: 'llm_inline', cloud_consent: true }
+      enrichment: {
+        enabled: true,
+        coref_strategy: 'llm_inline',
+        cloud_consent: true,
+        chat_model: { provider: 'openai', model: 'gpt-4o' }
+      }
     });
     const writes = setup(cfg, { provider: { 'gpt-4o': textModel('gpt-4o') } });
 
     render(AiModelSection);
     await screen.findByRole('heading', { name: 'AI Model' });
 
-    // CloudFirst + consent → resolves to the cloud entry, not blind models[0].
+    // chat_model pins the cloud entry → init reads it directly, not blind models[0] (ollama).
     await waitFor(() =>
       expect(screen.getByRole('tab', { name: 'Cloud API' })).toHaveAttribute(
         'aria-selected',
@@ -195,7 +200,7 @@ describe('AiModelSection', () => {
         enabled: true,
         coref_strategy: 'llm_inline',
         cloud_consent: true,
-        routing: { kind: 'explicit', provider: 'ollama', model: 'llama3.2:3b' }
+        chat_model: { provider: 'ollama', model: 'llama3.2:3b' }
       }
     });
     const writes = setup(cfg, { ollama: ['llama3.2:3b', 'qwen2.5:7b'] });
@@ -206,7 +211,7 @@ describe('AiModelSection', () => {
     await fireEvent.click(await screen.findByRole('button', { name: '16K' }));
 
     await waitFor(() => expect(writes.length).toBeGreaterThan(0));
-    const enrWrite = writes.find((w) => w.enrichment.routing?.kind === 'explicit');
+    const enrWrite = writes.find((w) => w.enrichment.chat_model);
     expect(enrWrite).toBeDefined();
     expect(enrWrite!.enrichment.enabled).toBe(true);
     expect(enrWrite!.enrichment.coref_strategy).toBe('llm_inline');
@@ -214,7 +219,7 @@ describe('AiModelSection', () => {
     expect(enrWrite!.enrichment.cloud_consent).toBe(true);
   });
 
-  it('writes routing=Explicit and cloud_consent when a cloud provider is selected (AC-2)', async () => {
+  it('writes chat_model and cloud_consent when a cloud provider is selected (AC-2)', async () => {
     const cfg = baseAppConfig({
       models: [],
       enrichment: { enabled: false, coref_strategy: 'llm_inline', cloud_consent: false }
@@ -227,7 +232,7 @@ describe('AiModelSection', () => {
     await fireEvent.click(screen.getByRole('tab', { name: 'Cloud API' }));
 
     await waitFor(() => expect(writes.some((w) => w.enrichment.cloud_consent === true)).toBe(true));
-    const enrWrite = writes.find((w) => w.enrichment.routing?.kind === 'explicit');
+    const enrWrite = writes.find((w) => w.enrichment.chat_model);
     expect(enrWrite).toBeDefined();
     expect(enrWrite!.enrichment.cloud_consent).toBe(true);
     // enabled must NOT be flipped on by this panel.
@@ -241,8 +246,8 @@ describe('AiModelSection', () => {
     expect(entry.provider).toBe('openai');
     expect(entry.model).toBe('gpt-4o');
     expect(modelWrite!.models.some((m) => m.provider === 'ollama')).toBe(false);
-    // routing pins the same real cloud provider.
-    expect(enrWrite!.enrichment.routing).toMatchObject({ provider: 'openai' });
+    // chat_model pins the same real cloud provider + model.
+    expect(enrWrite!.enrichment.chat_model).toMatchObject({ provider: 'openai', model: 'gpt-4o' });
   });
 
   it('restores a saved model on provider round-trip and never pins an empty model (ROUND-TRIP)', async () => {
@@ -261,7 +266,7 @@ describe('AiModelSection', () => {
         enabled: true,
         coref_strategy: 'llm_inline',
         cloud_consent: true,
-        routing: { kind: 'explicit', provider: 'openai', model: 'gpt-4o' }
+        chat_model: { provider: 'openai', model: 'gpt-4o' }
       }
     });
     const writes = setup(cfg, { provider: { 'gpt-4o': textModel('gpt-4o') }, ollama: [] });
@@ -269,7 +274,7 @@ describe('AiModelSection', () => {
     render(AiModelSection);
     await screen.findByRole('heading', { name: 'AI Model' });
 
-    // Panel opens on the cloud entry (CloudFirst + consent).
+    // Panel opens on the cloud entry (chat_model pin).
     await waitFor(() =>
       expect(screen.getByRole('tab', { name: 'Cloud API' })).toHaveAttribute(
         'aria-selected',
@@ -297,10 +302,8 @@ describe('AiModelSection', () => {
       ).toBe(true)
     );
 
-    // No set_config ever wrote an Explicit pin (or a models entry) with an empty model.
-    const emptyPin = writes.find(
-      (w) => w.enrichment.routing?.kind === 'explicit' && w.enrichment.routing.model === ''
-    );
+    // No set_config ever wrote a chat_model pin (or a models entry) with an empty model.
+    const emptyPin = writes.find((w) => w.enrichment.chat_model?.model === '');
     expect(emptyPin).toBeUndefined();
     expect(writes.some((w) => w.models.some((m) => m.model === ''))).toBe(false);
   });

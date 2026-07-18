@@ -1074,15 +1074,20 @@ impl LensEngine {
     }
 
     /// Resolves the provider for interactive CHAT/dialogue (CX-5), decoupled from
-    /// `enrichment.enabled` (that flag gates only the enrichment worker). Reuses the
-    /// installed enrichment provider when present, else builds one from config
-    /// regardless of the master toggle. `None` only when no model is configured.
+    /// `enrichment.enabled` (that flag gates only the enrichment worker). Variant B: a
+    /// purpose-built `enrichment.chat_model` pin is authoritative when set — it does not
+    /// fall back to routing or the cached enrichment provider, so an unusable pin reports
+    /// "no chat provider". With no pin, reuses the installed enrichment provider else
+    /// builds one from routing. `None` when nothing usable is configured.
     pub async fn chat_provider(&self) -> Option<Arc<dyn LlmProvider>> {
+        let config = self.config().await;
+        if config.enrichment.chat_model.is_some() {
+            return crate::llm::chat_provider_from_config(&config, config.enrichment.cloud_consent);
+        }
         if let Some(p) = self.llm_provider().await {
             return Some(p);
         }
-        let config = self.config().await;
-        crate::llm::provider_from_config(&config, config.enrichment.cloud_consent)
+        crate::llm::chat_provider_from_config(&config, config.enrichment.cloud_consent)
     }
 
     /// Installs (or replaces) the JS renderer for SPA URL-render fallback (issue

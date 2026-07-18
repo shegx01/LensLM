@@ -5,9 +5,9 @@
   no Save button.
 
   Two backend-coupled invariants:
-  • The chosen chat entry is written as enrichment.routing = Explicit{provider,model} —
-    chat resolution ignores chat_model, so this is what actually makes it authoritative
-    (and enrichment defaults to it).
+  • The chosen chat entry is written as enrichment.chat_model = {provider,model} — the
+    purpose-built chat pin the engine's chat_provider resolves FIRST (Variant B). Routing
+    is left untouched; it stays the enrichment-only policy.
   • saveEnrichmentPrefs overwrites enabled/coref_strategy/cloud_consent unconditionally,
     so we source those from the persisted config and only ever flip cloud_consent → true
     for a cloud provider (never false) to avoid re-enqueuing or killing enrichment.
@@ -63,23 +63,17 @@
     return limit != null ? `Catalog limit: ${formatCompact(limit)} tokens (advisory)` : null;
   });
 
-  // Never blind models[0]: derive the entry chat currently resolves to (Explicit pin
-  // first, else CloudFirst — a consented cloud entry outranks local), so opening the
-  // panel on a multi-entry config doesn't silently repin a different model on blur.
+  // chat_model is an explicit pin, so init just reads it back — no need to replicate the
+  // engine's routing (CloudFirst/LocalFirst) semantics (a key Variant B simplification).
+  // Legacy configs with no chat_model fall back to the first entry with a real model.
   function resolveInitialEntry(cfg: AppConfig): ModelConfig | null {
     const models = cfg.models ?? [];
-    const routing = cfg.enrichment?.routing;
-    if (routing?.kind === 'explicit') {
-      const m = models.find((e) => e.provider === routing.provider && e.model === routing.model);
+    const pin = cfg.enrichment?.chat_model;
+    if (pin) {
+      const m = models.find((e) => e.provider === pin.provider && e.model === pin.model);
       if (m) return m;
     }
-    if (cfg.enrichment?.cloud_consent) {
-      const cloud = models.find((m) => m.provider !== 'ollama' && m.model.trim() !== '');
-      if (cloud) return cloud;
-    }
-    const local = models.find((m) => m.provider === 'ollama' && m.model.trim() !== '');
-    if (local) return local;
-    return models[0] ?? null;
+    return models.find((m) => m.model.trim() !== '') ?? null;
   }
 
   onMount(async () => {
@@ -176,7 +170,7 @@
       hasSavedKey = (existing?.api_key.trim() ?? '') !== '';
     }
 
-    // Never persist an Explicit pin with an empty model; defer until a model is chosen.
+    // Never persist a chat_model pin with an empty model; defer until a model is chosen.
     if (model.trim() !== '') void persistChat();
   }
 
@@ -205,7 +199,7 @@
         enabled: prior.enabled,
         coref_strategy: prior.coref_strategy,
         cloud_consent: isCloud ? true : prior.cloud_consent,
-        routing: { kind: 'explicit', provider: providerId, model },
+        chat_model: { provider: providerId, model },
         coref_model: enrichmentModel,
         map_model: enrichmentModel
       });
