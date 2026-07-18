@@ -105,6 +105,15 @@ impl VectorStore for MockStore {
     async fn search(&self, _c: &Coordinate, _q: &[f32], _k: usize) -> Result<Vec<Hit>, LensError> {
         unreachable!()
     }
+    async fn search_filtered(
+        &self,
+        _c: &Coordinate,
+        _q: &[f32],
+        _k: usize,
+        _s: &[String],
+    ) -> Result<Vec<Hit>, LensError> {
+        unreachable!("chunk-vector search path not exercised")
+    }
     async fn drop_source(&self, _c: &Coordinate, _s: &str) -> Result<(), LensError> {
         unreachable!()
     }

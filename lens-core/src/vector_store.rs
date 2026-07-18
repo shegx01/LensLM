@@ -152,20 +152,17 @@ pub trait VectorStore: Send + Sync {
     /// top-`k` cut (the #39 recall fix). An empty `source_ids` means "no narrowing"
     /// and behaves exactly like `search` (notebook scope).
     ///
-    /// Default cannot narrow by source because [`Hit`] carries no `source_id`;
-    /// implementors that can narrow at the store layer SHOULD override. Callers
-    /// needing a hard guarantee must post-filter (the router pairs this with
-    /// `live_chunk_ids`).
+    /// No default body (RQ-9): a silent fallback to notebook-scope `search` would leak
+    /// deselected/trashed chunks past the pre-filter and regress #39 recall invisibly.
+    /// Every backend MUST implement narrowing (or return an explicit error) so a new
+    /// backend fails to compile rather than losing recall silently.
     async fn search_filtered(
         &self,
         coord: &Coordinate,
         query: &[f32],
         k: usize,
         source_ids: &[String],
-    ) -> Result<Vec<Hit>, LensError> {
-        let _ = source_ids;
-        self.search(coord, query, k).await
-    }
+    ) -> Result<Vec<Hit>, LensError>;
 
     /// Drops all vectors for `source_id` from the active table. Runs BEFORE the
     /// SQLite `chunks` delete (cross-store ordering guarantee).

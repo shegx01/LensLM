@@ -13,8 +13,10 @@ use tokenizers::Tokenizer;
 use crate::LensError;
 use crate::chunk::kind;
 use crate::config::{ModelConfig, RetrievalConfig, TierThresholds};
-use crate::graph::{EntityKind, NotebookGraph, entity_evidence, entity_lookup, ppr_expand};
-use crate::vector_store::{Coordinate, VectorStore};
+use crate::graph::{
+    EntityKind, NotebookGraph, entity_evidence, entity_lookup_prefix_first, ppr_expand,
+};
+use crate::vector_store::{Coordinate, Hit, VectorStore};
 
 use super::{HitSource, MAX_OVERFETCH, OVERFETCH, Reranker, RetrievalHit, bm25, live_chunk_ids};
 
@@ -42,6 +44,11 @@ const TIER1_FRACTION: f32 = 0.65;
 /// post-filter (both correct; the fallback is just slower). Realistic per-notebook
 /// source counts are tens, so the guard is purely defensive.
 const MAX_PREFILTER_IDS: usize = 512;
+
+/// Confidence floor dropping the max-normalized graph arm's weak traversal tail
+/// (~0.01 PPR neighbors) before fusion, so it can't enter RRF with full rank mass
+/// (RQ-4). Evidence chunks (fixed conf 1.0) always clear it.
+const GRAPH_MIN_CONFIDENCE: f32 = 0.1;
 
 /// Which tier the router selected for a query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -249,38 +256,47 @@ async fn resolve_selected_sources(
     Ok(rows)
 }
 
-/// A parent-chunk row in document order, used by both tier assemblies.
+/// A parent-chunk row in document order, used by both tier assemblies. `level` /
+/// `token_start` carry the document-order key so Tier-2 can re-sort merged parents
+/// without a separate per-chunk lookup.
 #[derive(Debug, Clone)]
 struct ParentRow {
     chunk_id: String,
     source_id: String,
     text: String,
     locator: Option<String>,
+    level: i32,
+    token_start: i64,
 }
 
 /// Loads the parent chunks for a set of sources in document order (source order,
-/// then `level ASC, token_start ASC`). `source_anchor` falls back to `section_path`.
+/// then `level ASC, token_start ASC`), under the [`RETRIEVAL_LIVE_WHERE`] JOIN.
+/// `source_anchor` falls back to `section_path`.
 async fn load_parent_rows(
     pool: &SqlitePool,
     source_ids: &[String],
 ) -> Result<Vec<ParentRow>, LensError> {
     let mut rows = Vec::new();
     for source_id in source_ids {
-        let recs = sqlx::query_as::<_, (String, String, Option<String>, String)>(
-            "SELECT id, text, source_anchor, section_path FROM chunks \
-             WHERE source_id = ? AND kind = ? \
-             ORDER BY level ASC, token_start ASC",
-        )
-        .bind(source_id)
-        .bind(kind::PARENT)
-        .fetch_all(pool)
-        .await?;
-        for (chunk_id, text, source_anchor, section_path) in recs {
+        let recs =
+            sqlx::query_as::<_, (String, String, Option<String>, String, i32, i64)>(&format!(
+                "SELECT c.id, c.text, c.source_anchor, c.section_path, c.level, c.token_start \
+             FROM chunks c JOIN sources s ON s.id = c.source_id \
+             WHERE c.source_id = ? AND c.kind = ? AND {RETRIEVAL_LIVE_WHERE} \
+             ORDER BY c.level ASC, c.token_start ASC"
+            ))
+            .bind(source_id)
+            .bind(kind::PARENT)
+            .fetch_all(pool)
+            .await?;
+        for (chunk_id, text, source_anchor, section_path, level, token_start) in recs {
             rows.push(ParentRow {
                 chunk_id,
                 source_id: source_id.clone(),
                 text,
                 locator: source_anchor.or(Some(section_path)),
+                level,
+                token_start,
             });
         }
     }
@@ -288,17 +304,28 @@ async fn load_parent_rows(
 }
 
 /// Tier-1 raw-corpus assembly: the selected+live sources' parent chunks in document
-/// order, each hydrated, `parent_id = None`, `order_index` monotonic. Non-graph
-/// provenance (raw inject). No retrieval, no fusion.
+/// order, `parent_id = None`, `order_index` monotonic. No retrieval, no fusion. The
+/// running-sum trim against `tier1_cap` is the RT-4 net against a stale cached
+/// `token_count` (keeps ≥1 unit; exact via `tokenizer` when present).
 async fn assemble_tier1(
     pool: &SqlitePool,
     source_ids: &[String],
+    tier1_cap: usize,
+    tokenizer: Option<&Tokenizer>,
 ) -> Result<Vec<ContextUnit>, LensError> {
     let parents = load_parent_rows(pool, source_ids).await?;
-    Ok(parents
-        .into_iter()
-        .enumerate()
-        .map(|(order_index, p)| ContextUnit {
+    let mut units = Vec::with_capacity(parents.len());
+    let mut running = 0usize;
+    for (order_index, p) in parents.into_iter().enumerate() {
+        let cost = match tokenizer {
+            Some(tk) => exact_tokens(tk, &p.text).unwrap_or_else(|_| estimate_tokens(&p.text)),
+            None => estimate_tokens(&p.text),
+        };
+        if running + cost > tier1_cap && !units.is_empty() {
+            break;
+        }
+        running += cost;
+        units.push(ContextUnit {
             text: p.text,
             source_id: p.source_id,
             chunk_id: p.chunk_id,
@@ -309,12 +336,13 @@ async fn assemble_tier1(
                 source: HitSource::Dense,
                 graph_confidence: None,
             },
-        })
-        .collect())
+        });
+    }
+    Ok(units)
 }
 
-/// A retrieved child chunk with its parent linkage and provenance, the input to
-/// Tier-2 auto-merge.
+/// A retrieved child chunk with its parent linkage, provenance, fused score, and
+/// document-order key (`level`, `token_start`) — the input to Tier-2 auto-merge.
 #[derive(Debug, Clone)]
 struct RetrievedChunk {
     chunk_id: String,
@@ -324,161 +352,195 @@ struct RetrievedChunk {
     locator: Option<String>,
     source: HitSource,
     graph_confidence: Option<f32>,
+    /// Fused RRF/reranker score (higher = better); drives the RQ-1 relevance trim.
+    score: f32,
+    level: i32,
+    token_start: i64,
 }
 
-/// Loads the parent/child linkage + text for a set of retrieved chunk ids,
-/// preserving the input (fused rank) order. Chunks that vanished are dropped.
+/// A chunk-metadata row for the batched Tier-2 hydration. `#[derive(FromRow)]` binds
+/// by column NAME, so a reordered `SELECT` cannot silently misbind (unlike a wide
+/// positional tuple of same-typed columns).
+#[derive(sqlx::FromRow)]
+struct ChunkMetaRow {
+    id: String,
+    source_id: String,
+    parent_id: Option<String>,
+    source_anchor: Option<String>,
+    section_path: String,
+    level: i32,
+    token_start: i64,
+}
+
+/// A merged-parent row (adds `text`, drops `parent_id`). Name-bound like [`ChunkMetaRow`].
+#[derive(sqlx::FromRow)]
+struct MergedParentRow {
+    id: String,
+    source_id: String,
+    text: String,
+    source_anchor: Option<String>,
+    section_path: String,
+    level: i32,
+    token_start: i64,
+}
+
+/// Batch-hydrates linkage + doc-order key + text for the retrieved hits in fused
+/// order (RQ-2). Metadata JOINs `sources` on [`RETRIEVAL_LIVE_WHERE`]; text reuses
+/// `prehydrated` and re-selects only the residual (RQ-3). `graph_confidence` is
+/// attached only to `HitSource::Graph` hits (RQ-8).
 async fn hydrate_retrieved(
     pool: &SqlitePool,
     hits: &[RetrievalHit],
     graph_conf: &HashMap<String, f32>,
+    prehydrated: &HashMap<String, String>,
 ) -> Result<Vec<RetrievedChunk>, LensError> {
+    if hits.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids: Vec<String> = hits.iter().map(|h| h.chunk_id.clone()).collect();
+    let rows: Vec<ChunkMetaRow> = crate::db::fetch_batched(pool, &ids, |ph| {
+        format!(
+            "SELECT c.id, c.source_id, c.parent_id, c.source_anchor, c.section_path, \
+             c.level, c.token_start \
+             FROM chunks c JOIN sources s ON s.id = c.source_id \
+             WHERE c.id IN ({ph}) AND {RETRIEVAL_LIVE_WHERE}"
+        )
+    })
+    .await?;
+    let mut meta: HashMap<String, ChunkMetaRow> =
+        rows.into_iter().map(|r| (r.id.clone(), r)).collect();
+
+    let missing: Vec<String> = ids
+        .iter()
+        .filter(|id| meta.contains_key(*id) && !prehydrated.contains_key(*id))
+        .cloned()
+        .collect();
+    let fetched = super::hydrate_texts_map(pool, &missing).await?;
+
     let mut out = Vec::with_capacity(hits.len());
     for h in hits {
-        let rec = sqlx::query_as::<_, (String, Option<String>, String, Option<String>, String)>(
-            "SELECT source_id, parent_id, text, source_anchor, section_path FROM chunks \
-             WHERE id = ?",
-        )
-        .bind(&h.chunk_id)
-        .fetch_optional(pool)
-        .await?;
-        if let Some((source_id, parent_id, text, source_anchor, section_path)) = rec {
-            out.push(RetrievedChunk {
-                chunk_id: h.chunk_id.clone(),
-                source_id,
-                parent_id,
-                text,
-                locator: source_anchor.or(Some(section_path)),
-                source: h.source,
-                graph_confidence: graph_conf.get(&h.chunk_id).copied(),
-            });
-        }
+        // `remove` moves the owned row out (fused ids are RRF-deduped, so unique);
+        // a missing id was dropped by the live filter (RT-2) or vanished.
+        let Some(m) = meta.remove(&h.chunk_id) else {
+            continue;
+        };
+        let text = prehydrated
+            .get(&h.chunk_id)
+            .or_else(|| fetched.get(&h.chunk_id))
+            .cloned()
+            .unwrap_or_default();
+        out.push(RetrievedChunk {
+            chunk_id: h.chunk_id.clone(),
+            source_id: m.source_id,
+            parent_id: m.parent_id,
+            text,
+            locator: m.source_anchor.or(Some(m.section_path)),
+            source: h.source,
+            graph_confidence: if h.source == HitSource::Graph {
+                graph_conf.get(&h.chunk_id).copied()
+            } else {
+                None
+            },
+            score: h.score,
+            level: m.level,
+            token_start: m.token_start,
+        });
     }
     Ok(out)
 }
 
-/// The number of children a parent has (`chunks.parent_id = parent_id`), used to
-/// decide the ≥50% auto-merge boundary.
-async fn parent_child_count(pool: &SqlitePool, parent_id: &str) -> Result<usize, LensError> {
-    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE parent_id = ?")
-        .bind(parent_id)
-        .fetch_optional(pool)
-        .await?
-        .unwrap_or(0);
-    Ok(n.max(0) as usize)
-}
+/// The authoritative RT-2 predicate, re-applied via a `sources s` JOIN at every
+/// hydration site (both tiers) so a source trashed/deselected between source-id
+/// resolution and hydration contributes no text. Uses the `s` alias; distinct from
+/// [`SELECTED_LIVE_WHERE`] (bare-`sources`, `notebook_id`-scoped).
+pub(crate) const RETRIEVAL_LIVE_WHERE: &str = "s.trashed_at IS NULL AND s.selected = 1";
 
-/// A parent chunk's row (text + locator + source), loaded when a parent is merged.
-async fn load_parent(pool: &SqlitePool, parent_id: &str) -> Result<Option<ParentRow>, LensError> {
-    let rec = sqlx::query_as::<_, (String, String, Option<String>, String)>(
-        "SELECT source_id, text, source_anchor, section_path FROM chunks WHERE id = ?",
-    )
-    .bind(parent_id)
-    .fetch_optional(pool)
+/// Batched child counts per parent (RQ-2), for the ≥50% auto-merge boundary.
+async fn parent_child_counts(
+    pool: &SqlitePool,
+    parent_ids: &[String],
+) -> Result<HashMap<String, usize>, LensError> {
+    let rows: Vec<(String, i64)> = crate::db::fetch_batched(pool, parent_ids, |ph| {
+        format!(
+            "SELECT parent_id, COUNT(*) FROM chunks WHERE parent_id IN ({ph}) GROUP BY parent_id"
+        )
+    })
     .await?;
-    Ok(
-        rec.map(|(source_id, text, source_anchor, section_path)| ParentRow {
-            chunk_id: parent_id.to_string(),
-            source_id,
-            text,
-            locator: source_anchor.or(Some(section_path)),
-        }),
-    )
+    Ok(rows
+        .into_iter()
+        .map(|(pid, n)| (pid, n.max(0) as usize))
+        .collect())
 }
 
-/// Document-order key for a chunk id (`(source rank, level, token_start)`), so the
+/// Batch-loads merged-parent rows keyed by parent id (RQ-2), under the
+/// [`RETRIEVAL_LIVE_WHERE`] JOIN. An absent parent drops its children too.
+async fn load_parents(
+    pool: &SqlitePool,
+    parent_ids: &[String],
+) -> Result<HashMap<String, ParentRow>, LensError> {
+    let rows: Vec<MergedParentRow> = crate::db::fetch_batched(pool, parent_ids, |ph| {
+        format!(
+            "SELECT c.id, c.source_id, c.text, c.source_anchor, c.section_path, \
+             c.level, c.token_start \
+             FROM chunks c JOIN sources s ON s.id = c.source_id \
+             WHERE c.id IN ({ph}) AND {RETRIEVAL_LIVE_WHERE}"
+        )
+    })
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            (
+                r.id.clone(),
+                ParentRow {
+                    chunk_id: r.id,
+                    source_id: r.source_id,
+                    text: r.text,
+                    locator: r.source_anchor.or(Some(r.section_path)),
+                    level: r.level,
+                    token_start: r.token_start,
+                },
+            )
+        })
+        .collect())
+}
+
+/// Document-order key for a candidate (`(source rank, level, token_start)`), so the
 /// final units re-sort to reading order regardless of retrieval rank.
-async fn doc_order_key(
-    pool: &SqlitePool,
-    chunk_id: &str,
+fn doc_order_key(
     source_rank: &HashMap<String, usize>,
-) -> Result<(usize, i32, i64), LensError> {
-    let rec = sqlx::query_as::<_, (String, i32, i64)>(
-        "SELECT source_id, level, token_start FROM chunks WHERE id = ?",
-    )
-    .bind(chunk_id)
-    .fetch_optional(pool)
-    .await?;
-    match rec {
-        Some((source_id, level, token_start)) => {
-            let rank = source_rank.get(&source_id).copied().unwrap_or(usize::MAX);
-            Ok((rank, level, token_start))
-        }
-        None => Ok((usize::MAX, i32::MAX, i64::MAX)),
-    }
+    source_id: &str,
+    level: i32,
+    token_start: i64,
+) -> (usize, i32, i64) {
+    let rank = source_rank.get(source_id).copied().unwrap_or(usize::MAX);
+    (rank, level, token_start)
 }
 
-/// Tier-2 assembly (spec/AC4): a parent is auto-merged when **≥50%** of its children
-/// are in the retrieved set (2/4 merges, 1/4 does not); a merged parent replaces its
-/// retrieved children; overlapping parents are deduped; survivors are trimmed to
-/// `tier2_cap` (by `chars/4` estimate) and re-sorted to document order.
-async fn assemble_tier2(
-    pool: &SqlitePool,
-    hits: &[RetrievalHit],
-    graph_conf: &HashMap<String, f32>,
-    source_rank: &HashMap<String, usize>,
-    tier2_cap: usize,
-) -> Result<Vec<ContextUnit>, LensError> {
-    let retrieved = hydrate_retrieved(pool, hits, graph_conf).await?;
+/// The ≥50% auto-merge rule: a parent merges when at least half its children were
+/// retrieved (2/4 merges, 1/4 does not). Single source of truth for both the
+/// which-parents-to-load pass and the candidate-building pass.
+fn should_merge(retrieved_children: usize, total_children: usize) -> bool {
+    total_children > 0 && retrieved_children * 2 >= total_children
+}
 
-    let mut by_parent: HashMap<String, Vec<RetrievedChunk>> = HashMap::new();
-    let mut orphans: Vec<RetrievedChunk> = Vec::new();
-    for rc in retrieved {
-        match &rc.parent_id {
-            Some(pid) => by_parent.entry(pid.clone()).or_default().push(rc),
-            None => orphans.push(rc),
-        }
-    }
+/// One assembled Tier-2 candidate before the budget trim. `score` is the fused
+/// score (max over children for a merged parent), driving the RQ-1 relevance trim.
+struct Candidate {
+    chunk_id: String,
+    source_id: String,
+    parent_id: Option<String>,
+    text: String,
+    locator: Option<String>,
+    provenance: Provenance,
+    score: f32,
+    level: i32,
+    token_start: i64,
+}
 
-    #[derive(Clone)]
-    struct Candidate {
-        chunk_id: String,
-        source_id: String,
-        parent_id: Option<String>,
-        text: String,
-        locator: Option<String>,
-        provenance: Provenance,
-    }
-
-    let mut candidates: Vec<Candidate> = Vec::new();
-    let mut merged_parent_ids: HashSet<String> = HashSet::new();
-
-    for (parent_id, children) in by_parent {
-        let total = parent_child_count(pool, &parent_id).await?;
-        let retrieved_count = children.len();
-        let merge = total > 0 && retrieved_count * 2 >= total;
-        if merge {
-            if merged_parent_ids.insert(parent_id.clone())
-                && let Some(parent) = load_parent(pool, &parent_id).await?
-            {
-                let provenance = merged_provenance(&children);
-                candidates.push(Candidate {
-                    chunk_id: parent.chunk_id,
-                    source_id: parent.source_id,
-                    parent_id: Some(parent_id.clone()),
-                    text: parent.text,
-                    locator: parent.locator,
-                    provenance,
-                });
-            }
-        } else {
-            for rc in children {
-                candidates.push(Candidate {
-                    chunk_id: rc.chunk_id,
-                    source_id: rc.source_id,
-                    parent_id: rc.parent_id,
-                    text: rc.text,
-                    locator: rc.locator,
-                    provenance: Provenance {
-                        source: rc.source,
-                        graph_confidence: rc.graph_confidence,
-                    },
-                });
-            }
-        }
-    }
-    for rc in orphans {
-        candidates.push(Candidate {
+impl From<RetrievedChunk> for Candidate {
+    fn from(rc: RetrievedChunk) -> Self {
+        Candidate {
             chunk_id: rc.chunk_id,
             source_id: rc.source_id,
             parent_id: rc.parent_id,
@@ -488,25 +550,95 @@ async fn assemble_tier2(
                 source: rc.source,
                 graph_confidence: rc.graph_confidence,
             },
-        });
-    }
-
-    let mut keyed: Vec<((usize, i32, i64), Candidate)> = Vec::with_capacity(candidates.len());
-    for c in candidates {
-        let key = doc_order_key(pool, &c.chunk_id, source_rank).await?;
-        keyed.push((key, c));
-    }
-    keyed.sort_by(|a, b| a.0.cmp(&b.0));
-
-    let mut units = Vec::new();
-    let mut running = 0usize;
-    for (order_index, (_, c)) in keyed.into_iter().enumerate() {
-        let est = estimate_tokens(&c.text);
-        if running + est > tier2_cap && !units.is_empty() {
-            break;
+            score: rc.score,
+            level: rc.level,
+            token_start: rc.token_start,
         }
-        running += est;
-        units.push(ContextUnit {
+    }
+}
+
+/// Applies the ≥50% auto-merge (spec/AC4) over the grouped hits: a merged parent
+/// (max child score) replaces its retrieved children; non-merged children and
+/// orphans pass through. A parent dropped by the RT-2 live filter drops its children.
+async fn build_candidates(
+    pool: &SqlitePool,
+    by_parent: HashMap<String, Vec<RetrievedChunk>>,
+    orphans: Vec<RetrievedChunk>,
+) -> Result<Vec<Candidate>, LensError> {
+    let parent_ids: Vec<String> = by_parent.keys().cloned().collect();
+    let counts = parent_child_counts(pool, &parent_ids).await?;
+    let merge_ids: Vec<String> = by_parent
+        .iter()
+        .filter(|(pid, children)| {
+            should_merge(children.len(), counts.get(*pid).copied().unwrap_or(0))
+        })
+        .map(|(pid, _)| pid.clone())
+        .collect();
+    let parents = load_parents(pool, &merge_ids).await?;
+
+    let mut candidates: Vec<Candidate> = Vec::new();
+    for (parent_id, children) in by_parent {
+        if should_merge(children.len(), counts.get(&parent_id).copied().unwrap_or(0)) {
+            if let Some(parent) = parents.get(&parent_id) {
+                candidates.push(Candidate {
+                    chunk_id: parent.chunk_id.clone(),
+                    source_id: parent.source_id.clone(),
+                    parent_id: Some(parent_id),
+                    text: parent.text.clone(),
+                    locator: parent.locator.clone(),
+                    provenance: merged_provenance(&children),
+                    score: children
+                        .iter()
+                        .map(|c| c.score)
+                        .fold(f32::NEG_INFINITY, f32::max),
+                    level: parent.level,
+                    token_start: parent.token_start,
+                });
+            }
+        } else {
+            candidates.extend(children.into_iter().map(Candidate::from));
+        }
+    }
+    candidates.extend(orphans.into_iter().map(Candidate::from));
+    Ok(candidates)
+}
+
+/// RQ-1 relevance-aware trim + presentation: when the corpus exceeds `tier2_cap`,
+/// keep the highest-FUSED-SCORE units (the old doc-position trim evicted the best
+/// evidence), then re-sort survivors to document order. Pure — unit-testable.
+fn trim_and_order(
+    mut candidates: Vec<Candidate>,
+    source_rank: &HashMap<String, usize>,
+    tier2_cap: usize,
+) -> Vec<ContextUnit> {
+    let key = |c: &Candidate| doc_order_key(source_rank, &c.source_id, c.level, c.token_start);
+    let total_tokens: usize = candidates.iter().map(|c| estimate_tokens(&c.text)).sum();
+    let mut survivors: Vec<Candidate> = if total_tokens <= tier2_cap {
+        candidates
+    } else {
+        candidates.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| key(a).cmp(&key(b)))
+        });
+        let mut chosen = Vec::new();
+        let mut running = 0usize;
+        for c in candidates {
+            let est = estimate_tokens(&c.text);
+            if running + est > tier2_cap && !chosen.is_empty() {
+                break;
+            }
+            running += est;
+            chosen.push(c);
+        }
+        chosen
+    };
+    survivors.sort_by_cached_key(|c| key(c));
+    survivors
+        .into_iter()
+        .enumerate()
+        .map(|(order_index, c)| ContextUnit {
             text: c.text,
             source_id: c.source_id,
             chunk_id: c.chunk_id,
@@ -514,9 +646,31 @@ async fn assemble_tier2(
             locator: c.locator,
             order_index,
             provenance: c.provenance,
-        });
+        })
+        .collect()
+}
+
+/// Tier-2 assembly (spec/AC4): hydrate the fused hits, group by parent, apply the
+/// ≥50% auto-merge, then budget-trim and re-order for presentation.
+async fn assemble_tier2(
+    pool: &SqlitePool,
+    hits: &[RetrievalHit],
+    graph_conf: &HashMap<String, f32>,
+    source_rank: &HashMap<String, usize>,
+    tier2_cap: usize,
+    prehydrated: &HashMap<String, String>,
+) -> Result<Vec<ContextUnit>, LensError> {
+    let retrieved = hydrate_retrieved(pool, hits, graph_conf, prehydrated).await?;
+    let mut by_parent: HashMap<String, Vec<RetrievedChunk>> = HashMap::new();
+    let mut orphans: Vec<RetrievedChunk> = Vec::new();
+    for rc in retrieved {
+        match &rc.parent_id {
+            Some(pid) => by_parent.entry(pid.clone()).or_default().push(rc),
+            None => orphans.push(rc),
+        }
     }
-    Ok(units)
+    let candidates = build_candidates(pool, by_parent, orphans).await?;
+    Ok(trim_and_order(candidates, source_rank, tier2_cap))
 }
 
 /// Provenance for a merged-parent unit: if any child came from the graph arm, keep
@@ -577,6 +731,19 @@ const MAX_SEED_SPAN: usize = 5;
 /// entities appear early, so the leading window loses nothing in practice.
 const MAX_SEED_TOKENS: usize = 64;
 
+/// Minimum unclaimed non-stop-word tokens for the relational signal to fire — the
+/// "content beyond the seed name(s)" that distinguishes a bare entity lookup from a
+/// relational question.
+const MIN_RESIDUAL_SIGNAL_TOKENS: usize = 2;
+
+/// Number of entity nodes the RQ-5 semantic seed fallback pulls from `entity_ann`.
+const SEED_ANN_K: usize = 5;
+
+/// Max cosine distance (LanceDB `1 - cos`) for a semantically-resolved seed (RQ-5):
+/// `0.5` ≈ similarity ≥ 0.5. The seed only enables the additive, floored, gated
+/// graph arm, so a loose match cannot displace dense/BM25 evidence.
+const SEED_ANN_MAX_DISTANCE: f32 = 0.5;
+
 /// Tokenizes on whitespace/punctuation, lowercased.
 fn content_tokens(text: &str) -> Vec<String> {
     text.split(|c: char| !c.is_alphanumeric())
@@ -592,18 +759,18 @@ struct SeedResolution {
     signal: bool,
 }
 
-/// Deterministic, LLM-free seed resolution (spec §5.2, corrected). `entity_lookup`
-/// matches the WHOLE query string against entity names, so passing a multi-word
-/// query never yields seeds; instead we tokenize and look up per contiguous span
-/// (longest-first, capped at [`MAX_SEED_SPAN`]), claiming matched token positions.
-/// The relational signal fires when `>= 2` non-stop-word tokens remain unclaimed by
-/// any seed name — the "content tokens beyond the matched seed name(s)" the plan's
-/// worked examples assume.
+/// Deterministic, LLM-free seed resolution (spec §5.2): tokenize the query and look
+/// up per contiguous span (longest-first, capped at [`MAX_SEED_SPAN`]), claiming
+/// matched positions. The relational signal fires on [`MIN_RESIDUAL_SIGNAL_TOKENS`]
+/// unclaimed non-stop-word tokens (content beyond the seed name).
 async fn resolve_seeds(
     pool: &SqlitePool,
-    notebook_id: &str,
+    store: &dyn VectorStore,
+    coord: &Coordinate,
     query: &str,
+    query_vec: &[f32],
 ) -> Result<SeedResolution, LensError> {
+    let notebook_id = coord.notebook.as_str();
     let mut tokens = content_tokens(query);
     tokens.truncate(MAX_SEED_TOKENS);
     let mut claimed = vec![false; tokens.len()];
@@ -612,13 +779,18 @@ async fn resolve_seeds(
 
     // Longest-first spans so a multi-word entity name is matched before its parts.
     for width in (1..=MAX_SEED_SPAN.min(tokens.len())).rev() {
+        // Short-circuit once every token is claimed — nothing more can match, so skip
+        // the rest of the O(MAX_SEED_SPAN * tokens) fan-out (RQ-6).
+        if claimed.iter().all(|c| *c) {
+            break;
+        }
         for start in 0..=tokens.len().saturating_sub(width) {
             let end = start + width;
             if claimed[start..end].iter().any(|c| *c) {
                 continue;
             }
             let span = tokens[start..end].join(" ");
-            let hits = entity_lookup(pool, notebook_id, &span, 1).await?;
+            let hits = entity_lookup_prefix_first(pool, notebook_id, &span, 1).await?;
             let Some(entity) = hits.into_iter().next() else {
                 continue;
             };
@@ -645,11 +817,49 @@ async fn resolve_seeds(
         .filter(|(i, _)| !claimed[*i])
         .filter(|(_, t)| !STOP_WORDS.contains(&t.as_str()))
         .count();
+    let signal = residual >= MIN_RESIDUAL_SIGNAL_TOKENS;
 
-    Ok(SeedResolution {
-        seeds,
-        signal: residual >= 2,
+    // RQ-5: on a paraphrase with no name-match seed but a live relational signal,
+    // resolve seeds by vector similarity (empty ent__ table → graph stays off).
+    if seeds.is_empty() && signal {
+        seeds = resolve_seeds_by_ann(pool, store, coord, query_vec).await?;
+    }
+
+    Ok(SeedResolution { seeds, signal })
+}
+
+/// Semantic seed fallback (RQ-5): the nearest `ent__` entity nodes to `query_vec`,
+/// mapped to `(logical name, kind)` seeds. Applies [`SEED_ANN_MAX_DISTANCE`] and
+/// dedups by `(name lowercased, kind)`.
+async fn resolve_seeds_by_ann(
+    pool: &SqlitePool,
+    store: &dyn VectorStore,
+    coord: &Coordinate,
+    query_vec: &[f32],
+) -> Result<Vec<(String, EntityKind)>, LensError> {
+    let ann = store.entity_ann(coord, query_vec, SEED_ANN_K, None).await?;
+    let node_ids: Vec<String> = ann
+        .into_iter()
+        .filter(|(_, dist)| *dist <= SEED_ANN_MAX_DISTANCE)
+        .map(|(id, _)| id)
+        .collect();
+    if node_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let rows: Vec<(String, String)> = crate::db::fetch_batched(pool, &node_ids, |ph| {
+        format!("SELECT COALESCE(canonical_name, name) AS name, kind FROM entity_nodes WHERE id IN ({ph})")
     })
+    .await?;
+    let mut seeds: Vec<(String, EntityKind)> = Vec::new();
+    let mut seen: HashSet<(String, EntityKind)> = HashSet::new();
+    for (name, kind_str) in rows {
+        let kind = EntityKind::from_db(&kind_str)?;
+        if seen.insert((name.to_lowercase(), kind)) {
+            seeds.push((name, kind));
+        }
+    }
+    Ok(seeds)
 }
 
 /// Resolves the effective per-notebook graph-retrieval opt-in: the per-notebook
@@ -666,12 +876,9 @@ fn should_run_graph(resolution: &SeedResolution, effective_flag: bool) -> bool {
     !resolution.seeds.is_empty() && effective_flag && resolution.signal
 }
 
-/// Pair-preserving graph composition extracted from `eval::graph_arm` (spec §5.1):
-/// `entity_evidence` (fixed conf 1.0) + `ppr_expand` (traversal conf), merged with
-/// the LOCKED merge invariant (dedup keeps max conf; evidence precedes equal-conf
-/// expansion; truncate to `k`) but returning `(chunk_id, graph_confidence)` pairs so
-/// `Provenance.graph_confidence` survives. `eval::graph_arm` maps these back to
-/// `Vec<String>`.
+/// Pair-preserving graph composition (spec §5.1): `entity_evidence` (conf 1.0) +
+/// `ppr_expand` (traversal conf) under the LOCKED merge invariant, returning
+/// `(chunk_id, graph_confidence)` pairs so `Provenance.graph_confidence` survives.
 pub(crate) async fn graph_compose(
     pool: &SqlitePool,
     graph: &NotebookGraph,
@@ -730,6 +937,48 @@ fn merge_ranked_pairs(
     });
     ranked.truncate(k);
     ranked.into_iter().map(|(id, c, _)| (id, c)).collect()
+}
+
+/// Dense search narrowed to `source_ids` before the top-N (the #39 recall fix),
+/// batched into ≤[`MAX_PREFILTER_IDS`] groups merged by ascending distance so the
+/// guarantee holds at ANY source count (RQ-7). Returns chunk ids nearest-first.
+async fn dense_search_prefiltered(
+    store: &dyn VectorStore,
+    coord: &Coordinate,
+    query_vec: &[f32],
+    overfetch: usize,
+    source_ids: &[String],
+) -> Result<Vec<String>, LensError> {
+    if source_ids.len() <= MAX_PREFILTER_IDS {
+        let hits = store
+            .search_filtered(coord, query_vec, overfetch, source_ids)
+            .await?;
+        return Ok(hits.into_iter().map(|h| h.chunk_id).collect());
+    }
+    let mut merged: Vec<Hit> = Vec::new();
+    for batch in source_ids.chunks(MAX_PREFILTER_IDS) {
+        merged.extend(
+            store
+                .search_filtered(coord, query_vec, overfetch, batch)
+                .await?,
+        );
+    }
+    merged.sort_by(|a, b| {
+        a.distance
+            .partial_cmp(&b.distance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut seen = HashSet::new();
+    let mut ids = Vec::with_capacity(overfetch);
+    for h in merged {
+        if seen.insert(h.chunk_id.clone()) {
+            ids.push(h.chunk_id);
+            if ids.len() >= overfetch {
+                break;
+            }
+        }
+    }
+    Ok(ids)
 }
 
 /// The Tiered Context Router entry point (issue #21): decides Tier-1 vs Tier-2,
@@ -792,7 +1041,7 @@ pub async fn tiered_search(
             true
         };
         if confirmed {
-            let units = assemble_tier1(pool_db, &source_ids).await?;
+            let units = assemble_tier1(pool_db, &source_ids, caps.tier1_cap, tokenizer).await?;
             let total_tokens = units.iter().map(|u| estimate_tokens(&u.text)).sum();
             return Ok(RouterOutput {
                 tier: Tier::Tier1,
@@ -806,20 +1055,13 @@ pub async fn tiered_search(
     // Over-fetch per path IDENTICALLY to hybrid_search so the fusion seam matches.
     let overfetch = pool.clamp(OVERFETCH, MAX_OVERFETCH);
 
-    // DENSE: pre-filter to selected+live BEFORE top-N (#39 fix) when the id-set is
-    // small; above the guard, notebook-scope search + the live_chunk_ids post-filter
-    // (both correct; the fallback is just slower).
-    let use_prefilter = source_ids.len() <= MAX_PREFILTER_IDS;
-    let dense_hits = if use_prefilter {
-        store
-            .search_filtered(coord, query_vec, overfetch, &source_ids)
-            .await?
-    } else {
-        store.search(coord, query_vec, overfetch).await?
-    };
-    let dense_ids: Vec<String> = dense_hits.into_iter().map(|h| h.chunk_id).collect();
-    // Correctness backstop regardless of store impl (the default trait body cannot
-    // narrow by source): guarantee selected+live via the SQLite post-filter too.
+    // DENSE: pre-filter to selected+live BEFORE top-N (#39 fix), batching the id-set
+    // into ≤MAX_PREFILTER_IDS groups and merging by distance so the #39 recall
+    // guarantee holds at ANY source count (RQ-7 — no notebook-wide fallback).
+    let dense_ids =
+        dense_search_prefiltered(store, coord, query_vec, overfetch, &source_ids).await?;
+    // Correctness backstop regardless of store impl: guarantee selected+live via the
+    // SQLite post-filter too.
     let dense_ids = live_chunk_ids(pool_db, &dense_ids, None, None).await?;
 
     // BM25: same selected+live scope (its sources JOIN already enforces it).
@@ -833,12 +1075,17 @@ pub async fn tiered_search(
     let mut graph_conf: HashMap<String, f32> = HashMap::new();
     let graph_ids: Vec<String> = match graph {
         Some(g) => {
-            let resolution = resolve_seeds(pool_db, &coord.notebook, query_text).await?;
+            let resolution = resolve_seeds(pool_db, store, coord, query_text, query_vec).await?;
             let flag = effective_graph_flag(notebook_graph_flag, retrieval.graph_retrieval_enabled);
             if should_run_graph(&resolution, flag) {
                 let pairs = graph_compose(pool_db, g, &resolution.seeds, overfetch).await?;
                 let mut ids = Vec::with_capacity(pairs.len());
                 for (id, conf) in pairs {
+                    // RQ-4: floor the graph arm so low-confidence traversal tail does
+                    // not enter RRF with full rank mass.
+                    if conf < GRAPH_MIN_CONFIDENCE {
+                        continue;
+                    }
                     graph_conf.entry(id.clone()).or_insert(conf);
                     ids.push(id);
                 }
@@ -851,12 +1098,20 @@ pub async fn tiered_search(
         None => Vec::new(),
     };
 
-    let fused = super::fuse_and_rerank(
+    let (fused, prehydrated) = super::fuse_and_rerank(
         pool_db, reranker, query_text, &dense_ids, &bm25_ids, &graph_ids, pool, retrieval,
     )
     .await?;
 
-    let units = assemble_tier2(pool_db, &fused, &graph_conf, &source_rank, caps.tier2_cap).await?;
+    let units = assemble_tier2(
+        pool_db,
+        &fused,
+        &graph_conf,
+        &source_rank,
+        caps.tier2_cap,
+        &prehydrated,
+    )
+    .await?;
     let total_tokens = units.iter().map(|u| estimate_tokens(&u.text)).sum();
     Ok(RouterOutput {
         tier: Tier::Tier2,
@@ -1088,6 +1343,9 @@ mod tests {
             locator: None,
             source,
             graph_confidence: conf,
+            score: 0.0,
+            level: 1,
+            token_start: 0,
         }
     }
 

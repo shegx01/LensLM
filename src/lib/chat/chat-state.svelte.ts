@@ -43,6 +43,10 @@ interface NotebookChatState {
   pendingCitations: Citation[] | null;
   currentTurnId: string | null;
   error: { kind: string; message: string } | null;
+  /** True when the last turn ended because the notebook's embeddings are rebuilding
+   * (RT-1). Distinct from `error`: it is transient and retryable, persists NOTHING,
+   * and renders as a calm notice, not a red error card. Live-only; cleared on send. */
+  reindexing: boolean;
   pinnedToBottom: boolean;
   streamGeneration: number;
   /** Turn whose just-finished answer was ungrounded (text, zero citations). Drives
@@ -61,6 +65,7 @@ function emptyNotebookState(): NotebookChatState {
     pendingCitations: null,
     currentTurnId: null,
     error: null,
+    reindexing: false,
     pinnedToBottom: true,
     streamGeneration: 0,
     ungroundedTurnId: null
@@ -215,6 +220,7 @@ async function runStream(notebookId: string, turnId: string, question: string): 
   state.pendingCitations = null;
   state.currentTurnId = turnId;
   state.error = null;
+  state.reindexing = false;
   state.ungroundedTurnId = null;
   state.pinnedToBottom = true;
 
@@ -338,6 +344,11 @@ async function runStream(notebookId: string, turnId: string, question: string): 
           state.answerBuffer,
           true
         );
+        state.streaming = false;
+        state.stage = null;
+      } else if (err.kind === 'Reindexing') {
+        // RT-1 (see the `reindexing` field): transient, retryable, persist NOTHING.
+        state.reindexing = true;
         state.streaming = false;
         state.stage = null;
       } else {
@@ -475,6 +486,9 @@ export const chatStore = {
   },
   error(notebookId: string): { kind: string; message: string } | null {
     return byNotebook[notebookId]?.error ?? null;
+  },
+  reindexing(notebookId: string): boolean {
+    return byNotebook[notebookId]?.reindexing ?? false;
   },
   pinnedToBottom(notebookId: string): boolean {
     return byNotebook[notebookId]?.pinnedToBottom ?? true;

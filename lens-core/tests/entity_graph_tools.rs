@@ -7,7 +7,7 @@
 mod common;
 
 use common::{file_engine, seed_chunk, seed_entity_node, seed_mention, seed_source};
-use lens_core::graph::{EntityKind, entity_evidence, entity_lookup};
+use lens_core::graph::{EntityKind, entity_evidence, entity_lookup, entity_lookup_prefix_first};
 use sqlx::Row;
 
 // ---------------------------------------------------------------------------
@@ -57,6 +57,54 @@ async fn lookup_exact_gt_prefix_gt_substring() {
     assert_eq!(results[0].name.to_lowercase(), "alice");
     assert_eq!(results[1].name.to_lowercase(), "alicesmith");
     assert_eq!(results[2].name.to_lowercase(), "malice");
+}
+
+/// RQ-6: `entity_lookup_prefix_first` returns exact/prefix matches WITHOUT the
+/// unindexable substring scan when exact/prefix hits, and falls back to substring
+/// only on a miss — unlike `entity_lookup`, which always unions all three.
+#[tokio::test]
+async fn prefix_first_skips_substring_when_exact_or_prefix_hits() {
+    let (_dir, engine) = file_engine().await;
+    let nb = engine
+        .create_notebook("nb", None, None)
+        .await
+        .expect("create notebook")
+        .id
+        .to_string();
+    let pool = engine.pool().await;
+
+    seed_source(&pool, "s1", &nb, 1, None).await;
+    seed_chunk(&pool, "c1", "s1", 1, Some(0), "text").await;
+    seed_chunk(&pool, "c2", "s1", 1, Some(1), "text").await;
+    // "Alice" = exact/prefix for "Alice"; "Malice" only substring-matches "Alice"/"lice".
+    seed_entity_node(&pool, "n-alice", &nb, "s1", "concept", "Alice", None).await;
+    seed_entity_node(&pool, "n-malice", &nb, "s1", "concept", "Malice", None).await;
+    seed_mention(&pool, "m1", &nb, "n-alice", "c1", 0).await;
+    seed_mention(&pool, "m2", &nb, "n-malice", "c2", 0).await;
+
+    // The general lookup unions exact + substring → both.
+    let all = entity_lookup(&pool, &nb, "Alice", 10)
+        .await
+        .expect("lookup");
+    let all_names: Vec<String> = all.iter().map(|e| e.name.to_lowercase()).collect();
+    assert!(all_names.contains(&"alice".to_string()));
+    assert!(all_names.contains(&"malice".to_string()));
+
+    // The fast path returns ONLY the exact/prefix match — the substring "Malice" is
+    // not scanned once exact/prefix hits.
+    let fast = entity_lookup_prefix_first(&pool, &nb, "Alice", 10)
+        .await
+        .expect("prefix-first");
+    let fast_names: Vec<String> = fast.iter().map(|e| e.name.to_lowercase()).collect();
+    assert_eq!(fast_names, vec!["alice".to_string()]);
+
+    // A query matching only as a substring ("lice" is a prefix of neither) falls back.
+    let fb = entity_lookup_prefix_first(&pool, &nb, "lice", 10)
+        .await
+        .expect("prefix-first fallback");
+    let fb_names: Vec<String> = fb.iter().map(|e| e.name.to_lowercase()).collect();
+    assert!(fb_names.contains(&"alice".to_string()));
+    assert!(fb_names.contains(&"malice".to_string()));
 }
 
 /// 2. case-insensitive collapse across sources

@@ -38,6 +38,7 @@
   const currentTurnId = $derived(chatStore.currentTurnId(notebookId));
   const ungroundedTurnId = $derived(chatStore.ungroundedTurnId(notebookId));
   const error = $derived(chatStore.error(notebookId));
+  const reindexing = $derived(chatStore.reindexing(notebookId));
   const pinnedToBottom = $derived(chatStore.pinnedToBottom(notebookId));
 
   function handleSend(question: string): void {
@@ -67,6 +68,7 @@
     {currentTurnId}
     {ungroundedTurnId}
     {error}
+    {reindexing}
     {pinnedToBottom}
     bottomInset={overlayHeight}
     oncopy={(content) => void copyMessage(content)}

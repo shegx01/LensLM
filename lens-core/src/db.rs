@@ -75,6 +75,30 @@ pub(crate) fn in_placeholders(n: usize) -> String {
     std::iter::repeat_n("?", n).collect::<Vec<_>>().join(",")
 }
 
+/// Runs a batched `IN (…)` query over `ids`, binding each id in order. `sql_for`
+/// receives the placeholder string and returns the full SQL (the only variable part
+/// besides the ids is static text). Owns the `BIND_BATCH` / `in_placeholders` /
+/// bind-loop invariant so the seven read-path call sites don't each re-implement it.
+pub(crate) async fn fetch_batched<T>(
+    pool: &SqlitePool,
+    ids: &[String],
+    sql_for: impl Fn(&str) -> String,
+) -> Result<Vec<T>, LensError>
+where
+    T: for<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> + Send + Unpin,
+{
+    let mut out = Vec::new();
+    for batch in ids.chunks(BIND_BATCH) {
+        let sql = sql_for(&in_placeholders(batch.len()));
+        let mut q = sqlx::query_as::<_, T>(&sql);
+        for id in batch {
+            q = q.bind(id);
+        }
+        out.extend(q.fetch_all(pool).await?);
+    }
+    Ok(out)
+}
+
 /// Applies all pending embedded migrations. Idempotent: re-running is a no-op.
 #[tracing::instrument(skip_all)]
 pub async fn run_migrations(pool: &SqlitePool) -> Result<(), LensError> {

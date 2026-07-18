@@ -33,7 +33,9 @@ use crate::graph::NotebookGraph;
 use crate::llm::{LlmMessage, LlmProvider, LlmRequest, StreamChunk};
 use crate::prompt::{fence_excerpt, fence_nonce};
 use crate::retrieval::Reranker;
-use crate::retrieval::router::{ContextUnit, RESERVED_OUTPUT, estimate_tokens, tiered_search};
+use crate::retrieval::router::{
+    ContextUnit, RESERVED_OUTPUT, RETRIEVAL_LIVE_WHERE, estimate_tokens, tiered_search,
+};
 use crate::vector_store::{Coordinate, VectorStore};
 
 /// Low, near-deterministic sampling for grounded answers.
@@ -419,9 +421,26 @@ pub fn answer_stream(
             return;
         }
 
-        // Empty selected+live corpus → deterministic grounded refusal, no LLM call.
-        // Reported `grounded: true` — an honest "no sources" is not an ungrounded claim.
+        // Empty retrieval: a transient reindexing gap vs an honest "no sources" — see
+        // `reindexing_gap`. Inside the empty branch only, so it never blocks a
+        // BM25-served answer during a reembed.
         if out.units.is_empty() {
+            match reindexing_gap(&ctx.pool, &ctx.coord).await {
+                Ok(true) => {
+                    yield Err(LensError::Reindexing(
+                        "the notebook's embeddings are still being built; try again shortly"
+                            .to_string(),
+                    ));
+                    return;
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    yield Err(err);
+                    return;
+                }
+            }
+            // Honest empty corpus → deterministic grounded refusal, no LLM call.
+            // Reported `grounded: true` — an honest "no sources" is not an ungrounded claim.
             yield Ok(AnswerEvent::Stage(AnswerStage::Answering));
             yield Ok(AnswerEvent::TextDelta(NO_SOURCES_MSG.to_string()));
             yield Ok(AnswerEvent::Citations(Vec::new()));
@@ -541,6 +560,34 @@ pub fn answer_stream(
         yield Ok(AnswerEvent::Citations(cites));
         yield Ok(AnswerEvent::Done { tokens_used, grounded, citation_count });
     }
+}
+
+/// True when the notebook has grounded (selected + live) chunks but its resolved
+/// coordinate has NO `active` index row — the RT-1 reindexing gap. The corpus scope
+/// reuses [`RETRIEVAL_LIVE_WHERE`]; the active-index probe mirrors
+/// `LensEngine::get_notebook_embedding_info`.
+async fn reindexing_gap(pool: &SqlitePool, coord: &Coordinate) -> Result<bool, LensError> {
+    let has_live: Option<i64> = sqlx::query_scalar(&format!(
+        "SELECT 1 FROM chunks c JOIN sources s ON s.id = c.source_id \
+         WHERE s.notebook_id = ? AND {RETRIEVAL_LIVE_WHERE} LIMIT 1"
+    ))
+    .bind(&coord.notebook)
+    .fetch_optional(pool)
+    .await?;
+    if has_live.is_none() {
+        return Ok(false);
+    }
+    let active: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM embedding_index \
+         WHERE notebook_id = ? AND model = ? AND dim = ? AND backend = ? AND status = 'active'",
+    )
+    .bind(&coord.notebook)
+    .bind(&coord.model)
+    .bind(coord.dim as i64)
+    .bind(coord.backend.as_str())
+    .fetch_optional(pool)
+    .await?;
+    Ok(active.is_none())
 }
 
 /// Distinct `chunk_id`s across every citation's locators, for the locator-hydration

@@ -31,8 +31,10 @@ pub struct GraphEntity {
 }
 
 /// Returns up to `k` entities in a notebook matching `query`, ranked
-/// exact > prefix > substring. Collapses `(name COLLATE NOCASE, kind)` across
-/// sources. Returns `[]` immediately for an empty query.
+/// exact > prefix > substring in ONE result set. Collapses `(name COLLATE NOCASE,
+/// kind)` across sources. Returns `[]` immediately for an empty query. This is the
+/// general lookup (e.g. entity search UIs) and keeps the full ranked union; the
+/// latency-sensitive seed path uses [`entity_lookup_prefix_first`] instead.
 pub async fn entity_lookup(
     pool: &SqlitePool,
     notebook_id: &str,
@@ -42,18 +44,78 @@ pub async fn entity_lookup(
     if query.trim().is_empty() {
         return Ok(Vec::new());
     }
+    let esc = escape_like(query);
+    entity_lookup_tier(pool, notebook_id, query, &esc, k, MatchTier::All).await
+}
 
-    // Escape LIKE metacharacters so query is treated literally in LIKE clauses.
-    // Backslash must be escaped first so the replacements don't re-escape.
-    let esc = query
+/// Seed-resolution lookup (RQ-6): tries the index-friendly exact/prefix match first
+/// and only falls to the unindexable leading-wildcard `%..%` scan when that misses.
+/// A genuine entity span resolves on the fast path and never pays the scan — the
+/// fix for the per-query `entity_lookup` fan-out in the router's `resolve_seeds`.
+/// Rank ordering within each phase is identical to [`entity_lookup`].
+pub async fn entity_lookup_prefix_first(
+    pool: &SqlitePool,
+    notebook_id: &str,
+    query: &str,
+    k: usize,
+) -> Result<Vec<GraphEntity>, LensError> {
+    if query.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let esc = escape_like(query);
+    let exact_prefix =
+        entity_lookup_tier(pool, notebook_id, query, &esc, k, MatchTier::ExactPrefix).await?;
+    if !exact_prefix.is_empty() {
+        return Ok(exact_prefix);
+    }
+    entity_lookup_tier(pool, notebook_id, query, &esc, k, MatchTier::Substring).await
+}
+
+/// Escapes LIKE metacharacters so `query` is treated literally in LIKE clauses.
+/// Backslash must be escaped first so the replacements don't re-escape.
+fn escape_like(query: &str) -> String {
+    query
         .replace('\\', r"\\")
         .replace('%', r"\%")
-        .replace('_', r"\_");
+        .replace('_', r"\_")
+}
 
+/// Which name-match predicates an [`entity_lookup_tier`] call includes.
+#[derive(Clone, Copy)]
+enum MatchTier {
+    /// Exact + prefix only (index-friendly).
+    ExactPrefix,
+    /// Leading-wildcard substring only (unindexable fallback).
+    Substring,
+    /// The full ranked union (exact + prefix + substring).
+    All,
+}
+
+/// One name-match variant of the entity lookup. The tier CASE / GROUP BY / ORDER BY
+/// are shared across variants so rank ordering is identical to the single-query form.
+async fn entity_lookup_tier(
+    pool: &SqlitePool,
+    notebook_id: &str,
+    query: &str,
+    esc: &str,
+    k: usize,
+    tier: MatchTier,
+) -> Result<Vec<GraphEntity>, LensError> {
+    let exact_prefix = "en.name = ?1 COLLATE NOCASE
+           OR en.canonical_name = ?1 COLLATE NOCASE
+           OR en.name LIKE ?2 || '%' ESCAPE '\\'
+           OR en.canonical_name LIKE ?2 || '%' ESCAPE '\\'";
+    let substring = "en.name LIKE '%' || ?2 || '%' ESCAPE '\\'
+           OR en.canonical_name LIKE '%' || ?2 || '%' ESCAPE '\\'";
+    let where_match = match tier {
+        MatchTier::ExactPrefix => exact_prefix.to_string(),
+        MatchTier::Substring => substring.to_string(),
+        MatchTier::All => format!("{exact_prefix}\n           OR {substring}"),
+    };
     // #155: nodes resolved to the same entity share a `canonical_name`; group and
     // return by COALESCE(canonical_name, name) so cross-doc aliases collapse into one
     // result. Unresolved nodes (NULL canonical_name) fall back to their own name.
-    let rows = sqlx::query(
+    let sql = format!(
         "SELECT
             COALESCE(en.canonical_name, en.name) AS name,
             en.kind,
@@ -72,24 +134,18 @@ pub async fn entity_lookup(
         LEFT JOIN entity_mentions em ON em.entity_node_id = en.id
         WHERE en.notebook_id = ?3
           AND s.trashed_at IS NULL AND s.selected = 1
-          AND (
-              en.name = ?1 COLLATE NOCASE
-           OR en.canonical_name = ?1 COLLATE NOCASE
-           OR en.name LIKE ?2 || '%'        ESCAPE '\\'
-           OR en.canonical_name LIKE ?2 || '%' ESCAPE '\\'
-           OR en.name LIKE '%' || ?2 || '%' ESCAPE '\\'
-           OR en.canonical_name LIKE '%' || ?2 || '%' ESCAPE '\\'
-          )
+          AND ({where_match})
         GROUP BY COALESCE(en.canonical_name, en.name) COLLATE NOCASE, en.kind
         ORDER BY tier ASC, length(COALESCE(en.canonical_name, en.name)) ASC
-        LIMIT ?4",
-    )
-    .bind(query)
-    .bind(&esc)
-    .bind(notebook_id)
-    .bind(k as i64)
-    .fetch_all(pool)
-    .await?;
+        LIMIT ?4"
+    );
+    let rows = sqlx::query(&sql)
+        .bind(query)
+        .bind(esc)
+        .bind(notebook_id)
+        .bind(k as i64)
+        .fetch_all(pool)
+        .await?;
 
     rows.iter()
         .map(|row| {

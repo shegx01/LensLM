@@ -309,6 +309,50 @@ describe('error path', () => {
     expect(chatStore.streaming(NB)).toBe(false);
   });
 
+  it('enters a retryable reindexing state and persists NOTHING on Reindexing (RT-1)', async () => {
+    vi.mocked(saveChatUser).mockResolvedValue(makeChatMessage({ id: 'u1' }));
+    vi.mocked(askNotebook).mockImplementation(
+      async (_nb: string, _turnId: string, _q: string, handlers: AskNotebookHandlers) => {
+        handlers.onFailed({ kind: 'Reindexing', message: 'embeddings rebuilding' });
+        await Promise.resolve();
+        await Promise.resolve();
+      }
+    );
+
+    await send(NB, 'q');
+
+    // Distinct from a hard error: a reindexing flag, no ErrorCard state.
+    expect(chatStore.reindexing(NB)).toBe(true);
+    expect(chatStore.error(NB)).toBeNull();
+    expect(chatStore.streaming(NB)).toBe(false);
+    // No terminal marker — a transient, retryable gap must not survive reload.
+    expect(saveChatMarker).not.toHaveBeenCalled();
+    expect(saveChatAssistant).not.toHaveBeenCalled();
+    // currentTurnId survives so the notice's gate (reindexing && currentTurnId === turn) matches.
+    const turnId = chatStore.turns(NB)[0]?.turn_id;
+    expect(turnId).toBeTruthy();
+    expect(chatStore.currentTurnId(NB)).toBe(turnId);
+  });
+
+  it('clears the reindexing state on the next send', async () => {
+    vi.mocked(saveChatUser).mockResolvedValue(makeChatMessage({ id: 'u1' }));
+    vi.mocked(askNotebook).mockImplementationOnce(
+      async (_nb: string, _turnId: string, _q: string, handlers: AskNotebookHandlers) => {
+        handlers.onFailed({ kind: 'Reindexing', message: 'embeddings rebuilding' });
+      }
+    );
+    await send(NB, 'q');
+    expect(chatStore.reindexing(NB)).toBe(true);
+
+    vi.mocked(askNotebook).mockImplementationOnce(
+      async (_nb: string, _turnId: string, _q: string, handlers: AskNotebookHandlers) => {
+        handlers.onEvent({ TextDelta: 'x' });
+      }
+    );
+    await send(NB, 'q2');
+    expect(chatStore.reindexing(NB)).toBe(false);
+  });
+
   it('sets error state and stops streaming when saveChatAssistant rejects on inner Done', async () => {
     vi.mocked(saveChatUser).mockResolvedValue(makeChatMessage({ id: 'u1' }));
     vi.mocked(saveChatAssistant).mockRejectedValue(new Error('save failed'));

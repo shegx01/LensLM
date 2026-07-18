@@ -10,7 +10,9 @@ mod tools;
 
 pub use build::{ResolvedNode, build_entity_graph_rows, build_node_index};
 pub use ppr::{NotebookGraph, ppr_expand, ppr_expand_capped_for_test};
-pub use tools::{GraphEntity, entity_evidence, entity_lookup, expand_neighbors};
+pub use tools::{
+    GraphEntity, entity_evidence, entity_lookup, entity_lookup_prefix_first, expand_neighbors,
+};
 
 use crate::LensError;
 
