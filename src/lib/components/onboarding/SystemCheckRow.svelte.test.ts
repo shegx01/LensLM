@@ -3,12 +3,14 @@ import { describe, expect, it, vi } from 'vitest';
 import SystemCheckRow from './SystemCheckRow.svelte';
 import type { CheckResult } from '$lib/onboarding/system-check.js';
 
+// llm_runtime now renders OnboardingLlmPicker (no STATUS→badge fallback), so the
+// default row targets embedding_model — the only tile-rendered, badge-bearing row.
 function row(over: Partial<CheckResult>): CheckResult {
   return {
-    id: 'llm_runtime',
-    label: 'LLM runtime',
+    id: 'embedding_model',
+    label: 'Embedding model',
     status: 'pass',
-    detail: 'Local LLM reachable',
+    detail: 'Embedding model installed',
     action: null,
     ...over
   };
@@ -24,7 +26,7 @@ function badge(container: HTMLElement): HTMLElement {
 describe('SystemCheckRow', () => {
   it('renders a Pass row with the green primary badge treatment', () => {
     const { container } = render(SystemCheckRow, { props: { result: row({ status: 'pass' }) } });
-    expect(screen.getByText('LLM runtime')).toBeInTheDocument();
+    expect(screen.getByText('Embedding model')).toBeInTheDocument();
     const b = badge(container);
     expect(b.className).toContain('text-primary');
     expect(b.className).toContain('bg-primary/15');

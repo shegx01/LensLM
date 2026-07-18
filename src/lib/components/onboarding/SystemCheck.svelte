@@ -7,7 +7,7 @@
   import { Button } from '$lib/components/ui/button/index.js';
   import { Card } from '$lib/components/ui/card/index.js';
   import SystemCheckRow from '$lib/components/onboarding/SystemCheckRow.svelte';
-  import { runSystemCheck, type CheckResult } from '$lib/onboarding/system-check.js';
+  import { runSystemCheck, type CheckResult, type SaveApi } from '$lib/onboarding/system-check.js';
   import ThemeCycleButton from '$lib/components/ThemeCycleButton.svelte';
 
   let { onadvance }: { onadvance: () => void } = $props();
@@ -18,11 +18,18 @@
   let checkError = $state<string | null>(null);
   let continueError = $state<string | null>(null);
 
-  // Every check is now a real readiness gate: Continue is blocked unless ALL
-  // three rows pass. An empty result set (still loading / nothing returned) or a
-  // check error also keeps it blocked.
+  // The LLM picker hands up a live { save } so this footer can drive Save &
+  // continue; Skip never touches it.
+  let llmApi = $state<SaveApi | null>(null);
+
+  // Embedding is the retrieval floor, so it stays REQUIRED — both footer buttons
+  // are blocked until it passes. The LLM row is skippable and never contributes
+  // to the gate. A load-in / check error, or an absent passing embedding row,
+  // also keeps the gate blocked (fail-closed).
   const blocked = $derived(
-    checkError !== null || results.length === 0 || !results.every((r) => r.status === 'pass')
+    checkError !== null ||
+      results.length === 0 ||
+      !results.some((r) => r.id === 'embedding_model' && r.status === 'pass')
   );
 
   const readyCount = $derived(results.filter((r) => r.status === 'pass').length);
@@ -45,17 +52,31 @@
     }
   }
 
-  // This screen no longer persists anything — it is the first of four steps and
-  // simply advances the layout's step machine. The finishing/continueError
-  // inline-error scaffolding is kept intact for any future per-step failure.
-  async function handleContinue(): Promise<void> {
+  // Skip writes nothing and always advances (onboarding stays non-blocking).
+  async function handleSkip(): Promise<void> {
     finishing = true;
     continueError = null;
     try {
       onadvance();
     } catch (err) {
       console.error('SystemCheck: advance failed', err);
-      continueError = 'Could not save your setup. Please try again.';
+      continueError = 'Could not continue. Please try again.';
+    } finally {
+      finishing = false;
+    }
+  }
+
+  // Save persists the local LLM (Variant-B chat_model pin) via the picker, then
+  // advances. A failed save surfaces its own inline error in the tile, so we hold
+  // on the step instead of advancing.
+  async function handleSave(): Promise<void> {
+    finishing = true;
+    continueError = null;
+    try {
+      await llmApi?.save();
+      onadvance();
+    } catch (err) {
+      console.error('SystemCheck: save failed', err);
     } finally {
       finishing = false;
     }
@@ -78,7 +99,9 @@
        are inner surface cards; footer is plain (not its own card). Width 592 px
        so rows land at the previous lg (512 px) without description truncation. -->
   <div class="w-full max-w-[592px]" style="-webkit-app-region: no-drag;">
-    <Card class="w-full gap-4 rounded-[14px] px-10 pt-9 pb-8 shadow-2xl ring-0">
+    <Card
+      class="w-full gap-4 rounded-[14px] border border-[color-mix(in_oklch,var(--primary)_50%,transparent)] px-10 pt-9 pb-8 shadow-2xl ring-0"
+    >
       <div class="flex flex-col items-center text-center gap-3 pb-2">
         <div
           class="bg-primary flex size-14 items-center justify-center rounded-2xl text-primary-foreground shadow-lg"
@@ -113,7 +136,7 @@
           </div>
         {:else}
           {#each results as result (result.id)}
-            <SystemCheckRow {result} oncheck={check} />
+            <SystemCheckRow {result} oncheck={check} onready={(api) => (llmApi = api)} />
           {/each}
         {/if}
       </div>
@@ -127,14 +150,26 @@
             {readyCount} of {totalCount} checks passed
           </p>
         {/if}
-        <Button
-          class="h-11 w-full"
-          onclick={handleContinue}
-          disabled={loading || finishing || blocked}
-        >
-          Continue to setup
-          <ArrowRight />
-        </Button>
+        <div class="flex items-center gap-3">
+          <Button
+            variant="ghost"
+            class="h-11 flex-1 active:scale-[0.97] disabled:active:scale-100 motion-reduce:transition-none"
+            onclick={handleSkip}
+            disabled={loading || finishing || blocked}
+          >
+            Skip for now
+          </Button>
+          <Button
+            class="group h-11 flex-1 shadow-[inset_0_1px_0_color-mix(in_oklch,var(--primary-foreground)_25%,transparent),0_8px_24px_-8px_color-mix(in_oklch,var(--primary)_55%,transparent)] active:scale-[0.97] disabled:active:scale-100 motion-reduce:transition-none"
+            onclick={handleSave}
+            disabled={loading || finishing || blocked}
+          >
+            Save &amp; continue
+            <ArrowRight
+              class="transition-transform group-hover:translate-x-0.5 motion-reduce:transition-none"
+            />
+          </Button>
+        </div>
       </div>
     </Card>
   </div>

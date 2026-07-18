@@ -1,6 +1,6 @@
 // Shared Tailwind class strings for the onboarding config panels.
 //
-// The native <select> elements in LlmConfigPanel (model picker) and TtsConfigPanel
+// The native <select> elements in LlmModelField (model picker) and TtsConfigPanel
 // (host/guest voice pickers) share one visual treatment. Centralizing the class
 // string here keeps them in lockstep (DRY — was triplicated inline).
 

@@ -20,6 +20,9 @@ export interface CheckResult {
   action: CheckAction | null;
 }
 
+/** The live save handle a step's picker hands up to drive its footer's Save & continue. */
+export type SaveApi = { save: () => Promise<void> };
+
 /**
  * The raw backend row shape: still includes the legacy `text_to_speech` gate
  * (lens-core/src/system_check.rs unchanged) even though onboarding no longer
