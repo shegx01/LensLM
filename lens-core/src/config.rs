@@ -159,6 +159,11 @@ fn default_whisper_model() -> String {
     "base".to_string()
 }
 
+/// Serde/`Default` value for [`AsrConfig::apple_min_confidence`] (`0.5`).
+fn default_apple_min_confidence() -> f32 {
+    0.5
+}
+
 /// Cloud ASR provider wire format (#45). Strong-typed, not a magic string:
 /// `OpenAiCompatible` covers OpenAI/Groq/self-hosted (WAV multipart), `Deepgram`
 /// is the raw-PCM `linear32` path. Serialized snake_case in `config.json`.
@@ -202,6 +207,12 @@ pub struct AsrConfig {
     /// Cloud ASR API key. Stored in PLAINTEXT — see [`ModelConfig::api_key`].
     #[serde(default)]
     pub cloud_api_key: String,
+    /// Aggregate-confidence floor for Apple-native ASR (#147). A successful Apple
+    /// result below this is discarded and the clip is re-transcribed on Whisper.
+    /// Compared against the clip's MINIMUM per-run confidence (worst span), so a
+    /// modest floor rejects any clip with a single weak span.
+    #[serde(default = "default_apple_min_confidence")]
+    pub apple_min_confidence: f32,
 }
 
 impl std::fmt::Debug for AsrConfig {
@@ -220,6 +231,7 @@ impl std::fmt::Debug for AsrConfig {
             .field("cloud_base_url", &self.cloud_base_url)
             .field("cloud_model", &self.cloud_model)
             .field("cloud_api_key", &cloud_api_key)
+            .field("apple_min_confidence", &self.apple_min_confidence)
             .finish()
     }
 }
@@ -235,6 +247,7 @@ impl Default for AsrConfig {
             cloud_base_url: String::default(),
             cloud_model: String::default(),
             cloud_api_key: String::default(),
+            apple_min_confidence: default_apple_min_confidence(),
         }
     }
 }
@@ -933,6 +946,26 @@ mod tests {
         assert_eq!(asr.whisper_model, "base");
         assert_eq!(asr.language, None);
         assert!(!asr.translate);
+    }
+
+    #[test]
+    fn missing_apple_min_confidence_deserializes_to_default_and_round_trips() {
+        let asr: AsrConfig = serde_json::from_str(r#"{ "backend": "apple_native" }"#).unwrap();
+        assert_eq!(
+            asr.apple_min_confidence, 0.5,
+            "absent apple_min_confidence reads back the default 0.5"
+        );
+
+        let set = AsrConfig {
+            apple_min_confidence: 0.8,
+            ..AsrConfig::default()
+        };
+        let json = serde_json::to_string(&set).unwrap();
+        let back: AsrConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.apple_min_confidence, 0.8,
+            "a set apple_min_confidence survives a serde round-trip"
+        );
     }
 
     #[test]

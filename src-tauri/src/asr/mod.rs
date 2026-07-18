@@ -17,7 +17,9 @@ use std::os::raw::c_float;
 
 use async_trait::async_trait;
 
-use lens_core::{AsrEngine, Lang, LensError, TranscribeConfig, TranscriptSegment};
+use lens_core::{
+    AsrEngine, Lang, LensError, TranscribeConfig, TranscriptOutput, TranscriptSegment,
+};
 
 // ------------------------------- C ABI (mirror of bridge.h) -------------------------------
 
@@ -46,7 +48,8 @@ struct CError {
 
 unsafe extern "C" {
     /// See `bridge.h` — returns an owned `*mut CResult` or null (then `*out_error`
-    /// is set to an owned `*mut CError`).
+    /// is set to an owned `*mut CError`). On a non-null return `*out_confidence`
+    /// holds the aggregate clip confidence per `bridge.h`'s contract.
     fn lens_asr_transcribe(
         pcm: *const c_float,
         pcm_len: usize,
@@ -54,6 +57,7 @@ unsafe extern "C" {
         lang_code: *const c_char,
         translate: i32,
         out_error: *mut *mut CError,
+        out_confidence: *mut f64,
     ) -> *mut CResult;
 
     /// Frees a `CResult` (and everything it owns). No-op on null. Clause (a).
@@ -63,8 +67,7 @@ unsafe extern "C" {
     fn lens_asr_free_error(error: *mut CError);
 
     /// Non-zero if the Apple transcriber supports `lang_code`. Never traps.
-    /// Called by `apple_supports_locale`; wired into transcribe locale gate in #43.
-    #[allow(dead_code)]
+    /// Called by `apple_supports_locale`, which backs `AppleSpeechEngine::supports_locale`.
     fn lens_asr_supports_locale(lang_code: *const c_char) -> i32;
 }
 
@@ -148,7 +151,7 @@ fn run_bridge(
     pcm: &[f32],
     lang_code: Option<&str>,
     translate: bool,
-) -> Result<Vec<TranscriptSegment>, LensError> {
+) -> Result<TranscriptOutput, LensError> {
     // Borrowed, NUL-terminated lang code (clause a: Rust owns it; Swift borrows).
     // A NUL-containing code is invalid BCP-47 → typed error rather than a panic.
     let lang_c =
@@ -166,12 +169,16 @@ fn run_bridge(
     let sample_rate: i32 = 16_000;
     let translate_flag: i32 = i32::from(translate);
     let mut err_ptr: *mut CError = std::ptr::null_mut();
+    // Negative sentinel = "no confidence".
+    let mut confidence: f64 = -1.0;
 
     // SAFETY: `pcm` is a valid Rust slice living for this call; `lang_ptr` is
     // either null or a valid NUL-terminated buffer owned by `lang_c` (kept alive
-    // by staying in scope). `out_error` points to our stack `err_ptr`. The bridge
-    // borrows `pcm`/`lang_ptr` (never frees them — clause a) and returns either a
-    // Swift-owned `*mut CResult` OR null with `*out_error` set (clause c: no trap).
+    // by staying in scope). `out_error` points to our stack `err_ptr` and
+    // `out_confidence` to our stack `confidence` (a plain scalar — clause a: not
+    // an allocation, nothing to free). The bridge borrows `pcm`/`lang_ptr` (never
+    // frees them — clause a) and returns either a Swift-owned `*mut CResult` OR
+    // null with `*out_error` set (clause c: no trap).
     let result_ptr = unsafe {
         lens_asr_transcribe(
             pcm.as_ptr(),
@@ -180,6 +187,7 @@ fn run_bridge(
             lang_ptr,
             translate_flag,
             &mut err_ptr,
+            &mut confidence,
         )
     };
 
@@ -225,7 +233,12 @@ fn run_bridge(
             });
         }
     }
-    Ok(segments)
+    // A negative sentinel means the transcriber exposed none → `None`.
+    let confidence = (confidence >= 0.0).then(|| (confidence as f32).clamp(0.0, 1.0));
+    Ok(TranscriptOutput {
+        segments,
+        confidence,
+    })
     // `guard` drops here → `lens_asr_free` releases the whole Swift buffer.
 }
 
@@ -253,7 +266,7 @@ impl AsrEngine for AppleSpeechEngine {
         pcm: &[f32],
         config: &TranscribeConfig,
         progress_tx: Option<tokio::sync::mpsc::UnboundedSender<f32>>,
-    ) -> Result<Vec<TranscriptSegment>, LensError> {
+    ) -> Result<TranscriptOutput, LensError> {
         // Own the inputs so they outlive the blocking task. The Swift bridge runs
         // the SpeechAnalyzer pipeline to completion synchronously (it joins its own
         // async work on a semaphore), so the whole FFI call must run OFF the async
@@ -267,7 +280,7 @@ impl AsrEngine for AppleSpeechEngine {
 
         // The bridge reports no incremental progress; emit a terminal 1.0 (the
         // trait's `0.0..=1.0` convention) so a listening onboarding bar completes.
-        let out =
+        let output =
             tokio::task::spawn_blocking(move || run_bridge(&pcm, lang_code.as_deref(), translate))
                 .await
                 .map_err(|e| {
@@ -277,7 +290,12 @@ impl AsrEngine for AppleSpeechEngine {
         if let Some(tx) = progress_tx {
             let _ = tx.send(1.0);
         }
-        Ok(out)
+        Ok(output)
+    }
+
+    /// Apple is the only locale-aware engine: delegate to the real OS probe.
+    fn supports_locale(&self, lang: &Lang) -> bool {
+        apple_supports_locale(lang)
     }
 }
 
@@ -285,8 +303,7 @@ impl AsrEngine for AppleSpeechEngine {
 /// router's `apple_supports_locale` gate. Delegates to the Swift bridge, which
 /// queries `SpeechTranscriber.supportedLocales`; a NUL-containing code or any
 /// bridge error is treated as unsupported (returns `false`, never panics).
-/// Wired into the per-call locale gate in #43.
-#[allow(dead_code)]
+/// Backs [`AppleSpeechEngine::supports_locale`] for the router's per-locale gate.
 pub fn apple_supports_locale(lang: &Lang) -> bool {
     let code = lang_to_bcp47(lang);
     let Ok(c_code) = CString::new(code) else {
@@ -376,9 +393,21 @@ mod tests {
             translate: false,
         };
         match engine.transcribe_pcm(&pcm, &config, None).await {
-            Ok(segments) => {
-                eprintln!("apple transcription produced {} segment(s)", segments.len());
+            Ok(TranscriptOutput {
+                segments,
+                confidence,
+            }) => {
+                eprintln!(
+                    "apple transcription produced {} segment(s), confidence {confidence:?}",
+                    segments.len()
+                );
                 assert!(!segments.is_empty(), "expected non-empty segments");
+                if let Some(c) = confidence {
+                    assert!(
+                        (0.0..=1.0).contains(&c),
+                        "aggregate confidence must be in 0.0..=1.0, got {c}"
+                    );
+                }
                 for seg in &segments {
                     eprintln!(
                         "  [{:.2}..{:.2}] {:?}",

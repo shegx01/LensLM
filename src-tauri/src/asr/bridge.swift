@@ -140,7 +140,7 @@ private func transcribe(
     // `translate` is a reserved ABI slot: SpeechTranscriber has no translate task;
     // translation is routed to Whisper in lib.rs. Kept for signature stability.
     translate: Bool
-) async throws -> [Segment] {
+) async throws -> (segments: [Segment], confidence: Double?) {
     // `supportedLocales` may be downloadable-but-not-present; `installedLocales`
     // is what actually has an on-device asset. Reaching the analyzer with a locale
     // whose asset is NOT installed makes Speech.framework TRAP (an uncatchable
@@ -164,13 +164,14 @@ private func transcribe(
         throw BridgeError.noSupportedLocale
     }
 
-    // `attributeOptions` includes `.audioTimeRange` so each result run carries a
-    // CMTimeRange we can turn into segment start/end seconds.
+    // `attributeOptions` includes `.audioTimeRange` (each run carries a CMTimeRange
+    // → segment start/end seconds) and `.transcriptionConfidence` (per-run Double
+    // confidence, aggregated to a clip-level score for the degraded-output gate).
     let transcriber = SpeechTranscriber(
         locale: locale,
         transcriptionOptions: [],
         reportingOptions: [],
-        attributeOptions: [.audioTimeRange]
+        attributeOptions: [.audioTimeRange, .transcriptionConfidence]
     )
 
     // Install the on-device asset only when this locale isn't already present;
@@ -212,6 +213,9 @@ private func transcribe(
     }
 
     var segments: [Segment] = []
+    // Clip-level confidence = MIN of every run that carries one (most conservative:
+    // a single low-confidence span degrades the whole clip). nil if no run has it.
+    var clipConfidence: Double? = nil
     do {
         for try await result in transcriber.results {
             // `audioTimeRange` is populated on final results only; skip volatile.
@@ -222,6 +226,11 @@ private func transcribe(
             var segStart: Double? = nil
             var segEnd: Double? = nil
             for run in attributed.runs {
+                // Confidence and time-range are independent per-run attributes; read
+                // confidence first so a run carrying only confidence still counts.
+                if let conf = run.transcriptionConfidence {
+                    clipConfidence = clipConfidence.map { min($0, conf) } ?? conf
+                }
                 guard let range = run.audioTimeRange else { continue }
                 let s = CMTimeGetSeconds(range.start)
                 let e = CMTimeGetSeconds(range.end)
@@ -244,7 +253,7 @@ private func transcribe(
     }
 
     try? await analyzer.finalizeAndFinishThroughEndOfInput()
-    return segments
+    return (segments, clipConfidence)
 }
 
 /// Drives the async transcription to completion synchronously. The C caller is
@@ -257,14 +266,16 @@ private func transcribeBlocking(
     langCode: String?,
     // Reserved ABI slot — see `transcribe`; translation is Whisper-only in lib.rs.
     translate: Bool
-) -> Result<[Segment], Error> {
+) -> Result<(segments: [Segment], confidence: Double?), Error> {
     let semaphore = DispatchSemaphore(value: 0)
-    final class Box: @unchecked Sendable { var value: Result<[Segment], Error> = .success([]) }
+    final class Box: @unchecked Sendable {
+        var value: Result<(segments: [Segment], confidence: Double?), Error> = .success(([], nil))
+    }
     let box = Box()
     Task.detached {
         do {
-            let segs = try await transcribe(buffer: buffer, langCode: langCode, translate: translate)
-            box.value = .success(segs)
+            let out = try await transcribe(buffer: buffer, langCode: langCode, translate: translate)
+            box.value = .success(out)
         } catch {
             box.value = .failure(error)
         }
@@ -287,7 +298,8 @@ func lens_asr_transcribe(
     // Reserved ABI slot — SpeechTranscriber has no translate task; translation is
     // routed to Whisper in lib.rs. Kept in the C ABI for signature stability.
     _ translate: Int32,
-    _ out_error: UnsafeMutablePointer<UnsafeMutablePointer<LensAsrError>?>?
+    _ out_error: UnsafeMutablePointer<UnsafeMutablePointer<LensAsrError>?>?,
+    _ out_confidence: UnsafeMutablePointer<Double>?
 ) -> UnsafeMutablePointer<LensAsrResult>? {
 
     guard #available(macOS 26.0, *) else {
@@ -312,8 +324,10 @@ func lens_asr_transcribe(
 
     let segments: [Segment]
     switch outcome {
-    case .success(let segs):
-        segments = segs
+    case .success(let out):
+        segments = out.segments
+        // Scalar out-param (clause a: nothing to free). Negative sentinel = absent.
+        out_confidence?.pointee = out.confidence ?? -1.0
     case .failure(let error):
         setError("apple transcription failed: \(error.localizedDescription)", out_error)
         return nil

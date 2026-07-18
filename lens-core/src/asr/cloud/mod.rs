@@ -36,7 +36,7 @@ use async_trait::async_trait;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::LensError;
-use crate::asr::{AsrEngine, TranscribeConfig, TranscriptSegment};
+use crate::asr::{AsrEngine, TranscribeConfig, TranscriptOutput, TranscriptSegment};
 use crate::config::{AppConfig, CloudAsrProvider};
 
 /// Bounded connect timeout for cloud ASR. Slightly larger than the LLM path's 1 s
@@ -176,7 +176,7 @@ impl AsrEngine for CloudAsrEngine {
         pcm: &[f32],
         config: &TranscribeConfig,
         progress_tx: Option<UnboundedSender<f32>>,
-    ) -> Result<Vec<TranscriptSegment>, LensError> {
+    ) -> Result<TranscriptOutput, LensError> {
         tracing::info!(provider = ?self.provider, model = %self.model, "cloud ASR started");
 
         let chunks = chunk::split_if_needed(pcm, self.provider, SAMPLE_RATE);
@@ -192,7 +192,10 @@ impl AsrEngine for CloudAsrEngine {
             }
         }
 
-        Ok(chunk::stitch_segments(&stitched_input))
+        Ok(TranscriptOutput {
+            segments: chunk::stitch_segments(&stitched_input),
+            confidence: None,
+        })
     }
 }
 
