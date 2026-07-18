@@ -20,6 +20,8 @@ export interface LlmProviderInput {
   api_key: string;
   /** Context window (tokens). Persisted to ModelConfig.context. */
   context: number;
+  /** Sampling temperature. Defaults to 0.7 when omitted (existing callers unaffected). */
+  temperature?: number;
 }
 
 /** Upserts `models[]` by provider, preserving all other AppConfig fields. No-op outside Tauri. */
@@ -29,7 +31,7 @@ export async function saveLlmProvider(input: LlmProviderInput): Promise<void> {
     base_url: input.base_url,
     model: input.model,
     context: input.context,
-    temperature: 0.7,
+    temperature: input.temperature ?? 0.7,
     api_key: input.api_key
   };
 

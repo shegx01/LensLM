@@ -7,6 +7,7 @@
   import { notebookStore } from '$lib/notebooks/index.js';
   import EmbeddingsSection from './EmbeddingsSection.svelte';
   import GeneralSection from './GeneralSection.svelte';
+  import AiModelSection from './AiModelSection.svelte';
   import IngestionSection from './IngestionSection.svelte';
   import TtsConfigPanel from '../onboarding/TtsConfigPanel.svelte';
   import SettingsShell, { type NavItem } from './SettingsShell.svelte';
@@ -22,10 +23,10 @@
 
   const open = $derived(notebookStore.settingsOpen);
 
-  // `embeddings`, `ingestion` and `text_to_speech` are live; the rest are coming-soon stubs.
+  // `general`, `ai`, `embeddings`, `ingestion` and `text_to_speech` are live; the rest are coming-soon stubs.
   const NAV: NavItem[] = [
     { id: 'general', label: 'General', icon: Settings2, stub: false },
-    { id: 'ai', label: 'AI Model', icon: Cpu, stub: true },
+    { id: 'ai', label: 'AI Model', icon: Cpu, stub: false },
     { id: 'embeddings', label: 'Embeddings', icon: Share2, stub: false },
     { id: 'ingestion', label: 'Ingestion', icon: Download, stub: false },
     { id: 'text_to_speech', label: 'Text-to-Speech', icon: Volume2, stub: false },
@@ -35,7 +36,8 @@
     { id: 'about', label: 'About', icon: Info, stub: true }
   ];
 
-  let active = $state<string>('embeddings');
+  // Honour a deep-link target (e.g. the chat "no model" CTA routes to 'ai'); default embeddings.
+  let active = $state<string>(notebookStore.settingsSection ?? 'embeddings');
 
   function close(): void {
     notebookStore.settingsOpen = false;
@@ -52,6 +54,8 @@
       {#snippet content(active)}
         {#if active === 'general'}
           <GeneralSection />
+        {:else if active === 'ai'}
+          <AiModelSection />
         {:else if active === 'embeddings'}
           <EmbeddingsSection mode="global" />
         {:else if active === 'ingestion'}
