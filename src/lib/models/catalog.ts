@@ -66,10 +66,8 @@ function compareDateDesc(a: string | null | undefined, b: string | null | undefi
 }
 
 /**
- * True when the engine resolves a usable chat provider (mirrors the backend
- * `usable` gate — endpoint + model + build eligibility). The safe "has a chat
- * model" signal; `models.length` is not (a present-but-unusable entry lies).
- * Resolves `false` outside Tauri.
+ * Wraps `has_chat_provider`; resolves `false` outside Tauri.
+ * See the chat-provider store for the usable-gate rationale.
  */
 export async function hasChatProvider(): Promise<boolean> {
   if (!isTauri()) return false;

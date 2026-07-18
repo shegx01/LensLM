@@ -1,10 +1,7 @@
 <!--
   LlmModelField — model picker shared by the Settings AI Model panel and (issue #217)
-  onboarding's curated 3-preset picker. For local providers it offers Auto-detect
-  (probes the endpoint) and lists pulled models; for cloud providers it lists the
-  models.dev catalog; a custom OpenAI-compatible endpoint falls back to free text.
-  An inline Validate action surfaces `validate_model_interactive` feedback. In the
-  onboarding preset cards this renders under each provider tile with the same props.
+  onboarding's curated 3-preset picker. Local providers get Auto-detect + pulled
+  models; cloud gets the models.dev catalog; custom endpoints fall back to free text.
 -->
 <script lang="ts">
   import { Button } from '$lib/components/ui/button/index.js';

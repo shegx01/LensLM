@@ -1,10 +1,10 @@
 <!--
   AiModelSection — the "AI Model" panel inside the global Preferences view. Chat-first:
-  one chat model (provider, base URL, model, context, temperature, API key), with a
-  collapsed Advanced disclosure to pin a separate enrichment model. Reactive persist via
-  the shared saveLlmProvider/saveEnrichmentPrefs helpers — no Save button.
+  one chat model, with a collapsed Advanced disclosure to pin a separate enrichment
+  model. Reactive persist via the shared saveLlmProvider/saveEnrichmentPrefs helpers —
+  no Save button.
 
-  Two backend-coupled invariants (see the consensus plan):
+  Two backend-coupled invariants:
   • The chosen chat entry is written as enrichment.routing = Explicit{provider,model} —
     chat resolution ignores chat_model, so this is what actually makes it authoritative
     (and enrichment defaults to it).
@@ -171,7 +171,9 @@
     try {
       const cfg = await invoke<AppConfig>('get_config');
       const existing = (cfg.models ?? []).find((m) => m.provider === providerId);
-      const keyMasked = isCloud && hasSavedKey && !editingKey;
+      // Focusing the masked field flips editingKey before any keystroke; an empty
+      // buffer still means "keep the saved key", so guard on the buffer too (no wipe).
+      const keyMasked = isCloud && hasSavedKey && (!editingKey || apiKeyValue.trim() === '');
       const api_key = isCloud ? (keyMasked ? (existing?.api_key ?? '') : apiKeyValue) : '';
 
       await saveLlmProvider({
@@ -187,7 +189,6 @@
       await saveEnrichmentPrefs({
         enabled: prior.enabled,
         coref_strategy: prior.coref_strategy,
-        // Cloud requires consent to resolve; local never rewrites it (clobber guard).
         cloud_consent: isCloud ? true : prior.cloud_consent,
         routing: { kind: 'explicit', provider: providerId, model },
         coref_model: enrichmentModel,

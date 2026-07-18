@@ -143,6 +143,42 @@ describe('AiModelSection', () => {
     expect(entry.api_key).toBe('secret-key');
   });
 
+  it('preserves a masked API key on focus-then-blur without typing (KEY-WIPE)', async () => {
+    const cfg = baseAppConfig({
+      models: [
+        {
+          provider: 'openai',
+          base_url: '',
+          model: 'gpt-4o',
+          context: 128000,
+          temperature: 0.7,
+          api_key: 'secret-key'
+        }
+      ],
+      enrichment: {
+        enabled: true,
+        coref_strategy: 'llm_inline',
+        cloud_consent: true,
+        routing: { kind: 'explicit', provider: 'openai', model: 'gpt-4o' }
+      }
+    });
+    const writes = setup(cfg, { provider: { 'gpt-4o': textModel('gpt-4o') } });
+
+    render(AiModelSection);
+    await screen.findByRole('heading', { name: 'AI Model' });
+
+    // Focusing the masked field flips it into edit mode with an empty buffer;
+    // blurring without a keystroke must not persist the empty string as the key.
+    const keyInput = await screen.findByLabelText('API Key');
+    await fireEvent.focus(keyInput);
+    await fireEvent.blur(keyInput);
+
+    const wipe = writes.find((w) =>
+      w.models.some((m) => m.provider === 'openai' && m.api_key === '')
+    );
+    expect(wipe).toBeUndefined();
+  });
+
   it('never rewrites prior enrichment flags for a local save (CLOBBER-GUARD)', async () => {
     const cfg = baseAppConfig({
       models: [

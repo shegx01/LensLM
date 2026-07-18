@@ -51,9 +51,7 @@ pub async fn set_config(
     apply_config(engine.inner(), config).await
 }
 
-/// Read-only gate for chat: whether a chat provider currently resolves from config.
-/// Mirrors the engine's `usable` selection (builds no network client), so a
-/// present-but-unusable model entry correctly reads as "no provider". (AC-11)
+/// Read-only chat-provider gate; builds no network client. (AC-11)
 #[tracing::instrument(skip_all)]
 #[tauri::command]
 pub async fn has_chat_provider(engine: tauri::State<'_, LensEngine>) -> Result<bool, LensError> {

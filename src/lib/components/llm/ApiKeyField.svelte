@@ -3,7 +3,7 @@
   panel and (issue #217) onboarding's curated 3-preset picker. A saved key is shown
   masked; the field only becomes editable on focus/input, and the caller must NOT
   persist the (empty) editing value as the key while `editing` is false — it should
-  reconstruct the prior key from config instead. Reused as-is inside each preset card.
+  reconstruct the prior key from config instead.
 -->
 <script lang="ts">
   import { Input } from '$lib/components/ui/input/index.js';
