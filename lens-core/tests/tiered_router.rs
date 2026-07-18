@@ -1029,3 +1029,83 @@ async fn tier2_trim_keeps_highest_fused_score_not_doc_order() {
         "tight budget must keep the highest-score unit (doc-later), not the doc-earliest"
     );
 }
+
+// ---------------------------------------------------------------------------
+// RQ-7 — >512 sources batch the dense pre-filter without losing recall
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn dense_prefilter_batches_beyond_512_sources_preserves_recall() {
+    // With more selected sources than MAX_PREFILTER_IDS (512), the dense pre-filter
+    // must batch and merge by distance — NOT fall back to a notebook-wide search that
+    // reintroduces the #39 recall bug. The nearest vector lives on a source in the
+    // OVERFLOW batch (index > 512); it must still surface.
+    let dir = tempfile::tempdir().unwrap();
+    let engine = LensEngine::init(dir.path()).await.unwrap();
+    let pool = engine.pool().await;
+    let nb = engine.create_notebook("nb", None, None).await.unwrap().id;
+
+    const N: usize = 520;
+    for i in 0..N {
+        let sid = format!("s{i:04}");
+        let cid = format!("c{i:04}");
+        insert_source(&pool, &nb, &sid, 9_000).await;
+        insert_chunk(&pool, &sid, &cid, None, "child", 1, 0, "content").await;
+    }
+
+    let (store, coord) = store_and_coord(&engine, dir.path(), pool.clone(), &nb);
+    // Sources sort by (created_at, id); zero-padded ids sort lexically == numerically,
+    // so s0519 lands last → in the 2nd (overflow) prefilter batch. Give it the nearest
+    // vector; a far vector on the first source.
+    store
+        .add(
+            &coord,
+            vec![
+                VectorRow {
+                    chunk_id: "c0519".into(),
+                    source_id: "s0519".into(),
+                    notebook_id: nb.to_string(),
+                    level: 1,
+                    vector: axis_vec(0),
+                },
+                VectorRow {
+                    chunk_id: "c0000".into(),
+                    source_id: "s0000".into(),
+                    notebook_id: nb.to_string(),
+                    level: 1,
+                    vector: axis_vec(1),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+    let reranker = Reranker::new(dir.path());
+    let cfg = RetrievalConfig {
+        hybrid_enabled: false,
+        ..RetrievalConfig::default()
+    };
+    let out = tiered_search(
+        &pool,
+        &store,
+        &reranker,
+        None,
+        &coord,
+        "q",
+        &axis_vec(0),
+        &model_ctx(10_000),
+        10,
+        &cfg,
+        None,
+        &TierThresholds::default(),
+        None,
+        0,
+    )
+    .await
+    .unwrap();
+    let ids: Vec<&str> = out.units.iter().map(|u| u.chunk_id.as_str()).collect();
+    assert!(
+        ids.contains(&"c0519"),
+        "nearest vector in the overflow batch must be retrieved, got {ids:?}"
+    );
+}

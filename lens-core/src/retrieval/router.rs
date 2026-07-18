@@ -45,11 +45,9 @@ const TIER1_FRACTION: f32 = 0.65;
 /// source counts are tens, so the guard is purely defensive.
 const MAX_PREFILTER_IDS: usize = 512;
 
-/// Confidence floor for the graph arm (RQ-4). `graph_confidence` is max-normalized
-/// (top hit ≈ 1.0), so the long tail of ~0.01 PPR neighbors would otherwise enter
-/// RRF with full rank mass and crowd out dense/BM25 hits. Drop pairs below this
-/// before fusion. Evidence chunks (fixed conf 1.0) always clear it; only weak
-/// traversal expansion is floored. Mirrors `WRITE_CONFIDENCE_BAR`'s named-bar style.
+/// Confidence floor dropping the max-normalized graph arm's weak traversal tail
+/// (~0.01 PPR neighbors) before fusion, so it can't enter RRF with full rank mass
+/// (RQ-4). Evidence chunks (fixed conf 1.0) always clear it.
 const GRAPH_MIN_CONFIDENCE: f32 = 0.1;
 
 /// Which tier the router selected for a query.
@@ -273,21 +271,25 @@ struct ParentRow {
 
 /// Loads the parent chunks for a set of sources in document order (source order,
 /// then `level ASC, token_start ASC`). `source_anchor` falls back to `section_path`.
+/// The `sources` JOIN re-applies [`RETRIEVAL_LIVE_WHERE`] so a source trashed or
+/// deselected mid-flight drops out of Tier-1 too (RT-2 parity with Tier-2).
 async fn load_parent_rows(
     pool: &SqlitePool,
     source_ids: &[String],
 ) -> Result<Vec<ParentRow>, LensError> {
     let mut rows = Vec::new();
     for source_id in source_ids {
-        let recs = sqlx::query_as::<_, (String, String, Option<String>, String, i32, i64)>(
-            "SELECT id, text, source_anchor, section_path, level, token_start FROM chunks \
-             WHERE source_id = ? AND kind = ? \
-             ORDER BY level ASC, token_start ASC",
-        )
-        .bind(source_id)
-        .bind(kind::PARENT)
-        .fetch_all(pool)
-        .await?;
+        let recs =
+            sqlx::query_as::<_, (String, String, Option<String>, String, i32, i64)>(&format!(
+                "SELECT c.id, c.text, c.source_anchor, c.section_path, c.level, c.token_start \
+             FROM chunks c JOIN sources s ON s.id = c.source_id \
+             WHERE c.source_id = ? AND c.kind = ? AND {RETRIEVAL_LIVE_WHERE} \
+             ORDER BY c.level ASC, c.token_start ASC"
+            ))
+            .bind(source_id)
+            .bind(kind::PARENT)
+            .fetch_all(pool)
+            .await?;
         for (chunk_id, text, source_anchor, section_path, level, token_start) in recs {
             rows.push(ParentRow {
                 chunk_id,
@@ -303,13 +305,9 @@ async fn load_parent_rows(
 }
 
 /// Tier-1 raw-corpus assembly: the selected+live sources' parent chunks in document
-/// order, each hydrated, `parent_id = None`, `order_index` monotonic. Non-graph
-/// provenance (raw inject). No retrieval, no fusion.
-///
-/// A hard running-sum trim against `tier1_cap` is the RT-4 safety net: tier selection
-/// trusts each source's cached `sources.token_count`, which can be stale, so this
-/// re-measures the actual assembled text (exact via `tokenizer` when present, else
-/// the estimate) and never injects beyond budget. At least one unit is always kept.
+/// order, `parent_id = None`, `order_index` monotonic. No retrieval, no fusion. The
+/// running-sum trim against `tier1_cap` is the RT-4 net against a stale cached
+/// `token_count` (keeps ≥1 unit; exact via `tokenizer` when present).
 async fn assemble_tier1(
     pool: &SqlitePool,
     source_ids: &[String],
@@ -361,13 +359,11 @@ struct RetrievedChunk {
     token_start: i64,
 }
 
-/// Batch-hydrates the linkage + doc-order key + text for a set of retrieved hits,
-/// preserving the input (fused rank) order. Collapses the former per-hit N+1 into a
-/// constant number of batched queries (RQ-2). The metadata query JOINs `sources`
-/// with the live/selected predicate, so a source trashed or deselected mid-flight
-/// drops out here (RT-2). Text comes from `prehydrated` when the reranker already
-/// hydrated it (RQ-3); only the residual ids are re-selected. A vanished chunk is
-/// dropped. `graph_confidence` is attached ONLY to `HitSource::Graph` hits (RQ-8).
+/// Batch-hydrates the linkage + doc-order key + text for a set of retrieved hits in
+/// fused-rank order, collapsing the former per-hit N+1 into a constant number of
+/// batched queries (RQ-2). Metadata JOINs `sources` on [`RETRIEVAL_LIVE_WHERE`]
+/// (RT-2). Text reuses `prehydrated` and re-selects only the residual (RQ-3).
+/// `graph_confidence` is attached ONLY to `HitSource::Graph` hits (RQ-8).
 async fn hydrate_retrieved(
     pool: &SqlitePool,
     hits: &[RetrievalHit],
@@ -461,9 +457,10 @@ async fn hydrate_retrieved(
     Ok(out)
 }
 
-/// The live/selected predicate at Tier-2 hydration time (RT-2). Uses unqualified
-/// column names via the `sources s` alias in the JOIN; distinct from
-/// [`SELECTED_LIVE_WHERE`] which scopes a bare `sources` query by `notebook_id`.
+/// The authoritative RT-2 predicate: re-applied via a `sources s` JOIN at every
+/// hydration site (both tiers) so a source trashed/deselected in the window between
+/// source-id resolution and hydration contributes no text. Uses the `s` alias;
+/// distinct from [`SELECTED_LIVE_WHERE`] which scopes a bare `sources` query.
 const RETRIEVAL_LIVE_WHERE: &str = "s.trashed_at IS NULL AND s.selected = 1";
 
 /// Batched child counts per parent (`chunks.parent_id`), one `GROUP BY` over the
@@ -494,9 +491,8 @@ async fn parent_child_counts(
 }
 
 /// Batch-loads the merged-parent rows (text + locator + source + doc-order key),
-/// keyed by parent id (RQ-2). The `sources` JOIN applies the live/selected predicate
-/// so a parent whose source was trashed mid-flight is absent → its children also
-/// drop (RT-2). A missing parent is simply absent from the map.
+/// keyed by parent id (RQ-2), under the [`RETRIEVAL_LIVE_WHERE`] JOIN. A parent
+/// absent from the map (trashed source, or vanished) drops its children too.
 async fn load_parents(
     pool: &SqlitePool,
     parent_ids: &[String],
@@ -767,11 +763,9 @@ const MAX_SEED_TOKENS: usize = 64;
 /// Number of entity nodes the RQ-5 semantic seed fallback pulls from `entity_ann`.
 const SEED_ANN_K: usize = 5;
 
-/// Max cosine distance for a semantically-resolved seed (RQ-5). LanceDB cosine
-/// distance is `1 - cos`, range `[0, 2]`; `0.5` ≈ cosine similarity ≥ 0.5 — near
-/// enough to be a plausible graph entry point without seeding on noise. The seed
-/// still only enables the additive, floored, gated graph arm, so a loose match
-/// cannot displace dense/BM25 evidence.
+/// Max cosine distance (LanceDB `1 - cos`) for a semantically-resolved seed (RQ-5):
+/// `0.5` ≈ similarity ≥ 0.5. The seed only enables the additive, floored, gated
+/// graph arm, so a loose match cannot displace dense/BM25 evidence.
 const SEED_ANN_MAX_DISTANCE: f32 = 0.5;
 
 /// Tokenizes on whitespace/punctuation, lowercased.

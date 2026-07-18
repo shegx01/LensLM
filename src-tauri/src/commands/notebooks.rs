@@ -852,9 +852,11 @@ pub async fn set_notebook_embedding_model(
             }
         }
         Err(err) => {
-            // Roll the pointer back to the prior still-active coordinate, but ONLY if
-            // it still names the coordinate we just set — a concurrent model switch may
-            // have already moved it, and clobbering that would be wrong (RT-1).
+            // Best-effort roll the pointer back to the prior still-active coordinate,
+            // guarded so we only revert when it still names the coordinate we just set
+            // (a concurrent switch that already moved it is left alone). A concurrent
+            // switch landing between this re-read and the revert is a benign, near-zero
+            // race in the single-user model — not fully atomic (RT-1).
             if let (Some(prior), Some(attempted)) = (&prior, &attempted) {
                 match engine.resolve_notebook_embedding(&nb_id).await {
                     Ok(current) if &current == attempted && attempted != prior => {
