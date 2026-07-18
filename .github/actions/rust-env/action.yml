@@ -12,7 +12,7 @@ inputs:
   save-cache:
     description: >-
       Whether THIS job writes the shared cache ('true'/'false'). Exactly one job
-      (test shard 1) should set this so parallel jobs don't race on the key.
+      (the archive build) should set this so parallel jobs don't race on the key.
     default: 'false'
   fetch-pdfium:
     description: >-
@@ -20,7 +20,7 @@ inputs:
       by every job that compiles the workspace (the checksum is the gate).
     default: 'false'
   install-nextest:
-    description: Install cargo-nextest ('true'/'false') — to run test binaries.
+    description: Install cargo-nextest ('true'/'false') — to archive/run test binaries.
     default: 'false'
 
 runs:
@@ -60,7 +60,7 @@ runs:
       if: ${{ inputs.cache != 'false' }}
       uses: Swatinem/rust-cache@v2
       with:
-        # Fixed key so all Rust jobs share one cache; only test shard 1 writes.
+        # Fixed key so all Rust jobs share one cache; only the archive job writes.
         shared-key: rust-ci
         save-if: ${{ inputs.save-cache }}
 
