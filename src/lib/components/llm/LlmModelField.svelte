@@ -25,6 +25,7 @@
     baseUrl = '',
     apiKey = '',
     id,
+    options = undefined,
     onchange
   }: {
     /** Selected model id. */
@@ -38,6 +39,8 @@
     baseUrl?: string;
     apiKey?: string;
     id: string;
+    /** Pre-resolved catalog options from the parent; when supplied, the field skips its own fetch. */
+    options?: ModelOption[];
     /** Fires when the user picks or edits the model. */
     onchange?: (model: string) => void;
   } = $props();
@@ -52,17 +55,23 @@
   let validationMessage = $state<string | null>(null);
 
   const localIds = $derived(
-    kind === 'local' ? Array.from(new Set([...detected, ...ollamaOptions.map((o) => o.id)])) : []
+    kind === 'local'
+      ? Array.from(new Set([...detected, ...(options ?? ollamaOptions).map((o) => o.id)]))
+      : []
   );
 
-  const options = $derived<ModelOption[]>(
-    kind === 'local' ? localIds.map((mid) => ({ id: mid, label: mid, info: null })) : cloudOptions
+  const resolvedOptions = $derived<ModelOption[]>(
+    kind === 'local'
+      ? localIds.map((mid) => ({ id: mid, label: mid, info: null }))
+      : (options ?? cloudOptions)
   );
 
   // Custom endpoints have no catalog; local/cloud fall back to free text when nothing resolves.
-  const freeText = $derived(kind === 'custom' || options.length === 0);
+  const freeText = $derived(kind === 'custom' || resolvedOptions.length === 0);
 
   async function loadOptions(): Promise<void> {
+    // Parent-supplied options are authoritative; don't duplicate the catalog fetch.
+    if (options !== undefined) return;
     if (kind === 'local') {
       try {
         ollamaOptions = await listOllamaModelOptions(baseUrl);
@@ -155,7 +164,7 @@
           onchange={(e) => emit(e.currentTarget.value)}
           class={`${SELECT_CLASS} flex-1`}
         >
-          {#each options as opt (opt.id)}
+          {#each resolvedOptions as opt (opt.id)}
             <option value={opt.id}>{opt.label}</option>
           {/each}
         </select>
@@ -186,7 +195,7 @@
     />
   {:else}
     <select {id} {value} onchange={(e) => emit(e.currentTarget.value)} class={SELECT_CLASS}>
-      {#each options as opt (opt.id)}
+      {#each resolvedOptions as opt (opt.id)}
         <option value={opt.id}>{opt.label}</option>
       {/each}
     </select>

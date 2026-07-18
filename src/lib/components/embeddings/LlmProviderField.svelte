@@ -7,7 +7,7 @@
 <script lang="ts">
   import { cn } from '$lib/utils.js';
   import { SELECT_CLASS } from '$lib/components/onboarding/styles.js';
-  import { CLOUD_PROVIDERS } from '$lib/onboarding/cloud-providers.js';
+  import { CLOUD_PROVIDERS, CLOUD_PROVIDER_IDS } from '$lib/onboarding/cloud-providers.js';
 
   let {
     kind,
@@ -39,7 +39,10 @@
 
   function pickCloud(): void {
     if (kind === 'cloud') return;
-    onchange({ kind: 'cloud', providerId: providerId || CLOUD_PROVIDERS[0].id });
+    // Reuse the incoming id only when it is a real cloud provider; the default local
+    // state carries providerId='ollama', which must not pin the cloud entry to a local id.
+    const cloudId = CLOUD_PROVIDER_IDS.includes(providerId) ? providerId : CLOUD_PROVIDERS[0].id;
+    onchange({ kind: 'cloud', providerId: cloudId });
   }
 </script>
 

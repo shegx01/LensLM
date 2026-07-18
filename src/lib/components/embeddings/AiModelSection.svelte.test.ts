@@ -232,6 +232,136 @@ describe('AiModelSection', () => {
     expect(enrWrite!.enrichment.cloud_consent).toBe(true);
     // enabled must NOT be flipped on by this panel.
     expect(enrWrite!.enrichment.enabled).toBe(false);
+
+    // The persisted entry must be pinned to a REAL cloud id — never the local 'ollama'
+    // id (regression: pickCloud reused the truthy default providerId='ollama').
+    const modelWrite = writes.find((w) => w.models.some((m) => m.provider === 'openai'));
+    expect(modelWrite).toBeDefined();
+    const entry = modelWrite!.models.find((m) => m.provider === 'openai')!;
+    expect(entry.provider).toBe('openai');
+    expect(entry.model).toBe('gpt-4o');
+    expect(modelWrite!.models.some((m) => m.provider === 'ollama')).toBe(false);
+    // routing pins the same real cloud provider.
+    expect(enrWrite!.enrichment.routing).toMatchObject({ provider: 'openai' });
+  });
+
+  it('restores a saved model on provider round-trip and never pins an empty model (ROUND-TRIP)', async () => {
+    const cfg = baseAppConfig({
+      models: [
+        {
+          provider: 'openai',
+          base_url: '',
+          model: 'gpt-4o',
+          context: 128000,
+          temperature: 0.7,
+          api_key: 'secret'
+        }
+      ],
+      enrichment: {
+        enabled: true,
+        coref_strategy: 'llm_inline',
+        cloud_consent: true,
+        routing: { kind: 'explicit', provider: 'openai', model: 'gpt-4o' }
+      }
+    });
+    const writes = setup(cfg, { provider: { 'gpt-4o': textModel('gpt-4o') }, ollama: [] });
+
+    render(AiModelSection);
+    await screen.findByRole('heading', { name: 'AI Model' });
+
+    // Panel opens on the cloud entry (CloudFirst + consent).
+    await waitFor(() =>
+      expect(screen.getByRole('tab', { name: 'Cloud API' })).toHaveAttribute(
+        'aria-selected',
+        'true'
+      )
+    );
+
+    // Switch to Local — no saved ollama entry, so nothing may persist an empty model.
+    await fireEvent.click(screen.getByRole('tab', { name: 'Local' }));
+    await waitFor(() =>
+      expect(screen.getByRole('tab', { name: 'Local' })).toHaveAttribute('aria-selected', 'true')
+    );
+
+    // Switch back to Cloud (defaults to openai) — the saved gpt-4o entry is restored.
+    await fireEvent.click(screen.getByRole('tab', { name: 'Cloud API' }));
+    await waitFor(() =>
+      expect(screen.getByRole('tab', { name: 'Cloud API' })).toHaveAttribute(
+        'aria-selected',
+        'true'
+      )
+    );
+    await waitFor(() =>
+      expect(
+        writes.some((w) => w.models.some((m) => m.provider === 'openai' && m.model === 'gpt-4o'))
+      ).toBe(true)
+    );
+
+    // No set_config ever wrote an Explicit pin (or a models entry) with an empty model.
+    const emptyPin = writes.find(
+      (w) => w.enrichment.routing?.kind === 'explicit' && w.enrichment.routing.model === ''
+    );
+    expect(emptyPin).toBeUndefined();
+    expect(writes.some((w) => w.models.some((m) => m.model === ''))).toBe(false);
+  });
+
+  it('fetches the cloud catalog once per provider change — no duplicate child fetch (FIX-3)', async () => {
+    const cfg = baseAppConfig({
+      models: [
+        {
+          provider: 'openai',
+          base_url: '',
+          model: 'gpt-4o',
+          context: 128000,
+          temperature: 0.7,
+          api_key: 'secret'
+        }
+      ],
+      enrichment: {
+        enabled: true,
+        coref_strategy: 'llm_inline',
+        cloud_consent: true,
+        routing: { kind: 'explicit', provider: 'openai', model: 'gpt-4o' }
+      }
+    });
+    let providerModelCalls = 0;
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return cfg;
+      if (cmd === 'set_config') return null;
+      if (cmd === 'list_provider_models') {
+        providerModelCalls += 1;
+        return {
+          'gpt-4o': textModel('gpt-4o'),
+          'claude-sonnet-4-5': textModel('claude-sonnet-4-5')
+        };
+      }
+      if (cmd === 'list_ollama_models') return [];
+      if (cmd === 'has_chat_provider') return true;
+      if (cmd === 'validate_model_interactive') return { status: 'valid' };
+      if (cmd === 'detect_llm') return { reachable: true, version: 'v1', models: [] };
+      if (cmd === 'refresh_models') return false;
+      return undefined;
+    });
+
+    render(AiModelSection);
+    await screen.findByRole('heading', { name: 'AI Model' });
+    await waitFor(() =>
+      expect(screen.getByRole('tab', { name: 'Cloud API' })).toHaveAttribute(
+        'aria-selected',
+        'true'
+      )
+    );
+    await new Promise((r) => setTimeout(r, 30));
+
+    const before = providerModelCalls;
+    // Switch cloud provider openai → anthropic: exactly one catalog fetch (panel only).
+    await fireEvent.change(screen.getByLabelText('Cloud provider'), {
+      target: { value: 'anthropic' }
+    });
+    await waitFor(() => expect(providerModelCalls).toBe(before + 1));
+    // Settle to catch any duplicate fetch from the always-mounted model field.
+    await new Promise((r) => setTimeout(r, 30));
+    expect(providerModelCalls).toBe(before + 1);
   });
 
   it('persists the temperature slider into the chat entry (AC-2)', async () => {

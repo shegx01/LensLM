@@ -134,35 +134,50 @@
     }
   }
 
-  async function refreshSavedKeyState(): Promise<void> {
-    if (!isTauri() || kind !== 'cloud') {
-      hasSavedKey = false;
-      return;
-    }
-    try {
-      const cfg = await invoke<AppConfig>('get_config');
-      const existing = (cfg.models ?? []).find((m) => m.provider === providerId);
-      hasSavedKey = (existing?.api_key.trim() ?? '') !== '';
-    } catch {
-      hasSavedKey = false;
-    }
-  }
-
-  function onProviderChange(sel: { kind: 'local' | 'cloud'; providerId: string }): void {
+  async function onProviderChange(sel: {
+    kind: 'local' | 'cloud';
+    providerId: string;
+  }): Promise<void> {
     kind = sel.kind;
     providerId = sel.providerId;
     editingKey = false;
     apiKeyValue = '';
-    model = '';
+
+    // Restore the target provider's previously-saved entry so a provider round-trip
+    // doesn't overwrite its models[] entry with an empty model. Recomputes hasSavedKey
+    // for the newly-selected provider from the same fetch (no separate round-trip).
+    let existing: ModelConfig | undefined;
+    if (isTauri()) {
+      try {
+        const cfg = await invoke<AppConfig>('get_config');
+        existing = (cfg.models ?? []).find((m) => m.provider === providerId);
+      } catch {
+        existing = undefined;
+      }
+    }
+
+    if (existing) {
+      model = existing.model;
+      context = existing.context || 8192;
+      temperature = existing.temperature ?? 0.7;
+    } else {
+      context = 8192;
+      temperature = 0.7;
+      // No saved entry: blank for local/catalog-less providers, else the catalog floor model.
+      model = kind === 'cloud' ? (findCloudProvider(providerId)?.defaultModel ?? '') : '';
+    }
+
     if (kind === 'local') {
-      baseUrl = baseUrl || LOCAL_DEFAULT_ENDPOINT;
+      baseUrl = existing?.base_url || LOCAL_DEFAULT_ENDPOINT;
       hasSavedKey = false;
-      void persistChat();
     } else {
       const p = findCloudProvider(providerId);
-      baseUrl = p?.custom ? p.baseUrl : '';
-      void refreshSavedKeyState().then(() => persistChat());
+      baseUrl = existing?.base_url || (p?.custom ? p.baseUrl : '');
+      hasSavedKey = (existing?.api_key.trim() ?? '') !== '';
     }
+
+    // Never persist an Explicit pin with an empty model; defer until a model is chosen.
+    if (model.trim() !== '') void persistChat();
   }
 
   async function persistChat(): Promise<void> {
@@ -249,6 +264,7 @@
         {catalogKey}
         {baseUrl}
         apiKey={apiKeyValue}
+        options={overrideOptions}
         bind:value={model}
         onchange={() => void persistChat()}
       />
