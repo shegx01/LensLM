@@ -146,6 +146,7 @@ fn main() {
             commands::invoke_core_action,
             commands::config::get_config,
             commands::config::set_config,
+            commands::config::has_chat_provider,
             commands::notebooks::list_notebooks,
             commands::notebooks::create_notebook,
             commands::notebooks::rename_notebook,

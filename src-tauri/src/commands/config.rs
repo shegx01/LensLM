@@ -10,6 +10,30 @@ pub async fn get_config(engine: tauri::State<'_, LensEngine>) -> Result<AppConfi
     Ok(engine.config().await)
 }
 
+/// Whether `new` differs from `old` in any LLM-resolution-relevant field. Gates the
+/// provider rebind so unrelated writes (theme/accent/etc.) don't re-enqueue enrichment.
+fn llm_config_changed(old: &AppConfig, new: &AppConfig) -> bool {
+    old.models != new.models
+        || old.enrichment.routing != new.enrichment.routing
+        || old.enrichment.coref_model != new.enrichment.coref_model
+        || old.enrichment.map_model != new.enrichment.map_model
+        || old.enrichment.enabled != new.enrichment.enabled
+        || old.enrichment.cloud_consent != new.enrichment.cloud_consent
+}
+
+/// Swaps the in-memory config and, on an LLM delta, re-derives the cached
+/// chat/enrichment provider so model changes take effect without a restart. Split
+/// from [`set_config`] (which owns disk persistence) so the rebind gate is testable
+/// without a concrete Tauri runtime handle.
+async fn apply_config(engine: &LensEngine, config: AppConfig) -> Result<(), LensError> {
+    let rebind = llm_config_changed(&engine.config().await, &config);
+    engine.set_config(config).await;
+    if rebind {
+        engine.rescan_enrichment_on_provider_change().await?;
+    }
+    Ok(())
+}
+
 /// Replaces the configuration in memory and persists it to `config.json` in the
 /// app data directory.
 #[tracing::instrument(skip_all)]
@@ -24,13 +48,44 @@ pub async fn set_config(
         .app_data_dir()
         .map_err(|e| LensError::Io(e.to_string()))?;
     config.save(&data_dir)?;
-    engine.set_config(config).await;
-    Ok(())
+    apply_config(engine.inner(), config).await
+}
+
+/// Read-only gate for chat: whether a chat provider currently resolves from config.
+/// Mirrors the engine's `usable` selection (builds no network client), so a
+/// present-but-unusable model entry correctly reads as "no provider". (AC-11)
+#[tracing::instrument(skip_all)]
+#[tauri::command]
+pub async fn has_chat_provider(engine: tauri::State<'_, LensEngine>) -> Result<bool, LensError> {
+    Ok(engine.chat_provider().await.is_some())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lens_core::EnrichmentConfig;
+    use lens_core::config::ModelConfig;
+
+    /// A usable local-Ollama config with enrichment enabled: `provider_from_config`
+    /// resolves a provider from this (no network), so a rebind installs one.
+    fn ollama_local_config(theme: &str) -> AppConfig {
+        AppConfig {
+            theme: theme.to_string(),
+            models: vec![ModelConfig {
+                provider: "ollama".to_string(),
+                base_url: "http://localhost:11434".to_string(),
+                model: "llama3".to_string(),
+                context: 8192,
+                temperature: 0.7,
+                api_key: String::new(),
+            }],
+            enrichment: EnrichmentConfig {
+                enabled: true,
+                ..EnrichmentConfig::default()
+            },
+            ..AppConfig::default()
+        }
+    }
 
     #[tokio::test]
     async fn get_config_returns_default_for_fresh_engine() {
@@ -40,5 +95,99 @@ mod tests {
 
         let config = get_config(engine).await.unwrap();
         assert_eq!(config, AppConfig::default());
+    }
+
+    #[test]
+    fn llm_config_changed_detects_llm_deltas() {
+        let base = ollama_local_config("dark");
+
+        assert!(
+            !llm_config_changed(&base, &base.clone()),
+            "identical config must not be a delta"
+        );
+
+        let mut models = base.clone();
+        models.models[0].model = "mistral".to_string();
+        assert!(llm_config_changed(&base, &models), "models change");
+
+        let mut routing = base.clone();
+        routing.enrichment.routing = lens_core::LlmRouting::Explicit {
+            provider: "ollama".to_string(),
+            model: "llama3".to_string(),
+        };
+        assert!(llm_config_changed(&base, &routing), "routing change");
+
+        let mut coref = base.clone();
+        coref.enrichment.coref_model = Some(lens_core::TaskModel {
+            provider: "ollama".to_string(),
+            model: "llama3".to_string(),
+        });
+        assert!(llm_config_changed(&base, &coref), "coref_model change");
+
+        let mut map = base.clone();
+        map.enrichment.map_model = Some(lens_core::TaskModel {
+            provider: "ollama".to_string(),
+            model: "llama3".to_string(),
+        });
+        assert!(llm_config_changed(&base, &map), "map_model change");
+
+        let mut enabled = base.clone();
+        enabled.enrichment.enabled = !base.enrichment.enabled;
+        assert!(llm_config_changed(&base, &enabled), "enabled change");
+
+        let mut consent = base.clone();
+        consent.enrichment.cloud_consent = !base.enrichment.cloud_consent;
+        assert!(llm_config_changed(&base, &consent), "cloud_consent change");
+    }
+
+    #[test]
+    fn llm_config_changed_ignores_unrelated_fields() {
+        let base = ollama_local_config("dark");
+        let mut themed = base.clone();
+        themed.theme = "light".to_string();
+        assert!(
+            !llm_config_changed(&base, &themed),
+            "a theme-only change must not be an LLM delta"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_config_rebinds_provider_on_llm_change() {
+        let engine = LensEngine::for_test().await;
+        assert!(
+            engine.llm_provider().await.is_none(),
+            "fresh engine has no provider installed"
+        );
+
+        apply_config(&engine, ollama_local_config("dark"))
+            .await
+            .unwrap();
+
+        assert!(
+            engine.llm_provider().await.is_some(),
+            "an LLM-config change must rebind the cached provider without a restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_config_does_not_rebind_on_unrelated_change() {
+        let engine = LensEngine::for_test().await;
+
+        // Seat a provider-eligible config WITHOUT rebinding (`set_config` only swaps
+        // in-memory config; it does not install a provider), so the cached provider
+        // stays absent and a subsequent rebind would be observable.
+        engine.set_config(ollama_local_config("dark")).await;
+        assert!(engine.llm_provider().await.is_none());
+
+        // A theme-only write is not an LLM delta, so the rescan must NOT fire and no
+        // provider gets installed.
+        let mut themed = ollama_local_config("dark");
+        themed.theme = "light".to_string();
+        apply_config(&engine, themed).await.unwrap();
+
+        assert!(
+            engine.llm_provider().await.is_none(),
+            "an unrelated (theme) change must not trigger a provider rebind"
+        );
     }
 }
