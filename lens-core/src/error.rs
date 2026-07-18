@@ -73,11 +73,9 @@ pub enum LensError {
     #[error("tts error: {0}")]
     Tts(String),
 
-    /// The notebook's embeddings are being rebuilt (a re-embed / model switch is in
-    /// flight or a prior one failed), so retrieval has no active index yet. Distinct
-    /// from an honest "no sources" refusal: the sources exist, the index is just
-    /// transiently unavailable — the caller should retry shortly, NOT persist a
-    /// false empty-answer (RT-1).
+    /// The notebook's embeddings are rebuilding, so retrieval has no active index yet
+    /// (RT-1). Transient and retryable — distinct from an honest "no sources" refusal;
+    /// the caller retries shortly and persists nothing.
     #[error("reindexing: {0}")]
     Reindexing(String),
 }

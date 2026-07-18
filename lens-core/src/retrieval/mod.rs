@@ -205,28 +205,15 @@ pub(crate) async fn live_chunk_ids(
         .collect())
 }
 
-/// Batched `SELECT id, text` over `chunk_ids` into an `id -> text` map, chunked
-/// under the SQLite bind limit. Absent ids are simply missing from the map (the
-/// caller substitutes an empty string, preserving the old per-id fallback). Order
-/// is irrelevant — callers index by id, not position.
+/// Batched `id -> text` map over `chunk_ids`. Absent ids are simply missing (the
+/// caller substitutes an empty string). Callers index by id, so order is irrelevant.
 pub(crate) async fn hydrate_texts_map(
     pool: &SqlitePool,
     chunk_ids: &[String],
 ) -> Result<HashMap<String, String>, LensError> {
-    let mut out = HashMap::with_capacity(chunk_ids.len());
-    if chunk_ids.is_empty() {
-        return Ok(out);
-    }
-    for batch in chunk_ids.chunks(crate::db::BIND_BATCH) {
-        let placeholders = crate::db::in_placeholders(batch.len());
-        let sql = format!("SELECT id, text FROM chunks WHERE id IN ({placeholders})");
-        let mut q = sqlx::query_as::<_, (String, String)>(&sql);
-        for id in batch {
-            q = q.bind(id);
-        }
-        for (id, text) in q.fetch_all(pool).await? {
-            out.insert(id, text);
-        }
-    }
-    Ok(out)
+    let rows: Vec<(String, String)> = crate::db::fetch_batched(pool, chunk_ids, |ph| {
+        format!("SELECT id, text FROM chunks WHERE id IN ({ph})")
+    })
+    .await?;
+    Ok(rows.into_iter().collect())
 }

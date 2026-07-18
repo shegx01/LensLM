@@ -33,8 +33,7 @@
      * subtle live badge (SP-3); `null` otherwise. */
     ungroundedTurnId: string | null;
     error: { kind: string; message: string } | null;
-    /** True when the in-flight turn ended in the RT-1 reindexing gap — renders a
-     * calm retryable notice instead of an ErrorCard. */
+    /** RT-1: render ReindexingNotice instead of ErrorCard for the in-flight turn. */
     reindexing?: boolean;
     pinnedToBottom: boolean;
     oncopy: (content: string) => void;

@@ -33,7 +33,9 @@ use crate::graph::NotebookGraph;
 use crate::llm::{LlmMessage, LlmProvider, LlmRequest, StreamChunk};
 use crate::prompt::{fence_excerpt, fence_nonce};
 use crate::retrieval::Reranker;
-use crate::retrieval::router::{ContextUnit, RESERVED_OUTPUT, estimate_tokens, tiered_search};
+use crate::retrieval::router::{
+    ContextUnit, RESERVED_OUTPUT, RETRIEVAL_LIVE_WHERE, estimate_tokens, tiered_search,
+};
 use crate::vector_store::{Coordinate, VectorStore};
 
 /// Low, near-deterministic sampling for grounded answers.
@@ -419,13 +421,9 @@ pub fn answer_stream(
             return;
         }
 
-        // Empty retrieval: distinguish an honest "no sources" from a transient
-        // reindexing gap (RT-1). If the notebook HAS selected+live chunks but its
-        // resolved coordinate has no `active` index row, a re-embed/model-switch is
-        // in flight (or a prior one failed) — surface a typed `Reindexing` error so
-        // the caller retries instead of persisting a false empty answer. This lives
-        // strictly inside the empty branch, so it fires only when dense+BM25+graph
-        // ALL returned nothing — never blocking a BM25-served answer during a reembed.
+        // Empty retrieval: a transient reindexing gap vs an honest "no sources" — see
+        // `reindexing_gap`. Inside the empty branch only, so it never blocks a
+        // BM25-served answer during a reembed.
         if out.units.is_empty() {
             match reindexing_gap(&ctx.pool, &ctx.coord).await {
                 Ok(true) => {
@@ -565,15 +563,14 @@ pub fn answer_stream(
 }
 
 /// True when the notebook has grounded (selected + live) chunks but its resolved
-/// embedding coordinate has NO `active` index row — the RT-1 reindexing gap. Both
-/// probes reuse queries already proven elsewhere: [`crate::retrieval::router::
-/// SELECTED_LIVE_WHERE`] for the corpus scope and the active-index predicate from
+/// coordinate has NO `active` index row — the RT-1 reindexing gap. The corpus scope
+/// reuses [`RETRIEVAL_LIVE_WHERE`]; the active-index probe mirrors
 /// `LensEngine::get_notebook_embedding_info`.
 async fn reindexing_gap(pool: &SqlitePool, coord: &Coordinate) -> Result<bool, LensError> {
-    let has_live: Option<i64> = sqlx::query_scalar(
+    let has_live: Option<i64> = sqlx::query_scalar(&format!(
         "SELECT 1 FROM chunks c JOIN sources s ON s.id = c.source_id \
-         WHERE s.notebook_id = ? AND s.selected = 1 AND s.trashed_at IS NULL LIMIT 1",
-    )
+         WHERE s.notebook_id = ? AND {RETRIEVAL_LIVE_WHERE} LIMIT 1"
+    ))
     .bind(&coord.notebook)
     .fetch_optional(pool)
     .await?;

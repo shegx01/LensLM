@@ -152,12 +152,10 @@ pub trait VectorStore: Send + Sync {
     /// top-`k` cut (the #39 recall fix). An empty `source_ids` means "no narrowing"
     /// and behaves exactly like `search` (notebook scope).
     ///
-    /// No default body: a store that silently fell back to notebook-scope `search`
-    /// here would leak deselected/trashed chunks past the pre-filter and regress
-    /// #39 recall invisibly (RQ-9). Every backend MUST implement narrowing (or, if
-    /// genuinely unable, return an explicit error) so the gap fails loudly — a
-    /// compile error for a new backend, never a silent recall loss. Callers still
-    /// pair this with `live_chunk_ids` as a correctness backstop.
+    /// No default body (RQ-9): a silent fallback to notebook-scope `search` would leak
+    /// deselected/trashed chunks past the pre-filter and regress #39 recall invisibly.
+    /// Every backend MUST implement narrowing (or return an explicit error) so a new
+    /// backend fails to compile rather than losing recall silently.
     async fn search_filtered(
         &self,
         coord: &Coordinate,

@@ -347,10 +347,7 @@ async function runStream(notebookId: string, turnId: string, question: string): 
         state.streaming = false;
         state.stage = null;
       } else if (err.kind === 'Reindexing') {
-        // RT-1: the notebook's embeddings are rebuilding, so retrieval had no active
-        // index. This is transient and retryable — persist NOTHING (no errored
-        // marker, so no false "couldn't complete" line survives reload) and surface a
-        // calm, distinct notice instead of a red error card.
+        // RT-1 (see the `reindexing` field): transient, retryable, persist NOTHING.
         state.reindexing = true;
         state.streaming = false;
         state.stage = null;
