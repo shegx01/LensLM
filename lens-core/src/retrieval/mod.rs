@@ -14,6 +14,8 @@ pub mod rerank;
 pub mod router;
 pub mod rrf;
 
+use std::collections::HashMap;
+
 use sqlx::SqlitePool;
 
 use crate::LensError;
@@ -109,7 +111,7 @@ pub async fn hybrid_search(
         "hybrid_search: retrieved candidates"
     );
 
-    fuse_and_rerank(
+    let (hits, _texts) = fuse_and_rerank(
         pool_db,
         reranker,
         query_text,
@@ -119,7 +121,8 @@ pub async fn hybrid_search(
         pool,
         config,
     )
-    .await
+    .await?;
+    Ok(hits)
 }
 
 /// The shared fusion + rerank tail (issue #21). Both [`hybrid_search`] and the
@@ -128,6 +131,10 @@ pub async fn hybrid_search(
 /// empty `graph_ids`, the output is bitwise-identical regardless of caller. Mirrors
 /// the former `hybrid_search` tail exactly: over-fetch clamp → three-list RRF →
 /// non-reranker truncation → reranker hydrate+rerank.
+/// Returns `(hits, texts_by_id)`. `texts_by_id` is populated ONLY on the reranker
+/// path — it is the chunk text this call already hydrated to score the reranker, so
+/// a downstream consumer (the router's Tier-2 assembly) can reuse it instead of
+/// re-selecting the same rows (RQ-3). Empty on the non-reranker path.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn fuse_and_rerank(
     pool_db: &SqlitePool,
@@ -138,23 +145,28 @@ pub(crate) async fn fuse_and_rerank(
     graph_ids: &[String],
     pool: usize,
     config: &RetrievalConfig,
-) -> Result<Vec<RetrievalHit>, LensError> {
+) -> Result<(Vec<RetrievalHit>, HashMap<String, String>), LensError> {
     let overfetch = pool.clamp(OVERFETCH, MAX_OVERFETCH);
     let fused = rrf::rrf_merge3(dense_ids, bm25_ids, graph_ids, RRF_K, overfetch);
 
     if !config.reranker.enabled || fused.is_empty() {
         let mut out = fused;
         out.truncate(pool);
-        return Ok(out);
+        return Ok((out, HashMap::new()));
     }
 
     // Hydrate text in the SAME order as the fused list (reranker maps by index).
-    let texts = hydrate_texts(pool_db, &fused).await?;
+    let ids: Vec<String> = fused.iter().map(|h| h.chunk_id.clone()).collect();
+    let texts_by_id = hydrate_texts_map(pool_db, &ids).await?;
+    let texts: Vec<String> = ids
+        .iter()
+        .map(|id| texts_by_id.get(id).cloned().unwrap_or_default())
+        .collect();
     let reranked = reranker
         .rerank_with_fallback(query_text, fused, texts, &config.reranker, pool)
         .await;
     tracing::debug!(reranked = reranked.len(), "fuse_and_rerank: reranked");
-    Ok(reranked)
+    Ok((reranked, texts_by_id))
 }
 
 /// Filters `chunk_ids` down to those whose source is live (`trashed_at IS NULL`)
@@ -193,22 +205,28 @@ pub(crate) async fn live_chunk_ids(
         .collect())
 }
 
-/// Hydrates `chunks.text` for each hit, in the SAME order as `hits`. A chunk that
-/// vanished between fusion and hydration is dropped from both lists' correspondence
-/// by returning an empty string; the reranker keys results by index so alignment
-/// must be preserved — we look each id up individually to guarantee ordering.
-pub(crate) async fn hydrate_texts(
+/// Batched `SELECT id, text` over `chunk_ids` into an `id -> text` map, chunked
+/// under the SQLite bind limit. Absent ids are simply missing from the map (the
+/// caller substitutes an empty string, preserving the old per-id fallback). Order
+/// is irrelevant — callers index by id, not position.
+pub(crate) async fn hydrate_texts_map(
     pool: &SqlitePool,
-    hits: &[RetrievalHit],
-) -> Result<Vec<String>, LensError> {
-    let mut texts = Vec::with_capacity(hits.len());
-    for h in hits {
-        let text: Option<String> =
-            sqlx::query_scalar::<_, String>("SELECT text FROM chunks WHERE id = ?")
-                .bind(&h.chunk_id)
-                .fetch_optional(pool)
-                .await?;
-        texts.push(text.unwrap_or_default());
+    chunk_ids: &[String],
+) -> Result<HashMap<String, String>, LensError> {
+    let mut out = HashMap::with_capacity(chunk_ids.len());
+    if chunk_ids.is_empty() {
+        return Ok(out);
     }
-    Ok(texts)
+    for batch in chunk_ids.chunks(crate::db::BIND_BATCH) {
+        let placeholders = crate::db::in_placeholders(batch.len());
+        let sql = format!("SELECT id, text FROM chunks WHERE id IN ({placeholders})");
+        let mut q = sqlx::query_as::<_, (String, String)>(&sql);
+        for id in batch {
+            q = q.bind(id);
+        }
+        for (id, text) in q.fetch_all(pool).await? {
+            out.insert(id, text);
+        }
+    }
+    Ok(out)
 }

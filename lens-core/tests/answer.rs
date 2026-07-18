@@ -608,3 +608,96 @@ async fn seed_active_coord(
     .await
     .expect("insert embedding_index coord");
 }
+
+/// Inserts an oversized (Tier-2-forcing) selected+live source with one parent chunk.
+async fn insert_oversized_source(pool: &SqlitePool, nb: &str, source_id: &str, chunk_text: &str) {
+    sqlx::query(
+        "INSERT INTO sources (id, notebook_id, kind, title, status, locator, selected, \
+         token_count, content_hash, created_at) \
+         VALUES (?, ?, 'text', 'Doc', 'indexed', '/tmp/s.txt', 1, 9000, ?, ?)",
+    )
+    .bind(source_id)
+    .bind(nb)
+    .bind(format!("hash-{source_id}"))
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(pool)
+    .await
+    .expect("insert oversized source");
+    insert_chunk(pool, source_id, "c1", chunk_text, 1).await;
+}
+
+// ---------------------------------------------------------------------------
+// RT-1 — reindexing gap vs honest refusal
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn empty_retrieval_during_reindex_yields_reindexing_not_refusal() {
+    // Live selected chunks exist, but NO vectors were added and NO active
+    // embedding_index row exists (a re-embed in flight / failed). The query shares no
+    // lexical token, so BM25 misses too → retrieval goes fully empty. This must be a
+    // typed `Reindexing` error the caller can retry, NEVER the persisted refusal.
+    let dir = tempfile::tempdir().unwrap();
+    let engine = LensEngine::init(dir.path()).await.unwrap();
+    let pool = engine.pool().await;
+    let nb = engine.create_notebook("nb", None, None).await.unwrap().id;
+    insert_oversized_source(&pool, nb.as_str(), "s1", "alpha content").await;
+
+    let ctx = build_ctx(
+        dir.path(),
+        &pool,
+        nb.as_str(),
+        panicking_provider(),
+        "zzzznomatch",
+    );
+    let items = collect_raw(answer_stream(ctx, CancellationToken::new())).await;
+
+    assert_eq!(
+        items[0].as_ref().unwrap(),
+        &AnswerEvent::Stage(AnswerStage::Retrieving)
+    );
+    let last = items.last().expect("at least one item");
+    assert!(
+        matches!(last, Err(lens_core::LensError::Reindexing(_))),
+        "expected terminal Reindexing, got {last:?}"
+    );
+    assert!(
+        !items
+            .iter()
+            .any(|i| matches!(i, Ok(AnswerEvent::Done { .. }))),
+        "a reindexing gap must not persist a Done/refusal"
+    );
+}
+
+#[tokio::test]
+async fn empty_retrieval_with_active_index_still_refuses() {
+    // Same empty-retrieval shape, but an active index row exists → the corpus is
+    // genuinely unanswerable, so the honest "no sources" refusal stands (not RT-1).
+    let dir = tempfile::tempdir().unwrap();
+    let engine = LensEngine::init(dir.path()).await.unwrap();
+    let pool = engine.pool().await;
+    let nb = engine.create_notebook("nb", None, None).await.unwrap().id;
+    insert_oversized_source(&pool, nb.as_str(), "s1", "alpha content").await;
+    seed_active_coord(&pool, nb.as_str(), "m", DIM, "fastembed", "tbl").await;
+
+    let ctx = build_ctx(
+        dir.path(),
+        &pool,
+        nb.as_str(),
+        panicking_provider(),
+        "zzzznomatch",
+    );
+    let events = collect(answer_stream(ctx, CancellationToken::new())).await;
+
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AnswerEvent::TextDelta(t) if t.contains("couldn't find"))),
+        "active index + empty retrieval → honest refusal, got {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AnswerEvent::Done { grounded: true, .. })),
+        "refusal reports grounded=true"
+    );
+}

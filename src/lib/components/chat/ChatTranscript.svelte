@@ -13,6 +13,7 @@
   import ThoughtsDisclosure from './ThoughtsDisclosure.svelte';
   import EmptyState from './EmptyState.svelte';
   import ErrorCard from './ErrorCard.svelte';
+  import ReindexingNotice from './ReindexingNotice.svelte';
   import { fade } from 'svelte/transition';
   import { prefersReducedMotion } from '$lib/motion/index.js';
   import type { AnswerStage, Citation, Turn } from '$lib/chat/types.js';
@@ -32,6 +33,9 @@
      * subtle live badge (SP-3); `null` otherwise. */
     ungroundedTurnId: string | null;
     error: { kind: string; message: string } | null;
+    /** True when the in-flight turn ended in the RT-1 reindexing gap — renders a
+     * calm retryable notice instead of an ErrorCard. */
+    reindexing?: boolean;
     pinnedToBottom: boolean;
     oncopy: (content: string) => void;
     onregenerate: (turnId: string) => void;
@@ -55,6 +59,7 @@
     currentTurnId,
     ungroundedTurnId,
     error,
+    reindexing = false,
     pinnedToBottom,
     oncopy,
     onregenerate,
@@ -261,6 +266,8 @@
           {/if}
           {#if error && currentTurnId === turn.turn_id}
             <ErrorCard {error} {onretry} />
+          {:else if reindexing && currentTurnId === turn.turn_id}
+            <ReindexingNotice {onretry} />
           {/if}
         {/each}
       </div>

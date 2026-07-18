@@ -33,6 +33,7 @@ vi.mock('$lib/chat/chat-state.svelte.js', () => ({
     currentTurnId: vi.fn(() => 'turn-failed'),
     ungroundedTurnId: vi.fn(() => null),
     error: vi.fn(() => ({ kind: 'Internal', message: 'stream failed' })),
+    reindexing: vi.fn(() => false),
     pinnedToBottom: vi.fn(() => true)
   },
   hydrate: vi.fn().mockResolvedValue(undefined),

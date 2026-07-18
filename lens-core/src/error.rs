@@ -72,6 +72,14 @@ pub enum LensError {
 
     #[error("tts error: {0}")]
     Tts(String),
+
+    /// The notebook's embeddings are being rebuilt (a re-embed / model switch is in
+    /// flight or a prior one failed), so retrieval has no active index yet. Distinct
+    /// from an honest "no sources" refusal: the sources exist, the index is just
+    /// transiently unavailable — the caller should retry shortly, NOT persist a
+    /// false empty-answer (RT-1).
+    #[error("reindexing: {0}")]
+    Reindexing(String),
 }
 
 // Manual `From` mappings (NOT `#[from]`): source error types are not `Serialize`
@@ -153,6 +161,7 @@ impl LensError {
             LensError::Transcription(_) => "Transcription",
             LensError::Cancelled(_) => "Cancelled",
             LensError::Tts(_) => "Tts",
+            LensError::Reindexing(_) => "Reindexing",
         }
     }
 
@@ -173,7 +182,8 @@ impl LensError {
             | LensError::EmptyAudio(m)
             | LensError::Transcription(m)
             | LensError::Cancelled(m)
-            | LensError::Tts(m) => m,
+            | LensError::Tts(m)
+            | LensError::Reindexing(m) => m,
         }
     }
 }
@@ -253,6 +263,11 @@ mod tests {
                 LensError::Cancelled("audio ingest cancelled".into()),
                 "Cancelled",
                 "audio ingest cancelled",
+            ),
+            (
+                LensError::Reindexing("embeddings rebuilding".into()),
+                "Reindexing",
+                "embeddings rebuilding",
             ),
         ];
         for (err, kind, message) in cases {

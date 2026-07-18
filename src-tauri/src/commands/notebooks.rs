@@ -809,9 +809,19 @@ pub async fn set_notebook_embedding_model(
     let nb_id = NotebookId::from(notebook_id);
     let backend = lens_core::EmbeddingBackend::from_opt_str(Some(&backend));
 
+    // Capture the prior coordinate so a failed re-embed can be rolled back (RT-1).
+    // On failure the old index is still `active` (retirement happens only on the
+    // successful flip), so reverting the pointer restores chat instead of leaving it
+    // aimed at a coordinate with no active index (a persisted false "no sources").
+    let prior = engine.resolve_notebook_embedding(&nb_id).await.ok();
+
     engine
         .set_notebook_embedding_model(&nb_id, &model_id, backend)
         .await?;
+
+    // The canonical coordinate the pointer now names (spec.id may differ from the
+    // raw `model_id` alias); used to guard the rollback against a concurrent switch.
+    let attempted = engine.resolve_notebook_embedding(&nb_id).await.ok();
 
     if let Err(e) = send_event(&on_progress, StreamEvent::Started) {
         tracing::warn!("set_notebook_embedding_model: started event send failed: {e}");
@@ -842,6 +852,22 @@ pub async fn set_notebook_embedding_model(
             }
         }
         Err(err) => {
+            // Roll the pointer back to the prior still-active coordinate, but ONLY if
+            // it still names the coordinate we just set — a concurrent model switch may
+            // have already moved it, and clobbering that would be wrong (RT-1).
+            if let (Some(prior), Some(attempted)) = (&prior, &attempted) {
+                match engine.resolve_notebook_embedding(&nb_id).await {
+                    Ok(current) if &current == attempted && attempted != prior => {
+                        if let Err(revert_err) = engine
+                            .set_notebook_embedding_model(&nb_id, &prior.0, prior.2)
+                            .await
+                        {
+                            tracing::warn!("reembed rollback: pointer revert failed: {revert_err}");
+                        }
+                    }
+                    _ => {}
+                }
+            }
             if let Err(e) = send_event(&on_progress, StreamEvent::Failed(err.clone())) {
                 tracing::warn!("set_notebook_embedding_model: failed event send failed: {e}");
             }

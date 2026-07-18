@@ -871,3 +871,161 @@ async fn graph_off_when_flag_disabled() {
         "graph disabled must not surface the graph-only chunk, got {ids:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// RT-2 — a trashed source contributes no text to the assembled units
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn trashed_source_contributes_no_units() {
+    // A trashed source must never reach the prompt (RT-2), enforced at the source
+    // scope AND the Tier-2 hydration JOIN. sB's chunk is the nearest to the query,
+    // yet trashing sB drops it entirely; sA's chunk survives.
+    let dir = tempfile::tempdir().unwrap();
+    let engine = LensEngine::init(dir.path()).await.unwrap();
+    let pool = engine.pool().await;
+    let nb = engine.create_notebook("nb", None, None).await.unwrap().id;
+    insert_source(&pool, &nb, "sA", 9_000).await;
+    insert_source(&pool, &nb, "sB", 9_000).await;
+    insert_chunk(&pool, "sA", "cA", None, "child", 1, 0, "alpha").await;
+    insert_chunk(&pool, "sB", "cB", None, "child", 1, 0, "beta").await;
+
+    let (store, coord) = store_and_coord(&engine, dir.path(), pool.clone(), &nb);
+    store
+        .add(
+            &coord,
+            vec![
+                VectorRow {
+                    chunk_id: "cA".into(),
+                    source_id: "sA".into(),
+                    notebook_id: nb.to_string(),
+                    level: 1,
+                    vector: axis_vec(1),
+                },
+                VectorRow {
+                    chunk_id: "cB".into(),
+                    source_id: "sB".into(),
+                    notebook_id: nb.to_string(),
+                    level: 1,
+                    vector: axis_vec(0),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+    // Trash sB after it was indexed (the mid-flight-trash invariant).
+    sqlx::query("UPDATE sources SET trashed_at = ? WHERE id = 'sB'")
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let reranker = Reranker::new(dir.path());
+    let cfg = RetrievalConfig {
+        hybrid_enabled: false,
+        ..RetrievalConfig::default()
+    };
+    let out = tiered_search(
+        &pool,
+        &store,
+        &reranker,
+        None,
+        &coord,
+        "q",
+        &axis_vec(0),
+        &model_ctx(10_000),
+        10,
+        &cfg,
+        None,
+        &TierThresholds::default(),
+        None,
+        0,
+    )
+    .await
+    .unwrap();
+    let ids: Vec<&str> = out.units.iter().map(|u| u.chunk_id.as_str()).collect();
+    assert!(
+        !ids.contains(&"cB"),
+        "trashed source's chunk excluded, got {ids:?}"
+    );
+    assert!(ids.contains(&"cA"), "live source retained, got {ids:?}");
+}
+
+// ---------------------------------------------------------------------------
+// RQ-1 — relevance-aware Tier-2 trim (highest fused score survives, not doc order)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn tier2_trim_keeps_highest_fused_score_not_doc_order() {
+    // Under a tight tier2 budget the highest-FUSED-SCORE unit must survive even when
+    // it is LATER in document order — the old doc-position trim evicted exactly this
+    // most-relevant evidence (RQ-1).
+    let dir = tempfile::tempdir().unwrap();
+    let engine = LensEngine::init(dir.path()).await.unwrap();
+    let pool = engine.pool().await;
+    let nb = engine.create_notebook("nb", None, None).await.unwrap().id;
+    insert_source(&pool, &nb, "s1", 9_000).await;
+    // Two level-1 orphans (no parent merge), equal length so the cap admits exactly
+    // one. c_early is doc-order-first but far from the query; c_late is doc-order-last
+    // but ON the query axis (nearest → higher fused score).
+    let long = "word ".repeat(300); // ~1500 chars → ~375 est tokens
+    insert_chunk(&pool, "s1", "c_early", None, "child", 1, 0, &long).await;
+    insert_chunk(&pool, "s1", "c_late", None, "child", 1, 1, &long).await;
+
+    let (store, coord) = store_and_coord(&engine, dir.path(), pool.clone(), &nb);
+    store
+        .add(
+            &coord,
+            vec![
+                VectorRow {
+                    chunk_id: "c_early".into(),
+                    source_id: "s1".into(),
+                    notebook_id: nb.to_string(),
+                    level: 1,
+                    vector: axis_vec(1),
+                },
+                VectorRow {
+                    chunk_id: "c_late".into(),
+                    source_id: "s1".into(),
+                    notebook_id: nb.to_string(),
+                    level: 1,
+                    vector: axis_vec(0),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+    let reranker = Reranker::new(dir.path());
+    let cfg = RetrievalConfig {
+        hybrid_enabled: false,
+        ..RetrievalConfig::default()
+    };
+    // ctx 3000 → tier2_cap ≈ 440 tokens: one ~375-token chunk fits, two do not.
+    let out = tiered_search(
+        &pool,
+        &store,
+        &reranker,
+        None,
+        &coord,
+        "q",
+        &axis_vec(0),
+        &model_ctx(3_000),
+        10,
+        &cfg,
+        None,
+        &TierThresholds::default(),
+        None,
+        0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(out.tier, Tier::Tier2);
+    let ids: Vec<&str> = out.units.iter().map(|u| u.chunk_id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["c_late"],
+        "tight budget must keep the highest-score unit (doc-later), not the doc-earliest"
+    );
+}
