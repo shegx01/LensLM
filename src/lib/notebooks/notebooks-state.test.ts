@@ -895,3 +895,33 @@ describe('refreshTrashed (exported)', () => {
     expect(notebookStore.loading).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Settings deep-link (AC-7)
+// ---------------------------------------------------------------------------
+
+describe('settings deep-link', () => {
+  it('openSettings(section) opens Preferences and records the target section', () => {
+    notebookStore.openSettings('ai');
+    expect(notebookStore.settingsOpen).toBe(true);
+    expect(notebookStore.settingsSection).toBe('ai');
+  });
+
+  it('openSettings() with no section opens Preferences with a null target', () => {
+    notebookStore.openSettings();
+    expect(notebookStore.settingsOpen).toBe(true);
+    expect(notebookStore.settingsSection).toBeNull();
+  });
+
+  it('closing Settings clears the deep-link target', () => {
+    notebookStore.openSettings('ai');
+    notebookStore.settingsOpen = false;
+    expect(notebookStore.settingsSection).toBeNull();
+  });
+
+  it('opening Settings closes the per-notebook settings sheet (mutual exclusion)', () => {
+    notebookStore.notebookSettingsOpen = true;
+    notebookStore.openSettings('ai');
+    expect(notebookStore.notebookSettingsOpen).toBe(false);
+  });
+});
