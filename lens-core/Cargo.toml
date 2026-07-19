@@ -194,7 +194,7 @@ rbook = { version = "=0.7.9", default-features = false, features = ["threadsafe"
 # `open_workbook_auto_from_rs(Cursor::new(raw))`. The cell enum is `Data`
 # (variants Int/Float/String/Bool/DateTime(ExcelDateTime)/DateTimeIso(String)/
 # DurationIso(String)/Error/Empty). MIT — deny.toml allowlist. Pinned exactly.
-calamine = "=0.35.0"
+calamine = "=0.36.0"
 # CSV reader (comma-delimited, RFC-4180 quoting) for the `csv.rs` extractor.
 # `ReaderBuilder::default()` does NOT strip a leading UTF-8 BOM; the extractor
 # strips it manually. MIT OR Unlicense — MIT in deny.toml allowlist. Pinned.
