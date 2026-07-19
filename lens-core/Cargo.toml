@@ -220,7 +220,7 @@ docx-rs = { version = "=0.4.20", default-features = false }
 # `pdfium_latest` selects the newest API-version surface the binding exposes;
 # our vendored binary is bblanchon chromium/7906 (>= the binding's pinned 7763),
 # which is API-compatible for the text/page/object calls we use.
-pdfium-render = { version = "=0.9.2", default-features = false, features = [
+pdfium-render = { version = "=0.9.3", default-features = false, features = [
     "pdfium_latest",
     "thread_safe",
 ] }
