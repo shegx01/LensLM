@@ -74,7 +74,7 @@ llama-cpp-2 = { version = "=0.1.151", default-features = false, features = ["sam
 # issue #194: offline, deterministic language detection at ingest for the
 # engine-aware TTS language guard. Pure-Rust, in-process, no network/model.
 # Pinned per workspace convention. MIT — allowlisted in deny.toml.
-whatlang = "=0.16.4"
+whatlang = "=0.18.0"
 
 # Shared lint policy across the workspace.
 [workspace.lints.clippy]
