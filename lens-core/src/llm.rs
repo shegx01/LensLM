@@ -28,9 +28,12 @@ use crate::model_catalog::{ModelCatalog, SupportedProvider};
 
 /// Connect timeout for LLM HTTP requests (matches the system-check probe).
 const LLM_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
-/// Overall (read) timeout for LLM generate/probe requests. Generate calls can take many seconds,
-/// so this is far longer than the 2s system-check probe window.
+/// Total timeout for the cheap unauthenticated Ollama `api/version` reachability probe.
 const LLM_TIMEOUT: Duration = Duration::from_secs(30);
+/// Idle read timeout for LLM generation: resets on each received chunk, not a total-
+/// request deadline, so unbounded streaming on a small local model never times out —
+/// yet a stalled/unreachable model still fails. Also bounds a buffered `generate`.
+const LLM_GENERATION_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Canonical provider ids matching `ModelConfig.provider`. First-class cloud providers use their
 /// models.dev catalog key; `openai-compatible` covers self-hosted OpenAI-protocol endpoints
@@ -140,6 +143,13 @@ pub trait LlmProvider: Send + Sync {
         &()
     }
 
+    /// Whether this provider runs on-device (local Ollama). Lets callers relax limits
+    /// small local models can't meet — e.g. the dialogue min-turns floor (#26) — while
+    /// keeping cloud strict.
+    fn is_local(&self) -> bool {
+        false
+    }
+
     /// Reachability probe. `false` on connection refusal, DNS/timeout, or auth errors
     /// (`401`/`403`) — a misconfigured key is unreachable so sources degrade gracefully.
     async fn reachable(&self) -> bool;
@@ -168,7 +178,7 @@ pub trait LlmProvider: Send + Sync {
 }
 
 fn llm_client() -> reqwest::Client {
-    crate::http::hardened_client(LLM_CONNECT_TIMEOUT, LLM_TIMEOUT)
+    crate::http::hardened_client_idle(LLM_CONNECT_TIMEOUT, LLM_GENERATION_IDLE_TIMEOUT)
 }
 
 /// Maps a genai error onto [`LensError`], sanitizing the message before it crosses the IPC
@@ -177,16 +187,28 @@ fn llm_client() -> reqwest::Client {
 /// → `Model`). The full error is logged server-side; only a generic message is surfaced over IPC.
 fn genai_err(err: genai::Error) -> LensError {
     let lower = err.to_string().to_ascii_lowercase();
+    // reqwest's transport-failure `Display` often lacks "timeout"/"connect": a send
+    // failure reads "error sending request", an idle read-timeout "error reading
+    // response"/"body", and a deadline "deadline". Match those too so a genuine
+    // transport error is never misclassified as a model (bad-output) error.
     let is_transport = lower.contains("connect")
         || lower.contains("connection")
         || lower.contains("timed out")
         || lower.contains("timeout")
         || lower.contains("dns")
-        || lower.contains("refused");
+        || lower.contains("refused")
+        || lower.contains("sending request")
+        || lower.contains("reading response")
+        || lower.contains("response body")
+        || lower.contains("deadline");
     // Log the full detail for operators; never surface it across IPC.
     tracing::error!(error = %err, transport = is_transport, "LLM request failed");
     if is_transport {
-        LensError::Network("LLM request failed (network)".to_string())
+        LensError::Network(
+            "couldn't reach the language model — check that your LLM provider \
+             (e.g. local Ollama) is running and reachable"
+                .to_string(),
+        )
     } else {
         LensError::Model("LLM request failed (model)".to_string())
     }
@@ -379,6 +401,10 @@ impl LlmProvider for GenaiProvider {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn is_local(&self) -> bool {
+        self.is_ollama()
     }
 
     async fn reachable(&self) -> bool {

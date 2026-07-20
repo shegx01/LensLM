@@ -68,14 +68,25 @@ fn length_serde_snake_case() {
 struct ScriptedProvider {
     calls: Arc<AtomicU32>,
     responses: Vec<String>,
+    local: bool,
 }
 
 impl ScriptedProvider {
     fn new(responses: Vec<&str>) -> (Arc<Self>, Arc<AtomicU32>) {
+        Self::with_locality(responses, false)
+    }
+
+    /// A local (on-device Ollama-like) provider — exercises the relaxed min-turns floor.
+    fn new_local(responses: Vec<&str>) -> (Arc<Self>, Arc<AtomicU32>) {
+        Self::with_locality(responses, true)
+    }
+
+    fn with_locality(responses: Vec<&str>, local: bool) -> (Arc<Self>, Arc<AtomicU32>) {
         let calls = Arc::new(AtomicU32::new(0));
         let p = Arc::new(Self {
             calls: calls.clone(),
             responses: responses.into_iter().map(|s| s.to_string()).collect(),
+            local,
         });
         (p, calls)
     }
@@ -85,6 +96,9 @@ impl ScriptedProvider {
 impl LlmProvider for ScriptedProvider {
     fn model_id(&self) -> &str {
         "mock-model"
+    }
+    fn is_local(&self) -> bool {
+        self.local
     }
     async fn reachable(&self) -> bool {
         true
@@ -333,19 +347,24 @@ async fn validation_failure_then_valid_repairs_in_two_calls() {
 }
 
 // ---------------------------------------------------------------------------
-// Step 5 — malformed twice → Err (exactly one repair, two calls)
+// Step 5 — malformed every round → Err (capped at two repairs, three calls)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn malformed_twice_errors_after_one_repair() {
+async fn malformed_every_round_errors_after_two_repairs() {
     let (_engine, pool, nb, ids, dir) = seed_two_source_notebook().await;
-    let (provider, calls) = ScriptedProvider::new(vec!["garbage", "still garbage"]);
+    let (provider, calls) =
+        ScriptedProvider::new(vec!["garbage", "still garbage", "yet more garbage"]);
     let ctx = build_ctx(dir.path(), &pool, &nb, provider, ids, Length::Short);
     let err = generate_dialogue(ctx, CancellationToken::new(), no_phase())
         .await
-        .expect_err("second failure is terminal");
+        .expect_err("third failure is terminal");
     assert!(matches!(err, lens_core::LensError::Parse(_)));
-    assert_eq!(calls.load(Ordering::SeqCst), 2, "capped at one repair");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "one initial + two repairs, then capped"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -360,17 +379,61 @@ async fn truncated_long_response_falls_to_repair() {
     let good = valid_short_json();
     let (provider, calls) = ScriptedProvider::new(vec![truncated, &good]);
     let ctx = build_ctx(dir.path(), &pool, &nb, provider, ids, Length::Long);
-    // Long min_turns is 30; the repair `good` has 10 turns, so this still fails
-    // validation on the repaired attempt — proving the truncation fell to repair.
+    // Long min_turns is 30; the repair `good` has 10 turns (ScriptedProvider cycles
+    // its last entry), so every repaired attempt still fails validation — proving the
+    // truncation fell to repair and the path is capped at two repairs.
     let err = generate_dialogue(ctx, CancellationToken::new(), no_phase())
         .await
         .expect_err("repaired-but-still-short is terminal");
     assert_eq!(
         calls.load(Ordering::SeqCst),
-        2,
-        "truncation triggered a repair"
+        3,
+        "truncation triggered repairs, capped at two"
     );
     assert!(matches!(err, lens_core::LensError::Validation(_)));
+}
+
+// ---------------------------------------------------------------------------
+// #29 — model-aware min-turns floor (local relaxed vs cloud strict)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn local_provider_passes_at_relaxed_floor() {
+    let (_engine, pool, nb, ids, dir) = seed_two_source_notebook().await;
+    // 10 turns: below Medium's strict floor (16) but at/above the local floor (8).
+    let (provider, calls) = ScriptedProvider::new_local(vec![&valid_short_json()]);
+    let ctx = build_ctx(dir.path(), &pool, &nb, provider, ids, Length::Medium);
+    let script = generate_dialogue(ctx, CancellationToken::new(), no_phase())
+        .await
+        .expect("local floor accepts a 10-turn Medium script");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "no repair needed at the relaxed floor"
+    );
+    assert_eq!(script.turns.len(), 10);
+}
+
+#[tokio::test]
+async fn cloud_provider_enforces_strict_floor_with_actionable_message() {
+    let (_engine, pool, nb, ids, dir) = seed_two_source_notebook().await;
+    // Same 10-turn script, but a non-local provider keeps Medium's strict floor (16),
+    // so every attempt is too short → repairs exhaust → actionable length message.
+    let (provider, calls) = ScriptedProvider::new(vec![&valid_short_json()]);
+    let ctx = build_ctx(dir.path(), &pool, &nb, provider, ids, Length::Medium);
+    let err = generate_dialogue(ctx, CancellationToken::new(), no_phase())
+        .await
+        .expect_err("strict floor rejects a 10-turn Medium script");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "one initial + two repairs, then capped"
+    );
+    assert!(matches!(
+        err,
+        lens_core::LensError::Validation(m)
+            if m.contains("too short an overview script") && m.contains("more capable model")
+    ));
 }
 
 // ---------------------------------------------------------------------------

@@ -192,7 +192,7 @@
       {/if}
 
       {#if status === 'generating'}
-        <div class="mt-3 flex flex-col gap-2">
+        <div class="card-body mt-3 flex flex-col justify-center gap-3">
           <div class="flex items-center justify-between gap-2">
             <p class="text-xs font-medium text-foreground" role="status">{phaseLabel()}</p>
             <button
@@ -213,11 +213,11 @@
           </div>
         </div>
       {:else if hasPlayableAudio && notebookId && audioOverviewStore.overviewPath}
-        <div class="mt-3">
+        <div class="card-body mt-3 flex flex-col justify-center">
           <AudioPlayer src={convertFileSrc(audioOverviewStore.overviewPath)} />
         </div>
       {:else}
-        <div class="mt-3 flex flex-col gap-2">
+        <div class="card-body mt-3 flex flex-col justify-center gap-2">
           <div class="seg3" role="radiogroup" aria-label="Overview length" data-len={length}>
             <span class="seg-ind" aria-hidden="true"></span>
             {#each LENGTH_OPTIONS as opt (opt.value)}
@@ -355,6 +355,12 @@
     flex: none;
     border-radius: 9px;
     background: color-mix(in oklch, var(--primary) 12%, transparent);
+  }
+
+  /* Shared floor across idle/generating/player content so switching lifecycle
+     state can't shrink the card (generating renders far less markup than idle). */
+  .card-body {
+    min-height: 9.5rem;
   }
 
   .progress-track {

@@ -23,7 +23,13 @@ use std::time::Duration;
 /// hardening (timeouts + `redirect(none)`) rather than degrading to a bare
 /// default — so a redirect-following, timeout-less client can never escape.
 pub fn hardened_client(connect: Duration, read: Duration) -> reqwest::Client {
-    build_hardened(connect, read, |b| b)
+    build_hardened(|b| b.connect_timeout(connect).timeout(read))
+}
+
+/// Like [`hardened_client`] but bounded by an idle read timeout instead of a
+/// total-request deadline; see `llm::LLM_GENERATION_IDLE_TIMEOUT` for why.
+pub fn hardened_client_idle(connect: Duration, idle_read: Duration) -> reqwest::Client {
+    build_hardened(|b| b.connect_timeout(connect).read_timeout(idle_read))
 }
 
 /// Builds a hardened client (same timeouts + `redirect(none)` as
@@ -43,27 +49,23 @@ pub fn hardened_client_pinned(
     host: &str,
     addrs: &[std::net::SocketAddr],
 ) -> reqwest::Client {
-    build_hardened(connect, read, |b| b.resolve_to_addrs(host, addrs))
+    build_hardened(|b| {
+        b.connect_timeout(connect)
+            .timeout(read)
+            .resolve_to_addrs(host, addrs)
+    })
 }
 
-/// Shared hardened-builder core: applies the timeouts + no-redirect policy, then
-/// runs `customize` on the builder (e.g. to pin `resolve_to_addrs`). The fallback
-/// rebuilds the identical hardened client. The final `expect` is a last-resort
-/// guard on an unreachable path (rustls has no system deps): we never substitute a
-/// bare default that would silently follow redirects.
+/// Shared hardened-builder core: applies the no-redirect policy, then runs
+/// `customize` (each caller sets its own timeout model + any `resolve_to_addrs`
+/// pin). The fallback rebuilds the identical hardened client. The final `expect` is
+/// a last-resort guard on an unreachable path (rustls has no system deps): we never
+/// substitute a bare default that would silently follow redirects.
 fn build_hardened(
-    connect: Duration,
-    read: Duration,
     customize: impl Fn(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
 ) -> reqwest::Client {
-    let builder = || {
-        customize(
-            reqwest::Client::builder()
-                .connect_timeout(connect)
-                .timeout(read)
-                .redirect(reqwest::redirect::Policy::none()),
-        )
-    };
+    let builder =
+        || customize(reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()));
     builder().build().unwrap_or_else(|_| {
         builder()
             .build()
