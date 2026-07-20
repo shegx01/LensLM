@@ -9,6 +9,7 @@
 
 pub mod answer;
 pub mod asr;
+pub mod audio_overview;
 pub mod chat;
 pub mod chunk;
 pub mod citation;
@@ -46,6 +47,7 @@ pub use answer::{AnswerEvent, AnswerStage};
 // desktop bridge uses `answer_notebook` + `AnswerEvent`.
 #[cfg(feature = "test-util")]
 pub use answer::{AnswerCtx, answer_stream};
+pub use audio_overview::{AudioOverviewRecord, AudioOverviewStatus};
 // Dialogue-script domain types (#26) — unconditional `pub` so the cross-crate
 // integration test sees them. `DialogueCtx`/`generate_dialogue` are the internal
 // orchestrator seam, gated behind `test-util` like `AnswerCtx`/`answer_stream`.
@@ -1395,8 +1397,193 @@ impl LensEngine {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(LensError::from)?;
         }
-        tts::write_wav_16bit(&buffer, &path)?;
+        // Atomic overwrite: write a sibling temp then rename, so a crash mid-write never
+        // leaves a torn `overview.wav` that a `ready` row would point at. The temp name is
+        // per-run unique so concurrent same-notebook runs can't collide on it.
+        let tmp = path.with_extension(format!("wav.{}.tmp", uuid::Uuid::now_v7()));
+        tts::write_wav_16bit(&buffer, &tmp)?;
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(LensError::from(e));
+        }
         Ok(path)
+    }
+
+    /// [M3] Order-independent hash over the selected + live source set (the exact
+    /// grounding set the dialogue is built from) combined with each source's
+    /// `raw_content_hash`. Captured at generation start and stored so a later source
+    /// change surfaces as a `Stale` overview. Uses the same `SELECTED_LIVE_WHERE`
+    /// predicate as `selected_live_source_ids`.
+    async fn source_set_hash(&self, notebook_id: &str) -> Result<String, LensError> {
+        use sha2::Digest;
+        let pool = self.pool().await;
+        let sql = format!(
+            "SELECT id, raw_content_hash FROM sources WHERE {}",
+            crate::retrieval::router::SELECTED_LIVE_WHERE
+        );
+        let mut pairs = sqlx::query_as::<_, (String, Option<String>)>(&sql)
+            .bind(notebook_id)
+            .fetch_all(&pool)
+            .await?;
+        pairs.sort();
+        let mut hasher = sha2::Sha256::new();
+        for (id, content_hash) in &pairs {
+            hasher.update(id.as_bytes());
+            hasher.update([0u8]);
+            hasher.update(content_hash.as_deref().unwrap_or("").as_bytes());
+            hasher.update([0u8]);
+        }
+        Ok(crate::hex_encode(&hasher.finalize()))
+    }
+
+    /// [#29] Single-owner orchestration: dialogue → synth (atomic write) → persist the
+    /// terminal `audio_overviews` row. `Ok(Some(path))` = success (`ready`), `Ok(None)` =
+    /// user cancel ([M2], no row written), `Err` = genuine failure (`failed` persisted).
+    pub async fn generate_and_persist_overview(
+        &self,
+        notebook_id: &str,
+        length: dialogue::Length,
+        on_phase: impl Fn(tts::TtsPhase) + Send + Sync,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Option<std::path::PathBuf>, LensError> {
+        // Cancelled before any work started → idle, nothing persisted.
+        if cancel.is_cancelled() {
+            return Ok(None);
+        }
+
+        let source_set_hash = self.source_set_hash(notebook_id).await?;
+
+        let script = match self
+            .generate_dialogue(
+                &NotebookId::from(notebook_id.to_string()),
+                length,
+                cancel.clone(),
+                |_phase| {},
+            )
+            .await
+        {
+            Ok(script) => script,
+            Err(LensError::Cancelled(_)) => return Ok(None),
+            Err(err) => {
+                self.persist_overview_failed(notebook_id, &source_set_hash)
+                    .await?;
+                return Err(err);
+            }
+        };
+
+        let config = self.config().await;
+        let path = match self
+            .synthesize_overview(
+                notebook_id,
+                &script,
+                &config.voices,
+                &config.tts,
+                on_phase,
+                &cancel,
+            )
+            .await
+        {
+            Ok(path) => path,
+            Err(LensError::Cancelled(_)) => return Ok(None),
+            Err(err) => {
+                self.persist_overview_failed(notebook_id, &source_set_hash)
+                    .await?;
+                return Err(err);
+            }
+        };
+
+        let generated_at = chrono::Utc::now().to_rfc3339();
+        audio_overview::upsert_overview(
+            &self.pool().await,
+            notebook_id,
+            &path.to_string_lossy(),
+            &generated_at,
+            AudioOverviewStatus::Ready,
+            &source_set_hash,
+        )
+        .await?;
+        Ok(Some(path))
+    }
+
+    /// Persists a `failed` terminal row for a genuine dialogue/synth failure. `path` is
+    /// the canonical (possibly absent) overview path — the frontend never plays a failed
+    /// row, and read-path reconciliation covers a missing file.
+    async fn persist_overview_failed(
+        &self,
+        notebook_id: &str,
+        source_set_hash: &str,
+    ) -> Result<(), LensError> {
+        let data_dir = self.data_dir().await;
+        let path = notebook_audio_path(&data_dir, notebook_id)?;
+        let generated_at = chrono::Utc::now().to_rfc3339();
+        audio_overview::upsert_overview(
+            &self.pool().await,
+            notebook_id,
+            &path.to_string_lossy(),
+            &generated_at,
+            AudioOverviewStatus::Failed,
+            source_set_hash,
+        )
+        .await
+    }
+
+    /// Reads the persisted overview row and reconciles it against disk: a `ready` row
+    /// whose file is absent or zero-length (manual delete / crash) is downgraded to
+    /// `Missing` so the UI offers a regenerate instead of a dead player. Returns `None`
+    /// when no overview has ever been generated.
+    pub async fn get_audio_overview_status(
+        &self,
+        notebook_id: &str,
+    ) -> Result<Option<AudioOverviewRecord>, LensError> {
+        let pool = self.pool().await;
+        let Some((path, generated_at, status_str, source_set_hash)) =
+            audio_overview::read_overview_row(&pool, notebook_id).await?
+        else {
+            return Ok(None);
+        };
+        let stored = AudioOverviewStatus::from_db_str(&status_str)?;
+        // Reconcile a `ready` row at read time. Missing (file gone) wins over Stale
+        // (sources changed): a vanished file is the more urgent regenerate signal. Only
+        // a `ready` row is reconciled — a `failed` row stays `failed`.
+        let status = if stored == AudioOverviewStatus::Ready {
+            if !audio_file_is_nonempty(&path) {
+                AudioOverviewStatus::Missing
+            } else if self.source_set_hash(notebook_id).await? != source_set_hash {
+                AudioOverviewStatus::Stale
+            } else {
+                AudioOverviewStatus::Ready
+            }
+        } else {
+            stored
+        };
+        Ok(Some(AudioOverviewRecord {
+            path,
+            generated_at,
+            status,
+            source_set_hash,
+        }))
+    }
+
+    /// Test-only accessor for the order-independent source-set hash (the private
+    /// staleness key). Lets integration tests assert order-independence, content
+    /// sensitivity, and the `ready`-when-matching read path.
+    #[cfg(feature = "test-util")]
+    pub async fn source_set_hash_for_test(&self, notebook_id: &str) -> Result<String, LensError> {
+        self.source_set_hash(notebook_id).await
+    }
+
+    /// Whether an overview synthesis is currently in flight for `notebook_id`, backed by
+    /// the TTS cancel-token registry (which covers both the dialogue and synth phases).
+    /// A cancelled-but-not-yet-dropped token reads as NOT generating.
+    pub fn is_overview_generating(&self, notebook_id: &str) -> bool {
+        let map = self
+            .tts_cancel_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match map.get(notebook_id) {
+            Some(token) => !token.is_cancelled(),
+            None => false,
+        }
     }
 
     /// Grounded-answer entry point (#173, the "rag route"). Gathers ALL fallible
@@ -2763,6 +2950,14 @@ pub fn notebook_audio_path(
         .join("notebooks")
         .join(notebook_id)
         .join("overview.wav"))
+}
+
+/// True when `path` is a regular file with non-zero length. Backs the read-path
+/// reconciliation that downgrades a `ready` overview whose file vanished to `Missing`.
+fn audio_file_is_nonempty(path: &str) -> bool {
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.len() > 0)
+        .unwrap_or(false)
 }
 
 /// Best-effort removal of a managed source file and its `.extracted.txt` /

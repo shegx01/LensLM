@@ -27,7 +27,10 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 lens-core = { path = "../lens-core" }
 # `tauri::ipc::Channel` and `app.path()` are available without extra features.
-tauri = { version = "2", features = [] }
+# `protocol-asset` enables the `asset:`/`convertFileSrc` protocol used to stream the
+# Audio Overview WAV to the webview `<audio>` (#29); it must match the enabled
+# `app.security.assetProtocol` block in `tauri.conf.json`.
+tauri = { version = "2", features = ["protocol-asset"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
@@ -97,6 +100,9 @@ sha2 = "=0.10.9"
 [dev-dependencies]
 # The `test` feature (mock runtime) is unioned in only for test builds.
 tauri = { version = "2", features = ["test"] }
+# Asset-protocol config guard parses tauri.conf.json (integration test crate — cannot
+# reach the base-`[dependencies]` serde_json, so it is re-listed here).
+serde_json = { workspace = true }
 # Temp dirs for the recent-documents scan test.
 tempfile = { workspace = true }
 # Inspector-command test seeds chunk + embedding_index rows via raw SQL on the
