@@ -93,10 +93,6 @@ afterEach(() => {
   resetAudioOverviewStore();
 });
 
-// ---------------------------------------------------------------------------
-// resetAudioOverviewStore
-// ---------------------------------------------------------------------------
-
 describe('resetAudioOverviewStore', () => {
   it('resets all fields to initial values', async () => {
     vi.mocked(getAudioOverviewStatus).mockResolvedValue(record());
@@ -113,10 +109,6 @@ describe('resetAudioOverviewStore', () => {
     expect(audioOverviewStore.modelReady).toBe(false);
   });
 });
-
-// ---------------------------------------------------------------------------
-// hydrateOverview
-// ---------------------------------------------------------------------------
 
 describe('hydrateOverview', () => {
   it('populates status from a persisted ready record', async () => {
@@ -223,10 +215,6 @@ describe('hydrateOverview', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// generateOverview
-// ---------------------------------------------------------------------------
-
 describe('generateOverview', () => {
   it('sets status to generating immediately on call', async () => {
     let resolvePromise: (path: string) => void = () => {};
@@ -311,10 +299,6 @@ describe('generateOverview', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// cancelOverview
-// ---------------------------------------------------------------------------
-
 describe('cancelOverview', () => {
   it('calls cancelSynthesis with the notebookId', async () => {
     vi.mocked(cancelSynthesis).mockResolvedValue(true);
@@ -334,10 +318,6 @@ describe('cancelOverview', () => {
     consoleSpy.mockRestore();
   });
 });
-
-// ---------------------------------------------------------------------------
-// canGenerate — derived gating
-// ---------------------------------------------------------------------------
 
 describe('canGenerate', () => {
   it('is false with zero selected sources, even when the model is ready', async () => {

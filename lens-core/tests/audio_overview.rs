@@ -14,9 +14,7 @@ use lens_core::{AudioOverviewStatus, Length, LensEngine, LensError};
 use sqlx::SqlitePool;
 use tokio_util::sync::CancellationToken;
 
-// ---------------------------------------------------------------------------
 // Fixtures
-// ---------------------------------------------------------------------------
 
 async fn insert_source(
     pool: &SqlitePool,
@@ -196,10 +194,6 @@ fn no_phase() -> impl Fn(lens_core::TtsPhase) + Send + Sync {
     |_p| {}
 }
 
-// ---------------------------------------------------------------------------
-// Migration
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn migration_applies_and_table_exists_at_count_23() {
     let engine = LensEngine::for_test().await;
@@ -214,9 +208,7 @@ async fn migration_applies_and_table_exists_at_count_23() {
     assert_eq!(exists, 1, "audio_overviews table must exist after 0023");
 }
 
-// ---------------------------------------------------------------------------
 // Read-path round-trip + reconciliation
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn ready_row_reads_back_then_downgrades_to_missing_when_file_gone() {
@@ -332,10 +324,6 @@ async fn status_is_none_when_never_generated() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// source_set_hash properties
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn source_set_hash_is_stable_and_reflects_ids_and_content() {
     let engine = LensEngine::for_test().await;
@@ -367,9 +355,7 @@ async fn source_set_hash_is_stable_and_reflects_ids_and_content() {
     assert_ne!(h1, h2, "a content-hash change must change the set hash");
 }
 
-// ---------------------------------------------------------------------------
 // generate_and_persist_overview terminal-row semantics
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn dialogue_phase_failure_persists_failed_row() {
@@ -449,10 +435,6 @@ async fn cancel_writes_no_failed_row_and_preserves_prior() {
     assert_eq!(rec.source_set_hash, hash);
 }
 
-// ---------------------------------------------------------------------------
-// FK cascade
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn purge_notebook_cascades_audio_overview_row() {
     let engine = LensEngine::for_test().await;
@@ -476,10 +458,6 @@ async fn purge_notebook_cascades_audio_overview_row() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// is_overview_generating
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn is_overview_generating_reflects_tts_registry() {
     let engine = LensEngine::for_test().await;
@@ -501,10 +479,6 @@ async fn is_overview_generating_reflects_tts_registry() {
         "a cancelled-but-not-dropped token must read as not generating"
     );
 }
-
-// ---------------------------------------------------------------------------
-// serde
-// ---------------------------------------------------------------------------
 
 #[test]
 fn audio_overview_status_serde_snake_case() {

@@ -2,8 +2,7 @@
      (#29) is a live per-notebook lifecycle: idle (length + Generate) → generating
      (phase + progress + Cancel) → ready/stale (player + regenerate) → failed/missing
      (functional error + retry). The study/report tools below remain a "coming soon"
-     preview (M6/M7 land those separately) — every action stays aria-disabled there.
-     Tokens only — no hardcoded hex. -->
+     preview (M6/M7 land those separately) — every action stays aria-disabled there. -->
 <script lang="ts">
   import BookOpen from '@lucide/svelte/icons/book-open';
   import FileText from '@lucide/svelte/icons/file-text';
@@ -45,9 +44,7 @@
     selectedCount = 0,
     totalCount = 0
   }: {
-    /** Number of currently-selected sources. */
     selectedCount?: number;
-    /** Total number of sources in the notebook. */
     totalCount?: number;
   } = $props();
 
@@ -112,8 +109,7 @@
     notebookStore.openSettings('text_to_speech');
   }
 
-  // The study/learning trio renders as full-width rows for prominence; the
-  // remaining document/visual tools fill a 2-column grid below.
+  // Full-width rows give the study trio prominence over the grid below.
   const heroTools: Array<{ label: string; sub: string; icon: Component }> = [
     { label: 'Study Guide', sub: 'Key terms & review Qs', icon: BookOpen },
     { label: 'Flashcards', sub: 'Spaced recall', icon: Layers },
@@ -391,7 +387,6 @@
     }
   }
 
-  /* ---- length segmented control (3-way) ---- */
   .seg3 {
     position: relative;
     display: grid;
@@ -475,7 +470,6 @@
     outline: none;
     box-shadow: 0 0 0 2px var(--ring);
   }
-  /* The study trio rests a touch higher than the grid via a stronger shadow. */
   .hero-tile {
     box-shadow: var(--shadow-bar);
   }

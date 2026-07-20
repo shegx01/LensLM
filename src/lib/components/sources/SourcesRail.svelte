@@ -87,7 +87,7 @@
 
   const sources = $derived(sourcesStore.sources);
   const totalCount = $derived(sources.length);
-  const selectedCount = $derived(sources.filter((s) => s.selected === 1).length);
+  const selectedCount = $derived(sourcesStore.selectedCount);
   const allSelected = $derived(totalCount > 0 && selectedCount === totalCount);
   const someSelected = $derived(selectedCount > 0 && selectedCount < totalCount);
 

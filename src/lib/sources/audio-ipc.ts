@@ -51,13 +51,13 @@ export async function getAudioOverviewStatus(
   return invoke<AudioOverviewRecord | null>('get_audio_overview_status', { notebookId });
 }
 
-/** True iff a synthesis is in flight for this notebook (e.g. started before a notebook switch). */
+/** Detects a run started before a notebook switch. */
 export async function isOverviewGenerating(notebookId: string): Promise<boolean> {
   if (!isTauri()) return false;
   return invoke<boolean>('is_overview_generating', { notebookId });
 }
 
-/** Cancels an in-flight overview generation — covers either the dialogue or the TTS phase. */
+/** Covers either the dialogue or the TTS phase. */
 export async function cancelSynthesis(notebookId: string): Promise<boolean> {
   if (!isTauri()) return false;
   return invoke<boolean>('cancel_synthesis', { notebookId });

@@ -195,12 +195,8 @@ export async function ttsModelStatus(engine: string, model: string): Promise<Tts
 }
 
 /**
- * Whether the currently-configured TTS backend is ready to synthesize: selectable
- * under the active config (catalog `available` — folds in "Cloud needs a key" /
- * "Qwen needs Apple Silicon") AND every required model id is `complete` on disk.
- * Mirrors the per-engine aggregation `LocalTtsForm.engineStatus` does for the
- * Settings download step; #29's Studio card reuses it to gate Generate rather
- * than re-deriving readiness from scratch.
+ * Whether the configured TTS backend can synthesize — reused to gate #29's Generate,
+ * folding in "Cloud needs a key" / "Qwen needs Apple Silicon" (catalog `available`).
  */
 export async function isTtsReady(): Promise<boolean> {
   if (!isTauri()) return false;

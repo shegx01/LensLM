@@ -16,6 +16,9 @@ const { mockSourcesStore, mockNotebookStore } = vi.hoisted(() => {
     get sources() {
       return _sources;
     },
+    get selectedCount() {
+      return _sources.filter((s) => s.selected === 1).length;
+    },
     get loading() {
       return false;
     },

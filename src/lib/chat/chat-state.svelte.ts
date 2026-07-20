@@ -24,6 +24,7 @@ import {
   listChatMessages
 } from './ipc.js';
 import { parseCitations } from './citations.js';
+import { toLensError } from '../sources/lens-error.js';
 import type {
   AnswerEvent,
   AnswerStage,
@@ -143,14 +144,6 @@ function resetStreamBuffers(state: NotebookChatState): void {
   state.answerBuffer = '';
   state.pendingCitations = null;
   state.currentTurnId = null;
-}
-
-/** Passes a `{kind,message}` LensError through; wraps anything else without leaking a raw `Error:` prefix. */
-function toLensError(err: unknown): { kind: string; message: string } {
-  if (err && typeof err === 'object' && 'kind' in err && 'message' in err) {
-    return err as { kind: string; message: string };
-  }
-  return { kind: 'Internal', message: err instanceof Error ? err.message : String(err) };
 }
 
 /**

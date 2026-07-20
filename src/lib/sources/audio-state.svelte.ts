@@ -13,6 +13,7 @@ import {
   type TtsPhase
 } from './audio-ipc.js';
 import type { StreamEvent } from './types.js';
+import { toLensError } from './lens-error.js';
 import { sourcesStore } from './sources-state.svelte.js';
 import { notebookStore } from '$lib/notebooks/notebooks-state.svelte.js';
 import { isTtsReady } from '$lib/onboarding/system-check.js';
@@ -60,7 +61,6 @@ export const audioOverviewStore = {
   get modelReady() {
     return modelReady;
   },
-  /** Generate is allowed with a ready TTS model, ≥1 selected source, and no run already in flight. */
   get canGenerate(): boolean {
     return modelReady && overviewStatus !== 'generating' && sourcesStore.selectedCount > 0;
   }
@@ -74,14 +74,6 @@ function resetOverviewState(): void {
   overviewPath = null;
   generatedAt = null;
   errorMessage = null;
-}
-
-/** Normalizes a Tauri invoke rejection into `{kind, message}` — mirrors chat-state.svelte.ts's toLensError. */
-function toLensError(err: unknown): { kind: string; message: string } {
-  if (err && typeof err === 'object' && 'kind' in err && 'message' in err) {
-    return err as { kind: string; message: string };
-  }
-  return { kind: 'Internal', message: err instanceof Error ? err.message : String(err) };
 }
 
 /** Hydrate from the persisted record + in-flight generation probe (notebook-open/restart). */
@@ -121,7 +113,7 @@ export async function hydrateOverview(notebookId: string): Promise<void> {
  * 'generating', so a notebook switch (which bumps `hydrateGeneration`) cancels it with
  * no overlapping polls or stale writes. Re-hydrates once the run settles.
  */
-function pollInFlightOverview(notebookId: string, gen: number): void {
+function pollInFlightOverview(notebookId: string, gen: number, retriedAfterError = false): void {
   setTimeout(() => {
     if (gen !== hydrateGeneration || overviewStatus !== 'generating') return;
     void (async () => {
@@ -130,6 +122,10 @@ function pollInFlightOverview(notebookId: string, gen: number): void {
         stillGenerating = await isOverviewGenerating(notebookId);
       } catch (err) {
         console.error('pollInFlightOverview: probe failed for notebook', notebookId, err);
+        // One bounded retry so a transient probe error doesn't strand the spinner.
+        if (gen === hydrateGeneration && overviewStatus === 'generating' && !retriedAfterError) {
+          pollInFlightOverview(notebookId, gen, true);
+        }
         return;
       }
       if (gen !== hydrateGeneration || overviewStatus !== 'generating') return;
@@ -191,7 +187,7 @@ export async function generateOverview(notebookId: string, length: Length): Prom
   }
 }
 
-/** Cancels the in-flight generation; the awaited `generateOverview` call settles the state. */
+/** The awaited `generateOverview` call settles the state. */
 export async function cancelOverview(notebookId: string): Promise<void> {
   try {
     await cancelSynthesis(notebookId);

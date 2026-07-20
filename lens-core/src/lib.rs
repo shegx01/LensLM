@@ -1401,9 +1401,18 @@ impl LensEngine {
         // leaves a torn `overview.wav` that a `ready` row would point at. The temp name is
         // per-run unique so concurrent same-notebook runs can't collide on it.
         let tmp = path.with_extension(format!("wav.{}.tmp", uuid::Uuid::now_v7()));
-        tts::write_wav_16bit(&buffer, &tmp)?;
+        if let Err(e) = tts::write_wav_16bit(&buffer, &tmp) {
+            remove_file_best_effort(&tmp);
+            return Err(e);
+        }
+        // A late cancel (after the buffer was produced) must not leave a Ready overview:
+        // drop the temp and let the orchestrator settle to Ok(None).
+        if cancel.is_cancelled() {
+            remove_file_best_effort(&tmp);
+            return Err(LensError::Cancelled("overview synthesis cancelled".into()));
+        }
         if let Err(e) = std::fs::rename(&tmp, &path) {
-            let _ = std::fs::remove_file(&tmp);
+            remove_file_best_effort(&tmp);
             return Err(LensError::from(e));
         }
         Ok(path)
