@@ -1,11 +1,10 @@
 <script lang="ts">
-  import { onMount, onDestroy } from 'svelte';
+  import { onDestroy, untrack } from 'svelte';
   import { invoke, isTauri } from '@tauri-apps/api/core';
   import { Button } from '$lib/components/ui/button/index.js';
   import ProgressBar from '$lib/components/ui/ProgressBar.svelte';
   import { cn } from '$lib/utils.js';
   import LoaderCircle from '@lucide/svelte/icons/loader-circle';
-  import CircleCheck from '@lucide/svelte/icons/circle-check';
   import Download from '@lucide/svelte/icons/download';
   import {
     downloadTtsModel,
@@ -31,38 +30,27 @@
   } from '$lib/components/ui/select/index.js';
   import { updateConfig } from '$lib/config.js';
 
-  // Bound so this form can self-fetch `catalog` on mount (writing back through the
-  // bind), keeping its catalog-then-config init self-contained regardless of
-  // parent/child mount order. See TtsConfigPanel for the ownership rationale.
+  // `engine` is owned by the parent's engine list. `catalog` is $bindable so the form
+  // can self-fetch when mounted standalone (unit tests); the panel passes it populated.
+  // See TtsConfigPanel for the parent/child ownership rationale.
   let {
     catalog = $bindable(),
-    active
+    engine,
+    active,
+    onactivated
   }: {
     catalog: TtsEngineCatalogEntry[];
+    engine: TtsEngineId;
     active: boolean;
+    onactivated?: (id: TtsEngineId) => void;
   } = $props();
 
-  let selectedEngine = $state<TtsEngineId>('orpheus');
-
-  const localEngines = $derived(catalog.filter((e) => e.id !== 'cloud'));
-  const selectedEntry = $derived(catalog.find((e) => e.id === selectedEngine) ?? null);
-
-  function engineLabel(id: TtsEngineId): string {
-    if (id === 'orpheus') return 'Orpheus';
-    if (id === 'qwen3_local') return 'Qwen3-TTS';
-    return 'Cloud';
-  }
+  const selectedEntry = $derived(catalog.find((e) => e.id === engine) ?? null);
 
   function engineToProvider(id: TtsEngineId): TtsProvider {
     if (id === 'qwen3_local') return 'qwen3';
     if (id === 'cloud') return 'cloud';
     return 'orpheus';
-  }
-
-  /** Human-readable on-disk size for the always-visible label, e.g. "~2.3 GB". */
-  function formatSize(bytes: number | null): string | null {
-    if (bytes === null || bytes <= 0) return null;
-    return `~${(bytes / 1_000_000_000).toFixed(1)} GB`;
   }
 
   // Registry ids the selected engine needs on disk, from the catalog DTO (authority:
@@ -90,17 +78,25 @@
   const maleVoices = $derived(voices.filter((v) => v.gender === 'male'));
   const femaleVoices = $derived(voices.filter((v) => v.gender === 'female'));
 
-  /** Aggregate the engine's per-model status into one tri-state, probing each
+  /** Human-readable on-disk size for the always-visible label, e.g. "~2.3 GB". */
+  function formatSize(bytes: number | null): string | null {
+    if (bytes === null || bytes <= 0) return null;
+    return `~${(bytes / 1_000_000_000).toFixed(1)} GB`;
+  }
+
+  /** Aggregate the given engine's per-model status into one tri-state, probing each
    *  model once: Complete iff all Complete; Partial iff any Partial; else Absent
-   *  (so Orpheus complete + SNAC absent is Absent, not Partial). */
-  async function engineStatus(): Promise<TtsModelStatus> {
-    if (selectedEngine === 'qwen3_local') {
+   *  (so Orpheus complete + SNAC absent is Absent, not Partial). Takes an explicit
+   *  `id` (not the reactive `engine`) so a stale in-flight probe stays self-consistent. */
+  async function engineStatus(id: TtsEngineId): Promise<TtsModelStatus> {
+    if (id === 'qwen3_local') {
       return ttsModelStatus('qwen3_local', '');
     }
-    let allComplete = true;
+    const ids = catalog.find((e) => e.id === id)?.required_model_ids ?? [];
+    let allComplete = ids.length > 0;
     let anyPartial = false;
-    for (const model of modelIds) {
-      const s = await ttsModelStatus(selectedEngine, model);
+    for (const model of ids) {
+      const s = await ttsModelStatus(id, model);
       if (s !== 'complete') allComplete = false;
       if (s === 'partial') anyPartial = true;
     }
@@ -108,46 +104,23 @@
     return anyPartial ? 'partial' : 'absent';
   }
 
-  onMount(async () => {
-    if (!isTauri()) return;
-    try {
-      catalog = (await ttsEngineCatalog()) ?? [];
-    } catch {
-      catalog = [];
-    }
-    try {
-      const cfg = await invoke<AppConfig>('get_config');
-      selectedEngine = cfg.tts?.backend === 'qwen3_local' ? 'qwen3_local' : 'orpheus';
-      // If the local engine is already on disk, skip the download step and go
-      // straight to voice selection — pre-filled from any previously saved
-      // host/guest voices.
-      status = await engineStatus();
-      if (downloaded) {
-        // Read the just-fetched catalog directly (not the `selectedEntry`/`maleVoices`
-        // deriveds, which can be stale when read in this async continuation).
-        const preset = (catalog.find((e) => e.id === selectedEngine)?.preset_voices ?? []).slice();
-        voices = preset;
-        voicesUnavailable = preset.length === 0;
-        const host = cfg.voices?.host;
-        const guest = cfg.voices?.guest;
-        const male = preset.filter((v) => v.gender === 'male');
-        const female = preset.filter((v) => v.gender === 'female');
-        maleVoice = (typeof host === 'string' ? host : '') || male[0]?.id || '';
-        femaleVoice = (typeof guest === 'string' ? guest : '') || female[0]?.id || '';
-      }
-    } catch {
-      // Non-fatal: fall back to the default download prompt.
-    }
-  });
+  // Read preset voices straight from the freshly-fetched catalog (not a derived,
+  // which can be stale in an async continuation).
+  function presetVoicesFor(id: TtsEngineId): TtsVoice[] {
+    return (catalog.find((e) => e.id === id)?.preset_voices ?? []).slice();
+  }
 
-  /** Switch the Local-tab engine. Selection persists reactively via persistLocalTts
-   *  (see nextTtsConfig in system-check.ts for the Cloud-key-preserving rule). */
-  async function pickEngine(id: TtsEngineId): Promise<void> {
-    if (id === 'cloud' || id === selectedEngine) return;
-    const entry = catalog.find((e) => e.id === id);
-    if (entry && !entry.available) return;
+  /** Probe `id`'s on-disk status and, when complete, populate the voice pickers.
+   *  `prefillFromConfig` (initial engine only) seeds host/guest from saved config;
+   *  a switch uses catalog defaults. `persist` pins an already-installed engine. */
+  // Set by activate() when the parent re-picks this engine before its load finished;
+  // the in-flight load persists on completion (see loadEngine). Reset per fresh load.
+  let pendingActivate = false;
 
-    selectedEngine = id;
+  async function loadEngine(
+    id: TtsEngineId,
+    opts: { persist: boolean; prefillFromConfig: boolean }
+  ): Promise<void> {
     status = 'absent';
     downloadProgress = null;
     downloadIndeterminate = false;
@@ -156,16 +129,85 @@
     voicesUnavailable = false;
     maleVoice = '';
     femaleVoice = '';
+    pendingActivate = false;
 
-    status = await engineStatus();
-    if (downloaded) {
-      voices = selectedEntry?.preset_voices ?? [];
-      voicesUnavailable = voices.length === 0;
-      if (maleVoices.length > 0) maleVoice = maleVoices[0].id;
-      if (femaleVoices.length > 0) femaleVoice = femaleVoices[0].id;
-      // Don't persist fake/empty voice IDs when the catalog has none for this engine.
-      if (!voicesUnavailable) void persistLocalTts();
+    if (!isTauri()) return;
+
+    let probed: TtsModelStatus;
+    try {
+      probed = await engineStatus(id);
+    } catch {
+      // A transient probe failure is non-fatal: leave the download prompt (status
+      // was reset to 'absent' above) rather than throwing out of the effect.
+      return;
     }
+    // A newer selection superseded this load while probing — don't clobber its state.
+    if (engine !== id) return;
+    status = probed;
+    if (probed !== 'complete') return;
+
+    const preset = presetVoicesFor(id);
+    voices = preset;
+    voicesUnavailable = preset.length === 0;
+    const male = preset.filter((v) => v.gender === 'male');
+    const female = preset.filter((v) => v.gender === 'female');
+
+    let savedHost = '';
+    let savedGuest = '';
+    if (opts.prefillFromConfig) {
+      try {
+        const cfg = await invoke<AppConfig>('get_config');
+        savedHost = typeof cfg.voices?.host === 'string' ? cfg.voices.host : '';
+        savedGuest = typeof cfg.voices?.guest === 'string' ? cfg.voices.guest : '';
+      } catch {
+        // Non-fatal: fall back to catalog defaults below.
+      }
+    }
+    if (engine !== id) return;
+    maleVoice = savedHost || male[0]?.id || '';
+    femaleVoice = savedGuest || female[0]?.id || '';
+
+    if ((opts.persist || pendingActivate) && !voicesUnavailable) {
+      pendingActivate = false;
+      void persistLocalTts();
+    }
+  }
+
+  // Only `engine` is tracked (untrack guards the rest) so a catalog refresh never
+  // re-triggers a load; `lastLoaded` dedupes and the `engine !== id` checks in
+  // loadEngine act as its cancellation token against superseded loads.
+  let lastLoaded: TtsEngineId | null = null;
+  $effect(() => {
+    const id = engine;
+    untrack(() => {
+      if (id === lastLoaded) return;
+      void handleEngine(id);
+    });
+  });
+
+  /** Pin the current engine when the parent re-selects it without changing the
+   *  `engine` prop (e.g. Cloud → the already-default local engine); the load effect
+   *  can't observe that, so the panel calls this. Persists now if ready, else defers
+   *  to the in-flight load's completion (never activates an uninstalled engine). */
+  export function activate(): void {
+    if (status === 'complete' && !voicesUnavailable) void persistLocalTts();
+    else pendingActivate = true;
+  }
+
+  /** Fetch the catalog first when standalone, THEN load — `engineStatus` reads
+   *  `modelIds` (catalog-derived), which would wrongly aggregate to `complete` over
+   *  an empty list if probed before the catalog resolved. */
+  async function handleEngine(id: TtsEngineId): Promise<void> {
+    const isInitial = lastLoaded === null;
+    lastLoaded = id;
+    if (catalog.length === 0 && isTauri()) {
+      try {
+        catalog = (await ttsEngineCatalog()) ?? [];
+      } catch {
+        catalog = [];
+      }
+    }
+    await loadEngine(id, { persist: !isInitial, prefillFromConfig: isInitial });
   }
 
   /** Apply one progress callback tick: `null` (unknown total) flips the
@@ -181,38 +223,45 @@
   }
 
   async function handleDownload(): Promise<void> {
+    // Pin the target so a mid-download engine switch can't make the completion
+    // path probe/persist/reveal-voices for the newly-selected engine instead.
+    const dlId = engine;
     downloadError = null;
     status = 'absent';
     downloadProgress = 0;
     downloadIndeterminate = false;
     try {
-      if (selectedEngine === 'qwen3_local') {
+      if (dlId === 'qwen3_local') {
         await prepareQwenModel((pct) => applyProgress(pct, (p) => p));
       } else {
         for (const [i, model] of modelIds.entries()) {
-          await downloadTtsModel(selectedEngine, model, (pct) =>
+          await downloadTtsModel(dlId, model, (pct) =>
             applyProgress(pct, (p) => Math.round(((i + p / 100) / modelIds.length) * 100))
           );
         }
       }
+      if (engine !== dlId) return;
       downloadIndeterminate = false;
       downloadProgress = 100;
       // Re-run the on-disk presence check before flipping to "ready": a download
       // that reported done can still be truncated/partial. If it isn't actually
       // complete, surface the re-download affordance instead of a false-ready.
-      if ((await engineStatus()) !== 'complete') {
+      const rechecked = await engineStatus(dlId);
+      if (engine !== dlId) return;
+      if (rechecked !== 'complete') {
         status = 'partial';
         downloadProgress = null;
         return;
       }
       status = 'complete';
       // list_tts_voices is reserved for runtime synth — the sidecar may not be running during setup.
-      voices = selectedEntry?.preset_voices ?? [];
+      voices = presetVoicesFor(dlId);
       voicesUnavailable = voices.length === 0;
       if (maleVoices.length > 0) maleVoice = maleVoices[0].id;
       if (femaleVoices.length > 0) femaleVoice = femaleVoices[0].id;
       if (!voicesUnavailable) void persistLocalTts();
     } catch (err) {
+      if (engine !== dlId) return;
       downloadIndeterminate = false;
       downloadProgress = null;
       // A deliberate cancel (unmount during a Qwen download) isn't a failure —
@@ -230,98 +279,63 @@
       await updateConfig((cfg) => ({
         ...cfg,
         voices: { host: maleVoice, guest: femaleVoice },
-        tts: nextTtsConfig(cfg.tts, { provider: engineToProvider(selectedEngine), apiKey: '' })
+        tts: nextTtsConfig(cfg.tts, { provider: engineToProvider(engine), apiKey: '' })
       }));
+      onactivated?.(engine);
     } catch (err) {
       saveError = err instanceof Error ? err.message : 'Could not save voice settings.';
     }
   }
 
-  // TtsConfigPanel is single-@render-mounted by SettingsShell, so unmount here means
-  // Settings nav-away/close — the intended cancel trigger. Engine-guarded because
-  // `cancel_prepare` is macOS-aarch64-only (cancelPrepare() no-ops off it anyway).
+  // Unmount here means Settings nav-away/close — the intended cancel trigger. Engine-guarded
+  // because `cancel_prepare` is macOS-aarch64-only (cancelPrepare() no-ops off it anyway).
   onDestroy(() => {
-    if (isDownloading && selectedEngine === 'qwen3_local') {
+    if (isDownloading && engine === 'qwen3_local') {
       void cancelPrepare();
     }
   });
 </script>
 
 <div
-  id="tts-panel-local"
-  role="tabpanel"
-  aria-labelledby="tts-tab-local"
-  tabindex={active ? 0 : -1}
-  class={cn('mt-3 flex flex-col gap-3', !active && 'hidden')}
+  role="group"
+  aria-label="Local voice engine setup"
+  class={cn('flex flex-col gap-4', !active && 'hidden')}
 >
-  {#if localEngines.length > 0}
-    <div class="flex flex-col gap-1.5" role="radiogroup" aria-label="Local voice engine">
-      {#each localEngines as entry (entry.id)}
-        {@const isSel = selectedEngine === entry.id}
-        {@const isAvailable = entry.available}
-        <button
-          type="button"
-          role="radio"
-          aria-checked={isSel}
-          aria-disabled={!isAvailable}
-          disabled={!isAvailable}
-          onclick={() => pickEngine(entry.id)}
-          class={cn(
-            'flex w-full items-center justify-between rounded-lg border px-3 py-2 text-left transition-colors',
-            'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
-            isSel
-              ? 'border-primary bg-primary/10 ring-1 ring-primary'
-              : 'border-border bg-card hover:text-foreground',
-            !isAvailable && 'cursor-not-allowed opacity-60'
-          )}
-        >
-          <span class="flex flex-col">
-            <span class="text-[0.78rem] font-bold text-foreground">{engineLabel(entry.id)}</span>
-            {#if !isAvailable && entry.unavailable_reason}
-              <span class="text-[0.68rem] text-destructive">{entry.unavailable_reason}</span>
-            {/if}
-          </span>
-          <span class="text-[0.68rem] text-muted-foreground">
-            {entry.language_capability_label}
-          </span>
-        </button>
-      {/each}
-    </div>
-  {/if}
-
   {#if !downloaded}
-    <div class="flex flex-col gap-2">
-      <p class="text-muted-foreground text-[0.78rem] leading-relaxed">
-        This open-weight TTS engine runs entirely on-device. Download once — no internet required
-        for synthesis.
+    <div class="rounded-[10px] border border-border bg-card p-4">
+      <p class="text-pretty text-[0.72rem] leading-relaxed text-muted-foreground">
+        This open-weight engine runs entirely on-device. Download once — no internet required for
+        synthesis.
       </p>
-      <div class="flex items-center justify-between text-[0.75rem] text-muted-foreground">
+      <div class="mt-3 flex items-center justify-between text-[0.72rem] text-muted-foreground">
         <span>{selectedEntry?.language_capability_label ?? 'Local voice engine'}</span>
-        <span class="tabular-nums"
-          >{formatSize(selectedEntry?.model_size_bytes ?? null) ?? 'On-device · Offline'}</span
-        >
+        <span class="tabular-nums">
+          {formatSize(selectedEntry?.model_size_bytes ?? null) ?? 'On-device · Offline'}
+        </span>
       </div>
 
       {#if isDownloading}
-        <ProgressBar value={downloadIndeterminate ? null : downloadProgress} />
-        {#if !downloadIndeterminate}
-          <p class="text-[0.72rem] text-muted-foreground text-center">
-            {downloadProgress}% downloaded
-          </p>
-        {/if}
+        <div class="mt-3">
+          <ProgressBar value={downloadIndeterminate ? null : downloadProgress} />
+          {#if !downloadIndeterminate}
+            <p class="mt-1 text-center text-[0.7rem] tabular-nums text-muted-foreground">
+              {downloadProgress}% downloaded
+            </p>
+          {/if}
+        </div>
       {/if}
 
       {#if downloadError}
-        <p class="text-destructive text-[0.75rem]" role="alert">{downloadError}</p>
+        <p class="mt-3 text-[0.72rem] text-destructive" role="alert">{downloadError}</p>
       {/if}
 
       {#if incomplete && !isDownloading}
-        <p class="text-destructive text-[0.75rem]" role="alert">
+        <p class="mt-3 text-[0.72rem] text-destructive" role="alert">
           The download didn't complete. Re-download to finish setting up this voice engine.
         </p>
       {/if}
 
-      <Button class="h-10 w-full" onclick={handleDownload} disabled={isDownloading}>
+      <Button class="mt-4 h-10 w-full" onclick={handleDownload} disabled={isDownloading}>
         {#if isDownloading}
           <LoaderCircle class="size-4 animate-spin" />
           Downloading…
@@ -334,22 +348,18 @@
         {/if}
       </Button>
     </div>
+  {:else if voicesUnavailable}
+    <p class="text-[0.72rem] text-destructive" role="alert">
+      Couldn't load voices — is the engine installed?
+    </p>
   {:else}
-    <div class="flex items-center gap-2 text-[0.78rem] text-primary" role="status">
-      <CircleCheck class="size-4" />
-      Voice engine ready
-    </div>
-
-    {#if voicesUnavailable}
-      <p class="text-destructive text-[0.75rem]" role="alert">
-        Couldn't load voices — is the engine installed?
+    <div class="rounded-[10px] border border-border bg-card p-4">
+      <p class="text-[0.65rem] font-bold uppercase tracking-[0.08em] text-muted-foreground/70">
+        Voices
       </p>
-    {:else}
-      <div class="flex flex-col gap-1.5">
-        <label
-          for="tts-male-voice"
-          class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase"
-        >
+
+      <div class="mt-3 flex flex-col gap-1.5">
+        <label for="tts-male-voice" class="text-[0.72rem] font-bold text-foreground">
           Host voice (male)
         </label>
         <Select
@@ -366,7 +376,9 @@
           <SelectTrigger id="tts-male-voice" class="w-full">
             <SelectValue placeholder="Select a voice" />
           </SelectTrigger>
-          <SelectContent>
+          <SelectContent
+            class="origin-(--bits-select-content-transform-origin) duration-200 ease-[cubic-bezier(0.23,1,0.32,1)]"
+          >
             {#each maleVoices as voice (voice.id)}
               <SelectItem value={voice.id} label={voice.name}>{voice.name}</SelectItem>
             {/each}
@@ -374,11 +386,8 @@
         </Select>
       </div>
 
-      <div class="flex flex-col gap-1.5">
-        <label
-          for="tts-female-voice"
-          class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase"
-        >
+      <div class="mt-3 flex flex-col gap-1.5">
+        <label for="tts-female-voice" class="text-[0.72rem] font-bold text-foreground">
           Co-host voice (female)
         </label>
         <Select
@@ -395,17 +404,19 @@
           <SelectTrigger id="tts-female-voice" class="w-full">
             <SelectValue placeholder="Select a voice" />
           </SelectTrigger>
-          <SelectContent>
+          <SelectContent
+            class="origin-(--bits-select-content-transform-origin) duration-200 ease-[cubic-bezier(0.23,1,0.32,1)]"
+          >
             {#each femaleVoices as voice (voice.id)}
               <SelectItem value={voice.id} label={voice.name}>{voice.name}</SelectItem>
             {/each}
           </SelectContent>
         </Select>
       </div>
-    {/if}
+    </div>
+  {/if}
 
-    {#if saveError}
-      <p class="text-destructive text-[0.75rem]" role="alert">{saveError}</p>
-    {/if}
+  {#if saveError}
+    <p class="text-[0.72rem] text-destructive" role="alert">{saveError}</p>
   {/if}
 </div>

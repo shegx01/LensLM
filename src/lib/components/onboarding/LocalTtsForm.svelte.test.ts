@@ -5,6 +5,7 @@ import type { AppConfig } from '$lib/theme/types.js';
 import { baseAppConfig } from '$lib/test-fixtures.js';
 import type {
   TtsEngineCatalogEntry,
+  TtsEngineId,
   TtsModelStatus,
   TtsVoice
 } from '$lib/onboarding/system-check.js';
@@ -61,8 +62,15 @@ function catalogFixture(overrides?: { qwenAvailable?: boolean }): TtsEngineCatal
   ];
 }
 
-function renderLocal(): { unmount: () => void } {
-  return render(LocalTtsForm, { props: { catalog: [], active: true } });
+// The engine list (Local/Cloud selection) now lives in the parent TtsConfigPanel;
+// this form receives its engine as a prop and switches via re-render (untracked
+// $effect on `engine`). Ready state = the Voices card, so assert the host-voice
+// picker rather than a "ready" banner.
+function renderLocal(engine: TtsEngineId = 'orpheus'): {
+  unmount: () => void;
+  rerender: (props: Record<string, unknown>) => Promise<void>;
+} {
+  return render(LocalTtsForm, { props: { catalog: [], engine, active: true } });
 }
 
 type ProgressChannel = {
@@ -85,52 +93,51 @@ afterEach(() => {
 describe('LocalTtsForm — engine status aggregation (corrected tri-state rule)', () => {
   type Matrix = { orpheus: TtsModelStatus; snac: TtsModelStatus };
 
-  async function mountWith(m: Matrix): Promise<void> {
+  function mountWith(m: Matrix): void {
     mockIPC((cmd, args) => {
       if (cmd === 'get_config') return baseAppConfig();
       if (cmd === 'tts_engine_catalog') return catalogFixture();
       if (cmd === 'tts_model_status') {
         return (args as { model: string }).model === 'orpheus' ? m.orpheus : m.snac;
       }
+      if (cmd === 'set_config') return null;
     });
-    renderLocal();
-    // Wait for the engine radios (proves the catalog fetch resolved) before asserting.
-    await screen.findByRole('radio', { name: /orpheus/i });
+    renderLocal('orpheus');
   }
 
-  it('{complete, complete} → complete (voice engine ready)', async () => {
-    await mountWith({ orpheus: 'complete', snac: 'complete' });
-    await waitFor(() => expect(screen.getByText(/voice engine ready/i)).toBeInTheDocument());
+  it('{complete, complete} → complete (voice pickers shown)', async () => {
+    mountWith({ orpheus: 'complete', snac: 'complete' });
+    await waitFor(() => expect(screen.getByLabelText(/^host voice/i)).toBeInTheDocument());
     expect(
       screen.queryByRole('button', { name: /download voice engine/i })
     ).not.toBeInTheDocument();
   });
 
   it('{complete, partial} → partial (re-download)', async () => {
-    await mountWith({ orpheus: 'complete', snac: 'partial' });
+    mountWith({ orpheus: 'complete', snac: 'partial' });
     expect(
       await screen.findByRole('button', { name: /model incomplete.*re-download/i })
     ).toBeInTheDocument();
   });
 
   it('{partial, absent} → partial (re-download)', async () => {
-    await mountWith({ orpheus: 'partial', snac: 'absent' });
+    mountWith({ orpheus: 'partial', snac: 'absent' });
     expect(
       await screen.findByRole('button', { name: /model incomplete.*re-download/i })
     ).toBeInTheDocument();
   });
 
   it('{complete, absent} → absent (plain Download, NOT re-download) — the divergent case', async () => {
-    await mountWith({ orpheus: 'complete', snac: 'absent' });
+    mountWith({ orpheus: 'complete', snac: 'absent' });
     expect(
       await screen.findByRole('button', { name: /download voice engine/i })
     ).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /re-download/i })).not.toBeInTheDocument();
-    expect(screen.queryByText(/voice engine ready/i)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/^host voice/i)).not.toBeInTheDocument();
   });
 
   it('{absent, absent} → absent (plain Download)', async () => {
-    await mountWith({ orpheus: 'absent', snac: 'absent' });
+    mountWith({ orpheus: 'absent', snac: 'absent' });
     expect(
       await screen.findByRole('button', { name: /download voice engine/i })
     ).toBeInTheDocument();
@@ -141,9 +148,12 @@ describe('LocalTtsForm — engine status aggregation (corrected tri-state rule)'
 describe('LocalTtsForm — status probe count (AC-5)', () => {
   it('probes each required model exactly once per engine switch (2 for Orpheus, 1 for Qwen), no repeats', async () => {
     let probes: { engine: string; model: string }[] = [];
+    // A stable, populated catalog reference so re-render keeps it (the bound prop
+    // would otherwise reset a self-fetched catalog back to []).
+    const cat = catalogFixture({ qwenAvailable: true });
     mockIPC((cmd, args) => {
       if (cmd === 'get_config') return baseAppConfig();
-      if (cmd === 'tts_engine_catalog') return catalogFixture({ qwenAvailable: true });
+      if (cmd === 'tts_engine_catalog') return cat;
       if (cmd === 'tts_model_status') {
         const a = args as { engine: string; model: string };
         probes.push({ engine: a.engine, model: a.model });
@@ -152,10 +162,11 @@ describe('LocalTtsForm — status probe count (AC-5)', () => {
       if (cmd === 'set_config') return null;
     });
 
-    render(LocalTtsForm, { props: { catalog: [], active: true } });
+    const { rerender } = render(LocalTtsForm, {
+      props: { catalog: cat, engine: 'orpheus', active: true }
+    });
 
-    // Mount probes Orpheus (the default) once per required model.
-    const qwenRadio = await screen.findByRole('radio', { name: /qwen3-tts/i });
+    // Mount probes Orpheus (the initial engine) once per required model.
     await waitFor(() =>
       expect(
         probes
@@ -167,7 +178,7 @@ describe('LocalTtsForm — status probe count (AC-5)', () => {
 
     // One engine switch → Qwen: exactly one probe, the empty-model sentinel.
     probes = [];
-    await fireEvent.click(qwenRadio);
+    await rerender({ catalog: cat, engine: 'qwen3_local', active: true });
     await waitFor(() =>
       expect(screen.getByRole('button', { name: /download voice engine/i })).toBeInTheDocument()
     );
@@ -175,8 +186,8 @@ describe('LocalTtsForm — status probe count (AC-5)', () => {
 
     // Switch back to Orpheus → exactly one probe per required model, no repeats.
     probes = [];
-    await fireEvent.click(screen.getByRole('radio', { name: /orpheus/i }));
-    await waitFor(() => expect(screen.getByText(/voice engine ready/i)).toBeInTheDocument());
+    await rerender({ catalog: cat, engine: 'orpheus', active: true });
+    await waitFor(() => expect(screen.getByLabelText(/^host voice/i)).toBeInTheDocument());
     expect(probes.map((p) => p.model).sort()).toEqual(['orpheus', 'snac']);
     expect(new Set(probes.map((p) => p.model)).size).toBe(probes.length);
   });
@@ -196,14 +207,13 @@ describe('LocalTtsForm — post-download re-check', () => {
       if (cmd === 'set_config') return null;
     });
 
-    render(LocalTtsForm, { props: { catalog: [], active: true } });
-    await screen.findByRole('radio', { name: /orpheus/i });
-    await fireEvent.click(screen.getByRole('button', { name: /download voice engine/i }));
+    renderLocal('orpheus');
+    await fireEvent.click(await screen.findByRole('button', { name: /download voice engine/i }));
 
     expect(
       await screen.findByRole('button', { name: /model incomplete.*re-download/i })
     ).toBeInTheDocument();
-    expect(screen.queryByText(/voice engine ready/i)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/^host voice/i)).not.toBeInTheDocument();
   });
 });
 
@@ -228,11 +238,10 @@ describe('LocalTtsForm — reactive persist', () => {
       }
     });
 
-    render(LocalTtsForm, { props: { catalog: [], active: true } });
-    await screen.findByRole('radio', { name: /orpheus/i });
-    await fireEvent.click(screen.getByRole('button', { name: /download voice engine/i }));
+    renderLocal('orpheus');
+    await fireEvent.click(await screen.findByRole('button', { name: /download voice engine/i }));
 
-    await waitFor(() => expect(screen.getByText(/voice engine ready/i)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByLabelText(/^host voice/i)).toBeInTheDocument());
     await waitFor(() => expect(written).not.toBeNull());
     expect((written as unknown as AppConfig).voices).toEqual({ host: 'leo', guest: 'tara' });
     expect((written as unknown as AppConfig).tts.backend).toBe('orpheus');
@@ -252,9 +261,7 @@ describe('LocalTtsForm — indeterminate progress (null pct)', () => {
       }
     });
 
-    renderLocal();
-    const qwenRadio = await screen.findByRole('radio', { name: /qwen3-tts/i });
-    await fireEvent.click(qwenRadio);
+    renderLocal('qwen3_local');
     await fireEvent.click(await screen.findByRole('button', { name: /download voice engine/i }));
     await waitFor(() => expect(progressCh).toBeDefined());
 
@@ -288,9 +295,8 @@ describe('LocalTtsForm — indeterminate progress (null pct)', () => {
       }
     });
 
-    renderLocal();
-    await screen.findByRole('radio', { name: /orpheus/i });
-    await fireEvent.click(screen.getByRole('button', { name: /download voice engine/i }));
+    renderLocal('orpheus');
+    await fireEvent.click(await screen.findByRole('button', { name: /download voice engine/i }));
 
     await waitFor(() => expect(screen.getByText(/70% downloaded/)).toBeInTheDocument());
 
@@ -316,9 +322,7 @@ describe('LocalTtsForm — cancel on unmount (engine-guarded)', () => {
       }
     });
 
-    const { unmount } = renderLocal();
-    const qwenRadio = await screen.findByRole('radio', { name: /qwen3-tts/i });
-    await fireEvent.click(qwenRadio);
+    const { unmount } = renderLocal('qwen3_local');
     await fireEvent.click(await screen.findByRole('button', { name: /download voice engine/i }));
     await waitFor(() =>
       expect(screen.getByRole('button', { name: /downloading/i })).toBeInTheDocument()
@@ -341,9 +345,8 @@ describe('LocalTtsForm — cancel on unmount (engine-guarded)', () => {
       }
     });
 
-    const { unmount } = renderLocal();
-    await screen.findByRole('radio', { name: /orpheus/i });
-    await fireEvent.click(screen.getByRole('button', { name: /download voice engine/i }));
+    const { unmount } = renderLocal('orpheus');
+    await fireEvent.click(await screen.findByRole('button', { name: /download voice engine/i }));
     await waitFor(() =>
       expect(screen.getByRole('button', { name: /downloading/i })).toBeInTheDocument()
     );
@@ -365,9 +368,7 @@ describe('LocalTtsForm — cancellation is not surfaced as a download failure', 
       }
     });
 
-    renderLocal();
-    const qwenRadio = await screen.findByRole('radio', { name: /qwen3-tts/i });
-    await fireEvent.click(qwenRadio);
+    renderLocal('qwen3_local');
     await fireEvent.click(await screen.findByRole('button', { name: /download voice engine/i }));
 
     await waitFor(() =>
