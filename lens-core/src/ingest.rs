@@ -877,9 +877,19 @@ impl IngestContext<'_> {
                 .await
                 .map_err(|e| LensError::Io(format!("{}: {e}", sources_dir.display())))?;
             let sibling = extracted_sibling_path(data_dir, source_id);
-            tokio::fs::write(&sibling, &out.extracted_text)
-                .await
-                .map_err(|e| LensError::Io(format!("{}: {e}", sibling.display())))?;
+            // Tmp + rename so a concurrent citation read-back sees full-old or
+            // full-new content, never a truncated write (R2 retention invariant).
+            // The tmp name is fixed (not unique per write) — safe because `ingest_lock`
+            // (Semaphore(1)) serializes ALL ingests, so no two writers ever race on it.
+            let tmp = sibling.with_extension("txt.part");
+            if let Err(e) = tokio::fs::write(&tmp, &out.extracted_text).await {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                return Err(LensError::Io(format!("{}: {e}", tmp.display())));
+            }
+            if let Err(e) = tokio::fs::rename(&tmp, &sibling).await {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                return Err(LensError::Io(format!("{}: {e}", sibling.display())));
+            }
         }
 
         // Persist the `table_markdown` sibling for tabular kinds (never embedded; display only).

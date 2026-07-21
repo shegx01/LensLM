@@ -4,6 +4,7 @@
 //! `Result<T, LensError>` so failures cross IPC as the locked `{kind, message}`
 //! envelope. Milestones add files here rather than rewriting a generic handler.
 
+pub mod citations;
 pub mod config;
 pub mod inspector;
 pub mod models;

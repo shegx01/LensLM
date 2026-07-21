@@ -45,6 +45,18 @@ let trashQueue = $state<TrashEntry[]>([]);
 let focusedSourceId = $state<string | null>(null);
 let focusNonce = $state(0);
 
+interface SourceViewerRequest {
+  sourceId: string;
+  charStart: number | null;
+  charEnd: number | null;
+}
+
+// "View in source" signal (#237): mirrors focusedSourceId/focusNonce above. A
+// citation's "View in source" action sets `sourceViewerRequest`; `sourceViewerNonce`
+// bumps every call so re-opening the same source+span re-fires the viewer effect.
+let sourceViewerRequest = $state<SourceViewerRequest | null>(null);
+let sourceViewerNonce = $state(0);
+
 // ---------------------------------------------------------------------------
 // Exported store object
 // ---------------------------------------------------------------------------
@@ -81,6 +93,14 @@ export const sourcesStore = {
   /** Bumps on every `focusSource` call so re-clicking the same chip re-fires the rail effect. */
   get focusNonce(): number {
     return focusNonce;
+  },
+  /** The last "view in source" request (issue #237); `null` until the first call. */
+  get sourceViewerRequest(): SourceViewerRequest | null {
+    return sourceViewerRequest;
+  },
+  /** Bumps on every `openSourceViewer` call so reopening the same source+span re-fires. */
+  get sourceViewerNonce(): number {
+    return sourceViewerNonce;
   }
 };
 
@@ -91,6 +111,20 @@ export const sourcesStore = {
 export function focusSource(sourceId: string, _locator?: unknown): void {
   focusedSourceId = sourceId;
   focusNonce++;
+}
+
+/**
+ * Opens the "view in source" viewer for `sourceId` (issue #237, AC2). Offsets are
+ * optional — omit both (or pass `null`) to open the whole document unhighlighted,
+ * which is also the degraded path for older chat history carrying null offsets.
+ */
+export function openSourceViewer(
+  sourceId: string,
+  charStart: number | null = null,
+  charEnd: number | null = null
+): void {
+  sourceViewerRequest = { sourceId, charStart, charEnd };
+  sourceViewerNonce++;
 }
 
 /**
@@ -386,6 +420,8 @@ export function resetSourcesStore(): void {
   error = null;
   focusedSourceId = null;
   focusNonce = 0;
+  sourceViewerRequest = null;
+  sourceViewerNonce = 0;
   for (const entry of trashQueue) {
     clearTimeout(entry.timeoutId);
   }

@@ -13,6 +13,7 @@ pub mod audio_overview;
 pub mod chat;
 pub mod chunk;
 pub mod citation;
+pub mod citation_source;
 pub mod config;
 pub(crate) mod db;
 pub mod dialogue;
@@ -68,6 +69,7 @@ pub use citation::{
     CITATION_PROMPT_INSTRUCTION, ChunkLocatorRow, Citation, Locator, extract_citations,
     hydrate_locators, load_chunk_locators,
 };
+pub use citation_source::{SnippetSegments, SourceView};
 pub use config::{
     AppConfig, ChatConfig, CloudAsrProvider, CloudTtsConfig, EnrichmentConfig, RerankerConfig,
     RerankerModel, RetrievalConfig, TaskModel, TtsConfig, VoiceConfig, VoiceRef,

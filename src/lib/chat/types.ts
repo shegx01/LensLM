@@ -81,3 +81,23 @@ export interface Turn {
   user: ChatMessage;
   versions: ChatMessage[];
 }
+
+// SYNC-CHECK: mirrors lens-core `SnippetSegments` (issue #237).
+export interface SnippetSegments {
+  before: string;
+  marked: string;
+  after: string;
+  truncated_before: boolean;
+  truncated_after: boolean;
+}
+
+// SYNC-CHECK: mirrors lens-core `SourceView` (issue #237). `marked` is empty and
+// `before` holds the whole text when no span was requested (null offsets).
+export interface SourceView {
+  before: string;
+  marked: string;
+  after: string;
+  title: string;
+  kind: string;
+  truncated: boolean;
+}

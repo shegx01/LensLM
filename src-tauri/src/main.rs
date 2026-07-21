@@ -192,6 +192,8 @@ fn main() {
             commands::notebooks::save_chat_marker,
             commands::notebooks::set_chat_feedback,
             commands::notebooks::list_chat_messages,
+            commands::citations::resolve_citation_snippet,
+            commands::citations::load_source_view,
             commands::notes::save_chat_note,
             commands::notes::save_manual_note,
             commands::notes::update_note,

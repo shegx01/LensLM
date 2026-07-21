@@ -7,11 +7,16 @@
 // live source-list changes.
 
 import { focusSource } from '$lib/sources/sources-state.svelte.js';
+import { showCitationPreview, scheduleHideCitationPreview } from './citation-preview.svelte.js';
+import type { Locator } from './types.js';
 
 export interface CitationTarget {
   source_id: string;
   title: string;
   live: boolean;
+  /** Every locator for this ordinal (issue #237) — the preview popover lists one
+   * snippet per span; a null-offset locator still offers "view in source". */
+  locators: Locator[];
 }
 
 const SKIP_TAGS = new Set(['CODE', 'PRE', 'A', 'BUTTON']);
@@ -115,6 +120,21 @@ function buildChip(
     const onClick = (): void => focusSource(target.source_id);
     btn.addEventListener('click', onClick);
     cleanups.push(() => btn.removeEventListener('click', onClick));
+
+    // Hover/focus lazily shows the context-snippet popover (issue #237); click
+    // keeps its existing reveal-in-rail behavior above, unchanged.
+    const onShow = (): void => showCitationPreview(btn, target);
+    const onHide = (): void => scheduleHideCitationPreview();
+    btn.addEventListener('pointerenter', onShow);
+    btn.addEventListener('focus', onShow);
+    btn.addEventListener('pointerleave', onHide);
+    btn.addEventListener('blur', onHide);
+    cleanups.push(() => {
+      btn.removeEventListener('pointerenter', onShow);
+      btn.removeEventListener('focus', onShow);
+      btn.removeEventListener('pointerleave', onHide);
+      btn.removeEventListener('blur', onHide);
+    });
   } else {
     btn.disabled = true;
     btn.classList.add('citation-chip--stale');
