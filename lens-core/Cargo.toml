@@ -314,7 +314,7 @@ lancedb = "0.30.0"
 # Pure-Rust PDF writer — generates the tiny text-layer PDF fixture IN-TEST (Step 5
 # TDD) so no binary fixture is committed. Dev-only; never in production builds.
 # MIT-licensed (deny.toml allowlist).
-printpdf = "=0.7.0"
+printpdf = "=0.11.3"
 # Pure-Rust XLSX writer — generates the `sample.xlsx` test fixture in a #[test]
 # (see `extract::spreadsheet` tests). calamine is READ-ONLY so it cannot write
 # fixtures. Dev-only; never in production builds. MIT OR Apache-2.0.
