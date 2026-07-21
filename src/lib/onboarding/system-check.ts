@@ -112,10 +112,9 @@ export async function installEmbeddingModel(
 }
 
 /**
- * Build the shared `DownloadProgress` channel for the download/prepare wrappers below.
- * `done` always reports 100 (even on a rounding-short determinate finish); otherwise
- * `toPct` reports the known percentage or `null` when the total is unknown — callers
- * render `null` as an indeterminate bar rather than holding at a stale value.
+ * Shared `DownloadProgress` channel for the wrappers below. `done` reports 100; otherwise
+ * `toPct` gives the known percentage or `null` when the total is unknown (callers render
+ * `null` as an indeterminate bar rather than holding at a stale value).
  */
 function makeProgressChannel(onProgress: (pct: number | null) => void): Channel<DownloadProgress> {
   const channel = new Channel<DownloadProgress>();

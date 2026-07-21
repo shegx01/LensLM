@@ -32,10 +32,9 @@ impl QwenPrepareCoordinator {
         }
     }
 
-    /// Runs a single-flight `--prepare`: serializes on the gate, re-checks the
-    /// on-disk snapshot after acquiring (a queued-behind caller whose predecessor
-    /// just completed does no redundant download), then drives [`run_prepare`]
-    /// under a cancel token stored in the single slot.
+    /// Runs a single-flight `--prepare`: serializes on the gate, re-checks the on-disk
+    /// snapshot after acquiring (a just-finished predecessor short-circuits, no redundant
+    /// download), then drives [`run_prepare`] under a cancel token in the single slot.
     pub async fn run_single_flight<F>(
         &self,
         paths: &SidecarPaths,

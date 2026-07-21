@@ -30,7 +30,7 @@ mod coordinator;
 mod prepare;
 mod resolver;
 pub use coordinator::QwenPrepareCoordinator;
-pub use prepare::{qwen_snapshot_dir_present, qwen_snapshot_present, run_prepare};
+pub(crate) use prepare::{qwen_snapshot_dir_present, qwen_snapshot_present, run_prepare};
 pub use resolver::resolve_sidecar_spawn;
 
 /// The app-data-derived paths the Qwen sidecar launches against. Single source of
@@ -104,10 +104,9 @@ const SYNTH_TIMEOUT: Duration = Duration::from_secs(300);
 /// OOM the host; a real reply (id + temp-WAV path) is well under this.
 const MAX_REPLY_BYTES: u64 = 64 * 1024;
 
-/// Outcome of a single capped read-line: a full newline-terminated `Line`, `Eof`
-/// (the child closed the pipe), or `OverCap` (the cap was hit with no newline — a
-/// runaway/never-newline child). Error-neutral so each caller maps to its own
-/// domain error (`tts_err` in prepare + handshake, `TurnError::Dead` in `drain_until`).
+/// Outcome of one capped read-line: newline-terminated `Line`, `Eof` (child closed the
+/// pipe), or `OverCap` (cap hit with no newline). Error-neutral so each caller maps it to
+/// its own domain error (`tts_err`, or `TurnError::Dead` in `drain_until`).
 #[derive(Debug, PartialEq)]
 pub(crate) enum ReadLineOutcome {
     Line(String),

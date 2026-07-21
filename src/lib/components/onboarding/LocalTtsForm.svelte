@@ -237,10 +237,9 @@
     }
   }
 
-  // Settings' TtsConfigPanel is single-@render-mounted by SettingsShell's `active`
-  // check, so unmount here means Settings nav-away or close — the intended cancel
-  // trigger. Engine-guarded: `isDownloading` is true for Orpheus too, but
-  // `cancel_prepare` is macOS-aarch64-only; cancelPrepare() swallows the mismatch.
+  // TtsConfigPanel is single-@render-mounted by SettingsShell, so unmount here means
+  // Settings nav-away/close — the intended cancel trigger. Engine-guarded because
+  // `cancel_prepare` is macOS-aarch64-only (cancelPrepare() no-ops off it anyway).
   onDestroy(() => {
     if (isDownloading && selectedEngine === 'qwen3_local') {
       void cancelPrepare();
