@@ -91,6 +91,44 @@ describe('enhanceCitations', () => {
     expect(chip.childNodes[0].nodeType).toBe(Node.TEXT_NODE);
   });
 
+  it('strips a trailing (title) echo that exactly matches the source title', () => {
+    const el = host('<p>See [1] (Alpha).</p>');
+    enhanceCitations(el, resolve);
+
+    expect(el.querySelector('button.citation-chip')?.textContent).toBe('1');
+    expect(el.textContent).not.toContain('(Alpha)');
+    // The chip hugs the preceding word (leading space consumed by design), so the
+    // title echo is gone and only "See" + chip + "." remains.
+    expect(el.textContent).toBe('See1.');
+  });
+
+  it('strips the echoed (title): label including the trailing colon', () => {
+    const el = host('<p>See [1] (Alpha): the rest.</p>');
+    enhanceCitations(el, resolve);
+
+    expect(el.querySelector('button.citation-chip')?.textContent).toBe('1');
+    expect(el.textContent).not.toContain('(Alpha)');
+    expect(el.textContent).toBe('See1 the rest.');
+  });
+
+  it('never mangles surrounding prose like "open source" (title echo present)', () => {
+    const el = host('<p>Use an open source [1] (Alpha) library.</p>');
+    enhanceCitations(el, resolve);
+
+    expect(el.querySelector('button.citation-chip')).not.toBeNull();
+    // The (title) echo is dropped but the real words "open source" are untouched.
+    expect(el.textContent).not.toContain('(Alpha)');
+    expect(el.textContent).toContain('open source');
+    expect(el.textContent).toBe('Use an open source1 library.');
+  });
+
+  it('does not strip a parenthetical that is not the source title', () => {
+    const el = host('<p>See [1] (the diagram).</p>');
+    enhanceCitations(el, resolve);
+
+    expect(el.textContent).toContain('(the diagram)');
+  });
+
   it('re-enhancing with a changed resolver flips a chip live→stale without duplicating (AC5)', () => {
     const el = host('<p>See [1].</p>');
     const live = (n: number) => (n === 1 ? { source_id: 's1', title: 'Alpha', live: true } : null);

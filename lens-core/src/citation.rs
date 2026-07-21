@@ -135,6 +135,11 @@ fn parse_marker_list(inner: &str) -> Option<Vec<usize>> {
     (!ns.is_empty()).then_some(ns)
 }
 
+/// Whether a 1-based marker `n` maps to a real unit in `1..=len`.
+fn in_range(n: usize, len: usize) -> bool {
+    (1..=len).contains(&n)
+}
+
 /// Extracts citations from a grounded `answer` by parsing `[n]` markers and mapping
 /// each to `units[n-1]` **by slice position**. Pure and synchronous: out-of-range /
 /// malformed markers are dropped and logged, never an `Err`; duplicate markers per
@@ -145,7 +150,7 @@ pub fn extract_citations(answer: &str, units: &[ContextUnit]) -> Vec<Citation> {
     let mut groups: Vec<(String, Vec<Locator>)> = Vec::new();
 
     for (_pos, n) in parse_markers(answer) {
-        if n == 0 || n > units.len() {
+        if !in_range(n, units.len()) {
             tracing::debug!(
                 marker = n,
                 units = units.len(),
@@ -182,6 +187,63 @@ pub fn extract_citations(answer: &str, units: &[ContextUnit]) -> Vec<Citation> {
             locators,
         })
         .collect()
+}
+
+/// Content-free fingerprint of an answer that yielded no citations, for the "text but
+/// no citations" warning. Every field is a count or bool — NO answer/source text is
+/// retained — so it is safe to log in a privacy-first app while still telling operators
+/// why extraction came up empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CitationDiag {
+    /// Answer length in chars, not bytes.
+    pub answer_len: usize,
+    /// Total `[` characters — a coarse "did the model use brackets at all" signal.
+    pub open_brackets: usize,
+    /// Markers that parsed as integer lists per the accepted grammar.
+    pub raw_markers: usize,
+    /// Subset of `raw_markers` mapping to a valid `1..=units_len` unit.
+    pub in_range_markers: usize,
+    /// `【…】` present — common in CJK-tuned models like Qwen.
+    pub fullwidth_bracket: bool,
+    pub footnote_marker: bool,
+    pub paren_number: bool,
+}
+
+/// Reuses [`parse_markers`] so the raw-vs-in-range split matches real extraction.
+pub(crate) fn citation_diag(answer: &str, units_len: usize) -> CitationDiag {
+    let markers = parse_markers(answer);
+    let in_range = markers
+        .iter()
+        .filter(|(_, n)| in_range(*n, units_len))
+        .count();
+    CitationDiag {
+        answer_len: answer.chars().count(),
+        open_brackets: answer.matches('[').count(),
+        raw_markers: markers.len(),
+        in_range_markers: in_range,
+        fullwidth_bracket: answer.contains('【'),
+        footnote_marker: answer.contains("[^"),
+        paren_number: has_paren_number(answer),
+    }
+}
+
+/// A `(n)`-style citation some models emit instead of `[n]`.
+fn has_paren_number(answer: &str) -> bool {
+    let b = answer.as_bytes();
+    let mut i = 0;
+    while i + 2 < b.len() {
+        if b[i] == b'(' && b[i + 1].is_ascii_digit() {
+            let mut j = i + 1;
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j < b.len() && b[j] == b')' {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Fills each [`Locator`]'s `section_path`/`page`/`char_*` from `rows` keyed by
@@ -341,5 +403,38 @@ mod tests {
     fn empty_brackets_and_letters_dropped() {
         assert!(parse_markers("[]").is_empty());
         assert!(parse_markers("[abc]").is_empty());
+    }
+
+    #[test]
+    fn diag_model_emitted_no_markers() {
+        let d = citation_diag("The sky is blue. Water boils at 100C.", 2);
+        assert_eq!(d.open_brackets, 0);
+        assert_eq!(d.raw_markers, 0);
+        assert_eq!(d.in_range_markers, 0);
+        assert!(!d.fullwidth_bracket && !d.footnote_marker && !d.paren_number);
+    }
+
+    #[test]
+    fn diag_markers_in_rejected_formats() {
+        let d = citation_diag("See 【1】 and [^2] and (3).", 3);
+        assert_eq!(d.raw_markers, 0, "none parse as accepted [n] markers");
+        assert!(d.open_brackets > 0);
+        assert!(d.fullwidth_bracket);
+        assert!(d.footnote_marker);
+        assert!(d.paren_number);
+    }
+
+    #[test]
+    fn diag_markers_present_but_out_of_range() {
+        // Two valid-grammar markers, both beyond the single available unit.
+        let d = citation_diag("Backed by [5] and [9].", 1);
+        assert_eq!(d.raw_markers, 2);
+        assert_eq!(d.in_range_markers, 0);
+    }
+
+    #[test]
+    fn diag_counts_chars_not_bytes() {
+        let d = citation_diag("café", 0);
+        assert_eq!(d.answer_len, 4);
     }
 }

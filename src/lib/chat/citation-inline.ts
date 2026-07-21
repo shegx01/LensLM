@@ -61,12 +61,17 @@ export function enhanceCitations(
     let matched = false;
     let m: RegExpExecArray | null;
     while ((m = MARKER.exec(text)) !== null) {
-      const target = resolve(Number(m[1]));
+      const ordinal = Number(m[1]);
+      const target = resolve(ordinal);
       if (!target) continue;
       matched = true;
-      frag.append(document.createTextNode(text.slice(lastIndex, m.index)));
-      frag.append(buildChip(Number(m[1]), m[0], target, cleanups));
+      const before = text.slice(lastIndex, m.index);
       lastIndex = m.index + m[0].length;
+      // Drop a `(title)` (with any echoed trailing `:`) that some models copy from the
+      // prompt's `[n] (title):` label, ONLY when it exactly matches this source's title.
+      lastIndex += titleEchoLength(text.slice(lastIndex), target.title);
+      frag.append(document.createTextNode(before));
+      frag.append(buildChip(ordinal, m[0], target, cleanups));
     }
     if (matched) {
       frag.append(document.createTextNode(text.slice(lastIndex)));
@@ -77,6 +82,20 @@ export function enhanceCitations(
   return () => {
     for (const c of cleanups) c();
   };
+}
+
+// Length of a `(title)` echo at the START of `after` (optional leading space, optional
+// echoed trailing `:` from the `[n] (title):` label) when the parenthetical content
+// EXACTLY equals `title`; 0 otherwise. Exact match keeps it safe — arbitrary
+// `[n] (some prose)` is never removed.
+function titleEchoLength(after: string, title: string): number {
+  if (title.length === 0) return 0;
+  for (const base of [` (${title})`, `(${title})`]) {
+    if (after.startsWith(base)) {
+      return after.startsWith(`${base}:`) ? base.length + 1 : base.length;
+    }
+  }
+  return 0;
 }
 
 function buildChip(
