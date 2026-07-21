@@ -27,6 +27,23 @@ fn csp_allows_media_from_asset_protocol() {
         media_src.contains("asset:") || media_src.contains("http://asset.localhost"),
         "media-src must allow the asset protocol; got {media_src:?}"
     );
+
+    // Playback loads the WAV into a Blob objectURL to dodge the WKWebView asset-scheme
+    // pause/seek deadlock (tauri-apps/tauri#10426); both directives below are load-bearing.
+    assert!(
+        media_src.contains("blob:"),
+        "media-src must allow blob: URLs for Blob-backed <audio> playback; got {media_src:?}"
+    );
+
+    let connect_src = csp
+        .split(';')
+        .map(str::trim)
+        .find(|d| d.starts_with("connect-src"))
+        .expect("csp must define a connect-src directive for fetch(convertFileSrc(...))");
+    assert!(
+        connect_src.contains("http://asset.localhost"),
+        "connect-src must allow the asset origin so fetch(convertFileSrc(...)) is not blocked; got {connect_src:?}"
+    );
 }
 
 #[test]

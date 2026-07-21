@@ -87,8 +87,8 @@ pub use ingest::{
     readback_host_allowed, resolve_nomic_tokenizer, ssrf_check_host, ssrf_check_url,
 };
 pub use llm::{
-    GenaiProvider, LlmProvider, LlmRequest, LlmResponse, LlmRouting, ReasoningEffort, StreamChunk,
-    provider_from_config,
+    ActiveModelCandidate, GenaiProvider, LlmProvider, LlmRequest, LlmResponse, LlmRouting,
+    ReasoningEffort, StreamChunk, active_model_candidates, provider_from_config,
 };
 pub use model_catalog::{
     Cost, MODELS_CATALOG_REFRESH_INTERVAL, MODELS_CATALOG_RELPATH, MODELS_CATALOG_URL, Modalities,

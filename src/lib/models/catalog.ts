@@ -2,7 +2,7 @@
 // onboarding picker shows a "none found" state rather than an error.
 
 import { invoke, isTauri } from '@tauri-apps/api/core';
-import type { ModelInfo } from './types.js';
+import type { ActiveModelSelection, ModelInfo } from './types.js';
 
 /** One option in a model picker with its capability info. */
 export interface ModelOption {
@@ -123,4 +123,38 @@ export function formatCompact(n: number): string {
 /** Per-1M-token USD: `5` → "5", `0.5` → "0.5". */
 export function formatUsd(n: number): string {
   return String(n);
+}
+
+/** The "nothing configured" active-model selection — shared with the reactive store. */
+export const EMPTY_ACTIVE_SELECTION: ActiveModelSelection = { active: null, candidates: [] };
+
+/**
+ * Configured chat-model candidates plus the current pin, each `available` exactly as
+ * `chat_provider()` would resolve it. Resolves the empty selection outside Tauri or on
+ * failure — never throws (the Active-model picker treats that as "nothing configured").
+ */
+export async function listActiveModelCandidates(): Promise<ActiveModelSelection> {
+  if (!isTauri()) return EMPTY_ACTIVE_SELECTION;
+  try {
+    const selection = await invoke<ActiveModelSelection>('list_active_model_candidates');
+    return selection ?? EMPTY_ACTIVE_SELECTION;
+  } catch {
+    return EMPTY_ACTIVE_SELECTION;
+  }
+}
+
+/**
+ * Pins the active chat model to `(provider, model)`; persists and applies immediately
+ * so chat/notes/audio-overview resolve to it — including after restart. No-op outside
+ * Tauri.
+ */
+export async function setActiveChatModel(provider: string, model: string): Promise<void> {
+  if (!isTauri()) return;
+  await invoke('set_active_chat_model', { provider, model });
+}
+
+/** Clears the active-chat-model pin, reverting to routing-based resolution. */
+export async function clearActiveChatModel(): Promise<void> {
+  if (!isTauri()) return;
+  await invoke('clear_active_chat_model');
 }

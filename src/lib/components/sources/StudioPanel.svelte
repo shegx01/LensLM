@@ -21,7 +21,6 @@
   import TriangleAlert from '@lucide/svelte/icons/triangle-alert';
   import Settings2 from '@lucide/svelte/icons/settings-2';
   import type { Component } from 'svelte';
-  import { convertFileSrc } from '@tauri-apps/api/core';
   import { fadeRise } from '$lib/motion/index.js';
   import { notebookStore } from '$lib/notebooks/index.js';
   import { formatRelativeTime } from '$lib/notebooks/format-time.js';
@@ -214,7 +213,7 @@
         </div>
       {:else if hasPlayableAudio && notebookId && audioOverviewStore.overviewPath}
         <div class="card-body mt-3 flex flex-col justify-center">
-          <AudioPlayer src={convertFileSrc(audioOverviewStore.overviewPath)} />
+          <AudioPlayer path={audioOverviewStore.overviewPath} />
         </div>
       {:else}
         <div class="card-body mt-3 flex flex-col justify-center gap-2">

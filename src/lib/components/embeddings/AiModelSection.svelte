@@ -25,8 +25,10 @@
     type ModelOption
   } from '$lib/models/catalog.js';
   import { refreshChatProvider } from '$lib/models/chat-provider.svelte.js';
+  import { refreshActiveModel } from '$lib/models/active-model.svelte.js';
   import LlmModelField from '$lib/components/llm/LlmModelField.svelte';
   import ApiKeyField from '$lib/components/llm/ApiKeyField.svelte';
+  import ActiveModelPicker from './ActiveModelPicker.svelte';
   import LlmProviderField from './LlmProviderField.svelte';
   import ContextWindowField from './ContextWindowField.svelte';
   import EnrichmentOverride from './EnrichmentOverride.svelte';
@@ -208,6 +210,7 @@
       editingKey = false;
       apiKeyValue = '';
       await refreshChatProvider();
+      await refreshActiveModel();
     } catch (err) {
       saveError = err instanceof Error ? err.message : 'Could not save the model.';
     }
@@ -227,6 +230,8 @@
 
   {#if loaded}
     <div class="mt-6 flex flex-col gap-4">
+      <ActiveModelPicker />
+
       <div class="flex flex-col gap-1.5">
         <p class="text-[0.65rem] font-bold uppercase tracking-[0.08em] text-muted-foreground/70">
           Chat model

@@ -1,6 +1,6 @@
 //! Configuration commands.
 
-use lens_core::{AppConfig, LensEngine, LensError};
+use lens_core::{AppConfig, LensEngine, LensError, TaskModel};
 use tauri::Manager;
 
 /// Returns the current in-memory application configuration.
@@ -34,6 +34,22 @@ async fn apply_config(engine: &LensEngine, config: AppConfig) -> Result<(), Lens
     Ok(())
 }
 
+/// Persists `config` to `config.json` in the app data dir, then applies it in memory
+/// (rebinding the provider on an LLM delta). Shared by every config-mutating command so
+/// the persist-then-apply order lives in one place.
+async fn persist_and_apply(
+    engine: &LensEngine,
+    config: AppConfig,
+    app: &tauri::AppHandle,
+) -> Result<(), LensError> {
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| LensError::Io(e.to_string()))?;
+    config.save(&data_dir)?;
+    apply_config(engine, config).await
+}
+
 /// Replaces the configuration in memory and persists it to `config.json` in the
 /// app data directory.
 #[tracing::instrument(skip_all)]
@@ -43,12 +59,35 @@ pub async fn set_config(
     engine: tauri::State<'_, LensEngine>,
     app: tauri::AppHandle,
 ) -> Result<(), LensError> {
-    let data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| LensError::Io(e.to_string()))?;
-    config.save(&data_dir)?;
-    apply_config(engine.inner(), config).await
+    persist_and_apply(engine.inner(), config, &app).await
+}
+
+/// Pins the active chat model to `(provider, model)` and persists it, so `chat_provider()`
+/// resolves it immediately and it survives restart (fixes "no chat model configured" on
+/// relaunch). Additive: routing and resolution semantics are unchanged.
+#[tracing::instrument(skip_all, fields(provider = %provider, model = %model))]
+#[tauri::command(rename_all = "snake_case")]
+pub async fn set_active_chat_model(
+    provider: String,
+    model: String,
+    engine: tauri::State<'_, LensEngine>,
+    app: tauri::AppHandle,
+) -> Result<(), LensError> {
+    let mut config = engine.config().await;
+    config.enrichment.chat_model = Some(TaskModel { provider, model });
+    persist_and_apply(engine.inner(), config, &app).await
+}
+
+/// Clears the active chat-model pin, reverting to routing-based resolution.
+#[tracing::instrument(skip_all)]
+#[tauri::command]
+pub async fn clear_active_chat_model(
+    engine: tauri::State<'_, LensEngine>,
+    app: tauri::AppHandle,
+) -> Result<(), LensError> {
+    let mut config = engine.config().await;
+    config.enrichment.chat_model = None;
+    persist_and_apply(engine.inner(), config, &app).await
 }
 
 /// Read-only chat-provider gate; builds no network client. (AC-11)
@@ -164,6 +203,31 @@ mod tests {
         assert!(
             engine.llm_provider().await.is_some(),
             "an LLM-config change must rebind the cached provider without a restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn active_chat_model_pin_round_trips_and_resolves() {
+        let engine = LensEngine::for_test().await;
+
+        let mut config = ollama_local_config("dark");
+        config.enrichment.chat_model = Some(lens_core::TaskModel {
+            provider: "ollama".to_string(),
+            model: "llama3".to_string(),
+        });
+        apply_config(&engine, config).await.unwrap();
+
+        assert_eq!(
+            engine.config().await.enrichment.chat_model,
+            Some(lens_core::TaskModel {
+                provider: "ollama".to_string(),
+                model: "llama3".to_string(),
+            }),
+            "the pin round-trips through get_config"
+        );
+        assert!(
+            engine.chat_provider().await.is_some(),
+            "the pinned chat model resolves a chat provider"
         );
     }
 

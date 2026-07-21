@@ -119,10 +119,6 @@ vi.mock('$lib/notebooks/index.js', () => ({
   notebookStore: mockNotebookStore
 }));
 
-vi.mock('@tauri-apps/api/core', () => ({
-  convertFileSrc: (path: string) => `asset://localhost/${path}`
-}));
-
 vi.mock('$lib/components/audio/AudioPlayer.svelte', async () => {
   const { default: Stub } = await import('./__fixtures__/AudioPlayerStub.svelte');
   return { default: Stub };
@@ -258,7 +254,7 @@ describe('StudioPanel — generating state', () => {
 });
 
 describe('StudioPanel — ready / stale states', () => {
-  it('renders the AudioPlayer with a convertFileSrc-derived src and a "Generated" caption', () => {
+  it('renders the AudioPlayer with the raw overview path and a "Generated" caption', () => {
     mockAudioStore._set({
       overviewStatus: 'ready',
       overviewPath: '/data/notebooks/nb-001/overview.wav',
@@ -267,7 +263,7 @@ describe('StudioPanel — ready / stale states', () => {
     render(StudioPanel, { props: { selectedCount: 2, totalCount: 3 } });
 
     const stub = screen.getByTestId('audio-player-stub');
-    expect(stub).toHaveTextContent('asset://localhost//data/notebooks/nb-001/overview.wav');
+    expect(stub).toHaveTextContent('/data/notebooks/nb-001/overview.wav');
     expect(screen.getByText(/Generated/)).toBeInTheDocument();
   });
 

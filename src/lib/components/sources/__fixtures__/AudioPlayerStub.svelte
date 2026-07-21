@@ -1,8 +1,8 @@
 <!-- Test-only stand-in for AudioPlayer.svelte, used by StudioPanel.svelte.test.ts so
-     that suite can assert on the `src` StudioPanel derives without exercising
+     that suite can assert on the `path` StudioPanel passes without exercising
      AudioPlayer's own playback internals (covered separately). -->
 <script lang="ts">
-  let { src }: { src: string } = $props();
+  let { path }: { path: string } = $props();
 </script>
 
-<div data-testid="audio-player-stub">{src}</div>
+<div data-testid="audio-player-stub">{path}</div>

@@ -56,3 +56,20 @@ export interface ProviderEntry {
 
 /** Full catalog keyed by provider id. (`list_provider_models` returns the inner `Record<string, ModelInfo>`.) */
 export type ModelCatalog = Record<string, ProviderEntry>;
+
+// SYNC-CHECK: must match lens-core/src/llm.rs ActiveModelCandidate. `reason` is `null`
+// exactly when `available` is true.
+export interface ActiveModelCandidate {
+  provider: string;
+  model: string;
+  /** Display label, e.g. "Ollama · llama3.2:3b". */
+  label: string;
+  available: boolean;
+  reason: string | null;
+}
+
+// SYNC-CHECK: must match src-tauri/src/commands/models.rs ActiveModelSelection.
+export interface ActiveModelSelection {
+  active: { provider: string; model: string } | null;
+  candidates: ActiveModelCandidate[];
+}

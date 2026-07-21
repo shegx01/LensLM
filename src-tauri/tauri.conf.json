@@ -25,7 +25,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self' 'sha256-EPB8q+R7chM/2GDPSkscM53/b8eDLk1hpO3spvSAMng='; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost data:; media-src 'self' asset: http://asset.localhost; connect-src 'self' ipc: http://ipc.localhost",
+      "csp": "default-src 'self'; script-src 'self' 'sha256-EPB8q+R7chM/2GDPSkscM53/b8eDLk1hpO3spvSAMng='; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost data:; media-src 'self' asset: http://asset.localhost blob:; connect-src 'self' ipc: http://ipc.localhost asset: http://asset.localhost",
       "assetProtocol": {
         "enable": true,
         "scope": ["$APPDATA/notebooks/**"]

@@ -20,7 +20,7 @@ use crate::config::{ModelConfig, RetrievalConfig, TierThresholds};
 use crate::embedder::Embedder;
 use crate::error::LensError;
 use crate::graph::NotebookGraph;
-use crate::llm::{LlmProvider, LlmRequest, StreamChunk};
+use crate::llm::{LlmProvider, LlmRequest};
 use crate::prompt::{fence_excerpt, fence_nonce};
 use crate::retrieval::Reranker;
 use crate::retrieval::router::{ContextUnit, tiered_search};
@@ -504,28 +504,9 @@ fn build_repair_request(
     )
 }
 
-/// Runs one generation over the streaming path and accumulates the full text; see
-/// `llm::LLM_GENERATION_IDLE_TIMEOUT` for why streaming (not buffered `generate`) is used here.
-async fn generate_full_via_stream(
-    provider: &dyn LlmProvider,
-    req: &LlmRequest,
-) -> Result<String, LensError> {
-    use futures_util::StreamExt;
-    let mut stream = provider.generate_stream(req).await?;
-    let mut text = String::new();
-    while let Some(chunk) = stream.next().await {
-        match chunk? {
-            StreamChunk::TextDelta(t) => text.push_str(&t),
-            StreamChunk::ThinkingDelta(_) => {}
-            StreamChunk::Done { .. } => break,
-        }
-    }
-    Ok(text)
-}
-
 /// The grounded dialogue-script orchestrator. Pure over the owned [`DialogueCtx`] so
 /// the returned future is `Send`. Emits phase markers via `on_phase`, buffers the
-/// full model text before parse/validate, and races the streaming generation against
+/// full model text before parse/validate, and races each buffered generation against
 /// `cancel` so an in-flight call is truly interruptible. Returns the validated script
 /// or a terminal [`LensError`]; never a partial script.
 pub async fn generate_dialogue(
@@ -598,7 +579,7 @@ pub async fn generate_dialogue(
     on_phase(DialoguePhase::Generating);
 
     let resp_text = tokio::select! {
-        r = generate_full_via_stream(&*ctx.provider, &req) => r?,
+        r = ctx.provider.generate(&req) => r?.text,
         _ = cancel.cancelled() => {
             return Err(LensError::Cancelled(CANCELLED_MSG.into()));
         }
@@ -623,7 +604,7 @@ pub async fn generate_dialogue(
                 repairs += 1;
                 let repair = build_repair_request(&prior, &failure, &preset, min_turns);
                 let repaired_text = tokio::select! {
-                    r = generate_full_via_stream(&*ctx.provider, &repair) => r?,
+                    r = ctx.provider.generate(&repair) => r?.text,
                     _ = cancel.cancelled() => {
                         return Err(LensError::Cancelled(CANCELLED_MSG.into()));
                     }
@@ -1022,5 +1003,30 @@ mod tests {
         let mut ids = HashSet::new();
         ids.insert("selected-not-retrieved".to_string());
         assert!(validate_script(&script, &ids, 2).is_ok());
+    }
+
+    #[test]
+    fn parse_then_validate_canonical_object_script_is_ok() {
+        // The canonical shape (#26/#29) the model is asked to return: a bare
+        // `{"turns":[...]}` object with >= the Short floor (8) of alternating
+        // host/guest turns. It must parse AND clear the validator end-to-end.
+        let text = r#"{"turns":[
+            {"speaker":"host","text":"Welcome to today's overview."},
+            {"speaker":"guest","text":"Glad to be here."},
+            {"speaker":"host","text":"Let's start with the main idea."},
+            {"speaker":"guest","text":"Sure — it centers on local-first design."},
+            {"speaker":"host","text":"Why does that matter?"},
+            {"speaker":"guest","text":"It keeps data private and on-device."},
+            {"speaker":"host","text":"Any trade-offs?"},
+            {"speaker":"guest","text":"Mostly the engineering effort up front."}
+        ]}"#;
+        let script = parse_dialogue(text).expect("canonical object script parses");
+        assert_eq!(script.turns.len(), 8);
+        assert_eq!(script.turns[0].speaker, Speaker::Host);
+        assert_eq!(script.turns[1].speaker, Speaker::Guest);
+        assert!(
+            validate_script(&script, &HashSet::new(), 8).is_ok(),
+            "8 alternating ungrounded turns must satisfy the Short floor"
+        );
     }
 }
