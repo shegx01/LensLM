@@ -284,7 +284,7 @@
     {/if}
   {/if}
 
-  <div class="rounded-[10px] border border-border bg-card p-4">
+  <div>
     <p class="text-[0.65rem] font-bold uppercase tracking-[0.08em] text-muted-foreground/70">
       Connection
     </p>
@@ -323,7 +323,7 @@
     </div>
   </div>
 
-  <div class="rounded-[10px] border border-border bg-card p-4">
+  <div>
     <p class="text-[0.65rem] font-bold uppercase tracking-[0.08em] text-muted-foreground/70">
       Voices
     </p>

@@ -33,6 +33,10 @@
   let loaded = $state(false);
   let localForm = $state<{ activate: () => void } | undefined>();
 
+  const selectedCapability = $derived(
+    catalog.find((e) => e.id === selectedEngine)?.language_capability_label ?? ''
+  );
+
   function engineLabel(id: TtsEngineId): string {
     if (id === 'orpheus') return 'Orpheus';
     if (id === 'qwen3_local') return 'Qwen3-TTS';
@@ -111,85 +115,92 @@
   </p>
 
   {#if loaded}
-    <div class="mt-6 flex flex-col gap-4">
-      <div class="flex flex-col gap-2">
-        <p class="text-[0.65rem] font-bold uppercase tracking-[0.08em] text-muted-foreground/70">
-          Engine
-        </p>
-        <div class="flex flex-col gap-1.5" role="radiogroup" aria-label="Text-to-speech engine">
-          {#each catalog as e (e.id)}
-            {@const checked = e.id === selectedEngine}
-            {@const locked = isLocked(e)}
-            {@const pill = rowPill(e)}
-            <button
-              type="button"
-              role="radio"
-              aria-checked={checked}
-              aria-disabled={locked}
-              disabled={locked}
-              onclick={() => pickEngine(e)}
-              class={cn(
-                'flex items-center gap-2.5 rounded-[9px] border px-3 py-2.5 text-left transition-[background-color,border-color,transform] duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
-                !locked && 'active:scale-[0.985]',
-                checked ? 'border-primary/55 bg-primary/8' : 'border-border bg-card hover:bg-muted',
-                locked && 'cursor-not-allowed opacity-60'
-              )}
-            >
-              <span
-                class={cn(
-                  'grid size-[15px] shrink-0 place-items-center rounded-full border-2',
-                  checked ? 'border-primary' : 'border-muted-foreground'
-                )}
-                aria-hidden="true"
-              >
-                {#if checked}
-                  <span class="size-[7px] rounded-full bg-primary"></span>
-                {/if}
-              </span>
-
-              <span class="min-w-0 flex-1">
-                <span class="block truncate text-[0.8rem] font-semibold text-foreground">
-                  {engineLabel(e.id)}
-                </span>
-                <span class="mt-1 flex flex-wrap items-center gap-1.5">
-                  <span
-                    class="rounded-full bg-muted px-1.5 py-px text-[0.58rem] font-bold tracking-[0.02em] text-muted-foreground"
-                  >
-                    {e.language_capability_label}
-                  </span>
-                  {#if locked && e.unavailable_reason}
-                    <span class="text-[0.62rem] text-muted-foreground">{e.unavailable_reason}</span>
-                  {/if}
-                </span>
-              </span>
-
-              {#if pill}
+    <div
+      class="mt-6 grid grid-cols-1 items-start gap-3.5 md:grid-cols-[minmax(200px,0.85fr)_1.15fr]"
+    >
+      <!-- Left rail: engine list (mirrors the Providers rail). Selection = the active engine. -->
+      <div
+        class="no-scrollbar flex max-h-[420px] flex-col gap-1.5 overflow-y-auto"
+        role="radiogroup"
+        aria-label="Text-to-speech engine"
+      >
+        {#each catalog as e (e.id)}
+          {@const checked = e.id === selectedEngine}
+          {@const locked = isLocked(e)}
+          {@const pill = rowPill(e)}
+          <button
+            type="button"
+            role="radio"
+            aria-checked={checked}
+            aria-disabled={locked}
+            disabled={locked}
+            onclick={() => pickEngine(e)}
+            class={cn(
+              'flex w-full items-center gap-2.5 rounded-[10px] border px-3 py-2.5 text-left transition-[background-color,border-color,transform] duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+              !locked && 'active:scale-[0.98]',
+              checked ? 'border-primary/40 bg-primary/10' : 'border-transparent hover:bg-muted',
+              locked && 'cursor-not-allowed opacity-60'
+            )}
+          >
+            <span class="min-w-0 flex-1">
+              <span class="flex items-center gap-2 text-[0.8rem] font-bold text-foreground">
                 <span
                   class={cn(
-                    'shrink-0 rounded-full px-1.5 py-px text-[0.58rem] font-bold uppercase tracking-[0.05em]',
-                    pill.tone === 'active' && 'bg-primary text-primary-foreground',
-                    pill.tone === 'setup' && 'bg-muted-foreground/15 text-muted-foreground',
-                    pill.tone === 'off' && 'bg-muted-foreground/10 text-muted-foreground/60'
+                    'size-[7px] shrink-0 rounded-full',
+                    e.id === activeEngine ? 'bg-primary' : 'bg-muted-foreground/50'
                   )}
-                >
-                  {pill.text}
-                </span>
-              {/if}
-            </button>
-          {/each}
-        </div>
+                  aria-hidden="true"
+                ></span>
+                <span class="truncate">{engineLabel(e.id)}</span>
+                {#if pill}
+                  <span
+                    class={cn(
+                      'shrink-0 rounded-full px-1.5 py-px text-[0.58rem] font-bold uppercase tracking-[0.05em]',
+                      pill.tone === 'active' && 'bg-primary text-primary-foreground',
+                      pill.tone === 'setup' && 'bg-muted-foreground/15 text-muted-foreground',
+                      pill.tone === 'off' && 'bg-muted-foreground/10 text-muted-foreground/60'
+                    )}
+                  >
+                    {pill.text}
+                  </span>
+                {/if}
+              </span>
+              <span class="mt-px block truncate text-[0.68rem] text-muted-foreground">
+                {locked && e.unavailable_reason
+                  ? e.unavailable_reason
+                  : e.language_capability_label}
+              </span>
+            </span>
+          </button>
+        {/each}
       </div>
 
-      <!-- Both forms stay mounted; visibility toggles via `active` so switching engines
+      <!-- Right detail panel for the selected engine (mirrors the Providers detail panel).
+           Both child forms stay mounted (visibility via `active`) so switching engines
            never drops typed-but-unsaved state or an in-flight download. -->
-      <LocalTtsForm
-        bind:this={localForm}
-        bind:catalog
-        engine={selectedLocalEngine}
-        active={selectedEngine !== 'cloud'}
-        onactivated={onActivated}
-      />
-      <CloudTtsForm bind:catalog active={selectedEngine === 'cloud'} onactivated={onActivated} />
+      <div class="rounded-xl border border-border bg-card p-[18px]">
+        <div class="min-w-0">
+          <div class="truncate text-[0.95rem] font-extrabold text-foreground">
+            {engineLabel(selectedEngine)}
+          </div>
+          <div class="text-[0.7rem] text-muted-foreground">{selectedCapability}</div>
+        </div>
+
+        <div class="mt-4">
+          <LocalTtsForm
+            bind:this={localForm}
+            bind:catalog
+            engine={selectedLocalEngine}
+            active={selectedEngine !== 'cloud'}
+            onactivated={onActivated}
+          />
+          <CloudTtsForm
+            bind:catalog
+            active={selectedEngine === 'cloud'}
+            onactivated={onActivated}
+          />
+        </div>
+      </div>
     </div>
   {/if}
 </section>

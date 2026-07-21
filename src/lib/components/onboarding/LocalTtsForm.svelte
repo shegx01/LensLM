@@ -302,7 +302,7 @@
   class={cn('flex flex-col gap-4', !active && 'hidden')}
 >
   {#if !downloaded}
-    <div class="rounded-[10px] border border-border bg-card p-4">
+    <div>
       <p class="text-pretty text-[0.72rem] leading-relaxed text-muted-foreground">
         This open-weight engine runs entirely on-device. Download once — no internet required for
         synthesis.
@@ -353,7 +353,7 @@
       Couldn't load voices — is the engine installed?
     </p>
   {:else}
-    <div class="rounded-[10px] border border-border bg-card p-4">
+    <div>
       <p class="text-[0.65rem] font-bold uppercase tracking-[0.08em] text-muted-foreground/70">
         Voices
       </p>
