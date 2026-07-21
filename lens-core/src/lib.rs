@@ -34,6 +34,7 @@ pub mod notes;
 pub mod parse;
 pub mod paths;
 pub(crate) mod prompt;
+pub mod relocate;
 pub mod render;
 pub mod resolution;
 pub mod retrieval;
@@ -1095,6 +1096,58 @@ impl LensEngine {
         })
         .await
         .map_err(|e| LensError::Internal(format!("clear_model_cache task join failed: {e}")))?
+    }
+
+    /// Copies the data dir to `to`, verifies the snapshot, and rewrites absolute-path
+    /// DB columns in the copy (#238). Holds `ingest_lock` so no ingest/embed/purge runs
+    /// during the copy. The live pool is untouched — the caller writes the anchor
+    /// pointer and prompts a restart, after which [`crate::relocate::resolve_data_dir`]
+    /// re-points the engine. Returns the current (old) data dir so the caller can record
+    /// it for cleanup.
+    pub async fn relocate_data_dir(
+        &self,
+        to: &std::path::Path,
+    ) -> Result<std::path::PathBuf, LensError> {
+        let _permit = self
+            .ingest_lock()
+            .acquire()
+            .await
+            .map_err(|e| LensError::Internal(format!("ingest semaphore closed: {e}")))?;
+        let from = self.data_dir().await;
+        let pool = self.pool().await;
+        crate::relocate::relocate_data_dir(&pool, &from, to).await?;
+        Ok(from)
+    }
+
+    /// Moves the model cache to `to_cache_root` (offload, #238) or, when `to_cache_root`
+    /// is `None`, back under the data dir (reset). Persists `paths.cache_dir` and applies
+    /// it in-memory so subsequent model loads resolve under the new root. Holds
+    /// `ingest_lock` so no embed runs mid-move. Returns bytes moved.
+    pub async fn offload_cache(
+        &self,
+        to_cache_root: Option<&std::path::Path>,
+    ) -> Result<u64, LensError> {
+        let _permit = self
+            .ingest_lock()
+            .acquire()
+            .await
+            .map_err(|e| LensError::Internal(format!("ingest semaphore closed: {e}")))?;
+        let data_dir = self.data_dir().await;
+        let mut config = self.config().await;
+        let from = config.cache_root(&data_dir);
+        let to = to_cache_root
+            .map(|p| p.to_path_buf())
+            .unwrap_or(data_dir.clone());
+        let moved = {
+            let to = to.clone();
+            tokio::task::spawn_blocking(move || crate::relocate::offload_cache(&from, &to))
+                .await
+                .map_err(|e| LensError::Internal(format!("offload task join failed: {e}")))??
+        };
+        config.paths.cache_dir = to_cache_root.map(|p| p.display().to_string());
+        config.save(&data_dir)?;
+        self.set_config(config).await;
+        Ok(moved)
     }
 
     /// Returns the per-notebook write lock, creating it on first use. The enrichment

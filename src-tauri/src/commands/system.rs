@@ -62,6 +62,62 @@ pub async fn clear_model_cache(engine: tauri::State<'_, LensEngine>) -> Result<u
     engine.clear_model_cache().await
 }
 
+/// Relocates the engine's data dir to `new_path` (#238), then persists the
+/// relocation pointer under the fixed anchor so the next boot resolves there.
+/// The pointer is written ONLY after the engine copy+verify succeeds; the frontend
+/// then calls [`restart_app`]. `cleanup` records the old dir for boot-time GC.
+#[tracing::instrument(skip_all)]
+#[tauri::command(rename_all = "snake_case")]
+pub async fn relocate_data_dir(
+    engine: tauri::State<'_, LensEngine>,
+    app: tauri::AppHandle,
+    new_path: String,
+) -> Result<(), LensError> {
+    let to = std::path::PathBuf::from(&new_path);
+    let from = engine.relocate_data_dir(&to).await?;
+    let anchor = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| LensError::Io(e.to_string()))?;
+    lens_core::relocate::write_location(
+        &anchor,
+        &lens_core::relocate::DataLocation {
+            data_dir: new_path,
+            cleanup: Some(from.display().to_string()),
+        },
+    )?;
+    Ok(())
+}
+
+/// Moves the model cache to `new_path` (#238); returns bytes moved. `HF_HOME` is
+/// startup-bound, so the sidecar picks up the new cache only after a restart.
+#[tracing::instrument(skip_all)]
+#[tauri::command(rename_all = "snake_case")]
+pub async fn offload_cache(
+    engine: tauri::State<'_, LensEngine>,
+    new_path: String,
+) -> Result<u64, LensError> {
+    engine
+        .offload_cache(Some(std::path::Path::new(&new_path)))
+        .await
+}
+
+/// Resets the model cache back under the data dir (#238); returns bytes moved.
+#[tracing::instrument(skip_all)]
+#[tauri::command]
+pub async fn reset_cache_location(engine: tauri::State<'_, LensEngine>) -> Result<u64, LensError> {
+    engine.offload_cache(None).await
+}
+
+/// Restarts the app so a data-dir relocation / cache offload is re-resolved from
+/// the boot path. `AppHandle::restart` diverges (returns `!`), so control never
+/// reaches the implicit `Ok`.
+#[tracing::instrument(skip_all)]
+#[tauri::command]
+pub async fn restart_app(app: tauri::AppHandle) -> Result<(), LensError> {
+    app.restart();
+}
+
 /// Runs the three onboarding readiness gates (LLM runtime, embedding model,
 /// text-to-speech) and returns the ordered results for the system-check screen.
 /// On Apple Silicon, Qwen3Local readiness is finalized by [`override_qwen_tts_readiness`].
@@ -91,7 +147,9 @@ fn override_qwen_tts_readiness(
     if !matches!(config.tts.backend, lens_core::TtsBackend::Qwen3Local) {
         return Ok(());
     }
-    let paths = crate::qwen::sidecar_paths(app)?;
+    let data_dir = std::path::PathBuf::from(&config.paths.data_dir);
+    let cache_root = config.cache_root(&data_dir);
+    let paths = crate::qwen::sidecar_paths(app, &data_dir, &cache_root)?;
     downgrade_tts_if_qwen_snapshot_absent(checks, &paths.hf_cache_dir);
     Ok(())
 }
@@ -253,7 +311,10 @@ pub async fn tts_model_status(
 ) -> Result<TtsModelStatus, LensError> {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if engine == "qwen3_local" {
-        let paths = crate::qwen::sidecar_paths(&app)?;
+        let config = lens_engine.config().await;
+        let data_dir = std::path::PathBuf::from(&config.paths.data_dir);
+        let cache_root = config.cache_root(&data_dir);
+        let paths = crate::qwen::sidecar_paths(&app, &data_dir, &cache_root)?;
         return Ok(if crate::qwen::qwen_snapshot_present(&paths.hf_cache_dir) {
             TtsModelStatus::Complete
         } else if crate::qwen::qwen_snapshot_dir_present(&paths.hf_cache_dir) {
@@ -286,9 +347,13 @@ pub async fn tts_model_status(
 pub async fn prepare_qwen_model(
     on_progress: Channel<DownloadProgress>,
     app: tauri::AppHandle,
+    engine: tauri::State<'_, LensEngine>,
     coordinator: tauri::State<'_, crate::qwen::QwenPrepareCoordinator>,
 ) -> Result<(), LensError> {
-    let paths = crate::qwen::sidecar_paths(&app)?;
+    let config = engine.config().await;
+    let data_dir = std::path::PathBuf::from(&config.paths.data_dir);
+    let cache_root = config.cache_root(&data_dir);
+    let paths = crate::qwen::sidecar_paths(&app, &data_dir, &cache_root)?;
     let resolver = crate::qwen::spawn_resolver(&paths);
     // Route through the single-flight coordinator (#202): concurrent callers
     // coalesce to one download, and the prepare is cancellable via `cancel_prepare`.

@@ -176,6 +176,12 @@ fn path_size_bytes(path: &Path) -> Result<u64, LensError> {
     Ok(total)
 }
 
+/// Recursive byte size of a single path (symlink-skipping); a missing path is 0.
+/// Shared with relocation/offload accounting (#238).
+pub(crate) fn dir_size_bytes(path: &Path) -> Result<u64, LensError> {
+    path_size_bytes(path)
+}
+
 fn sum_paths(paths: &[PathBuf]) -> Result<u64, LensError> {
     let mut total = 0u64;
     for path in paths {
