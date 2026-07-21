@@ -10,6 +10,7 @@
     "dialog:allow-save",
     "fs:allow-write-text-file",
     "clipboard-manager:allow-write-text",
+    "opener:allow-reveal-item-in-dir",
     {
       "identifier": "opener:allow-open-url",
       "allow": [{ "url": "https://*" }]

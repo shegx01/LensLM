@@ -35,6 +35,7 @@ pub(crate) mod prompt;
 pub mod render;
 pub mod resolution;
 pub mod retrieval;
+pub mod storage;
 pub mod system_check;
 pub mod transcription;
 pub mod tts;
@@ -107,6 +108,7 @@ pub use retrieval::router::{ContextUnit, Provenance, RouterOutput, Tier, tiered_
 #[cfg(feature = "test-util")]
 pub use retrieval::router::RESERVED_OUTPUT;
 pub use retrieval::{HitSource, Reranker, RetrievalHit, hybrid_search};
+pub use storage::StorageStats;
 pub use system_check::{
     ALLOWED_EMBEDDING_MODELS, CheckAction, CheckId, CheckResult, CheckStatus, LlmDetection,
     ModelValidation, detect_llm, fastembed_weights_cached, is_allowlisted_embedding_id,
@@ -1045,6 +1047,45 @@ impl LensEngine {
 
     pub(crate) fn ingest_lock(&self) -> &Arc<Semaphore> {
         &self.ingest_lock
+    }
+
+    /// Byte-usage breakdown of the data directory (corpus / reclaimable cache /
+    /// retained). Read-only. The recursive fs walk runs under `spawn_blocking`
+    /// so a multi-GB directory never blocks an async executor thread; missing
+    /// dirs on a fresh install read as 0.
+    pub async fn storage_stats(&self) -> Result<StorageStats, LensError> {
+        let data_dir = self.data_dir().await;
+        let embedding_model = self.config().await.embedding_model;
+        tokio::task::spawn_blocking(move || {
+            crate::storage::storage_stats_blocking(&data_dir, &embedding_model)
+        })
+        .await
+        .map_err(|e| LensError::Internal(format!("storage_stats task join failed: {e}")))?
+    }
+
+    /// Deletes only re-downloadable model bundles (voice + ASR weights and any
+    /// non-active embedding model) and returns the bytes freed. The DB, vectors,
+    /// sources, notebooks, the active embedding model, and the model catalog are
+    /// left intact.
+    ///
+    /// Invariant: the cache must not be cleared while a model is actively loaded
+    /// for ingest/embed. We hold `ingest_lock` across the delete so it cannot
+    /// race an in-flight ingest — the only engine primitive that serializes
+    /// model use. TTS/ASR generation has no in-flight guard, so the Storage panel
+    /// additionally disables this action while any generation runs (AC-S7).
+    pub async fn clear_model_cache(&self) -> Result<u64, LensError> {
+        let _permit = self
+            .ingest_lock()
+            .acquire()
+            .await
+            .map_err(|e| LensError::Internal(format!("ingest semaphore closed: {e}")))?;
+        let data_dir = self.data_dir().await;
+        let embedding_model = self.config().await.embedding_model;
+        tokio::task::spawn_blocking(move || {
+            crate::storage::clear_model_cache_blocking(&data_dir, &embedding_model)
+        })
+        .await
+        .map_err(|e| LensError::Internal(format!("clear_model_cache task join failed: {e}")))?
     }
 
     /// Returns the per-notebook write lock, creating it on first use. The enrichment

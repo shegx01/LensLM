@@ -22,4 +22,14 @@ describe('PreferencesShell deep-link (AC-7)', () => {
     render(PreferencesShell);
     expect(await screen.findByRole('heading', { name: 'Embeddings' })).toBeInTheDocument();
   });
+
+  it.each([
+    ['storage', 'Storage'],
+    ['privacy', 'Privacy'],
+    ['shortcuts', 'Shortcuts']
+  ])('renders the %s panel when deep-linked (issue #32)', async (section, heading) => {
+    notebookStore.openSettings(section);
+    render(PreferencesShell);
+    expect(await screen.findByRole('heading', { name: heading })).toBeInTheDocument();
+  });
 });

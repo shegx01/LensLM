@@ -277,7 +277,7 @@
     <p class="text-[0.65rem] font-bold uppercase tracking-[0.08em] text-muted-foreground/70">
       Select your local embeddings provider
     </p>
-    <div class="mt-2.5 grid grid-cols-2 gap-2" role="radiogroup" aria-label="Embeddings provider">
+    <div class="mt-3 grid grid-cols-2 gap-2" role="radiogroup" aria-label="Embeddings provider">
       {#each providers as p (p.id)}
         {@const isSel = backend === p.id}
         <button
@@ -288,7 +288,7 @@
           disabled={pickerDisabled}
           onclick={() => pickBackend(p.id as EmbeddingBackend)}
           class={cn(
-            'rounded-lg border px-3 text-sm font-semibold transition-[color,background-color,border-color,transform] duration-150',
+            'rounded-[10px] border px-3 text-[0.78rem] font-bold transition-[color,background-color,border-color,transform] duration-150',
             compact ? 'h-9' : 'h-10',
             'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
             isSel
@@ -312,7 +312,7 @@
   <p class="mt-6 text-[0.65rem] font-bold uppercase tracking-[0.08em] text-muted-foreground/70">
     Embedding model
   </p>
-  <div class="mt-2.5 flex flex-col gap-1.5" role="radiogroup" aria-label="Embedding model">
+  <div class="mt-3 flex flex-col gap-1.5" role="radiogroup" aria-label="Embedding model">
     {#each filteredModels as model (model.id)}
       {@const isSelected = selectedModel === model.id}
       {@const isReady = installed.has(model.id)}
