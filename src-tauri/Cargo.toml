@@ -45,6 +45,9 @@ tauri-plugin-fs = "2"
 tauri-plugin-clipboard-manager = "2"
 # Persist the main window's size/position across restarts (Tauri 2.x plugin).
 tauri-plugin-window-state = "2"
+# Open external provider-doc URLs in the system browser; a webview `<a href>` does
+# not escape to the OS browser. Scoped to `https://` in capabilities/default.json.
+tauri-plugin-opener = "2"
 # `#[async_trait]` to implement lens-core's `JsRenderer` trait (issue #78).
 async-trait = "0.1"
 # `FutureExt::catch_unwind` so a panic in the untrusted-JS render body still

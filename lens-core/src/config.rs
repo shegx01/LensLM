@@ -17,6 +17,9 @@ use crate::tts::{CloudTtsKind, TtsBackend};
 const CONFIG_FILE_NAME: &str = "config.json";
 
 /// Per-provider model endpoint configuration (LLM or embedding backend).
+/// An entry MAY be credential-only (`model: ""`): "entry present" means provider
+/// credentials are configured, not necessarily that a model was chosen. All resolution
+/// gates already tolerate this by returning `None` for an empty model.
 /// `Debug` is manual so `api_key` is redacted in logs (`"***"` or `""`).
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModelConfig {
@@ -805,6 +808,52 @@ mod tests {
         config.save(dir.path()).unwrap();
         let loaded = AppConfig::load(dir.path()).unwrap();
         assert_eq!(loaded.embedding_model, "nomic-embed-text");
+    }
+
+    // A-T1: a credential-only entry (empty model) survives save → load intact.
+    #[test]
+    fn credential_only_model_config_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = AppConfig {
+            models: vec![ModelConfig {
+                provider: "anthropic".to_string(),
+                base_url: String::new(),
+                model: String::new(),
+                context: 8192,
+                temperature: 0.7,
+                api_key: "sk-credential-only".to_string(),
+            }],
+            ..AppConfig::default()
+        };
+        config.save(dir.path()).unwrap();
+        let loaded = AppConfig::load(dir.path()).unwrap();
+        assert_eq!(loaded.models.len(), 1);
+        let entry = &loaded.models[0];
+        assert_eq!(entry.provider, "anthropic");
+        assert_eq!(entry.model, "", "model stays empty");
+        assert_eq!(entry.context, 8192);
+        assert_eq!(entry.temperature, 0.7);
+        assert_eq!(entry.api_key, "sk-credential-only");
+    }
+
+    // A-T3: a large context value survives save → load.
+    #[test]
+    fn model_config_context_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = AppConfig {
+            models: vec![ModelConfig {
+                provider: "ollama".to_string(),
+                base_url: "http://localhost:11434".to_string(),
+                model: "llama3".to_string(),
+                context: 200_000,
+                temperature: 0.5,
+                api_key: String::new(),
+            }],
+            ..AppConfig::default()
+        };
+        config.save(dir.path()).unwrap();
+        let loaded = AppConfig::load(dir.path()).unwrap();
+        assert_eq!(loaded.models[0].context, 200_000);
     }
 
     #[test]

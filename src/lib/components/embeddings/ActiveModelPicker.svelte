@@ -9,7 +9,13 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import CircleAlert from '@lucide/svelte/icons/circle-alert';
-  import { SELECT_CLASS } from '$lib/components/onboarding/styles.js';
+  import {
+    Select,
+    SelectTrigger,
+    SelectValue,
+    SelectContent,
+    SelectItem
+  } from '$lib/components/ui/select/index.js';
   import { setActiveChatModel } from '$lib/models/catalog.js';
   import { activeModelStore, refreshActiveModel } from '$lib/models/active-model.svelte.js';
 
@@ -48,8 +54,8 @@
 
   const unavailableCandidates = $derived(candidates.filter((c) => !c.available));
 
-  // Every value the <select> can hold. A native <select> silently shows its first option
-  // when its value matches none — so the bound value must always be in this set.
+  // Every value the Select can hold. The bound value must always be in this set, or it
+  // resolves to no item (showing the placeholder) instead of the intended pin.
   const optionValues = $derived(
     new Set<string>([
       ...(active === null ? [''] : []),
@@ -65,12 +71,30 @@
     return selectedValue;
   });
 
+  // The item set bits-ui resolves the trigger label from — candidates plus the stale pin,
+  // each carrying its disabled state so unavailable picks stay selectable-disabled.
+  const selectItems = $derived([
+    ...candidates.map((c) => ({
+      value: keyOf(c.provider, c.model),
+      label: c.label,
+      disabled: !c.available
+    })),
+    ...(staleActive
+      ? [
+          {
+            value: keyOf(staleActive.provider, staleActive.model),
+            label: `${staleActive.provider} · ${staleActive.model} — no longer available`,
+            disabled: true
+          }
+        ]
+      : [])
+  ]);
+
   onMount(() => {
     void refreshActiveModel();
   });
 
-  async function onSelectChange(e: Event): Promise<void> {
-    const value = (e.currentTarget as HTMLSelectElement).value;
+  async function onSelectChange(value: string): Promise<void> {
     if (value === selectedValue) return;
     error = null;
     pending = true;
@@ -103,32 +127,33 @@
       No models configured yet — set one up below, then pick it here.
     </p>
   {:else}
-    <select
-      id="active-model-select"
-      aria-label="Active model"
+    <Select
+      type="single"
       value={boundValue}
-      onchange={(e) => void onSelectChange(e)}
+      onValueChange={(v) => {
+        if (v) void onSelectChange(v);
+      }}
       disabled={pending}
-      class={SELECT_CLASS}
+      items={selectItems}
     >
-      {#if active === null}
-        <option value="" disabled hidden>None selected — pick a model</option>
-      {/if}
-      {#each candidates as c (keyOf(c.provider, c.model))}
-        <option
-          value={keyOf(c.provider, c.model)}
-          disabled={!c.available}
-          title={c.available ? undefined : (c.reason ?? undefined)}
-        >
-          {c.label}
-        </option>
-      {/each}
-      {#if staleActive}
-        <option value={keyOf(staleActive.provider, staleActive.model)} disabled>
-          {staleActive.provider} · {staleActive.model} — no longer available
-        </option>
-      {/if}
-    </select>
+      <SelectTrigger id="active-model-select" class="w-full" aria-label="Active model">
+        <SelectValue placeholder="None selected — pick a model" />
+      </SelectTrigger>
+      <SelectContent
+        class="origin-(--bits-select-content-transform-origin) duration-200 ease-[cubic-bezier(0.23,1,0.32,1)]"
+      >
+        {#each candidates as c (keyOf(c.provider, c.model))}
+          <SelectItem value={keyOf(c.provider, c.model)} label={c.label} disabled={!c.available}>
+            {c.label}
+          </SelectItem>
+        {/each}
+        {#if staleActive}
+          <SelectItem value={keyOf(staleActive.provider, staleActive.model)} disabled>
+            {staleActive.provider} · {staleActive.model} — no longer available
+          </SelectItem>
+        {/if}
+      </SelectContent>
+    </Select>
 
     {#if unavailableCandidates.length > 0}
       <ul class="flex flex-col gap-0.5 text-[0.7rem] text-muted-foreground">

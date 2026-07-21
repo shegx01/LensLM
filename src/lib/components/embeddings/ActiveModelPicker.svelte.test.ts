@@ -1,4 +1,4 @@
-import { render, screen, fireEvent, waitFor, within } from '@testing-library/svelte';
+import { render, screen, fireEvent, waitFor } from '@testing-library/svelte';
 import { mockIPC, clearMocks } from '@tauri-apps/api/mocks';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { ActiveModelSelection } from '$lib/models/types.js';
@@ -54,11 +54,11 @@ describe('ActiveModelPicker', () => {
 
     render(ActiveModelPicker);
 
-    const select = await screen.findByLabelText('Active model');
-    expect(
-      within(select).getByRole('option', { name: 'Ollama · llama3.2:3b' })
-    ).toBeInTheDocument();
-    expect(within(select).getByRole('option', { name: 'OpenAI · gpt-4o' })).toBeInTheDocument();
+    const trigger = await screen.findByLabelText('Active model');
+    await fireEvent.keyDown(trigger, { key: 'Enter' });
+
+    expect(await screen.findByRole('option', { name: 'Ollama · llama3.2:3b' })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: 'OpenAI · gpt-4o' })).toBeInTheDocument();
   });
 
   it('disables unavailable candidates and surfaces the reason as help text', async () => {
@@ -84,9 +84,12 @@ describe('ActiveModelPicker', () => {
 
     render(ActiveModelPicker);
 
-    const select = await screen.findByLabelText('Active model');
-    const option = within(select).getByRole('option', { name: 'OpenAI · gpt-4o' });
-    expect(option).toBeDisabled();
+    const trigger = await screen.findByLabelText('Active model');
+    await fireEvent.keyDown(trigger, { key: 'Enter' });
+
+    const option = await screen.findByRole('option', { name: 'OpenAI · gpt-4o' });
+    expect(option).toHaveAttribute('data-disabled');
+    // The reason is surfaced independently in the help list below the picker.
     expect(screen.getByText('OpenAI · gpt-4o — cloud consent required')).toBeInTheDocument();
   });
 
@@ -112,15 +115,18 @@ describe('ActiveModelPicker', () => {
     });
 
     render(ActiveModelPicker);
-    const select = await screen.findByLabelText('Active model');
 
-    await fireEvent.change(select, { target: { value: 'openai gpt-4o' } });
+    const trigger = await screen.findByLabelText('Active model');
+    await fireEvent.keyDown(trigger, { key: 'Enter' });
+
+    const option = await screen.findByRole('option', { name: 'OpenAI · gpt-4o' });
+    await fireEvent.pointerUp(option);
 
     await waitFor(() => expect(calls.setActiveCalls).toHaveLength(1));
     expect(calls.setActiveCalls[0]).toEqual({ provider: 'openai', model: 'gpt-4o' });
   });
 
-  it('reflects the active pin as the selected option', async () => {
+  it('reflects the active pin on the trigger', async () => {
     setup({
       active: { provider: 'openai', model: 'gpt-4o' },
       candidates: [
@@ -142,9 +148,9 @@ describe('ActiveModelPicker', () => {
     });
 
     render(ActiveModelPicker);
-    const select = (await screen.findByLabelText('Active model')) as HTMLSelectElement;
+    const trigger = await screen.findByLabelText('Active model');
 
-    await waitFor(() => expect(select.value).toBe('openai gpt-4o'));
+    await waitFor(() => expect(trigger).toHaveTextContent('OpenAI · gpt-4o'));
     expect(
       screen.queryByText(/without a pin|active model is unavailable/i)
     ).not.toBeInTheDocument();
@@ -165,17 +171,20 @@ describe('ActiveModelPicker', () => {
     });
 
     render(ActiveModelPicker);
-    const select = (await screen.findByLabelText('Active model')) as HTMLSelectElement;
+    const trigger = await screen.findByLabelText('Active model');
 
-    // The select shows the stale pin's own option, never a silent fallback to the first
+    // The trigger shows the stale pin's own label, never a silent fallback to the first
     // candidate.
-    await waitFor(() => expect(select.value).toBe('openai gpt-4o'));
-    expect(select.value).not.toBe('ollama llama3.2:3b');
+    await waitFor(() =>
+      expect(trigger).toHaveTextContent(/openai · gpt-4o — no longer available/i)
+    );
+    expect(trigger).not.toHaveTextContent('llama3.2:3b');
 
-    const staleOption = within(select).getByRole('option', {
+    await fireEvent.keyDown(trigger, { key: 'Enter' });
+    const staleOption = await screen.findByRole('option', {
       name: /openai · gpt-4o — no longer available/i
     });
-    expect(staleOption).toBeDisabled();
+    expect(staleOption).toHaveAttribute('data-disabled');
     expect(screen.getByText(/active model is unavailable.*choose another/i)).toBeInTheDocument();
   });
 
@@ -194,9 +203,9 @@ describe('ActiveModelPicker', () => {
     });
 
     render(ActiveModelPicker);
-    const select = (await screen.findByLabelText('Active model')) as HTMLSelectElement;
+    const trigger = await screen.findByLabelText('Active model');
 
-    await waitFor(() => expect(select.value).toBe(''));
+    await waitFor(() => expect(trigger).toHaveTextContent(/none selected — pick a model/i));
     expect(screen.getByText(/no chat model configured/i)).toBeInTheDocument();
   });
 });
