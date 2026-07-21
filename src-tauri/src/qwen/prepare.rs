@@ -5,17 +5,19 @@
 use std::path::Path;
 use std::process::Stdio;
 
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::io::BufReader;
 use tokio::process::Command;
 use tokio::time::{Duration, timeout};
+use tokio_util::sync::CancellationToken;
 
 use lens_core::{DownloadProgress, LensError};
 
-use super::{MAX_REPLY_BYTES, SpawnResolver, tts_err};
+use super::{MAX_REPLY_BYTES, ReadLineOutcome, SpawnResolver, read_capped_line, tts_err};
 
 /// huggingface_hub's on-disk cache subdir for the Qwen model (under `<hf>/hub`).
 /// Kept in lockstep with the sidecar's `CACHE_SUBDIR`.
-const QWEN_SNAPSHOT_DIR: &str = "models--mlx-community--Qwen3-TTS-12Hz-1.7B-CustomVoice-bf16";
+pub(super) const QWEN_SNAPSHOT_DIR: &str =
+    "models--mlx-community--Qwen3-TTS-12Hz-1.7B-CustomVoice-bf16";
 
 /// Ceiling on the whole prepare download; matches the serve handshake budget
 /// (~4.5 GB over a modest link).
@@ -38,7 +40,11 @@ struct PrepareProgress {
 /// Drives the one-shot `--prepare` sidecar, forwarding streamed byte progress to
 /// `on_progress` then a terminal `done:true`. Reuses the serve resolver, appending
 /// `--prepare`; every failure maps to a detail-free [`LensError::Tts`].
-pub async fn run_prepare<F>(resolver: SpawnResolver, mut on_progress: F) -> Result<(), LensError>
+pub async fn run_prepare<F>(
+    resolver: SpawnResolver,
+    cancel: CancellationToken,
+    mut on_progress: F,
+) -> Result<(), LensError>
 where
     F: FnMut(DownloadProgress) + Send,
 {
@@ -73,54 +79,68 @@ where
     let stdout = child.stdout.take().ok_or_else(tts_err)?;
     let mut reader = BufReader::new(stdout);
 
-    let outcome = timeout(PREPARE_TIMEOUT, async {
-        let mut last = DownloadProgress {
-            received: 0,
-            total: None,
-            done: false,
-        };
-        let mut line = String::new();
-        loop {
-            line.clear();
-            // Cap each line so a never-newline child can't OOM the host.
-            let n = (&mut reader)
-                .take(MAX_REPLY_BYTES)
-                .read_line(&mut line)
-                .await
-                .map_err(|e| {
-                    tracing::warn!(error = %e, "Qwen prepare read failed");
-                    tts_err()
-                })?;
-            if n == 0 {
-                tracing::warn!("Qwen prepare closed stdout before done (EOF)");
-                return Err(tts_err());
-            }
-            if !line.ends_with('\n') {
-                tracing::warn!(bytes = n, "Qwen prepare line exceeded cap or truncated");
-                return Err(tts_err());
-            }
-            let Ok(msg) = serde_json::from_str::<PrepareLine>(line.trim()) else {
-                // Non-JSON stdout (a stray sidecar log) — ignore and keep reading.
-                continue;
+    let outcome = tokio::select! {
+        biased;
+        res = timeout(PREPARE_TIMEOUT, async {
+            let mut last = DownloadProgress {
+                received: 0,
+                total: None,
+                done: false,
             };
-            if let Some(err) = msg.error {
-                tracing::warn!(error = %err, "Qwen prepare reported error");
-                return Err(tts_err());
-            }
-            if let Some(p) = msg.progress {
-                last = DownloadProgress {
-                    received: p.received,
-                    total: p.total,
-                    done: false,
+            loop {
+                let line = match read_capped_line(&mut reader, MAX_REPLY_BYTES)
+                    .await
+                    .map_err(|e| {
+                        tracing::warn!(error = %e, "Qwen prepare read failed");
+                        tts_err()
+                    })? {
+                    ReadLineOutcome::Line(l) => l,
+                    ReadLineOutcome::Eof => {
+                        tracing::warn!("Qwen prepare closed stdout before done (EOF)");
+                        return Err(tts_err());
+                    }
+                    ReadLineOutcome::OverCap => {
+                        tracing::warn!("Qwen prepare line exceeded cap or truncated");
+                        return Err(tts_err());
+                    }
                 };
-                on_progress(last);
+                let Ok(msg) = serde_json::from_str::<PrepareLine>(line.trim()) else {
+                    // Non-JSON stdout (a stray sidecar log) — ignore and keep reading.
+                    continue;
+                };
+                if let Some(err) = msg.error {
+                    tracing::warn!(error = %err, "Qwen prepare reported error");
+                    return Err(tts_err());
+                }
+                if let Some(p) = msg.progress {
+                    last = DownloadProgress {
+                        received: p.received,
+                        total: p.total,
+                        done: false,
+                    };
+                    on_progress(last);
+                }
+                if msg.done {
+                    return Ok(last);
+                }
             }
-            if msg.done {
-                return Ok(last);
-            }
+        }) => res,
+        // Cancel path mirrors the err/timeout paths: kill and let `kill_on_drop`
+        // reap. `read_line` is not cancel-safe, but we never reuse the reader.
+        _ = cancel.cancelled() => {
+            tracing::info!("Qwen prepare cancelled; killing child");
+            let _ = child.start_kill();
+            return Err(LensError::Cancelled("prepare cancelled".into()));
         }
-    })
-    .await;
+    };
+
+    // Late-`done` race: `biased` polls the read loop first, so a download that
+    // completes at the same instant a cancel arrives wins and counts as success;
+    // only a loop that did NOT complete under an in-flight cancel is Cancelled.
+    if cancel.is_cancelled() && !matches!(outcome, Ok(Ok(_))) {
+        let _ = child.start_kill();
+        return Err(LensError::Cancelled("prepare cancelled".into()));
+    }
 
     let last = match outcome {
         Ok(Ok(last)) => last,
@@ -260,9 +280,11 @@ mod tests {
         );
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink = events.clone();
-        run_prepare(resolver_for(stub), move |p| sink.lock().unwrap().push(p))
-            .await
-            .expect("stub prepare succeeds");
+        run_prepare(resolver_for(stub), CancellationToken::new(), move |p| {
+            sink.lock().unwrap().push(p)
+        })
+        .await
+        .expect("stub prepare succeeds");
 
         let got = events.lock().unwrap().clone();
         assert_eq!(got.len(), 3, "two progress + one done: {got:?}");
@@ -303,7 +325,7 @@ mod tests {
                 "sys.exit(1)\n",
             ),
         );
-        let err = run_prepare(resolver_for(stub), |_| {})
+        let err = run_prepare(resolver_for(stub), CancellationToken::new(), |_| {})
             .await
             .expect_err("sidecar error surfaces");
         assert!(matches!(err, LensError::Tts(_)));
@@ -321,7 +343,7 @@ mod tests {
                 "sys.stdout.flush()\n",
             ),
         );
-        let err = run_prepare(resolver_for(stub), |_| {})
+        let err = run_prepare(resolver_for(stub), CancellationToken::new(), |_| {})
             .await
             .expect_err("EOF before done is an error");
         assert!(matches!(err, LensError::Tts(_)));
@@ -330,7 +352,7 @@ mod tests {
     #[tokio::test]
     async fn run_prepare_resolver_failure_is_tts() {
         let resolver: SpawnResolver = Arc::new(|| Err(tts_err()));
-        let err = run_prepare(resolver, |_| {})
+        let err = run_prepare(resolver, CancellationToken::new(), |_| {})
             .await
             .expect_err("resolver failure surfaces");
         assert!(matches!(err, LensError::Tts(_)));
