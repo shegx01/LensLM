@@ -1,14 +1,14 @@
 <!--
   StorageSection — the "Storage" panel inside the global Preferences view.
-  Read-only data-dir + usage figures via `get_storage_stats`; the only mutation
-  is `clear_model_cache`, which frees re-downloadable models only (never the
-  active embedding model or `models-catalog.json` — see the consensus plan).
+  Read-only data-dir + usage figures via `get_storage_stats`, plus `clear_model_cache`.
 -->
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, onDestroy } from 'svelte';
   import { invoke, isTauri } from '@tauri-apps/api/core';
   import { revealItemInDir } from '@tauri-apps/plugin-opener';
   import { writeText } from '@tauri-apps/plugin-clipboard-manager';
+  import { audioOverviewStore } from '$lib/sources/audio-state.svelte.js';
+  import { formatBytes } from '$lib/format/bytes.js';
   import { Button } from '$lib/components/ui/button/index.js';
   import {
     Dialog,
@@ -79,27 +79,23 @@
     clearError = null;
     try {
       await invoke<number>('clear_model_cache');
-      await loadStats();
     } catch (err) {
       clearError = err instanceof Error ? err.message : 'Could not clear the model cache.';
+      return;
     } finally {
       clearing = false;
     }
+    // A failed refetch after a successful clear must not report the clear as failed.
+    try {
+      await loadStats();
+    } catch (err) {
+      console.error('StorageSection: stats refetch after clear failed', err);
+    }
   }
 
-  /** Format a byte count: `0 B`, `842 KB`, `1.3 GB`. */
-  function formatBytes(bytes: number): string {
-    if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
-    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-    let value = bytes;
-    let unit = 0;
-    while (value >= 1024 && unit < units.length - 1) {
-      value /= 1024;
-      unit += 1;
-    }
-    const precision = unit === 0 ? 0 : 1;
-    return `${value.toFixed(precision)} ${units[unit]}`;
-  }
+  onDestroy(() => {
+    if (copiedTimer) clearTimeout(copiedTimer);
+  });
 </script>
 
 <section class="flex flex-col" aria-label="Storage settings">
@@ -212,10 +208,16 @@
       variant="destructive"
       class="mt-4 h-10 w-full"
       onclick={() => (confirmOpen = true)}
-      disabled={clearing || !stats}
+      disabled={clearing || !stats || audioOverviewStore.overviewStatus === 'generating'}
     >
-      {clearing ? 'Clearing…' : 'Clear downloaded voice/ASR models'}
+      {clearing ? 'Clearing…' : 'Clear reclaimable model cache'}
     </Button>
+
+    {#if audioOverviewStore.overviewStatus === 'generating'}
+      <p class="mt-2 text-[0.72rem] text-muted-foreground">
+        Unavailable while an audio overview is generating.
+      </p>
+    {/if}
 
     {#if clearError}
       <p class="mt-2 text-[0.72rem] text-destructive" role="alert">{clearError}</p>

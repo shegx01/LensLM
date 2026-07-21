@@ -81,7 +81,7 @@ describe('StorageSection', () => {
     await waitFor(() => expect(screen.getByText(/1\.4 GB/)).toBeInTheDocument());
 
     const clearButton = await screen.findByRole('button', {
-      name: /clear downloaded voice\/asr models/i
+      name: /clear reclaimable model cache/i
     });
     await fireEvent.click(clearButton);
 

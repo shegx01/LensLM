@@ -1063,16 +1063,9 @@ impl LensEngine {
         .map_err(|e| LensError::Internal(format!("storage_stats task join failed: {e}")))?
     }
 
-    /// Deletes only re-downloadable model bundles (voice + ASR weights and any
-    /// non-active embedding model) and returns the bytes freed. The DB, vectors,
-    /// sources, notebooks, the active embedding model, and the model catalog are
-    /// left intact.
-    ///
-    /// Invariant: the cache must not be cleared while a model is actively loaded
-    /// for ingest/embed. We hold `ingest_lock` across the delete so it cannot
-    /// race an in-flight ingest — the only engine primitive that serializes
-    /// model use. TTS/ASR generation has no in-flight guard, so the Storage panel
-    /// additionally disables this action while any generation runs (AC-S7).
+    /// Invariant: holds `ingest_lock` so it can't race an in-flight ingest/embed; the
+    /// Storage panel disables it while an audio overview generates; a concurrent raw ASR
+    /// transcription is unguarded but at worst re-downloads its model afterward (no data loss).
     pub async fn clear_model_cache(&self) -> Result<u64, LensError> {
         let _permit = self
             .ingest_lock()

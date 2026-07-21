@@ -46,8 +46,7 @@ pub async fn health_check(engine: tauri::State<'_, LensEngine>) -> Result<Health
     })
 }
 
-/// Byte-usage breakdown of the engine data directory for the Storage settings
-/// panel. Read-only.
+/// Thin wrapper over [`LensEngine::storage_stats`].
 #[tracing::instrument(skip_all)]
 #[tauri::command]
 pub async fn get_storage_stats(
@@ -56,9 +55,7 @@ pub async fn get_storage_stats(
     engine.storage_stats().await
 }
 
-/// Clears the re-downloadable model cache (voice/ASR + inactive embedding
-/// models) and returns the bytes freed. Never touches corpus data or the active
-/// embedding model.
+/// Thin wrapper over [`LensEngine::clear_model_cache`].
 #[tracing::instrument(skip_all)]
 #[tauri::command]
 pub async fn clear_model_cache(engine: tauri::State<'_, LensEngine>) -> Result<u64, LensError> {

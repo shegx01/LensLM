@@ -25,12 +25,21 @@
 
   const anyActive = $derived(egressRows.some((row) => row.active));
 
+  /** True when `url` is a non-empty base URL that is not a loopback host. */
+  function isRemoteUrl(url: string | undefined): boolean {
+    const u = url?.trim() ?? '';
+    if (u === '') return false;
+    return !/(^|\/\/)(localhost|127\.0\.0\.1)([:/]|$)/i.test(u);
+  }
+
   /** Cloud LLM egress: active when the pinned chat model belongs to a non-local provider. */
   function llmEgress(cfg: AppConfig): EgressRow {
     const pin = cfg.enrichment?.chat_model;
     const descriptor = pin ? providerDescriptors().find((d) => d.id === pin.provider) : undefined;
-    const active = descriptor != null && descriptor.kind !== 'local';
     const entry = pin ? cfg.models?.find((m) => m.provider === pin.provider) : undefined;
+    // Fail safe for a privacy surface: a known provider follows its descriptor kind,
+    // but an unknown provider counts as active cloud egress if its base_url is remote.
+    const active = descriptor != null ? descriptor.kind !== 'local' : isRemoteUrl(entry?.base_url);
     return {
       label: 'Chat & notes model',
       active,
@@ -82,7 +91,6 @@
       }));
     } catch (err) {
       saveError = err instanceof Error ? err.message : 'Could not save setting.';
-      // Revert the optimistic update on failure.
       textConsent = !checked;
     } finally {
       saving = false;
@@ -97,7 +105,6 @@
       await updateConfig((cfg) => ({ ...cfg, audio_cloud_consent: checked }));
     } catch (err) {
       saveError = err instanceof Error ? err.message : 'Could not save setting.';
-      // Revert the optimistic update on failure.
       audioConsent = !checked;
     } finally {
       saving = false;
