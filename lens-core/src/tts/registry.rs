@@ -43,30 +43,30 @@ pub fn resolve_tts(id: &str) -> Option<&'static TtsModelSpec> {
     TTS_REGISTRY.iter().find(|s| s.id == id)
 }
 
-pub fn tts_model_path(data_dir: &Path, id: &str) -> Option<PathBuf> {
-    resolve_tts(id).map(|spec| data_dir.join(spec.relpath))
+pub fn tts_model_path(cache_root: &Path, id: &str) -> Option<PathBuf> {
+    resolve_tts(id).map(|spec| cache_root.join(spec.relpath))
 }
 
 /// Cheap readiness probe: the artifact exists AND its byte length matches the
 /// registry's pinned `size_bytes` exactly. No hashing (too slow for a probe) —
 /// the exact-size check is enough to reject a truncated/partial download.
-pub fn tts_model_downloaded(data_dir: &Path, id: &str) -> bool {
+pub fn tts_model_downloaded(cache_root: &Path, id: &str) -> bool {
     let Some(spec) = resolve_tts(id) else {
         return false;
     };
-    let path = data_dir.join(spec.relpath);
+    let path = cache_root.join(spec.relpath);
     std::fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() == spec.size_bytes)
 }
 
 /// Whether the artifact exists on disk at all, regardless of size. Distinguishes a
 /// partial/truncated download (present but wrong size) from a never-downloaded one,
 /// so the UI can offer "re-download" instead of a plain "download".
-pub fn tts_model_file_present(data_dir: &Path, id: &str) -> bool {
-    tts_model_path(data_dir, id).is_some_and(|path| path.is_file())
+pub fn tts_model_file_present(cache_root: &Path, id: &str) -> bool {
+    tts_model_path(cache_root, id).is_some_and(|path| path.is_file())
 }
 
 pub async fn download_tts_model<F>(
-    data_dir: &Path,
+    cache_root: &Path,
     id: &str,
     on_progress: F,
 ) -> Result<PathBuf, LensError>
@@ -75,7 +75,7 @@ where
 {
     let spec = resolve_tts(id)
         .ok_or_else(|| LensError::Validation(format!("unknown TTS model id: {id:?}")))?;
-    let dest = data_dir.join(spec.relpath);
+    let dest = cache_root.join(spec.relpath);
     crate::download::download_verified(spec.url, &dest, Some(spec.sha256), on_progress).await?;
     Ok(dest)
 }

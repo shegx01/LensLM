@@ -32,6 +32,7 @@ pub mod model_catalog;
 pub mod notebooks;
 pub mod notes;
 pub mod parse;
+pub mod paths;
 pub(crate) mod prompt;
 pub mod render;
 pub mod resolution;
@@ -103,6 +104,7 @@ pub use notebooks::{
     Source, TrashedSource,
 };
 pub use notes::{Note, NoteId, NoteOrigin};
+pub use paths::StoragePaths;
 pub use render::JsRenderer;
 pub use retrieval::router::{ContextUnit, Provenance, RouterOutput, Tier, tiered_search};
 // Test-only: the integration test asserts `RESERVED_OUTPUT`'s value; production
@@ -167,7 +169,7 @@ pub(crate) fn f32_sample_to_i16(s: f32) -> i16 {
 #[cfg(feature = "native-ml-metal")]
 async fn build_candle_if_supported(
     compute: crate::embedder::Compute,
-    data_dir: &Path,
+    cache_root: &Path,
     spec: &'static crate::embedder::EmbeddingModelSpec,
 ) -> Option<Arc<dyn Embedder>> {
     // An unsupported model is an expected fastembed fallback — log at debug, not warn.
@@ -178,7 +180,7 @@ async fn build_candle_if_supported(
         );
         return None;
     }
-    let candle_dir = data_dir.join("models").join("candle");
+    let candle_dir = cache_root.join("models").join("candle");
     match tokio::task::spawn_blocking(move || {
         crate::embedder::CandleNomicEmbedder::new_with_spec(&candle_dir, compute, spec)
     })
@@ -212,7 +214,7 @@ async fn build_candle_if_supported(
 #[cfg(not(feature = "native-ml-metal"))]
 async fn build_candle_if_supported(
     _compute: crate::embedder::Compute,
-    _data_dir: &Path,
+    _cache_root: &Path,
     _spec: &'static crate::embedder::EmbeddingModelSpec,
 ) -> Option<Arc<dyn Embedder>> {
     None
@@ -223,7 +225,7 @@ async fn build_candle_if_supported(
 #[cfg(feature = "native-ml-cuda")]
 async fn build_cuda_if_supported(
     _compute: crate::embedder::Compute,
-    _data_dir: &Path,
+    _cache_root: &Path,
     spec: &'static crate::embedder::EmbeddingModelSpec,
 ) -> Option<Arc<dyn Embedder>> {
     tracing::debug!(
@@ -237,7 +239,7 @@ async fn build_cuda_if_supported(
 #[cfg(not(feature = "native-ml-cuda"))]
 async fn build_cuda_if_supported(
     _compute: crate::embedder::Compute,
-    _data_dir: &Path,
+    _cache_root: &Path,
     _spec: &'static crate::embedder::EmbeddingModelSpec,
 ) -> Option<Arc<dyn Embedder>> {
     None
@@ -461,11 +463,11 @@ impl LensEngine {
         // Best-effort model-catalog refresh at startup; a slow/failed fetch degrades
         // to the cached/bundled copy — never blocks init.
         {
-            let data_dir = std::path::PathBuf::from(&engine.config().await.paths.data_dir);
+            let cache_root = engine.cache_root().await;
             tokio::spawn(async move {
                 let client = crate::model_catalog::catalog_client();
                 if let Err(e) = crate::model_catalog::refresh_if_stale(
-                    &data_dir,
+                    &cache_root,
                     crate::model_catalog::MODELS_CATALOG_URL,
                     &client,
                 )
@@ -1040,6 +1042,14 @@ impl LensEngine {
         std::path::PathBuf::from(self.read().await.config.paths.data_dir.clone())
     }
 
+    /// Offload root for re-downloadable model/cache dirs (#238): `paths.cache_dir`
+    /// when set, else `data_dir`. Read config + data_dir under one lock acquisition.
+    pub(crate) async fn cache_root(&self) -> std::path::PathBuf {
+        let guard = self.read().await;
+        let data_dir = std::path::PathBuf::from(&guard.config.paths.data_dir);
+        guard.config.cache_root(&data_dir)
+    }
+
     /// Test-only accessor: `pub(crate)` `data_dir` is unreachable from the test
     /// crate; this exposes it. Absent from production builds.
     #[cfg(feature = "test-util")]
@@ -1057,9 +1067,11 @@ impl LensEngine {
     /// dirs on a fresh install read as 0.
     pub async fn storage_stats(&self) -> Result<StorageStats, LensError> {
         let data_dir = self.data_dir().await;
-        let embedding_model = self.config().await.embedding_model;
+        let config = self.config().await;
+        let embedding_model = config.embedding_model.clone();
+        let paths = crate::paths::StoragePaths::from_config(&config, &data_dir);
         tokio::task::spawn_blocking(move || {
-            crate::storage::storage_stats_blocking(&data_dir, &embedding_model)
+            crate::storage::storage_stats_blocking(&paths, &embedding_model)
         })
         .await
         .map_err(|e| LensError::Internal(format!("storage_stats task join failed: {e}")))?
@@ -1075,9 +1087,11 @@ impl LensEngine {
             .await
             .map_err(|e| LensError::Internal(format!("ingest semaphore closed: {e}")))?;
         let data_dir = self.data_dir().await;
-        let embedding_model = self.config().await.embedding_model;
+        let config = self.config().await;
+        let embedding_model = config.embedding_model.clone();
+        let paths = crate::paths::StoragePaths::from_config(&config, &data_dir);
         tokio::task::spawn_blocking(move || {
-            crate::storage::clear_model_cache_blocking(&data_dir, &embedding_model)
+            crate::storage::clear_model_cache_blocking(&paths, &embedding_model)
         })
         .await
         .map_err(|e| LensError::Internal(format!("clear_model_cache task join failed: {e}")))?
@@ -1400,12 +1414,12 @@ impl LensEngine {
         if matches!(cfg.backend, tts::TtsBackend::Qwen3Local) {
             return self.tts_sidecar().await.is_some();
         }
-        let data_dir = self.data_dir().await;
+        let cache_root = self.cache_root().await;
         let required = cfg.backend.required_model_ids();
         !required.is_empty()
             && required
                 .iter()
-                .all(|id| tts::tts_model_downloaded(&data_dir, id))
+                .all(|id| tts::tts_model_downloaded(&cache_root, id))
     }
 
     pub async fn synthesize_overview(
@@ -1421,8 +1435,9 @@ impl LensEngine {
         // (Qwen3Local) when a sidecar is injected, else the embedded provider
         // (Orpheus). `data_dir` supplies embedded model paths.
         let data_dir = self.data_dir().await;
+        let cache_root = self.cache_root().await;
         let provider =
-            tts::resolve_tts_provider_full(cfg.backend, cfg, &data_dir, self.tts_sidecar().await)
+            tts::resolve_tts_provider_full(cfg.backend, cfg, &cache_root, self.tts_sidecar().await)
                 .ok_or_else(|| LensError::Tts("no TTS backend available".into()))?;
         let buffer: tts::AudioBuffer = provider
             .synthesize_script(script, voices, &on_phase, cancel)
@@ -1680,7 +1695,8 @@ impl LensEngine {
         let tokenizer = self.tokenizer().await.ok();
 
         let data_dir = self.data_dir().await;
-        let reranker = crate::retrieval::Reranker::new(&data_dir);
+        let cache_root = self.cache_root().await;
+        let reranker = crate::retrieval::Reranker::new(&cache_root);
         let store: Arc<dyn crate::vector_store::VectorStore> = Arc::new(
             crate::vector_store::LanceVectorStore::new(&data_dir, pool.clone()),
         );
@@ -1769,7 +1785,8 @@ impl LensEngine {
         let tokenizer = self.tokenizer().await.ok();
 
         let data_dir = self.data_dir().await;
-        let reranker = crate::retrieval::Reranker::new(&data_dir);
+        let cache_root = self.cache_root().await;
+        let reranker = crate::retrieval::Reranker::new(&cache_root);
         let store: Arc<dyn crate::vector_store::VectorStore> = Arc::new(
             crate::vector_store::LanceVectorStore::new(&data_dir, pool.clone()),
         );
@@ -2069,8 +2086,8 @@ impl LensEngine {
         else {
             return false;
         };
-        let data_dir = self.data_dir().await;
-        asr::whisper_model_path(&data_dir, spec.id).is_file()
+        let cache_root = self.cache_root().await;
+        asr::whisper_model_path(&cache_root, spec.id).is_file()
     }
 
     #[cfg(not(feature = "local-whisper"))]
@@ -2129,8 +2146,8 @@ impl LensEngine {
             .or_else(|| asr::resolve_whisper(DEFAULT_WHISPER_MODEL_ID))
             .ok_or_else(|| LensError::Validation("no resolvable whisper model id".to_string()))?;
         let model_id = spec.id.to_string();
-        let data_dir = self.data_dir().await;
-        let model_path = asr::whisper_model_path(&data_dir, spec.id);
+        let cache_root = self.cache_root().await;
+        let model_path = asr::whisper_model_path(&cache_root, spec.id);
 
         // Intentionally hold this `tokio::sync::Mutex` across the spawn_blocking load
         // so init runs exactly once per model id (mirrors the embedder cache). An
@@ -2229,9 +2246,9 @@ impl LensEngine {
         if let Some(catalog) = self.catalog_cache.read().await.as_ref() {
             return catalog.clone();
         }
-        let data_dir = self.data_dir().await;
+        let cache_root = self.cache_root().await;
         let loaded =
-            tokio::task::spawn_blocking(move || crate::model_catalog::load_catalog(&data_dir))
+            tokio::task::spawn_blocking(move || crate::model_catalog::load_catalog(&cache_root))
                 .await
                 .map(Arc::new)
                 // A JoinError (load task panicked) is non-fatal; fall back to the bundled snapshot.
@@ -2248,10 +2265,10 @@ impl LensEngine {
     /// `model_catalog()` re-reads the fresh file (fix #5).
     #[tracing::instrument(skip_all)]
     pub async fn refresh_model_catalog(&self) -> Result<bool, LensError> {
-        let data_dir = self.data_dir().await;
+        let cache_root = self.cache_root().await;
         let client = crate::model_catalog::catalog_client();
         let refreshed = crate::model_catalog::refresh_if_stale(
-            &data_dir,
+            &cache_root,
             crate::model_catalog::MODELS_CATALOG_URL,
             &client,
         )
@@ -2553,19 +2570,19 @@ impl LensEngine {
         }
         let embedder: Arc<dyn Embedder> = match backend {
             crate::embedder::EmbeddingBackend::Fastembed => {
-                let data_dir = self.data_dir().await;
+                let cache_root = self.cache_root().await;
                 // Try candle (Metal/CUDA) first; fall back to fastembed on any failure
                 // or unsupported model. Never fail a job over a device choice.
                 let gpu = if compute == crate::embedder::Compute::Cuda {
-                    build_cuda_if_supported(compute, &data_dir, spec).await
+                    build_cuda_if_supported(compute, &cache_root, spec).await
                 } else {
-                    build_candle_if_supported(compute, &data_dir, spec).await
+                    build_candle_if_supported(compute, &cache_root, spec).await
                 };
                 match gpu {
                     Some(e) => e,
                     None => {
                         let e = tokio::task::spawn_blocking(move || {
-                            FastembedEmbedder::new_with_spec(&data_dir, spec)
+                            FastembedEmbedder::new_with_spec(&cache_root, spec)
                         })
                         .await
                         .map_err(|e| {
@@ -2778,7 +2795,8 @@ impl LensEngine {
         let coord =
             crate::vector_store::Coordinate::new(notebook_id.as_str(), backend, model_id, dim);
         let data_dir = self.data_dir().await;
-        let reranker = crate::retrieval::Reranker::new(&data_dir);
+        let cache_root = self.cache_root().await;
+        let reranker = crate::retrieval::Reranker::new(&cache_root);
         let store: Arc<dyn crate::vector_store::VectorStore> = Arc::new(
             crate::vector_store::LanceVectorStore::new(&data_dir, pool.clone()),
         );
@@ -2849,8 +2867,8 @@ impl LensEngine {
         }
         self.tokenizer
             .get_or_try_init(|| async {
-                let data_dir = self.data_dir().await;
-                let tokenizer = resolve_nomic_tokenizer(&data_dir).await?;
+                let cache_root = self.cache_root().await;
+                let tokenizer = resolve_nomic_tokenizer(&cache_root).await?;
                 Ok::<Arc<Tokenizer>, LensError>(Arc::new(tokenizer))
             })
             .await

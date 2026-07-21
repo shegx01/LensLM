@@ -56,9 +56,9 @@ pub fn resolve_whisper(model_id: &str) -> Option<&'static WhisperModelSpec> {
 }
 
 /// Single source of truth for the on-disk Whisper model path.
-/// Shape: `{data_dir}/models/whisper/ggml-{id}.bin`.
-pub fn whisper_model_path(data_dir: &Path, model_id: &str) -> PathBuf {
-    data_dir
+/// Shape: `{cache_root}/models/whisper/ggml-{id}.bin`.
+pub fn whisper_model_path(cache_root: &Path, model_id: &str) -> PathBuf {
+    cache_root
         .join("models")
         .join("whisper")
         .join(format!("ggml-{model_id}.bin"))
@@ -68,9 +68,9 @@ pub fn whisper_model_path(data_dir: &Path, model_id: &str) -> PathBuf {
 /// through the registry allowlist first (unknown/`..`-containing ids resolve to `None`
 /// → `false`), so the probed path is always built from an allowlisted `spec.id` and
 /// can never escape `models/whisper/`.
-pub fn whisper_model_downloaded(data_dir: &Path, model_id: &str) -> bool {
+pub fn whisper_model_downloaded(cache_root: &Path, model_id: &str) -> bool {
     match resolve_whisper(model_id) {
-        Some(spec) => whisper_model_path(data_dir, spec.id).is_file(),
+        Some(spec) => whisper_model_path(cache_root, spec.id).is_file(),
         None => false,
     }
 }
@@ -82,7 +82,7 @@ pub fn whisper_model_downloaded(data_dir: &Path, model_id: &str) -> bool {
 /// verify → atomic rename), and returns the final path. Idempotent: skips when the
 /// correctly-sized file is already present.
 pub async fn download_whisper_model<F>(
-    data_dir: &Path,
+    cache_root: &Path,
     model_id: &str,
     on_progress: F,
 ) -> Result<PathBuf, LensError>
@@ -94,7 +94,7 @@ where
             "unknown Whisper model id: {model_id:?}; known ids: tiny, base, small"
         ))
     })?;
-    let dest = whisper_model_path(data_dir, model_id);
+    let dest = whisper_model_path(cache_root, model_id);
     crate::download::download_verified(spec.url, &dest, Some(spec.sha256), on_progress).await?;
     Ok(dest)
 }

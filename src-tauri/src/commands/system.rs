@@ -149,12 +149,13 @@ pub async fn list_tts_voices(
         .app_data_dir()
         .map_err(|e| LensError::Io(e.to_string()))?;
     let config = engine.config().await;
-    Ok(resolve_voices(&config.tts, &data_dir))
+    let cache_root = config.cache_root(&data_dir);
+    Ok(resolve_voices(&config.tts, &cache_root))
 }
 
 /// Testable core of [`list_tts_voices`] (no `AppHandle`/engine state).
-fn resolve_voices(cfg: &lens_core::TtsConfig, data_dir: &std::path::Path) -> Vec<TtsVoice> {
-    lens_core::resolve_tts_provider(cfg.backend, cfg, data_dir)
+fn resolve_voices(cfg: &lens_core::TtsConfig, cache_root: &std::path::Path) -> Vec<TtsVoice> {
+    lens_core::resolve_tts_provider(cfg.backend, cfg, cache_root)
         .map(|provider| provider.voices())
         .unwrap_or_default()
 }
@@ -213,12 +214,14 @@ pub async fn download_tts_model(
     model: String,
     on_progress: Channel<DownloadProgress>,
     app: tauri::AppHandle,
+    lens_engine: tauri::State<'_, LensEngine>,
 ) -> Result<(), LensError> {
     let data_dir = app
         .path()
         .app_data_dir()
         .map_err(|e| LensError::Io(e.to_string()))?;
-    lens_core::download_tts_model(&data_dir, &model, |progress| {
+    let cache_root = lens_engine.config().await.cache_root(&data_dir);
+    lens_core::download_tts_model(&cache_root, &model, |progress| {
         if let Err(e) = on_progress.send(progress) {
             tracing::warn!("download_tts_model: progress channel send failed: {e}");
         }
@@ -246,6 +249,7 @@ pub async fn tts_model_status(
     engine: String,
     model: String,
     app: tauri::AppHandle,
+    lens_engine: tauri::State<'_, LensEngine>,
 ) -> Result<TtsModelStatus, LensError> {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if engine == "qwen3_local" {
@@ -262,9 +266,10 @@ pub async fn tts_model_status(
         .path()
         .app_data_dir()
         .map_err(|e| LensError::Io(e.to_string()))?;
-    Ok(if lens_core::tts_model_downloaded(&data_dir, &model) {
+    let cache_root = lens_engine.config().await.cache_root(&data_dir);
+    Ok(if lens_core::tts_model_downloaded(&cache_root, &model) {
         TtsModelStatus::Complete
-    } else if lens_core::tts_model_file_present(&data_dir, &model) {
+    } else if lens_core::tts_model_file_present(&cache_root, &model) {
         TtsModelStatus::Partial
     } else {
         TtsModelStatus::Absent
@@ -343,12 +348,14 @@ pub async fn download_whisper_model(
     model: String,
     on_progress: Channel<DownloadProgress>,
     app: tauri::AppHandle,
+    engine: tauri::State<'_, LensEngine>,
 ) -> Result<(), LensError> {
     let data_dir = app
         .path()
         .app_data_dir()
         .map_err(|e| LensError::Io(e.to_string()))?;
-    lens_core::download_whisper_model(&data_dir, &model, |progress| {
+    let cache_root = engine.config().await.cache_root(&data_dir);
+    lens_core::download_whisper_model(&cache_root, &model, |progress| {
         if let Err(e) = on_progress.send(progress) {
             tracing::warn!("download_whisper_model: progress channel send failed: {e}");
         }
@@ -364,12 +371,14 @@ pub async fn download_whisper_model(
 pub async fn whisper_model_downloaded(
     model: String,
     app: tauri::AppHandle,
+    engine: tauri::State<'_, LensEngine>,
 ) -> Result<bool, LensError> {
     let data_dir = app
         .path()
         .app_data_dir()
         .map_err(|e| LensError::Io(e.to_string()))?;
-    Ok(lens_core::whisper_model_downloaded(&data_dir, &model))
+    let cache_root = engine.config().await.cache_root(&data_dir);
+    Ok(lens_core::whisper_model_downloaded(&cache_root, &model))
 }
 
 /// Returns `true` when Apple-native ASR is available on this device:
@@ -418,21 +427,25 @@ pub fn macos_major_version() -> Result<u32, LensError> {
 /// so the card state and the gate can never disagree. Best-effort: empty on failure.
 #[tracing::instrument(skip_all)]
 #[tauri::command]
-pub async fn fastembed_models_cached(app: tauri::AppHandle) -> Result<Vec<String>, LensError> {
+pub async fn fastembed_models_cached(
+    app: tauri::AppHandle,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<Vec<String>, LensError> {
     let data_dir = app
         .path()
         .app_data_dir()
         .map_err(|e| LensError::Io(e.to_string()))?;
-    Ok(fastembed_cached_ids(&data_dir))
+    let cache_root = engine.config().await.cache_root(&data_dir);
+    Ok(fastembed_cached_ids(&cache_root))
 }
 
 /// Testable core of [`fastembed_models_cached`] (no `AppHandle`). Ollama-only models
 /// are skipped: they are served by the daemon, never downloaded by fastembed (#80).
-fn fastembed_cached_ids(data_dir: &std::path::Path) -> Vec<String> {
+fn fastembed_cached_ids(cache_root: &std::path::Path) -> Vec<String> {
     lens_core::REGISTRY
         .iter()
         .filter(|spec| spec.supports(lens_core::EmbeddingBackend::Fastembed))
-        .filter(|spec| lens_core::fastembed_weights_cached(data_dir, spec.id))
+        .filter(|spec| lens_core::fastembed_weights_cached(cache_root, spec.id))
         .map(|spec| spec.id.to_string())
         .collect()
 }

@@ -494,13 +494,13 @@ fn is_allowlisted_embedding(installed_name: &str, configured: &str) -> bool {
 /// (`models--{org}--{model}`) was observed empirically (R6, M4 Phase 4b-B).
 /// A non-empty subdir is treated as cached; construction is the final arbiter.
 /// Public so the `fastembed_models_cached` Tauri command can surface cache state.
-pub fn fastembed_weights_cached(data_dir: &Path, model_id: &str) -> bool {
+pub fn fastembed_weights_cached(cache_root: &Path, model_id: &str) -> bool {
     let spec = crate::embedder::resolve(model_id);
     // Ollama-only models (issue #80) have no fastembed cache dir.
     let Some(subdir) = spec.fastembed_cache_subdir() else {
         return false;
     };
-    let model_dir = data_dir.join("models").join("fastembed").join(subdir);
+    let model_dir = cache_root.join("models").join("fastembed").join(subdir);
     if !model_dir.is_dir() {
         return false;
     }
@@ -513,11 +513,11 @@ pub fn fastembed_weights_cached(data_dir: &Path, model_id: &str) -> bool {
 /// Whether the local (non-Ollama) embedding engine's weights are on disk.
 /// On `native-ml-metal` (Apple Silicon), accepts EITHER candle or fastembed cache
 /// (issue #91); other builds use the fastembed-only check.
-fn local_embedding_weights_cached(data_dir: &Path, model_id: &str) -> bool {
+fn local_embedding_weights_cached(cache_root: &Path, model_id: &str) -> bool {
     #[cfg(feature = "native-ml-metal")]
     {
         if let Some(subdir) = crate::embedder::candle_cache_subdir(model_id) {
-            let candle_dir = data_dir.join("models").join("candle").join(subdir);
+            let candle_dir = cache_root.join("models").join("candle").join(subdir);
             let candle_cached = candle_dir.is_dir()
                 && std::fs::read_dir(&candle_dir)
                     .ok()
@@ -528,7 +528,7 @@ fn local_embedding_weights_cached(data_dir: &Path, model_id: &str) -> bool {
             }
         }
     }
-    fastembed_weights_cached(data_dir, model_id)
+    fastembed_weights_cached(cache_root, model_id)
 }
 
 /// Embedding-readiness gate predicate (M4 4b-B D2): each backend passes only on
@@ -572,7 +572,8 @@ async fn probe_embedding_model(
 
     let backend = crate::embedder::EmbeddingBackend::from_opt_str(Some(&config.embedding_backend));
 
-    let fastembed_cached = local_embedding_weights_cached(data_dir, &config.embedding_model);
+    let cache_root = config.cache_root(data_dir);
+    let fastembed_cached = local_embedding_weights_cached(&cache_root, &config.embedding_model);
 
     // Only probe Ollama for an Ollama-backend selection (D2: fastembed must never wait on Ollama).
     let ollama_detected =
@@ -608,6 +609,7 @@ fn has_cloud_tts(config: &AppConfig) -> bool {
 /// disk AND both voices are saved, OR a cloud TTS provider is configured.
 fn probe_text_to_speech(config: &AppConfig) -> CheckResult {
     let data_dir = Path::new(&config.paths.data_dir);
+    let cache_root = config.cache_root(data_dir);
 
     // Qwen3Local (Apple-Silicon only) provisions runtime + model on demand and
     // ships default voices, so it is ready with no prefetch. Off Apple Silicon
@@ -629,7 +631,7 @@ fn probe_text_to_speech(config: &AppConfig) -> CheckResult {
     let engine_ready = !required.is_empty()
         && required
             .iter()
-            .all(|id| crate::tts::tts_model_downloaded(data_dir, id));
+            .all(|id| crate::tts::tts_model_downloaded(&cache_root, id));
     let voices_set = !config.voices.host.is_unset() && !config.voices.guest.is_unset();
 
     let (status, detail) = if engine_ready && voices_set {

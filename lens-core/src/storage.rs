@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::error::LensError;
+use crate::paths::StoragePaths;
 
 /// Byte-usage breakdown of the engine data directory. Crosses the IPC boundary
 /// as plain JSON numbers; consumed by the Storage settings panel.
@@ -34,41 +35,48 @@ struct DataLayout {
     retained_paths: Vec<PathBuf>,
 }
 
-/// Partitions `{data_dir}` into corpus, reclaimable-cache, and retained paths.
+/// Partitions the engine directories into corpus, reclaimable-cache, and retained
+/// paths. Corpus lives under `paths.data_dir()`; re-downloadable model/cache dirs
+/// live under `paths.cache_root()` (the #238 offload root, else `data_dir`).
 ///
 /// Reads `models/{fastembed,candle}` to split each embedding backend's per-model
 /// subdirs into the active model (retained) versus the rest (reclaimable); a
 /// missing backend dir contributes nothing. `embedding_model` is the configured
 /// id (empty resolves to the registry default at the embedder boundary).
-fn data_layout(data_dir: &Path, embedding_model: &str) -> DataLayout {
+fn data_layout(paths: &StoragePaths, embedding_model: &str) -> DataLayout {
+    let data_dir = paths.data_dir();
     let corpus_paths = vec![
-        data_dir.join("lens.db"),
+        paths.db_path(),
         data_dir.join("lens.db-wal"),
         data_dir.join("lens.db-shm"),
-        data_dir.join("lancedb"),
-        data_dir.join("sources"),
-        data_dir.join("notebooks"),
+        paths.lancedb_root(),
+        paths.sources_dir(),
+        paths.notebooks_dir(),
     ];
 
-    let models = data_dir.join("models");
+    let models = paths.models_dir();
 
     // Re-downloadable bundles: voice + ASR weights are always reclaimable.
     // Qwen3-TTS (mlx-audio) caches its snapshot here; switching TTS backend re-downloads, so the whole dir is reclaimable.
     let mut reclaimable_cache_paths = vec![
         models.join("orpheus"),
         models.join("snac"),
-        models.join("whisper"),
-        data_dir.join("hf-cache"),
+        paths.whisper_dir(),
+        paths.hf_cache(),
     ];
 
     // Catalog is retained (tiny; its loss forces a network re-fetch and degrades
     // the Providers UI).
-    let mut retained_paths = vec![data_dir.join(crate::model_catalog::MODELS_CATALOG_RELPATH)];
+    let mut retained_paths = vec![
+        paths
+            .cache_root()
+            .join(crate::model_catalog::MODELS_CATALOG_RELPATH),
+    ];
 
     let active_fastembed =
         crate::embedder::registry::resolve(embedding_model).fastembed_cache_subdir();
     partition_backend_dir(
-        &models.join("fastembed"),
+        &paths.fastembed_cache(),
         active_fastembed.as_deref(),
         &mut reclaimable_cache_paths,
         &mut retained_paths,
@@ -79,7 +87,7 @@ fn data_layout(data_dir: &Path, embedding_model: &str) -> DataLayout {
     {
         let active_candle = crate::embedder::candle_cache_subdir(embedding_model);
         partition_backend_dir(
-            &models.join("candle"),
+            &paths.candle_cache(),
             active_candle.as_deref(),
             &mut reclaimable_cache_paths,
             &mut retained_paths,
@@ -163,10 +171,10 @@ fn sum_paths(paths: &[PathBuf]) -> Result<u64, LensError> {
 
 /// Blocking byte scan; invoked under `spawn_blocking` by [`crate::LensEngine::storage_stats`].
 pub(crate) fn storage_stats_blocking(
-    data_dir: &Path,
+    paths: &StoragePaths,
     embedding_model: &str,
 ) -> Result<StorageStats, LensError> {
-    let layout = data_layout(data_dir, embedding_model);
+    let layout = data_layout(paths, embedding_model);
     let corpus_bytes = sum_paths(&layout.corpus_paths)?;
     let reclaimable_cache_bytes = sum_paths(&layout.reclaimable_cache_paths)?;
     let retained_bytes = sum_paths(&layout.retained_paths)?;
@@ -185,10 +193,10 @@ pub(crate) fn storage_stats_blocking(
 /// Never touches corpus, the active embedding model, or the catalog. Runs under
 /// `spawn_blocking` and behind the engine `ingest_lock` at the call site.
 pub(crate) fn clear_model_cache_blocking(
-    data_dir: &Path,
+    paths: &StoragePaths,
     embedding_model: &str,
 ) -> Result<u64, LensError> {
-    let layout = data_layout(data_dir, embedding_model);
+    let layout = data_layout(paths, embedding_model);
     let mut freed = 0u64;
     for path in &layout.reclaimable_cache_paths {
         freed = freed.saturating_add(remove_path(path)?);
@@ -242,66 +250,53 @@ mod tests {
         fs::write(path, bytes).expect("write seed file");
     }
 
-    /// Seeds one file in every bucket.
-    fn seed_all(data_dir: &Path) {
+    /// Seeds one file in every bucket, placing corpus under `data_dir()` and cache
+    /// under `cache_root()` so the same helper exercises both the default (equal
+    /// roots) and offloaded (split roots) layouts.
+    fn seed_all(paths: &StoragePaths) {
         let active = active_subdir();
-        // Corpus.
-        write_file(&data_dir.join("lens.db"), &[0u8; 10]);
-        write_file(&data_dir.join("lancedb").join("data.lance"), &[0u8; 20]);
+        // Corpus (under data_dir).
+        write_file(&paths.db_path(), &[0u8; 10]);
+        write_file(&paths.lancedb_root().join("data.lance"), &[0u8; 20]);
+        write_file(&paths.sources_dir().join("s1.extracted.txt"), &[0u8; 30]);
         write_file(
-            &data_dir.join("sources").join("s1.extracted.txt"),
-            &[0u8; 30],
-        );
-        write_file(
-            &data_dir.join("notebooks").join("nb1").join("overview.wav"),
+            &paths.notebooks_dir().join("nb1").join("overview.wav"),
             &[0u8; 40],
         );
-        // Reclaimable cache.
+        // Reclaimable cache (under cache_root).
         write_file(
-            &data_dir.join("models").join("orpheus").join("model.gguf"),
+            &paths.models_dir().join("orpheus").join("model.gguf"),
             &[0u8; 100],
         );
         write_file(
-            &data_dir
-                .join("models")
-                .join("snac")
-                .join("pytorch_model.bin"),
+            &paths.models_dir().join("snac").join("pytorch_model.bin"),
             &[0u8; 200],
         );
+        write_file(&paths.whisper_dir().join("ggml-base.bin"), &[0u8; 300]);
         write_file(
-            &data_dir
-                .join("models")
-                .join("whisper")
-                .join("ggml-base.bin"),
-            &[0u8; 300],
-        );
-        write_file(
-            &data_dir
-                .join("models")
-                .join("fastembed")
+            &paths
+                .fastembed_cache()
                 .join("models--other--model")
                 .join("w.onnx"),
             &[0u8; 400],
         );
         write_file(
-            &data_dir
-                .join("hf-cache")
+            &paths
+                .hf_cache()
                 .join("hub")
                 .join("models--mlx-community--Qwen3-TTS-12Hz-1.7B-CustomVoice-bf16")
                 .join("weights.bin"),
             &[0u8; 700],
         );
-        // Retained.
+        // Retained (under cache_root).
         write_file(
-            &data_dir
-                .join("models")
-                .join("fastembed")
-                .join(&active)
-                .join("w.onnx"),
+            &paths.fastembed_cache().join(&active).join("w.onnx"),
             &[0u8; 500],
         );
         write_file(
-            &data_dir.join(crate::model_catalog::MODELS_CATALOG_RELPATH),
+            &paths
+                .cache_root()
+                .join(crate::model_catalog::MODELS_CATALOG_RELPATH),
             &[0u8; 50],
         );
     }
@@ -309,9 +304,10 @@ mod tests {
     #[test]
     fn storage_stats_sums_each_bucket() {
         let dir = tempfile::tempdir().expect("tempdir");
-        seed_all(dir.path());
+        let paths = StoragePaths::new(dir.path(), None);
+        seed_all(&paths);
 
-        let stats = storage_stats_blocking(dir.path(), "").expect("stats");
+        let stats = storage_stats_blocking(&paths, "").expect("stats");
         assert_eq!(stats.corpus_bytes, 10 + 20 + 30 + 40);
         assert_eq!(stats.reclaimable_cache_bytes, 100 + 200 + 300 + 400 + 700);
         assert_eq!(stats.retained_bytes, 500 + 50);
@@ -324,7 +320,8 @@ mod tests {
     #[test]
     fn storage_stats_missing_dirs_are_zero() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let stats = storage_stats_blocking(dir.path(), "").expect("stats");
+        let paths = StoragePaths::new(dir.path(), None);
+        let stats = storage_stats_blocking(&paths, "").expect("stats");
         assert_eq!(stats.corpus_bytes, 0);
         assert_eq!(stats.reclaimable_cache_bytes, 0);
         assert_eq!(stats.retained_bytes, 0);
@@ -334,50 +331,52 @@ mod tests {
     #[test]
     fn clear_model_cache_removes_only_reclaimable() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path();
-        seed_all(root);
+        let paths = StoragePaths::new(dir.path(), None);
+        seed_all(&paths);
         let active = active_subdir();
 
-        let freed = clear_model_cache_blocking(root, "").expect("clear");
+        let freed = clear_model_cache_blocking(&paths, "").expect("clear");
         assert_eq!(freed, 100 + 200 + 300 + 400 + 700);
 
         // Reclaimable subtrees gone.
-        assert!(!root.join("models").join("orpheus").exists());
-        assert!(!root.join("models").join("snac").exists());
-        assert!(!root.join("models").join("whisper").exists());
+        assert!(!paths.models_dir().join("orpheus").exists());
+        assert!(!paths.models_dir().join("snac").exists());
+        assert!(!paths.whisper_dir().exists());
         assert!(
-            !root
-                .join("models")
-                .join("fastembed")
+            !paths
+                .fastembed_cache()
                 .join("models--other--model")
                 .exists()
         );
-        assert!(!root.join("hf-cache").exists());
+        assert!(!paths.hf_cache().exists());
 
         // Corpus + active model + catalog intact.
-        assert!(root.join("lens.db").exists());
-        assert!(root.join("lancedb").join("data.lance").exists());
-        assert!(root.join("sources").join("s1.extracted.txt").exists());
+        assert!(paths.db_path().exists());
+        assert!(paths.lancedb_root().join("data.lance").exists());
+        assert!(paths.sources_dir().join("s1.extracted.txt").exists());
         assert!(
-            root.join("notebooks")
+            paths
+                .notebooks_dir()
                 .join("nb1")
                 .join("overview.wav")
                 .exists()
         );
         assert!(
-            root.join("models")
-                .join("fastembed")
+            paths
+                .fastembed_cache()
                 .join(&active)
                 .join("w.onnx")
                 .exists()
         );
         assert!(
-            root.join(crate::model_catalog::MODELS_CATALOG_RELPATH)
+            paths
+                .cache_root()
+                .join(crate::model_catalog::MODELS_CATALOG_RELPATH)
                 .exists()
         );
 
         // Reclaimable figure drops to 0; retained unchanged.
-        let stats = storage_stats_blocking(root, "").expect("stats after clear");
+        let stats = storage_stats_blocking(&paths, "").expect("stats after clear");
         assert_eq!(stats.reclaimable_cache_bytes, 0);
         assert_eq!(stats.retained_bytes, 500 + 50);
         assert_eq!(stats.corpus_bytes, 10 + 20 + 30 + 40);
@@ -386,37 +385,40 @@ mod tests {
     #[test]
     fn clear_model_cache_on_fresh_install_frees_zero() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let freed = clear_model_cache_blocking(dir.path(), "").expect("clear");
+        let paths = StoragePaths::new(dir.path(), None);
+        let freed = clear_model_cache_blocking(&paths, "").expect("clear");
         assert_eq!(freed, 0);
     }
 
     #[test]
     fn clear_reclaims_qwen_hf_cache() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path();
-        seed_all(root);
+        let paths = StoragePaths::new(dir.path(), None);
+        seed_all(&paths);
         let active = active_subdir();
 
         // The Qwen3-TTS HF snapshot counts as reclaimable.
-        let hf_cache = root.join("hf-cache");
+        let hf_cache = paths.hf_cache();
         assert!(hf_cache.exists());
-        let before = storage_stats_blocking(root, "").expect("stats");
+        let before = storage_stats_blocking(&paths, "").expect("stats");
         assert_eq!(before.reclaimable_cache_bytes, 100 + 200 + 300 + 400 + 700);
 
-        clear_model_cache_blocking(root, "").expect("clear");
+        clear_model_cache_blocking(&paths, "").expect("clear");
 
         // hf-cache subtree gone; corpus + active model + catalog survive.
         assert!(!hf_cache.exists());
-        assert!(root.join("lens.db").exists());
+        assert!(paths.db_path().exists());
         assert!(
-            root.join("models")
-                .join("fastembed")
+            paths
+                .fastembed_cache()
                 .join(&active)
                 .join("w.onnx")
                 .exists()
         );
         assert!(
-            root.join(crate::model_catalog::MODELS_CATALOG_RELPATH)
+            paths
+                .cache_root()
+                .join(crate::model_catalog::MODELS_CATALOG_RELPATH)
                 .exists()
         );
     }
@@ -424,20 +426,50 @@ mod tests {
     #[test]
     fn clear_and_scan_ignore_symlink_into_corpus() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path();
-        seed_all(root);
+        let paths = StoragePaths::new(dir.path(), None);
+        seed_all(&paths);
 
         // A symlink under a reclaimable dir pointing at a corpus file must be
         // neither counted by the scan nor followed by the clear.
-        let target = root.join("lens.db");
-        let link = root.join("models").join("whisper").join("link-to-db");
+        let target = paths.db_path();
+        let link = paths.whisper_dir().join("link-to-db");
         std::os::unix::fs::symlink(&target, &link).expect("symlink");
 
-        let stats = storage_stats_blocking(root, "").expect("stats");
+        let stats = storage_stats_blocking(&paths, "").expect("stats");
         assert_eq!(stats.reclaimable_cache_bytes, 100 + 200 + 300 + 400 + 700);
 
-        clear_model_cache_blocking(root, "").expect("clear");
+        clear_model_cache_blocking(&paths, "").expect("clear");
         assert!(!link.exists());
         assert!(target.exists());
+    }
+
+    /// #238: with an offloaded `cache_dir`, the model cache is scanned/cleared under
+    /// the offload root while corpus stays under `data_dir`.
+    #[test]
+    fn offloaded_cache_dir_splits_corpus_from_cache() {
+        let data = tempfile::tempdir().expect("data tempdir");
+        let cache = tempfile::tempdir().expect("cache tempdir");
+        let cache_str = cache.path().to_string_lossy().into_owned();
+        let paths = StoragePaths::new(data.path(), Some(&cache_str));
+        seed_all(&paths);
+
+        // Cache lives under the offload root, not data_dir.
+        assert!(cache.path().join("models").join("orpheus").exists());
+        assert!(!data.path().join("models").exists());
+        assert!(data.path().join("lens.db").exists());
+
+        let stats = storage_stats_blocking(&paths, "").expect("stats");
+        assert_eq!(stats.corpus_bytes, 10 + 20 + 30 + 40);
+        assert_eq!(stats.reclaimable_cache_bytes, 100 + 200 + 300 + 400 + 700);
+        assert_eq!(stats.retained_bytes, 500 + 50);
+
+        let freed = clear_model_cache_blocking(&paths, "").expect("clear");
+        assert_eq!(freed, 100 + 200 + 300 + 400 + 700);
+
+        // Reclaimable cache removed from the offload root; corpus under data_dir intact.
+        assert!(!cache.path().join("models").join("orpheus").exists());
+        assert!(!cache.path().join("hf-cache").exists());
+        assert!(data.path().join("lens.db").exists());
+        assert!(data.path().join("lancedb").join("data.lance").exists());
     }
 }

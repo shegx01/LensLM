@@ -377,6 +377,17 @@ impl EnrichmentConfig {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PathConfig {
     pub data_dir: String,
+    /// Offloaded model-cache root (#238). `None`/empty resolves under `data_dir`.
+    #[serde(default)]
+    pub cache_dir: Option<String>,
+}
+
+/// Storage-management settings (#238). Absent key reads as default (no quota).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct StorageConfig {
+    /// Soft advisory cap on the reclaimable model cache, in bytes. `None` = no cap.
+    #[serde(default)]
+    pub cache_quota_bytes: Option<u64>,
 }
 
 /// Token-budget thresholds for the tiered retrieval/synthesis pipeline.
@@ -591,6 +602,9 @@ pub struct AppConfig {
     #[serde(default = "default_animations")]
     pub animations: String,
     pub paths: PathConfig,
+    /// Storage-management settings (#238). Absent key reads as [`StorageConfig::default`].
+    #[serde(default)]
+    pub storage: StorageConfig,
     pub tier_thresholds: TierThresholds,
     pub onboarding_complete: bool,
 }
@@ -617,6 +631,7 @@ impl Default for AppConfig {
             reopen_last_notebook: default_reopen_last_notebook(),
             animations: default_animations(),
             paths: PathConfig::default(),
+            storage: StorageConfig::default(),
             tier_thresholds: TierThresholds::default(),
             onboarding_complete: false,
         }
@@ -624,6 +639,15 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
+    /// Offload root for re-downloadable model/cache dirs (#238): `paths.cache_dir`
+    /// when set and non-empty, else `data_dir` (byte-for-byte the pre-#238 layout).
+    pub fn cache_root(&self, data_dir: &Path) -> PathBuf {
+        match self.paths.cache_dir.as_deref() {
+            Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+            _ => data_dir.to_path_buf(),
+        }
+    }
+
     /// Loads config from `{dir}/config.json`. Missing file → writes the default.
     #[tracing::instrument(skip_all, fields(dir = %dir.as_ref().display()))]
     pub fn load(dir: impl AsRef<Path>) -> Result<Self, LensError> {
