@@ -61,9 +61,13 @@ function catalogFixture(overrides?: { qwenAvailable?: boolean }): TtsEngineCatal
   ];
 }
 
-function renderLocal(): void {
-  render(LocalTtsForm, { props: { catalog: [], active: true } });
+function renderLocal(): { unmount: () => void } {
+  return render(LocalTtsForm, { props: { catalog: [], active: true } });
 }
+
+type ProgressChannel = {
+  onmessage: (m: { received: number; total: number | null; done: boolean }) => void;
+};
 
 beforeEach(() => {
   (globalThis as { isTauri?: boolean }).isTauri = true;
@@ -232,5 +236,144 @@ describe('LocalTtsForm — reactive persist', () => {
     await waitFor(() => expect(written).not.toBeNull());
     expect((written as unknown as AppConfig).voices).toEqual({ host: 'leo', guest: 'tara' });
     expect((written as unknown as AppConfig).tts.backend).toBe('orpheus');
+  });
+});
+
+describe('LocalTtsForm — indeterminate progress (null pct)', () => {
+  it('qwen3_local: null pct flips downloadIndeterminate and isDownloading stays true', async () => {
+    let progressCh: ProgressChannel | undefined;
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return baseAppConfig();
+      if (cmd === 'tts_engine_catalog') return catalogFixture({ qwenAvailable: true });
+      if (cmd === 'tts_model_status') return 'absent';
+      if (cmd === 'prepare_qwen_model') {
+        progressCh = (args as { onProgress: ProgressChannel }).onProgress;
+        return new Promise(() => {}); // keep the download in flight
+      }
+    });
+
+    renderLocal();
+    const qwenRadio = await screen.findByRole('radio', { name: /qwen3-tts/i });
+    await fireEvent.click(qwenRadio);
+    await fireEvent.click(await screen.findByRole('button', { name: /download voice engine/i }));
+    await waitFor(() => expect(progressCh).toBeDefined());
+
+    progressCh?.onmessage({ received: 1, total: null, done: false });
+
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: /downloading/i })).toBeInTheDocument()
+    );
+    expect(screen.queryByText(/% downloaded/)).not.toBeInTheDocument();
+    expect(screen.getByRole('progressbar')).not.toHaveAttribute('aria-valuenow');
+  });
+
+  it('Orpheus composite loop treats a null pct as an indeterminate phase, not a silent low value', async () => {
+    let secondCh: ProgressChannel | undefined;
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return baseAppConfig();
+      if (cmd === 'tts_engine_catalog') return catalogFixture();
+      if (cmd === 'tts_model_status') return 'absent';
+      if (cmd === 'download_tts_model') {
+        const a = args as { model: string; onProgress: ProgressChannel };
+        if (a.model === 'orpheus') {
+          a.onProgress.onmessage({ received: 100, total: 100, done: true });
+          return null;
+        }
+        // 'snac' (second model): report 40% then hold, so the composite reaches
+        // 70% before the null tick below — a regression to `null/100 === 0`
+        // would silently drop this to 50%, not crash.
+        a.onProgress.onmessage({ received: 40, total: 100, done: false });
+        secondCh = a.onProgress;
+        return new Promise(() => {});
+      }
+    });
+
+    renderLocal();
+    await screen.findByRole('radio', { name: /orpheus/i });
+    await fireEvent.click(screen.getByRole('button', { name: /download voice engine/i }));
+
+    await waitFor(() => expect(screen.getByText(/70% downloaded/)).toBeInTheDocument());
+
+    secondCh?.onmessage({ received: 0, total: null, done: false });
+
+    await waitFor(() => expect(screen.queryByText(/% downloaded/)).not.toBeInTheDocument());
+    expect(screen.queryByText(/50% downloaded/)).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /downloading/i })).toBeInTheDocument();
+  });
+});
+
+describe('LocalTtsForm — cancel on unmount (engine-guarded)', () => {
+  it('invokes cancel_prepare on unmount mid-download for qwen3_local', async () => {
+    let cancelInvoked = false;
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return baseAppConfig();
+      if (cmd === 'tts_engine_catalog') return catalogFixture({ qwenAvailable: true });
+      if (cmd === 'tts_model_status') return 'absent';
+      if (cmd === 'prepare_qwen_model') return new Promise(() => {});
+      if (cmd === 'cancel_prepare') {
+        cancelInvoked = true;
+        return true;
+      }
+    });
+
+    const { unmount } = renderLocal();
+    const qwenRadio = await screen.findByRole('radio', { name: /qwen3-tts/i });
+    await fireEvent.click(qwenRadio);
+    await fireEvent.click(await screen.findByRole('button', { name: /download voice engine/i }));
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: /downloading/i })).toBeInTheDocument()
+    );
+
+    unmount();
+    await waitFor(() => expect(cancelInvoked).toBe(true));
+  });
+
+  it('does NOT invoke cancel_prepare on unmount mid-download for Orpheus (no cancel path)', async () => {
+    let cancelInvoked = false;
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return baseAppConfig();
+      if (cmd === 'tts_engine_catalog') return catalogFixture();
+      if (cmd === 'tts_model_status') return 'absent';
+      if (cmd === 'download_tts_model') return new Promise(() => {});
+      if (cmd === 'cancel_prepare') {
+        cancelInvoked = true;
+        return true;
+      }
+    });
+
+    const { unmount } = renderLocal();
+    await screen.findByRole('radio', { name: /orpheus/i });
+    await fireEvent.click(screen.getByRole('button', { name: /download voice engine/i }));
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: /downloading/i })).toBeInTheDocument()
+    );
+
+    unmount();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(cancelInvoked).toBe(false);
+  });
+});
+
+describe('LocalTtsForm — cancellation is not surfaced as a download failure', () => {
+  it('a Cancelled error from prepare_qwen_model resets to idle without an error alert', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return baseAppConfig();
+      if (cmd === 'tts_engine_catalog') return catalogFixture({ qwenAvailable: true });
+      if (cmd === 'tts_model_status') return 'absent';
+      if (cmd === 'prepare_qwen_model') {
+        throw { kind: 'Cancelled', message: 'prepare cancelled' };
+      }
+    });
+
+    renderLocal();
+    const qwenRadio = await screen.findByRole('radio', { name: /qwen3-tts/i });
+    await fireEvent.click(qwenRadio);
+    await fireEvent.click(await screen.findByRole('button', { name: /download voice engine/i }));
+
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: /download voice engine/i })).toBeInTheDocument()
+    );
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.queryByText(/download failed/i)).not.toBeInTheDocument();
   });
 });

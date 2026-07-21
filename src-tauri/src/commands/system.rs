@@ -265,15 +265,31 @@ pub async fn tts_model_status(
 pub async fn prepare_qwen_model(
     on_progress: Channel<DownloadProgress>,
     app: tauri::AppHandle,
+    coordinator: tauri::State<'_, crate::qwen::QwenPrepareCoordinator>,
 ) -> Result<(), LensError> {
     let paths = crate::qwen::sidecar_paths(&app)?;
     let resolver = crate::qwen::spawn_resolver(&paths);
-    crate::qwen::run_prepare(resolver, move |progress| {
-        if let Err(e) = on_progress.send(progress) {
-            tracing::warn!("prepare_qwen_model: progress channel send failed: {e}");
-        }
-    })
-    .await
+    // Route through the single-flight coordinator (#202): concurrent callers
+    // coalesce to one download, and the prepare is cancellable via `cancel_prepare`.
+    coordinator
+        .run_single_flight(&paths, resolver, move |progress| {
+            if let Err(e) = on_progress.send(progress) {
+                tracing::warn!("prepare_qwen_model: progress channel send failed: {e}");
+            }
+        })
+        .await
+}
+
+/// Cancels an in-flight Qwen `--prepare` download (Settings TTS panel unmount, #202).
+/// Returns `true` if one was in flight; a later prepare resumes via HF `.incomplete`.
+/// Apple-Silicon only, like the sidecar it drives.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[tracing::instrument(skip_all)]
+#[tauri::command]
+pub async fn cancel_prepare(
+    coordinator: tauri::State<'_, crate::qwen::QwenPrepareCoordinator>,
+) -> Result<bool, LensError> {
+    Ok(coordinator.cancel())
 }
 
 /// UI representation of a Whisper model entry from the registry.

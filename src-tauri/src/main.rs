@@ -139,6 +139,9 @@ fn main() {
                 let resolver = qwen::spawn_resolver(&paths);
                 let qwen = qwen::QwenSidecar::new(resolver);
                 tauri::async_runtime::block_on(engine_state.set_tts_sidecar(Some(Arc::new(qwen))));
+
+                // Single-flight + cancel coordinator for `--prepare` (#202); see qwen::coordinator.
+                app.manage(qwen::QwenPrepareCoordinator::new());
             }
 
             Ok(())
@@ -214,6 +217,8 @@ fn main() {
             // the sidecar it drives.
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             commands::system::prepare_qwen_model,
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            commands::system::cancel_prepare,
             commands::system::list_whisper_models,
             commands::system::download_whisper_model,
             commands::system::whisper_model_downloaded,

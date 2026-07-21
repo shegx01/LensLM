@@ -31,6 +31,7 @@
     TooltipProvider
   } from '$lib/components/ui/tooltip/index.js';
   import AudioPlayer from '$lib/components/audio/AudioPlayer.svelte';
+  import ProgressBar from '$lib/components/ui/ProgressBar.svelte';
   import {
     audioOverviewStore,
     generateOverview,
@@ -203,13 +204,7 @@
               <Square class="size-2.5" fill="currentColor" strokeWidth={0} />
             </button>
           </div>
-          <div class="progress-track">
-            {#if progressPct !== null}
-              <div class="progress-fill" style:width="{progressPct}%"></div>
-            {:else}
-              <div class="progress-fill indeterminate"></div>
-            {/if}
-          </div>
+          <ProgressBar value={progressPct} />
         </div>
       {:else if hasPlayableAudio && notebookId && audioOverviewStore.overviewPath}
         <div class="card-body mt-3 flex flex-col justify-center">
@@ -360,36 +355,6 @@
      state can't shrink the card (generating renders far less markup than idle). */
   .card-body {
     min-height: 9.5rem;
-  }
-
-  .progress-track {
-    position: relative;
-    height: 5px;
-    border-radius: 999px;
-    background: var(--muted);
-    overflow: hidden;
-  }
-  .progress-fill {
-    height: 100%;
-    border-radius: 999px;
-    background: var(--primary);
-    transition: width 0.3s var(--ease-out, ease);
-  }
-  .progress-fill.indeterminate {
-    position: absolute;
-    top: 0;
-    width: 40%;
-    left: -40%;
-    animation: indeterminate-slide calc(1.1s / max(var(--rail-motion, 1), 0.0001)) ease-in-out
-      infinite;
-  }
-  @keyframes indeterminate-slide {
-    0% {
-      left: -40%;
-    }
-    100% {
-      left: 100%;
-    }
   }
 
   .seg3 {

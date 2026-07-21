@@ -26,9 +26,11 @@ use lens_core::{
     read_wav_mono16,
 };
 
+mod coordinator;
 mod prepare;
 mod resolver;
-pub use prepare::{qwen_snapshot_dir_present, qwen_snapshot_present, run_prepare};
+pub use coordinator::QwenPrepareCoordinator;
+pub(crate) use prepare::{qwen_snapshot_dir_present, qwen_snapshot_present, run_prepare};
 pub use resolver::resolve_sidecar_spawn;
 
 /// The app-data-derived paths the Qwen sidecar launches against. Single source of
@@ -101,6 +103,37 @@ const SYNTH_TIMEOUT: Duration = Duration::from_secs(300);
 /// Byte ceiling on a single reply line so a runaway/never-newline child cannot
 /// OOM the host; a real reply (id + temp-WAV path) is well under this.
 const MAX_REPLY_BYTES: u64 = 64 * 1024;
+
+/// Outcome of one capped read-line: newline-terminated `Line`, `Eof` (child closed the
+/// pipe), or `OverCap` (cap hit with no newline). Error-neutral so each caller maps it to
+/// its own domain error (`tts_err`, or `TurnError::Dead` in `drain_until`).
+#[derive(Debug, PartialEq)]
+pub(crate) enum ReadLineOutcome {
+    Line(String),
+    Eof,
+    OverCap,
+}
+
+/// Reads one line from `reader`, capped at `cap` bytes so a never-newline child
+/// cannot OOM the host. `Eof` on a zero-byte read; `OverCap` when the cap is
+/// reached before a terminating newline.
+pub(crate) async fn read_capped_line<R>(
+    reader: &mut R,
+    cap: u64,
+) -> std::io::Result<ReadLineOutcome>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let mut line = String::new();
+    let n = reader.take(cap).read_line(&mut line).await?;
+    if n == 0 {
+        return Ok(ReadLineOutcome::Eof);
+    }
+    if !line.ends_with('\n') {
+        return Ok(ReadLineOutcome::OverCap);
+    }
+    Ok(ReadLineOutcome::Line(line))
+}
 
 /// A live sidecar: the child process plus its owned stdin sink and buffered stdout
 /// source. Held together so acquiring the cell's guard grants exclusive IO access.
@@ -242,26 +275,23 @@ impl QwenSidecar {
         // for a one-time cold start); app-quit force-kills via `kill_on_drop`.
         tracing::info!(invocation_id = %self.invocation_id, "awaiting Qwen sidecar readiness (first run may download ~5 GB)");
         let handshake = timeout(READY_TIMEOUT, async {
-            let mut line = String::new();
             loop {
-                line.clear();
-                // Cap the handshake line so a never-newline child can't OOM us.
-                let n = (&mut reader)
-                    .take(MAX_REPLY_BYTES)
-                    .read_line(&mut line)
+                let line = match read_capped_line(&mut reader, MAX_REPLY_BYTES)
                     .await
                     .map_err(|e| {
                         tracing::warn!(error = %e, "Qwen handshake read failed");
                         tts_err()
-                    })?;
-                if n == 0 {
-                    tracing::warn!("Qwen sidecar closed stdout before ready (EOF)");
-                    return Err(tts_err()); // EOF before ready — model load failed/exited
-                }
-                if !line.ends_with('\n') {
-                    tracing::warn!(bytes = n, "Qwen handshake line exceeded cap or truncated");
-                    return Err(tts_err());
-                }
+                    })? {
+                    ReadLineOutcome::Line(l) => l,
+                    ReadLineOutcome::Eof => {
+                        tracing::warn!("Qwen sidecar closed stdout before ready (EOF)");
+                        return Err(tts_err()); // EOF before ready — model load failed/exited
+                    }
+                    ReadLineOutcome::OverCap => {
+                        tracing::warn!("Qwen handshake line exceeded cap or truncated");
+                        return Err(tts_err());
+                    }
+                };
                 if let Ok(msg) = serde_json::from_str::<ReadyMsg>(line.trim())
                     && msg.ready
                 {
@@ -384,26 +414,22 @@ async fn drain_until<R: tokio::io::AsyncBufRead + Unpin>(
     id: u64,
 ) -> Result<SynthReply, TurnError> {
     loop {
-        let mut buf = String::new();
-        let n = (&mut *reader)
-            .take(MAX_REPLY_BYTES)
-            .read_line(&mut buf)
+        let buf = match read_capped_line(&mut *reader, MAX_REPLY_BYTES)
             .await
             .map_err(|e| {
                 tracing::warn!(error = %e, "Qwen sidecar reply read failed");
                 TurnError::Dead
-            })?;
-        if n == 0 {
-            tracing::warn!("Qwen sidecar closed stdout (EOF) awaiting reply");
-            return Err(TurnError::Dead); // EOF — child exited
-        }
-        if !buf.ends_with('\n') {
-            tracing::warn!(
-                bytes = n,
-                "Qwen reply exceeded cap or truncated; treating as dead"
-            );
-            return Err(TurnError::Dead);
-        }
+            })? {
+            ReadLineOutcome::Line(l) => l,
+            ReadLineOutcome::Eof => {
+                tracing::warn!("Qwen sidecar closed stdout (EOF) awaiting reply");
+                return Err(TurnError::Dead); // EOF — child exited
+            }
+            ReadLineOutcome::OverCap => {
+                tracing::warn!("Qwen reply exceeded cap or truncated; treating as dead");
+                return Err(TurnError::Dead);
+            }
+        };
         let reply: SynthReply = match serde_json::from_str(buf.trim()) {
             Ok(r) => r,
             Err(e) => {
@@ -653,6 +679,34 @@ mod tests {
             .expect("matching id returns the reply");
         assert_eq!(reply.id, 5);
         assert!(!reply.ok);
+    }
+
+    #[tokio::test]
+    async fn read_capped_line_returns_line_on_newline() {
+        let mut r = &b"ab\ncd"[..];
+        assert_eq!(
+            read_capped_line(&mut r, 8).await.unwrap(),
+            ReadLineOutcome::Line("ab\n".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn read_capped_line_reports_eof_on_empty() {
+        let mut r = &b""[..];
+        assert_eq!(
+            read_capped_line(&mut r, 8).await.unwrap(),
+            ReadLineOutcome::Eof
+        );
+    }
+
+    #[tokio::test]
+    async fn read_capped_line_reports_over_cap_at_boundary() {
+        // A line with no newline within `cap` bytes is a runaway child.
+        let mut r = &b"abcdef"[..];
+        assert_eq!(
+            read_capped_line(&mut r, 4).await.unwrap(),
+            ReadLineOutcome::OverCap
+        );
     }
 
     #[test]

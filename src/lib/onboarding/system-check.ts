@@ -112,39 +112,60 @@ export async function installEmbeddingModel(
 }
 
 /**
+ * Shared `DownloadProgress` channel for the wrappers below. `done` reports 100; otherwise
+ * `toPct` gives the known percentage or `null` when the total is unknown (callers render
+ * `null` as an indeterminate bar rather than holding at a stale value).
+ */
+function makeProgressChannel(onProgress: (pct: number | null) => void): Channel<DownloadProgress> {
+  const channel = new Channel<DownloadProgress>();
+  channel.onmessage = (p) => {
+    if (p.done) {
+      onProgress(100);
+      return;
+    }
+    onProgress(toPct(p.received, p.total));
+  };
+  return channel;
+}
+
+/**
  * Download a TTS model artifact (registry id, e.g. `"orpheus"`/`"snac"`) for the given
- * engine, streaming 0–100% progress. When total is unknown, `done` is surfaced as 100%.
- * No-op outside Tauri. Mirrors `download_whisper_model`.
+ * engine, streaming 0–100% progress (`null` while the total is unknown). No-op outside
+ * Tauri. Mirrors `download_whisper_model`.
  */
 export async function downloadTtsModel(
   engine: string,
   model: string,
-  onProgress: (pct: number) => void
+  onProgress: (pct: number | null) => void
 ): Promise<void> {
   if (!isTauri()) return;
-  const channel = new Channel<DownloadProgress>();
-  channel.onmessage = (p) => {
-    const pct = toPct(p.received, p.total);
-    if (pct !== null) onProgress(pct);
-    else if (p.done) onProgress(100);
-  };
+  const channel = makeProgressChannel(onProgress);
   await invoke<void>('download_tts_model', { engine, model, onProgress: channel });
 }
 
 /**
- * Prepare (download) the Qwen3-TTS MLX model, streaming 0–100% progress. Apple-Silicon
- * only — the backing command is absent elsewhere. No-op outside Tauri. Mirrors
- * `downloadTtsModel`.
+ * Prepare (download) the Qwen3-TTS MLX model, streaming 0–100% progress (`null` while
+ * the total is unknown). Apple-Silicon only — the backing command is absent elsewhere.
+ * No-op outside Tauri. Mirrors `downloadTtsModel`.
  */
-export async function prepareQwenModel(onProgress: (pct: number) => void): Promise<void> {
+export async function prepareQwenModel(onProgress: (pct: number | null) => void): Promise<void> {
   if (!isTauri()) return;
-  const channel = new Channel<DownloadProgress>();
-  channel.onmessage = (p) => {
-    const pct = toPct(p.received, p.total);
-    if (pct !== null) onProgress(pct);
-    else if (p.done) onProgress(100);
-  };
+  const channel = makeProgressChannel(onProgress);
   await invoke<void>('prepare_qwen_model', { onProgress: channel });
+}
+
+/**
+ * Cancel an in-flight Qwen prepare/download (`cancel_prepare`, macOS-aarch64-only —
+ * cfg-gated out on other targets). Swallows an unregistered-command/invoke error so
+ * callers (e.g. an unmount handler) can call this unconditionally as a defensive no-op.
+ */
+export async function cancelPrepare(): Promise<void> {
+  if (!isTauri()) return;
+  try {
+    await invoke<boolean>('cancel_prepare');
+  } catch {
+    // Command absent on this platform, or nothing was in flight — both are no-ops.
+  }
 }
 
 /** List the active backend's named-voice catalog. Adapter-driven — empty when no provider resolves. */
