@@ -70,6 +70,10 @@ fn main() {
         // resize survives relaunch. First launch uses the tauri.conf.json default;
         // thereafter the saved geometry supersedes it. Auto-saves on exit.
         .plugin(tauri_plugin_window_state::Builder::default().build())
+        // Open external provider-doc URLs in the system browser (a webview
+        // `<a href>` never escapes to the OS browser). Scoped to https:// in
+        // capabilities/default.json.
+        .plugin(tauri_plugin_opener::init())
         // Resolve the OS app-data dir, init the engine (open db + migrate +
         // load config) on it, and store the handle in Tauri managed state.
         .setup(|app| {

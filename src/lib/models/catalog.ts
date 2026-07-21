@@ -2,7 +2,7 @@
 // onboarding picker shows a "none found" state rather than an error.
 
 import { invoke, isTauri } from '@tauri-apps/api/core';
-import type { ActiveModelSelection, ModelInfo } from './types.js';
+import type { ActiveModelSelection, ModelInfo, ProviderEntry } from './types.js';
 
 /** One option in a model picker with its capability info. */
 export interface ModelOption {
@@ -28,8 +28,28 @@ export async function listCloudModelOptions(provider: string): Promise<ModelOpti
     .sort(compareCloudOptions);
 }
 
+/**
+ * Text-capable model count per provider, keyed by the catalog provider id (= the
+ * `catalogKey` a cloud provider uses), so `counts[catalogKey]` equals
+ * `listCloudModelOptions(catalogKey).length`. One `list_models` call, counted
+ * client-side. Resolves `{}` outside Tauri or on failure — never throws.
+ */
+export async function providerModelCounts(): Promise<Record<string, number>> {
+  if (!isTauri()) return {};
+  try {
+    const catalog = await invoke<Record<string, ProviderEntry>>('list_models');
+    const counts: Record<string, number> = {};
+    for (const [id, entry] of Object.entries(catalog)) {
+      counts[id] = Object.values(entry.models).filter(isTextCapable).length;
+    }
+    return counts;
+  } catch {
+    return {};
+  }
+}
+
 /** True iff a model has both text input AND text output — the minimum for a chat model. */
-function isTextCapable(info: ModelInfo): boolean {
+export function isTextCapable(info: ModelInfo): boolean {
   return (
     Array.isArray(info.modalities?.input) &&
     info.modalities.input.includes('text') &&

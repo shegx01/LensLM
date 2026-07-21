@@ -12,7 +12,9 @@ describe('PreferencesShell deep-link (AC-7)', () => {
   it('honors settingsSection = "ai" and renders the AI Model panel', async () => {
     notebookStore.openSettings('ai');
     render(PreferencesShell);
-    expect(await screen.findByRole('heading', { name: 'AI Model' })).toBeInTheDocument();
+    // The AI Model panel composes the Providers + Active model sections.
+    expect(await screen.findByRole('heading', { name: 'Providers' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Active model' })).toBeInTheDocument();
   });
 
   it('defaults to Embeddings when no section is requested', async () => {

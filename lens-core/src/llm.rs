@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::AppConfig;
 use crate::error::LensError;
-use crate::model_catalog::{ModelCatalog, SupportedProvider};
+use crate::model_catalog::SupportedProvider;
 
 /// Connect timeout for LLM HTTP requests (matches the system-check probe).
 const LLM_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -481,7 +481,7 @@ pub enum LlmRouting {
     CloudFirst,
     /// Prefer local Ollama; fall back to a consented cloud provider.
     LocalFirst,
-    /// Pin one exact `(provider, model)`. Cloud entries are still consent- and catalog-gated.
+    /// Pin one exact `(provider, model)`. Cloud entries are still consent-gated.
     Explicit { provider: String, model: String },
 }
 
@@ -518,38 +518,23 @@ fn adapter_for(provider: &str) -> Option<AdapterKind> {
     }
 }
 
-/// Returns the models.dev catalog namespace for a provider, used to validate
-/// `(provider, model)`. Returns `None` for `openai-compatible` and local runtimes,
-/// signalling the caller to skip catalog validation.
-fn catalog_key_for(provider: &str) -> Option<&str> {
-    match provider {
-        PROVIDER_OPENAI => Some(SupportedProvider::OpenAI.catalog_key()),
-        PROVIDER_ANTHROPIC => Some(SupportedProvider::Anthropic.catalog_key()),
-        PROVIDER_GOOGLE => Some(SupportedProvider::Google.catalog_key()),
-        PROVIDER_ZAI | PROVIDER_GLM => Some(SupportedProvider::Zai.catalog_key()),
-        PROVIDER_OLLAMA_CLOUD => Some(SupportedProvider::OllamaCloud.catalog_key()),
-        PROVIDER_OPENAI_COMPAT | PROVIDER_OLLAMA => None,
-        other => Some(other), // groq / deepseek / xai / cohere: same-named namespace
-    }
-}
-
 /// Builds the enrichment [`LlmProvider`] from `config.models[]` under the [`LlmRouting`]
-/// policy. Cloud providers require `cloud_consent == true` and catalog validation; local
-/// Ollama is exempt from both. Does NOT probe reachability — the caller does that separately.
+/// policy. Cloud providers require `cloud_consent == true`; local Ollama is exempt.
+/// Catalog membership is advisory metadata, not a usability gate. Does NOT probe
+/// reachability — the caller does that separately.
 pub fn provider_from_config(
     config: &AppConfig,
     cloud_consent: bool,
 ) -> Option<Arc<dyn LlmProvider>> {
     let routing = config.enrichment.routing.clone();
-    let catalog = ModelCatalog::bundled();
-    select_provider(&config.models, &routing, cloud_consent, &catalog)
+    select_provider(&config.models, &routing, cloud_consent)
 }
 
 /// Resolves the interactive-chat provider (Variant B). A purpose-built
 /// `enrichment.chat_model` pin is authoritative when present: it builds a fresh provider
-/// for the matching `models[]` entry under the same consent + catalog gates as routing,
-/// and does NOT fall back to routing when the pin is unusable (so `has_chat_provider`
-/// reports absence). With no pin, defers to the routing-based [`provider_from_config`].
+/// for the matching `models[]` entry under the same consent gate as routing, and does NOT
+/// fall back to routing when the pin is unusable (so `has_chat_provider` reports absence).
+/// With no pin, defers to the routing-based [`provider_from_config`].
 pub fn chat_provider_from_config(
     config: &AppConfig,
     cloud_consent: bool,
@@ -560,7 +545,6 @@ pub fn chat_provider_from_config(
             &chat_model.model,
             &config.models,
             cloud_consent,
-            &ModelCatalog::bundled(),
         ),
         None => provider_from_config(config, cloud_consent),
     }
@@ -569,15 +553,14 @@ pub fn chat_provider_from_config(
 /// Resolves a per-task enrichment provider, reusing `base`'s genai client (M4 Phase 3).
 /// When `task_model` resolves to a gated, usable entry, returns a sibling [`GenaiProvider`]
 /// pinned to that `(provider, model)` over the same client. Falls back to `base.clone()` on
-/// `None` or failed gates (unknown provider, no consent, uncatalogued model).
+/// `None` or failed gates (unknown provider, no consent, empty model).
 pub fn task_provider_from_config(
     base: &Arc<dyn LlmProvider>,
     task_model: Option<&crate::config::TaskModel>,
     models: &[crate::config::ModelConfig],
     cloud_consent: bool,
 ) -> Arc<dyn LlmProvider> {
-    let catalog = ModelCatalog::bundled();
-    match task_model.and_then(|tm| build_task_provider(base, tm, models, cloud_consent, &catalog)) {
+    match task_model.and_then(|tm| build_task_provider(base, tm, models, cloud_consent)) {
         Some(p) => p,
         None => base.clone(),
     }
@@ -591,7 +574,6 @@ fn build_task_provider(
     task_model: &crate::config::TaskModel,
     models: &[crate::config::ModelConfig],
     cloud_consent: bool,
-    catalog: &ModelCatalog,
 ) -> Option<Arc<dyn LlmProvider>> {
     let want_provider = task_model.provider.to_ascii_lowercase();
     let adapter = adapter_for(&want_provider)?;
@@ -611,22 +593,14 @@ fn build_task_provider(
                 .find(|m| m.provider.to_ascii_lowercase() == want_provider && has_endpoint(m))
         })?;
 
-    // Same consent + catalog gates as routing: local Ollama exempt; openai-compatible
-    // consent-gated but not catalog-validated; cloud needs consent + catalog hit.
+    // Same consent gate as routing: local Ollama exempt; every cloud provider needs consent
+    // and a non-empty model id. Catalog membership is advisory metadata, not a usability gate.
     if is_local_provider(&want_provider) {
         if task_model.model.is_empty() {
             return None;
         }
-    } else if !cloud_consent {
+    } else if !cloud_consent || task_model.model.is_empty() {
         return None;
-    } else {
-        let ok = match catalog_key_for(&want_provider) {
-            Some(key) => catalog.validate(key, &task_model.model).is_ok(),
-            None => !task_model.model.is_empty(),
-        };
-        if !ok {
-            return None;
-        }
     }
 
     let base_genai = base.as_any().downcast_ref::<GenaiProvider>()?;
@@ -645,15 +619,14 @@ fn select_provider(
     models: &[crate::config::ModelConfig],
     routing: &LlmRouting,
     cloud_consent: bool,
-    catalog: &ModelCatalog,
 ) -> Option<Arc<dyn LlmProvider>> {
     let usable = |m: &crate::config::ModelConfig| {
-        has_endpoint(m) && !m.model.is_empty() && build_eligible(m, cloud_consent, catalog)
+        has_endpoint(m) && !m.model.is_empty() && build_eligible(m, cloud_consent)
     };
 
     match routing {
         LlmRouting::Explicit { provider, model } => {
-            build_pinned_provider(provider, model, models, cloud_consent, catalog)
+            build_pinned_provider(provider, model, models, cloud_consent)
         }
         LlmRouting::CloudFirst => models
             .iter()
@@ -678,7 +651,7 @@ fn select_provider(
 
 /// Resolves the `models[]` entry pinned to `(provider, model)` and builds a fresh
 /// [`GenaiProvider`] for it under the same usable gates routing selection applies
-/// (endpoint present, non-empty model, `build_eligible` consent + catalog). Shared by
+/// (endpoint present, non-empty model, `build_eligible` consent gate). Shared by
 /// `select_provider`'s Explicit arm and the chat-model pin in [`chat_provider_from_config`]
 /// so the gate lives in exactly one place.
 fn build_pinned_provider(
@@ -686,7 +659,6 @@ fn build_pinned_provider(
     model: &str,
     models: &[crate::config::ModelConfig],
     cloud_consent: bool,
-    catalog: &ModelCatalog,
 ) -> Option<Arc<dyn LlmProvider>> {
     let want_provider = provider.to_ascii_lowercase();
     models
@@ -696,19 +668,17 @@ fn build_pinned_provider(
                 && m.model == *model
                 && has_endpoint(m)
                 && !m.model.is_empty()
-                && build_eligible(m, cloud_consent, catalog)
+                && build_eligible(m, cloud_consent)
         })
         .and_then(build_provider)
 }
 
-/// Whether an entry passes consent + catalog gates. Local Ollama is exempt from both;
-/// `openai-compatible` is consent-gated but not catalog-validated (arbitrary models);
-/// first-class cloud needs consent AND a catalog hit. Unrecognized providers: never eligible.
-fn build_eligible(
-    model: &crate::config::ModelConfig,
-    cloud_consent: bool,
-    catalog: &ModelCatalog,
-) -> bool {
+/// Whether an entry passes the consent gate. Local Ollama is exempt; every other
+/// (cloud / `openai-compatible`) provider needs consent and a non-empty model id.
+/// Catalog membership is advisory metadata — it lists known models but must NOT block
+/// usability, so a model newer than the bundled snapshot stays usable. Unrecognized
+/// providers are never eligible.
+fn build_eligible(model: &crate::config::ModelConfig, cloud_consent: bool) -> bool {
     let provider = model.provider.to_ascii_lowercase();
     if adapter_for(&provider).is_none() {
         return false;
@@ -719,10 +689,7 @@ fn build_eligible(
     if !cloud_consent {
         return false;
     }
-    match catalog_key_for(&provider) {
-        Some(key) => catalog.validate(key, &model.model).is_ok(),
-        None => !model.model.is_empty(), // openai-compatible: consent-gated, not catalog-validated
-    }
+    !model.model.is_empty()
 }
 
 /// Whether an entry has a usable endpoint: a configured `base_url`, or a native cloud adapter
@@ -797,22 +764,24 @@ pub struct ActiveModelCandidate {
     pub reason: Option<String>,
 }
 
-/// Enumerates `config.models[]` as active-chat-model candidates. Each entry's `available`
-/// mirrors exactly what a chat-model pin would resolve to (same endpoint + consent +
-/// catalog gates as [`build_pinned_provider`]), with a short `reason` otherwise. Entries
+/// Enumerates the *pinnable-eligible* `config.models[]` entries (those with a non-empty
+/// model) as active-chat-model candidates. Each entry's `available` mirrors exactly what a
+/// chat-model pin would resolve to (same endpoint + consent + catalog gates as
+/// [`build_pinned_provider`]), with a short `reason` otherwise. Credential-only entries
+/// (empty model) are excluded — they are not pinnable, mirroring the build gates. Entries
 /// whose provider has no genai adapter (e.g. an embedding backend) are omitted — they can
 /// never back a chat model.
 pub fn active_model_candidates(
     config: &AppConfig,
     cloud_consent: bool,
 ) -> Vec<ActiveModelCandidate> {
-    let catalog = ModelCatalog::bundled();
     config
         .models
         .iter()
+        .filter(|m| !m.model.is_empty())
         .filter(|m| adapter_for(&m.provider.to_ascii_lowercase()).is_some())
         .map(|m| {
-            let reason = candidate_unavailable_reason(m, cloud_consent, &catalog);
+            let reason = candidate_unavailable_reason(m, cloud_consent);
             ActiveModelCandidate {
                 provider: m.provider.clone(),
                 model: m.model.clone(),
@@ -825,28 +794,23 @@ pub fn active_model_candidates(
 }
 
 /// `None` when the entry would resolve as a chat pin; otherwise the first failing gate as a
-/// short human reason. Mirrors the usable-gate order in [`build_pinned_provider`]: non-empty
-/// model, endpoint, then [`build_eligible`] (consent + catalog).
+/// short human reason. Mirrors the usable-gate order in [`build_pinned_provider`]: endpoint,
+/// then [`build_eligible`] (the consent gate). Catalog membership is advisory metadata, not a
+/// usability gate — a keyed + consented cloud model absent from the bundled snapshot reports
+/// available. The caller already filters out empty-model (credential-only) entries, so the
+/// model here is always non-empty.
 fn candidate_unavailable_reason(
     model: &crate::config::ModelConfig,
     cloud_consent: bool,
-    catalog: &ModelCatalog,
 ) -> Option<String> {
-    if model.model.is_empty() {
-        return Some("no model configured".to_string());
-    }
     if !has_endpoint(model) {
         return Some("base URL required".to_string());
     }
-    if build_eligible(model, cloud_consent, catalog) {
+    if build_eligible(model, cloud_consent) {
         return None;
     }
-    // Endpoint present and model non-empty, so build_eligible failed on the cloud gate.
-    if !cloud_consent {
-        Some("cloud consent required".to_string())
-    } else {
-        Some("model not in catalog".to_string())
-    }
+    // Endpoint present and model non-empty, so the only remaining gate is cloud consent.
+    Some("cloud consent required".to_string())
 }
 
 /// Human-friendly provider name for a candidate label; falls back to the raw id for unknowns.
@@ -881,6 +845,7 @@ mod tests {
     use super::*;
 
     use crate::config::ModelConfig;
+    use crate::model_catalog::ModelCatalog;
     use futures_util::StreamExt;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1337,15 +1302,15 @@ mod tests {
     }
 
     #[test]
-    fn cloud_rejected_when_model_not_in_catalog() {
+    fn cloud_uncatalogued_model_resolves_when_keyed_and_consented() {
+        // Catalog membership is advisory: a model newer than the bundled snapshot must
+        // still resolve when keyed + consented.
         let cfg = config_with(
             vec![anthropic_entry("totally-made-up-model")],
             LlmRouting::CloudFirst,
         );
-        assert!(
-            provider_from_config(&cfg, true).is_none(),
-            "uncatalogued cloud model must be rejected"
-        );
+        let p = provider_from_config(&cfg, true).expect("uncatalogued cloud model is usable");
+        assert_eq!(p.model_id(), "totally-made-up-model");
     }
 
     #[test]
@@ -1405,14 +1370,6 @@ mod tests {
         ));
         assert!(matches!(adapter_for("xai"), Some(AdapterKind::Xai)));
         assert!(matches!(adapter_for("cohere"), Some(AdapterKind::Cohere)));
-    }
-
-    #[test]
-    fn catalog_key_for_maps_new_native_providers_to_own_namespace() {
-        assert_eq!(catalog_key_for("groq"), Some("groq"));
-        assert_eq!(catalog_key_for("deepseek"), Some("deepseek"));
-        assert_eq!(catalog_key_for("xai"), Some("xai"));
-        assert_eq!(catalog_key_for("cohere"), Some("cohere"));
     }
 
     #[test]
@@ -1482,15 +1439,14 @@ mod tests {
     }
 
     #[test]
-    fn new_native_cloud_model_rejected_when_not_in_catalog() {
+    fn new_native_cloud_uncatalogued_model_resolves_with_consent() {
+        // Advisory catalog: an uncatalogued groq model is usable once keyed + consented.
         let cfg = config_with(
             vec![native_cloud_entry("groq", "totally-made-up-model")],
             LlmRouting::CloudFirst,
         );
-        assert!(
-            provider_from_config(&cfg, true).is_none(),
-            "uncatalogued groq model must be rejected"
-        );
+        let p = provider_from_config(&cfg, true).expect("uncatalogued groq model is usable");
+        assert_eq!(p.model_id(), "totally-made-up-model");
     }
 
     #[test]
@@ -1745,7 +1701,8 @@ mod tests {
     }
 
     #[test]
-    fn task_provider_rejects_uncatalogued_cloud_override() {
+    fn task_provider_pins_uncatalogued_cloud_override_with_consent() {
+        // Advisory catalog: an uncatalogued cloud override still pins once consented.
         let base = base_genai("qwen2.5-instruct");
         let models = vec![anthropic_entry("totally-made-up-model")];
         let map = TaskModel {
@@ -1753,7 +1710,7 @@ mod tests {
             model: "totally-made-up-model".to_string(),
         };
         let p = task_provider_from_config(&base, Some(&map), &models, true);
-        assert_eq!(p.model_id(), "qwen2.5-instruct");
+        assert_eq!(p.model_id(), "totally-made-up-model");
     }
 
     #[test]
@@ -1813,32 +1770,84 @@ mod tests {
     }
 
     #[test]
-    fn candidates_reject_uncatalogued_cloud_model_with_consent() {
+    fn candidates_accept_uncatalogued_cloud_model_with_consent() {
+        // Advisory catalog: a keyed + consented model absent from the bundled snapshot is
+        // reported available (reason=None), not a false-negative "not in catalog".
         let cfg = config_with(
             vec![anthropic_entry("totally-made-up-model")],
             LlmRouting::CloudFirst,
         );
         let out = active_model_candidates(&cfg, true);
         let c = candidate(&out, "anthropic", "totally-made-up-model");
-        assert!(!c.available);
-        assert_eq!(c.reason.as_deref(), Some("model not in catalog"));
+        assert!(c.available);
+        assert_eq!(c.reason, None);
     }
 
     #[test]
-    fn candidates_flag_empty_model() {
+    fn uncatalogued_cloud_model_is_available_and_pinnable() {
+        // Advisory catalog end-to-end: a keyed + consented cloud model newer than the
+        // bundled snapshot reports available AND resolves to a real pinned provider.
         let cfg = config_with(
-            vec![ModelConfig {
-                provider: "ollama".to_string(),
-                base_url: "http://localhost:11434".to_string(),
-                model: String::new(),
-                ..ModelConfig::default()
-            }],
+            vec![anthropic_entry("claude-future-99")],
+            LlmRouting::CloudFirst,
+        );
+        let out = active_model_candidates(&cfg, true);
+        let c = candidate(&out, "anthropic", "claude-future-99");
+        assert!(c.available);
+        assert_eq!(c.reason, None);
+
+        let pinned = build_pinned_provider("anthropic", "claude-future-99", &cfg.models, true)
+            .expect("uncatalogued keyed cloud model is pinnable");
+        assert_eq!(pinned.model_id(), "claude-future-99");
+    }
+
+    // A-T2: credential-only (empty-model) entries are excluded from candidates; only
+    // pinnable-eligible (non-empty model) entries appear.
+    #[test]
+    fn candidates_exclude_empty_model_entries() {
+        let credential_only = ModelConfig {
+            provider: "ollama".to_string(),
+            base_url: "http://localhost:11434".to_string(),
+            model: String::new(),
+            ..ModelConfig::default()
+        };
+        let cfg = config_with(
+            vec![credential_only, ollama_entry()],
             LlmRouting::CloudFirst,
         );
         let out = active_model_candidates(&cfg, false);
-        let c = candidate(&out, "ollama", "");
-        assert!(!c.available);
-        assert_eq!(c.reason.as_deref(), Some("no model configured"));
+        assert_eq!(
+            out.len(),
+            1,
+            "only the non-empty-model entry is a candidate"
+        );
+        assert_eq!(out[0].provider, "ollama");
+        assert_eq!(out[0].model, "llama3");
+        assert!(
+            out.iter().all(|c| !c.model.is_empty()),
+            "no empty-model candidate leaks through"
+        );
+    }
+
+    // A-T5: a credential-only cloud entry (saved key, empty model) is not a usable chat
+    // provider and is not pinnable — the chat gate and pin builder both return None.
+    #[test]
+    fn credential_only_cloud_entry_is_not_a_chat_provider() {
+        let credential_only = ModelConfig {
+            provider: "anthropic".to_string(),
+            base_url: "https://api.anthropic.com".to_string(),
+            model: String::new(),
+            api_key: "sk-ant".to_string(),
+            ..ModelConfig::default()
+        };
+        let cfg = config_with(vec![credential_only.clone()], LlmRouting::CloudFirst);
+
+        // No pin → routing resolution; the empty-model entry is not usable (mirrors
+        // src-tauri `has_chat_provider`, which builds no client either).
+        assert!(chat_provider_from_config(&cfg, true).is_none());
+
+        // A pin to the empty model does not resolve.
+        assert!(build_pinned_provider("anthropic", "", &[credential_only], true).is_none());
     }
 
     #[test]

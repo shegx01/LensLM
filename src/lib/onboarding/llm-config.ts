@@ -44,6 +44,75 @@ export async function saveLlmProvider(input: LlmProviderInput): Promise<void> {
   });
 }
 
+/** Provider-level credentials, decoupled from model selection. */
+export interface ProviderCredentialInput {
+  /** Canonical provider id (= models.dev catalog key). */
+  provider: string;
+  base_url: string;
+  api_key: string;
+}
+
+/**
+ * Upserts a provider's credentials (`base_url`/`api_key`) while PRESERVING its
+ * `model`/`context`/`temperature`. A brand-new entry is credential-only (`model:''`) —
+ * valid config; excluded from active-model candidates until a model is pinned. The
+ * read-merge runs inside the `updateConfig` mutator so it commutes with a concurrent
+ * model-pin write to the same entry. No-op outside Tauri.
+ */
+export async function saveProviderCredential(input: ProviderCredentialInput): Promise<void> {
+  await updateConfig((cfg) => {
+    const existing = cfg.models ?? [];
+    const idx = existing.findIndex((m) => m.provider === input.provider);
+    const prior = idx >= 0 ? existing[idx] : undefined;
+    const entry: ModelConfig = {
+      provider: input.provider,
+      base_url: input.base_url,
+      api_key: input.api_key,
+      model: prior?.model ?? '',
+      context: prior?.context ?? 8192,
+      temperature: prior?.temperature ?? 0.7
+    };
+    const models: ModelConfig[] =
+      idx >= 0 ? existing.map((m, i) => (i === idx ? entry : m)) : [...existing, entry];
+    return { ...cfg, models };
+  });
+}
+
+/** The model-pin half of a provider entry, decoupled from its credentials. */
+export interface ActiveModelInput {
+  /** Canonical provider id (= models.dev catalog key). */
+  provider: string;
+  model: string;
+  context: number;
+  temperature: number;
+}
+
+/**
+ * Upserts a provider's model pin (`model`/`context`/`temperature`) while PRESERVING its
+ * `base_url`/`api_key`. The read-merge runs inside the `updateConfig` mutator so a stale
+ * snapshot can never clobber a credential the user just edited in the Providers section.
+ * Callers pin `enrichment.chat_model` + flip `cloud_consent` via `saveEnrichmentPrefs`
+ * separately. No-op outside Tauri.
+ */
+export async function saveActiveModel(input: ActiveModelInput): Promise<void> {
+  await updateConfig((cfg) => {
+    const existing = cfg.models ?? [];
+    const idx = existing.findIndex((m) => m.provider === input.provider);
+    const prior = idx >= 0 ? existing[idx] : undefined;
+    const entry: ModelConfig = {
+      provider: input.provider,
+      base_url: prior?.base_url ?? '',
+      api_key: prior?.api_key ?? '',
+      model: input.model,
+      context: input.context,
+      temperature: input.temperature
+    };
+    const models: ModelConfig[] =
+      idx >= 0 ? existing.map((m, i) => (i === idx ? entry : m)) : [...existing, entry];
+    return { ...cfg, models };
+  });
+}
+
 /** The enrichment preferences captured by the onboarding LLM step. */
 export interface EnrichmentPrefsInput {
   enabled: boolean;
