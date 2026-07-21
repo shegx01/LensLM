@@ -11,11 +11,19 @@ use crate::paths::StoragePaths;
 /// Byte-usage breakdown of the engine data directory. Crosses the IPC boundary
 /// as plain JSON numbers; consumed by the Storage settings panel.
 ///
+/// `corpus_bytes == db_bytes + vectors_bytes + sources_bytes + audio_bytes` and
 /// `total_bytes == corpus_bytes + reclaimable_cache_bytes + retained_bytes`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct StorageStats {
-    /// User data that cannot be re-downloaded: DB, vectors, extracted sources,
-    /// generated audio overviews.
+    /// SQLite database (data + WAL + shared-memory index).
+    pub db_bytes: u64,
+    /// LanceDB vector store.
+    pub vectors_bytes: u64,
+    /// Extracted/managed source files.
+    pub sources_bytes: u64,
+    /// Generated audio overviews.
+    pub audio_bytes: u64,
+    /// User data that cannot be re-downloaded: the sum of the four buckets above.
     pub corpus_bytes: u64,
     /// Re-downloadable model bundles safe to clear: voice/ASR models and any
     /// embedding weights that are not the active model.
@@ -28,9 +36,13 @@ pub struct StorageStats {
 
 /// Path partition of the data dir. Private single source consumed by both
 /// [`storage_stats`] and [`clear_model_cache`] so their notions of corpus /
-/// reclaimable / retained can never drift.
+/// reclaimable / retained can never drift. Corpus is split into per-bottleneck
+/// buckets (#238) for the usage breakdown.
 struct DataLayout {
-    corpus_paths: Vec<PathBuf>,
+    db_paths: Vec<PathBuf>,
+    vectors_paths: Vec<PathBuf>,
+    sources_paths: Vec<PathBuf>,
+    audio_paths: Vec<PathBuf>,
     reclaimable_cache_paths: Vec<PathBuf>,
     retained_paths: Vec<PathBuf>,
 }
@@ -45,14 +57,14 @@ struct DataLayout {
 /// id (empty resolves to the registry default at the embedder boundary).
 fn data_layout(paths: &StoragePaths, embedding_model: &str) -> DataLayout {
     let data_dir = paths.data_dir();
-    let corpus_paths = vec![
+    let db_paths = vec![
         paths.db_path(),
         data_dir.join("lens.db-wal"),
         data_dir.join("lens.db-shm"),
-        paths.lancedb_root(),
-        paths.sources_dir(),
-        paths.notebooks_dir(),
     ];
+    let vectors_paths = vec![paths.lancedb_root()];
+    let sources_paths = vec![paths.sources_dir()];
+    let audio_paths = vec![paths.notebooks_dir()];
 
     let models = paths.models_dir();
 
@@ -95,7 +107,10 @@ fn data_layout(paths: &StoragePaths, embedding_model: &str) -> DataLayout {
     }
 
     DataLayout {
-        corpus_paths,
+        db_paths,
+        vectors_paths,
+        sources_paths,
+        audio_paths,
         reclaimable_cache_paths,
         retained_paths,
     }
@@ -175,13 +190,24 @@ pub(crate) fn storage_stats_blocking(
     embedding_model: &str,
 ) -> Result<StorageStats, LensError> {
     let layout = data_layout(paths, embedding_model);
-    let corpus_bytes = sum_paths(&layout.corpus_paths)?;
+    let db_bytes = sum_paths(&layout.db_paths)?;
+    let vectors_bytes = sum_paths(&layout.vectors_paths)?;
+    let sources_bytes = sum_paths(&layout.sources_paths)?;
+    let audio_bytes = sum_paths(&layout.audio_paths)?;
+    let corpus_bytes = db_bytes
+        .saturating_add(vectors_bytes)
+        .saturating_add(sources_bytes)
+        .saturating_add(audio_bytes);
     let reclaimable_cache_bytes = sum_paths(&layout.reclaimable_cache_paths)?;
     let retained_bytes = sum_paths(&layout.retained_paths)?;
     let total_bytes = corpus_bytes
         .saturating_add(reclaimable_cache_bytes)
         .saturating_add(retained_bytes);
     Ok(StorageStats {
+        db_bytes,
+        vectors_bytes,
+        sources_bytes,
+        audio_bytes,
         corpus_bytes,
         reclaimable_cache_bytes,
         retained_bytes,
@@ -308,7 +334,15 @@ mod tests {
         seed_all(&paths);
 
         let stats = storage_stats_blocking(&paths, "").expect("stats");
+        assert_eq!(stats.db_bytes, 10);
+        assert_eq!(stats.vectors_bytes, 20);
+        assert_eq!(stats.sources_bytes, 30);
+        assert_eq!(stats.audio_bytes, 40);
         assert_eq!(stats.corpus_bytes, 10 + 20 + 30 + 40);
+        assert_eq!(
+            stats.corpus_bytes,
+            stats.db_bytes + stats.vectors_bytes + stats.sources_bytes + stats.audio_bytes
+        );
         assert_eq!(stats.reclaimable_cache_bytes, 100 + 200 + 300 + 400 + 700);
         assert_eq!(stats.retained_bytes, 500 + 50);
         assert_eq!(

@@ -97,6 +97,10 @@ export interface PathConfig {
 // SYNC-CHECK: must match the `get_storage_stats` Tauri command's return shape
 // (src-tauri/src/commands/system.rs) — not a persisted AppConfig field.
 export interface StorageStats {
+  db_bytes: number;
+  vectors_bytes: number;
+  sources_bytes: number;
+  audio_bytes: number;
   corpus_bytes: number;
   reclaimable_cache_bytes: number;
   retained_bytes: number;
