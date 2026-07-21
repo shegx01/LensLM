@@ -2,9 +2,9 @@
 
 use futures::StreamExt;
 use lens_core::{
-    AddSourceOutcome, AnswerEvent, ChatFeedback, ChatMessage, ChatState, DialoguePhase,
-    DialogueScript, IngestProgress, Length, LensEngine, LensError, Notebook, NotebookId,
-    NotebookSummary, Source, TrashedSource, TtsPhase,
+    AddSourceOutcome, AnswerEvent, AudioOverviewRecord, ChatFeedback, ChatMessage, ChatState,
+    DialoguePhase, DialogueScript, IngestProgress, Length, LensEngine, LensError, Notebook,
+    NotebookId, NotebookSummary, Source, TrashedSource, TtsPhase,
 };
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
@@ -545,10 +545,17 @@ pub async fn cancel_dialogue(
     Ok(engine.cancel_dialogue_generation(&notebook_id))
 }
 
+/// Generates + synthesizes the per-notebook Audio Overview at `length` (#29) and
+/// persists the terminal `audio_overviews` row (see
+/// [`LensEngine::generate_and_persist_overview`]). Streams `TtsPhase` progress and
+/// returns the WAV path for immediate `convertFileSrc` playback. A user cancel is
+/// surfaced as the `Cancelled` error kind (no `failed` row, no `Failed` event) so the
+/// card can return to idle rather than an error state.
 #[tracing::instrument(skip(on_progress, engine))]
 #[tauri::command]
 pub async fn synthesize_overview(
     notebook_id: String,
+    length: Length,
     on_progress: Channel<StreamEvent<TtsPhase>>,
     engine: tauri::State<'_, LensEngine>,
 ) -> Result<String, LensError> {
@@ -567,49 +574,33 @@ pub async fn synthesize_overview(
     }
 
     let token = engine.register_tts(&notebook_id);
+    // Persist happens inside `generate_and_persist_overview`; this guard drops only after
+    // the command returns, so the token is released only after the row is written.
     let _guard = engine.tts_cancel_guard(&notebook_id, token.clone());
-
-    let script = match engine
-        .generate_dialogue(
-            &NotebookId::from(notebook_id.clone()),
-            Length::Medium,
-            (*token).clone(),
-            |_phase| {},
-        )
-        .await
-    {
-        Ok(script) => script,
-        Err(err) => {
-            if let Err(e) = send_event(&on_progress, StreamEvent::Failed(err.clone())) {
-                tracing::warn!("synthesize_overview: failed event send failed: {e}");
-            }
-            return Err(err);
-        }
-    };
 
     let on_progress_phase = on_progress.clone();
     let result = engine
-        .synthesize_overview(
+        .generate_and_persist_overview(
             &notebook_id,
-            &script,
-            &config.voices,
-            &config.tts,
+            length,
             move |phase| {
                 if let Err(e) = send_event(&on_progress_phase, StreamEvent::Chunk(phase)) {
                     tracing::warn!("synthesize_overview: phase send failed: {e}");
                 }
             },
-            &token,
+            (*token).clone(),
         )
         .await;
 
     match result {
-        Ok(path) => {
+        Ok(Some(path)) => {
             if let Err(e) = send_event(&on_progress, StreamEvent::Done) {
                 tracing::warn!("synthesize_overview: done event send failed: {e}");
             }
             Ok(path.to_string_lossy().into_owned())
         }
+        // [M2] User cancel: no row/`Failed` event written; surfaced as `Cancelled` → idle.
+        Ok(None) => Err(LensError::Cancelled("overview generation cancelled".into())),
         Err(err) => {
             if let Err(e) = send_event(&on_progress, StreamEvent::Failed(err.clone())) {
                 tracing::warn!("synthesize_overview: failed event send failed: {e}");
@@ -617,6 +608,29 @@ pub async fn synthesize_overview(
             Err(err)
         }
     }
+}
+
+/// Returns the persisted (and disk-reconciled) Audio Overview record for a notebook, or
+/// `None` if none was ever generated (#29). A `ready` row whose file has vanished
+/// resolves to `Missing` so the UI never shows a dead player.
+#[tracing::instrument(skip(engine))]
+#[tauri::command]
+pub async fn get_audio_overview_status(
+    notebook_id: String,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<Option<AudioOverviewRecord>, LensError> {
+    engine.get_audio_overview_status(&notebook_id).await
+}
+
+/// Whether an overview synthesis is currently in flight for `notebook_id` (#29). Lets a
+/// reopened notebook show an indeterminate generating state after navigating away mid-run.
+#[tracing::instrument(skip(engine))]
+#[tauri::command]
+pub async fn is_overview_generating(
+    notebook_id: String,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<bool, LensError> {
+    Ok(engine.is_overview_generating(&notebook_id))
 }
 
 #[tracing::instrument(skip(engine))]

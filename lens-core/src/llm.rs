@@ -28,9 +28,12 @@ use crate::model_catalog::{ModelCatalog, SupportedProvider};
 
 /// Connect timeout for LLM HTTP requests (matches the system-check probe).
 const LLM_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
-/// Overall (read) timeout for LLM generate/probe requests. Generate calls can take many seconds,
-/// so this is far longer than the 2s system-check probe window.
+/// Total timeout for the cheap unauthenticated Ollama `api/version` reachability probe.
 const LLM_TIMEOUT: Duration = Duration::from_secs(30);
+/// Idle read timeout for LLM generation: resets on each received chunk, not a total-
+/// request deadline, so unbounded streaming on a small local model never times out —
+/// yet a stalled/unreachable model still fails. Also bounds a buffered `generate`.
+const LLM_GENERATION_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Canonical provider ids matching `ModelConfig.provider`. First-class cloud providers use their
 /// models.dev catalog key; `openai-compatible` covers self-hosted OpenAI-protocol endpoints
@@ -140,6 +143,13 @@ pub trait LlmProvider: Send + Sync {
         &()
     }
 
+    /// Whether this provider runs on-device (local Ollama). Lets callers relax limits
+    /// small local models can't meet — e.g. the dialogue min-turns floor (#26) — while
+    /// keeping cloud strict.
+    fn is_local(&self) -> bool {
+        false
+    }
+
     /// Reachability probe. `false` on connection refusal, DNS/timeout, or auth errors
     /// (`401`/`403`) — a misconfigured key is unreachable so sources degrade gracefully.
     async fn reachable(&self) -> bool;
@@ -168,7 +178,7 @@ pub trait LlmProvider: Send + Sync {
 }
 
 fn llm_client() -> reqwest::Client {
-    crate::http::hardened_client(LLM_CONNECT_TIMEOUT, LLM_TIMEOUT)
+    crate::http::hardened_client_idle(LLM_CONNECT_TIMEOUT, LLM_GENERATION_IDLE_TIMEOUT)
 }
 
 /// Maps a genai error onto [`LensError`], sanitizing the message before it crosses the IPC
@@ -177,16 +187,28 @@ fn llm_client() -> reqwest::Client {
 /// → `Model`). The full error is logged server-side; only a generic message is surfaced over IPC.
 fn genai_err(err: genai::Error) -> LensError {
     let lower = err.to_string().to_ascii_lowercase();
+    // reqwest's transport-failure `Display` often lacks "timeout"/"connect": a send
+    // failure reads "error sending request", an idle read-timeout "error reading
+    // response"/"body", and a deadline "deadline". Match those too so a genuine
+    // transport error is never misclassified as a model (bad-output) error.
     let is_transport = lower.contains("connect")
         || lower.contains("connection")
         || lower.contains("timed out")
         || lower.contains("timeout")
         || lower.contains("dns")
-        || lower.contains("refused");
+        || lower.contains("refused")
+        || lower.contains("sending request")
+        || lower.contains("reading response")
+        || lower.contains("response body")
+        || lower.contains("deadline");
     // Log the full detail for operators; never surface it across IPC.
     tracing::error!(error = %err, transport = is_transport, "LLM request failed");
     if is_transport {
-        LensError::Network("LLM request failed (network)".to_string())
+        LensError::Network(
+            "couldn't reach the language model — check that your LLM provider \
+             (e.g. local Ollama) is running and reachable"
+                .to_string(),
+        )
     } else {
         LensError::Model("LLM request failed (model)".to_string())
     }
@@ -379,6 +401,10 @@ impl LlmProvider for GenaiProvider {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn is_local(&self) -> bool {
+        self.is_ollama()
     }
 
     async fn reachable(&self) -> bool {
@@ -756,6 +782,98 @@ pub fn build_provider_raw(
     Some(Arc::new(GenaiProvider::new(
         adapter, model, base_url, api_key,
     )))
+}
+
+/// A configured `(provider, model)` offered as the active chat model, with its computed
+/// availability and a short reason when unavailable. Tauri-free: crosses IPC as-is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ActiveModelCandidate {
+    pub provider: String,
+    pub model: String,
+    /// Display label, e.g. `"Ollama · llama3.2:3b"`.
+    pub label: String,
+    pub available: bool,
+    /// Short human reason when unavailable; `None` when `available`.
+    pub reason: Option<String>,
+}
+
+/// Enumerates `config.models[]` as active-chat-model candidates. Each entry's `available`
+/// mirrors exactly what a chat-model pin would resolve to (same endpoint + consent +
+/// catalog gates as [`build_pinned_provider`]), with a short `reason` otherwise. Entries
+/// whose provider has no genai adapter (e.g. an embedding backend) are omitted — they can
+/// never back a chat model.
+pub fn active_model_candidates(
+    config: &AppConfig,
+    cloud_consent: bool,
+) -> Vec<ActiveModelCandidate> {
+    let catalog = ModelCatalog::bundled();
+    config
+        .models
+        .iter()
+        .filter(|m| adapter_for(&m.provider.to_ascii_lowercase()).is_some())
+        .map(|m| {
+            let reason = candidate_unavailable_reason(m, cloud_consent, &catalog);
+            ActiveModelCandidate {
+                provider: m.provider.clone(),
+                model: m.model.clone(),
+                label: candidate_label(&m.provider, &m.model),
+                available: reason.is_none(),
+                reason,
+            }
+        })
+        .collect()
+}
+
+/// `None` when the entry would resolve as a chat pin; otherwise the first failing gate as a
+/// short human reason. Mirrors the usable-gate order in [`build_pinned_provider`]: non-empty
+/// model, endpoint, then [`build_eligible`] (consent + catalog).
+fn candidate_unavailable_reason(
+    model: &crate::config::ModelConfig,
+    cloud_consent: bool,
+    catalog: &ModelCatalog,
+) -> Option<String> {
+    if model.model.is_empty() {
+        return Some("no model configured".to_string());
+    }
+    if !has_endpoint(model) {
+        return Some("base URL required".to_string());
+    }
+    if build_eligible(model, cloud_consent, catalog) {
+        return None;
+    }
+    // Endpoint present and model non-empty, so build_eligible failed on the cloud gate.
+    if !cloud_consent {
+        Some("cloud consent required".to_string())
+    } else {
+        Some("model not in catalog".to_string())
+    }
+}
+
+/// Human-friendly provider name for a candidate label; falls back to the raw id for unknowns.
+fn provider_display_name(provider: &str) -> &str {
+    match provider.to_ascii_lowercase().as_str() {
+        PROVIDER_OLLAMA => "Ollama",
+        PROVIDER_OLLAMA_CLOUD => "Ollama Cloud",
+        PROVIDER_OPENAI => "OpenAI",
+        PROVIDER_ANTHROPIC => "Anthropic",
+        PROVIDER_GOOGLE => "Google",
+        PROVIDER_ZAI | PROVIDER_GLM => "Z.ai",
+        PROVIDER_GROQ => "Groq",
+        PROVIDER_DEEPSEEK => "DeepSeek",
+        PROVIDER_XAI => "xAI",
+        PROVIDER_COHERE => "Cohere",
+        PROVIDER_OPENAI_COMPAT => "OpenAI-compatible",
+        _ => provider,
+    }
+}
+
+fn candidate_label(provider: &str, model: &str) -> String {
+    let name = provider_display_name(provider);
+    if model.is_empty() {
+        name.to_string()
+    } else {
+        format!("{name} · {model}")
+    }
 }
 
 #[cfg(test)]
@@ -1648,5 +1766,96 @@ mod tests {
         };
         let p = task_provider_from_config(&base, Some(&coref), &models, true);
         assert_eq!(p.model_id(), "qwen2.5-instruct");
+    }
+
+    // --- active_model_candidates (selector enumeration) ----------------------
+
+    fn candidate<'a>(
+        list: &'a [ActiveModelCandidate],
+        provider: &str,
+        model: &str,
+    ) -> &'a ActiveModelCandidate {
+        list.iter()
+            .find(|c| c.provider == provider && c.model == model)
+            .unwrap_or_else(|| panic!("candidate {provider}/{model} missing"))
+    }
+
+    #[test]
+    fn candidates_mark_usable_local_available() {
+        let cfg = config_with(vec![ollama_entry()], LlmRouting::CloudFirst);
+        let out = active_model_candidates(&cfg, false);
+        let c = candidate(&out, "ollama", "llama3");
+        assert!(
+            c.available,
+            "usable local entry is available without consent"
+        );
+        assert_eq!(c.reason, None);
+        assert_eq!(c.label, "Ollama · llama3");
+    }
+
+    #[test]
+    fn candidates_gate_cloud_on_consent() {
+        let model = catalog_anthropic_model();
+        let cfg = config_with(vec![anthropic_entry(&model)], LlmRouting::CloudFirst);
+
+        let denied = active_model_candidates(&cfg, false);
+        let c = candidate(&denied, "anthropic", &model);
+        assert!(!c.available, "cloud entry needs consent");
+        assert_eq!(c.reason.as_deref(), Some("cloud consent required"));
+
+        let granted = active_model_candidates(&cfg, true);
+        let c = candidate(&granted, "anthropic", &model);
+        assert!(
+            c.available,
+            "consent + catalog-valid cloud entry is available"
+        );
+        assert_eq!(c.reason, None);
+    }
+
+    #[test]
+    fn candidates_reject_uncatalogued_cloud_model_with_consent() {
+        let cfg = config_with(
+            vec![anthropic_entry("totally-made-up-model")],
+            LlmRouting::CloudFirst,
+        );
+        let out = active_model_candidates(&cfg, true);
+        let c = candidate(&out, "anthropic", "totally-made-up-model");
+        assert!(!c.available);
+        assert_eq!(c.reason.as_deref(), Some("model not in catalog"));
+    }
+
+    #[test]
+    fn candidates_flag_empty_model() {
+        let cfg = config_with(
+            vec![ModelConfig {
+                provider: "ollama".to_string(),
+                base_url: "http://localhost:11434".to_string(),
+                model: String::new(),
+                ..ModelConfig::default()
+            }],
+            LlmRouting::CloudFirst,
+        );
+        let out = active_model_candidates(&cfg, false);
+        let c = candidate(&out, "ollama", "");
+        assert!(!c.available);
+        assert_eq!(c.reason.as_deref(), Some("no model configured"));
+    }
+
+    #[test]
+    fn candidates_omit_non_llm_providers() {
+        let cfg = config_with(
+            vec![
+                ollama_entry(),
+                ModelConfig {
+                    provider: "fastembed".to_string(),
+                    model: "bge-small".to_string(),
+                    ..ModelConfig::default()
+                },
+            ],
+            LlmRouting::CloudFirst,
+        );
+        let out = active_model_candidates(&cfg, false);
+        assert_eq!(out.len(), 1, "the embedding entry has no genai adapter");
+        assert_eq!(out[0].provider, "ollama");
     }
 }

@@ -3,7 +3,7 @@
 
 import { Channel, invoke, isTauri } from '@tauri-apps/api/core';
 import { updateConfig } from '$lib/config.js';
-import type { TtsConfig } from '$lib/theme/types.js';
+import type { AppConfig, TtsConfig } from '$lib/theme/types.js';
 
 export type CheckId = 'llm_runtime' | 'embedding_model';
 
@@ -192,6 +192,22 @@ export type TtsModelStatus = 'complete' | 'partial' | 'absent';
 export async function ttsModelStatus(engine: string, model: string): Promise<TtsModelStatus> {
   if (!isTauri()) return 'absent';
   return invoke<TtsModelStatus>('tts_model_status', { engine, model });
+}
+
+/**
+ * Whether the configured TTS backend can synthesize — reused to gate #29's Generate,
+ * folding in "Cloud needs a key" / "Qwen needs Apple Silicon" (catalog `available`).
+ */
+export async function isTtsReady(): Promise<boolean> {
+  if (!isTauri()) return false;
+  const [cfg, catalog] = await Promise.all([invoke<AppConfig>('get_config'), ttsEngineCatalog()]);
+  const id: TtsEngineId = typeof cfg.tts.backend === 'object' ? 'cloud' : cfg.tts.backend;
+  const entry = catalog.find((e) => e.id === id);
+  if (!entry || !entry.available) return false;
+  for (const model of entry.required_model_ids) {
+    if ((await ttsModelStatus(id, model)) !== 'complete') return false;
+  }
+  return true;
 }
 
 // SYNC-CHECK: a UI selector mapped to the wire `TtsBackend` (lens-core/src/tts/mod.rs) by

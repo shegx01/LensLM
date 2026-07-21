@@ -53,6 +53,10 @@ export const sourcesStore = {
   get sources() {
     return sources;
   },
+  /** The single source of truth for selection gating. */
+  get selectedCount(): number {
+    return sources.filter((s) => s.selected === 1).length;
+  },
   get loading() {
     return loading;
   },

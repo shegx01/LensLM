@@ -16,6 +16,9 @@ const { mockSourcesStore, mockNotebookStore } = vi.hoisted(() => {
     get sources() {
       return _sources;
     },
+    get selectedCount() {
+      return _sources.filter((s) => s.selected === 1).length;
+    },
     get loading() {
       return false;
     },
@@ -468,10 +471,12 @@ describe('SourcesRail — Studio shell', () => {
     expect(screen.getByText(/1 of 2 sources selected/i)).toBeInTheDocument();
   });
 
-  it('the Generate Audio Overview button is marked coming-soon (aria-disabled)', () => {
+  // #29 replaced the "coming soon" stub with a live lifecycle card — full
+  // idle/generating/ready/stale/failed/missing coverage lives in
+  // StudioPanel.svelte.test.ts. This suite only checks the shell mounts it.
+  it('renders the Generate Audio Overview button', () => {
     render(SourcesRail);
-    const gen = screen.getByRole('button', { name: /generate audio overview/i });
-    expect(gen).toHaveAttribute('aria-disabled', 'true');
+    expect(screen.getByRole('button', { name: /generate audio overview/i })).toBeInTheDocument();
   });
 
   it('renders the study-tool actions, each marked coming-soon (aria-disabled)', () => {

@@ -7,8 +7,8 @@
 use std::collections::BTreeMap;
 
 use lens_core::{
-    LensEngine, LensError, ModelInfo, ModelValidation, ProviderEntry,
-    validate_model_interactive as core_validate_model_interactive,
+    ActiveModelCandidate, LensEngine, LensError, ModelInfo, ModelValidation, ProviderEntry,
+    TaskModel, validate_model_interactive as core_validate_model_interactive,
 };
 use serde::Serialize;
 
@@ -97,6 +97,29 @@ pub async fn refresh_models(engine: tauri::State<'_, LensEngine>) -> Result<bool
     engine.refresh_model_catalog().await
 }
 
+/// Active-model selector payload: the configured candidates plus the current chat-model pin
+/// (`None` ⇒ routing fallback), so one call gives the picker both its options and its
+/// selection.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ActiveModelSelection {
+    pub active: Option<TaskModel>,
+    pub candidates: Vec<ActiveModelCandidate>,
+}
+
+/// Read-only; builds no network client. See `active_model_candidates`.
+#[tracing::instrument(skip_all)]
+#[tauri::command]
+pub async fn list_active_model_candidates(
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<ActiveModelSelection, LensError> {
+    let config = engine.config().await;
+    let candidates = lens_core::active_model_candidates(&config, config.enrichment.cloud_consent);
+    Ok(ActiveModelSelection {
+        active: config.enrichment.chat_model.clone(),
+        candidates,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,5 +205,47 @@ mod tests {
             .await
             .unwrap();
         assert!(models.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_active_model_candidates_reports_pin_and_availability() {
+        use lens_core::config::ModelConfig;
+        use lens_core::{AppConfig, EnrichmentConfig};
+
+        let engine = LensEngine::for_test().await;
+        engine
+            .set_config(AppConfig {
+                models: vec![ModelConfig {
+                    provider: "ollama".to_string(),
+                    base_url: "http://localhost:11434".to_string(),
+                    model: "llama3".to_string(),
+                    ..ModelConfig::default()
+                }],
+                enrichment: EnrichmentConfig {
+                    chat_model: Some(TaskModel {
+                        provider: "ollama".to_string(),
+                        model: "llama3".to_string(),
+                    }),
+                    ..EnrichmentConfig::default()
+                },
+                ..AppConfig::default()
+            })
+            .await;
+
+        let app = tauri::test::mock_app();
+        app.manage(engine);
+        let state = app.state::<LensEngine>();
+
+        let sel = list_active_model_candidates(state).await.unwrap();
+        assert_eq!(
+            sel.active,
+            Some(TaskModel {
+                provider: "ollama".to_string(),
+                model: "llama3".to_string(),
+            })
+        );
+        assert_eq!(sel.candidates.len(), 1);
+        assert!(sel.candidates[0].available);
+        assert_eq!(sel.candidates[0].label, "Ollama · llama3");
     }
 }
