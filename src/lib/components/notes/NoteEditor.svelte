@@ -50,7 +50,8 @@
       map.set(c.ordinal, {
         source_id: c.source_id,
         title: src?.title ?? 'Removed source',
-        live: !!src
+        live: !!src,
+        locators: c.locators
       });
     }
     return map;

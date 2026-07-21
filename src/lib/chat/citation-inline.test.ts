@@ -8,8 +8,8 @@ vi.mock('$lib/sources/sources-state.svelte.js', () => ({
 import { focusSource } from '$lib/sources/sources-state.svelte.js';
 
 const resolve = (n: number): CitationTarget | null => {
-  if (n === 1) return { source_id: 's1', title: 'Alpha', live: true };
-  if (n === 2) return { source_id: 's2', title: 'Gone', live: false };
+  if (n === 1) return { source_id: 's1', title: 'Alpha', live: true, locators: [] };
+  if (n === 2) return { source_id: 's2', title: 'Gone', live: false, locators: [] };
   return null;
 };
 
@@ -131,9 +131,10 @@ describe('enhanceCitations', () => {
 
   it('re-enhancing with a changed resolver flips a chip live→stale without duplicating (AC5)', () => {
     const el = host('<p>See [1].</p>');
-    const live = (n: number) => (n === 1 ? { source_id: 's1', title: 'Alpha', live: true } : null);
+    const live = (n: number) =>
+      n === 1 ? { source_id: 's1', title: 'Alpha', live: true, locators: [] } : null;
     const stale = (n: number) =>
-      n === 1 ? { source_id: 's1', title: 'Alpha', live: false } : null;
+      n === 1 ? { source_id: 's1', title: 'Alpha', live: false, locators: [] } : null;
 
     enhanceCitations(el, live);
     expect((el.querySelector('button.citation-chip') as HTMLButtonElement).disabled).toBe(false);

@@ -16,6 +16,8 @@
     selectNotebook
   } from '$lib/notebooks/index.js';
   import SourcesRail from '$lib/components/sources/SourcesRail.svelte';
+  import SourceViewer from '$lib/components/sources/SourceViewer.svelte';
+  import CitationSnippetPopover from '$lib/components/chat/CitationSnippetPopover.svelte';
   import PreferencesShell from '$lib/components/embeddings/PreferencesShell.svelte';
   import NotebookSettingsSheet from '$lib/components/embeddings/NotebookSettingsSheet.svelte';
   import ChatPane from '$lib/components/chat/ChatPane.svelte';
@@ -159,6 +161,8 @@
 <CommandPalette />
 <TrashView />
 <NotebookCreateDialog open={createOpen} onOpenChange={(v) => (createOpen = v)} />
+<SourceViewer />
+<CitationSnippetPopover />
 
 <!-- DEV-gated dynamic import: tree-shaken out of release bundles. -->
 {#if import.meta.env.DEV}
