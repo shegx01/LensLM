@@ -25,7 +25,7 @@
 
   // The row highlighted in the engine list. `selectedLocalEngine` tracks which local
   // engine LocalTtsForm shows — it only changes when a local row is picked, so picking
-  // Cloud leaves LocalTtsForm on its last engine (hidden, state preserved).
+  // Cloud leaves LocalTtsForm on its last engine.
   let selectedEngine = $state<TtsEngineId>('orpheus');
   let selectedLocalEngine = $state<LocalEngineId>('orpheus');
   // The persisted backend actually powering audio overviews — drives the "Active" pill.
@@ -61,10 +61,13 @@
     try {
       const cfg = await invoke<AppConfig>('get_config');
       activeEngine = ttsBackendId(cfg.tts.backend);
-      selectedEngine = activeEngine;
-      // Never seed the local form with a locked engine (e.g. a stale qwen3_local
-      // config on non-Apple-Silicon hardware) — it would show a doomed download.
-      if (activeEngine !== 'cloud' && !isLockedId(activeEngine)) selectedLocalEngine = activeEngine;
+      // A locked active engine (e.g. a stale qwen3_local config on non-Apple-Silicon)
+      // must not become the selected row — that would show a doomed download under a
+      // header naming the wrong engine. Fall back to the default local engine; the
+      // "Active" pill still marks the real backend via rowPill.
+      const lockedActive = activeEngine !== 'cloud' && isLockedId(activeEngine);
+      selectedEngine = lockedActive ? selectedLocalEngine : activeEngine;
+      if (activeEngine !== 'cloud' && !lockedActive) selectedLocalEngine = activeEngine;
     } catch {
       // Non-fatal: default to Orpheus selected, nothing active.
     }
@@ -118,7 +121,7 @@
     <div
       class="mt-6 grid grid-cols-1 items-start gap-3.5 md:grid-cols-[minmax(200px,0.85fr)_1.15fr]"
     >
-      <!-- Left rail: engine list (mirrors the Providers rail). Selection = the active engine. -->
+      <!-- Left rail: the engine list. Selecting a ready row makes that engine active. -->
       <div
         class="no-scrollbar flex max-h-[420px] flex-col gap-1.5 overflow-y-auto"
         role="radiogroup"
@@ -175,9 +178,9 @@
         {/each}
       </div>
 
-      <!-- Right detail panel for the selected engine (mirrors the Providers detail panel).
-           Both child forms stay mounted (visibility via `active`) so switching engines
-           never drops typed-but-unsaved state or an in-flight download. -->
+      <!-- Right detail panel for the selected engine. Both child forms stay mounted
+           (visibility via `active`) so switching engines never drops typed-but-unsaved
+           state or an in-flight download. -->
       <div class="rounded-xl border border-border bg-card p-[18px]">
         <div class="min-w-0">
           <div class="truncate text-[0.95rem] font-extrabold text-foreground">

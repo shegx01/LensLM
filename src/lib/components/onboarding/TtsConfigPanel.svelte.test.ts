@@ -569,10 +569,8 @@ describe('TtsConfigPanel — cloud (OpenAI-compatible, reactive, #195)', () => {
 
     const hostTrigger = await screen.findByLabelText(/host speaker/i);
     const guestTrigger = screen.getByLabelText(/guest speaker/i);
-    // Male voice (Onyx) defaults into Host, female (Alloy) into Guest — same
-    // gender-bucket convention as the local engine pickers. Mount-time defaulting
-    // doesn't itself persist (mirrors the local onMount, which doesn't either) —
-    // only an explicit pick does.
+    // Male (Onyx) defaults into Host, female (Alloy) into Guest; mount-time
+    // defaulting doesn't itself persist — only an explicit pick does.
     await waitFor(() => expect(hostTrigger).toHaveTextContent('Onyx'));
     expect(guestTrigger).toHaveTextContent('Alloy');
     expect(written).toBeNull();

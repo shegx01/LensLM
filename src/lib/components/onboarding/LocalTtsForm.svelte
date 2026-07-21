@@ -84,10 +84,9 @@
     return `~${(bytes / 1_000_000_000).toFixed(1)} GB`;
   }
 
-  /** Aggregate the given engine's per-model status into one tri-state, probing each
-   *  model once: Complete iff all Complete; Partial iff any Partial; else Absent
-   *  (so Orpheus complete + SNAC absent is Absent, not Partial). Takes an explicit
-   *  `id` (not the reactive `engine`) so a stale in-flight probe stays self-consistent. */
+  /** Aggregate the engine's per-model tri-states (Complete iff all; Partial iff any;
+   *  else Absent). Takes an explicit `id`, not the reactive `engine`, so a stale
+   *  in-flight probe stays self-consistent. */
   async function engineStatus(id: TtsEngineId): Promise<TtsModelStatus> {
     if (id === 'qwen3_local') {
       return ttsModelStatus('qwen3_local', '');
@@ -110,13 +109,24 @@
     return (catalog.find((e) => e.id === id)?.preset_voices ?? []).slice();
   }
 
-  /** Probe `id`'s on-disk status and, when complete, populate the voice pickers.
-   *  `prefillFromConfig` (initial engine only) seeds host/guest from saved config;
-   *  a switch uses catalog defaults. `persist` pins an already-installed engine. */
+  /** Populate the pickers from `preset`, computing male/female locally (never the
+   *  possibly-stale deriveds); prefer a saved id, else the first of each gender. */
+  function seedVoicePickers(preset: TtsVoice[], savedHost = '', savedGuest = ''): void {
+    voices = preset;
+    voicesUnavailable = preset.length === 0;
+    const male = preset.filter((v) => v.gender === 'male');
+    const female = preset.filter((v) => v.gender === 'female');
+    maleVoice = savedHost || male[0]?.id || '';
+    femaleVoice = savedGuest || female[0]?.id || '';
+  }
+
   // Set by activate() when the parent re-picks this engine before its load finished;
   // the in-flight load persists on completion (see loadEngine). Reset per fresh load.
   let pendingActivate = false;
 
+  /** Probe `id`'s on-disk status and, when complete, populate the voice pickers.
+   *  `prefillFromConfig` (initial engine only) seeds host/guest from saved config;
+   *  a switch uses catalog defaults. `persist` pins an already-installed engine. */
   async function loadEngine(
     id: TtsEngineId,
     opts: { persist: boolean; prefillFromConfig: boolean }
@@ -146,12 +156,6 @@
     status = probed;
     if (probed !== 'complete') return;
 
-    const preset = presetVoicesFor(id);
-    voices = preset;
-    voicesUnavailable = preset.length === 0;
-    const male = preset.filter((v) => v.gender === 'male');
-    const female = preset.filter((v) => v.gender === 'female');
-
     let savedHost = '';
     let savedGuest = '';
     if (opts.prefillFromConfig) {
@@ -164,8 +168,7 @@
       }
     }
     if (engine !== id) return;
-    maleVoice = savedHost || male[0]?.id || '';
-    femaleVoice = savedGuest || female[0]?.id || '';
+    seedVoicePickers(presetVoicesFor(id), savedHost, savedGuest);
 
     if ((opts.persist || pendingActivate) && !voicesUnavailable) {
       pendingActivate = false;
@@ -185,10 +188,9 @@
     });
   });
 
-  /** Pin the current engine when the parent re-selects it without changing the
-   *  `engine` prop (e.g. Cloud → the already-default local engine); the load effect
-   *  can't observe that, so the panel calls this. Persists now if ready, else defers
-   *  to the in-flight load's completion (never activates an uninstalled engine). */
+  /** Pin this engine when the parent re-picks it without changing the `engine` prop
+   *  (the load effect can't observe that). Persists now if ready, else defers to the
+   *  in-flight load — never activates an uninstalled engine. */
   export function activate(): void {
     if (status === 'complete' && !voicesUnavailable) void persistLocalTts();
     else pendingActivate = true;
@@ -230,14 +232,21 @@
     status = 'absent';
     downloadProgress = 0;
     downloadIndeterminate = false;
+    // Pin the model list at the start: `modelIds` is a derived that recomputes to
+    // the newly-selected engine on a mid-download switch (0-length for Qwen →
+    // division by zero), and the `engine === dlId` guard drops stale progress ticks.
+    const ids = [...modelIds];
     try {
       if (dlId === 'qwen3_local') {
-        await prepareQwenModel((pct) => applyProgress(pct, (p) => p));
+        await prepareQwenModel((pct) => {
+          if (engine === dlId) applyProgress(pct, (p) => p);
+        });
       } else {
-        for (const [i, model] of modelIds.entries()) {
-          await downloadTtsModel(dlId, model, (pct) =>
-            applyProgress(pct, (p) => Math.round(((i + p / 100) / modelIds.length) * 100))
-          );
+        for (const [i, model] of ids.entries()) {
+          await downloadTtsModel(dlId, model, (pct) => {
+            if (engine === dlId)
+              applyProgress(pct, (p) => Math.round(((i + p / 100) / ids.length) * 100));
+          });
         }
       }
       if (engine !== dlId) return;
@@ -255,10 +264,7 @@
       }
       status = 'complete';
       // list_tts_voices is reserved for runtime synth — the sidecar may not be running during setup.
-      voices = presetVoicesFor(dlId);
-      voicesUnavailable = voices.length === 0;
-      if (maleVoices.length > 0) maleVoice = maleVoices[0].id;
-      if (femaleVoices.length > 0) femaleVoice = femaleVoices[0].id;
+      seedVoicePickers(presetVoicesFor(dlId));
       if (!voicesUnavailable) void persistLocalTts();
     } catch (err) {
       if (engine !== dlId) return;
@@ -295,6 +301,37 @@
     }
   });
 </script>
+
+{#snippet voiceSelect(opts: {
+  id: string;
+  label: string;
+  value: string;
+  voices: TtsVoice[];
+  onpick: (v: string) => void;
+})}
+  <div class="mt-3 flex flex-col gap-1.5">
+    <label for={opts.id} class="text-[0.72rem] font-bold text-foreground">{opts.label}</label>
+    <Select
+      type="single"
+      value={opts.value}
+      onValueChange={(v) => {
+        if (v) opts.onpick(v);
+      }}
+      items={opts.voices.map((voice) => ({ value: voice.id, label: voice.name }))}
+    >
+      <SelectTrigger id={opts.id} class="w-full">
+        <SelectValue placeholder="Select a voice" />
+      </SelectTrigger>
+      <SelectContent
+        class="origin-(--bits-select-content-transform-origin) duration-200 ease-[cubic-bezier(0.23,1,0.32,1)]"
+      >
+        {#each opts.voices as voice (voice.id)}
+          <SelectItem value={voice.id} label={voice.name}>{voice.name}</SelectItem>
+        {/each}
+      </SelectContent>
+    </Select>
+  </div>
+{/snippet}
 
 <div
   role="group"
@@ -357,62 +394,26 @@
       <p class="text-[0.65rem] font-bold uppercase tracking-[0.08em] text-muted-foreground/70">
         Voices
       </p>
-
-      <div class="mt-3 flex flex-col gap-1.5">
-        <label for="tts-male-voice" class="text-[0.72rem] font-bold text-foreground">
-          Host voice (male)
-        </label>
-        <Select
-          type="single"
-          value={maleVoice}
-          onValueChange={(v) => {
-            if (v) {
-              maleVoice = v;
-              void persistLocalTts();
-            }
-          }}
-          items={maleVoices.map((voice) => ({ value: voice.id, label: voice.name }))}
-        >
-          <SelectTrigger id="tts-male-voice" class="w-full">
-            <SelectValue placeholder="Select a voice" />
-          </SelectTrigger>
-          <SelectContent
-            class="origin-(--bits-select-content-transform-origin) duration-200 ease-[cubic-bezier(0.23,1,0.32,1)]"
-          >
-            {#each maleVoices as voice (voice.id)}
-              <SelectItem value={voice.id} label={voice.name}>{voice.name}</SelectItem>
-            {/each}
-          </SelectContent>
-        </Select>
-      </div>
-
-      <div class="mt-3 flex flex-col gap-1.5">
-        <label for="tts-female-voice" class="text-[0.72rem] font-bold text-foreground">
-          Co-host voice (female)
-        </label>
-        <Select
-          type="single"
-          value={femaleVoice}
-          onValueChange={(v) => {
-            if (v) {
-              femaleVoice = v;
-              void persistLocalTts();
-            }
-          }}
-          items={femaleVoices.map((voice) => ({ value: voice.id, label: voice.name }))}
-        >
-          <SelectTrigger id="tts-female-voice" class="w-full">
-            <SelectValue placeholder="Select a voice" />
-          </SelectTrigger>
-          <SelectContent
-            class="origin-(--bits-select-content-transform-origin) duration-200 ease-[cubic-bezier(0.23,1,0.32,1)]"
-          >
-            {#each femaleVoices as voice (voice.id)}
-              <SelectItem value={voice.id} label={voice.name}>{voice.name}</SelectItem>
-            {/each}
-          </SelectContent>
-        </Select>
-      </div>
+      {@render voiceSelect({
+        id: 'tts-male-voice',
+        label: 'Host voice (male)',
+        value: maleVoice,
+        voices: maleVoices,
+        onpick: (v) => {
+          maleVoice = v;
+          void persistLocalTts();
+        }
+      })}
+      {@render voiceSelect({
+        id: 'tts-female-voice',
+        label: 'Co-host voice (female)',
+        value: femaleVoice,
+        voices: femaleVoices,
+        onpick: (v) => {
+          femaleVoice = v;
+          void persistLocalTts();
+        }
+      })}
     </div>
   {/if}
 
