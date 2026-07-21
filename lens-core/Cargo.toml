@@ -285,7 +285,7 @@ candle-transformers = { version = "=0.11.0", features = ["metal"], optional = tr
 # HF weight/config/tokenizer fetch for the candle backend. hf-hub 0.5.0 is ALREADY
 # resolved in the lock tree (transitive via fastembed), so this pulls NO new copy —
 # it just promotes it to a direct, feature-gated dependency for the download path.
-hf-hub = { version = "=0.5.0", optional = true }
+hf-hub = { version = "=1.0.0", optional = true }
 # issue #42: enable whisper.cpp's Metal (Apple GPU) backend on the shipping macOS
 # target only. Elsewhere the base `whisper-rs` dep (CPU + Accelerate) stays the
 # default. `optional` mirrors the base declaration so it is still pulled in only
