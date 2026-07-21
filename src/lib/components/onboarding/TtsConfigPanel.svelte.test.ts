@@ -114,6 +114,11 @@ function drivePrepare(args: unknown): null {
   return null;
 }
 
+/** Select an engine from the unified engine list (replaces the old Local/Cloud tabs). */
+async function selectEngine(name: RegExp): Promise<void> {
+  await fireEvent.click(await screen.findByRole('radio', { name }));
+}
+
 beforeEach(() => {
   (globalThis as { isTauri?: boolean }).isTauri = true;
 });
@@ -149,14 +154,15 @@ describe('TtsConfigPanel — voices', () => {
     });
 
     render(TtsConfigPanel);
-    // Wait for the catalog fetch to resolve so `selectedEntry` (and its preset_voices) is populated
-    // before Download runs.
-    await waitFor(() => expect(screen.getAllByText(/english only/i).length).toBeGreaterThan(0));
+    // Wait for the catalog fetch to resolve so the download step (and its preset voices)
+    // is available before Download runs.
+    await screen.findByRole('button', { name: /download voice engine/i });
     await fireEvent.click(screen.getByRole('button', { name: /download voice engine/i }));
-    await waitFor(() => expect(screen.getByText(/voice engine ready/i)).toBeInTheDocument());
+    // Ready state = the Voices card (host-voice picker), not a "ready" banner.
+    await waitFor(() => expect(screen.getByLabelText(/^host voice/i)).toBeInTheDocument());
 
-    // No explicit Save button on the Local tab — a freshly-downloaded engine's
-    // default voice selection persists on its own.
+    // No explicit Save button — a freshly-downloaded engine's default voice
+    // selection persists on its own.
     expect(screen.queryByRole('button', { name: /save voice settings/i })).not.toBeInTheDocument();
 
     await waitFor(() => expect(written).not.toBeNull());
@@ -192,9 +198,9 @@ describe('TtsConfigPanel — voices', () => {
     });
 
     render(TtsConfigPanel);
-    await waitFor(() => expect(screen.getAllByText(/english only/i).length).toBeGreaterThan(0));
+    await screen.findByRole('button', { name: /download voice engine/i });
     await fireEvent.click(screen.getByRole('button', { name: /download voice engine/i }));
-    await waitFor(() => expect(screen.getByText(/voice engine ready/i)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByLabelText(/^host voice/i)).toBeInTheDocument());
 
     // Defaults to the first preset voice until the user picks another.
     const trigger = screen.getByLabelText(/^host voice/i);
@@ -239,6 +245,7 @@ describe('TtsConfigPanel — voices', () => {
     });
 
     render(TtsConfigPanel);
+    await screen.findByRole('button', { name: /download voice engine/i });
     await fireEvent.click(screen.getByRole('button', { name: /download voice engine/i }));
 
     await waitFor(() =>
@@ -254,14 +261,14 @@ describe('TtsConfigPanel — voices', () => {
 });
 
 describe('TtsConfigPanel — cloud (OpenAI-compatible, reactive, #195)', () => {
-  it('has no Save button — the Cloud tab persists reactively like the Local tab', async () => {
+  it('has no Save button — Cloud persists reactively like the local engines', async () => {
     mockIPC((cmd) => {
       if (cmd === 'get_config') return baseConfig();
       if (cmd === 'tts_engine_catalog') return catalogFixture();
     });
 
     render(TtsConfigPanel);
-    await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
+    await selectEngine(/cloud/i);
 
     expect(screen.queryByRole('button', { name: /^save$/i })).not.toBeInTheDocument();
   });
@@ -273,7 +280,7 @@ describe('TtsConfigPanel — cloud (OpenAI-compatible, reactive, #195)', () => {
     });
 
     render(TtsConfigPanel);
-    await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
+    await selectEngine(/cloud/i);
 
     expect(screen.getByText(/groq/i)).toBeInTheDocument();
     expect(screen.getByText(/deepinfra/i)).toBeInTheDocument();
@@ -287,10 +294,10 @@ describe('TtsConfigPanel — cloud (OpenAI-compatible, reactive, #195)', () => {
     });
 
     render(TtsConfigPanel);
-    await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
+    await selectEngine(/cloud/i);
 
     await screen.findByLabelText(/host speaker/i);
-    expect(screen.getByRole('heading', { name: /openai voices/i })).toBeInTheDocument();
+    expect(screen.getByText(/curated voices are openai's/i)).toBeInTheDocument();
     expect(
       screen.getByText(/using another provider\? enter its own voice ids\./i)
     ).toBeInTheDocument();
@@ -312,9 +319,9 @@ describe('TtsConfigPanel — cloud (OpenAI-compatible, reactive, #195)', () => {
     });
 
     render(TtsConfigPanel);
-    await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
+    await selectEngine(/cloud/i);
 
-    await waitFor(() => expect(screen.getByText(/requires an api key/i)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/add an api key below/i)).toBeInTheDocument());
 
     const keyField = screen.getByLabelText(/api key/i);
     await fireEvent.input(keyField, { target: { value: 'sk-openai-1234' } });
@@ -334,11 +341,11 @@ describe('TtsConfigPanel — cloud (OpenAI-compatible, reactive, #195)', () => {
     });
 
     await waitFor(() => expect(screen.getByText(/cloud is available/i)).toBeInTheDocument());
-    expect(screen.queryByText(/requires an api key/i)).not.toBeInTheDocument();
   });
 
   it('masks a previously-saved key and clears it for fresh entry on focus', async () => {
     mockIPC((cmd) => {
+      if (cmd === 'tts_engine_catalog') return catalogFixture({ cloudAvailable: true });
       if (cmd === 'get_config') {
         const cfg = baseConfig();
         return {
@@ -355,7 +362,7 @@ describe('TtsConfigPanel — cloud (OpenAI-compatible, reactive, #195)', () => {
     });
 
     render(TtsConfigPanel);
-    await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
+    await selectEngine(/cloud/i);
 
     const keyField = screen.getByLabelText(/api key/i);
 
@@ -396,7 +403,7 @@ describe('TtsConfigPanel — cloud (OpenAI-compatible, reactive, #195)', () => {
     });
 
     render(TtsConfigPanel);
-    await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
+    await selectEngine(/cloud/i);
 
     const keyField = screen.getByLabelText(/api key/i);
     // Wait for onMount's `get_config` fetch to resolve (hasSavedKey/masked
@@ -418,11 +425,12 @@ describe('TtsConfigPanel — cloud (OpenAI-compatible, reactive, #195)', () => {
 
   it('surfaces an inline error when a reactive persist fails', async () => {
     mockIPC((cmd) => {
+      if (cmd === 'tts_engine_catalog') return catalogFixture();
       if (cmd === 'get_config') throw new Error('disk full');
     });
 
     render(TtsConfigPanel);
-    await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
+    await selectEngine(/cloud/i);
 
     const keyField = screen.getByLabelText(/api key/i);
     await fireEvent.input(keyField, { target: { value: 'sk-x' } });
@@ -438,9 +446,9 @@ describe('TtsConfigPanel — cloud (OpenAI-compatible, reactive, #195)', () => {
     });
 
     render(TtsConfigPanel);
-    await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
+    await selectEngine(/cloud/i);
 
-    await waitFor(() => expect(screen.getByText(/requires an api key/i)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/add an api key below/i)).toBeInTheDocument());
   });
 
   it('editing the base URL and blurring persists it, resending the already-saved key', async () => {
@@ -468,7 +476,7 @@ describe('TtsConfigPanel — cloud (OpenAI-compatible, reactive, #195)', () => {
     });
 
     render(TtsConfigPanel);
-    await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
+    await selectEngine(/cloud/i);
 
     const baseUrlField = screen.getByLabelText(/base url/i);
     await waitFor(() => expect(baseUrlField).toHaveValue('https://api.openai.com'));
@@ -498,7 +506,7 @@ describe('TtsConfigPanel — cloud (OpenAI-compatible, reactive, #195)', () => {
     });
 
     render(TtsConfigPanel);
-    await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
+    await selectEngine(/cloud/i);
 
     const baseUrlField = screen.getByLabelText(/base url/i);
     await waitFor(() => expect(baseUrlField).toHaveValue('https://api.openai.com'));
@@ -523,7 +531,7 @@ describe('TtsConfigPanel — cloud (OpenAI-compatible, reactive, #195)', () => {
     });
 
     render(TtsConfigPanel);
-    await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
+    await selectEngine(/cloud/i);
 
     const hostField = screen.getByLabelText(/host speaker/i);
     // Let onMount's async config fetch settle first — it unconditionally (re)sets
@@ -557,14 +565,12 @@ describe('TtsConfigPanel — cloud (OpenAI-compatible, reactive, #195)', () => {
     });
 
     render(TtsConfigPanel);
-    await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
+    await selectEngine(/cloud/i);
 
     const hostTrigger = await screen.findByLabelText(/host speaker/i);
     const guestTrigger = screen.getByLabelText(/guest speaker/i);
-    // Male voice (Onyx) defaults into Host, female (Alloy) into Guest — same
-    // gender-bucket convention as the Local engine pickers. Mount-time defaulting
-    // doesn't itself persist (mirrors Local's onMount, which doesn't either) —
-    // only an explicit pick does.
+    // Male (Onyx) defaults into Host, female (Alloy) into Guest; mount-time
+    // defaulting doesn't itself persist — only an explicit pick does.
     await waitFor(() => expect(hostTrigger).toHaveTextContent('Onyx'));
     expect(guestTrigger).toHaveTextContent('Alloy');
     expect(written).toBeNull();
@@ -594,7 +600,7 @@ describe('TtsConfigPanel — cloud (OpenAI-compatible, reactive, #195)', () => {
     });
 
     render(TtsConfigPanel);
-    await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
+    await selectEngine(/cloud/i);
 
     const hostTrigger = await screen.findByLabelText(/host speaker/i);
     await waitFor(() => expect(hostTrigger).toHaveTextContent('Onyx'));
@@ -611,24 +617,24 @@ describe('TtsConfigPanel — cloud (OpenAI-compatible, reactive, #195)', () => {
     expect((written as unknown as AppConfig).voices.host).toBe('my-self-hosted-voice');
   });
 
-  it('retains a typed-but-unblurred custom cloud voice across a tab switch (children stay mounted)', async () => {
+  it('retains a typed-but-unblurred custom cloud voice across an engine switch (children stay mounted)', async () => {
     mockIPC((cmd) => {
       if (cmd === 'get_config') return cloudKeyedConfig();
       // No curated cloud voices → the host/guest pickers render as free-text inputs.
       if (cmd === 'tts_engine_catalog') return catalogFixture();
+      if (cmd === 'tts_model_status') return 'absent';
     });
 
     render(TtsConfigPanel);
-    await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
-
+    // The saved backend is cloud, so the Cloud form is shown first.
     const hostField = await screen.findByLabelText(/host speaker/i);
     await waitFor(() => expect(hostField).toHaveValue(''));
     // Type WITHOUT blurring — the value lives only in child $state.
     await fireEvent.input(hostField, { target: { value: 'unsaved-voice' } });
 
-    // Switch away and back; always-mounted children must not lose the edit.
-    await fireEvent.click(screen.getByRole('tab', { name: /local/i }));
-    await fireEvent.click(screen.getByRole('tab', { name: /cloud/i }));
+    // Switch away to a local engine and back; always-mounted children must not lose the edit.
+    await selectEngine(/orpheus/i);
+    await selectEngine(/cloud/i);
 
     expect(screen.getByLabelText(/host speaker/i)).toHaveValue('unsaved-voice');
   });
@@ -644,15 +650,15 @@ describe('TtsConfigPanel — local engine detection', () => {
 
     render(TtsConfigPanel);
 
-    await waitFor(() => expect(screen.getByText(/voice engine ready/i)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByLabelText(/^host voice/i)).toBeInTheDocument());
     expect(
       screen.queryByRole('button', { name: /download voice engine/i })
     ).not.toBeInTheDocument();
   });
 });
 
-describe('TtsConfigPanel — engine selector from the catalog (#194)', () => {
-  it('renders engines from the catalog with capability gating (Qwen disabled off Apple Silicon)', async () => {
+describe('TtsConfigPanel — engine list from the catalog (#194)', () => {
+  it('renders every engine with capability gating (Qwen disabled off Apple Silicon; Cloud selectable)', async () => {
     mockIPC((cmd) => {
       if (cmd === 'get_config') return baseConfig();
       if (cmd === 'tts_engine_catalog') return catalogFixture({ qwenAvailable: false });
@@ -668,11 +674,60 @@ describe('TtsConfigPanel — engine selector from the catalog (#194)', () => {
     expect(qwenRadio).toBeDisabled();
     expect(screen.getByText(/requires apple silicon/i)).toBeInTheDocument();
 
-    // Cloud is its own tab, not a Local-selector entry.
-    expect(screen.queryByRole('radio', { name: /^cloud$/i })).not.toBeInTheDocument();
+    // Cloud is now a first-class entry in the unified engine list, and stays
+    // selectable (needs a key) rather than being disabled.
+    const cloudRadio = screen.getByRole('radio', { name: /cloud/i });
+    expect(cloudRadio).not.toBeDisabled();
   });
 
-  it('shows model size + language-capability label next to Download, before first fetch', async () => {
+  it('marks the persisted backend as the Active engine', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config')
+        return {
+          ...baseConfig(),
+          tts: { version: 1, backend: 'orpheus' as const, model: '', cloud: null }
+        };
+      if (cmd === 'tts_engine_catalog') return catalogFixture();
+      if (cmd === 'tts_model_status') return 'complete';
+    });
+
+    render(TtsConfigPanel);
+
+    const orpheusRadio = await screen.findByRole('radio', { name: /orpheus/i });
+    expect(orpheusRadio).toHaveTextContent(/active/i);
+  });
+
+  it('activates the default local engine when switching from Cloud (engine prop unchanged)', async () => {
+    // Regression: Cloud active on mount → selectedLocalEngine defaults to orpheus, so
+    // clicking Orpheus doesn't change LocalTtsForm's `engine` prop; the panel must still
+    // activate it (imperative activate()) rather than silently leaving Cloud active.
+    let written: AppConfig | null = null;
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return cloudKeyedConfig();
+      if (cmd === 'tts_engine_catalog') return catalogFixture({ cloudAvailable: true });
+      if (cmd === 'tts_model_status') return 'complete';
+      if (cmd === 'set_config') {
+        written = (args as { config: AppConfig }).config;
+        return null;
+      }
+    });
+
+    render(TtsConfigPanel);
+    // Cloud is the active backend on mount.
+    const cloudRadio = await screen.findByRole('radio', { name: /cloud/i });
+    expect(cloudRadio).toHaveTextContent(/active/i);
+
+    await selectEngine(/orpheus/i);
+
+    await waitFor(() => expect(written).not.toBeNull());
+    expect((written as unknown as AppConfig).tts.backend).toBe('orpheus');
+    // The "Active" pill follows the newly-activated engine.
+    await waitFor(() =>
+      expect(screen.getByRole('radio', { name: /orpheus/i })).toHaveTextContent(/active/i)
+    );
+  });
+
+  it('shows model size + language-capability label in the download step, before first fetch', async () => {
     mockIPC((cmd) => {
       if (cmd === 'get_config') return baseConfig();
       if (cmd === 'tts_engine_catalog') return catalogFixture();
@@ -682,6 +737,7 @@ describe('TtsConfigPanel — engine selector from the catalog (#194)', () => {
     render(TtsConfigPanel);
 
     await waitFor(() => expect(screen.getByText('~2.3 GB')).toBeInTheDocument());
+    // "English only" appears on both the engine-list row and the download card.
     expect(screen.getAllByText(/english only/i).length).toBeGreaterThan(0);
     // Still pre-fetch: Download is offered, no progress yet.
     expect(screen.getByRole('button', { name: /download voice engine/i })).toBeInTheDocument();
@@ -700,13 +756,10 @@ describe('TtsConfigPanel — engine selector from the catalog (#194)', () => {
     });
 
     render(TtsConfigPanel);
+    await selectEngine(/qwen3-tts/i);
 
-    const qwenRadio = await screen.findByRole('radio', { name: /qwen3-tts/i });
-    await fireEvent.click(qwenRadio);
-
-    // Wait for the post-switch voice list (Qwen preset voices, straight from the catalog) to prefill the pickers.
-    // The picker is a bits-ui Select now: the trigger's label-associated element is a button
-    // (no native `.value`), so assert the displayed voice name instead of a form value.
+    // The picker is a bits-ui Select: the trigger's label-associated element is a
+    // button (no native `.value`), so assert the displayed voice name.
     await waitFor(() => expect(screen.getByLabelText(/^host voice/i)).toHaveTextContent('Leo'));
 
     expect(screen.queryByRole('button', { name: /save voice settings/i })).not.toBeInTheDocument();
@@ -715,7 +768,7 @@ describe('TtsConfigPanel — engine selector from the catalog (#194)', () => {
     expect((written as unknown as AppConfig).voices).toEqual({ host: 'leo', guest: 'tara' });
   });
 
-  it('preserves a previously-saved Cloud API key when switching the local engine', async () => {
+  it('preserves a previously-saved Cloud API key when switching to a local engine', async () => {
     const savedCloud = { kind: 'eleven_labs' as const, api_key: 'sk-keep-me', base_url: '' };
     let written: AppConfig | null = null;
     mockIPC((cmd, args) => {
@@ -733,15 +786,12 @@ describe('TtsConfigPanel — engine selector from the catalog (#194)', () => {
     });
 
     render(TtsConfigPanel);
-
-    const qwenRadio = await screen.findByRole('radio', { name: /qwen3-tts/i });
-    await fireEvent.click(qwenRadio);
+    await selectEngine(/qwen3-tts/i);
     await waitFor(() => expect(screen.getByLabelText(/^host voice/i)).toHaveTextContent('Leo'));
 
-    // Reactive persist (triggered by pickEngine, no Save click) still round-trips
-    // through the cloud-preserving helper.
+    // Reactive persist (triggered by the engine switch, no Save click) still
+    // round-trips through the cloud-preserving helper.
     await waitFor(() => expect(written).not.toBeNull());
-    // Local engine is active, but the stored Cloud key survives (not wiped to null).
     expect((written as unknown as AppConfig).tts.backend).toBe('qwen3_local');
     expect((written as unknown as AppConfig).tts.cloud).toEqual(savedCloud);
   });
@@ -759,9 +809,7 @@ describe('TtsConfigPanel — engine selector from the catalog (#194)', () => {
     });
 
     render(TtsConfigPanel);
-
-    const qwenRadio = await screen.findByRole('radio', { name: /qwen3-tts/i });
-    await fireEvent.click(qwenRadio);
+    await selectEngine(/qwen3-tts/i);
 
     await waitFor(() => expect(screen.getByLabelText(/^host voice/i)).toHaveTextContent('Leo'));
     expect(screen.getByLabelText(/co-host voice/i)).toHaveTextContent('Tara');
@@ -778,17 +826,15 @@ describe('TtsConfigPanel — Qwen3-TTS prepare/download (#194)', () => {
       if (cmd === 'get_config') return baseConfig();
       if (cmd === 'tts_engine_catalog') return catalogFixture({ qwenAvailable: true });
       if (cmd === 'tts_model_status') {
-        // Qwen presence check ignores `model` — assert it's called with the
-        // empty-string sentinel from the handoff contract.
-        expect((args as { engine: string; model: string }).model).toBe('');
-        return (args as { engine: string }).engine !== 'qwen3_local' ? 'complete' : 'absent';
+        const a = args as { engine: string; model: string };
+        // Qwen's presence check uses the empty-model sentinel (it fetches weights lazily).
+        if (a.engine === 'qwen3_local') expect(a.model).toBe('');
+        return a.engine !== 'qwen3_local' ? 'complete' : 'absent';
       }
     });
 
     render(TtsConfigPanel);
-
-    const qwenRadio = await screen.findByRole('radio', { name: /qwen3-tts/i });
-    await fireEvent.click(qwenRadio);
+    await selectEngine(/qwen3-tts/i);
 
     await waitFor(() => expect(screen.getByText('~4.5 GB')).toBeInTheDocument());
     expect(screen.getAllByText(/10 languages/i).length).toBeGreaterThan(0);
@@ -821,15 +867,12 @@ describe('TtsConfigPanel — Qwen3-TTS prepare/download (#194)', () => {
     });
 
     render(TtsConfigPanel);
-
-    const qwenRadio = await screen.findByRole('radio', { name: /qwen3-tts/i });
-    await fireEvent.click(qwenRadio);
+    await selectEngine(/qwen3-tts/i);
     await waitFor(() => expect(screen.getByText('~4.5 GB')).toBeInTheDocument());
 
     await fireEvent.click(screen.getByRole('button', { name: /download voice engine/i }));
 
     expect(prepareSpy).toHaveBeenCalledOnce();
-    await waitFor(() => expect(screen.getByText(/voice engine ready/i)).toBeInTheDocument());
 
     await waitFor(() => expect(screen.getByLabelText(/^host voice/i)).toHaveTextContent('Leo'));
     expect(screen.getByLabelText(/co-host voice/i)).toHaveTextContent('Tara');
@@ -852,7 +895,7 @@ describe('TtsConfigPanel — Qwen3-TTS prepare/download (#194)', () => {
 
     render(TtsConfigPanel);
 
-    await waitFor(() => expect(screen.getByText(/voice engine ready/i)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByLabelText(/^host voice/i)).toBeInTheDocument());
     expect(
       screen.queryByRole('button', { name: /download voice engine/i })
     ).not.toBeInTheDocument();
@@ -868,9 +911,7 @@ describe('TtsConfigPanel — Qwen3-TTS prepare/download (#194)', () => {
     });
 
     render(TtsConfigPanel);
-
-    const qwenRadio = await screen.findByRole('radio', { name: /qwen3-tts/i });
-    await fireEvent.click(qwenRadio);
+    await selectEngine(/qwen3-tts/i);
     await waitFor(() => expect(screen.getByText('~4.5 GB')).toBeInTheDocument());
 
     await fireEvent.click(screen.getByRole('button', { name: /download voice engine/i }));
@@ -894,7 +935,7 @@ describe('TtsConfigPanel — incomplete-model re-download affordance', () => {
     });
 
     render(TtsConfigPanel);
-    await waitFor(() => expect(screen.getAllByText(/english only/i).length).toBeGreaterThan(0));
+    await screen.findByRole('button', { name: /download voice engine/i });
     await fireEvent.click(screen.getByRole('button', { name: /download voice engine/i }));
 
     await waitFor(() =>
@@ -904,10 +945,10 @@ describe('TtsConfigPanel — incomplete-model re-download affordance', () => {
     );
     expect(screen.getByRole('alert')).toHaveTextContent(/didn't complete/i);
     // Never falsely reports ready.
-    expect(screen.queryByText(/voice engine ready/i)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/^host voice/i)).not.toBeInTheDocument();
   });
 
-  it('hides the re-download affordance and shows "ready" when the engine is genuinely on disk', async () => {
+  it('hides the re-download affordance and shows voices when the engine is genuinely on disk', async () => {
     mockIPC((cmd) => {
       if (cmd === 'get_config') return { ...baseConfig(), voices: { host: 'leo', guest: 'tara' } };
       if (cmd === 'tts_model_status') return 'complete';
@@ -916,7 +957,7 @@ describe('TtsConfigPanel — incomplete-model re-download affordance', () => {
 
     render(TtsConfigPanel);
 
-    await waitFor(() => expect(screen.getByText(/voice engine ready/i)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByLabelText(/^host voice/i)).toBeInTheDocument());
     expect(screen.queryByRole('button', { name: /re-download/i })).not.toBeInTheDocument();
     expect(
       screen.queryByRole('button', { name: /download voice engine/i })
@@ -938,7 +979,7 @@ describe('TtsConfigPanel — incomplete-model re-download affordance', () => {
     });
 
     render(TtsConfigPanel);
-    await waitFor(() => expect(screen.getAllByText(/english only/i).length).toBeGreaterThan(0));
+    await screen.findByRole('button', { name: /download voice engine/i });
     await fireEvent.click(screen.getByRole('button', { name: /download voice engine/i }));
 
     await waitFor(() => {

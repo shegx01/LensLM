@@ -77,8 +77,9 @@ describe('PreferencesShell', () => {
     expect(ttsNav).not.toHaveAttribute('aria-disabled', 'true');
     await fireEvent.click(ttsNav);
 
-    expect(await screen.findByRole('tab', { name: /^local$/i })).toBeInTheDocument();
-    expect(screen.getByRole('tab', { name: /^cloud$/i })).toBeInTheDocument();
+    // The panel's own heading (an h2, distinct from the nav button) proves it mounted.
+    expect(await screen.findByRole('heading', { name: /text-to-speech/i })).toBeInTheDocument();
+    expect(screen.getByText(/choose the voice engine/i)).toBeInTheDocument();
   });
 
   it('is hidden when settingsOpen is false', () => {

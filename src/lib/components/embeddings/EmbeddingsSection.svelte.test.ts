@@ -26,11 +26,32 @@ describe('EmbeddingsSection — global mode', () => {
 
     expect(await screen.findByRole('heading', { name: 'Embeddings' })).toBeInTheDocument();
     expect(screen.getByText(/local only — all vectors computed on-device/i)).toBeInTheDocument();
-    expect(screen.getByText(/select your local embeddings provider/i)).toBeInTheDocument();
-    expect(screen.getByRole('radio', { name: 'On-device' })).toBeInTheDocument();
-    expect(screen.getByRole('radio', { name: 'Ollama' })).toBeInTheDocument();
+    // Global mode uses the master-detail layout: a provider rail (rows carry a
+    // descriptor sub-line) beside the model list.
+    expect(screen.getByRole('radio', { name: /on-device/i })).toBeInTheDocument();
+    expect(screen.getByRole('radio', { name: /ollama/i })).toBeInTheDocument();
     expect(screen.getByRole('radio', { name: /nomic-embed-text-v1\.5/i })).toBeInTheDocument();
     expect(screen.getByRole('radio', { name: /bge-m3/i })).toBeInTheDocument();
+  });
+
+  it('marks the persisted default provider Active and shows descriptors (master-detail rail)', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return baseAppConfig(); // default backend → fastembed (On-device)
+      if (cmd === 'fastembed_models_cached') return [];
+      if (cmd === 'list_ollama_models') return [];
+    });
+
+    render(EmbeddingsSection, { props: { mode: 'global' } });
+
+    const onDevice = await screen.findByRole('radio', { name: /on-device/i });
+    const ollama = screen.getByRole('radio', { name: /ollama/i });
+    // The persisted default (fastembed) carries the Active tag; the other does not.
+    expect(onDevice).toHaveTextContent(/active/i);
+    expect(ollama).not.toHaveTextContent(/active/i);
+    // Provider descriptor sub-lines render (the selected provider's also echoes in
+    // the detail-panel header, hence getAllByText).
+    expect(screen.getAllByText(/bundled — no setup/i).length).toBeGreaterThan(0);
+    expect(screen.getByText(/uses your local ollama models/i)).toBeInTheDocument();
   });
 
   it('badges only GPU-accelerated models and shows the hint when one is selected (issue #91)', async () => {
@@ -296,10 +317,10 @@ describe('EmbeddingsSection — backend-filtered model picker (Step 8)', () => {
 
     render(EmbeddingsSection, { props: { mode: 'global' } });
 
-    const ollamaBtn = await screen.findByRole('radio', { name: /^ollama$/i });
+    const ollamaBtn = await screen.findByRole('radio', { name: /^ollama\b/i });
     expect(ollamaBtn).toHaveAttribute('aria-checked', 'true');
 
-    const fastembedBtn = screen.getByRole('radio', { name: /^on-device$/i });
+    const fastembedBtn = screen.getByRole('radio', { name: /^on-device\b/i });
     await fireEvent.click(fastembedBtn);
 
     await waitFor(() => {
@@ -326,7 +347,7 @@ describe('EmbeddingsSection — backend-filtered model picker (Step 8)', () => {
     const allMiniLm = screen.getByRole('radio', { name: /all-minilm/i });
     expect(allMiniLm).toHaveAttribute('aria-checked', 'true');
 
-    const ollamaBtn = screen.getByRole('radio', { name: /^ollama$/i });
+    const ollamaBtn = screen.getByRole('radio', { name: /^ollama\b/i });
     await fireEvent.click(ollamaBtn);
 
     await waitFor(() => {

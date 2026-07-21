@@ -89,10 +89,18 @@
 
   const filteredModels = $derived(EMBEDDING_MODELS.filter((m) => m.backends.includes(backend)));
 
-  const providers = [
-    { id: 'fastembed', label: 'On-device' },
-    { id: 'ollama', label: 'Ollama' }
+  const providers: { id: EmbeddingBackend; label: string; desc: string }[] = [
+    { id: 'fastembed', label: 'On-device', desc: 'Bundled — no setup' },
+    { id: 'ollama', label: 'Ollama', desc: 'Uses your local Ollama models' }
   ];
+
+  const selectedProvider = $derived(providers.find((p) => p.id === backend) ?? providers[0]);
+
+  // Rail status dot: On-device is always usable (bundled); Ollama is usable only
+  // once we've detected at least one compatible model on the runtime.
+  function providerReady(id: EmbeddingBackend): boolean {
+    return id === 'fastembed' ? true : ollamaInstalled.size > 0;
+  }
 
   async function refreshOllama(): Promise<void> {
     refreshing = true;
@@ -265,51 +273,8 @@
     'rounded-full bg-muted px-1.5 py-0.5 text-[0.62rem] font-semibold text-muted-foreground';
 </script>
 
-<section class="flex flex-col" aria-label="Embeddings settings">
-  {#if showHeader}
-    <h2 class="text-xl font-extrabold tracking-[-0.4px] text-foreground">Embeddings</h2>
-    <p class="mt-1 text-[0.8rem] text-muted-foreground">
-      Local only — all vectors computed on-device.
-    </p>
-  {/if}
-
-  <div class={compact ? '' : 'mt-6'}>
-    <p class="text-[0.65rem] font-bold uppercase tracking-[0.08em] text-muted-foreground/70">
-      Select your local embeddings provider
-    </p>
-    <div class="mt-3 grid grid-cols-2 gap-2" role="radiogroup" aria-label="Embeddings provider">
-      {#each providers as p (p.id)}
-        {@const isSel = backend === p.id}
-        <button
-          type="button"
-          role="radio"
-          aria-checked={isSel}
-          aria-disabled={pickerDisabled}
-          disabled={pickerDisabled}
-          onclick={() => pickBackend(p.id as EmbeddingBackend)}
-          class={cn(
-            'rounded-[10px] border px-3 text-[0.78rem] font-bold transition-[color,background-color,border-color,transform] duration-150',
-            compact ? 'h-9' : 'h-10',
-            'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
-            isSel
-              ? 'border-primary bg-primary/10 text-foreground ring-1 ring-primary'
-              : 'border-border bg-card text-muted-foreground hover:text-foreground',
-            pickerDisabled ? 'cursor-not-allowed opacity-60' : 'active:scale-[0.97]'
-          )}
-        >
-          {p.label}
-        </button>
-      {/each}
-    </div>
-    {#if gpuModels.has(selectedModel)}
-      <p class="mt-2 flex items-center gap-1.5 text-[0.7rem] text-muted-foreground">
-        <span aria-hidden="true">⚡</span>
-        Best performance — embeds on your Apple GPU.
-      </p>
-    {/if}
-  </div>
-
-  <p class="mt-6 text-[0.65rem] font-bold uppercase tracking-[0.08em] text-muted-foreground/70">
+{#snippet modelSection()}
+  <p class="text-[0.65rem] font-bold uppercase tracking-[0.08em] text-muted-foreground/70">
     Embedding model
   </p>
   <div class="mt-3 flex flex-col gap-1.5" role="radiogroup" aria-label="Embedding model">
@@ -378,7 +343,15 @@
       </div>
     {/each}
   </div>
+  {#if gpuModels.has(selectedModel)}
+    <p class="mt-2 flex items-center gap-1.5 text-[0.7rem] text-muted-foreground">
+      <span aria-hidden="true">⚡</span>
+      Best performance — embeds on your Apple GPU.
+    </p>
+  {/if}
+{/snippet}
 
+{#snippet actionsBlock()}
   {#if actionError}
     <p class="mt-3 text-[0.75rem] text-destructive" role="alert">{actionError}</p>
   {/if}
@@ -462,6 +435,112 @@
   <p class="mt-5 text-[0.7rem] leading-relaxed text-muted-foreground">
     Ollama must be installed if chosen — Lens detects your local models but never downloads them.
   </p>
+{/snippet}
+
+<section class="flex flex-col" aria-label="Embeddings settings">
+  {#if showHeader}
+    <h2 class="text-xl font-extrabold tracking-[-0.4px] text-foreground">Embeddings</h2>
+    <p class="mt-1 text-[0.8rem] text-muted-foreground">
+      Local only — all vectors computed on-device.
+    </p>
+  {/if}
+
+  {#if compact}
+    <!-- Onboarding: narrow single column (a two-column rail wouldn't fit the step). -->
+    <div>
+      <p class="text-[0.65rem] font-bold uppercase tracking-[0.08em] text-muted-foreground/70">
+        Select your local embeddings provider
+      </p>
+      <div class="mt-3 grid grid-cols-2 gap-2" role="radiogroup" aria-label="Embeddings provider">
+        {#each providers as p (p.id)}
+          {@const isSel = backend === p.id}
+          <button
+            type="button"
+            role="radio"
+            aria-checked={isSel}
+            aria-disabled={pickerDisabled}
+            disabled={pickerDisabled}
+            onclick={() => pickBackend(p.id)}
+            class={cn(
+              'h-9 rounded-[10px] border px-3 text-[0.78rem] font-bold transition-[color,background-color,border-color,transform] duration-150',
+              'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+              isSel
+                ? 'border-primary bg-primary/10 text-foreground ring-1 ring-primary'
+                : 'border-border bg-card text-muted-foreground hover:text-foreground',
+              pickerDisabled ? 'cursor-not-allowed opacity-60' : 'active:scale-[0.97]'
+            )}
+          >
+            {p.label}
+          </button>
+        {/each}
+      </div>
+    </div>
+    <div class="mt-6">{@render modelSection()}</div>
+    {@render actionsBlock()}
+  {:else}
+    <!-- Global + notebook: master-detail two-column (mirrors the AI Model Providers pane). -->
+    <div
+      class="mt-6 grid grid-cols-1 items-start gap-3.5 md:grid-cols-[minmax(200px,0.85fr)_1.15fr]"
+    >
+      <!-- Left rail: provider. Selection drives the detail; the persisted default gets Active. -->
+      <div class="flex flex-col gap-1.5" role="radiogroup" aria-label="Embeddings provider">
+        {#each providers as p (p.id)}
+          {@const isSel = backend === p.id}
+          {@const isActive = activeBackend === p.id}
+          {@const isReady = providerReady(p.id)}
+          <button
+            type="button"
+            role="radio"
+            aria-checked={isSel}
+            aria-disabled={pickerDisabled}
+            disabled={pickerDisabled}
+            onclick={() => pickBackend(p.id)}
+            class={cn(
+              'flex w-full items-center gap-2.5 rounded-[10px] border px-3 py-2.5 text-left transition-[background-color,border-color,transform] duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+              isSel ? 'border-primary/40 bg-primary/10' : 'border-transparent hover:bg-muted',
+              pickerDisabled ? 'cursor-not-allowed opacity-60' : 'active:scale-[0.98]'
+            )}
+          >
+            <span class="min-w-0 flex-1">
+              <span class="flex items-center gap-2 text-[0.8rem] font-bold text-foreground">
+                <span
+                  class={cn(
+                    'size-[7px] shrink-0 rounded-full',
+                    isReady ? 'bg-primary' : 'bg-muted-foreground/50'
+                  )}
+                  aria-hidden="true"
+                ></span>
+                <span class="truncate">{p.label}</span>
+                {#if isActive}
+                  <span
+                    class="shrink-0 rounded-full bg-primary px-1.5 py-px text-[0.58rem] font-bold uppercase tracking-[0.05em] text-primary-foreground"
+                  >
+                    Active
+                  </span>
+                {/if}
+              </span>
+              <span class="mt-px block truncate text-[0.68rem] text-muted-foreground">{p.desc}</span
+              >
+            </span>
+          </button>
+        {/each}
+      </div>
+
+      <!-- Right detail panel: the selected provider's models + install/apply. -->
+      <div class="rounded-xl border border-border bg-card p-[18px]">
+        <div class="min-w-0">
+          <div class="truncate text-[0.95rem] font-extrabold text-foreground">
+            {selectedProvider.label}
+          </div>
+          <div class="text-[0.7rem] text-muted-foreground">{selectedProvider.desc}</div>
+        </div>
+        <div class="mt-4">
+          {@render modelSection()}
+          {@render actionsBlock()}
+        </div>
+      </div>
+    </div>
+  {/if}
 </section>
 
 <Dialog bind:open={confirmOpen}>

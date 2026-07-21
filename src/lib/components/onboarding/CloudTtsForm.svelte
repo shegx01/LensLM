@@ -3,14 +3,19 @@
   import { fade } from 'svelte/transition';
   import { invoke, isTauri } from '@tauri-apps/api/core';
   import { Input } from '$lib/components/ui/input/index.js';
+  import ApiKeyField from '$lib/components/llm/ApiKeyField.svelte';
   import { cn } from '$lib/utils.js';
   import CircleCheck from '@lucide/svelte/icons/circle-check';
+  import CircleAlert from '@lucide/svelte/icons/circle-alert';
   import {
     saveTtsProvider,
     ttsEngineCatalog,
+    ttsBackendId,
     type TtsVoice,
-    type TtsEngineCatalogEntry
+    type TtsEngineCatalogEntry,
+    type TtsEngineId
   } from '$lib/onboarding/system-check.js';
+  import { prefersReducedMotion } from '$lib/motion/index.js';
   import type { AppConfig } from '$lib/theme/types.js';
   import {
     Select,
@@ -21,14 +26,16 @@
   } from '$lib/components/ui/select/index.js';
 
   // Bound (not a plain prop) because refreshCatalog() reassigns `catalog` after a
-  // key save, and a child can't propagate that back through a plain prop in Svelte 5.
+  // key save, which a child can't propagate through a plain prop in Svelte 5.
   // See TtsConfigPanel for the ownership rationale.
   let {
     catalog = $bindable(),
-    active
+    active,
+    onactivated
   }: {
     catalog: TtsEngineCatalogEntry[];
     active: boolean;
+    onactivated?: (id: TtsEngineId) => void;
   } = $props();
 
   const CUSTOM_VOICE = '__custom__';
@@ -83,26 +90,21 @@
     return { preset: presets.length > 0 ? CUSTOM_VOICE : '', custom: saved };
   }
 
-  function prefersReducedMotion(): boolean {
-    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return false;
-    try {
-      return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-    } catch {
-      return false;
-    }
-  }
-
-  /** Crossfade duration, collapsed to 0 under reduced-motion. */
+  /** Crossfade duration, collapsed to 0 under the shared reduced-motion rule
+   *  (which also honours the app's `data-motion` Animations preference). */
   function motionMs(ms: number): number {
     return prefersReducedMotion() ? 0 : ms;
   }
 
   onMount(async () => {
     if (!isTauri()) return;
-    try {
-      catalog = (await ttsEngineCatalog()) ?? [];
-    } catch {
-      catalog = [];
+    // The panel passes a populated catalog; only self-fetch when mounted standalone.
+    if (catalog.length === 0) {
+      try {
+        catalog = (await ttsEngineCatalog()) ?? [];
+      } catch {
+        catalog = [];
+      }
     }
     try {
       const cfg = await invoke<AppConfig>('get_config');
@@ -115,10 +117,7 @@
       // Voices are shared across engines; only trust them as Cloud picks when
       // Cloud is the currently-active backend (otherwise they belong to whatever
       // local engine is active and would be nonsense cloud voice ids).
-      const backendIsCloud =
-        typeof cfg.tts?.backend === 'object' &&
-        cfg.tts.backend !== null &&
-        'cloud' in cfg.tts.backend;
+      const backendIsCloud = ttsBackendId(cfg.tts.backend) === 'cloud';
       const savedHost =
         backendIsCloud && typeof cfg.voices?.host === 'string' ? cfg.voices.host : '';
       const savedGuest =
@@ -138,14 +137,6 @@
       // Non-fatal: fall back to the default empty Cloud form.
     }
   });
-
-  // Entering "editing" mode clears the masked field so the user types a fresh key.
-  function startEditingKey(): void {
-    if (hasSavedKey && !editingKey) {
-      editingKey = true;
-      cloudApiKey = '';
-    }
-  }
 
   /** Re-fetch the catalog so Cloud's backend-derived `available` reflects the
    *  just-saved key immediately — without this the user saves a valid key but
@@ -183,16 +174,18 @@
       savedCloudApiKey = apiKey;
       hasSavedKey = apiKey.trim() !== '';
       editingKey = false;
+      cloudApiKey = '';
       await refreshCatalog();
+      onactivated?.('cloud');
     } catch (err) {
       cloudError = err instanceof Error ? err.message : 'Could not save configuration.';
     }
   }
 
-  /** API-key field's blur handler: persists a freshly-typed key (first-time
+  /** API-key field's commit (blur) handler: persists a freshly-typed key (first-time
    *  entry or an explicit replace), but blurring an emptied "replace" field
    *  re-masks instead of persisting — never wipes a real saved key with blank. */
-  function handleKeyBlur(): void {
+  function handleKeyCommit(): void {
     if (editingKey && !cloudApiKey.trim()) {
       editingKey = false;
       return;
@@ -214,10 +207,7 @@
   fallbackPlaceholder: string;
 })}
   <div class="flex flex-col gap-1.5">
-    <label
-      for={opts.id}
-      class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase"
-    >
+    <label for={opts.id} class="text-[0.72rem] font-bold text-foreground">
       {opts.label}
     </label>
     {#if opts.voices.length > 0}
@@ -268,80 +258,53 @@
 {/snippet}
 
 <div
-  id="tts-panel-cloud"
-  role="tabpanel"
-  aria-labelledby="tts-tab-cloud"
-  tabindex={active ? 0 : -1}
-  class={cn('mt-3 flex flex-col gap-4', !active && 'hidden')}
+  role="group"
+  aria-label="Cloud voice engine setup"
+  class={cn('flex flex-col gap-4', !active && 'hidden')}
 >
-  <p class="text-muted-foreground text-pretty text-[0.78rem] leading-relaxed">
-    Connect any endpoint that implements OpenAI's speech API (POST /v1/audio/speech) — OpenAI
-    itself, hosted providers like Groq or DeepInfra, or a self-hosted server such as LocalAI. Enter
-    the API root; no local model download required.
-  </p>
-
   {#if cloudEntry}
     {#if !cloudEntry.available}
       <p
         transition:fade={{ duration: motionMs(160) }}
-        class="rounded-lg px-3 py-2 text-[0.75rem] text-destructive ring-1 ring-destructive/30 bg-destructive/10"
+        class="flex items-center gap-2 rounded-[10px] bg-destructive/10 px-3.5 py-3 text-[0.72rem] text-destructive ring-1 ring-destructive/30"
         role="status"
       >
+        <CircleAlert class="size-3.5 shrink-0" aria-hidden="true" />
         {cloudEntry.unavailable_reason ?? 'Cloud is unavailable.'} Add an API key below to enable it.
       </p>
     {:else}
       <p
         transition:fade={{ duration: motionMs(160) }}
-        class="flex items-center gap-2 rounded-lg px-3 py-2 text-[0.75rem] text-primary ring-1 ring-primary/30 bg-primary/10"
+        class="flex items-center gap-2 rounded-[10px] bg-primary/10 px-3.5 py-3 text-[0.72rem] text-primary ring-1 ring-primary/30"
         role="status"
       >
-        <CircleCheck class="size-3.5" />
+        <CircleCheck class="size-3.5 shrink-0" aria-hidden="true" />
         Cloud is available
       </p>
     {/if}
   {/if}
 
-  <section class="flex flex-col gap-3 rounded-xl p-3 shadow-xs ring-1 ring-foreground/10">
-    <h3
-      class="text-muted-foreground text-balance text-[0.68rem] font-semibold tracking-widest uppercase"
-    >
+  <div>
+    <p class="text-[0.65rem] font-bold uppercase tracking-[0.08em] text-muted-foreground/70">
       Connection
-    </h3>
+    </p>
+    <p class="mt-2 text-pretty text-[0.72rem] leading-relaxed text-muted-foreground">
+      Connect any endpoint that implements OpenAI's speech API (POST /v1/audio/speech) — OpenAI
+      itself, hosted providers like Groq or DeepInfra, or a self-hosted server such as LocalAI.
+    </p>
 
-    <div class="flex flex-col gap-1.5">
-      <label
-        for="tts-cloud-key"
-        class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase"
-      >
-        API Key
-      </label>
-      <Input
+    <div class="mt-3">
+      <ApiKeyField
         id="tts-cloud-key"
-        type="password"
         bind:value={cloudApiKey}
-        placeholder={hasSavedKey && !editingKey
-          ? '•••••••••• saved — click to replace'
-          : 'Paste API key…'}
-        autocomplete="new-password"
-        onfocus={startEditingKey}
-        oninput={startEditingKey}
-        onblur={handleKeyBlur}
+        bind:editing={editingKey}
+        {hasSavedKey}
+        oncommit={handleKeyCommit}
       />
-      {#if hasSavedKey && !editingKey}
-        <p
-          transition:fade={{ duration: motionMs(160) }}
-          class="text-muted-foreground text-pretty text-[0.72rem] leading-relaxed"
-        >
-          A key is already saved. Click the field to replace it.
-        </p>
-      {/if}
     </div>
 
-    <div class="flex flex-col gap-1.5">
-      <label
-        for="tts-cloud-base-url"
-        class="text-muted-foreground text-[0.68rem] font-semibold tracking-widest uppercase"
-      >
+    <div class="mt-3 flex flex-col gap-1.5">
+      <label for="tts-cloud-base-url" class="text-[0.72rem] font-bold text-foreground">
         Base URL
       </label>
       <Input
@@ -352,53 +315,55 @@
         autocomplete="off"
         onblur={() => void persistCloud()}
       />
-      <p class="text-muted-foreground text-pretty text-[0.72rem] leading-relaxed">
-        API root only — no trailing <code>/v1</code>; it's appended automatically.
+      <p class="text-[0.68rem] leading-relaxed text-muted-foreground">
+        API root only — no trailing <code
+          class="rounded bg-muted px-1 py-px font-mono text-[0.62rem]">/v1</code
+        >; it's appended automatically.
       </p>
     </div>
-  </section>
+  </div>
 
-  <section class="flex flex-col gap-3 rounded-xl p-3 shadow-xs ring-1 ring-foreground/10">
-    <h3
-      class="text-muted-foreground text-balance text-[0.68rem] font-semibold tracking-widest uppercase"
-    >
-      OpenAI voices
-    </h3>
-
-    {@render cloudVoicePicker({
-      id: 'tts-cloud-host-voice',
-      label: 'Host speaker',
-      voices: cloudMaleVoices,
-      preset: cloudHostPreset,
-      onpreset: (v) => {
-        cloudHostPreset = v;
-        void persistCloud();
-      },
-      field: host,
-      customPlaceholder: 'e.g. alloy',
-      fallbackPlaceholder: 'Voice ID (e.g. alloy)'
-    })}
-
-    {@render cloudVoicePicker({
-      id: 'tts-cloud-guest-voice',
-      label: 'Guest speaker',
-      voices: cloudFemaleVoices,
-      preset: cloudGuestPreset,
-      onpreset: (v) => {
-        cloudGuestPreset = v;
-        void persistCloud();
-      },
-      field: guest,
-      customPlaceholder: 'e.g. onyx',
-      fallbackPlaceholder: 'Voice ID (e.g. onyx)'
-    })}
-
-    <p class="text-muted-foreground text-pretty text-[0.72rem] leading-relaxed">
-      Using another provider? Enter its own voice IDs.
+  <div>
+    <p class="text-[0.65rem] font-bold uppercase tracking-[0.08em] text-muted-foreground/70">
+      Voices
     </p>
-  </section>
+
+    <div class="mt-3 flex flex-col gap-3">
+      {@render cloudVoicePicker({
+        id: 'tts-cloud-host-voice',
+        label: 'Host speaker',
+        voices: cloudMaleVoices,
+        preset: cloudHostPreset,
+        onpreset: (v) => {
+          cloudHostPreset = v;
+          void persistCloud();
+        },
+        field: host,
+        customPlaceholder: 'e.g. alloy',
+        fallbackPlaceholder: 'Voice ID (e.g. alloy)'
+      })}
+
+      {@render cloudVoicePicker({
+        id: 'tts-cloud-guest-voice',
+        label: 'Guest speaker',
+        voices: cloudFemaleVoices,
+        preset: cloudGuestPreset,
+        onpreset: (v) => {
+          cloudGuestPreset = v;
+          void persistCloud();
+        },
+        field: guest,
+        customPlaceholder: 'e.g. onyx',
+        fallbackPlaceholder: 'Voice ID (e.g. onyx)'
+      })}
+
+      <p class="text-[0.68rem] leading-relaxed text-muted-foreground">
+        Curated voices are OpenAI's. Using another provider? Enter its own voice IDs.
+      </p>
+    </div>
+  </div>
 
   {#if cloudError}
-    <p class="text-destructive text-[0.75rem]" role="alert">{cloudError}</p>
+    <p class="text-[0.72rem] text-destructive" role="alert">{cloudError}</p>
   {/if}
 </div>

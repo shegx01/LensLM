@@ -215,6 +215,13 @@ export async function ttsModelStatus(engine: string, model: string): Promise<Tts
   return invoke<TtsModelStatus>('tts_model_status', { engine, model });
 }
 
+/** Map a persisted `TtsBackend` DTO to its engine id — every Cloud kind collapses to
+ *  'cloud' (the externally-tagged object form), unit variants pass through. Single home
+ *  for the discriminant so callers never re-derive it inconsistently. */
+export function ttsBackendId(backend: AppConfig['tts']['backend']): TtsEngineId {
+  return typeof backend === 'object' && backend !== null ? 'cloud' : backend;
+}
+
 /**
  * Whether the configured TTS backend can synthesize — reused to gate #29's Generate,
  * folding in "Cloud needs a key" / "Qwen needs Apple Silicon" (catalog `available`).
@@ -222,7 +229,7 @@ export async function ttsModelStatus(engine: string, model: string): Promise<Tts
 export async function isTtsReady(): Promise<boolean> {
   if (!isTauri()) return false;
   const [cfg, catalog] = await Promise.all([invoke<AppConfig>('get_config'), ttsEngineCatalog()]);
-  const id: TtsEngineId = typeof cfg.tts.backend === 'object' ? 'cloud' : cfg.tts.backend;
+  const id = ttsBackendId(cfg.tts.backend);
   const entry = catalog.find((e) => e.id === id);
   if (!entry || !entry.available) return false;
   for (const model of entry.required_model_ids) {
