@@ -1,8 +1,8 @@
 //! System / diagnostic commands.
 
 use lens_core::{
-    CheckResult, DownloadProgress, InstallProgress, LensEngine, LensError, LlmDetection, TtsVoice,
-    WHISPER_REGISTRY,
+    CheckResult, DownloadProgress, InstallProgress, LensEngine, LensError, LlmDetection,
+    StorageStats, TtsVoice, WHISPER_REGISTRY,
 };
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
@@ -44,6 +44,22 @@ pub async fn health_check(engine: tauri::State<'_, LensEngine>) -> Result<Health
         db_ok: true,
         migration_count,
     })
+}
+
+/// Thin wrapper over [`LensEngine::storage_stats`].
+#[tracing::instrument(skip_all)]
+#[tauri::command]
+pub async fn get_storage_stats(
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<StorageStats, LensError> {
+    engine.storage_stats().await
+}
+
+/// Thin wrapper over [`LensEngine::clear_model_cache`].
+#[tracing::instrument(skip_all)]
+#[tauri::command]
+pub async fn clear_model_cache(engine: tauri::State<'_, LensEngine>) -> Result<u64, LensError> {
+    engine.clear_model_cache().await
 }
 
 /// Runs the three onboarding readiness gates (LLM runtime, embedding model,

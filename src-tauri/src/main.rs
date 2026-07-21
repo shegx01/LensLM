@@ -205,6 +205,8 @@ fn main() {
             commands::notebooks::latest_notebook_eval,
             commands::notebooks::run_notebook_graph_eval,
             commands::system::health_check,
+            commands::system::get_storage_stats,
+            commands::system::clear_model_cache,
             commands::system::list_recent_documents,
             commands::system::run_system_check,
             commands::system::detect_llm,
