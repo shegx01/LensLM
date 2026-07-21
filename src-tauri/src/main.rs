@@ -140,9 +140,7 @@ fn main() {
                 let qwen = qwen::QwenSidecar::new(resolver);
                 tauri::async_runtime::block_on(engine_state.set_tts_sidecar(Some(Arc::new(qwen))));
 
-                // Single-flight + cancel coordinator for the explicit `--prepare`
-                // download (#202). Serializes concurrent prepares and holds the
-                // cancel slot the `cancel_prepare` command flips.
+                // Single-flight + cancel coordinator for `--prepare` (#202); see qwen::coordinator.
                 app.manage(qwen::QwenPrepareCoordinator::new());
             }
 

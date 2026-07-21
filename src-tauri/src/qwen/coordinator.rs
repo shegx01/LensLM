@@ -1,9 +1,6 @@
-//! Single-flight + cancel coordination for the Qwen `--prepare` download (#202).
-//! Serializes concurrent prepares into one download (a second caller re-checks the
-//! on-disk snapshot after the gate and short-circuits) and holds the single cancel
-//! slot for the in-flight prepare. Mirrors lens-core's cancel registries (the
-//! `Arc::ptr_eq` owner guard) but lives in the bridge crate — prepare coordination
-//! is a macOS-aarch64 concern, never an engine one.
+//! Single-flight + cancel coordination for the Qwen `--prepare` download (#202):
+//! serializes concurrent prepares to one download (second caller re-checks the on-disk
+//! snapshot after the gate) and holds the cancel slot. Bridge-crate only, like the sidecar.
 
 use std::sync::{Arc, Mutex};
 

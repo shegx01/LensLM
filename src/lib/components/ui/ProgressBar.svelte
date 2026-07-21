@@ -1,8 +1,6 @@
-<!-- ProgressBar — shared determinate/indeterminate progress track. `value=null`/omitted
-     renders an animated indeterminate bar gated by --rail-motion. Reduced motion (OS
-     `prefers-reduced-motion` or Settings Animations=Off) swaps the slide for a static
-     striped fill instead of slowing it — at --rail-motion:0 the slide's period grows to
-     ~11000s and parks off-screen (frozen/invisible), so it must not just slow down. -->
+<!-- Shared determinate/indeterminate progress track. Reduced motion swaps the animated
+     slide for a static striped fill rather than slowing it: at --rail-motion:0 the slide's
+     period grows to ~11000s and parks off-screen (frozen), so it must not merely slow. -->
 <script lang="ts">
   let { value = null }: { value?: number | null } = $props();
 

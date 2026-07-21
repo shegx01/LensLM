@@ -280,10 +280,9 @@ pub async fn prepare_qwen_model(
         .await
 }
 
-/// Cancels an in-flight Qwen `--prepare` download (Settings TTS panel unmount,
-/// #202). Returns `true` if one was in flight and cancelled, `false` otherwise; a
-/// later prepare resumes via HF `.incomplete`. Apple-Silicon only, like the
-/// sidecar it drives.
+/// Cancels an in-flight Qwen `--prepare` download (Settings TTS panel unmount, #202).
+/// Returns `true` if one was in flight; a later prepare resumes via HF `.incomplete`.
+/// Apple-Silicon only, like the sidecar it drives.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[tracing::instrument(skip_all)]
 #[tauri::command]
