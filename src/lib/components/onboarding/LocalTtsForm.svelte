@@ -1,7 +1,8 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, onDestroy } from 'svelte';
   import { invoke, isTauri } from '@tauri-apps/api/core';
   import { Button } from '$lib/components/ui/button/index.js';
+  import ProgressBar from '$lib/components/ui/ProgressBar.svelte';
   import { cn } from '$lib/utils.js';
   import LoaderCircle from '@lucide/svelte/icons/loader-circle';
   import CircleCheck from '@lucide/svelte/icons/circle-check';
@@ -9,6 +10,7 @@
   import {
     downloadTtsModel,
     prepareQwenModel,
+    cancelPrepare,
     ttsModelStatus,
     nextTtsConfig,
     ttsEngineCatalog,
@@ -18,6 +20,7 @@
     type TtsProvider,
     type TtsModelStatus
   } from '$lib/onboarding/system-check.js';
+  import { toLensError } from '../../sources/lens-error.js';
   import type { AppConfig } from '$lib/theme/types.js';
   import {
     Select,
@@ -67,6 +70,7 @@
   const modelIds = $derived<readonly string[]>(selectedEntry?.required_model_ids ?? []);
 
   let downloadProgress = $state<number | null>(null);
+  let downloadIndeterminate = $state(false);
   const isDownloading = $derived(downloadProgress !== null && downloadProgress < 100);
   // Single tri-state per engine; `downloaded`/`incomplete` derive from it — the
   // invalid "both true" state the two-boolean model allowed is unrepresentable.
@@ -146,6 +150,7 @@
     selectedEngine = id;
     status = 'absent';
     downloadProgress = null;
+    downloadIndeterminate = false;
     downloadError = null;
     voices = [];
     voicesUnavailable = false;
@@ -163,22 +168,34 @@
     }
   }
 
+  /** Apply one progress callback tick: `null` (unknown total) flips the
+   *  indeterminate flag without touching `downloadProgress`, so `isDownloading`
+   *  stays true; a known percentage clears the flag and updates the value. */
+  function applyProgress(pct: number | null, computeDeterminate: (p: number) => number): void {
+    if (pct === null) {
+      downloadIndeterminate = true;
+      return;
+    }
+    downloadIndeterminate = false;
+    downloadProgress = computeDeterminate(pct);
+  }
+
   async function handleDownload(): Promise<void> {
     downloadError = null;
     status = 'absent';
     downloadProgress = 0;
+    downloadIndeterminate = false;
     try {
       if (selectedEngine === 'qwen3_local') {
-        await prepareQwenModel((pct) => {
-          downloadProgress = pct;
-        });
+        await prepareQwenModel((pct) => applyProgress(pct, (p) => p));
       } else {
         for (const [i, model] of modelIds.entries()) {
-          await downloadTtsModel(selectedEngine, model, (pct) => {
-            downloadProgress = Math.round(((i + pct / 100) / modelIds.length) * 100);
-          });
+          await downloadTtsModel(selectedEngine, model, (pct) =>
+            applyProgress(pct, (p) => Math.round(((i + p / 100) / modelIds.length) * 100))
+          );
         }
       }
+      downloadIndeterminate = false;
       downloadProgress = 100;
       // Re-run the on-disk presence check before flipping to "ready": a download
       // that reported done can still be truncated/partial. If it isn't actually
@@ -196,8 +213,12 @@
       if (femaleVoices.length > 0) femaleVoice = femaleVoices[0].id;
       if (!voicesUnavailable) void persistLocalTts();
     } catch (err) {
-      downloadError = err instanceof Error ? err.message : 'Download failed.';
+      downloadIndeterminate = false;
       downloadProgress = null;
+      // A deliberate cancel (unmount during a Qwen download) isn't a failure —
+      // don't surface "Download failed" for it.
+      if (toLensError(err).kind === 'Cancelled') return;
+      downloadError = err instanceof Error ? err.message : 'Download failed.';
     }
   }
 
@@ -215,6 +236,16 @@
       saveError = err instanceof Error ? err.message : 'Could not save voice settings.';
     }
   }
+
+  // Settings' TtsConfigPanel is single-@render-mounted by SettingsShell's `active`
+  // check, so unmount here means Settings nav-away or close — the intended cancel
+  // trigger. Engine-guarded: `isDownloading` is true for Orpheus too, but
+  // `cancel_prepare` is macOS-aarch64-only; cancelPrepare() swallows the mismatch.
+  onDestroy(() => {
+    if (isDownloading && selectedEngine === 'qwen3_local') {
+      void cancelPrepare();
+    }
+  });
 </script>
 
 <div
@@ -273,15 +304,12 @@
       </div>
 
       {#if isDownloading}
-        <div class="w-full bg-muted rounded-full h-1.5 overflow-hidden">
-          <div
-            class="bg-primary h-full rounded-full transition-all duration-300"
-            style:width="{downloadProgress}%"
-          ></div>
-        </div>
-        <p class="text-[0.72rem] text-muted-foreground text-center">
-          {downloadProgress}% downloaded
-        </p>
+        <ProgressBar value={downloadIndeterminate ? null : downloadProgress} />
+        {#if !downloadIndeterminate}
+          <p class="text-[0.72rem] text-muted-foreground text-center">
+            {downloadProgress}% downloaded
+          </p>
+        {/if}
       {/if}
 
       {#if downloadError}
