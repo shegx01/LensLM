@@ -20,6 +20,6 @@
      no status-badge tile, no Choose/expand step. The row id selects which. -->
 {#if result.id === 'llm_runtime'}
   <OnboardingLlmPicker {onready} />
-{:else}
-  <OnboardingEmbeddingPicker oncheck={oncheck ?? (() => Promise.resolve())} />
+{:else if result.id === 'embedding_model'}
+  <OnboardingEmbeddingPicker {result} {oncheck} />
 {/if}

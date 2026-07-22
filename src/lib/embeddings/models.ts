@@ -22,6 +22,8 @@ export interface EmbeddingModelSpec {
   /** Canonical, storage-facing id (persisted; matches the registry `id`). */
   id: EmbeddingModelId;
   label: string;
+  /** Compact label for space-constrained UI (e.g. onboarding pills). */
+  short: string;
   /** Output vector dimension. */
   dims: number;
   /** Weight size on disk in MB. */
@@ -42,6 +44,7 @@ export const EMBEDDING_MODELS: EmbeddingModelSpec[] = [
   {
     id: 'nomic-embed-text-v1.5',
     label: 'nomic-embed-text-v1.5',
+    short: 'nomic v1.5',
     dims: 768,
     sizeMb: 274,
     speed: 'Fast',
@@ -52,6 +55,7 @@ export const EMBEDDING_MODELS: EmbeddingModelSpec[] = [
   {
     id: 'mxbai-embed-large',
     label: 'mxbai-embed-large',
+    short: 'mxbai',
     dims: 1024,
     sizeMb: 670,
     speed: 'Medium',
@@ -62,6 +66,7 @@ export const EMBEDDING_MODELS: EmbeddingModelSpec[] = [
   {
     id: 'all-minilm',
     label: 'all-minilm',
+    short: 'all-minilm',
     dims: 384,
     sizeMb: 45,
     speed: 'Very fast',
@@ -72,6 +77,7 @@ export const EMBEDDING_MODELS: EmbeddingModelSpec[] = [
   {
     id: 'bge-m3',
     label: 'bge-m3',
+    short: 'bge-m3',
     dims: 1024,
     sizeMb: 1200,
     speed: 'Medium',
@@ -84,6 +90,7 @@ export const EMBEDDING_MODELS: EmbeddingModelSpec[] = [
   {
     id: 'embeddinggemma',
     label: 'embeddinggemma',
+    short: 'gemma',
     dims: 768,
     sizeMb: 622,
     speed: 'Fast',
@@ -94,6 +101,7 @@ export const EMBEDDING_MODELS: EmbeddingModelSpec[] = [
   {
     id: 'qwen3-embedding:4b',
     label: 'qwen3-embedding:4b',
+    short: 'qwen3:4b',
     dims: 2560,
     sizeMb: 2500,
     speed: 'Medium',
@@ -104,6 +112,7 @@ export const EMBEDDING_MODELS: EmbeddingModelSpec[] = [
   {
     id: 'nomic-embed-text-v2-moe',
     label: 'nomic-embed-text-v2-moe',
+    short: 'nomic v2',
     dims: 768,
     sizeMb: 958,
     speed: 'Fast',
@@ -114,6 +123,7 @@ export const EMBEDDING_MODELS: EmbeddingModelSpec[] = [
   {
     id: 'snowflake-arctic-embed2',
     label: 'snowflake-arctic-embed2',
+    short: 'arctic 2',
     dims: 1024,
     sizeMb: 1200,
     speed: 'Fast',
