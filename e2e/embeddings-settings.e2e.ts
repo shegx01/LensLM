@@ -29,13 +29,15 @@ test('fresh_install_fastembed_only_passes_gate', async ({ page }) => {
 
   await page.goto('/');
 
+  // Local AI is the first step (#251); the embedding gate lives on the next screen.
   await expect(page.getByText('System check', { exact: true })).toBeVisible();
-  await expect(page.getByText('Embedding model', { exact: true })).toBeVisible();
-
-  // The Continue gate is not blocked (all rows pass; fastembed satisfied the
-  // embedding arm without Ollama). Advancing to "Make it yours" proves the gate
-  // did not dead-end a fastembed-only machine.
   await page.getByRole('button', { name: 'Skip for now' }).click();
+
+  // The embedding gate passes (fastembed satisfied the arm without Ollama), so
+  // Continue is enabled — advancing to "Make it yours" proves the gate did not
+  // dead-end a fastembed-only machine.
+  await expect(page.getByText('Embedding model', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Continue', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Make it yours' })).toBeVisible();
 });
 
