@@ -241,7 +241,7 @@ pub trait TtsProvider: Send + Sync {
 pub fn resolve_tts_provider_full(
     backend: TtsBackend,
     cfg: &TtsConfig,
-    data_dir: &Path,
+    cache_root: &Path,
     // Consumed only by the Apple-Silicon-gated `Qwen3Local` arm below.
     #[cfg_attr(
         not(all(target_os = "macos", target_arch = "aarch64")),
@@ -251,8 +251,8 @@ pub fn resolve_tts_provider_full(
 ) -> Option<Arc<dyn TtsProvider>> {
     match backend {
         TtsBackend::Orpheus => {
-            let orpheus = tts_model_path(data_dir, "orpheus")?;
-            let snac = tts_model_path(data_dir, "snac")?;
+            let orpheus = tts_model_path(cache_root, "orpheus")?;
+            let snac = tts_model_path(cache_root, "snac")?;
             Some(Arc::new(orpheus::OrpheusAdapter::new(orpheus, snac)))
         }
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -284,9 +284,9 @@ pub fn resolve_tts_provider_full(
 pub fn resolve_tts_provider(
     backend: TtsBackend,
     cfg: &TtsConfig,
-    data_dir: &Path,
+    cache_root: &Path,
 ) -> Option<Arc<dyn TtsProvider>> {
-    resolve_tts_provider_full(backend, cfg, data_dir, None)
+    resolve_tts_provider_full(backend, cfg, cache_root, None)
 }
 
 pub fn emotion_tag(emotion: Emotion, backend: TtsBackend) -> Option<String> {

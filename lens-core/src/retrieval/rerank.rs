@@ -35,11 +35,11 @@ impl std::fmt::Debug for Reranker {
 }
 
 impl Reranker {
-    /// Builds a reranker bound to `{data_dir}/models/fastembed` (shared with the
+    /// Builds a reranker bound to `{cache_root}/models/fastembed` (shared with the
     /// embedder cache; fastembed namespaces by model repo). Does NOT init the model.
-    pub fn new(data_dir: &std::path::Path) -> Self {
+    pub fn new(cache_root: &std::path::Path) -> Self {
         Self {
-            cache_dir: data_dir.join("models").join("fastembed"),
+            cache_dir: cache_root.join("models").join("fastembed"),
             cell: OnceCell::new(),
         }
     }

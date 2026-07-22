@@ -361,14 +361,14 @@ pub fn is_stale(mtime: SystemTime, now: SystemTime, interval: Duration) -> bool 
 // Cache / fetch / refresh
 // ---------------------------------------------------------------------------
 
-pub fn catalog_cache_path(data_dir: &Path) -> PathBuf {
-    data_dir.join("models").join(MODELS_CATALOG_FILENAME)
+pub fn catalog_cache_path(cache_root: &Path) -> PathBuf {
+    cache_root.join("models").join(MODELS_CATALOG_FILENAME)
 }
 
 /// Loads the model catalog, never failing hard. Falls back to the bundled snapshot on any
 /// read or parse error so the returned catalog is always usable for validation.
-pub fn load_catalog(data_dir: &Path) -> ModelCatalog {
-    let path = catalog_cache_path(data_dir);
+pub fn load_catalog(cache_root: &Path) -> ModelCatalog {
+    let path = catalog_cache_path(cache_root);
     match std::fs::read(&path) {
         Ok(bytes) => match ModelCatalog::from_json(&bytes) {
             Ok(catalog) => catalog,
@@ -395,11 +395,11 @@ pub fn load_catalog(data_dir: &Path) -> ModelCatalog {
 /// Returns `Ok(true)` when refreshed, `Ok(false)` when still fresh. Best-effort: the caller
 /// can fire-and-forget; errors leave the existing cache (or bundled snapshot) in place.
 pub async fn refresh_if_stale(
-    data_dir: &Path,
+    cache_root: &Path,
     url: &str,
     client: &reqwest::Client,
 ) -> Result<bool, LensError> {
-    let path = catalog_cache_path(data_dir);
+    let path = catalog_cache_path(cache_root);
 
     if let Ok(meta) = std::fs::metadata(&path)
         && let Ok(mtime) = meta.modified()

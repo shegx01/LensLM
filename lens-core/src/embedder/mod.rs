@@ -103,7 +103,7 @@ impl FastembedEmbedder {
     /// # Errors
     /// [`LensError::Model`] on session init failure; [`LensError::Validation`] if
     /// `spec` has no fastembed variant (Ollama-only model).
-    pub fn new_with_spec(data_dir: &Path, spec: &EmbeddingModelSpec) -> Result<Self, LensError> {
+    pub fn new_with_spec(cache_root: &Path, spec: &EmbeddingModelSpec) -> Result<Self, LensError> {
         // Defense-in-depth (issue #80): primary guard is in `embedder_for`; this
         // is the last line of defense for direct callers.
         if !spec.supports(EmbeddingBackend::Fastembed) || spec.fastembed_variant.is_none() {
@@ -116,7 +116,7 @@ impl FastembedEmbedder {
             .fastembed_variant
             .clone()
             .expect("fastembed_variant present: guarded by the check above");
-        let cache_dir = data_dir.join("models").join("fastembed");
+        let cache_dir = cache_root.join("models").join("fastembed");
         let opts = InitOptions::new(variant).with_cache_dir(cache_dir);
         let inner = TextEmbedding::try_new(opts)
             .map_err(|e| LensError::Model(format!("fastembed init failed: {e}")))?;

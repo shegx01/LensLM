@@ -1,0 +1,6 @@
+[package]
+name = "ofc"
+version = "0.0.0"
+edition = "2021"
+[lints.clippy]
+all = "warn"

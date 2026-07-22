@@ -948,7 +948,7 @@ impl IngestContext<'_> {
         on_progress(IngestProgress::new(ingest_phase::PARSING, 1, Some(1)));
 
         on_progress(IngestProgress::new(ingest_phase::CHUNKING, 0, None));
-        maybe_emit_tokenizer_download(data_dir, on_progress);
+        maybe_emit_tokenizer_download(&engine.cache_root().await, on_progress);
         let tokenizer = engine.tokenizer().await?;
         let mut chunks = chunk_blocks(canonical, blocks, &tokenizer)?;
         let total_tokens: i64 = chunks
@@ -1838,8 +1838,8 @@ fn attach_anchors_to_chunks(
 
 /// Emits a `model_download` progress event when the tokenizer is absent from disk
 /// (a network fetch is about to happen on the next [`LensEngine::tokenizer`] call).
-fn maybe_emit_tokenizer_download(data_dir: &Path, on_progress: &mut impl FnMut(IngestProgress)) {
-    let fastembed_dir = data_dir.join("models").join("fastembed");
+fn maybe_emit_tokenizer_download(cache_root: &Path, on_progress: &mut impl FnMut(IngestProgress)) {
+    let fastembed_dir = cache_root.join("models").join("fastembed");
     let canonical = fastembed_dir.join("tokenizer.json");
     if !canonical.is_file() && find_tokenizer_json(&fastembed_dir).is_none() {
         on_progress(IngestProgress::new(ingest_phase::MODEL_DOWNLOAD, 0, None));
@@ -1848,8 +1848,8 @@ fn maybe_emit_tokenizer_download(data_dir: &Path, on_progress: &mut impl FnMut(I
 
 /// Resolves the nomic `tokenizer.json`: (1) canonical cache path, (2) fastembed subtree,
 /// (3) atomic HuggingFace download. Shared by ingest and the eval harness.
-pub async fn resolve_nomic_tokenizer(data_dir: &Path) -> Result<Tokenizer, LensError> {
-    let fastembed_dir = data_dir.join("models").join("fastembed");
+pub async fn resolve_nomic_tokenizer(cache_root: &Path) -> Result<Tokenizer, LensError> {
+    let fastembed_dir = cache_root.join("models").join("fastembed");
     let canonical = fastembed_dir.join("tokenizer.json");
 
     if canonical.is_file() {

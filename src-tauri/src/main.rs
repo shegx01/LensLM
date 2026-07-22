@@ -89,8 +89,18 @@ fn main() {
                 .on_navigation(main_nav_allowed)
                 .build()?;
 
-            let data_dir = app.path().app_data_dir()?;
+            // The OS app-data dir is a fixed anchor that never moves; it holds the
+            // relocation pointer (location.json) that can re-point to a relocated
+            // data dir (#238). Init on the resolved dir, then GC any superseded old
+            // dir a prior relocate left behind.
+            let anchor = app.path().app_data_dir()?;
+            let data_dir = lens_core::relocate::resolve_data_dir(&anchor);
             let engine = tauri::async_runtime::block_on(LensEngine::init(&data_dir))?;
+            lens_core::relocate::run_boot_cleanup(
+                &anchor,
+                &data_dir,
+                commands::system::REGENERABLE_DIRS,
+            );
             app.manage(engine);
 
             // Inject the offscreen-webview JS renderer (issue #78, Layer f) so
@@ -134,8 +144,11 @@ fn main() {
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             {
                 // Resolution is deferred inside the closure; see
-                // `qwen::sidecar_paths` for the shared-path rationale.
-                let paths = qwen::sidecar_paths(app.handle())?;
+                // `qwen::sidecar_paths` for the shared-path rationale. The venv/bin
+                // follow the resolved data dir; `HF_HOME` follows the cache root (#238).
+                let cfg = tauri::async_runtime::block_on(engine_state.config());
+                let cache_root = cfg.cache_root(&data_dir);
+                let paths = qwen::sidecar_paths(app.handle(), &data_dir, &cache_root)?;
                 let resolver = qwen::spawn_resolver(&paths);
                 let qwen = qwen::QwenSidecar::new(resolver);
                 tauri::async_runtime::block_on(engine_state.set_tts_sidecar(Some(Arc::new(qwen))));
@@ -209,6 +222,10 @@ fn main() {
             commands::system::health_check,
             commands::system::get_storage_stats,
             commands::system::clear_model_cache,
+            commands::system::relocate_data_dir,
+            commands::system::offload_cache,
+            commands::system::reset_cache_location,
+            commands::system::restart_app,
             commands::system::list_recent_documents,
             commands::system::run_system_check,
             commands::system::detect_llm,

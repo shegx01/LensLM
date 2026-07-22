@@ -92,11 +92,24 @@ export interface AsrConfig {
 
 export interface PathConfig {
   data_dir: string;
+  // SYNC-CHECK: must match lens-core/src/config.rs PathConfig.cache_dir (#238;
+  // offloaded model-cache root; null/absent = under data_dir).
+  cache_dir?: string | null;
+}
+
+// SYNC-CHECK: must match lens-core/src/config.rs StorageConfig (#238).
+export interface StorageConfig {
+  // Soft advisory cap on the reclaimable model cache, in bytes. null = no cap.
+  cache_quota_bytes?: number | null;
 }
 
 // SYNC-CHECK: must match the `get_storage_stats` Tauri command's return shape
 // (src-tauri/src/commands/system.rs) — not a persisted AppConfig field.
 export interface StorageStats {
+  db_bytes: number;
+  vectors_bytes: number;
+  sources_bytes: number;
+  audio_bytes: number;
   corpus_bytes: number;
   reclaimable_cache_bytes: number;
   retained_bytes: number;
@@ -121,6 +134,8 @@ export interface AppConfig {
   // SYNC-CHECK: must match lens-core/src/config.rs AppConfig.enrichment (default disabled).
   enrichment: EnrichmentConfig;
   paths: PathConfig;
+  // SYNC-CHECK: must match lens-core/src/config.rs AppConfig.storage (#238; default no quota).
+  storage: StorageConfig;
   tier_thresholds: TierThresholds;
   onboarding_complete: boolean;
   // SYNC-CHECK: must match lens-core/src/config.rs AppConfig.embedding_model (default "").

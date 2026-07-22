@@ -42,15 +42,17 @@ pub struct SidecarPaths {
     pub hf_cache_dir: PathBuf,
 }
 
-/// Resolves the [`SidecarPaths`] from an [`AppHandle`](tauri::AppHandle): app-data
-/// via Tauri, the bundled sidecar dir (source tree in dev, `_up_/sidecar` in a
-/// packaged build), and the `hf-cache` subdir the resolver points `HF_HOME` at.
-pub fn sidecar_paths(app: &tauri::AppHandle) -> Result<SidecarPaths, LensError> {
+/// Resolves the [`SidecarPaths`] (#238): the venv/uv/bin live under the resolved
+/// `data_dir` (so they follow a relocated data dir), the bundled sidecar dir comes
+/// from the app handle (source tree in dev, `_up_/sidecar` packaged), and the
+/// `hf-cache` subdir `HF_HOME` points at lives under `cache_root` (so it follows offload).
+pub fn sidecar_paths(
+    app: &tauri::AppHandle,
+    data_dir: &Path,
+    cache_root: &Path,
+) -> Result<SidecarPaths, LensError> {
     use tauri::Manager;
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| LensError::Io(e.to_string()))?;
+    let app_data_dir = data_dir.to_path_buf();
     let sidecar_dir = if cfg!(debug_assertions) {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../sidecar/qwen3-tts")
     } else {
@@ -59,7 +61,7 @@ pub fn sidecar_paths(app: &tauri::AppHandle) -> Result<SidecarPaths, LensError> 
             .map_err(|e| LensError::Io(e.to_string()))?
             .join("_up_/sidecar/qwen3-tts")
     };
-    let hf_cache_dir = app_data_dir.join("hf-cache");
+    let hf_cache_dir = cache_root.join("hf-cache");
     Ok(SidecarPaths {
         app_data_dir,
         sidecar_dir,
