@@ -12,13 +12,16 @@
   import LoaderCircle from '@lucide/svelte/icons/loader-circle';
   import { Button } from '$lib/components/ui/button/index.js';
   import { cn } from '$lib/utils.js';
-  import { prefersReducedMotion } from '$lib/motion/index.js';
   import {
     formatSize,
     type EmbeddingBackend,
     type EmbeddingModelId
   } from '$lib/embeddings/models.js';
-  import { EmbeddingPickerState, CHIP_CLASS } from '$lib/embeddings/pickerState.svelte.js';
+  import {
+    EmbeddingPickerState,
+    CHIP_CLASS,
+    PROVIDER_LABELS
+  } from '$lib/embeddings/pickerState.svelte.js';
   import type { CheckResult } from '$lib/onboarding/system-check.js';
   import SystemCheckTile from './SystemCheckTile.svelte';
   import InstallRingButton from '$lib/components/embeddings/InstallRingButton.svelte';
@@ -41,20 +44,19 @@
   });
   onDestroy(() => picker.dispose());
 
-  const reduceMotion = $derived(prefersReducedMotion());
   // Header reflects the authoritative gate, not the local probe, so it can never
   // contradict the footer's Continue button.
   const ready = $derived(result.status === 'pass');
 
-  const providers: { id: EmbeddingBackend; label: string }[] = [
-    { id: 'fastembed', label: 'On-device' },
-    { id: 'ollama', label: 'Ollama' }
-  ];
+  const providers: { id: EmbeddingBackend; label: string }[] = (
+    ['fastembed', 'ollama'] as const
+  ).map((id) => ({ id, label: PROVIDER_LABELS[id].label }));
 
-  // Reactive persist: selecting an installed model makes it the default at once.
+  // Reactive persist: selecting a ready model that isn't already the default makes
+  // it the default at once (no Save button); re-picking the active one is a no-op.
   async function onPickModel(id: EmbeddingModelId): Promise<void> {
     picker.pickModel(id);
-    if (picker.installed.has(id)) await picker.commit();
+    if (picker.installed.has(id) && picker.isDirty) await picker.commit();
   }
 
   // Re-detect Ollama AND re-run the gate, so a freshly-started daemon flips the
@@ -200,7 +202,7 @@
     <div class="mt-3 flex min-h-[4.75rem] flex-col gap-2">
       {#if picker.backend === 'fastembed' && picker.installing}
         <p class="text-[0.72rem] text-muted-foreground" aria-live="polite">
-          {reduceMotion ? 'Installing…' : picker.installPhase}
+          {picker.installLabel}
         </p>
       {/if}
 

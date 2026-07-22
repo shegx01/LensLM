@@ -42,6 +42,12 @@ const FIRST_OLLAMA: EmbeddingModelId = OLLAMA_MODELS[0]?.id ?? DEFAULT_EMBEDDING
 export const CHIP_CLASS =
   'rounded-full bg-muted px-1.5 py-0.5 text-[0.62rem] font-semibold text-muted-foreground';
 
+/** Backend → display label + description, single-sourced so both views agree. */
+export const PROVIDER_LABELS: Record<EmbeddingBackend, { label: string; desc: string }> = {
+  fastembed: { label: 'On-device', desc: 'Bundled — no setup' },
+  ollama: { label: 'Ollama', desc: 'Uses your local Ollama models' }
+};
+
 export interface EmbeddingPickerConfig {
   mode: 'global' | 'notebook';
   /** Required in notebook mode — the notebook whose coordinate this edits. */
@@ -72,6 +78,7 @@ export class EmbeddingPickerState {
 
   refreshing = $state(false);
   installing = $state(false);
+  persisting = $state(false);
   installPhase = $state('');
   actionError = $state<string | null>(null);
 
@@ -100,18 +107,14 @@ export class EmbeddingPickerState {
     this.models.find((m) => m.id === this.selectedModel) ?? this.models[0]
   );
   readonly selectedReady = $derived(this.installed.has(this.selectedModel));
-  // Blocks selection changes while a write is in flight (install or re-embed).
-  readonly busy = $derived(this.reembedding || this.installing);
+  // Blocks selection changes while any write is in flight (install / persist / re-embed).
+  readonly busy = $derived(this.reembedding || this.installing || this.persisting);
   readonly isDirty = $derived(
     this.selectedModel !== this.activeModel || this.backend !== this.activeBackend
   );
   readonly needsInstall = $derived(this.backend === 'fastembed' && !this.selectedReady);
-  // Whether the PERSISTED default is usable — drives Settings' Active markers.
-  readonly activeReady = $derived(
-    this.activeBackend === 'fastembed'
-      ? this.fastembedCached.has(this.activeModel)
-      : this.ollamaInstalled.has(this.activeModel)
-  );
+  // Install-affordance label: reduced motion shows a static word instead of the ticker.
+  readonly installLabel = $derived(prefersReducedMotion() ? 'Installing…' : this.installPhase);
   readonly reembedPct = $derived(
     this.reembedTotal > 0
       ? Math.min(100, Math.round((this.reembedDone / this.reembedTotal) * 100))
@@ -124,7 +127,9 @@ export class EmbeddingPickerState {
   }
 
   async init(): Promise<void> {
-    void gpuAcceleratedModels().then((ids) => (this.gpuModels = new Set(ids)));
+    void gpuAcceleratedModels()
+      .then((ids) => (this.gpuModels = new Set(ids)))
+      .catch(() => {});
     if (this.#mode === 'global') {
       if (isTauri()) {
         try {
@@ -214,6 +219,8 @@ export class EmbeddingPickerState {
     }
   }
 
+  // Commit POLICY is caller-owned: Settings applies via explicit buttons, onboarding
+  // persists reactively on pick. This controller only performs the write.
   async commit(): Promise<void> {
     if (this.#mode === 'global') await this.#persistGlobal();
     else await this.#maybeReembed();
@@ -221,6 +228,7 @@ export class EmbeddingPickerState {
 
   async #persistGlobal(): Promise<void> {
     this.actionError = null;
+    this.persisting = true;
     const model = this.selectedModel;
     const backend = this.backend;
     try {
@@ -234,6 +242,8 @@ export class EmbeddingPickerState {
       await this.#onchange?.();
     } catch (err) {
       this.actionError = err instanceof Error ? err.message : 'Could not save the default.';
+    } finally {
+      this.persisting = false;
     }
   }
 

@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { CheckResult } from '$lib/onboarding/system-check.js';
 import SystemCheck from './SystemCheck.svelte';
 import { resetChatProvider } from '$lib/models/chat-provider.svelte.js';
+import { baseAppConfig } from '$lib/test-fixtures.js';
 
 // Both readiness gates passing. TTS is no longer a readiness gate (moved to Settings, #194).
 const ALL_PASS: CheckResult[] = [
@@ -219,6 +220,36 @@ describe('SystemCheck', () => {
     );
     expect(skipButton()).toBeDisabled();
     expect(saveButton()).toBeDisabled();
+  });
+
+  it('a failed re-check keeps the pickers mounted instead of dead-ending the screen', async () => {
+    let calls = 0;
+    mockIPC((cmd) => {
+      if (cmd === 'run_system_check') {
+        calls += 1;
+        if (calls === 1) return embeddingFail();
+        throw new Error('transient probe failure'); // the post-persist re-check fails
+      }
+      if (cmd === 'get_config') return baseAppConfig();
+      if (cmd === 'fastembed_models_cached') return ['nomic-embed-text-v1.5', 'all-minilm'];
+      if (cmd === 'list_ollama_models') return [];
+      if (cmd === 'gpu_accelerated_models') return [];
+      if (cmd === 'set_config') return null;
+      if (cmd === 'has_chat_provider') return true;
+    });
+
+    render(SystemCheck, { props: { onadvance: vi.fn() } });
+    await screen.findByText('Embedding model');
+    // Wait for the cache probe so the pill is a ready (persistable) selection.
+    await screen.findByLabelText(/nomic-embed-text-v1\.5 ready/i);
+
+    // Reactive persist → onchange → re-check, which throws.
+    await fireEvent.click(screen.getByRole('radio', { name: 'all-minilm' }));
+
+    // The screen must NOT collapse into the full-page error; pickers stay mounted.
+    await waitFor(() => expect(calls).toBeGreaterThanOrEqual(2));
+    expect(screen.getByText('Embedding model')).toBeInTheDocument();
+    expect(screen.queryByText(/could not run the system check/i)).not.toBeInTheDocument();
   });
 
   it('shows "0 of 2" when all gates fail and "2 of 2" when all pass', async () => {

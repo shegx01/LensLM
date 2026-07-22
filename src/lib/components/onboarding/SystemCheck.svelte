@@ -50,8 +50,13 @@
       loaded = true;
     } catch (err) {
       console.error('SystemCheck: runSystemCheck failed', err);
-      results = [];
-      checkError = 'Could not run the system check. Please retry.';
+      // Only the first load dead-ends into the error screen. A failed re-check
+      // (a post-persist gate refresh) keeps the last-good results and the mounted
+      // pickers rather than tearing the screen down mid-interaction.
+      if (!loaded) {
+        results = [];
+        checkError = 'Could not run the system check. Please retry.';
+      }
     } finally {
       loading = false;
     }

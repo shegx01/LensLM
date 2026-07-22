@@ -19,14 +19,12 @@
   import LoaderCircle from '@lucide/svelte/icons/loader-circle';
   import RefreshCw from '@lucide/svelte/icons/refresh-cw';
   import CircleCheck from '@lucide/svelte/icons/circle-check';
-  import { prefersReducedMotion } from '$lib/motion/index.js';
+  import { formatSize, REEMBED_WARNING, type EmbeddingBackend } from '$lib/embeddings/models.js';
   import {
-    resolveModel,
-    formatSize,
-    REEMBED_WARNING,
-    type EmbeddingBackend
-  } from '$lib/embeddings/models.js';
-  import { EmbeddingPickerState, CHIP_CLASS } from '$lib/embeddings/pickerState.svelte.js';
+    EmbeddingPickerState,
+    CHIP_CLASS,
+    PROVIDER_LABELS
+  } from '$lib/embeddings/pickerState.svelte.js';
   import InstallRingButton from './InstallRingButton.svelte';
 
   let {
@@ -52,12 +50,9 @@
   });
   onDestroy(() => picker.dispose());
 
-  const reduceMotion = $derived(prefersReducedMotion());
-
-  const providers: { id: EmbeddingBackend; label: string; desc: string }[] = [
-    { id: 'fastembed', label: 'On-device', desc: 'Bundled — no setup' },
-    { id: 'ollama', label: 'Ollama', desc: 'Uses your local Ollama models' }
-  ];
+  const providers: { id: EmbeddingBackend; label: string; desc: string }[] = (
+    ['fastembed', 'ollama'] as const
+  ).map((id) => ({ id, ...PROVIDER_LABELS[id] }));
   const selectedProvider = $derived(providers.find((p) => p.id === picker.backend) ?? providers[0]);
 </script>
 
@@ -182,7 +177,7 @@
         <p class="text-[0.72rem] text-muted-foreground">
           Not detected on your Ollama runtime. Pull it with
           <code class="rounded bg-muted px-1 py-0.5 text-[0.7rem] text-foreground"
-            >ollama pull {resolveModel(picker.selectedModel).ollamaName}</code
+            >ollama pull {picker.focusedModel.ollamaName}</code
           >, then Refresh.
         </p>
       {/if}
@@ -191,12 +186,12 @@
     <div class="mt-4 flex items-center gap-3">
       <InstallRingButton
         installing={picker.installing}
-        label={`Install ${resolveModel(picker.selectedModel).label}`}
+        label={`Install ${picker.focusedModel.label}`}
         onclick={() => picker.install()}
       />
       {#if picker.installing}
         <span class="text-[0.72rem] text-muted-foreground" aria-live="polite">
-          {reduceMotion ? 'Installing…' : picker.installPhase}
+          {picker.installLabel}
         </span>
       {/if}
     </div>
