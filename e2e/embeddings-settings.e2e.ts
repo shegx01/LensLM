@@ -39,12 +39,12 @@ test('fresh_install_fastembed_only_passes_gate', async ({ page }) => {
   await expect(page.getByRole('heading', { name: 'Make it yours' })).toBeVisible();
 });
 
-// ── Step 9 (panel): the onboarding embed panel sets the GLOBAL default ────────
+// ── Step 9 (picker): the inline onboarding embed picker sets the GLOBAL default ─
 //
-// Expanding the embedding row exposes the provider selector + model cards; a
-// fastembed Install warms the model and persists embedding_model + backend.
-test('onboarding embed panel sets the global default (model + backend)', async ({ page }) => {
-  // Make the embedding row FAIL so its "Choose" affordance expands the panel.
+// The picker is inline (no Choose/expand): the focused fastembed default shows an
+// Install ring button that warms the model and persists embedding_model + backend.
+test('onboarding embed picker sets the global default (model + backend)', async ({ page }) => {
+  // Embedding row FAILS (nothing cached) so the focused default offers Install.
   const checks: CheckResult[] = DEFAULT_CHECKS.map((c) =>
     c.id === 'embedding_model'
       ? { ...c, status: 'fail', detail: 'No embedding model installed' }
@@ -60,15 +60,14 @@ test('onboarding embed panel sets the global default (model + backend)', async (
   await page.goto('/');
   await expect(page.getByText('System check', { exact: true })).toBeVisible();
 
-  // Expand the embedding row via its action button. A failing row's action is
-  // "Choose"; the button is accessibly named "{action} {row label}".
-  await page.getByRole('button', { name: 'Choose Embedding model' }).click();
+  // Inline: the On-device provider tab and the focused default are visible at once
+  // (no Choose/expand step).
+  await expect(page.getByRole('radio', { name: 'On-device' })).toBeVisible();
+  await expect(page.getByText('nomic-embed-text-v1.5')).toBeVisible();
 
-  // The reworked panel shows the provider selector + the verbatim warning.
-  await expect(page.getByText('Select your local embeddings provider')).toBeVisible();
-  await expect(page.getByText(/permanently linked/)).toBeVisible();
-
-  // Retry click+read as a unit: the click can drop while the panel settles.
+  // fastembed default not cached → Install is shown directly. Warming populates
+  // the cache, so the picker then persists it as the default. Retry click+read as
+  // a unit: the click can drop while the picker settles.
   await expect(async () => {
     await page.getByRole('button', { name: /Install nomic-embed-text-v1\.5/i }).click();
     expect(await readSetConfigCalls(page)).toContainEqual(
