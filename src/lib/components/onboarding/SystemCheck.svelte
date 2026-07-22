@@ -1,7 +1,6 @@
 <!--
-  Onboarding readiness gate. Renders ONE gate per screen: `gate="llm"` is the
-  first step (Local AI, never blocks); `gate="embedding"` is the second step
-  (embedding model, REQUIRED). The two steps are sequenced by +layout.svelte.
+  Onboarding readiness gate; renders ONE gate per screen. gate="llm" = Local AI
+  (never blocks); gate="embedding" = embedding model (REQUIRED). Sequenced by +layout.svelte.
 -->
 <script lang="ts">
   import { onMount } from 'svelte';
@@ -17,17 +16,15 @@
   import { runSystemCheck, type CheckResult, type SaveApi } from '$lib/onboarding/system-check.js';
   import ThemeCycleButton from '$lib/components/ThemeCycleButton.svelte';
 
+  // `onback` is required exactly on the embedding gate (its only way back to Local AI);
+  // the union stops a caller rendering that gate — which has no Skip — without a Back path.
   let {
     gate,
     onadvance,
     onback
-  }: {
-    /** Which readiness gate this screen owns: the Local AI step or the Embedding step. */
-    gate: 'llm' | 'embedding';
-    onadvance: () => void;
-    /** Present only on the Embedding step (returns to Local AI); the LLM step is first. */
-    onback?: () => void;
-  } = $props();
+  }:
+    | { gate: 'llm'; onadvance: () => void; onback?: undefined }
+    | { gate: 'embedding'; onadvance: () => void; onback: () => void } = $props();
 
   let results = $state<CheckResult[]>([]);
   let loading = $state(true);

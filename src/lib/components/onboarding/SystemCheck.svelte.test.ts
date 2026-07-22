@@ -6,8 +6,6 @@ import SystemCheck from './SystemCheck.svelte';
 import { resetChatProvider } from '$lib/models/chat-provider.svelte.js';
 import { baseAppConfig } from '$lib/test-fixtures.js';
 
-// SystemCheck now renders ONE gate per screen: `gate="llm"` (Local AI, first step,
-// never blocks) and `gate="embedding"` (embedding model, REQUIRED, second step).
 // TTS is no longer a readiness gate (moved to Settings, #194).
 const ALL_PASS: CheckResult[] = [
   {
