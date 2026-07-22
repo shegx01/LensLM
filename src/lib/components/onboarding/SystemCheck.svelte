@@ -1,16 +1,33 @@
+<!--
+  Onboarding readiness gate. Renders ONE gate per screen: `gate="llm"` is the
+  first step (Local AI, never blocks); `gate="embedding"` is the second step
+  (embedding model, REQUIRED). The two steps are sequenced by +layout.svelte.
+-->
 <script lang="ts">
   import { onMount } from 'svelte';
   import LoaderCircle from '@lucide/svelte/icons/loader-circle';
   import ArrowRight from '@lucide/svelte/icons/arrow-right';
+  import ChevronLeft from '@lucide/svelte/icons/chevron-left';
   import TriangleAlert from '@lucide/svelte/icons/triangle-alert';
   import Aperture from '@lucide/svelte/icons/aperture';
   import { Button } from '$lib/components/ui/button/index.js';
   import { Card } from '$lib/components/ui/card/index.js';
-  import SystemCheckRow from '$lib/components/onboarding/SystemCheckRow.svelte';
+  import OnboardingLlmPicker from './OnboardingLlmPicker.svelte';
+  import OnboardingEmbeddingPicker from './OnboardingEmbeddingPicker.svelte';
   import { runSystemCheck, type CheckResult, type SaveApi } from '$lib/onboarding/system-check.js';
   import ThemeCycleButton from '$lib/components/ThemeCycleButton.svelte';
 
-  let { onadvance }: { onadvance: () => void } = $props();
+  let {
+    gate,
+    onadvance,
+    onback
+  }: {
+    /** Which readiness gate this screen owns: the Local AI step or the Embedding step. */
+    gate: 'llm' | 'embedding';
+    onadvance: () => void;
+    /** Present only on the Embedding step (returns to Local AI); the LLM step is first. */
+    onback?: () => void;
+  } = $props();
 
   let results = $state<CheckResult[]>([]);
   let loading = $state(true);
@@ -19,40 +36,40 @@
   let checkError = $state<string | null>(null);
   let continueError = $state<string | null>(null);
 
-  // The LLM picker hands up a live { save } so this footer can drive Save &
-  // continue; Skip never touches it.
+  // The LLM picker hands up a live { save } so the footer can drive Continue;
+  // Skip never touches it. Only set on the `llm` gate.
   let llmApi = $state<SaveApi | null>(null);
 
-  // Embedding is the retrieval floor, so it stays REQUIRED — both footer buttons
-  // are blocked until it passes. The LLM row is skippable and never contributes
-  // to the gate. A load-in / check error, or an absent passing embedding row,
-  // also keeps the gate blocked (fail-closed).
-  const blocked = $derived(
-    checkError !== null ||
-      results.length === 0 ||
-      !results.some((r) => r.id === 'embedding_model' && r.status === 'pass')
+  const embeddingRow = $derived(results.find((r) => r.id === 'embedding_model') ?? null);
+
+  // Embedding is the retrieval floor, so the Embedding step stays REQUIRED — Continue
+  // is enabled only once it passes. A load-in / check error, or an absent passing row,
+  // keeps it disabled (fail-closed). The LLM step never gates on the check.
+  const embeddingReady = $derived(
+    checkError === null && results.some((r) => r.id === 'embedding_model' && r.status === 'pass')
   );
 
-  const readyCount = $derived(results.filter((r) => r.status === 'pass').length);
-  const totalCount = $derived(results.length);
+  const continueDisabled = $derived(
+    finishing || (gate === 'embedding' && (loading || !embeddingReady))
+  );
 
   async function check(): Promise<void> {
-    // Only the first run gates the whole screen; a re-check triggered by a picker
-    // persist/refresh updates `results` in place, leaving the pickers mounted (no
-    // flash, no lost in-component state).
+    // Only the first run gates the whole screen; a re-check triggered by the embedding
+    // picker persisting a default updates `results` in place, leaving the picker mounted
+    // (no flash, no lost in-component state).
     if (!loaded) loading = true;
     checkError = null;
     try {
-      // runSystemCheck returns the two onboarding readiness gates (llm_runtime,
-      // embedding_model); the legacy text_to_speech gate is filtered out (TTS
-      // setup moved to Settings).
+      // runSystemCheck returns both onboarding readiness gates (llm_runtime,
+      // embedding_model); this step reads only its own row. The legacy
+      // text_to_speech gate is filtered out (TTS setup moved to Settings).
       results = await runSystemCheck();
       loaded = true;
     } catch (err) {
       console.error('SystemCheck: runSystemCheck failed', err);
       // Only the first load dead-ends into the error screen. A failed re-check
       // (a post-persist gate refresh) keeps the last-good results and the mounted
-      // pickers rather than tearing the screen down mid-interaction.
+      // picker rather than tearing the screen down mid-interaction.
       if (!loaded) {
         results = [];
         checkError = 'Could not run the system check. Please retry.';
@@ -62,7 +79,7 @@
     }
   }
 
-  // Skip writes nothing and always advances (onboarding stays non-blocking).
+  // Skip (LLM step only) writes nothing and always advances (the LLM never blocks).
   async function handleSkip(): Promise<void> {
     finishing = true;
     continueError = null;
@@ -76,24 +93,27 @@
     }
   }
 
-  // Save persists the local LLM (Variant-B chat_model pin) via the picker, then
-  // advances. A failed save surfaces its own inline error in the tile, so we hold
+  // Continue persists the local LLM (Variant-B chat_model pin) on the LLM step, then
+  // advances; on the Embedding step the picker persists reactively, so this only
+  // advances. A failed LLM save surfaces its own inline error in the tile, so we hold
   // on the step instead of advancing.
-  async function handleSave(): Promise<void> {
+  async function handleContinue(): Promise<void> {
     finishing = true;
     continueError = null;
     try {
-      await llmApi?.save();
+      if (gate === 'llm') await llmApi?.save();
       onadvance();
     } catch (err) {
-      console.error('SystemCheck: save failed', err);
+      console.error('SystemCheck: continue failed', err);
     } finally {
       finishing = false;
     }
   }
 
   onMount(() => {
-    void check();
+    // The LLM picker is self-contained (its own Ollama detection + save path) and
+    // never consumes the check, so only the Embedding step runs the probe.
+    if (gate === 'embedding') void check();
   });
 </script>
 
@@ -128,7 +148,9 @@
       </div>
 
       <div class="flex flex-col gap-2">
-        {#if loading}
+        {#if gate === 'llm'}
+          <OnboardingLlmPicker onready={(api) => (llmApi = api)} />
+        {:else if loading}
           <div
             class="text-muted-foreground flex items-center justify-center gap-2 py-12 text-sm"
             aria-live="polite"
@@ -144,10 +166,8 @@
             <TriangleAlert class="size-4 shrink-0" />
             {checkError}
           </div>
-        {:else}
-          {#each results as result (result.id)}
-            <SystemCheckRow {result} oncheck={check} onready={(api) => (llmApi = api)} />
-          {/each}
+        {:else if embeddingRow}
+          <OnboardingEmbeddingPicker result={embeddingRow} oncheck={check} />
         {/if}
       </div>
 
@@ -155,26 +175,35 @@
         {#if continueError}
           <p class="text-destructive w-full text-center text-sm" role="alert">{continueError}</p>
         {/if}
-        {#if !loading && !checkError}
-          <p class="text-muted-foreground w-full text-center text-[0.6875rem]">
-            {readyCount} of {totalCount} checks passed
-          </p>
-        {/if}
         <div class="flex items-center gap-3">
-          <Button
-            variant="ghost"
-            class="h-11 flex-1 active:scale-[0.97] disabled:active:scale-100 motion-reduce:transition-none"
-            onclick={handleSkip}
-            disabled={loading || finishing || blocked}
-          >
-            Skip for now
-          </Button>
+          {#if gate === 'llm'}
+            <Button
+              variant="ghost"
+              class="h-11 flex-1 active:scale-[0.97] disabled:active:scale-100 motion-reduce:transition-none"
+              onclick={handleSkip}
+              disabled={finishing}
+            >
+              Skip for now
+            </Button>
+          {:else}
+            <Button
+              variant="ghost"
+              class="group h-11 flex-1 active:scale-[0.97] disabled:active:scale-100 motion-reduce:transition-none"
+              onclick={() => onback?.()}
+              disabled={finishing}
+            >
+              <ChevronLeft
+                class="transition-transform group-hover:-translate-x-0.5 motion-reduce:transition-none"
+              />
+              Back
+            </Button>
+          {/if}
           <Button
             class="group h-11 flex-1 shadow-[inset_0_1px_0_color-mix(in_oklch,var(--primary-foreground)_25%,transparent),0_8px_24px_-8px_color-mix(in_oklch,var(--primary)_55%,transparent)] active:scale-[0.97] disabled:active:scale-100 motion-reduce:transition-none"
-            onclick={handleSave}
-            disabled={loading || finishing || blocked}
+            onclick={handleContinue}
+            disabled={continueDisabled}
           >
-            Save &amp; continue
+            Continue
             <ArrowRight
               class="transition-transform group-hover:translate-x-0.5 motion-reduce:transition-none"
             />

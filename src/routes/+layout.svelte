@@ -22,9 +22,9 @@
 
   // `onboardingComplete` is the sole gate between onboarding and the app (FOUC-free).
   // `onboardingStep` drives which screen renders within the !onboardingComplete branch.
-  let onboardingStep = $state<'system-check' | 'make-it-yours' | 'create-notebook' | 'add-sources'>(
-    'system-check'
-  );
+  let onboardingStep = $state<
+    'local-ai' | 'embedding-model' | 'make-it-yours' | 'create-notebook' | 'add-sources'
+  >('local-ai');
 
   // One `get_config` read on mount drives both theme reconciliation and the onboarding gate.
   onMount(() => {
@@ -79,12 +79,18 @@
 <ToastContainer />
 
 {#if booting}{:else if !onboardingComplete}
-  {#if onboardingStep === 'system-check'}
-    <SystemCheck onadvance={() => (onboardingStep = 'make-it-yours')} />
+  {#if onboardingStep === 'local-ai'}
+    <SystemCheck gate="llm" onadvance={() => (onboardingStep = 'embedding-model')} />
+  {:else if onboardingStep === 'embedding-model'}
+    <SystemCheck
+      gate="embedding"
+      onadvance={() => (onboardingStep = 'make-it-yours')}
+      onback={() => (onboardingStep = 'local-ai')}
+    />
   {:else if onboardingStep === 'make-it-yours'}
     <MakeItYours
       onadvance={() => (onboardingStep = 'create-notebook')}
-      onback={() => (onboardingStep = 'system-check')}
+      onback={() => (onboardingStep = 'embedding-model')}
     />
   {:else if onboardingStep === 'create-notebook'}
     <CreateNotebook

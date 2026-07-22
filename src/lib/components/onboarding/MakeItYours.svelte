@@ -1,5 +1,5 @@
 <!-- PROP CONTRACT (do not change without updating +layout.svelte):
-     onadvance → 'create-notebook', onback → 'system-check'. Reads/writes draft.userName + draft.accent. -->
+     onadvance → 'create-notebook', onback → 'embedding-model'. Reads/writes draft.userName + draft.accent. -->
 <script lang="ts">
   import { onMount } from 'svelte';
   import ArrowRight from '@lucide/svelte/icons/arrow-right';
