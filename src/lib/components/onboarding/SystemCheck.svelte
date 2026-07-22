@@ -14,6 +14,7 @@
 
   let results = $state<CheckResult[]>([]);
   let loading = $state(true);
+  let loaded = $state(false);
   let finishing = $state(false);
   let checkError = $state<string | null>(null);
   let continueError = $state<string | null>(null);
@@ -36,17 +37,26 @@
   const totalCount = $derived(results.length);
 
   async function check(): Promise<void> {
-    loading = true;
+    // Only the first run gates the whole screen; a re-check triggered by a picker
+    // persist/refresh updates `results` in place, leaving the pickers mounted (no
+    // flash, no lost in-component state).
+    if (!loaded) loading = true;
     checkError = null;
     try {
       // runSystemCheck returns the two onboarding readiness gates (llm_runtime,
       // embedding_model); the legacy text_to_speech gate is filtered out (TTS
       // setup moved to Settings).
       results = await runSystemCheck();
+      loaded = true;
     } catch (err) {
       console.error('SystemCheck: runSystemCheck failed', err);
-      results = [];
-      checkError = 'Could not run the system check. Please retry.';
+      // Only the first load dead-ends into the error screen. A failed re-check
+      // (a post-persist gate refresh) keeps the last-good results and the mounted
+      // pickers rather than tearing the screen down mid-interaction.
+      if (!loaded) {
+        results = [];
+        checkError = 'Could not run the system check. Please retry.';
+      }
     } finally {
       loading = false;
     }

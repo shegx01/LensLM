@@ -66,7 +66,11 @@
       <SettingsShell nav={NAV} bind:active>
         {#snippet content(active)}
           {#if active === 'embeddings'}
-            <EmbeddingsSection mode="notebook" notebookId={activeNotebook.id} onchange={close} />
+            <!-- Key on the notebook id so switching notebooks while open rebuilds the
+                 picker's controller against the current coordinate (no stale notebookId). -->
+            {#key activeNotebook.id}
+              <EmbeddingsSection mode="notebook" notebookId={activeNotebook.id} onchange={close} />
+            {/key}
           {:else if active === 'retrieval'}
             <RetrievalSection notebookId={activeNotebook.id} />
           {/if}
