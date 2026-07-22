@@ -38,3 +38,5 @@ src-tauri/frameworks/libpdfium.dylib
 
 # Local agent/session artifacts (signoff logs, scratch state); never tracked.
 .claude/
+# Throwaway scratch crate agents create to probe a lint in isolation; never tracked.
+/ofc/
