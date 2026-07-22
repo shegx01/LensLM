@@ -148,8 +148,10 @@
         {#if gate === 'llm'}
           <OnboardingLlmPicker onready={(api) => (llmApi = api)} />
         {:else if loading}
+          <!-- Hold the first-screen (Local AI, 296px) body height so the brief probe
+               doesn't collapse the card then jump when the picker mounts. -->
           <div
-            class="text-muted-foreground flex items-center justify-center gap-2 py-12 text-sm"
+            class="text-muted-foreground flex min-h-[296px] items-center justify-center gap-2 text-sm"
             aria-live="polite"
           >
             <LoaderCircle class="size-4 animate-spin" />
@@ -157,7 +159,7 @@
           </div>
         {:else if checkError}
           <div
-            class="text-destructive flex items-center justify-center gap-2 py-12 text-center text-sm"
+            class="text-destructive flex min-h-[296px] items-center justify-center gap-2 text-center text-sm"
             role="alert"
           >
             <TriangleAlert class="size-4 shrink-0" />
