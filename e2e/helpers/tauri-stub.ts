@@ -263,11 +263,14 @@ export async function installTauriStub(
             case 'list_ollama_models':
               // Detect-only Ollama /api/tags probe (graceful empty when down).
               return Promise.resolve(ollamaModels);
-            case 'warm_fastembed_model':
-              // fastembed Install = warm (download) the weights. No-op stub: by
-              // resolving we also pretend the model is now cached for any later
-              // fastembed_models_cached read in the same test (handled per-test).
+            case 'warm_fastembed_model': {
+              // fastembed Install = warm (download) the weights. Model the real
+              // backend: warming populates the on-disk cache, so a later
+              // fastembed_models_cached read in the same test reports it cached.
+              const warmed = args?.model as string | undefined;
+              if (warmed && !fastembedCached.includes(warmed)) fastembedCached.push(warmed);
               return Promise.resolve(null);
+            }
             case 'get_notebook_embedding_model':
               return Promise.resolve(
                 notebookEmbedding ?? {
