@@ -77,34 +77,36 @@
   }
 
   // Skip (LLM step only) writes nothing and always advances (the LLM never blocks).
+  // On success `onadvance()` unmounts this component, so we must NOT reset `finishing`
+  // afterwards (a post-unmount $state write re-reads the now-inert derived); only the
+  // error path (which stays on the step) resets it.
   async function handleSkip(): Promise<void> {
     finishing = true;
     continueError = null;
     try {
       onadvance();
     } catch (err) {
+      finishing = false;
       console.error('SystemCheck: advance failed', err);
       continueError = 'Could not continue. Please try again.';
-    } finally {
-      finishing = false;
     }
   }
 
   // Continue persists the local LLM (Variant-B chat_model pin) on the LLM step, then
   // advances; on the Embedding step the picker persists reactively, so this only
   // advances. A failed LLM save surfaces its own inline error in the tile, so we hold
-  // on the step instead of advancing.
+  // on the step. Reset `finishing` only on that error path — the success path unmounts.
   async function handleContinue(): Promise<void> {
     finishing = true;
     continueError = null;
     try {
       if (gate === 'llm') await llmApi?.save();
-      onadvance();
     } catch (err) {
-      console.error('SystemCheck: continue failed', err);
-    } finally {
       finishing = false;
+      console.error('SystemCheck: continue failed', err);
+      return;
     }
+    onadvance();
   }
 
   onMount(() => {

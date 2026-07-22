@@ -62,6 +62,10 @@ test('onboarding embed picker sets the global default (model + backend)', async 
   await page.goto('/');
   await expect(page.getByText('System check', { exact: true })).toBeVisible();
 
+  // Local AI is the first step (#251); advance to the inline embedding picker.
+  await page.getByRole('button', { name: 'Skip for now' }).click();
+  await expect(page.getByText('Embedding model', { exact: true })).toBeVisible();
+
   // Inline: the On-device provider tab and the focused default are visible at once
   // (no Choose/expand step).
   await expect(page.getByRole('radio', { name: 'On-device' })).toBeVisible();
