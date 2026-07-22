@@ -144,8 +144,9 @@ fn partition_backend_dir(
 
 /// Recursively sums the byte size of `path`. A missing path is 0 (not an error).
 /// Symlinks are never followed — this both prevents cycle-induced infinite
-/// recursion and avoids double-counting a symlinked target.
-fn path_size_bytes(path: &Path) -> Result<u64, LensError> {
+/// recursion and avoids double-counting a symlinked target. Shared with
+/// relocation/offload accounting (#238).
+pub(crate) fn path_size_bytes(path: &Path) -> Result<u64, LensError> {
     let meta = match std::fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
@@ -174,12 +175,6 @@ fn path_size_bytes(path: &Path) -> Result<u64, LensError> {
         total = total.saturating_add(path_size_bytes(&entry.path())?);
     }
     Ok(total)
-}
-
-/// Recursive byte size of a single path (symlink-skipping); a missing path is 0.
-/// Shared with relocation/offload accounting (#238).
-pub(crate) fn dir_size_bytes(path: &Path) -> Result<u64, LensError> {
-    path_size_bytes(path)
 }
 
 fn sum_paths(paths: &[PathBuf]) -> Result<u64, LensError> {

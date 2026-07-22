@@ -105,7 +105,6 @@ pub use notebooks::{
     Source, TrashedSource,
 };
 pub use notes::{Note, NoteId, NoteOrigin};
-pub use paths::StoragePaths;
 pub use render::JsRenderer;
 pub use retrieval::router::{ContextUnit, Provenance, RouterOutput, Tier, tiered_search};
 // Test-only: the integration test asserts `RESERVED_OUTPUT`'s value; production
@@ -1098,15 +1097,15 @@ impl LensEngine {
         .map_err(|e| LensError::Internal(format!("clear_model_cache task join failed: {e}")))?
     }
 
-    /// Copies the data dir to `to`, verifies the snapshot, and rewrites absolute-path
-    /// DB columns in the copy (#238). Holds `ingest_lock` so no ingest/embed/purge runs
-    /// during the copy. The live pool is untouched — the caller writes the anchor
-    /// pointer and prompts a restart, after which [`crate::relocate::resolve_data_dir`]
-    /// re-points the engine. Returns the current (old) data dir so the caller can record
-    /// it for cleanup.
+    /// Copies the data dir to `to` and rewrites absolute-path DB columns in the copy
+    /// (#238). `extra_regenerable` names top-level dirs the caller re-provisions at the
+    /// destination instead of copying (e.g. the Qwen sidecar venv). Holds `ingest_lock`
+    /// so no ingest/embed/purge runs during the copy; the live pool is untouched.
+    /// Returns the old data dir so the caller records it for cleanup.
     pub async fn relocate_data_dir(
         &self,
         to: &std::path::Path,
+        extra_regenerable: &[&str],
     ) -> Result<std::path::PathBuf, LensError> {
         let _permit = self
             .ingest_lock()
@@ -1115,14 +1114,14 @@ impl LensEngine {
             .map_err(|e| LensError::Internal(format!("ingest semaphore closed: {e}")))?;
         let from = self.data_dir().await;
         let pool = self.pool().await;
-        crate::relocate::relocate_data_dir(&pool, &from, to).await?;
+        crate::relocate::relocate_data_dir(&pool, &from, to, extra_regenerable).await?;
         Ok(from)
     }
 
-    /// Moves the model cache to `to_cache_root` (offload, #238) or, when `to_cache_root`
-    /// is `None`, back under the data dir (reset). Persists `paths.cache_dir` and applies
-    /// it in-memory so subsequent model loads resolve under the new root. Holds
-    /// `ingest_lock` so no embed runs mid-move. Returns bytes moved.
+    /// Offloads the model cache to `to_cache_root`, or resets it under the data dir when
+    /// `None` (#238). Copy → persist `paths.cache_dir` → delete the old root, so a
+    /// persist failure never leaves the cache moved-but-unreferenced. Holds `ingest_lock`
+    /// so no embed runs mid-move. Returns bytes copied.
     pub async fn offload_cache(
         &self,
         to_cache_root: Option<&std::path::Path>,
@@ -1137,17 +1136,23 @@ impl LensEngine {
         let from = config.cache_root(&data_dir);
         let to = to_cache_root
             .map(|p| p.to_path_buf())
-            .unwrap_or(data_dir.clone());
-        let moved = {
-            let to = to.clone();
-            tokio::task::spawn_blocking(move || crate::relocate::offload_cache(&from, &to))
+            .unwrap_or_else(|| data_dir.clone());
+        let copied = {
+            let (from, to) = (from.clone(), to.clone());
+            tokio::task::spawn_blocking(move || crate::relocate::copy_cache(&from, &to))
                 .await
-                .map_err(|e| LensError::Internal(format!("offload task join failed: {e}")))??
+                .map_err(|e| LensError::Internal(format!("cache copy task join failed: {e}")))??
         };
         config.paths.cache_dir = to_cache_root.map(|p| p.display().to_string());
         config.save(&data_dir)?;
         self.set_config(config).await;
-        Ok(moved)
+        // Old root is now unreferenced; remove it best-effort (leftover is reclaimable).
+        match tokio::task::spawn_blocking(move || crate::relocate::remove_cache(&from)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(error = %e, "cache offload: old-root removal failed"),
+            Err(e) => tracing::warn!(error = %e, "cache offload: removal task join failed"),
+        }
+        Ok(copied)
     }
 
     /// Returns the per-notebook write lock, creating it on first use. The enrichment

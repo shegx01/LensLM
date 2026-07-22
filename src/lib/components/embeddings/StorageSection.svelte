@@ -53,6 +53,7 @@
   let resetting = $state(false);
   let offloadError = $state<string | null>(null);
   let offloadedBytes = $state<number | null>(null);
+  let cacheRestartOpen = $state(false);
 
   // A native <input type="number"> binds `value` as number|null (Svelte coerces
   // an empty field to null), not a string — mirror that here.
@@ -197,11 +198,18 @@
       const moved = await invoke<number>('offload_cache', { new_path: dir });
       cacheDir = dir;
       offloadedBytes = moved;
-      await loadStats();
+      cacheRestartOpen = true;
     } catch (err) {
       offloadError = err instanceof Error ? err.message : 'Could not move the model cache.';
+      return;
     } finally {
       offloading = false;
+    }
+    // A failed refetch after a successful move must not report the move as failed.
+    try {
+      await loadStats();
+    } catch (err) {
+      console.error('StorageSection: stats refetch after cache move failed', err);
     }
   }
 
@@ -212,11 +220,18 @@
       const moved = await invoke<number>('reset_cache_location');
       cacheDir = null;
       offloadedBytes = moved;
-      await loadStats();
+      cacheRestartOpen = true;
     } catch (err) {
       offloadError = err instanceof Error ? err.message : 'Could not reset the cache location.';
+      return;
     } finally {
       resetting = false;
+    }
+    // A failed refetch after a successful reset must not report the reset as failed.
+    try {
+      await loadStats();
+    } catch (err) {
+      console.error('StorageSection: stats refetch after cache reset failed', err);
     }
   }
 
@@ -589,16 +604,42 @@
   </DialogContent>
 </Dialog>
 
-<Dialog bind:open={restartDialogOpen}>
-  <DialogContent class="max-w-md">
+<!--
+  Mandatory restart: the engine keeps writing to the OLD dir until relaunch, and the
+  next boot deletes it — so there is no safe "Later". Gate `open` (ignore any close
+  request) and drop the close button / Escape / outside-click affordances.
+-->
+<Dialog open={restartDialogOpen} onOpenChange={(v) => v && (restartDialogOpen = v)}>
+  <DialogContent
+    class="max-w-md"
+    showCloseButton={false}
+    escapeKeydownBehavior="ignore"
+    interactOutsideBehavior="ignore"
+  >
     <DialogHeader>
-      <DialogTitle>Data moved</DialogTitle>
+      <DialogTitle>Restart to finish the move</DialogTitle>
       <DialogDescription class="leading-relaxed">
-        Restart now to use the new location.
+        Your data was copied to the new location. Lens must restart now to switch over and clean up
+        the old copy — until it does, changes still write to the previous folder.
       </DialogDescription>
     </DialogHeader>
     <DialogFooter>
-      <Button variant="outline" onclick={() => (restartDialogOpen = false)}>Later</Button>
+      <Button onclick={handleRestartNow} aria-label="Restart now">Restart now</Button>
+    </DialogFooter>
+  </DialogContent>
+</Dialog>
+
+<Dialog bind:open={cacheRestartOpen}>
+  <DialogContent class="max-w-md">
+    <DialogHeader>
+      <DialogTitle>Cache moved</DialogTitle>
+      <DialogDescription class="leading-relaxed">
+        Embedding and speech-recognition models use the new location right away. Restart to finish
+        moving your text-to-speech voices.
+      </DialogDescription>
+    </DialogHeader>
+    <DialogFooter>
+      <Button variant="outline" onclick={() => (cacheRestartOpen = false)}>Later</Button>
       <Button onclick={handleRestartNow} aria-label="Restart now">Restart now</Button>
     </DialogFooter>
   </DialogContent>

@@ -602,7 +602,6 @@ pub struct AppConfig {
     #[serde(default = "default_animations")]
     pub animations: String,
     pub paths: PathConfig,
-    /// Storage-management settings (#238). Absent key reads as [`StorageConfig::default`].
     #[serde(default)]
     pub storage: StorageConfig,
     pub tier_thresholds: TierThresholds,
@@ -639,13 +638,12 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
-    /// Offload root for re-downloadable model/cache dirs (#238): `paths.cache_dir`
-    /// when set and non-empty, else `data_dir` (byte-for-byte the pre-#238 layout).
+    /// Offload root for re-downloadable model/cache dirs. See [`PathConfig::cache_dir`];
+    /// delegates to [`crate::paths::StoragePaths`] so the resolution rule has one home.
     pub fn cache_root(&self, data_dir: &Path) -> PathBuf {
-        match self.paths.cache_dir.as_deref() {
-            Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-            _ => data_dir.to_path_buf(),
-        }
+        crate::paths::StoragePaths::new(data_dir, self.paths.cache_dir.as_deref())
+            .cache_root()
+            .to_path_buf()
     }
 
     /// Loads config from `{dir}/config.json`. Missing file → writes the default.

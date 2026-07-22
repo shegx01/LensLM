@@ -1,12 +1,8 @@
 //! Data-directory relocation and model-cache offload (#238).
 //!
-//! Relocation is copy → verify → rewrite → (caller writes pointer) → restart.
-//! It never mutates the live pool's location: the running engine keeps using the
-//! old dir until the app restarts and [`resolve_data_dir`] re-points it. The DB is
-//! snapshotted with `VACUUM INTO` (transactionally consistent even with the pool
-//! open); absolute paths persisted in the DB (`sources.locator`,
-//! `audio_overviews.path`) are prefix-rewritten in the copy so file sources and
-//! audio overviews survive the move.
+//! Relocation is copy → verify → rewrite → (caller writes pointer) → restart, and
+//! never mutates the live pool's location: the running engine keeps the old dir
+//! until restart, when [`resolve_data_dir`] re-points it.
 
 use std::path::{Path, PathBuf};
 
@@ -36,6 +32,9 @@ const DATA_ENTRIES: &[&str] = &[
     "models",
     "hf-cache",
 ];
+
+/// Re-downloadable model-cache dirs, moved together on offload/reset.
+const CACHE_ENTRIES: &[&str] = &["models", "hf-cache"];
 
 /// Entries handled specially by [`relocate_data_dir`] and never bulk-copied: the DB
 /// files (snapshotted via `VACUUM INTO`) and the anchor-only pointer files.
@@ -79,7 +78,7 @@ pub fn resolve_data_dir(anchor: &Path) -> PathBuf {
 
 /// Reads and parses the anchor's pointer file. `None` when absent or unreadable;
 /// a malformed pointer logs and returns `None` (treated as no relocation).
-pub fn read_location(anchor: &Path) -> Option<DataLocation> {
+pub(crate) fn read_location(anchor: &Path) -> Option<DataLocation> {
     let path = anchor.join(LOCATION_FILE);
     let contents = std::fs::read_to_string(&path).ok()?;
     match serde_json::from_str(&contents) {
@@ -109,11 +108,16 @@ pub fn write_location(anchor: &Path, loc: &DataLocation) -> Result<(), LensError
 }
 
 /// Best-effort cleanup of a superseded old data dir, run once on the next boot after
-/// the engine opens cleanly on the new dir. Removes only the known data entries
-/// (never the directory itself or a pointer file), then clears `cleanup` from the
-/// pointer so it runs at most once. A cleanup that names the active dir or the
-/// anchor is refused as a safety backstop.
-pub fn run_boot_cleanup(anchor: &Path, active_data_dir: &Path) {
+/// the engine opens cleanly on the new dir. Removes the known data entries plus any
+/// caller-supplied `extra` regenerable dirs (never the directory itself or a pointer
+/// file), then clears `cleanup` from the pointer so it runs at most once.
+///
+/// Data-safety guard (issue #238, C1): if the old dir's DB is NEWER than the active
+/// dir's snapshot, the user wrote to the old dir after the relocation copy (e.g. a
+/// crash or a stray write before restart). Deleting it would lose that work, so we
+/// refuse and keep the old dir intact. A cleanup naming the active dir or anchor is
+/// likewise refused.
+pub fn run_boot_cleanup(anchor: &Path, active_data_dir: &Path, extra: &[&str]) {
     let Some(mut loc) = read_location(anchor) else {
         return;
     };
@@ -127,7 +131,15 @@ pub fn run_boot_cleanup(anchor: &Path, active_data_dir: &Path) {
         let _ = write_location(anchor, &loc);
         return;
     }
-    for entry in DATA_ENTRIES {
+    if old_dir_is_newer(&old, active_data_dir) {
+        tracing::warn!(
+            dir = %cleanup,
+            "old data dir has newer writes than the relocated snapshot; keeping it \
+             intact and leaving the cleanup marker for a later manual reclaim"
+        );
+        return;
+    }
+    for entry in DATA_ENTRIES.iter().chain(extra) {
         let path = old.join(entry);
         if let Err(e) = remove_if_exists(&path) {
             tracing::warn!(path = %path.display(), error = %e, "old-dir cleanup entry failed");
@@ -136,6 +148,21 @@ pub fn run_boot_cleanup(anchor: &Path, active_data_dir: &Path) {
     loc.cleanup = None;
     if let Err(e) = write_location(anchor, &loc) {
         tracing::warn!(error = %e, "failed to clear cleanup marker after boot cleanup");
+    }
+}
+
+/// True when `old/lens.db` has a strictly later mtime than `active/lens.db` — the
+/// signal that the old dir received writes after the relocation snapshot. On any
+/// stat ambiguity returns `true` (refuse to delete) — the safe default for a
+/// data-loss guard.
+fn old_dir_is_newer(old: &Path, active: &Path) -> bool {
+    let mtime = |dir: &Path| std::fs::metadata(dir.join("lens.db")).and_then(|m| m.modified());
+    match (mtime(old), mtime(active)) {
+        (Ok(old_t), Ok(active_t)) => old_t > active_t,
+        // Old DB missing → nothing worth keeping. Active DB missing/unreadable →
+        // ambiguous, so keep the old dir rather than risk deleting live data.
+        (Err(_), _) => false,
+        (Ok(_), Err(_)) => true,
     }
 }
 
@@ -224,10 +251,11 @@ async fn snapshot_db(pool: &SqlitePool, dest: &Path) -> Result<(), LensError> {
 }
 
 async fn source_count(pool: &SqlitePool) -> Result<i64, LensError> {
-    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sources")
+    // `?` routes any sqlx error through the opaque `From<sqlx::Error>` so no DB
+    // internals cross the IPC boundary.
+    Ok(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sources")
         .fetch_one(pool)
-        .await
-        .map_err(|e| LensError::Io(format!("count query failed: {e}")))
+        .await?)
 }
 
 /// Prefix-rewrites the two DB columns that store absolute paths under the data dir
@@ -240,8 +268,7 @@ async fn rewrite_paths(
 ) -> Result<(), LensError> {
     let sources = sqlx::query_as::<_, (String, String)>("SELECT id, locator FROM sources")
         .fetch_all(pool)
-        .await
-        .map_err(|e| LensError::Io(format!("read sources failed: {e}")))?;
+        .await?;
     for (id, locator) in sources {
         if let Some(rest) = locator.strip_prefix(old_prefix) {
             let updated = format!("{new_prefix}{rest}");
@@ -249,16 +276,14 @@ async fn rewrite_paths(
                 .bind(&updated)
                 .bind(&id)
                 .execute(pool)
-                .await
-                .map_err(|e| LensError::Io(format!("rewrite locator failed: {e}")))?;
+                .await?;
         }
     }
 
     let overviews =
         sqlx::query_as::<_, (String, String)>("SELECT notebook_id, path FROM audio_overviews")
             .fetch_all(pool)
-            .await
-            .map_err(|e| LensError::Io(format!("read audio overviews failed: {e}")))?;
+            .await?;
     for (notebook_id, path) in overviews {
         if let Some(rest) = path.strip_prefix(old_prefix) {
             let updated = format!("{new_prefix}{rest}");
@@ -266,56 +291,102 @@ async fn rewrite_paths(
                 .bind(&updated)
                 .bind(&notebook_id)
                 .execute(pool)
-                .await
-                .map_err(|e| LensError::Io(format!("rewrite audio path failed: {e}")))?;
+                .await?;
         }
     }
     Ok(())
 }
 
-/// Copies the data dir `from` → `to`, verifies the snapshot, and rewrites the
-/// absolute-path DB columns in the copy. On success the caller writes the anchor
-/// pointer (with `cleanup = from`) and prompts a restart; the live pool is never
-/// touched. Runs behind the engine `ingest_lock` at the call site.
-pub async fn relocate_data_dir(pool: &SqlitePool, from: &Path, to: &Path) -> Result<(), LensError> {
-    validate_target(from, to)?;
-    let old_prefix = from
+/// A path as a prefix string with any trailing separator stripped, so joining
+/// `strip_prefix` remainders (which start with a separator) never yields `//`.
+fn prefix_of(path: &Path) -> Result<String, LensError> {
+    let s = path
         .to_str()
-        .ok_or_else(|| LensError::Validation("current data path is not valid UTF-8".into()))?
-        .to_string();
-    let new_prefix = to
-        .to_str()
-        .ok_or_else(|| LensError::Validation("the new location path is not valid UTF-8".into()))?
-        .to_string();
+        .ok_or_else(|| LensError::Validation("a data path is not valid UTF-8".into()))?;
+    Ok(s.strip_suffix(std::path::MAIN_SEPARATOR)
+        .unwrap_or(s)
+        .to_string())
+}
 
+/// Copies the data dir `from` → `to`, verifies the snapshot, and rewrites the
+/// absolute-path DB columns in the copy. `extra_skip` names regenerable top-level
+/// dirs the caller wants re-provisioned at the destination rather than copied (e.g.
+/// the Qwen sidecar venv). On ANY failure the partial target is removed so a retry
+/// into the same folder is not blocked and no private residue is left behind. On
+/// success the caller writes the anchor pointer (with `cleanup = from`) and prompts a
+/// restart; the live pool is never touched. Runs behind the engine `ingest_lock`.
+pub async fn relocate_data_dir(
+    pool: &SqlitePool,
+    from: &Path,
+    to: &Path,
+    extra_skip: &[&str],
+) -> Result<(), LensError> {
+    validate_target(from, to)?;
+    let old_prefix = prefix_of(from)?;
+    let new_prefix = prefix_of(to)?;
     let expected_sources = source_count(pool).await?;
 
     std::fs::create_dir_all(to)
         .map_err(|e| LensError::Io(format!("failed to create the new location: {e}")))?;
-    snapshot_db(pool, &to.join("lens.db")).await?;
-    copy_tree(from, to, COPY_SKIP)?;
 
-    // Verify + rewrite against the copied DB via its own pool; drop it before
-    // returning so no stray connection holds the new file open.
-    let new_pool = crate::db::open_pool(to).await?;
-    let copied_sources = source_count(&new_pool).await?;
-    if copied_sources != expected_sources {
-        new_pool.close().await;
+    // Any failure after the target dir exists must leave nothing behind (partial
+    // corpus + a copied config.json holding a plaintext api_key would otherwise
+    // strand in a user folder and block retry).
+    let result = relocate_into(
+        pool,
+        from,
+        to,
+        &old_prefix,
+        &new_prefix,
+        expected_sources,
+        extra_skip,
+    )
+    .await;
+    if result.is_err() {
         let _ = remove_if_exists(to);
-        return Err(LensError::Io(
-            "the copied database did not verify; the move was cancelled".into(),
-        ));
     }
-    rewrite_paths(&new_pool, &old_prefix, &new_prefix).await?;
-    new_pool.close().await;
-    Ok(())
+    result
 }
 
-/// Moves the model cache (`models/` + `hf-cache/`) from `from_root` to `to_root`,
-/// returning the bytes moved. Copy-verify-then-delete so an interrupted move leaves
-/// the (regenerable) originals intact. The caller updates `config.paths.cache_dir`
-/// and persists. Runs behind the engine `ingest_lock`.
-pub fn offload_cache(from_root: &Path, to_root: &Path) -> Result<u64, LensError> {
+async fn relocate_into(
+    pool: &SqlitePool,
+    from: &Path,
+    to: &Path,
+    old_prefix: &str,
+    new_prefix: &str,
+    expected_sources: i64,
+    extra_skip: &[&str],
+) -> Result<(), LensError> {
+    snapshot_db(pool, &to.join("lens.db")).await?;
+    let skip: Vec<&str> = COPY_SKIP
+        .iter()
+        .copied()
+        .chain(extra_skip.iter().copied())
+        .collect();
+    copy_tree(from, to, &skip)?;
+
+    // Verify + rewrite against the copied DB via its own pool; close it on every
+    // path so no stray connection holds the new file open.
+    let new_pool = crate::db::open_pool(to).await?;
+    let verified = async {
+        if source_count(&new_pool).await? != expected_sources {
+            return Err(LensError::Io(
+                "the copied database did not verify; the move was cancelled".into(),
+            ));
+        }
+        rewrite_paths(&new_pool, old_prefix, new_prefix).await
+    }
+    .await;
+    new_pool.close().await;
+    verified
+}
+
+/// Copies the model cache (`models/` + `hf-cache/`) from `from_root` to `to_root`
+/// WITHOUT deleting the originals, returning the bytes copied. The caller persists
+/// `config.paths.cache_dir` and only then calls [`remove_cache`] on the old root, so
+/// a persist failure never strands the cache moved-but-unreferenced. Runs behind the
+/// engine `ingest_lock`.
+pub fn copy_cache(from_root: &Path, to_root: &Path) -> Result<u64, LensError> {
     if to_root == from_root {
         return Err(LensError::Validation(
             "the new cache location is the same as the current one".into(),
@@ -326,18 +397,31 @@ pub fn offload_cache(from_root: &Path, to_root: &Path) -> Result<u64, LensError>
             "the cache location and data folder cannot be nested".into(),
         ));
     }
-    let mut moved = 0u64;
-    for entry in ["models", "hf-cache"] {
+    let mut copied = 0u64;
+    for entry in CACHE_ENTRIES {
         let src = from_root.join(entry);
         if !src.exists() {
             continue;
         }
         let dst = to_root.join(entry);
+        if dst.exists() {
+            return Err(LensError::Validation(
+                "the new cache location already contains a model cache".into(),
+            ));
+        }
         copy_tree(&src, &dst, &[])?;
-        moved = moved.saturating_add(crate::storage::dir_size_bytes(&dst)?);
-        remove_if_exists(&src)?;
+        copied = copied.saturating_add(crate::storage::path_size_bytes(&dst)?);
     }
-    Ok(moved)
+    Ok(copied)
+}
+
+/// Removes the model-cache dirs under `root` (the old cache root after a successful
+/// offload, or the offload target when resetting). Best-effort per entry.
+pub fn remove_cache(root: &Path) -> Result<(), LensError> {
+    for entry in CACHE_ENTRIES {
+        remove_if_exists(&root.join(entry))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -396,12 +480,25 @@ mod tests {
         assert!(validate_target(from.path(), to.path()).is_err());
     }
 
+    /// Writes `db` seed and stamps its mtime to `UNIX_EPOCH + secs` so the C1
+    /// old-vs-active freshness guard is deterministic (no sleeps).
+    fn seed_db_at(dir: &Path, secs: u64) {
+        std::fs::write(dir.join("lens.db"), b"db").expect("seed db");
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("lens.db"))
+            .expect("open db");
+        f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+            .expect("set mtime");
+    }
+
     #[test]
     fn boot_cleanup_removes_old_data_but_keeps_pointer_and_dir() {
         let anchor = tempfile::tempdir().expect("anchor");
         let old = tempfile::tempdir().expect("old");
         let active = tempfile::tempdir().expect("active");
-        std::fs::write(old.path().join("lens.db"), b"db").expect("seed");
+        seed_db_at(old.path(), 100);
+        seed_db_at(active.path(), 200); // active snapshot newer → old safe to delete
         std::fs::create_dir_all(old.path().join("sources")).expect("seed");
         write_location(
             anchor.path(),
@@ -412,13 +509,61 @@ mod tests {
         )
         .expect("write");
 
-        run_boot_cleanup(anchor.path(), active.path());
+        run_boot_cleanup(anchor.path(), active.path(), &[]);
 
         assert!(!old.path().join("lens.db").exists());
         assert!(!old.path().join("sources").exists());
         assert!(old.path().exists(), "old dir itself preserved");
         let loc = read_location(anchor.path()).expect("pointer survives");
         assert_eq!(loc.cleanup, None, "cleanup marker cleared");
+    }
+
+    #[test]
+    fn boot_cleanup_removes_extra_regenerable_dirs() {
+        let anchor = tempfile::tempdir().expect("anchor");
+        let old = tempfile::tempdir().expect("old");
+        let active = tempfile::tempdir().expect("active");
+        seed_db_at(old.path(), 100);
+        seed_db_at(active.path(), 200);
+        std::fs::create_dir_all(old.path().join("qwen-venv")).expect("venv");
+        write_location(
+            anchor.path(),
+            &DataLocation {
+                data_dir: active.path().display().to_string(),
+                cleanup: Some(old.path().display().to_string()),
+            },
+        )
+        .expect("write");
+
+        run_boot_cleanup(anchor.path(), active.path(), &["qwen-venv"]);
+        assert!(!old.path().join("qwen-venv").exists(), "extra dir cleaned");
+    }
+
+    #[test]
+    fn boot_cleanup_refuses_when_old_dir_newer() {
+        let anchor = tempfile::tempdir().expect("anchor");
+        let old = tempfile::tempdir().expect("old");
+        let active = tempfile::tempdir().expect("active");
+        // Old dir has newer writes than the relocated snapshot → data-loss guard.
+        seed_db_at(old.path(), 200);
+        seed_db_at(active.path(), 100);
+        write_location(
+            anchor.path(),
+            &DataLocation {
+                data_dir: active.path().display().to_string(),
+                cleanup: Some(old.path().display().to_string()),
+            },
+        )
+        .expect("write");
+
+        run_boot_cleanup(anchor.path(), active.path(), &[]);
+        assert!(old.path().join("lens.db").exists(), "newer old data kept");
+        let loc = read_location(anchor.path()).expect("pointer survives");
+        assert_eq!(
+            loc.cleanup,
+            Some(old.path().display().to_string()),
+            "cleanup marker retained for manual reclaim"
+        );
     }
 
     #[test]
@@ -435,7 +580,7 @@ mod tests {
         )
         .expect("write");
 
-        run_boot_cleanup(anchor.path(), active.path());
+        run_boot_cleanup(anchor.path(), active.path(), &[]);
         assert!(
             active.path().join("lens.db").exists(),
             "active data untouched"
@@ -476,7 +621,7 @@ mod tests {
         std::fs::create_dir_all(from.path().join("sources")).expect("sources dir");
         std::fs::write(from.path().join("sources").join("a.pdf"), b"pdf").expect("file");
 
-        relocate_data_dir(&pool, from.path(), &to)
+        relocate_data_dir(&pool, from.path(), &to, &[])
             .await
             .expect("relocate");
 
@@ -512,7 +657,7 @@ mod tests {
     }
 
     #[test]
-    fn offload_moves_models_and_hf_cache() {
+    fn copy_cache_then_remove_moves_models_and_hf_cache() {
         let data = tempfile::tempdir().expect("data");
         let cache_parent = tempfile::tempdir().expect("cache_parent");
         let cache = cache_parent.path().join("offloaded");
@@ -525,14 +670,32 @@ mod tests {
         std::fs::create_dir_all(data.path().join("hf-cache")).expect("hf");
         std::fs::write(data.path().join("hf-cache").join("s.bin"), [0u8; 50]).expect("s");
 
-        let moved = offload_cache(data.path(), &cache).expect("offload");
-        assert_eq!(moved, 150);
+        // copy_cache leaves the originals intact (caller persists config first).
+        let copied = copy_cache(data.path(), &cache).expect("copy");
+        assert_eq!(copied, 150);
+        assert!(
+            data.path().join("models").exists(),
+            "originals kept until persist"
+        );
+        assert!(cache.join("models").join("whisper").join("g.bin").exists());
+        assert!(cache.join("hf-cache").join("s.bin").exists());
+
+        // remove_cache clears the old root after the config write.
+        remove_cache(data.path()).expect("remove");
         assert!(!data.path().join("models").exists(), "old models removed");
         assert!(
             !data.path().join("hf-cache").exists(),
             "old hf-cache removed"
         );
-        assert!(cache.join("models").join("whisper").join("g.bin").exists());
-        assert!(cache.join("hf-cache").join("s.bin").exists());
+    }
+
+    #[test]
+    fn copy_cache_refuses_when_target_already_has_cache() {
+        let data = tempfile::tempdir().expect("data");
+        let cache_parent = tempfile::tempdir().expect("cache_parent");
+        let cache = cache_parent.path().join("offloaded");
+        std::fs::create_dir_all(data.path().join("models")).expect("m");
+        std::fs::create_dir_all(cache.join("models")).expect("pre-existing");
+        assert!(copy_cache(data.path(), &cache).is_err());
     }
 }

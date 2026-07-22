@@ -154,16 +154,21 @@ describe('StorageSection', () => {
     await waitFor(() => expect(revealItemInDir).toHaveBeenCalledWith(DATA_DIR));
   });
 
-  it('moves the data folder via relocate_data_dir and offers a restart', async () => {
+  it('moves the data folder and forces a mandatory restart (no "Later")', async () => {
     const { open } = await import('@tauri-apps/plugin-dialog');
     vi.mocked(open).mockResolvedValue('/Volumes/External/LensLM');
 
     let relocateArgs: unknown;
+    let restartCalled = false;
     mockIPC((cmd, args) => {
       if (cmd === 'get_config') return config();
       if (cmd === 'get_storage_stats') return stats(0);
       if (cmd === 'relocate_data_dir') {
         relocateArgs = args;
+        return undefined;
+      }
+      if (cmd === 'restart_app') {
+        restartCalled = true;
         return undefined;
       }
     });
@@ -178,7 +183,12 @@ describe('StorageSection', () => {
     await fireEvent.click(confirmButton);
 
     await waitFor(() => expect(relocateArgs).toEqual({ new_path: '/Volumes/External/LensLM' }));
-    await screen.findByRole('button', { name: /^restart now$/i });
+    const restartButton = await screen.findByRole('button', { name: /^restart now$/i });
+    // The relocate restart is mandatory — no dismiss/"Later" affordance.
+    expect(screen.queryByRole('button', { name: /^later$/i })).not.toBeInTheDocument();
+
+    await fireEvent.click(restartButton);
+    await waitFor(() => expect(restartCalled).toBe(true));
   });
 
   it('surfaces an error inline when relocate_data_dir fails', async () => {
@@ -201,7 +211,7 @@ describe('StorageSection', () => {
     await waitFor(() => expect(screen.getByRole('alert')).toBeInTheDocument());
   });
 
-  it('moves the model cache location and calls offload_cache', async () => {
+  it('moves the model cache, calls offload_cache, and offers an optional restart', async () => {
     const { open } = await import('@tauri-apps/plugin-dialog');
     vi.mocked(open).mockResolvedValue('/Volumes/External/models');
 
@@ -222,6 +232,35 @@ describe('StorageSection', () => {
 
     await waitFor(() => expect(offloadArgs).toEqual({ new_path: '/Volumes/External/models' }));
     await waitFor(() => expect(screen.getByText('/Volumes/External/models')).toBeInTheDocument());
+    // Offload's restart is optional — both actions are offered.
+    await screen.findByRole('button', { name: /^restart now$/i });
+    expect(screen.getByRole('button', { name: /^later$/i })).toBeInTheDocument();
+  });
+
+  it('keeps the offload result when the post-move stats refetch fails', async () => {
+    const { open } = await import('@tauri-apps/plugin-dialog');
+    vi.mocked(open).mockResolvedValue('/Volumes/External/models');
+
+    let statsCallCount = 0;
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return config();
+      if (cmd === 'get_storage_stats') {
+        statsCallCount += 1;
+        if (statsCallCount > 1) throw new Error('stats unavailable');
+        return stats(0);
+      }
+      if (cmd === 'offload_cache') return 900_000_000;
+    });
+
+    render(StorageSection);
+    await waitFor(() => expect(screen.getByText('Default (with your data)')).toBeInTheDocument());
+
+    await fireEvent.click(screen.getByRole('button', { name: /move cache/i }));
+
+    await waitFor(() => expect(screen.getByText('/Volumes/External/models')).toBeInTheDocument());
+    await waitFor(() => expect(statsCallCount).toBeGreaterThan(1));
+    // The refetch failure is swallowed — the successful move is not reported as an error.
+    expect(screen.queryByText(/could not move the model cache/i)).not.toBeInTheDocument();
   });
 
   it('shows reset-to-default when offloaded and calls reset_cache_location', async () => {

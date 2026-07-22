@@ -11,6 +11,22 @@ use tauri::ipc::Channel;
 #[cfg(debug_assertions)]
 use crate::stream::{StreamEvent, send_event};
 
+/// Top-level data-dir entries the Qwen sidecar re-provisions from scratch. A Python
+/// venv bakes absolute paths, so on a #238 relocation these are regenerated (not
+/// copied) and their stale copies are removed from the old dir. Empty off Apple Silicon.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) const REGENERABLE_DIRS: &[&str] = &["qwen-venv", "uv-cache", "bin"];
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+pub(crate) const REGENERABLE_DIRS: &[&str] = &[];
+
+/// Resolves the model-cache root from the engine's CURRENT (possibly relocated) data
+/// dir. The OS anchor stays fixed across a #238 relocation, so deriving cache paths
+/// from it would resolve to the stale pre-move dir.
+async fn resolved_cache_root(engine: &LensEngine) -> std::path::PathBuf {
+    let config = engine.config().await;
+    config.cache_root(&std::path::PathBuf::from(&config.paths.data_dir))
+}
+
 /// A recent document suggested for the onboarding "Add sources" step.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RecentDocument {
@@ -74,7 +90,7 @@ pub async fn relocate_data_dir(
     new_path: String,
 ) -> Result<(), LensError> {
     let to = std::path::PathBuf::from(&new_path);
-    let from = engine.relocate_data_dir(&to).await?;
+    let from = engine.relocate_data_dir(&to, REGENERABLE_DIRS).await?;
     let anchor = app
         .path()
         .app_data_dir()
@@ -200,14 +216,9 @@ fn sanitize_url_for_log(raw: &str) -> String {
 #[tauri::command]
 pub async fn list_tts_voices(
     engine: tauri::State<'_, LensEngine>,
-    app: tauri::AppHandle,
 ) -> Result<Vec<TtsVoice>, LensError> {
-    let data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| LensError::Io(e.to_string()))?;
+    let cache_root = resolved_cache_root(&engine).await;
     let config = engine.config().await;
-    let cache_root = config.cache_root(&data_dir);
     Ok(resolve_voices(&config.tts, &cache_root))
 }
 
@@ -271,14 +282,9 @@ pub async fn download_tts_model(
     engine: String,
     model: String,
     on_progress: Channel<DownloadProgress>,
-    app: tauri::AppHandle,
     lens_engine: tauri::State<'_, LensEngine>,
 ) -> Result<(), LensError> {
-    let data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| LensError::Io(e.to_string()))?;
-    let cache_root = lens_engine.config().await.cache_root(&data_dir);
+    let cache_root = resolved_cache_root(&lens_engine).await;
     lens_core::download_tts_model(&cache_root, &model, |progress| {
         if let Err(e) = on_progress.send(progress) {
             tracing::warn!("download_tts_model: progress channel send failed: {e}");
@@ -306,7 +312,7 @@ pub enum TtsModelStatus {
 pub async fn tts_model_status(
     engine: String,
     model: String,
-    app: tauri::AppHandle,
+    #[allow(unused_variables)] app: tauri::AppHandle,
     lens_engine: tauri::State<'_, LensEngine>,
 ) -> Result<TtsModelStatus, LensError> {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -323,11 +329,7 @@ pub async fn tts_model_status(
             TtsModelStatus::Absent
         });
     }
-    let data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| LensError::Io(e.to_string()))?;
-    let cache_root = lens_engine.config().await.cache_root(&data_dir);
+    let cache_root = resolved_cache_root(&lens_engine).await;
     Ok(if lens_core::tts_model_downloaded(&cache_root, &model) {
         TtsModelStatus::Complete
     } else if lens_core::tts_model_file_present(&cache_root, &model) {
@@ -412,14 +414,9 @@ pub async fn list_whisper_models() -> Result<Vec<WhisperModelInfo>, LensError> {
 pub async fn download_whisper_model(
     model: String,
     on_progress: Channel<DownloadProgress>,
-    app: tauri::AppHandle,
     engine: tauri::State<'_, LensEngine>,
 ) -> Result<(), LensError> {
-    let data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| LensError::Io(e.to_string()))?;
-    let cache_root = engine.config().await.cache_root(&data_dir);
+    let cache_root = resolved_cache_root(&engine).await;
     lens_core::download_whisper_model(&cache_root, &model, |progress| {
         if let Err(e) = on_progress.send(progress) {
             tracing::warn!("download_whisper_model: progress channel send failed: {e}");
@@ -435,14 +432,9 @@ pub async fn download_whisper_model(
 #[tauri::command(rename_all = "snake_case")]
 pub async fn whisper_model_downloaded(
     model: String,
-    app: tauri::AppHandle,
     engine: tauri::State<'_, LensEngine>,
 ) -> Result<bool, LensError> {
-    let data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| LensError::Io(e.to_string()))?;
-    let cache_root = engine.config().await.cache_root(&data_dir);
+    let cache_root = resolved_cache_root(&engine).await;
     Ok(lens_core::whisper_model_downloaded(&cache_root, &model))
 }
 
@@ -493,14 +485,9 @@ pub fn macos_major_version() -> Result<u32, LensError> {
 #[tracing::instrument(skip_all)]
 #[tauri::command]
 pub async fn fastembed_models_cached(
-    app: tauri::AppHandle,
     engine: tauri::State<'_, LensEngine>,
 ) -> Result<Vec<String>, LensError> {
-    let data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| LensError::Io(e.to_string()))?;
-    let cache_root = engine.config().await.cache_root(&data_dir);
+    let cache_root = resolved_cache_root(&engine).await;
     Ok(fastembed_cached_ids(&cache_root))
 }
 

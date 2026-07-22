@@ -96,7 +96,11 @@ fn main() {
             let anchor = app.path().app_data_dir()?;
             let data_dir = lens_core::relocate::resolve_data_dir(&anchor);
             let engine = tauri::async_runtime::block_on(LensEngine::init(&data_dir))?;
-            lens_core::relocate::run_boot_cleanup(&anchor, &data_dir);
+            lens_core::relocate::run_boot_cleanup(
+                &anchor,
+                &data_dir,
+                commands::system::REGENERABLE_DIRS,
+            );
             app.manage(engine);
 
             // Inject the offscreen-webview JS renderer (issue #78, Layer f) so
