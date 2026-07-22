@@ -1,15 +1,20 @@
 <!--
   StorageSection — the "Storage" panel inside the global Preferences view.
-  Read-only data-dir + usage figures via `get_storage_stats`, plus `clear_model_cache`.
+  Data location + relocation (`relocate_data_dir` / `restart_app`), the per-bucket
+  usage breakdown, model-cache offload (`offload_cache` / `reset_cache_location`),
+  a soft cache quota, and reclaiming the cache via `clear_model_cache` (#238).
 -->
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
   import { invoke, isTauri } from '@tauri-apps/api/core';
+  import { open } from '@tauri-apps/plugin-dialog';
   import { revealItemInDir } from '@tauri-apps/plugin-opener';
   import { writeText } from '@tauri-apps/plugin-clipboard-manager';
   import { audioOverviewStore } from '$lib/sources/audio-state.svelte.js';
   import { formatBytes } from '$lib/format/bytes.js';
+  import { updateConfig } from '$lib/config.js';
   import { Button } from '$lib/components/ui/button/index.js';
+  import { Input } from '$lib/components/ui/input/index.js';
   import {
     Dialog,
     DialogContent,
@@ -19,9 +24,14 @@
     DialogFooter
   } from '$lib/components/ui/dialog/index.js';
   import FolderOpen from '@lucide/svelte/icons/folder-open';
+  import FolderInput from '@lucide/svelte/icons/folder-input';
+  import HardDriveDownload from '@lucide/svelte/icons/hard-drive-download';
   import Copy from '@lucide/svelte/icons/copy';
   import TriangleAlert from '@lucide/svelte/icons/triangle-alert';
+  import LoaderCircle from '@lucide/svelte/icons/loader-circle';
   import type { AppConfig, StorageStats } from '$lib/theme/types.js';
+
+  const GB = 1_000_000_000;
 
   let dataDir = $state('');
   let stats = $state<StorageStats | null>(null);
@@ -32,7 +42,48 @@
   let clearError = $state<string | null>(null);
   let confirmOpen = $state(false);
 
+  let relocating = $state(false);
+  let relocateError = $state<string | null>(null);
+  let moveConfirmOpen = $state(false);
+  let restartDialogOpen = $state(false);
+  let pendingNewDataPath = $state('');
+
+  let cacheDir = $state<string | null>(null);
+  let offloading = $state(false);
+  let resetting = $state(false);
+  let offloadError = $state<string | null>(null);
+  let offloadedBytes = $state<number | null>(null);
+
+  // A native <input type="number"> binds `value` as number|null (Svelte coerces
+  // an empty field to null), not a string — mirror that here.
+  let quotaGbInput = $state<number | null>(null);
+  let quotaBytes = $state<number | null>(null);
+  let quotaError = $state<string | null>(null);
+
   let copiedTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const corpusBreakdown = $derived(
+    stats
+      ? [
+          { label: 'Database', value: stats.db_bytes },
+          { label: 'Vectors', value: stats.vectors_bytes },
+          { label: 'Sources', value: stats.sources_bytes },
+          { label: 'Audio', value: stats.audio_bytes }
+        ]
+      : []
+  );
+
+  // Advisory only — nothing auto-deletes when the cache grows past this.
+  const overQuota = $derived(
+    quotaBytes != null && quotaBytes > 0 && (stats?.reclaimable_cache_bytes ?? 0) > quotaBytes
+  );
+
+  const generating = $derived(audioOverviewStore.overviewStatus === 'generating');
+
+  function bucketPct(value: number): number {
+    const total = stats?.corpus_bytes ?? 0;
+    return total > 0 ? Math.min(100, (value / total) * 100) : 0;
+  }
 
   async function loadStats(): Promise<void> {
     stats = await invoke<StorageStats>('get_storage_stats');
@@ -43,6 +94,9 @@
     try {
       const cfg = await invoke<AppConfig>('get_config');
       dataDir = cfg.paths.data_dir;
+      cacheDir = cfg.paths.cache_dir ?? null;
+      quotaBytes = cfg.storage?.cache_quota_bytes ?? null;
+      quotaGbInput = quotaBytes != null ? quotaBytes / GB : null;
       await loadStats();
     } catch (err) {
       loadError = err instanceof Error ? err.message : 'Could not load storage information.';
@@ -93,6 +147,101 @@
     }
   }
 
+  async function pickFolder(title: string): Promise<string | null> {
+    try {
+      return await open({ directory: true, multiple: false, title });
+    } catch {
+      return null;
+    }
+  }
+
+  async function handleMoveDataClick(): Promise<void> {
+    relocateError = null;
+    const dir = await pickFolder('Choose a new data location');
+    if (!dir) return;
+    pendingNewDataPath = dir;
+    moveConfirmOpen = true;
+  }
+
+  async function handleMoveConfirmed(): Promise<void> {
+    relocating = true;
+    relocateError = null;
+    try {
+      await invoke<void>('relocate_data_dir', { new_path: pendingNewDataPath });
+      moveConfirmOpen = false;
+      restartDialogOpen = true;
+    } catch (err) {
+      relocateError = err instanceof Error ? err.message : 'Could not move the data folder.';
+    } finally {
+      relocating = false;
+    }
+  }
+
+  async function handleRestartNow(): Promise<void> {
+    try {
+      // AppHandle::restart diverges (the process relaunches) — a resolved promise
+      // here only ever means the restart itself failed to kick off.
+      await invoke<void>('restart_app');
+    } catch (err) {
+      relocateError = err instanceof Error ? err.message : 'Could not restart the app.';
+    }
+  }
+
+  async function handleMoveCacheClick(): Promise<void> {
+    offloadError = null;
+    const dir = await pickFolder('Choose a new model cache location');
+    if (!dir) return;
+    offloading = true;
+    offloadedBytes = null;
+    try {
+      const moved = await invoke<number>('offload_cache', { new_path: dir });
+      cacheDir = dir;
+      offloadedBytes = moved;
+      await loadStats();
+    } catch (err) {
+      offloadError = err instanceof Error ? err.message : 'Could not move the model cache.';
+    } finally {
+      offloading = false;
+    }
+  }
+
+  async function handleResetCacheLocation(): Promise<void> {
+    offloadError = null;
+    resetting = true;
+    try {
+      const moved = await invoke<number>('reset_cache_location');
+      cacheDir = null;
+      offloadedBytes = moved;
+      await loadStats();
+    } catch (err) {
+      offloadError = err instanceof Error ? err.message : 'Could not reset the cache location.';
+    } finally {
+      resetting = false;
+    }
+  }
+
+  function quotaGbToBytes(gb: number | null): number | null {
+    return gb != null && Number.isFinite(gb) && gb > 0 ? Math.round(gb * GB) : null;
+  }
+
+  async function handleQuotaBlur(): Promise<void> {
+    const next = quotaGbToBytes(quotaGbInput);
+    if (next === quotaBytes) return;
+    quotaError = null;
+    const previous = quotaBytes;
+    quotaBytes = next;
+    try {
+      await updateConfig((cfg) => ({
+        ...cfg,
+        storage: { ...cfg.storage, cache_quota_bytes: next }
+      }));
+    } catch (err) {
+      quotaError = err instanceof Error ? err.message : 'Could not save the cache limit.';
+      quotaBytes = previous;
+      quotaGbInput = previous != null ? previous / GB : null;
+    }
+  }
+
   onDestroy(() => {
     if (copiedTimer) clearTimeout(copiedTimer);
   });
@@ -139,10 +288,33 @@
           <Copy class="size-3.5" />
           {copied ? 'Copied' : 'Copy path'}
         </Button>
+        <Button
+          variant="outline"
+          size="sm"
+          onclick={handleMoveDataClick}
+          disabled={!dataDir || relocating || generating}
+          aria-label="Move data folder"
+        >
+          {#if relocating}
+            <LoaderCircle class="size-3.5 animate-spin" />
+            Moving…
+          {:else}
+            <FolderInput class="size-3.5" />
+            Move…
+          {/if}
+        </Button>
       </div>
     </div>
     {#if revealError}
       <p class="mt-2 text-[0.72rem] text-destructive" role="alert">{revealError}</p>
+    {/if}
+    {#if generating}
+      <p class="mt-2 text-[0.72rem] text-muted-foreground">
+        Unavailable while an audio overview is generating.
+      </p>
+    {/if}
+    {#if relocateError}
+      <p class="mt-2 text-[0.72rem] text-destructive" role="alert">{relocateError}</p>
     {/if}
   </div>
 
@@ -152,6 +324,42 @@
     </p>
 
     <div class="mt-3 flex flex-col gap-2">
+      <div class="rounded-[10px] border border-border bg-card">
+        <div class="flex items-center justify-between gap-4 px-4 py-3.5">
+          <span class="min-w-0 flex-1">
+            <span class="block text-[0.78rem] font-bold text-foreground">Notebook corpus</span>
+            <span class="mt-0.5 block text-[0.68rem] text-muted-foreground">
+              Your notebooks, sources, and generated audio.
+            </span>
+          </span>
+          <span class="shrink-0 text-[0.9rem] font-bold tabular-nums text-foreground">
+            {formatBytes(stats?.corpus_bytes ?? 0)}
+          </span>
+        </div>
+        {#if stats}
+          <div class="flex flex-col gap-1.5 border-t border-border/60 px-4 py-3">
+            {#each corpusBreakdown as bucket (bucket.label)}
+              <div class="flex items-center gap-3">
+                <span class="w-16 shrink-0 text-[0.68rem] text-muted-foreground">
+                  {bucket.label}
+                </span>
+                <span class="h-1 flex-1 overflow-hidden rounded-full bg-muted">
+                  <span
+                    class="block h-full rounded-full bg-primary/50"
+                    style="width: {bucketPct(bucket.value)}%"
+                  ></span>
+                </span>
+                <span
+                  class="w-16 shrink-0 text-right text-[0.72rem] font-semibold tabular-nums text-foreground/80"
+                >
+                  {formatBytes(bucket.value)}
+                </span>
+              </div>
+            {/each}
+          </div>
+        {/if}
+      </div>
+
       <div
         class="flex items-center justify-between gap-4 rounded-[10px] border border-border bg-card px-4 py-3.5"
       >
@@ -165,20 +373,6 @@
         </span>
         <span class="shrink-0 text-[0.9rem] font-bold tabular-nums text-foreground">
           {formatBytes(stats?.reclaimable_cache_bytes ?? 0)}
-        </span>
-      </div>
-
-      <div
-        class="flex items-center justify-between gap-4 rounded-[10px] border border-border bg-card px-4 py-3.5"
-      >
-        <span class="min-w-0 flex-1">
-          <span class="block text-[0.78rem] font-bold text-foreground">Notebook corpus</span>
-          <span class="mt-0.5 block text-[0.68rem] text-muted-foreground">
-            Your notebooks, sources, and generated audio.
-          </span>
-        </span>
-        <span class="shrink-0 text-[0.9rem] font-bold tabular-nums text-foreground">
-          {formatBytes(stats?.corpus_bytes ?? 0)}
         </span>
       </div>
 
@@ -208,19 +402,135 @@
       variant="destructive"
       class="mt-4 h-10 w-full"
       onclick={() => (confirmOpen = true)}
-      disabled={clearing || !stats || audioOverviewStore.overviewStatus === 'generating'}
+      disabled={clearing || !stats || generating}
     >
       {clearing ? 'Clearing…' : 'Clear reclaimable model cache'}
     </Button>
 
-    {#if audioOverviewStore.overviewStatus === 'generating'}
+    {#if clearError}
+      <p class="mt-2 text-[0.72rem] text-destructive" role="alert">{clearError}</p>
+    {/if}
+  </div>
+
+  <div class="mt-6">
+    <p class="text-[0.65rem] font-bold uppercase tracking-[0.08em] text-muted-foreground/70">
+      Model cache location
+    </p>
+
+    <div
+      class="mt-3 flex items-center justify-between gap-4 rounded-[10px] border border-border bg-card px-4 py-3.5"
+    >
+      <span class="min-w-0 flex-1">
+        <span class="block text-[0.78rem] font-bold text-foreground">Downloaded model cache</span>
+        <span
+          class="mt-0.5 block truncate text-[0.68rem] text-muted-foreground"
+          title={cacheDir ?? undefined}
+        >
+          {cacheDir || 'Default (with your data)'}
+        </span>
+      </span>
+      <div class="flex shrink-0 items-center gap-2">
+        {#if cacheDir}
+          <Button
+            variant="outline"
+            size="sm"
+            onclick={handleResetCacheLocation}
+            disabled={offloading || resetting || generating}
+          >
+            {resetting ? 'Resetting…' : 'Reset to default'}
+          </Button>
+        {/if}
+        <Button
+          variant="outline"
+          size="sm"
+          onclick={handleMoveCacheClick}
+          disabled={offloading || resetting || generating}
+        >
+          {#if offloading}
+            <LoaderCircle class="size-3.5 animate-spin" />
+            Moving…
+          {:else}
+            <HardDriveDownload class="size-3.5" />
+            Move cache…
+          {/if}
+        </Button>
+      </div>
+    </div>
+    <p class="mt-2 text-[0.68rem] text-muted-foreground">
+      Text-to-speech voices use the new location after the next restart.
+    </p>
+    {#if offloadedBytes != null}
+      <p class="mt-2 text-[0.72rem] text-foreground" role="status">
+        Moved {formatBytes(offloadedBytes)}.
+      </p>
+    {/if}
+    {#if generating}
       <p class="mt-2 text-[0.72rem] text-muted-foreground">
         Unavailable while an audio overview is generating.
       </p>
     {/if}
+    {#if offloadError}
+      <p class="mt-2 text-[0.72rem] text-destructive" role="alert">{offloadError}</p>
+    {/if}
+  </div>
 
-    {#if clearError}
-      <p class="mt-2 text-[0.72rem] text-destructive" role="alert">{clearError}</p>
+  <div class="mt-6">
+    <p class="text-[0.65rem] font-bold uppercase tracking-[0.08em] text-muted-foreground/70">
+      Cache limit
+    </p>
+
+    <div
+      class="mt-3 flex items-center justify-between gap-4 rounded-[10px] border border-border bg-card px-4 py-3.5"
+    >
+      <span class="min-w-0 flex-1">
+        <span class="block text-[0.78rem] font-bold text-foreground">
+          Soft limit for the model cache
+        </span>
+        <span class="mt-0.5 block text-[0.68rem] text-muted-foreground">
+          Warns you when downloaded models grow past this size. Nothing is deleted automatically.
+          Leave empty for no limit.
+        </span>
+      </span>
+      <div class="flex shrink-0 items-center gap-1.5">
+        <Input
+          type="number"
+          step="0.5"
+          min="0"
+          inputmode="decimal"
+          class="h-8 w-20 text-right tabular-nums"
+          placeholder="No limit"
+          bind:value={quotaGbInput}
+          onblur={() => void handleQuotaBlur()}
+          aria-label="Model cache limit in gigabytes"
+        />
+        <span class="text-[0.72rem] text-muted-foreground">GB</span>
+      </div>
+    </div>
+
+    {#if quotaError}
+      <p class="mt-2 text-[0.72rem] text-destructive" role="alert">{quotaError}</p>
+    {/if}
+
+    {#if overQuota}
+      <div
+        class="mt-3 flex items-start gap-2.5 rounded-lg border border-amber-500/30 bg-amber-500/15 px-3 py-2.5"
+      >
+        <TriangleAlert class="mt-0.5 size-4 shrink-0 text-amber-500" />
+        <span class="min-w-0 flex-1 text-[0.78rem] leading-relaxed text-amber-500">
+          Model cache exceeds your limit ({formatBytes(stats?.reclaimable_cache_bytes ?? 0)} of {formatBytes(
+            quotaBytes ?? 0
+          )}).
+        </span>
+        <Button
+          variant="outline"
+          size="sm"
+          class="shrink-0 border-amber-500/40 text-amber-600 hover:bg-amber-500/10 dark:text-amber-400"
+          onclick={() => (confirmOpen = true)}
+          disabled={clearing || !stats || generating}
+        >
+          Reclaim now
+        </Button>
+      </div>
     {/if}
   </div>
 </section>
@@ -247,6 +557,49 @@
       >
         Clear cache
       </Button>
+    </DialogFooter>
+  </DialogContent>
+</Dialog>
+
+<Dialog bind:open={moveConfirmOpen}>
+  <DialogContent class="max-w-md">
+    <DialogHeader>
+      <DialogTitle class="flex items-center gap-2">
+        <TriangleAlert class="size-5 text-amber-500" />
+        Move your data folder?
+      </DialogTitle>
+      <DialogDescription class="leading-relaxed">
+        Lens will copy all notebooks, sources, and settings to {pendingNewDataPath} and verify the copy.
+        The app must restart to switch over — the old copy is cleaned up automatically after a successful
+        restart.
+      </DialogDescription>
+    </DialogHeader>
+    <DialogFooter>
+      <Button variant="outline" onclick={() => (moveConfirmOpen = false)} disabled={relocating}>
+        Cancel
+      </Button>
+      <Button
+        onclick={handleMoveConfirmed}
+        disabled={relocating}
+        aria-label="Confirm move data folder"
+      >
+        {relocating ? 'Moving…' : 'Move data'}
+      </Button>
+    </DialogFooter>
+  </DialogContent>
+</Dialog>
+
+<Dialog bind:open={restartDialogOpen}>
+  <DialogContent class="max-w-md">
+    <DialogHeader>
+      <DialogTitle>Data moved</DialogTitle>
+      <DialogDescription class="leading-relaxed">
+        Restart now to use the new location.
+      </DialogDescription>
+    </DialogHeader>
+    <DialogFooter>
+      <Button variant="outline" onclick={() => (restartDialogOpen = false)}>Later</Button>
+      <Button onclick={handleRestartNow} aria-label="Restart now">Restart now</Button>
     </DialogFooter>
   </DialogContent>
 </Dialog>

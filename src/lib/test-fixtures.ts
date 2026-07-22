@@ -14,6 +14,7 @@ export function baseAppConfig(overrides?: Partial<AppConfig>): AppConfig {
     tts: { version: 1, backend: 'orpheus', model: '', cloud: null },
     enrichment: { enabled: false, coref_strategy: 'llm_inline', cloud_consent: false },
     paths: { data_dir: '' },
+    storage: { cache_quota_bytes: null },
     tier_thresholds: { tier1_token_cap: 4000, tier2_token_cap: 16000 },
     onboarding_complete: false,
     embedding_model: '',
