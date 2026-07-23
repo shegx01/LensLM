@@ -368,24 +368,22 @@ pub async fn validate_enrichment_model(config: &AppConfig) -> ModelValidation {
         }
     };
 
-    let genai = provider
-        .as_any()
-        .downcast_ref::<crate::llm::GenaiProvider>();
-    match genai {
-        Some(g) if g.is_ollama() => {
-            let model = provider.model_id().to_string();
-            let installed = list_ollama_models(&ollama_base_url(config)).await;
-            if installed.iter().any(|m| m == &model) {
-                ModelValidation::Pass
-            } else {
-                ModelValidation::Invalid(format!(
-                    "LLM runtime detected, but {}",
-                    ollama_model_missing_reason(&model)
-                ))
-            }
+    // Trait-level capability, not a concrete-type downcast: a `RigProvider` (or any future
+    // backend) still gets the Ollama tags-membership check (#256 §0.1 #1). Non-Ollama providers
+    // fall to the live cloud probe, exactly as the downcast path did for every real provider.
+    if provider.is_ollama() {
+        let model = provider.model_id().to_string();
+        let installed = list_ollama_models(&ollama_base_url(config)).await;
+        if installed.iter().any(|m| m == &model) {
+            ModelValidation::Pass
+        } else {
+            ModelValidation::Invalid(format!(
+                "LLM runtime detected, but {}",
+                ollama_model_missing_reason(&model)
+            ))
         }
-        Some(_) => cloud_probe(provider.as_ref(), "Cloud enrichment model").await,
-        None => ModelValidation::Pass,
+    } else {
+        cloud_probe(provider.as_ref(), "Cloud enrichment model").await
     }
 }
 

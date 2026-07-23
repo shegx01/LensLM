@@ -596,12 +596,10 @@ async fn preflight_enrichment_provider(
         return PreflightOutcome::Proceed;
     };
 
-    // Only a local Ollama `GenaiProvider` gets a tags-membership check.
-    let is_ollama = provider
-        .as_any()
-        .downcast_ref::<crate::llm::GenaiProvider>()
-        .is_some_and(|p| p.is_ollama());
-    if !is_ollama {
+    // Trait-level capability, not a concrete-type downcast: any local-Ollama backend
+    // (genai or rig) gets the tags-membership check, so this #90 preflight cannot silently
+    // skip after a backend swap (#256 §0.1 #1).
+    if !provider.is_ollama() {
         return PreflightOutcome::Proceed;
     }
 
@@ -862,6 +860,60 @@ mod tests {
         let provider = provider_from_config(&config, false).expect("local provider");
         let outcome = preflight_enrichment_provider(Some(&provider), &server.uri()).await;
         assert!(matches!(outcome, PreflightOutcome::Proceed));
+    }
+
+    /// A non-`GenaiProvider` backend that reports `is_ollama() == true`, exactly as a
+    /// `RigProvider` does. The old `downcast_ref::<GenaiProvider>()` returned `None` for such a
+    /// type, so the #90 preflight silently skipped — invisible to every existing mock (which are
+    /// all non-Ollama). This is the regression #256 §0.1 #1 guards against.
+    struct MockOllamaProvider {
+        model: String,
+    }
+    #[async_trait::async_trait]
+    impl LlmProvider for MockOllamaProvider {
+        fn model_id(&self) -> &str {
+            &self.model
+        }
+        fn is_ollama(&self) -> bool {
+            true
+        }
+        async fn reachable(&self) -> bool {
+            true
+        }
+        async fn generate(
+            &self,
+            _req: &crate::llm::LlmRequest,
+        ) -> Result<crate::llm::LlmResponse, crate::LensError> {
+            Ok(crate::llm::LlmResponse {
+                text: "ok".to_string(),
+                tokens_used: 1,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_preflight_fires_for_non_genai_ollama_backend() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [{ "name": "some-other-model:latest" }]
+            })))
+            .mount(&server)
+            .await;
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockOllamaProvider {
+            model: "llama3.2:3b".to_string(),
+        });
+        let outcome = preflight_enrichment_provider(Some(&provider), &server.uri()).await;
+        match outcome {
+            PreflightOutcome::Fail(reason) => {
+                assert!(reason.contains("llama3.2:3b"), "got {reason}")
+            }
+            PreflightOutcome::Proceed => panic!(
+                "preflight must fire for a non-GenaiProvider Ollama backend — a downcast would have silently skipped it"
+            ),
+        }
     }
 
     #[tokio::test]

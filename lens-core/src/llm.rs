@@ -150,6 +150,15 @@ pub trait LlmProvider: Send + Sync {
         false
     }
 
+    /// Whether this provider targets a local Ollama runtime. The enrichment preflight
+    /// (#90) and the system check run Ollama's `/api/tags` model-installed check off this
+    /// capability instead of downcasting to a concrete provider type — so the check keeps
+    /// firing regardless of the backend (genai/rig). The default `false` is correct for
+    /// every cloud provider and for test mocks.
+    fn is_ollama(&self) -> bool {
+        false
+    }
+
     /// Reachability probe. `false` on connection refusal, DNS/timeout, or auth errors
     /// (`401`/`403`) — a misconfigured key is unreachable so sources degrade gracefully.
     async fn reachable(&self) -> bool;
@@ -324,12 +333,6 @@ impl GenaiProvider {
         self.client.clone()
     }
 
-    /// Whether the resolved adapter is local Ollama, without leaking [`AdapterKind`] into the
-    /// public API. Used by the enrichment-model preflight (issue #90).
-    pub fn is_ollama(&self) -> bool {
-        matches!(self.resolved.adapter, AdapterKind::Ollama)
-    }
-
     fn map_request(req: &LlmRequest) -> (ChatRequest, ChatOptions) {
         let mut chat = ChatRequest::default();
         if let Some(system) = &req.system {
@@ -407,6 +410,10 @@ impl LlmProvider for GenaiProvider {
         self.is_ollama()
     }
 
+    fn is_ollama(&self) -> bool {
+        matches!(self.resolved.adapter, AdapterKind::Ollama)
+    }
+
     async fn reachable(&self) -> bool {
         // Local Ollama: free unauthenticated GET to /api/version (no token cost).
         // Cloud: treat "key configured or keyless native endpoint" as reachable without any
@@ -465,6 +472,261 @@ impl LlmProvider for GenaiProvider {
             }
         });
         Ok(Box::pin(mapped))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// rig backend (genai → rig migration, epic #255 / Phase 0 #256)
+// ---------------------------------------------------------------------------
+
+/// The rig-backed [`LlmProvider`], gated behind `llm-backend-rig`. Phase 0 covers the
+/// Ollama path only; genai stays the default. Re-exported so tests and (later) the
+/// factories can construct it directly.
+#[cfg(feature = "llm-backend-rig")]
+pub use rig_backend::RigProvider;
+
+#[cfg(feature = "llm-backend-rig")]
+mod rig_backend {
+    use std::pin::Pin;
+
+    use async_trait::async_trait;
+    use futures_util::{Stream, StreamExt};
+    use rig_core::client::CompletionClient;
+    use rig_core::completion::{
+        AssistantContent, CompletionError, CompletionModel, CompletionRequest, GetTokenUsage,
+        Message as RigMessage, Usage,
+    };
+    use rig_core::http_client;
+    use rig_core::providers::ollama;
+    use rig_core::schemars::Schema;
+    use rig_core::streaming::StreamedAssistantContent;
+
+    use super::{
+        LLM_CONNECT_TIMEOUT, LLM_GENERATION_IDLE_TIMEOUT, LLM_TIMEOUT, LlmProvider, LlmRequest,
+        LlmResponse, ReasoningEffort, StreamChunk,
+    };
+    use crate::error::LensError;
+
+    /// Ollama's canonical default endpoint, mirrored so an empty `base_url` stays construct-able.
+    const OLLAMA_DEFAULT_BASE_URL: &str = "http://localhost:11434";
+
+    /// Per-provider rig completion models. Phase 0 ships only Ollama; Phase 1 (#257) adds the
+    /// remaining 11 provider ids. rig's `CompletionModel` carries associated types (it is not
+    /// object-safe), so the backends are enum-dispatched rather than held behind `dyn`.
+    enum RigModel {
+        Ollama(ollama::CompletionModel<reqwest::Client>),
+    }
+
+    /// A single LLM backend over rig. Constructed with our hardened reqwest client injected via
+    /// `ClientBuilder::http_client(...)`, so the SSRF/timeout policy carries over unchanged.
+    pub struct RigProvider {
+        model: RigModel,
+        model_id: String,
+        /// Always ends in `/`; the Ollama reachability probe appends `api/version`.
+        endpoint_base: String,
+    }
+
+    impl RigProvider {
+        /// Builds an Ollama-backed provider. An empty `base_url` falls back to Ollama's canonical
+        /// endpoint; an empty `api_key` means keyless (the default for a local runtime).
+        pub fn new_ollama(model: &str, base_url: &str, api_key: &str) -> Result<Self, LensError> {
+            let base = if base_url.is_empty() {
+                OLLAMA_DEFAULT_BASE_URL
+            } else {
+                base_url
+            };
+            let http =
+                crate::http::hardened_client_idle(LLM_CONNECT_TIMEOUT, LLM_GENERATION_IDLE_TIMEOUT);
+            let client = ollama::Client::builder()
+                .api_key(ollama::OllamaApiKey::from(api_key))
+                .base_url(base)
+                .http_client(http)
+                .build()
+                .map_err(|err| {
+                    tracing::error!(error = %err, "failed to build rig Ollama client");
+                    LensError::Model("failed to initialize the language model client".to_string())
+                })?;
+            Ok(Self {
+                model: RigModel::Ollama(client.completion_model(model)),
+                model_id: model.to_string(),
+                endpoint_base: normalize_base(base),
+            })
+        }
+
+        /// Unauthenticated GET to `{endpoint_base}api/version` — never bills a token, mirroring
+        /// [`super::GenaiProvider`]'s cheap Ollama liveness probe.
+        async fn ollama_alive(&self) -> bool {
+            let url = format!("{}api/version", self.endpoint_base);
+            crate::http::hardened_client(LLM_CONNECT_TIMEOUT, LLM_TIMEOUT)
+                .get(url)
+                .send()
+                .await
+                .map(|r| r.status().is_success())
+                .unwrap_or(false)
+        }
+    }
+
+    fn normalize_base(base: &str) -> String {
+        format!("{}/", base.trim_end_matches('/'))
+    }
+
+    /// A permissive object schema. Ollama's schemaless `format:"json"` is a plain string, but
+    /// rig types the top-level `format` field as `Option<schemars::Schema>` and cannot carry a
+    /// bare string; a `{"type":"object"}` schema is the faithful equivalent of Ollama JSON mode
+    /// and — crucially — lands `format` at the TOP level of the request body (not inside
+    /// `options`, where `additional_params` would put it). See #256 §0.1 #4.
+    fn json_object_schema() -> Schema {
+        let mut map = serde_json::Map::new();
+        map.insert(
+            "type".to_string(),
+            serde_json::Value::String("object".to_string()),
+        );
+        Schema::from(map)
+    }
+
+    /// Maps [`LlmRequest`] onto a rig [`CompletionRequest`]: system→preamble,
+    /// `messages` (oldest→newest)→history, `prompt`→final user turn, plus temperature and
+    /// max_tokens. `json` sets the top-level output schema; `thinking` uses Ollama's top-level
+    /// `think` field (rig lifts it out of `additional_params`).
+    fn map_request<M: CompletionModel>(model: &M, req: &LlmRequest) -> CompletionRequest {
+        let mut builder = model.completion_request(RigMessage::user(req.prompt.clone()));
+        if let Some(system) = &req.system {
+            builder = builder.preamble(system.clone());
+        }
+        let history = req.messages.iter().map(|msg| match msg.role {
+            crate::chat::ChatRole::User => RigMessage::user(msg.content.clone()),
+            crate::chat::ChatRole::Assistant => RigMessage::assistant(msg.content.clone()),
+        });
+        builder = builder
+            .messages(history)
+            .temperature(f64::from(req.temperature))
+            .max_tokens(u64::from(req.max_tokens));
+        if req.json {
+            builder = builder.output_schema(json_object_schema());
+        }
+        if req.thinking {
+            let think = match req.reasoning_effort {
+                Some(ReasoningEffort::Low) => serde_json::json!("low"),
+                Some(ReasoningEffort::Medium) => serde_json::json!("medium"),
+                Some(ReasoningEffort::High) => serde_json::json!("high"),
+                None => serde_json::json!(true),
+            };
+            builder = builder.additional_params(serde_json::json!({ "think": think }));
+        }
+        builder.build()
+    }
+
+    /// Collapses rig's `u64` token usage into a saturating `u32` — never a blind `as` cast.
+    /// Falls back to `total_tokens` when the split input/output counts are both absent.
+    fn usage_to_tokens(usage: &Usage) -> u32 {
+        let summed = usage.input_tokens.saturating_add(usage.output_tokens);
+        let total = if summed > 0 {
+            summed
+        } else {
+            usage.total_tokens
+        };
+        u32::try_from(total).unwrap_or(u32::MAX)
+    }
+
+    /// Maps a rig [`CompletionError`] onto [`LensError`], sanitizing every embedded string to a
+    /// fixed generic message before it crosses IPC and logging the full detail server-side
+    /// (mirrors [`super::genai_err`]). Classifies by sub-variant: a transport failure
+    /// (`HttpError(Instance)`) or a streaming transport failure (`ProviderError`) → `Network`;
+    /// an HTTP 4xx/5xx (`InvalidStatusCode*`) and every other arm — incl. the `#[non_exhaustive]`
+    /// tail and the body inside `InvalidStatusCodeWithMessage`/`ProviderResponse` — → `Model`.
+    fn rig_err(err: CompletionError) -> LensError {
+        // Never surfaced across IPC; only logged for operators.
+        tracing::error!(error = %err, "LLM request failed (rig)");
+        let is_transport = matches!(
+            &err,
+            CompletionError::HttpError(http_client::Error::Instance(_))
+                | CompletionError::ProviderError(_)
+        );
+        if is_transport {
+            LensError::Network(
+                "couldn't reach the language model — check that your LLM provider \
+                 (e.g. local Ollama) is running and reachable"
+                    .to_string(),
+            )
+        } else {
+            LensError::Model("LLM request failed (model)".to_string())
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for RigProvider {
+        fn model_id(&self) -> &str {
+            &self.model_id
+        }
+
+        fn is_local(&self) -> bool {
+            self.is_ollama()
+        }
+
+        fn is_ollama(&self) -> bool {
+            matches!(self.model, RigModel::Ollama(_))
+        }
+
+        async fn reachable(&self) -> bool {
+            match &self.model {
+                // Cloud variants (Phase 1) will return the keyless/keyed no-network signal here,
+                // never a billed probe (locked by `cloud_reachable_does_not_perform_a_billed_generate`).
+                RigModel::Ollama(_) => self.ollama_alive().await,
+            }
+        }
+
+        async fn generate(&self, req: &LlmRequest) -> Result<LlmResponse, LensError> {
+            match &self.model {
+                RigModel::Ollama(model) => {
+                    let request = map_request(model, req);
+                    let resp = model.completion(request).await.map_err(rig_err)?;
+                    let text = resp
+                        .choice
+                        .iter()
+                        .filter_map(|content| match content {
+                            AssistantContent::Text(t) => Some(t.text.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("");
+                    let tokens_used = usage_to_tokens(&resp.usage);
+                    Ok(LlmResponse { text, tokens_used })
+                }
+            }
+        }
+
+        async fn generate_stream(
+            &self,
+            req: &LlmRequest,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, LensError>> + Send>>, LensError>
+        {
+            match &self.model {
+                RigModel::Ollama(model) => {
+                    let request = map_request(model, req);
+                    let stream = model.stream(request).await.map_err(rig_err)?;
+                    let mapped = stream.filter_map(|ev| async move {
+                        match ev {
+                            Ok(StreamedAssistantContent::Text(t)) => {
+                                Some(Ok(StreamChunk::TextDelta(t.text)))
+                            }
+                            Ok(StreamedAssistantContent::ReasoningDelta { reasoning, .. }) => {
+                                Some(Ok(StreamChunk::ThinkingDelta(reasoning)))
+                            }
+                            Ok(StreamedAssistantContent::Final(resp)) => {
+                                Some(Ok(StreamChunk::Done {
+                                    tokens_used: usage_to_tokens(&resp.token_usage()),
+                                }))
+                            }
+                            // Tool calls / full reasoning blocks / unknown items: not part of the
+                            // text contract. Ollama streaming never emits them for enrichment.
+                            Ok(_) => None,
+                            Err(e) => Some(Err(rig_err(e))),
+                        }
+                    });
+                    Ok(Box::pin(mapped))
+                }
+            }
+        }
     }
 }
 
@@ -1866,5 +2128,245 @@ mod tests {
         let out = active_model_candidates(&cfg, false);
         assert_eq!(out.len(), 1, "the embedding entry has no genai adapter");
         assert_eq!(out[0].provider, "ollama");
+    }
+
+    // --- is_ollama trait capability (backend-agnostic preflight seam, #256 §0.1 #1) --------
+
+    #[test]
+    fn genai_is_ollama_via_trait() {
+        // Exercised through `dyn LlmProvider` (as the preflight sites now are), not the concrete
+        // type: an Ollama target reports `true`, a cloud target `false`.
+        let ollama: Arc<dyn LlmProvider> = Arc::new(GenaiProvider::new(
+            AdapterKind::Ollama,
+            "llama3",
+            "http://x",
+            "",
+        ));
+        assert!(ollama.is_ollama());
+        assert!(ollama.is_local());
+        let cloud: Arc<dyn LlmProvider> = Arc::new(GenaiProvider::new(
+            AdapterKind::Anthropic,
+            "claude",
+            "https://api.anthropic.com",
+            "k",
+        ));
+        assert!(!cloud.is_ollama());
+        assert!(!cloud.is_local());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// rig backend tests (Phase 0 #256) — offline (wiremock); real-model behind
+// LENS_RUN_MODEL_TESTS is a separate exit gate not run in CI.
+// ---------------------------------------------------------------------------
+#[cfg(all(test, feature = "llm-backend-rig"))]
+mod rig_tests {
+    use super::*;
+    use futures_util::StreamExt;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Nothing binds `127.0.0.1:1` — connection is deterministically refused.
+    const DEAD_URL: &str = "http://127.0.0.1:1";
+
+    fn req() -> LlmRequest {
+        LlmRequest {
+            system: Some("be terse".to_string()),
+            prompt: "hello".to_string(),
+            max_tokens: 64,
+            temperature: 0.0,
+            json: true,
+            thinking: false,
+            reasoning_effort: None,
+            messages: Vec::new(),
+        }
+    }
+
+    /// A non-streaming Ollama `/api/chat` body. `created_at` is required by rig's typed
+    /// `CompletionResponse`, unlike the genai adapter's shape.
+    fn ollama_chat_body(content: &str) -> serde_json::Value {
+        serde_json::json!({
+            "model": "llama3",
+            "created_at": "2024-01-01T00:00:00Z",
+            "message": { "role": "assistant", "content": content },
+            "done": true,
+            "done_reason": "stop",
+            "prompt_eval_count": 10,
+            "eval_count": 5
+        })
+    }
+
+    #[tokio::test]
+    async fn rig_generate_round_trips_ollama() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ollama_chat_body("hi there")))
+            .mount(&server)
+            .await;
+
+        let provider = RigProvider::new_ollama("llama3", &server.uri(), "").unwrap();
+        let resp = provider.generate(&req()).await.unwrap();
+        assert_eq!(resp.text, "hi there");
+        assert_eq!(
+            resp.tokens_used, 15,
+            "10 prompt + 5 eval tokens (u64→u32 cast)"
+        );
+    }
+
+    /// BLOCKING gate (#256 §0.1 #4): the `json` directive must land as Ollama's TOP-LEVEL
+    /// `format` field — a JSON Schema object (rig cannot carry the bare string `"json"`) — and
+    /// must NOT leak into `options`, where a naive `additional_params` passthrough would put it.
+    #[tokio::test]
+    async fn rig_json_directive_lands_top_level_format() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ollama_chat_body("{}")))
+            .mount(&server)
+            .await;
+
+        let provider = RigProvider::new_ollama("llama3", &server.uri(), "").unwrap();
+        provider.generate(&req()).await.unwrap();
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("wiremock request recording is on by default");
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert!(
+            body.get("format").is_some(),
+            "format missing at top level: {body}"
+        );
+        assert_eq!(
+            body["format"]["type"], "object",
+            "unexpected format schema: {body}"
+        );
+        assert!(
+            body["options"].get("format").is_none(),
+            "format leaked into options (wrong merge level): {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rig_no_json_omits_format() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ollama_chat_body("plain")))
+            .mount(&server)
+            .await;
+
+        let provider = RigProvider::new_ollama("llama3", &server.uri(), "").unwrap();
+        provider
+            .generate(&LlmRequest {
+                json: false,
+                ..req()
+            })
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.expect("recording on");
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert!(
+            body.get("format").is_none(),
+            "format set without json: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rig_generate_stream_yields_text_then_done() {
+        let server = MockServer::start().await;
+        // The Ollama streaming path parses NDJSON (newline-terminated lines); a single
+        // done-terminated line yields one text delta + a final response.
+        let ndjson = format!("{}\n", ollama_chat_body("streamed"));
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(ndjson))
+            .mount(&server)
+            .await;
+
+        let provider = RigProvider::new_ollama("llama3", &server.uri(), "").unwrap();
+        let stream = provider.generate_stream(&req()).await.unwrap();
+        let events: Vec<StreamChunk> = stream.map(|e| e.unwrap()).collect().await;
+
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamChunk::TextDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(text.contains("streamed"), "got deltas: {events:?}");
+        assert!(
+            matches!(events.last(), Some(StreamChunk::Done { tokens_used: 15 })),
+            "stream must end in Done with usage; got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rig_generate_non_success_is_sanitized_model_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom LEAK_SECRET_TOKEN"))
+            .mount(&server)
+            .await;
+
+        let provider = RigProvider::new_ollama("llama3", &server.uri(), "").unwrap();
+        let err = provider.generate(&req()).await.unwrap_err();
+        assert!(
+            matches!(err, LensError::Model(_)),
+            "4xx/5xx → Model; got {err:?}"
+        );
+        assert!(
+            !err.message().contains("LEAK_SECRET_TOKEN"),
+            "provider body must not cross IPC: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rig_generate_transport_failure_is_network_error() {
+        let provider = RigProvider::new_ollama("llama3", DEAD_URL, "").unwrap();
+        let err = provider.generate(&req()).await.unwrap_err();
+        assert!(
+            matches!(err, LensError::Network(_)),
+            "connection refused → Network; got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rig_reachable_true_without_billed_generate() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/version"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "version": "0.1.0" })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ollama_chat_body("x")))
+            .expect(0) // any billed generate dispatched by the probe fails the test
+            .mount(&server)
+            .await;
+
+        let provider = RigProvider::new_ollama("llama3", &server.uri(), "").unwrap();
+        assert!(provider.reachable().await);
+        drop(server);
+    }
+
+    #[tokio::test]
+    async fn rig_reachable_false_on_connection_refused() {
+        let provider = RigProvider::new_ollama("llama3", DEAD_URL, "").unwrap();
+        assert!(!provider.reachable().await);
+    }
+
+    #[tokio::test]
+    async fn rig_is_ollama_capability() {
+        let provider = RigProvider::new_ollama("llama3", "http://localhost:11434", "").unwrap();
+        assert!(provider.is_ollama());
+        assert!(provider.is_local());
     }
 }
