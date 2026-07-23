@@ -351,8 +351,8 @@ async fn cloud_probe(provider: &dyn crate::llm::LlmProvider, err_prefix: &str) -
 
 /// Validates the enrichment model via the same provider factory the engine uses,
 /// so routing and consent are respected (issue #90 Principle 3). Disabled
-/// enrichment always returns `Pass`; Ollama uses a tags check; cloud uses a live
-/// probe; non-Ollama local falls through to `Pass` (reachability is sufficient).
+/// enrichment always returns `Pass`; Ollama uses a tags check; every non-Ollama
+/// provider uses a live cloud probe.
 pub async fn validate_enrichment_model(config: &AppConfig) -> ModelValidation {
     if !config.enrichment.enabled {
         return ModelValidation::Pass;
@@ -368,9 +368,7 @@ pub async fn validate_enrichment_model(config: &AppConfig) -> ModelValidation {
         }
     };
 
-    // Trait-level capability, not a concrete-type downcast: a `RigProvider` (or any future
-    // backend) still gets the Ollama tags-membership check (#256 §0.1 #1). Non-Ollama providers
-    // fall to the live cloud probe, exactly as the downcast path did for every real provider.
+    // Trait-level capability (see `LlmProvider::is_ollama` doc), not a concrete-type downcast.
     if provider.is_ollama() {
         let model = provider.model_id().to_string();
         let installed = list_ollama_models(&ollama_base_url(config)).await;

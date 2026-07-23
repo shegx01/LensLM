@@ -596,9 +596,7 @@ async fn preflight_enrichment_provider(
         return PreflightOutcome::Proceed;
     };
 
-    // Trait-level capability, not a concrete-type downcast: any local-Ollama backend
-    // (genai or rig) gets the tags-membership check, so this #90 preflight cannot silently
-    // skip after a backend swap (#256 §0.1 #1).
+    // Trait-level capability (see `LlmProvider::is_ollama` doc), not a concrete-type downcast.
     if !provider.is_ollama() {
         return PreflightOutcome::Proceed;
     }

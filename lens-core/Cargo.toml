@@ -65,9 +65,8 @@ native-ml-cuda = []
 # via the target table below (CPU + Accelerate everywhere else).
 local-whisper = ["dep:whisper-rs"]
 
-# genai → rig migration (epic #255): selects the rig LLM backend alongside genai
-# during the transition. OFF by default until Phase 2 (#258) flips it; the dep and
-# both backends are removed of the gate in Phase 3 (#259).
+# Selects the rig LLM backend (see the `rig-core` dependency below for the full
+# migration rationale). OFF by default until Phase 2 (#258) flips it.
 llm-backend-rig = ["dep:rig-core"]
 
 [dependencies]

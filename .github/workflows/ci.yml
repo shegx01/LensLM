@@ -60,6 +60,28 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+  # genai -> rig migration (epic #255): `llm-backend-rig` is off by default, so it's
+  # excluded from the --workspace clippy job above and would otherwise be compiled and
+  # tested by nothing in CI. Own job (Phase 0 #256) until Phase 2 flips the default.
+  rust-rig-backend:
+    name: Rust (rig LLM backend, feature-gated)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RUSTFLAGS: '-D warnings'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Set up Rust environment
+        uses: ./.github/actions/rust-env
+        with:
+          fetch-pdfium: 'true'
+          install-nextest: 'true'
+      - name: Clippy (llm-backend-rig)
+        run: cargo clippy -p lens-core --all-targets --features llm-backend-rig -- -D warnings
+      - name: Test (llm-backend-rig)
+        run: cargo nextest run -p lens-core --features llm-backend-rig
+
   # ───────────────────────── Frontend ─────────────────────────
   frontend:
     name: Frontend (format + check + unit tests)

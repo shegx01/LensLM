@@ -6,6 +6,9 @@
 //! so SSRF policy and timeouts carry over; enrichment pins `temperature: 0.0 + json: true` for
 //! deterministic output. The default [`LlmProvider::generate_stream`] lets enrichment mocks
 //! (which only implement the three core methods) compile untouched.
+//!
+//! genai → rig migration (epic #255): behind `llm-backend-rig`, `RigProvider` implements the
+//! same trait over the `rig-core` crate (Ollama only in Phase 0); genai stays the default.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -151,10 +154,8 @@ pub trait LlmProvider: Send + Sync {
     }
 
     /// Whether this provider targets a local Ollama runtime. The enrichment preflight
-    /// (#90) and the system check run Ollama's `/api/tags` model-installed check off this
-    /// capability instead of downcasting to a concrete provider type — so the check keeps
-    /// firing regardless of the backend (genai/rig). The default `false` is correct for
-    /// every cloud provider and for test mocks.
+    /// (#90) and system check run Ollama's `/api/tags` model-installed check off this
+    /// capability, not a concrete-type downcast, so it fires regardless of backend.
     fn is_ollama(&self) -> bool {
         false
     }
@@ -486,6 +487,9 @@ impl LlmProvider for GenaiProvider {
 pub use rig_backend::RigProvider;
 
 #[cfg(feature = "llm-backend-rig")]
+// Phase 0 (#256) exercises this module only from its own tests; nothing in the lib
+// target constructs a `RigProvider` yet (Phase 1 #257 wires it into the factories).
+#[allow(dead_code)]
 mod rig_backend {
     use std::pin::Pin;
 
@@ -529,7 +533,11 @@ mod rig_backend {
     impl RigProvider {
         /// Builds an Ollama-backed provider. An empty `base_url` falls back to Ollama's canonical
         /// endpoint; an empty `api_key` means keyless (the default for a local runtime).
-        pub fn new_ollama(model: &str, base_url: &str, api_key: &str) -> Result<Self, LensError> {
+        pub(crate) fn new_ollama(
+            model: &str,
+            base_url: &str,
+            api_key: &str,
+        ) -> Result<Self, LensError> {
             let base = if base_url.is_empty() {
                 OLLAMA_DEFAULT_BASE_URL
             } else {
@@ -570,11 +578,9 @@ mod rig_backend {
         format!("{}/", base.trim_end_matches('/'))
     }
 
-    /// A permissive object schema. Ollama's schemaless `format:"json"` is a plain string, but
-    /// rig types the top-level `format` field as `Option<schemars::Schema>` and cannot carry a
-    /// bare string; a `{"type":"object"}` schema is the faithful equivalent of Ollama JSON mode
-    /// and — crucially — lands `format` at the TOP level of the request body (not inside
-    /// `options`, where `additional_params` would put it). See #256 §0.1 #4.
+    /// A permissive object schema standing in for Ollama's schemaless `format:"json"` — rig's
+    /// `output_schema` (typed `Option<Schema>`) can't carry that bare string, but this is the
+    /// only path that lands `format` at the request's TOP level, not inside `options` (#256 §0.1 #4).
     fn json_object_schema() -> Schema {
         let mut map = serde_json::Map::new();
         map.insert(
@@ -584,10 +590,9 @@ mod rig_backend {
         Schema::from(map)
     }
 
-    /// Maps [`LlmRequest`] onto a rig [`CompletionRequest`]: system→preamble,
-    /// `messages` (oldest→newest)→history, `prompt`→final user turn, plus temperature and
-    /// max_tokens. `json` sets the top-level output schema; `thinking` uses Ollama's top-level
-    /// `think` field (rig lifts it out of `additional_params`).
+    /// Maps [`LlmRequest`] onto a rig [`CompletionRequest`]: system→preamble, `messages`
+    /// (oldest→newest)→history, `prompt`→final user turn, temperature, `json`→top-level output
+    /// schema, and `max_tokens`/`thinking`→one merged `additional_params` object (see below).
     fn map_request<M: CompletionModel>(model: &M, req: &LlmRequest) -> CompletionRequest {
         let mut builder = model.completion_request(RigMessage::user(req.prompt.clone()));
         if let Some(system) = &req.system {
@@ -600,9 +605,22 @@ mod rig_backend {
         builder = builder
             .messages(history)
             .temperature(f64::from(req.temperature))
+            // Harmless: Ollama ignores this bare top-level field (see `num_predict` below), but
+            // a future non-Ollama rig backend may honor it directly.
             .max_tokens(u64::from(req.max_tokens));
         if req.json {
             builder = builder.output_schema(json_object_schema());
+        }
+
+        // Ollama only reads a token cap from `options.num_predict` — the bare top-level
+        // `max_tokens` field above is not part of its real API and is silently ignored, so the
+        // cap is threaded through here instead. `think` also belongs here (rig lifts it back out
+        // to a top-level field). Both go in ONE `additional_params` object: Ollama's request
+        // builder reads a single blob, and a second `additional_params` call would merge against
+        // whatever the first call set rather than compose cleanly with it.
+        let mut extra = serde_json::Map::new();
+        if req.max_tokens > 0 {
+            extra.insert("num_predict".to_string(), serde_json::json!(req.max_tokens));
         }
         if req.thinking {
             let think = match req.reasoning_effort {
@@ -611,7 +629,10 @@ mod rig_backend {
                 Some(ReasoningEffort::High) => serde_json::json!("high"),
                 None => serde_json::json!(true),
             };
-            builder = builder.additional_params(serde_json::json!({ "think": think }));
+            extra.insert("think".to_string(), think);
+        }
+        if !extra.is_empty() {
+            builder = builder.additional_params(serde_json::Value::Object(extra));
         }
         builder.build()
     }
@@ -628,15 +649,13 @@ mod rig_backend {
         u32::try_from(total).unwrap_or(u32::MAX)
     }
 
-    /// Maps a rig [`CompletionError`] onto [`LensError`], sanitizing every embedded string to a
-    /// fixed generic message before it crosses IPC and logging the full detail server-side
-    /// (mirrors [`super::genai_err`]). Classifies by sub-variant: a transport failure
-    /// (`HttpError(Instance)`) or a streaming transport failure (`ProviderError`) → `Network`;
-    /// an HTTP 4xx/5xx (`InvalidStatusCode*`) and every other arm — incl. the `#[non_exhaustive]`
-    /// tail and the body inside `InvalidStatusCodeWithMessage`/`ProviderResponse` — → `Model`.
+    /// Maps a rig [`CompletionError`] onto [`LensError`], sanitizing every embedded string
+    /// (incl. the `#[non_exhaustive]` catch-all) to a fixed generic message and logging the full
+    /// detail server-side (mirrors [`super::genai_err`]).
     fn rig_err(err: CompletionError) -> LensError {
-        // Never surfaced across IPC; only logged for operators.
         tracing::error!(error = %err, "LLM request failed (rig)");
+        // Phase 1 (#257): `ProviderError` is Ollama-transport-only here (only the streaming path
+        // emits it); non-Ollama backends emit it for semantic errors too — revisit classification.
         let is_transport = matches!(
             &err,
             CompletionError::HttpError(http_client::Error::Instance(_))
@@ -653,12 +672,16 @@ mod rig_backend {
         }
     }
 
+    // TODO(#257): override `as_any` (or add a shared-client trait method) before rig becomes a
+    // base provider — `task_provider_from_config`'s client-sharing downcast otherwise falls back
+    // to base for a `RigProvider`.
     #[async_trait]
     impl LlmProvider for RigProvider {
         fn model_id(&self) -> &str {
             &self.model_id
         }
 
+        // Phase 1: cloud `RigModel` variants must return `false` here.
         fn is_local(&self) -> bool {
             self.is_ollama()
         }
@@ -2196,6 +2219,16 @@ mod rig_tests {
         })
     }
 
+    /// A non-terminal (`done: false`) NDJSON line, as Ollama emits mid-stream.
+    fn ollama_chat_body_in_progress(content: &str) -> serde_json::Value {
+        serde_json::json!({
+            "model": "llama3",
+            "created_at": "2024-01-01T00:00:00Z",
+            "message": { "role": "assistant", "content": content },
+            "done": false
+        })
+    }
+
     #[tokio::test]
     async fn rig_generate_round_trips_ollama() {
         let server = MockServer::start().await;
@@ -2274,6 +2307,41 @@ mod rig_tests {
         );
     }
 
+    /// Ollama only honors a token cap via `options.num_predict` — the request builder's
+    /// `max_tokens` maps to a bare top-level field the real server ignores — so this must be
+    /// threaded through `additional_params` and land inside `options`, merged alongside a `json`
+    /// or `thinking` directive rather than clobbering it.
+    #[tokio::test]
+    async fn rig_max_tokens_lands_in_options_num_predict() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ollama_chat_body("ok")))
+            .mount(&server)
+            .await;
+
+        let provider = RigProvider::new_ollama("llama3", &server.uri(), "").unwrap();
+        provider
+            .generate(&LlmRequest {
+                max_tokens: 256,
+                thinking: true,
+                ..req()
+            })
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.expect("recording on");
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(
+            body["options"]["num_predict"], 256,
+            "max_tokens must reach options.num_predict: {body}"
+        );
+        assert!(
+            body.get("think").is_some(),
+            "think must still be set alongside num_predict: {body}"
+        );
+    }
+
     #[tokio::test]
     async fn rig_generate_stream_yields_text_then_done() {
         let server = MockServer::start().await;
@@ -2301,6 +2369,43 @@ mod rig_tests {
         assert!(
             matches!(events.last(), Some(StreamChunk::Done { tokens_used: 15 })),
             "stream must end in Done with usage; got {events:?}"
+        );
+    }
+
+    /// A malformed NDJSON line after a valid partial chunk fails rig's internal
+    /// `serde_json` parse mid-stream (the HTTP response itself is a 200 — this is distinct from
+    /// `rig_generate_non_success_is_sanitized_model_error`, which fails before streaming starts).
+    /// The stream must surface exactly one sanitized `Err` and never a `Done` after it.
+    #[tokio::test]
+    async fn rig_generate_stream_mid_stream_error_yields_err_no_done() {
+        let server = MockServer::start().await;
+        let body = format!(
+            "{}\nnot valid json\n",
+            ollama_chat_body_in_progress("partial")
+        );
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+
+        let provider = RigProvider::new_ollama("llama3", &server.uri(), "").unwrap();
+        let stream = provider.generate_stream(&req()).await.unwrap();
+        let events: Vec<Result<StreamChunk, LensError>> = stream.collect().await;
+
+        assert!(
+            matches!(events.first(), Some(Ok(StreamChunk::TextDelta(t))) if t == "partial"),
+            "expected the valid partial chunk first; got {events:?}"
+        );
+        assert!(
+            matches!(events.last(), Some(Err(LensError::Model(_)))),
+            "a mid-stream parse failure must surface as a single Err; got {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Ok(StreamChunk::Done { .. }))),
+            "no Done may follow a mid-stream error: {events:?}"
         );
     }
 
