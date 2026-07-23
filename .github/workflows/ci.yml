@@ -66,7 +66,11 @@ jobs:
   rust-rig-backend:
     name: Rust (rig LLM backend, feature-gated)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Higher than the default-feature clippy job (30): the shared Rust cache is keyed to
+    # the default feature set, so this job cold-compiles rig's full tree AND the lens-core
+    # test binaries with no warm cache on its first run. Headroom lets that first run finish
+    # and populate the cache; later runs are far quicker.
+    timeout-minutes: 45
     env:
       RUSTFLAGS: '-D warnings'
     steps:
