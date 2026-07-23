@@ -351,8 +351,8 @@ async fn cloud_probe(provider: &dyn crate::llm::LlmProvider, err_prefix: &str) -
 
 /// Validates the enrichment model via the same provider factory the engine uses,
 /// so routing and consent are respected (issue #90 Principle 3). Disabled
-/// enrichment always returns `Pass`; Ollama uses a tags check; cloud uses a live
-/// probe; non-Ollama local falls through to `Pass` (reachability is sufficient).
+/// enrichment always returns `Pass`; Ollama uses a tags check; every non-Ollama
+/// provider uses a live cloud probe.
 pub async fn validate_enrichment_model(config: &AppConfig) -> ModelValidation {
     if !config.enrichment.enabled {
         return ModelValidation::Pass;
@@ -368,24 +368,20 @@ pub async fn validate_enrichment_model(config: &AppConfig) -> ModelValidation {
         }
     };
 
-    let genai = provider
-        .as_any()
-        .downcast_ref::<crate::llm::GenaiProvider>();
-    match genai {
-        Some(g) if g.is_ollama() => {
-            let model = provider.model_id().to_string();
-            let installed = list_ollama_models(&ollama_base_url(config)).await;
-            if installed.iter().any(|m| m == &model) {
-                ModelValidation::Pass
-            } else {
-                ModelValidation::Invalid(format!(
-                    "LLM runtime detected, but {}",
-                    ollama_model_missing_reason(&model)
-                ))
-            }
+    // Trait-level capability (see `LlmProvider::is_ollama` doc), not a concrete-type downcast.
+    if provider.is_ollama() {
+        let model = provider.model_id().to_string();
+        let installed = list_ollama_models(&ollama_base_url(config)).await;
+        if installed.iter().any(|m| m == &model) {
+            ModelValidation::Pass
+        } else {
+            ModelValidation::Invalid(format!(
+                "LLM runtime detected, but {}",
+                ollama_model_missing_reason(&model)
+            ))
         }
-        Some(_) => cloud_probe(provider.as_ref(), "Cloud enrichment model").await,
-        None => ModelValidation::Pass,
+    } else {
+        cloud_probe(provider.as_ref(), "Cloud enrichment model").await
     }
 }
 
