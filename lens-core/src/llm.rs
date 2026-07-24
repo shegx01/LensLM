@@ -192,17 +192,14 @@ fn llm_client() -> reqwest::Client {
     crate::http::hardened_client_idle(LLM_CONNECT_TIMEOUT, LLM_GENERATION_IDLE_TIMEOUT)
 }
 
-/// Maps a genai error onto [`LensError`], sanitizing the message before it crosses the IPC
-/// boundary. genai wraps transport errors inside its own types with no public `reqwest::Error`
-/// accessor, so we classify by `Display` text (connect/timeout → `Network`; everything else
-/// → `Model`). The full error is logged server-side; only a generic message is surfaced over IPC.
-fn genai_err(err: genai::Error) -> LensError {
-    let lower = err.to_string().to_ascii_lowercase();
-    // reqwest's transport-failure `Display` often lacks "timeout"/"connect": a send
-    // failure reads "error sending request", an idle read-timeout "error reading
-    // response"/"body", and a deadline "deadline". Match those too so a genuine
-    // transport error is never misclassified as a model (bad-output) error.
-    let is_transport = lower.contains("connect")
+/// Whether an error's text reads like a transport failure (connection/timeout/dns) rather than a
+/// model/semantic error. reqwest's transport-failure `Display` often lacks "timeout"/"connect": a
+/// send failure reads "error sending request", an idle read-timeout "error reading
+/// response"/"body", a deadline "deadline". Matching those keeps a genuine transport error from
+/// being misclassified as a model (bad-output) error. Shared by [`genai_err`] and the rig backend.
+fn looks_like_transport(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("connect")
         || lower.contains("connection")
         || lower.contains("timed out")
         || lower.contains("timeout")
@@ -211,7 +208,15 @@ fn genai_err(err: genai::Error) -> LensError {
         || lower.contains("sending request")
         || lower.contains("reading response")
         || lower.contains("response body")
-        || lower.contains("deadline");
+        || lower.contains("deadline")
+}
+
+/// Maps a genai error onto [`LensError`], sanitizing the message before it crosses the IPC
+/// boundary. genai wraps transport errors inside its own types with no public `reqwest::Error`
+/// accessor, so we classify by `Display` text (connect/timeout → `Network`; everything else
+/// → `Model`). The full error is logged server-side; only a generic message is surfaced over IPC.
+fn genai_err(err: genai::Error) -> LensError {
+    let is_transport = looks_like_transport(&err.to_string());
     // Log the full detail for operators; never surface it across IPC.
     tracing::error!(error = %err, transport = is_transport, "LLM request failed");
     if is_transport {
@@ -814,6 +819,116 @@ mod rig_backend {
         format!("{}/", base.trim_end_matches('/'))
     }
 
+    /// How a provider family carries the token cap and reasoning knobs — rig exposes no universal
+    /// reasoning field, so each family needs its own `additional_params` shape.
+    #[derive(Clone, Copy)]
+    enum ParamStyle {
+        /// Ollama: token cap via `options.num_predict`; reasoning via `think`.
+        Ollama,
+        /// OpenAI wire (openai, openai-compatible, groq, deepseek, xai): reasoning via
+        /// `reasoning_effort`; the cap is the honored top-level `max_tokens`.
+        OpenAi,
+        /// Anthropic: reasoning via `thinking: {type, budget_tokens}`.
+        Anthropic,
+        /// Gemini / Cohere / Z.ai: only the top-level `max_tokens`; no reasoning knob mapped
+        /// (their native reasoning controls are out of scope for the migration).
+        Plain,
+    }
+
+    impl ParamStyle {
+        /// The `additional_params` object for `req`, or `None` when nothing extra is needed.
+        fn additional_params(self, req: &LlmRequest) -> Option<serde_json::Value> {
+            let mut extra = serde_json::Map::new();
+            match self {
+                ParamStyle::Ollama => {
+                    if req.max_tokens > 0 {
+                        extra.insert("num_predict".to_string(), serde_json::json!(req.max_tokens));
+                    }
+                    if req.thinking {
+                        // rig lifts `think` back out to a top-level Ollama field.
+                        let think = match req.reasoning_effort {
+                            Some(ReasoningEffort::Low) => serde_json::json!("low"),
+                            Some(ReasoningEffort::Medium) => serde_json::json!("medium"),
+                            Some(ReasoningEffort::High) => serde_json::json!("high"),
+                            None => serde_json::json!(true),
+                        };
+                        extra.insert("think".to_string(), think);
+                    }
+                }
+                ParamStyle::OpenAi => {
+                    if req.thinking {
+                        let effort = match req.reasoning_effort.unwrap_or(ReasoningEffort::Medium) {
+                            ReasoningEffort::Low => "low",
+                            ReasoningEffort::Medium => "medium",
+                            ReasoningEffort::High => "high",
+                        };
+                        extra.insert("reasoning_effort".to_string(), serde_json::json!(effort));
+                    }
+                }
+                ParamStyle::Anthropic => {
+                    // Enable extended thinking only when a valid budget fits under `max_tokens`
+                    // (Anthropic rejects a budget ≥ the cap or below its 1024 floor).
+                    if let Some(budget) = anthropic_thinking_budget(req) {
+                        extra.insert(
+                            "thinking".to_string(),
+                            serde_json::json!({ "type": "enabled", "budget_tokens": budget }),
+                        );
+                    }
+                }
+                ParamStyle::Plain => {}
+            }
+            if extra.is_empty() {
+                None
+            } else {
+                Some(serde_json::Value::Object(extra))
+            }
+        }
+
+        /// The temperature to send. Anthropic requires `temperature == 1` whenever extended
+        /// thinking is enabled (it rejects any other value), so override it there; every other
+        /// path uses the request's configured temperature.
+        fn temperature(self, req: &LlmRequest) -> f64 {
+            let anthropic_thinking =
+                matches!(self, ParamStyle::Anthropic) && anthropic_thinking_budget(req).is_some();
+            if anthropic_thinking {
+                1.0
+            } else {
+                f64::from(req.temperature)
+            }
+        }
+    }
+
+    /// The active [`ParamStyle`] for a backend variant.
+    fn param_style(model: &RigModel) -> ParamStyle {
+        match model {
+            RigModel::Ollama(_) => ParamStyle::Ollama,
+            RigModel::OpenAi(_) | RigModel::Groq(_) | RigModel::DeepSeek(_) | RigModel::Xai(_) => {
+                ParamStyle::OpenAi
+            }
+            RigModel::Anthropic(_) => ParamStyle::Anthropic,
+            RigModel::Gemini(_) | RigModel::Cohere(_) | RigModel::Zai(_) => ParamStyle::Plain,
+        }
+    }
+
+    /// Anthropic extended-thinking budget, or `None` when thinking is off or `max_tokens` leaves
+    /// no room for Anthropic's 1024-token floor below the cap (the API rejects a budget ≥ the
+    /// cap). Scaled to effort and clamped strictly below `max_tokens`.
+    fn anthropic_thinking_budget(req: &LlmRequest) -> Option<u32> {
+        if !req.thinking {
+            return None;
+        }
+        let ceiling = req.max_tokens.checked_sub(1)?;
+        if ceiling < 1024 {
+            return None;
+        }
+        let want = match req.reasoning_effort.unwrap_or(ReasoningEffort::Medium) {
+            ReasoningEffort::Low => 1024,
+            ReasoningEffort::Medium => 4096,
+            ReasoningEffort::High => 8192,
+        };
+        Some(want.min(ceiling))
+    }
+
     /// A permissive object schema standing in for Ollama's schemaless `format:"json"` — rig's
     /// `output_schema` (typed `Option<Schema>`) can't carry that bare string, but this is the
     /// only path that lands `format` at the request's TOP level, not inside `options` (#256 §0.1 #4).
@@ -828,8 +943,13 @@ mod rig_backend {
 
     /// Maps [`LlmRequest`] onto a rig [`CompletionRequest`]: system→preamble, `messages`
     /// (oldest→newest)→history, `prompt`→final user turn, temperature, `json`→top-level output
-    /// schema, and `max_tokens`/`thinking`→one merged `additional_params` object (see below).
-    fn map_request<M: CompletionModel>(model: &M, req: &LlmRequest) -> CompletionRequest {
+    /// schema, and the token-cap / reasoning knobs → a per-provider `additional_params` object
+    /// (rig has no universal reasoning field, so each family carries its own — see [`ParamStyle`]).
+    fn map_request<M: CompletionModel>(
+        model: &M,
+        req: &LlmRequest,
+        style: ParamStyle,
+    ) -> CompletionRequest {
         let mut builder = model.completion_request(RigMessage::user(req.prompt.clone()));
         if let Some(system) = &req.system {
             builder = builder.preamble(system.clone());
@@ -840,35 +960,19 @@ mod rig_backend {
         });
         builder = builder
             .messages(history)
-            .temperature(f64::from(req.temperature))
-            // Harmless: Ollama ignores this bare top-level field (see `num_predict` below), but
-            // a future non-Ollama rig backend may honor it directly.
+            .temperature(style.temperature(req))
+            // OpenAI-family / Anthropic / Gemini honor this bare top-level field; Ollama ignores it
+            // and reads the cap from `options.num_predict` instead (added below for that style).
             .max_tokens(u64::from(req.max_tokens));
         if req.json {
             builder = builder.output_schema(json_object_schema());
         }
 
-        // Ollama only reads a token cap from `options.num_predict` — the bare top-level
-        // `max_tokens` field above is not part of its real API and is silently ignored, so the
-        // cap is threaded through here instead. `think` also belongs here (rig lifts it back out
-        // to a top-level field). Both go in ONE `additional_params` object: Ollama's request
-        // builder reads a single blob, and a second `additional_params` call would merge against
-        // whatever the first call set rather than compose cleanly with it.
-        let mut extra = serde_json::Map::new();
-        if req.max_tokens > 0 {
-            extra.insert("num_predict".to_string(), serde_json::json!(req.max_tokens));
-        }
-        if req.thinking {
-            let think = match req.reasoning_effort {
-                Some(ReasoningEffort::Low) => serde_json::json!("low"),
-                Some(ReasoningEffort::Medium) => serde_json::json!("medium"),
-                Some(ReasoningEffort::High) => serde_json::json!("high"),
-                None => serde_json::json!(true),
-            };
-            extra.insert("think".to_string(), think);
-        }
-        if !extra.is_empty() {
-            builder = builder.additional_params(serde_json::Value::Object(extra));
+        // Per-provider knobs go in ONE `additional_params` object — a second call would overwrite
+        // rather than merge. `thinking` is inert today (no runtime caller sets it; M5 chat will).
+        let extra = style.additional_params(req);
+        if let Some(extra) = extra {
+            builder = builder.additional_params(extra);
         }
         builder.build()
     }
@@ -890,13 +994,18 @@ mod rig_backend {
     /// detail server-side (mirrors [`super::genai_err`]).
     fn rig_err(err: CompletionError) -> LensError {
         tracing::error!(error = %err, "LLM request failed (rig)");
-        // Phase 1 (#257): `ProviderError` is Ollama-transport-only here (only the streaming path
-        // emits it); non-Ollama backends emit it for semantic errors too — revisit classification.
-        let is_transport = matches!(
-            &err,
-            CompletionError::HttpError(http_client::Error::Instance(_))
-                | CompletionError::ProviderError(_)
-        );
+        // Only the transport-layer `HttpError::Instance` (a reqwest connect/timeout/dns failure)
+        // is a Network error; an `InvalidStatusCode{,WithMessage}` is an HTTP status (semantic →
+        // Model), and its body must never cross IPC. `ProviderError`/`ProviderResponse` are
+        // overloaded — the Ollama streaming path emits `ProviderError` for transport failures while
+        // cloud backends emit both for *semantic* errors — so classify those by message text,
+        // mirroring `genai_err`. Everything else (Json/Url/Request/Response parse) is a Model error.
+        let is_transport = match &err {
+            CompletionError::HttpError(http_client::Error::Instance(_)) => true,
+            CompletionError::ProviderError(msg) => super::looks_like_transport(msg),
+            CompletionError::ProviderResponse(e) => super::looks_like_transport(&e.to_string()),
+            _ => false,
+        };
         if is_transport {
             LensError::Network(
                 "couldn't reach the language model — check that your LLM provider \
@@ -913,8 +1022,9 @@ mod rig_backend {
     async fn rig_generate<M: CompletionModel>(
         model: &M,
         req: &LlmRequest,
+        style: ParamStyle,
     ) -> Result<LlmResponse, LensError> {
-        let request = map_request(model, req);
+        let request = map_request(model, req, style);
         let resp = model.completion(request).await.map_err(rig_err)?;
         let text = resp
             .choice
@@ -934,12 +1044,13 @@ mod rig_backend {
     async fn rig_stream<M>(
         model: &M,
         req: &LlmRequest,
+        style: ParamStyle,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, LensError>> + Send>>, LensError>
     where
         M: CompletionModel,
         M::StreamingResponse: 'static,
     {
-        let request = map_request(model, req);
+        let request = map_request(model, req, style);
         let stream = model.stream(request).await.map_err(rig_err)?;
         let mapped = stream.filter_map(|ev| async move {
             match ev {
@@ -1011,7 +1122,8 @@ mod rig_backend {
         }
 
         async fn generate(&self, req: &LlmRequest) -> Result<LlmResponse, LensError> {
-            dispatch!(&self.model, model => rig_generate(model, req).await)
+            let style = param_style(&self.model);
+            dispatch!(&self.model, model => rig_generate(model, req, style).await)
         }
 
         async fn generate_stream(
@@ -1019,7 +1131,8 @@ mod rig_backend {
             req: &LlmRequest,
         ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, LensError>> + Send>>, LensError>
         {
-            dispatch!(&self.model, model => rig_stream(model, req).await)
+            let style = param_style(&self.model);
+            dispatch!(&self.model, model => rig_stream(model, req, style).await)
         }
     }
 }
@@ -2654,6 +2767,179 @@ mod rig_tests {
         );
     }
 
+    /// A minimal OpenAI chat-completions body — enough for these tests, which assert on the
+    /// OUTBOUND request (`reasoning_effort` mapping), not the parsed response.
+    fn openai_chat_body(content: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "gpt-test",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": content },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+        })
+    }
+
+    /// Stage 4: OpenAI-family reasoning maps to a top-level `reasoning_effort` string — never
+    /// Ollama's `think`/`num_predict`. Targets the outbound request; the response is irrelevant.
+    #[tokio::test]
+    async fn rig_openai_reasoning_effort_lands_top_level() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(openai_chat_body("ok")))
+            .mount(&server)
+            .await;
+
+        let provider = RigProvider::new_openai("gpt", &server.uri(), "k").unwrap();
+        let _ = provider
+            .generate(&LlmRequest {
+                thinking: true,
+                reasoning_effort: Some(ReasoningEffort::High),
+                ..req()
+            })
+            .await;
+
+        let requests = server.received_requests().await.expect("recording on");
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(
+            body["reasoning_effort"], "high",
+            "reasoning_effort missing or mis-leveled: {body}"
+        );
+        assert!(
+            body.get("think").is_none() && body.get("num_predict").is_none(),
+            "Ollama-only knobs must not appear on the OpenAI wire: {body}"
+        );
+    }
+
+    /// Stage 5: on the OpenAI wire the `json` directive lands as a top-level `response_format`
+    /// (rig maps `output_schema`→`response_format`), NOT Ollama's `format`; absent without `json`.
+    #[tokio::test]
+    async fn rig_openai_json_directive_lands_as_response_format() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(openai_chat_body("ok")))
+            .mount(&server)
+            .await;
+
+        let provider = RigProvider::new_openai("gpt", &server.uri(), "k").unwrap();
+        let _ = provider.generate(&req()).await; // req() has json: true
+        let _ = provider
+            .generate(&LlmRequest {
+                json: false,
+                ..req()
+            })
+            .await;
+
+        let requests = server.received_requests().await.expect("recording on");
+        let with_json: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let without_json: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert!(
+            with_json.get("response_format").is_some(),
+            "json → response_format at top level: {with_json}"
+        );
+        assert!(
+            with_json.get("format").is_none(),
+            "OpenAI must not use Ollama's `format` key: {with_json}"
+        );
+        assert!(
+            without_json.get("response_format").is_none(),
+            "response_format set without json: {without_json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rig_openai_omits_reasoning_effort_without_thinking() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(openai_chat_body("ok")))
+            .mount(&server)
+            .await;
+
+        let provider = RigProvider::new_openai("gpt", &server.uri(), "k").unwrap();
+        let _ = provider.generate(&req()).await;
+
+        let requests = server.received_requests().await.expect("recording on");
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "reasoning_effort set without thinking: {body}"
+        );
+    }
+
+    /// Stage 4: Anthropic extended thinking maps to `thinking: {type, budget_tokens}` and forces
+    /// `temperature == 1` (Anthropic rejects any other value with thinking on).
+    #[tokio::test]
+    async fn rig_anthropic_thinking_lands_with_budget_and_temperature_one() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+
+        let provider = RigProvider::new_anthropic("claude", &server.uri(), "k").unwrap();
+        let _ = provider
+            .generate(&LlmRequest {
+                thinking: true,
+                reasoning_effort: Some(ReasoningEffort::High),
+                max_tokens: 20_000,
+                temperature: 0.0,
+                ..req()
+            })
+            .await;
+
+        let requests = server.received_requests().await.expect("recording on");
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(
+            body["thinking"]["type"], "enabled",
+            "thinking not enabled: {body}"
+        );
+        assert_eq!(
+            body["thinking"]["budget_tokens"], 8192,
+            "High effort budget: {body}"
+        );
+        assert_eq!(
+            body["temperature"], 1.0,
+            "Anthropic thinking requires temperature 1: {body}"
+        );
+    }
+
+    /// A `max_tokens` too small for Anthropic's 1024 floor below the cap disables thinking (and
+    /// leaves the configured temperature untouched).
+    #[tokio::test]
+    async fn rig_anthropic_thinking_omitted_when_cap_too_small() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+
+        let provider = RigProvider::new_anthropic("claude", &server.uri(), "k").unwrap();
+        let _ = provider
+            .generate(&LlmRequest {
+                thinking: true,
+                reasoning_effort: Some(ReasoningEffort::High),
+                max_tokens: 64,
+                temperature: 0.0,
+                ..req()
+            })
+            .await;
+
+        let requests = server.received_requests().await.expect("recording on");
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert!(
+            body.get("thinking").is_none(),
+            "thinking must be omitted when the cap can't fit the 1024 floor: {body}"
+        );
+        assert_eq!(
+            body["temperature"], 0.0,
+            "temperature must stay configured when thinking is disabled: {body}"
+        );
+    }
+
     #[tokio::test]
     async fn rig_generate_stream_yields_text_then_done() {
         let server = MockServer::start().await;
@@ -2749,6 +3035,29 @@ mod rig_tests {
         assert!(
             matches!(err, LensError::Network(_)),
             "connection refused → Network; got {err:?}"
+        );
+    }
+
+    /// D5: a *cloud* HTTP-status error (auth/rate-limit) is semantic, not transport — it must map
+    /// to `Model` (never `Network`, which the old blanket `ProviderError` rule would have done)
+    /// and never leak the provider's response body across IPC.
+    #[tokio::test]
+    async fn rig_cloud_status_error_is_sanitized_model_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("bad key LEAK_SECRET_TOKEN"))
+            .mount(&server)
+            .await;
+
+        let provider = RigProvider::new_openai("gpt", &server.uri(), "k").unwrap();
+        let err = provider.generate(&req()).await.unwrap_err();
+        assert!(
+            matches!(err, LensError::Model(_)),
+            "cloud 401 → Model; got {err:?}"
+        );
+        assert!(
+            !err.message().contains("LEAK_SECRET_TOKEN"),
+            "provider body must not cross IPC: {err:?}"
         );
     }
 
