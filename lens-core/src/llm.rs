@@ -498,8 +498,8 @@ impl LlmProvider for GenaiProvider {
 pub use rig_backend::RigProvider;
 
 #[cfg(feature = "llm-backend-rig")]
-// Phase 0 (#256) exercises this module only from its own tests; nothing in the lib
-// target constructs a `RigProvider` yet (Phase 1 #257 wires it into the factories).
+// The public `new_*` convenience constructors are exercised only by `#[cfg(test)]` code — the
+// lib path builds through `from_id`→`*_with_http` — so a non-test rig build would flag them.
 #[allow(dead_code)]
 mod rig_backend {
     use std::pin::Pin;
@@ -519,8 +519,8 @@ mod rig_backend {
     use rig_core::streaming::StreamedAssistantContent;
 
     use super::{
-        LLM_CONNECT_TIMEOUT, LLM_GENERATION_IDLE_TIMEOUT, LLM_TIMEOUT, LlmProvider, LlmRequest,
-        LlmResponse, ReasoningEffort, StreamChunk,
+        LLM_CONNECT_TIMEOUT, LLM_TIMEOUT, LlmProvider, LlmRequest, LlmResponse, ReasoningEffort,
+        StreamChunk,
     };
     use crate::error::LensError;
 
@@ -529,6 +529,25 @@ mod rig_backend {
 
     /// Ollama's managed cloud endpoint, used when `new_ollama_cloud` gets an empty `base_url`.
     const OLLAMA_CLOUD_DEFAULT_BASE_URL: &str = "https://ollama.com";
+
+    #[derive(Clone, Copy)]
+    enum OllamaKind {
+        Local,
+        Cloud,
+    }
+
+    impl OllamaKind {
+        fn default_base(self) -> &'static str {
+            match self {
+                OllamaKind::Local => OLLAMA_DEFAULT_BASE_URL,
+                OllamaKind::Cloud => OLLAMA_CLOUD_DEFAULT_BASE_URL,
+            }
+        }
+
+        fn is_local(self) -> bool {
+            matches!(self, OllamaKind::Local)
+        }
+    }
 
     /// One variant per distinct rig concrete completion-model type — NOT per provider id: the
     /// provider ids that share a client (openai/openai-compatible, ollama/ollama-cloud, glm/zai)
@@ -556,13 +575,8 @@ mod rig_backend {
         /// Always ends in `/`; only the local-Ollama reachability probe reads it (it appends
         /// `api/version`). Cloud backends never probe, so the field is unused for them.
         endpoint_base: String,
-        /// True only for a local Ollama runtime. Drives `is_local` and selects the network
-        /// liveness probe over the keyed cloud signal in `reachable`. False for ollama-cloud
-        /// (a keyed cloud endpoint reusing the same rig client) and every cloud provider.
+        /// true only for a local Ollama runtime; see `is_ollama`.
         is_local_ollama: bool,
-        /// Whether a non-empty API key was supplied — the no-network reachability signal for
-        /// every cloud backend (keyed ⇒ reachable, keyless ⇒ not).
-        has_key: bool,
         /// The hardened client this provider was built with, kept so `shared_http_client` can hand
         /// it to sibling per-task providers (rig's completion model does not re-expose it).
         http: reqwest::Client,
@@ -575,18 +589,14 @@ mod rig_backend {
         LensError::Model("failed to initialize the language model client".to_string())
     }
 
-    /// The hardened reqwest client every backend is built with (SSRF/timeout policy). A fresh
-    /// build gets one from here; sibling per-task providers reuse the base's via `from_id`.
+    /// The hardened reqwest client every fresh backend is built with (delegates to the parent).
     fn default_http() -> reqwest::Client {
-        crate::http::hardened_client_idle(LLM_CONNECT_TIMEOUT, LLM_GENERATION_IDLE_TIMEOUT)
+        super::llm_client()
     }
 
-    /// Generates a cloud-provider constructor pair: a public `$name` that builds a fresh hardened
-    /// client and a private `$with` that takes one (so a sibling per-task provider reuses the
-    /// base's). Both set `.api_key(api_key)` on a single code path (empty keys are allowed — cloud
-    /// reachability is decided in `reachable`, not here) and `.base_url(base_url)` only when
-    /// non-empty so an empty value keeps the provider default. These are runtime values and never
-    /// change the builder's concrete type.
+    /// Generates a cloud-provider constructor pair (public `$name` builds a fresh client, private
+    /// `$with` reuses a caller's). An empty api_key is allowed — reachability is decided elsewhere;
+    /// base_url is set only when non-empty so an empty value keeps the provider default.
     macro_rules! cloud_ctor {
         ($(#[$m:meta])* $name:ident, $with:ident, $client:ty, $variant:ident) => {
             $(#[$m])*
@@ -614,7 +624,6 @@ mod rig_backend {
                     model_id: model.to_string(),
                     endpoint_base: String::new(),
                     is_local_ollama: false,
-                    has_key: !api_key.is_empty(),
                     http,
                 })
             }
@@ -629,44 +638,27 @@ mod rig_backend {
             base_url: &str,
             api_key: &str,
         ) -> Result<Self, LensError> {
-            Self::build_ollama(
-                model,
-                base_url,
-                OLLAMA_DEFAULT_BASE_URL,
-                api_key,
-                true,
-                default_http(),
-            )
+            Self::build_ollama(model, base_url, api_key, OllamaKind::Local, default_http())
         }
 
-        /// Ollama's managed cloud endpoint — the SAME rig client as local Ollama, but treated as a
-        /// keyed cloud backend: `is_local` is false and `reachable` uses the keyed signal, never a
-        /// network probe. An empty `base_url` falls back to `https://ollama.com`.
+        /// Ollama's managed cloud endpoint. An empty `base_url` falls back to `https://ollama.com`.
         pub(crate) fn new_ollama_cloud(
             model: &str,
             base_url: &str,
             api_key: &str,
         ) -> Result<Self, LensError> {
-            Self::build_ollama(
-                model,
-                base_url,
-                OLLAMA_CLOUD_DEFAULT_BASE_URL,
-                api_key,
-                false,
-                default_http(),
-            )
+            Self::build_ollama(model, base_url, api_key, OllamaKind::Cloud, default_http())
         }
 
         fn build_ollama(
             model: &str,
             base_url: &str,
-            default_base: &str,
             api_key: &str,
-            is_local: bool,
+            kind: OllamaKind,
             http: reqwest::Client,
         ) -> Result<Self, LensError> {
             let base = if base_url.is_empty() {
-                default_base
+                kind.default_base()
             } else {
                 base_url
             };
@@ -680,8 +672,7 @@ mod rig_backend {
                 model: RigModel::Ollama(client.completion_model(model)),
                 model_id: model.to_string(),
                 endpoint_base: normalize_base(base),
-                is_local_ollama: is_local,
-                has_key: !api_key.is_empty(),
+                is_local_ollama: kind.is_local(),
                 http,
             })
         }
@@ -734,10 +725,8 @@ mod rig_backend {
         }
 
         /// Dispatches a provider id onto its constructor, reusing `http` for every variant so a
-        /// per-task sibling shares the base provider's client pool. Preserves the id semantics of
-        /// [`super::adapter_for`]: `glm`==`zai`, `openai-compatible`→OpenAI wire at a custom
-        /// base_url, `ollama-cloud`→the Ollama client as a keyed cloud endpoint. Unknown ids error
-        /// (the factory already gates recognition, so this is defensive).
+        /// per-task sibling shares the base provider's client pool. Unknown ids error (the factory
+        /// already gates recognition via [`super::adapter_for`], so this arm is defensive).
         pub(crate) fn from_id(
             provider: &str,
             model: &str,
@@ -746,22 +735,12 @@ mod rig_backend {
             http: reqwest::Client,
         ) -> Result<Self, LensError> {
             match provider {
-                super::PROVIDER_OLLAMA => Self::build_ollama(
-                    model,
-                    base_url,
-                    OLLAMA_DEFAULT_BASE_URL,
-                    api_key,
-                    true,
-                    http,
-                ),
-                super::PROVIDER_OLLAMA_CLOUD => Self::build_ollama(
-                    model,
-                    base_url,
-                    OLLAMA_CLOUD_DEFAULT_BASE_URL,
-                    api_key,
-                    false,
-                    http,
-                ),
+                super::PROVIDER_OLLAMA => {
+                    Self::build_ollama(model, base_url, api_key, OllamaKind::Local, http)
+                }
+                super::PROVIDER_OLLAMA_CLOUD => {
+                    Self::build_ollama(model, base_url, api_key, OllamaKind::Cloud, http)
+                }
                 super::PROVIDER_OPENAI => Self::openai_with_http(model, base_url, api_key, http),
                 super::PROVIDER_OPENAI_COMPAT => {
                     Self::openai_compatible_with_http(model, base_url, api_key, http)
@@ -994,12 +973,9 @@ mod rig_backend {
     /// detail server-side (mirrors [`super::genai_err`]).
     fn rig_err(err: CompletionError) -> LensError {
         tracing::error!(error = %err, "LLM request failed (rig)");
-        // Only the transport-layer `HttpError::Instance` (a reqwest connect/timeout/dns failure)
-        // is a Network error; an `InvalidStatusCode{,WithMessage}` is an HTTP status (semantic →
-        // Model), and its body must never cross IPC. `ProviderError`/`ProviderResponse` are
-        // overloaded — the Ollama streaming path emits `ProviderError` for transport failures while
-        // cloud backends emit both for *semantic* errors — so classify those by message text,
-        // mirroring `genai_err`. Everything else (Json/Url/Request/Response parse) is a Model error.
+        // Only `HttpError::Instance` is transport (→ Network); HTTP status codes are semantic
+        // (→ Model), and `ProviderError`/`ProviderResponse` are classified by message text (shared
+        // with `genai_err`). The response body never crosses IPC.
         let is_transport = match &err {
             CompletionError::HttpError(http_client::Error::Instance(_)) => true,
             CompletionError::ProviderError(msg) => super::looks_like_transport(msg),
@@ -1111,13 +1087,13 @@ mod rig_backend {
         }
 
         async fn reachable(&self) -> bool {
-            // Local Ollama probes network liveness (never a billed token); ollama-cloud and every
-            // cloud variant use the keyed no-network signal instead — a billed generate is locked
-            // out by `cloud_reachable_does_not_perform_a_billed_generate`.
+            // Local Ollama probes network liveness; cloud/compat report reachable without a network
+            // probe, mirroring genai — a genuinely unreachable host or bad key surfaces from
+            // `generate`, never a billed token here.
             if self.is_local_ollama {
                 self.ollama_alive().await
             } else {
-                self.has_key
+                true
             }
         }
 
@@ -1421,6 +1397,10 @@ pub fn build_provider_raw(
 /// endpoint gates in the callers (via [`adapter_for`]/[`native_endpoint`]) — this only builds the
 /// concrete provider once an entry is already deemed usable. A fresh build gets its own hardened
 /// client; [`build_task_provider`] passes the base's so the sibling shares one connection pool.
+///
+/// This seam owns CONSTRUCTION, not endpoint-normalization: genai force-appends `/v1/` for the
+/// OpenAI/Anthropic adapters while rig posts `<base_url>/chat/completions` verbatim, so a custom
+/// `openai-compatible` base must include the version segment. Reconcile before the Phase-2 flip.
 fn construct_provider(
     provider: &str,
     model: &str,
@@ -3097,7 +3077,7 @@ mod rig_tests {
     }
 
     /// A cloud base URL that never resolves — constructors must not touch the network, so this
-    /// still builds Ok and reachability is decided purely by key presence.
+    /// still builds Ok and reachability is decided without a probe.
     const CLOUD_URL: &str = "https://api.example.invalid";
 
     /// Every constructor builds offline and maps its id onto the expected concrete variant —
@@ -3182,9 +3162,7 @@ mod rig_tests {
                 .unwrap()
                 .is_ollama()
         );
-        // ollama-cloud is a keyed cloud endpoint: the `/api/tags` preflight targets the LOCAL
-        // runtime, so it must report `false` (parity with genai's distinct `OllamaCloud` adapter),
-        // else a cloud model is wrongly failed as "not installed locally".
+        // ollama-cloud reports false too: the local-runtime preflight must not fire for it.
         for built in [
             RigProvider::new_ollama_cloud("llama3", CLOUD_URL, "k"),
             RigProvider::new_openai("gpt", CLOUD_URL, "k"),
@@ -3204,11 +3182,11 @@ mod rig_tests {
         ));
     }
 
-    /// Cloud reachability is the keyed no-network signal — keyed ⇒ reachable, keyless ⇒ not —
-    /// and is decided WITHOUT any request, even against an unroutable host (no billed generate,
-    /// mirroring `cloud_reachable_does_not_perform_a_billed_generate`).
+    /// Cloud reachability is `true` without any network probe — keyed OR keyless — mirroring
+    /// genai (a bad key surfaces from `generate`, not here). Uses an unroutable host to prove no
+    /// request is made; a billed generate is separately locked out by the reachable-Ollama test.
     #[tokio::test]
-    async fn rig_cloud_reachable_reflects_key_presence_without_network() {
+    async fn rig_cloud_reachable_is_true_without_network() {
         assert!(
             RigProvider::new_openai("gpt", CLOUD_URL, "k")
                 .unwrap()
@@ -3216,17 +3194,82 @@ mod rig_tests {
                 .await
         );
         assert!(
-            !RigProvider::new_anthropic("claude", CLOUD_URL, "")
+            RigProvider::new_openai("gpt", CLOUD_URL, "")
                 .unwrap()
                 .reachable()
-                .await
+                .await,
+            "keyless cloud is still reachable (mirrors genai)"
         );
         assert!(
             RigProvider::new_ollama_cloud("llama3", CLOUD_URL, "k")
                 .unwrap()
                 .reachable()
                 .await,
-            "ollama-cloud uses the keyed signal, not the local liveness probe"
+            "ollama-cloud uses the no-network signal, not the local liveness probe"
+        );
+    }
+
+    /// Regression: a keyless local OpenAI-compatible server (LM Studio, llama.cpp, vLLM without
+    /// `--api-key`) must report reachable — the old keyed signal wrongly blocked it.
+    #[tokio::test]
+    async fn rig_keyless_openai_compatible_is_reachable() {
+        assert!(
+            RigProvider::new_openai_compatible("m", "http://127.0.0.1:1/v1", "")
+                .unwrap()
+                .reachable()
+                .await
+        );
+    }
+
+    /// Guards against `adapter_for`/`from_id` id-set drift: every recognized id must construct,
+    /// and an unknown id must error.
+    #[tokio::test]
+    async fn rig_from_id_covers_every_adapter_for_id() {
+        for id in [
+            "ollama",
+            "ollama-cloud",
+            "openai",
+            "openai-compatible",
+            "anthropic",
+            "google",
+            "groq",
+            "deepseek",
+            "xai",
+            "cohere",
+            "zai",
+            "glm",
+        ] {
+            assert!(
+                RigProvider::from_id(id, "m", "http://127.0.0.1:1/v1", "k", llm_client()).is_ok(),
+                "from_id must construct {id}"
+            );
+        }
+        assert!(
+            RigProvider::from_id("bogus", "m", "http://127.0.0.1:1/v1", "k", llm_client()).is_err()
+        );
+    }
+
+    /// Characterizes rig's verbatim endpoint handling (see [`super::construct_provider`]): rig
+    /// posts `<base_url>/chat/completions` and injects no extra `/v1`, unlike genai's force-append.
+    #[tokio::test]
+    async fn rig_openai_compatible_posts_base_verbatim() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(openai_chat_body("ok")))
+            .mount(&server)
+            .await;
+
+        let provider =
+            RigProvider::new_openai_compatible("gpt", &format!("{}/v1", server.uri()), "k")
+                .unwrap();
+        let _ = provider.generate(&req()).await;
+
+        let requests = server.received_requests().await.expect("recording on");
+        assert_eq!(
+            requests[0].url.path(),
+            "/v1/chat/completions",
+            "rig must append /chat/completions to the base verbatim, no extra /v1"
         );
     }
 }
