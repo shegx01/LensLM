@@ -1553,12 +1553,14 @@ mod tests {
     }
 
     /// Config with a single cloud (openai-compatible) enrichment entry pointed at
-    /// `base_url`, consented so the provider resolves.
+    /// `base_url`, consented so the provider resolves. The `/v1` segment is part of the
+    /// openai-compatible base so both backends hit `/v1/chat/completions`: genai force-appends
+    /// `/v1` for the OpenAI adapter, while rig posts `<base>/chat/completions` verbatim.
     fn config_enrichment_cloud(base_url: &str, model: &str) -> AppConfig {
         AppConfig {
             models: vec![ModelConfig {
                 provider: "openai-compatible".to_string(),
-                base_url: base_url.to_string(),
+                base_url: format!("{base_url}/v1"),
                 model: model.to_string(),
                 api_key: "sk-test".to_string(),
                 ..ModelConfig::default()

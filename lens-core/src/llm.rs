@@ -139,11 +139,12 @@ pub trait LlmProvider: Send + Sync {
     /// Stable model id; a component of the enrichment composite cache key (AC9).
     fn model_id(&self) -> &str;
 
-    /// Upcast for downcasting to a concrete type. [`task_provider_from_config`] downcasts to
-    /// [`GenaiProvider`] to borrow its client. The default returns a `()` reference that never
-    /// downcasts, so mocks that don't override it cause the per-task path to fall back to base.
-    fn as_any(&self) -> &dyn std::any::Any {
-        &()
+    /// The hardened `reqwest::Client` this provider was built with, exposed so
+    /// [`task_provider_from_config`] can build sibling per-task providers over the SAME client
+    /// (shared connection pool) without downcasting to a concrete type. The default `None` makes
+    /// mocks and clients that can't share fall back to reusing the base provider unchanged.
+    fn shared_http_client(&self) -> Option<reqwest::Client> {
+        None
     }
 
     /// Whether this provider runs on-device (local Ollama). Lets callers relax limits
@@ -241,12 +242,16 @@ struct ResolvedTarget {
 pub struct GenaiProvider {
     client: Client,
     resolved: ResolvedTarget,
+    /// The hardened reqwest client backing `client`, kept so `shared_http_client` can hand it to
+    /// sibling per-task providers (genai's `Client` does not re-expose its inner reqwest).
+    http: reqwest::Client,
 }
 
 /// Normalizes a `base_url` into the endpoint base genai expects. genai concatenates a relative
 /// path onto this base, so it must end in `/`. OpenAI/Anthropic adapters also need `/v1/`
 /// (they append `chat/completions` / `messages` after the version segment); Ollama only needs
-/// a trailing slash.
+/// a trailing slash. Unused under `llm-backend-rig` (rig owns endpoint handling there).
+#[cfg_attr(feature = "llm-backend-rig", allow(dead_code))]
 fn normalize_endpoint(adapter: AdapterKind, base_url: &str) -> String {
     let trimmed = base_url.trim_end_matches('/');
     let needs_v1 = matches!(adapter, AdapterKind::OpenAI | AdapterKind::Anthropic);
@@ -282,21 +287,26 @@ fn native_endpoint(adapter: AdapterKind) -> Option<Endpoint> {
 }
 
 impl GenaiProvider {
-    /// Builds a provider with its own genai client. Per-task providers use
-    /// [`new_with_client`](Self::new_with_client) to share one client across coref/map.
+    /// Builds a provider with its own hardened client. Lib code goes through
+    /// [`new_with_http`](Self::new_with_http) (via the construction seam); this stays as a
+    /// terse test constructor.
+    #[cfg(test)]
     fn new(adapter: AdapterKind, model: &str, base_url: &str, api_key: &str) -> Self {
-        let client = Client::builder().with_reqwest(llm_client()).build();
-        Self::new_with_client(client, adapter, model, base_url, api_key)
+        Self::new_with_http(llm_client(), adapter, model, base_url, api_key)
     }
 
-    /// Builds a provider reusing an existing genai client (only the pinned target differs).
-    fn new_with_client(
-        client: Client,
+    /// Builds a provider over a given hardened reqwest client (only the pinned target differs),
+    /// so sibling per-task providers reuse one connection pool. Unused under `llm-backend-rig`
+    /// (rig is the active backend there) but retained as the default backend.
+    #[cfg_attr(feature = "llm-backend-rig", allow(dead_code))]
+    fn new_with_http(
+        http: reqwest::Client,
         adapter: AdapterKind,
         model: &str,
         base_url: &str,
         api_key: &str,
     ) -> Self {
+        let client = Client::builder().with_reqwest(http.clone()).build();
         let model_iden = ModelIden::new(adapter, model.to_string());
         // Configured base_url wins (custom/self-hosted or explicit override). With no base_url,
         // a native cloud adapter falls back to its canonical endpoint; otherwise normalize an
@@ -326,12 +336,8 @@ impl GenaiProvider {
                 endpoint_base: normalized,
                 has_key: !api_key.is_empty(),
             },
+            http,
         }
-    }
-
-    /// Returns a cheap `Arc`-backed clone of the genai client for sibling per-task providers.
-    fn client_handle(&self) -> Client {
-        self.client.clone()
     }
 
     fn map_request(req: &LlmRequest) -> (ChatRequest, ChatOptions) {
@@ -403,8 +409,8 @@ impl LlmProvider for GenaiProvider {
         &self.resolved.model_id
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
+    fn shared_http_client(&self) -> Option<reqwest::Client> {
+        Some(self.http.clone())
     }
 
     fn is_local(&self) -> bool {
@@ -552,6 +558,9 @@ mod rig_backend {
         /// Whether a non-empty API key was supplied — the no-network reachability signal for
         /// every cloud backend (keyed ⇒ reachable, keyless ⇒ not).
         has_key: bool,
+        /// The hardened client this provider was built with, kept so `shared_http_client` can hand
+        /// it to sibling per-task providers (rig's completion model does not re-expose it).
+        http: reqwest::Client,
     }
 
     /// Maps a rig client `build()` failure onto a fixed generic [`LensError`], logging the full
@@ -561,23 +570,36 @@ mod rig_backend {
         LensError::Model("failed to initialize the language model client".to_string())
     }
 
-    /// Generates a cloud-provider constructor: `.api_key(api_key)` on a single code path (empty
-    /// keys are allowed — cloud reachability is decided in `reachable`, not here) and
-    /// `.base_url(base_url)` only when non-empty so an empty value keeps the provider default.
-    /// These are runtime values and never change the builder's concrete type.
+    /// The hardened reqwest client every backend is built with (SSRF/timeout policy). A fresh
+    /// build gets one from here; sibling per-task providers reuse the base's via `from_id`.
+    fn default_http() -> reqwest::Client {
+        crate::http::hardened_client_idle(LLM_CONNECT_TIMEOUT, LLM_GENERATION_IDLE_TIMEOUT)
+    }
+
+    /// Generates a cloud-provider constructor pair: a public `$name` that builds a fresh hardened
+    /// client and a private `$with` that takes one (so a sibling per-task provider reuses the
+    /// base's). Both set `.api_key(api_key)` on a single code path (empty keys are allowed — cloud
+    /// reachability is decided in `reachable`, not here) and `.base_url(base_url)` only when
+    /// non-empty so an empty value keeps the provider default. These are runtime values and never
+    /// change the builder's concrete type.
     macro_rules! cloud_ctor {
-        ($(#[$m:meta])* $name:ident, $client:ty, $variant:ident) => {
+        ($(#[$m:meta])* $name:ident, $with:ident, $client:ty, $variant:ident) => {
             $(#[$m])*
             pub(crate) fn $name(
                 model: &str,
                 base_url: &str,
                 api_key: &str,
             ) -> Result<Self, LensError> {
-                let http = crate::http::hardened_client_idle(
-                    LLM_CONNECT_TIMEOUT,
-                    LLM_GENERATION_IDLE_TIMEOUT,
-                );
-                let mut builder = <$client>::builder().api_key(api_key).http_client(http);
+                Self::$with(model, base_url, api_key, default_http())
+            }
+
+            fn $with(
+                model: &str,
+                base_url: &str,
+                api_key: &str,
+                http: reqwest::Client,
+            ) -> Result<Self, LensError> {
+                let mut builder = <$client>::builder().api_key(api_key).http_client(http.clone());
                 if !base_url.is_empty() {
                     builder = builder.base_url(base_url);
                 }
@@ -588,6 +610,7 @@ mod rig_backend {
                     endpoint_base: String::new(),
                     is_local_ollama: false,
                     has_key: !api_key.is_empty(),
+                    http,
                 })
             }
         };
@@ -601,7 +624,14 @@ mod rig_backend {
             base_url: &str,
             api_key: &str,
         ) -> Result<Self, LensError> {
-            Self::build_ollama(model, base_url, OLLAMA_DEFAULT_BASE_URL, api_key, true)
+            Self::build_ollama(
+                model,
+                base_url,
+                OLLAMA_DEFAULT_BASE_URL,
+                api_key,
+                true,
+                default_http(),
+            )
         }
 
         /// Ollama's managed cloud endpoint — the SAME rig client as local Ollama, but treated as a
@@ -612,7 +642,14 @@ mod rig_backend {
             base_url: &str,
             api_key: &str,
         ) -> Result<Self, LensError> {
-            Self::build_ollama(model, base_url, OLLAMA_CLOUD_DEFAULT_BASE_URL, api_key, false)
+            Self::build_ollama(
+                model,
+                base_url,
+                OLLAMA_CLOUD_DEFAULT_BASE_URL,
+                api_key,
+                false,
+                default_http(),
+            )
         }
 
         fn build_ollama(
@@ -621,18 +658,17 @@ mod rig_backend {
             default_base: &str,
             api_key: &str,
             is_local: bool,
+            http: reqwest::Client,
         ) -> Result<Self, LensError> {
             let base = if base_url.is_empty() {
                 default_base
             } else {
                 base_url
             };
-            let http =
-                crate::http::hardened_client_idle(LLM_CONNECT_TIMEOUT, LLM_GENERATION_IDLE_TIMEOUT);
             let client = ollama::Client::builder()
                 .api_key(ollama::OllamaApiKey::from(api_key))
                 .base_url(base)
-                .http_client(http)
+                .http_client(http.clone())
                 .build()
                 .map_err(map_build_err)?;
             Ok(Self {
@@ -641,6 +677,7 @@ mod rig_backend {
                 endpoint_base: normalize_base(base),
                 is_local_ollama: is_local,
                 has_key: !api_key.is_empty(),
+                http,
             })
         }
 
@@ -648,17 +685,23 @@ mod rig_backend {
             /// OpenAI's Chat Completions API. Uses `openai::CompletionsClient` (not the default
             /// `openai::Client`, which yields the Responses-API model).
             new_openai,
+            openai_with_http,
             openai::CompletionsClient,
             OpenAi
         );
-        cloud_ctor!(new_anthropic, anthropic::Client, Anthropic);
-        cloud_ctor!(new_gemini, gemini::Client, Gemini);
-        cloud_ctor!(new_cohere, cohere::Client, Cohere);
-        cloud_ctor!(new_xai, xai::Client, Xai);
-        cloud_ctor!(new_groq, groq::Client, Groq);
-        cloud_ctor!(new_deepseek, deepseek::Client, DeepSeek);
+        cloud_ctor!(
+            new_anthropic,
+            anthropic_with_http,
+            anthropic::Client,
+            Anthropic
+        );
+        cloud_ctor!(new_gemini, gemini_with_http, gemini::Client, Gemini);
+        cloud_ctor!(new_cohere, cohere_with_http, cohere::Client, Cohere);
+        cloud_ctor!(new_xai, xai_with_http, xai::Client, Xai);
+        cloud_ctor!(new_groq, groq_with_http, groq::Client, Groq);
+        cloud_ctor!(new_deepseek, deepseek_with_http, deepseek::Client, DeepSeek);
         // glm and zai both build the Zai variant (GLM models are Z.ai's).
-        cloud_ctor!(new_zai, zai::Client, Zai);
+        cloud_ctor!(new_zai, zai_with_http, zai::Client, Zai);
 
         /// An OpenAI-wire-compatible provider at a user-supplied endpoint. The custom `base_url`
         /// is mandatory (there is no default host to fall back to); otherwise identical to
@@ -668,12 +711,73 @@ mod rig_backend {
             base_url: &str,
             api_key: &str,
         ) -> Result<Self, LensError> {
+            Self::openai_compatible_with_http(model, base_url, api_key, default_http())
+        }
+
+        fn openai_compatible_with_http(
+            model: &str,
+            base_url: &str,
+            api_key: &str,
+            http: reqwest::Client,
+        ) -> Result<Self, LensError> {
             if base_url.is_empty() {
                 return Err(LensError::Validation(
                     "an OpenAI-compatible provider requires a base URL".to_string(),
                 ));
             }
-            Self::new_openai(model, base_url, api_key)
+            Self::openai_with_http(model, base_url, api_key, http)
+        }
+
+        /// Dispatches a provider id onto its constructor, reusing `http` for every variant so a
+        /// per-task sibling shares the base provider's client pool. Preserves the id semantics of
+        /// [`super::adapter_for`]: `glm`==`zai`, `openai-compatible`→OpenAI wire at a custom
+        /// base_url, `ollama-cloud`→the Ollama client as a keyed cloud endpoint. Unknown ids error
+        /// (the factory already gates recognition, so this is defensive).
+        pub(crate) fn from_id(
+            provider: &str,
+            model: &str,
+            base_url: &str,
+            api_key: &str,
+            http: reqwest::Client,
+        ) -> Result<Self, LensError> {
+            match provider {
+                super::PROVIDER_OLLAMA => Self::build_ollama(
+                    model,
+                    base_url,
+                    OLLAMA_DEFAULT_BASE_URL,
+                    api_key,
+                    true,
+                    http,
+                ),
+                super::PROVIDER_OLLAMA_CLOUD => Self::build_ollama(
+                    model,
+                    base_url,
+                    OLLAMA_CLOUD_DEFAULT_BASE_URL,
+                    api_key,
+                    false,
+                    http,
+                ),
+                super::PROVIDER_OPENAI => Self::openai_with_http(model, base_url, api_key, http),
+                super::PROVIDER_OPENAI_COMPAT => {
+                    Self::openai_compatible_with_http(model, base_url, api_key, http)
+                }
+                super::PROVIDER_ANTHROPIC => {
+                    Self::anthropic_with_http(model, base_url, api_key, http)
+                }
+                super::PROVIDER_GOOGLE => Self::gemini_with_http(model, base_url, api_key, http),
+                super::PROVIDER_ZAI | super::PROVIDER_GLM => {
+                    Self::zai_with_http(model, base_url, api_key, http)
+                }
+                super::PROVIDER_GROQ => Self::groq_with_http(model, base_url, api_key, http),
+                super::PROVIDER_DEEPSEEK => {
+                    Self::deepseek_with_http(model, base_url, api_key, http)
+                }
+                super::PROVIDER_XAI => Self::xai_with_http(model, base_url, api_key, http),
+                super::PROVIDER_COHERE => Self::cohere_with_http(model, base_url, api_key, http),
+                other => Err(LensError::Validation(format!(
+                    "unknown LLM provider id: {other}"
+                ))),
+            }
         }
 
         /// Test-only discriminant so id→variant mapping can be asserted without exposing the
@@ -873,13 +977,14 @@ mod rig_backend {
         };
     }
 
-    // TODO(#257): override `as_any` (or add a shared-client trait method) before rig becomes a
-    // base provider — `task_provider_from_config`'s client-sharing downcast otherwise falls back
-    // to base for a `RigProvider`.
     #[async_trait]
     impl LlmProvider for RigProvider {
         fn model_id(&self) -> &str {
             &self.model_id
+        }
+
+        fn shared_http_client(&self) -> Option<reqwest::Client> {
+            Some(self.http.clone())
         }
 
         fn is_local(&self) -> bool {
@@ -1017,9 +1122,10 @@ pub fn task_provider_from_config(
     }
 }
 
-/// Builds a sibling [`GenaiProvider`] pinned to `task_model`, reusing `base`'s client.
-/// Returns `None` when no matching config entry exists, the provider is ungated, or
-/// `base` is not a [`GenaiProvider`] (e.g. a test mock).
+/// Builds a sibling provider pinned to `task_model`, reusing `base`'s hardened client (one
+/// connection pool across coref/map). Returns `None` — so the caller reuses `base` unchanged —
+/// when no matching config entry exists, the provider is ungated/unrecognized, or `base` does not
+/// expose a shareable client (e.g. a test mock). Backend-agnostic: no concrete-type downcast.
 fn build_task_provider(
     base: &Arc<dyn LlmProvider>,
     task_model: &crate::config::TaskModel,
@@ -1027,7 +1133,8 @@ fn build_task_provider(
     cloud_consent: bool,
 ) -> Option<Arc<dyn LlmProvider>> {
     let want_provider = task_model.provider.to_ascii_lowercase();
-    let adapter = adapter_for(&want_provider)?;
+    // Recognized provider only (mirrors the factory gate); unknown → fall back to base.
+    adapter_for(&want_provider)?;
 
     // Prefer the entry matching both provider AND override model (e.g. two Ollama endpoints,
     // instruct vs. coder); fall back to the first entry for that provider.
@@ -1054,15 +1161,15 @@ fn build_task_provider(
         return None;
     }
 
-    let base_genai = base.as_any().downcast_ref::<GenaiProvider>()?;
-    let client = base_genai.client_handle();
-    Some(Arc::new(GenaiProvider::new_with_client(
-        client,
-        adapter,
+    // Reuse the base's client via the trait, not a concrete downcast — `None` (mocks) falls back.
+    let http = base.shared_http_client()?;
+    construct_provider_with_http(
+        &want_provider,
         &task_model.model,
         &entry.base_url,
         &entry.api_key,
-    )))
+        http,
+    )
 }
 
 /// Routing-aware selection over configured model entries; split out for testability.
@@ -1152,8 +1259,8 @@ fn has_endpoint(model: &crate::config::ModelConfig) -> bool {
     adapter_for(&model.provider.to_ascii_lowercase()).is_some_and(|a| native_endpoint(a).is_some())
 }
 
-/// Builds a [`GenaiProvider`] for a recognized entry (caller applies [`build_eligible`] first).
-/// Returns `None` for an unrecognized provider, empty model, or missing endpoint.
+/// Builds the active [`LlmProvider`] for a recognized entry (caller applies [`build_eligible`]
+/// first). Returns `None` for an unrecognized provider, empty model, or missing endpoint.
 fn build_provider(model: &crate::config::ModelConfig) -> Option<Arc<dyn LlmProvider>> {
     if model.model.is_empty() {
         return None;
@@ -1164,12 +1271,7 @@ fn build_provider(model: &crate::config::ModelConfig) -> Option<Arc<dyn LlmProvi
     if model.base_url.is_empty() && native_endpoint(adapter).is_none() {
         return None;
     }
-    Some(Arc::new(GenaiProvider::new(
-        adapter,
-        &model.model,
-        &model.base_url,
-        &model.api_key,
-    )))
+    construct_provider(&provider, &model.model, &model.base_url, &model.api_key)
 }
 
 /// Builds a provider directly from raw, unsaved params (issue #90 interactive validation).
@@ -1193,13 +1295,57 @@ pub fn build_provider_raw(
             return None;
         }
     }
-    let adapter = adapter_for(&provider.to_ascii_lowercase())?;
+    let lower = provider.to_ascii_lowercase();
+    let adapter = adapter_for(&lower)?;
     if base_url.is_empty() && native_endpoint(adapter).is_none() {
         return None;
     }
-    Some(Arc::new(GenaiProvider::new(
-        adapter, model, base_url, api_key,
+    construct_provider(&lower, model, base_url, api_key)
+}
+
+/// The backend-construction seam. `genai` is the default; the `llm-backend-rig` feature swaps in
+/// [`RigProvider`] for every recognized id. Both backends share the id-recognition, consent, and
+/// endpoint gates in the callers (via [`adapter_for`]/[`native_endpoint`]) — this only builds the
+/// concrete provider once an entry is already deemed usable. A fresh build gets its own hardened
+/// client; [`build_task_provider`] passes the base's so the sibling shares one connection pool.
+fn construct_provider(
+    provider: &str,
+    model: &str,
+    base_url: &str,
+    api_key: &str,
+) -> Option<Arc<dyn LlmProvider>> {
+    construct_provider_with_http(provider, model, base_url, api_key, llm_client())
+}
+
+#[cfg(not(feature = "llm-backend-rig"))]
+fn construct_provider_with_http(
+    provider: &str,
+    model: &str,
+    base_url: &str,
+    api_key: &str,
+    http: reqwest::Client,
+) -> Option<Arc<dyn LlmProvider>> {
+    let adapter = adapter_for(provider)?;
+    Some(Arc::new(GenaiProvider::new_with_http(
+        http, adapter, model, base_url, api_key,
     )))
+}
+
+#[cfg(feature = "llm-backend-rig")]
+fn construct_provider_with_http(
+    provider: &str,
+    model: &str,
+    base_url: &str,
+    api_key: &str,
+    http: reqwest::Client,
+) -> Option<Arc<dyn LlmProvider>> {
+    match RigProvider::from_id(provider, model, base_url, api_key, http) {
+        Ok(built) => Some(Arc::new(built)),
+        Err(err) => {
+            tracing::error!(error = %err, provider, "failed to build rig provider");
+            None
+        }
+    }
 }
 
 /// A configured `(provider, model)` offered as the active chat model, with its computed
@@ -2713,7 +2859,10 @@ mod rig_tests {
             RigProvider::new_groq("llama", CLOUD_URL, "k"),
             RigProvider::new_zai("glm-4", CLOUD_URL, "k"),
         ] {
-            assert!(!built.unwrap().is_local(), "cloud backend must not be local");
+            assert!(
+                !built.unwrap().is_local(),
+                "cloud backend must not be local"
+            );
         }
     }
 
