@@ -44,10 +44,12 @@ fn dialogue_content() -> String {
 }
 
 /// A non-streamed Ollama `/api/chat` body. `prompt_eval_count + eval_count` is what
-/// genai maps into `LlmResponse::tokens_used`.
+/// genai maps into `LlmResponse::tokens_used`. `created_at` is required by rig's typed
+/// `CompletionResponse` (the `llm-backend-rig` path) and ignored by genai.
 fn ollama_chat_response(content: &str) -> serde_json::Value {
     serde_json::json!({
         "model": "llama3",
+        "created_at": "2024-01-01T00:00:00Z",
         "message": { "role": "assistant", "content": content },
         "done": true,
         "done_reason": "stop",

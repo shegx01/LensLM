@@ -621,15 +621,18 @@ mod tests {
     use crate::config::{AppConfig, EnrichmentConfig, ModelConfig, TaskModel};
     use crate::enrichment::coref::resolve_coref_batch;
     use crate::enrichment::meta::{Budget, SessionBudget};
-    use crate::llm::{GenaiProvider, provider_from_config, task_provider_from_config};
+    use crate::llm::{provider_from_config, task_provider_from_config};
 
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    /// An Ollama `/api/chat` body carrying a model field + the given assistant text.
+    /// An Ollama `/api/chat` body carrying a model field + the given assistant text. `created_at`
+    /// is required by rig's typed `CompletionResponse` (the `llm-backend-rig` path) and ignored by
+    /// genai, so it keeps the fixture valid under both backends.
     fn ollama_body(model: &str, content: &str) -> serde_json::Value {
         serde_json::json!({
             "model": model,
+            "created_at": "2024-01-01T00:00:00Z",
             "message": { "role": "assistant", "content": content },
             "done": true,
             "done_reason": "stop",
@@ -720,9 +723,10 @@ mod tests {
             .expect("coref pass dispatches against the override");
         assert!(subs.is_empty() || subs.values().all(|v| v.is_empty()));
 
-        let base_genai = base.as_any().downcast_ref::<GenaiProvider>();
-        let coref_genai = coref_provider.as_any().downcast_ref::<GenaiProvider>();
-        assert!(base_genai.is_some() && coref_genai.is_some());
+        // Both expose a shareable client (backend-agnostic — no concrete-type downcast); the
+        // sibling per-task provider was built over the base's pool rather than a fresh one.
+        assert!(base.shared_http_client().is_some());
+        assert!(coref_provider.shared_http_client().is_some());
 
         drop(instruct_server);
         drop(coder_server);
@@ -732,7 +736,7 @@ mod tests {
     use crate::llm::LlmProvider;
     use std::sync::Arc;
 
-    /// Non-Ollama mock provider: `as_any` never downcasts to `GenaiProvider` → preflight Proceeds.
+    /// Non-Ollama mock provider: `is_ollama()` is `false` → preflight Proceeds.
     struct MockCloudProvider;
     #[async_trait::async_trait]
     impl LlmProvider for MockCloudProvider {
