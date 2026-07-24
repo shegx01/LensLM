@@ -501,7 +501,9 @@ mod rig_backend {
         Message as RigMessage, Usage,
     };
     use rig_core::http_client;
-    use rig_core::providers::ollama;
+    use rig_core::providers::{
+        anthropic, cohere, deepseek, gemini, groq, ollama, openai, xai, zai,
+    };
     use rig_core::schemars::Schema;
     use rig_core::streaming::StreamedAssistantContent;
 
@@ -514,11 +516,25 @@ mod rig_backend {
     /// Ollama's canonical default endpoint, mirrored so an empty `base_url` stays construct-able.
     const OLLAMA_DEFAULT_BASE_URL: &str = "http://localhost:11434";
 
-    /// Per-provider rig completion models. Phase 0 ships only Ollama; Phase 1 (#257) adds the
-    /// remaining 11 provider ids. rig's `CompletionModel` carries associated types (it is not
+    /// Ollama's managed cloud endpoint, used when `new_ollama_cloud` gets an empty `base_url`.
+    const OLLAMA_CLOUD_DEFAULT_BASE_URL: &str = "https://ollama.com";
+
+    /// One variant per distinct rig concrete completion-model type — NOT per provider id: the
+    /// provider ids that share a client (openai/openai-compatible, ollama/ollama-cloud, glm/zai)
+    /// collapse onto one variant. rig's `CompletionModel` carries associated types (it is not
     /// object-safe), so the backends are enum-dispatched rather than held behind `dyn`.
     enum RigModel {
         Ollama(ollama::CompletionModel<reqwest::Client>),
+        // Chat Completions API — NOT the Responses API model that `openai::Client` yields.
+        OpenAi(openai::completion::CompletionModel<reqwest::Client>),
+        Anthropic(anthropic::completion::CompletionModel<reqwest::Client>),
+        Gemini(gemini::completion::CompletionModel<reqwest::Client>),
+        Cohere(cohere::completion::CompletionModel<reqwest::Client>),
+        Xai(xai::completion::CompletionModel<reqwest::Client>),
+        Groq(groq::CompletionModel<reqwest::Client>),
+        DeepSeek(deepseek::CompletionModel<reqwest::Client>),
+        // Z.ai (GLM) has no provider-level `CompletionModel` alias; name the generic type directly.
+        Zai(openai::completion::GenericCompletionModel<zai::ZAiExt, reqwest::Client>),
     }
 
     /// A single LLM backend over rig. Constructed with our hardened reqwest client injected via
@@ -526,8 +542,55 @@ mod rig_backend {
     pub struct RigProvider {
         model: RigModel,
         model_id: String,
-        /// Always ends in `/`; the Ollama reachability probe appends `api/version`.
+        /// Always ends in `/`; only the local-Ollama reachability probe reads it (it appends
+        /// `api/version`). Cloud backends never probe, so the field is unused for them.
         endpoint_base: String,
+        /// True only for a local Ollama runtime. Drives `is_local` and selects the network
+        /// liveness probe over the keyed cloud signal in `reachable`. False for ollama-cloud
+        /// (a keyed cloud endpoint reusing the same rig client) and every cloud provider.
+        is_local_ollama: bool,
+        /// Whether a non-empty API key was supplied — the no-network reachability signal for
+        /// every cloud backend (keyed ⇒ reachable, keyless ⇒ not).
+        has_key: bool,
+    }
+
+    /// Maps a rig client `build()` failure onto a fixed generic [`LensError`], logging the full
+    /// detail server-side. Never leaks the client's error string across IPC.
+    fn map_build_err(err: http_client::Error) -> LensError {
+        tracing::error!(error = %err, "failed to build rig LLM client");
+        LensError::Model("failed to initialize the language model client".to_string())
+    }
+
+    /// Generates a cloud-provider constructor: `.api_key(api_key)` on a single code path (empty
+    /// keys are allowed — cloud reachability is decided in `reachable`, not here) and
+    /// `.base_url(base_url)` only when non-empty so an empty value keeps the provider default.
+    /// These are runtime values and never change the builder's concrete type.
+    macro_rules! cloud_ctor {
+        ($(#[$m:meta])* $name:ident, $client:ty, $variant:ident) => {
+            $(#[$m])*
+            pub(crate) fn $name(
+                model: &str,
+                base_url: &str,
+                api_key: &str,
+            ) -> Result<Self, LensError> {
+                let http = crate::http::hardened_client_idle(
+                    LLM_CONNECT_TIMEOUT,
+                    LLM_GENERATION_IDLE_TIMEOUT,
+                );
+                let mut builder = <$client>::builder().api_key(api_key).http_client(http);
+                if !base_url.is_empty() {
+                    builder = builder.base_url(base_url);
+                }
+                let client = builder.build().map_err(map_build_err)?;
+                Ok(Self {
+                    model: RigModel::$variant(client.completion_model(model)),
+                    model_id: model.to_string(),
+                    endpoint_base: String::new(),
+                    is_local_ollama: false,
+                    has_key: !api_key.is_empty(),
+                })
+            }
+        };
     }
 
     impl RigProvider {
@@ -538,8 +601,29 @@ mod rig_backend {
             base_url: &str,
             api_key: &str,
         ) -> Result<Self, LensError> {
+            Self::build_ollama(model, base_url, OLLAMA_DEFAULT_BASE_URL, api_key, true)
+        }
+
+        /// Ollama's managed cloud endpoint — the SAME rig client as local Ollama, but treated as a
+        /// keyed cloud backend: `is_local` is false and `reachable` uses the keyed signal, never a
+        /// network probe. An empty `base_url` falls back to `https://ollama.com`.
+        pub(crate) fn new_ollama_cloud(
+            model: &str,
+            base_url: &str,
+            api_key: &str,
+        ) -> Result<Self, LensError> {
+            Self::build_ollama(model, base_url, OLLAMA_CLOUD_DEFAULT_BASE_URL, api_key, false)
+        }
+
+        fn build_ollama(
+            model: &str,
+            base_url: &str,
+            default_base: &str,
+            api_key: &str,
+            is_local: bool,
+        ) -> Result<Self, LensError> {
             let base = if base_url.is_empty() {
-                OLLAMA_DEFAULT_BASE_URL
+                default_base
             } else {
                 base_url
             };
@@ -550,15 +634,63 @@ mod rig_backend {
                 .base_url(base)
                 .http_client(http)
                 .build()
-                .map_err(|err| {
-                    tracing::error!(error = %err, "failed to build rig Ollama client");
-                    LensError::Model("failed to initialize the language model client".to_string())
-                })?;
+                .map_err(map_build_err)?;
             Ok(Self {
                 model: RigModel::Ollama(client.completion_model(model)),
                 model_id: model.to_string(),
                 endpoint_base: normalize_base(base),
+                is_local_ollama: is_local,
+                has_key: !api_key.is_empty(),
             })
+        }
+
+        cloud_ctor!(
+            /// OpenAI's Chat Completions API. Uses `openai::CompletionsClient` (not the default
+            /// `openai::Client`, which yields the Responses-API model).
+            new_openai,
+            openai::CompletionsClient,
+            OpenAi
+        );
+        cloud_ctor!(new_anthropic, anthropic::Client, Anthropic);
+        cloud_ctor!(new_gemini, gemini::Client, Gemini);
+        cloud_ctor!(new_cohere, cohere::Client, Cohere);
+        cloud_ctor!(new_xai, xai::Client, Xai);
+        cloud_ctor!(new_groq, groq::Client, Groq);
+        cloud_ctor!(new_deepseek, deepseek::Client, DeepSeek);
+        // glm and zai both build the Zai variant (GLM models are Z.ai's).
+        cloud_ctor!(new_zai, zai::Client, Zai);
+
+        /// An OpenAI-wire-compatible provider at a user-supplied endpoint. The custom `base_url`
+        /// is mandatory (there is no default host to fall back to); otherwise identical to
+        /// [`Self::new_openai`].
+        pub(crate) fn new_openai_compatible(
+            model: &str,
+            base_url: &str,
+            api_key: &str,
+        ) -> Result<Self, LensError> {
+            if base_url.is_empty() {
+                return Err(LensError::Validation(
+                    "an OpenAI-compatible provider requires a base URL".to_string(),
+                ));
+            }
+            Self::new_openai(model, base_url, api_key)
+        }
+
+        /// Test-only discriminant so id→variant mapping can be asserted without exposing the
+        /// private [`RigModel`] type across the module boundary.
+        #[cfg(test)]
+        pub(crate) fn variant_name(&self) -> &'static str {
+            match &self.model {
+                RigModel::Ollama(_) => "ollama",
+                RigModel::OpenAi(_) => "openai",
+                RigModel::Anthropic(_) => "anthropic",
+                RigModel::Gemini(_) => "gemini",
+                RigModel::Cohere(_) => "cohere",
+                RigModel::Xai(_) => "xai",
+                RigModel::Groq(_) => "groq",
+                RigModel::DeepSeek(_) => "deepseek",
+                RigModel::Zai(_) => "zai",
+            }
         }
 
         /// Unauthenticated GET to `{endpoint_base}api/version` — never bills a token, mirroring
@@ -672,6 +804,75 @@ mod rig_backend {
         }
     }
 
+    /// Runs one buffered completion. Generic over the rig model so every [`RigModel`] variant
+    /// shares this body via `dispatch!`.
+    async fn rig_generate<M: CompletionModel>(
+        model: &M,
+        req: &LlmRequest,
+    ) -> Result<LlmResponse, LensError> {
+        let request = map_request(model, req);
+        let resp = model.completion(request).await.map_err(rig_err)?;
+        let text = resp
+            .choice
+            .iter()
+            .filter_map(|content| match content {
+                AssistantContent::Text(t) => Some(t.text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        let tokens_used = usage_to_tokens(&resp.usage);
+        Ok(LlmResponse { text, tokens_used })
+    }
+
+    /// Runs one streaming completion, mapping rig's stream items onto the [`StreamChunk`] text
+    /// contract. Generic over the rig model so every variant shares this body via `dispatch!`.
+    async fn rig_stream<M>(
+        model: &M,
+        req: &LlmRequest,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, LensError>> + Send>>, LensError>
+    where
+        M: CompletionModel,
+        M::StreamingResponse: 'static,
+    {
+        let request = map_request(model, req);
+        let stream = model.stream(request).await.map_err(rig_err)?;
+        let mapped = stream.filter_map(|ev| async move {
+            match ev {
+                Ok(StreamedAssistantContent::Text(t)) => Some(Ok(StreamChunk::TextDelta(t.text))),
+                Ok(StreamedAssistantContent::ReasoningDelta { reasoning, .. }) => {
+                    Some(Ok(StreamChunk::ThinkingDelta(reasoning)))
+                }
+                Ok(StreamedAssistantContent::Final(resp)) => Some(Ok(StreamChunk::Done {
+                    tokens_used: usage_to_tokens(&resp.token_usage()),
+                })),
+                // Tool calls / full reasoning blocks / unknown items: not part of the text
+                // contract. Ollama streaming never emits them for enrichment.
+                Ok(_) => None,
+                Err(e) => Some(Err(rig_err(e))),
+            }
+        });
+        Ok(Box::pin(mapped))
+    }
+
+    /// Binds the inner model of any [`RigModel`] variant to `$m` and runs `$body` — the arms are
+    /// identical modulo the model value, so enumerate the variants once here.
+    macro_rules! dispatch {
+        ($model:expr, $m:ident => $body:expr) => {
+            match $model {
+                RigModel::Ollama($m) => $body,
+                RigModel::OpenAi($m) => $body,
+                RigModel::Anthropic($m) => $body,
+                RigModel::Gemini($m) => $body,
+                RigModel::Cohere($m) => $body,
+                RigModel::Xai($m) => $body,
+                RigModel::Groq($m) => $body,
+                RigModel::DeepSeek($m) => $body,
+                RigModel::Zai($m) => $body,
+            }
+        };
+    }
+
     // TODO(#257): override `as_any` (or add a shared-client trait method) before rig becomes a
     // base provider — `task_provider_from_config`'s client-sharing downcast otherwise falls back
     // to base for a `RigProvider`.
@@ -681,41 +882,31 @@ mod rig_backend {
             &self.model_id
         }
 
-        // Phase 1: cloud `RigModel` variants must return `false` here.
         fn is_local(&self) -> bool {
             self.is_ollama()
         }
 
+        // Matches genai (adapter == `Ollama`): true ONLY for a local Ollama runtime, NOT
+        // ollama-cloud. The `/api/tags` model-installed preflight targets the LOCAL runtime
+        // (`ollama_base_url(config)`), so firing it for a keyed cloud model would falsely fail;
+        // `adapter_for` likewise maps ollama-cloud to a distinct `OllamaCloud` adapter.
         fn is_ollama(&self) -> bool {
-            matches!(self.model, RigModel::Ollama(_))
+            self.is_local_ollama
         }
 
         async fn reachable(&self) -> bool {
-            match &self.model {
-                // Cloud variants (Phase 1) will return the keyless/keyed no-network signal here,
-                // never a billed probe (locked by `cloud_reachable_does_not_perform_a_billed_generate`).
-                RigModel::Ollama(_) => self.ollama_alive().await,
+            // Local Ollama probes network liveness (never a billed token); ollama-cloud and every
+            // cloud variant use the keyed no-network signal instead — a billed generate is locked
+            // out by `cloud_reachable_does_not_perform_a_billed_generate`.
+            if self.is_local_ollama {
+                self.ollama_alive().await
+            } else {
+                self.has_key
             }
         }
 
         async fn generate(&self, req: &LlmRequest) -> Result<LlmResponse, LensError> {
-            match &self.model {
-                RigModel::Ollama(model) => {
-                    let request = map_request(model, req);
-                    let resp = model.completion(request).await.map_err(rig_err)?;
-                    let text = resp
-                        .choice
-                        .iter()
-                        .filter_map(|content| match content {
-                            AssistantContent::Text(t) => Some(t.text.clone()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("");
-                    let tokens_used = usage_to_tokens(&resp.usage);
-                    Ok(LlmResponse { text, tokens_used })
-                }
-            }
+            dispatch!(&self.model, model => rig_generate(model, req).await)
         }
 
         async fn generate_stream(
@@ -723,32 +914,7 @@ mod rig_backend {
             req: &LlmRequest,
         ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, LensError>> + Send>>, LensError>
         {
-            match &self.model {
-                RigModel::Ollama(model) => {
-                    let request = map_request(model, req);
-                    let stream = model.stream(request).await.map_err(rig_err)?;
-                    let mapped = stream.filter_map(|ev| async move {
-                        match ev {
-                            Ok(StreamedAssistantContent::Text(t)) => {
-                                Some(Ok(StreamChunk::TextDelta(t.text)))
-                            }
-                            Ok(StreamedAssistantContent::ReasoningDelta { reasoning, .. }) => {
-                                Some(Ok(StreamChunk::ThinkingDelta(reasoning)))
-                            }
-                            Ok(StreamedAssistantContent::Final(resp)) => {
-                                Some(Ok(StreamChunk::Done {
-                                    tokens_used: usage_to_tokens(&resp.token_usage()),
-                                }))
-                            }
-                            // Tool calls / full reasoning blocks / unknown items: not part of the
-                            // text contract. Ollama streaming never emits them for enrichment.
-                            Ok(_) => None,
-                            Err(e) => Some(Err(rig_err(e))),
-                        }
-                    });
-                    Ok(Box::pin(mapped))
-                }
-            }
+            dispatch!(&self.model, model => rig_stream(model, req).await)
         }
     }
 }
@@ -2473,5 +2639,136 @@ mod rig_tests {
         let provider = RigProvider::new_ollama("llama3", "http://localhost:11434", "").unwrap();
         assert!(provider.is_ollama());
         assert!(provider.is_local());
+    }
+
+    /// A cloud base URL that never resolves — constructors must not touch the network, so this
+    /// still builds Ok and reachability is decided purely by key presence.
+    const CLOUD_URL: &str = "https://api.example.invalid";
+
+    /// Every constructor builds offline and maps its id onto the expected concrete variant —
+    /// including the shared-variant ids: openai-compatible reuses `OpenAi`, ollama-cloud reuses
+    /// `Ollama`, and glm reuses `Zai` (glm is routed to `new_zai` at the factory stage).
+    #[test]
+    fn rig_constructors_build_offline_and_map_to_expected_variant() {
+        let cases: &[(&str, Result<RigProvider, LensError>)] = &[
+            ("openai", RigProvider::new_openai("gpt", CLOUD_URL, "k")),
+            (
+                "openai",
+                RigProvider::new_openai_compatible("gpt", CLOUD_URL, "k"),
+            ),
+            (
+                "anthropic",
+                RigProvider::new_anthropic("claude", CLOUD_URL, "k"),
+            ),
+            ("gemini", RigProvider::new_gemini("gemini", CLOUD_URL, "k")),
+            ("cohere", RigProvider::new_cohere("command", CLOUD_URL, "k")),
+            ("xai", RigProvider::new_xai("grok", CLOUD_URL, "k")),
+            ("groq", RigProvider::new_groq("llama", CLOUD_URL, "k")),
+            (
+                "deepseek",
+                RigProvider::new_deepseek("deepseek", CLOUD_URL, "k"),
+            ),
+            ("zai", RigProvider::new_zai("glm-4", CLOUD_URL, "k")),
+            ("ollama", RigProvider::new_ollama("llama3", CLOUD_URL, "")),
+            (
+                "ollama",
+                RigProvider::new_ollama_cloud("llama3", CLOUD_URL, "k"),
+            ),
+        ];
+        for (expected_variant, built) in cases {
+            let provider = built
+                .as_ref()
+                .unwrap_or_else(|e| panic!("{expected_variant} constructor failed: {e:?}"));
+            assert_eq!(&provider.variant_name(), expected_variant);
+        }
+    }
+
+    #[test]
+    fn rig_model_id_echoes_the_model_string() {
+        assert_eq!(
+            RigProvider::new_openai("gpt-4o-mini", CLOUD_URL, "k")
+                .unwrap()
+                .model_id(),
+            "gpt-4o-mini"
+        );
+        assert_eq!(
+            RigProvider::new_zai("glm-4.6", CLOUD_URL, "k")
+                .unwrap()
+                .model_id(),
+            "glm-4.6"
+        );
+    }
+
+    #[test]
+    fn rig_is_local_is_true_only_for_local_ollama() {
+        assert!(
+            RigProvider::new_ollama("llama3", CLOUD_URL, "")
+                .unwrap()
+                .is_local()
+        );
+        for built in [
+            RigProvider::new_ollama_cloud("llama3", CLOUD_URL, "k"),
+            RigProvider::new_openai("gpt", CLOUD_URL, "k"),
+            RigProvider::new_anthropic("claude", CLOUD_URL, "k"),
+            RigProvider::new_groq("llama", CLOUD_URL, "k"),
+            RigProvider::new_zai("glm-4", CLOUD_URL, "k"),
+        ] {
+            assert!(!built.unwrap().is_local(), "cloud backend must not be local");
+        }
+    }
+
+    #[test]
+    fn rig_is_ollama_is_true_only_for_local_ollama() {
+        assert!(
+            RigProvider::new_ollama("llama3", CLOUD_URL, "")
+                .unwrap()
+                .is_ollama()
+        );
+        // ollama-cloud is a keyed cloud endpoint: the `/api/tags` preflight targets the LOCAL
+        // runtime, so it must report `false` (parity with genai's distinct `OllamaCloud` adapter),
+        // else a cloud model is wrongly failed as "not installed locally".
+        for built in [
+            RigProvider::new_ollama_cloud("llama3", CLOUD_URL, "k"),
+            RigProvider::new_openai("gpt", CLOUD_URL, "k"),
+            RigProvider::new_anthropic("claude", CLOUD_URL, "k"),
+            RigProvider::new_gemini("gemini", CLOUD_URL, "k"),
+            RigProvider::new_zai("glm-4", CLOUD_URL, "k"),
+        ] {
+            assert!(!built.unwrap().is_ollama());
+        }
+    }
+
+    #[tokio::test]
+    async fn rig_openai_compatible_requires_a_base_url() {
+        assert!(matches!(
+            RigProvider::new_openai_compatible("gpt", "", "k"),
+            Err(LensError::Validation(_))
+        ));
+    }
+
+    /// Cloud reachability is the keyed no-network signal — keyed ⇒ reachable, keyless ⇒ not —
+    /// and is decided WITHOUT any request, even against an unroutable host (no billed generate,
+    /// mirroring `cloud_reachable_does_not_perform_a_billed_generate`).
+    #[tokio::test]
+    async fn rig_cloud_reachable_reflects_key_presence_without_network() {
+        assert!(
+            RigProvider::new_openai("gpt", CLOUD_URL, "k")
+                .unwrap()
+                .reachable()
+                .await
+        );
+        assert!(
+            !RigProvider::new_anthropic("claude", CLOUD_URL, "")
+                .unwrap()
+                .reachable()
+                .await
+        );
+        assert!(
+            RigProvider::new_ollama_cloud("llama3", CLOUD_URL, "k")
+                .unwrap()
+                .reachable()
+                .await,
+            "ollama-cloud uses the keyed signal, not the local liveness probe"
+        );
     }
 }
