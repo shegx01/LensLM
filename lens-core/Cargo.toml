@@ -219,7 +219,7 @@ csv = "=1.4.0"
 # DOCX paragraph/heading/table extraction. MIT licence — in deny.toml allowlist.
 # Pinned exactly to avoid future breaking changes in a crate still at 0.x.
 # `default-features = false` drops the optional `image` dep (not needed for extraction).
-docx-rs = { version = "=0.4.20", default-features = false }
+docx-rs = { version = "=0.4.22", default-features = false }
 
 # --- M4 Source Grounding (Phase 2, Step 5) ---
 # PDF text + per-segment bounding-box extraction. `pdfium-render` is a pure-Rust
