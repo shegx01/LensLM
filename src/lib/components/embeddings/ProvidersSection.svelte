@@ -234,6 +234,16 @@
             autocomplete="off"
             spellcheck={false}
           />
+          {#if selected.kind === 'custom'}
+            <p class="text-[0.64rem] text-muted-foreground">
+              Used as-is: requests POST to <code
+                class="rounded bg-muted px-1 py-px font-mono text-[0.62rem]"
+                >&lt;base&gt;/chat/completions</code
+              >, so include any version segment (e.g.
+              <code class="rounded bg-muted px-1 py-px font-mono text-[0.62rem]">/v1</code>) your
+              endpoint expects.
+            </p>
+          {/if}
         </div>
       {/if}
 

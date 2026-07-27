@@ -1392,15 +1392,17 @@ pub fn build_provider_raw(
     construct_provider(&lower, model, base_url, api_key)
 }
 
-/// The backend-construction seam. `genai` is the default; the `llm-backend-rig` feature swaps in
-/// [`RigProvider`] for every recognized id. Both backends share the id-recognition, consent, and
-/// endpoint gates in the callers (via [`adapter_for`]/[`native_endpoint`]) — this only builds the
-/// concrete provider once an entry is already deemed usable. A fresh build gets its own hardened
-/// client; [`build_task_provider`] passes the base's so the sibling shares one connection pool.
+/// The backend-construction seam. `rig` is the default; opting out of `llm-backend-rig` swaps in
+/// the legacy [`GenaiProvider`] for every recognized id. Both backends share the id-recognition,
+/// consent, and endpoint gates in the callers (via [`adapter_for`]/[`native_endpoint`]) — this
+/// only builds the concrete provider once an entry is already deemed usable. A fresh build gets
+/// its own hardened client; [`build_task_provider`] passes the base's so the sibling shares one
+/// connection pool.
 ///
-/// This seam owns CONSTRUCTION, not endpoint-normalization: genai force-appends `/v1/` for the
-/// OpenAI/Anthropic adapters while rig posts `<base_url>/chat/completions` verbatim, so a custom
-/// `openai-compatible` base must include the version segment. Reconcile before the Phase-2 flip.
+/// Endpoint contract (Phase-2 #258): a native cloud id with no `base_url` uses rig's own default
+/// endpoint. A custom openai/`openai-compatible` `base_url` is posted VERBATIM
+/// (`<base_url>/chat/completions`) — unlike genai's force-appended `/v1/` — so it must include the
+/// version segment. (Anthropic is the exception: rig injects `/v1/messages` itself, matching genai.)
 fn construct_provider(
     provider: &str,
     model: &str,
@@ -3270,6 +3272,50 @@ mod rig_tests {
             requests[0].url.path(),
             "/v1/chat/completions",
             "rig must append /chat/completions to the base verbatim, no extra /v1"
+        );
+    }
+
+    /// Endpoint contract (#258 Phase-2 decision): a CUSTOM `openai` base is posted VERBATIM. A base
+    /// with NO version segment therefore posts to `/chat/completions` — NOT `/v1/chat/completions`
+    /// (genai's old force-append is gone). Locks the "include your own `/v1`" contract for cloud too.
+    #[tokio::test]
+    async fn rig_openai_custom_base_has_no_implicit_v1() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(openai_chat_body("ok")))
+            .mount(&server)
+            .await;
+
+        let provider = RigProvider::new_openai("gpt", &server.uri(), "k").unwrap();
+        let _ = provider.generate(&req()).await;
+
+        let requests = server.received_requests().await.expect("recording on");
+        assert_eq!(
+            requests[0].url.path(),
+            "/chat/completions",
+            "a custom openai base must be verbatim — no implicit /v1"
+        );
+    }
+
+    /// Anthropic is the ONE exception to the verbatim rule: rig's anthropic client always targets
+    /// `<base>/v1/messages`, injecting `/v1` itself — which happens to match genai's force-append,
+    /// so a custom anthropic base has NO parity break (unlike openai, which is verbatim above).
+    #[tokio::test]
+    async fn rig_anthropic_custom_base_keeps_v1_matching_genai() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+
+        let provider = RigProvider::new_anthropic("claude", &server.uri(), "k").unwrap();
+        let _ = provider.generate(&req()).await;
+
+        let requests = server.received_requests().await.expect("recording on");
+        assert_eq!(
+            requests[0].url.path(),
+            "/v1/messages",
+            "rig injects /v1 for anthropic — parity with genai, no break"
         );
     }
 }

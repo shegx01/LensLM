@@ -28,7 +28,7 @@ path = "src/bin/eval.rs"
 # every CI `clippy --all-targets` compile must prove the whisper.cpp C++/cmake
 # build stays green. Downstream consumers without a C++ toolchain can opt out via
 # `default-features = false`.
-default = ["local-whisper"]
+default = ["local-whisper", "llm-backend-rig"]
 
 # Exposes test-only seams on the public API (e.g. `LensEngine::set_embedder_for_test`,
 # which pre-fills the embedder `OnceCell` with a caller-supplied `Arc<dyn Embedder>`
@@ -66,7 +66,9 @@ native-ml-cuda = []
 local-whisper = ["dep:whisper-rs"]
 
 # Selects the rig LLM backend (see the `rig-core` dependency below for the full
-# migration rationale). OFF by default until Phase 2 (#258) flips it.
+# migration rationale). DEFAULT-ON since Phase 2 (#258); opt out with
+# `--no-default-features` to fall back to the legacy genai backend (rollback path,
+# still tested by a dedicated CI leg through Phase 2 — removed in Phase 3).
 llm-backend-rig = ["dep:rig-core"]
 
 [dependencies]
