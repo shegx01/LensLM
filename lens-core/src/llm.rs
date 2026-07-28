@@ -1400,9 +1400,10 @@ pub fn build_provider_raw(
 /// connection pool.
 ///
 /// Endpoint contract (Phase-2 #258): a native cloud id with no `base_url` uses rig's own default
-/// endpoint. A custom openai/`openai-compatible` `base_url` is posted VERBATIM
-/// (`<base_url>/chat/completions`) — unlike genai's force-appended `/v1/` — so it must include the
-/// version segment. (Anthropic is the exception: rig injects `/v1/messages` itself, matching genai.)
+/// endpoint. For a custom openai/`openai-compatible` `base_url`, rig's openai-wire client posts it
+/// VERBATIM (`<base_url>/chat/completions`) — unlike genai's force-appended `/v1/` — so it must
+/// include the version segment. Other adapters (Anthropic, Gemini, Groq, …) inject their own path
+/// segment onto the base (e.g. Anthropic → `/v1/messages`), matching genai.
 fn construct_provider(
     provider: &str,
     model: &str,
@@ -3275,9 +3276,8 @@ mod rig_tests {
         );
     }
 
-    /// Endpoint contract (#258 Phase-2 decision): a CUSTOM `openai` base is posted VERBATIM. A base
-    /// with NO version segment therefore posts to `/chat/completions` — NOT `/v1/chat/completions`
-    /// (genai's old force-append is gone). Locks the "include your own `/v1`" contract for cloud too.
+    /// Locks the verbatim openai-wire contract (see [`super::construct_provider`]): a custom base
+    /// with no version segment posts to `/chat/completions`, not `/v1/chat/completions`.
     #[tokio::test]
     async fn rig_openai_custom_base_has_no_implicit_v1() {
         let server = MockServer::start().await;
@@ -3297,9 +3297,8 @@ mod rig_tests {
         );
     }
 
-    /// Anthropic is the ONE exception to the verbatim rule: rig's anthropic client always targets
-    /// `<base>/v1/messages`, injecting `/v1` itself — which happens to match genai's force-append,
-    /// so a custom anthropic base has NO parity break (unlike openai, which is verbatim above).
+    /// Anthropic injects its own `/v1/messages` (see [`super::construct_provider`]) — so a custom
+    /// base keeps `/v1`, matching genai with no parity break, unlike the verbatim openai case above.
     #[tokio::test]
     async fn rig_anthropic_custom_base_keeps_v1_matching_genai() {
         let server = MockServer::start().await;

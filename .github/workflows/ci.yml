@@ -63,7 +63,8 @@ jobs:
   # genai -> rig migration (epic #255): Phase 2 (#258) made `llm-backend-rig` DEFAULT-ON, so rig is
   # now covered by the --workspace clippy job and the signoff test gate. This job guards the OPPOSITE
   # direction — the off-default genai rollback path — running the shared lens-core suite against it
-  # so a fallback-backend regression still fails CI (until genai is deleted in Phase 3).
+  # so a fallback-backend regression surfaces as a red job (intentionally NOT a required status
+  # check — visible for review but not an auto-blocker; genai is deleted in Phase 3).
   rust-genai-backend:
     name: Rust (genai LLM backend, rollback path)
     runs-on: ubuntu-latest
