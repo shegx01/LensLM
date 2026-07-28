@@ -179,6 +179,27 @@ describe('ProvidersSection', () => {
     expect(entry.api_key).toBe('ck');
   });
 
+  // The verbatim-endpoint hint is scoped to the custom (openai-compatible) provider: local Ollama
+  // has a base URL field but no /v1 caveat, and native cloud has no base URL field at all.
+  it('shows the verbatim base-URL hint only for the custom provider', async () => {
+    setup(baseAppConfig());
+    render(ProvidersSection);
+    await screen.findByRole('heading', { name: 'Providers' });
+
+    await fireEvent.click(listbox().getByText('Custom (OpenAI-compatible)').closest('button')!);
+    const customBase = await screen.findByLabelText('Base URL');
+    expect(screen.getByText(/Used as-is/i)).toBeInTheDocument();
+    expect(customBase.getAttribute('aria-describedby')).toBe('provider-base-url-hint');
+
+    await fireEvent.click(listbox().getByText('Ollama').closest('button')!);
+    const ollamaBase = await screen.findByLabelText('Base URL');
+    expect(screen.queryByText(/Used as-is/i)).not.toBeInTheDocument();
+    expect(ollamaBase.getAttribute('aria-describedby')).toBeNull();
+
+    await fireEvent.click(listbox().getByText('OpenAI').closest('button')!);
+    await waitFor(() => expect(screen.queryByLabelText('Base URL')).not.toBeInTheDocument());
+  });
+
   // C-T2a: a decoupled credential save for a brand-new provider writes model:''.
   it('saves a credential-only entry (model:"") for a new provider (C-T2)', async () => {
     const writes = setup(baseAppConfig());

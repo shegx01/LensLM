@@ -60,16 +60,17 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-  # genai -> rig migration (epic #255): `llm-backend-rig` is off by default, so it's
-  # excluded from the --workspace clippy job above and would otherwise be compiled and
-  # tested by nothing in CI. Own job (Phase 0 #256) until Phase 2 flips the default.
-  rust-rig-backend:
-    name: Rust (rig LLM backend, feature-gated)
+  # genai -> rig migration (epic #255): Phase 2 (#258) made `llm-backend-rig` DEFAULT-ON, so rig is
+  # now covered by the --workspace clippy job and the signoff test gate. This job guards the OPPOSITE
+  # direction — the off-default genai rollback path — running the shared lens-core suite against it
+  # so a fallback-backend regression surfaces as a red job (intentionally NOT a required status
+  # check — visible for review but not an auto-blocker; genai is deleted in Phase 3).
+  rust-genai-backend:
+    name: Rust (genai LLM backend, rollback path)
     runs-on: ubuntu-latest
-    # Higher than the default-feature clippy job (30): the shared Rust cache is keyed to
-    # the default feature set, so this job cold-compiles rig's full tree AND the lens-core
-    # test binaries with no warm cache on its first run. Headroom lets that first run finish
-    # and populate the cache; later runs are far quicker.
+    # Cache is keyed to the default (now rig) feature set and this job saves none of its own, so it
+    # recompiles the genai-specific tree + test binaries on EVERY run; the 45-min ceiling is that
+    # recurring budget, not a one-time cost.
     timeout-minutes: 45
     env:
       RUSTFLAGS: '-D warnings'
@@ -81,10 +82,10 @@ jobs:
         with:
           fetch-pdfium: 'true'
           install-nextest: 'true'
-      - name: Clippy (llm-backend-rig)
-        run: cargo clippy -p lens-core --all-targets --features llm-backend-rig -- -D warnings
-      - name: Test (llm-backend-rig)
-        run: cargo nextest run -p lens-core --features llm-backend-rig
+      - name: Clippy (genai backend)
+        run: cargo clippy -p lens-core --all-targets --no-default-features --features local-whisper -- -D warnings
+      - name: Test (genai backend)
+        run: cargo nextest run -p lens-core --no-default-features --features local-whisper
 
   # ───────────────────────── Frontend ─────────────────────────
   frontend:
