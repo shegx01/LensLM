@@ -192,8 +192,9 @@ describe('ProvidersSection', () => {
     expect(customBase.getAttribute('aria-describedby')).toBe('provider-base-url-hint');
 
     await fireEvent.click(listbox().getByText('Ollama').closest('button')!);
-    await screen.findByLabelText('Base URL');
+    const ollamaBase = await screen.findByLabelText('Base URL');
     expect(screen.queryByText(/Used as-is/i)).not.toBeInTheDocument();
+    expect(ollamaBase.getAttribute('aria-describedby')).toBeNull();
 
     await fireEvent.click(listbox().getByText('OpenAI').closest('button')!);
     await waitFor(() => expect(screen.queryByLabelText('Base URL')).not.toBeInTheDocument());

@@ -1,8 +1,10 @@
 //! Real-model LLM soak (#258 Phase-2 acceptance): drives the ACTIVE LLM backend against real
 //! endpoints across the four migration-risk dimensions — reachability, buffered generate,
-//! streaming, and structured (JSON) output. Opt-in and offline-by-default: each target is skipped
-//! unless `LENS_RUN_MODEL_TESTS=1` AND its runtime/credentials are present, so CI (which sets
-//! neither) runs nothing here.
+//! streaming, and structured (JSON) output. (`reachable()` is a live probe for local Ollama;
+//! cloud providers report reachable without a network call by design, so there the assertion just
+//! pins that contract.) Opt-in and offline-by-default: without `LENS_RUN_MODEL_TESTS=1` every
+//! target skips; with it, a cloud target skips when its key is unset and Ollama skips when no local
+//! runtime answers — so CI (which sets neither key nor runtime) runs nothing here.
 //!
 //! Run: `LENS_RUN_MODEL_TESTS=1 cargo test -p lens-core --test llm_soak -- --ignored`.
 //! Ollama reads `LENS_SOAK_OLLAMA_URL` (default `http://localhost:11434`) + `LENS_SOAK_OLLAMA_MODEL`
@@ -13,7 +15,8 @@ use std::sync::Arc;
 
 use futures_util::StreamExt;
 use lens_core::{
-    AppConfig, LlmProvider, LlmRequest, LlmRouting, StreamChunk, provider_from_config,
+    AppConfig, EnrichmentConfig, LlmProvider, LlmRequest, LlmRouting, StreamChunk,
+    provider_from_config,
 };
 
 fn run_model_tests() -> bool {
@@ -36,19 +39,24 @@ fn build(
     base_url: &str,
     api_key: &str,
 ) -> Option<Arc<dyn LlmProvider>> {
-    let mut cfg = AppConfig::default();
-    cfg.models = serde_json::from_value(serde_json::json!([{
-        "provider": provider,
-        "base_url": base_url,
-        "model": model,
-        "context": 8192,
-        "temperature": 0.0,
-        "api_key": api_key,
-    }]))
-    .expect("model config deserializes");
-    cfg.enrichment.routing = LlmRouting::Explicit {
-        provider: provider.to_string(),
-        model: model.to_string(),
+    let cfg = AppConfig {
+        models: serde_json::from_value(serde_json::json!([{
+            "provider": provider,
+            "base_url": base_url,
+            "model": model,
+            "context": 8192,
+            "temperature": 0.0,
+            "api_key": api_key,
+        }]))
+        .expect("model config deserializes"),
+        enrichment: EnrichmentConfig {
+            routing: LlmRouting::Explicit {
+                provider: provider.to_string(),
+                model: model.to_string(),
+            },
+            ..Default::default()
+        },
+        ..Default::default()
     };
     provider_from_config(&cfg, true)
 }
@@ -66,15 +74,22 @@ fn base_req(prompt: &str) -> LlmRequest {
     }
 }
 
-/// Tolerant JSON acceptance for the structured-output dimension: some models fence or prefix the
-/// object, so fall back to the outermost `{..}` slice before declaring the output non-JSON.
+/// Tolerant JSON-object acceptance for the structured-output dimension: the prompt asks for an
+/// object, so a bare scalar/array does not count; some models fence or prefix it, so fall back to
+/// the outermost `{..}` slice.
 fn parse_jsonish(s: &str) -> Option<serde_json::Value> {
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(s.trim()) {
+    let as_object = |v: serde_json::Value| v.is_object().then_some(v);
+    if let Some(v) = serde_json::from_str::<serde_json::Value>(s.trim())
+        .ok()
+        .and_then(as_object)
+    {
         return Some(v);
     }
     let start = s.find('{')?;
     let end = s.rfind('}')?;
-    serde_json::from_str(&s[start..=end]).ok()
+    serde_json::from_str::<serde_json::Value>(&s[start..=end])
+        .ok()
+        .and_then(as_object)
 }
 
 /// The shared four-dimension soak: reachable -> generate -> stream -> structured JSON.
@@ -140,6 +155,10 @@ async fn soak_ollama() {
     let url = env_or("LENS_SOAK_OLLAMA_URL", "http://localhost:11434");
     let model = env_or("LENS_SOAK_OLLAMA_MODEL", "llama3.2:3b");
     let provider = build("ollama", &model, &url, "").expect("ollama provider builds");
+    if !provider.reachable().await {
+        eprintln!("skipping soak_ollama (no reachable Ollama at {url})");
+        return;
+    }
     soak(&format!("ollama:{model}"), provider).await;
 }
 

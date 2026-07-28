@@ -68,8 +68,9 @@ jobs:
   rust-genai-backend:
     name: Rust (genai LLM backend, rollback path)
     runs-on: ubuntu-latest
-    # Cache is keyed to the default (now rig) feature set, so this job cold-compiles the genai tree
-    # + test binaries on its first run; the headroom lets that run finish and populate the cache.
+    # Cache is keyed to the default (now rig) feature set and this job saves none of its own, so it
+    # recompiles the genai-specific tree + test binaries on EVERY run; the 45-min ceiling is that
+    # recurring budget, not a one-time cost.
     timeout-minutes: 45
     env:
       RUSTFLAGS: '-D warnings'

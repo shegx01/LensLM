@@ -1,14 +1,15 @@
 //! LLM provider seam for the M4 Phase-3 enrichment pass.
 //!
-//! Defines [`LlmProvider`] (object-safe, `Arc<dyn LlmProvider>`) backed by [`GenaiProvider`]
-//! over the `genai` crate (jeremychone/rust-genai 0.6.x), a typed routing policy ([`LlmRouting`]),
-//! and the [`provider_from_config`] factory. genai is constructed with our hardened reqwest client
-//! so SSRF policy and timeouts carry over; enrichment pins `temperature: 0.0 + json: true` for
-//! deterministic output. The default [`LlmProvider::generate_stream`] lets enrichment mocks
-//! (which only implement the three core methods) compile untouched.
+//! Defines [`LlmProvider`] (object-safe, `Arc<dyn LlmProvider>`), a typed routing policy
+//! ([`LlmRouting`]), and the [`provider_from_config`] factory. Providers are constructed with our
+//! hardened reqwest client so SSRF policy and timeouts carry over; enrichment pins
+//! `temperature: 0.0 + json: true` for deterministic output. The default
+//! [`LlmProvider::generate_stream`] lets enrichment mocks (which only implement the three core
+//! methods) compile untouched.
 //!
-//! genai → rig migration (epic #255): behind `llm-backend-rig`, `RigProvider` implements the
-//! same trait over the `rig-core` crate (Ollama only in Phase 0); genai stays the default.
+//! genai → rig migration (epic #255): [`RigProvider`] over the `rig-core` crate is the DEFAULT
+//! backend (Phase 2, #258); `--no-default-features` selects the legacy [`GenaiProvider`] over the
+//! `genai` crate as the rollback (removed in Phase 3, #259).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -491,9 +492,9 @@ impl LlmProvider for GenaiProvider {
 // rig backend (genai → rig migration, epic #255 / Phase 0 #256)
 // ---------------------------------------------------------------------------
 
-/// The rig-backed [`LlmProvider`], gated behind `llm-backend-rig`. Phase 0 covers the
-/// Ollama path only; genai stays the default. Re-exported so tests and (later) the
-/// factories can construct it directly.
+/// The rig-backed [`LlmProvider`], gated behind the default-on `llm-backend-rig` feature and
+/// covering every provider id since Phase 1 (#257). Re-exported so tests and the factories can
+/// construct it directly.
 #[cfg(feature = "llm-backend-rig")]
 pub use rig_backend::RigProvider;
 
@@ -1275,24 +1276,28 @@ fn select_provider(
         LlmRouting::Explicit { provider, model } => {
             build_pinned_provider(provider, model, models, cloud_consent)
         }
-        LlmRouting::CloudFirst => models
-            .iter()
-            .find(|m| !is_local_provider(&m.provider.to_ascii_lowercase()) && usable(m))
-            .or_else(|| {
-                models
-                    .iter()
-                    .find(|m| is_local_provider(&m.provider.to_ascii_lowercase()) && usable(m))
-            })
-            .and_then(build_provider),
-        LlmRouting::LocalFirst => models
-            .iter()
-            .find(|m| is_local_provider(&m.provider.to_ascii_lowercase()) && usable(m))
-            .or_else(|| {
-                models
-                    .iter()
-                    .find(|m| !is_local_provider(&m.provider.to_ascii_lowercase()) && usable(m))
-            })
-            .and_then(build_provider),
+        // Build in priority order, taking the first that succeeds: rig construction is fallible (a
+        // bad base_url yields None), so find-then-build could strand routing on an unbuildable
+        // preferred entry instead of honoring the cloud/local fallback. No-op for genai (its build
+        // never fails, so the first usable candidate always wins).
+        LlmRouting::CloudFirst => {
+            let cloud = models
+                .iter()
+                .filter(|m| !is_local_provider(&m.provider.to_ascii_lowercase()) && usable(m));
+            let local = models
+                .iter()
+                .filter(|m| is_local_provider(&m.provider.to_ascii_lowercase()) && usable(m));
+            cloud.chain(local).find_map(build_provider)
+        }
+        LlmRouting::LocalFirst => {
+            let local = models
+                .iter()
+                .filter(|m| is_local_provider(&m.provider.to_ascii_lowercase()) && usable(m));
+            let cloud = models
+                .iter()
+                .filter(|m| !is_local_provider(&m.provider.to_ascii_lowercase()) && usable(m));
+            local.chain(cloud).find_map(build_provider)
+        }
     }
 }
 
@@ -3316,5 +3321,31 @@ mod rig_tests {
             "/v1/messages",
             "rig injects /v1 for anthropic — parity with genai, no break"
         );
+    }
+
+    /// M1 (#258): rig construction is fallible, so `select_provider` must fall THROUGH to the next
+    /// usable candidate when the preferred one fails to build — here an `openai-compatible` entry
+    /// with an empty base_url (usable per `has_endpoint`, but rig rejects it) must not strand
+    /// CloudFirst; routing falls back to the buildable local Ollama. genai's build is infallible, so
+    /// this scenario only arises under rig — hence the feature gate.
+    #[test]
+    fn select_provider_falls_through_when_preferred_build_fails() {
+        let entry = |provider: &str, base_url: &str, model: &str, api_key: &str| {
+            crate::config::ModelConfig {
+                provider: provider.to_string(),
+                base_url: base_url.to_string(),
+                model: model.to_string(),
+                context: 8192,
+                temperature: 0.0,
+                api_key: api_key.to_string(),
+            }
+        };
+        let models = vec![
+            entry("openai-compatible", "", "some-model", "k"),
+            entry("ollama", "http://localhost:11434", "llama3", ""),
+        ];
+        let provider = select_provider(&models, &LlmRouting::CloudFirst, true)
+            .expect("must fall through to the buildable local candidate");
+        assert_eq!(provider.model_id(), "llama3");
     }
 }

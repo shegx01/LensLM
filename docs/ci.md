@@ -24,8 +24,8 @@ CI runs fmt + clippy (the Linux compile/lint canary; `clippy --all-targets` also
 compiles the test code) plus the frontend and E2E suites. Since Phase 2 of the
 genai→rig migration (`llm-backend-rig`, epic #255) the rig backend is **default-on**,
 so the `--workspace` clippy job and the `signoff` test gate both exercise it. The
-off-default genai rollback path (removed in Phase 3) gets its own clippy + `nextest`
-job so a fallback-backend regression still surfaces. The **Rust test suite
+off-default genai rollback path gets its own clippy + `nextest` job so a
+fallback-backend regression still surfaces (advisory — see the callout below). The **Rust test suite
 runs locally** and is gated by the `signoff` commit status, not by a CI job —
 dev hardware runs it faster than a shared runner, and the macOS-gated tests only
 run there anyway. The shared `.github/actions/rust-env` composite installs the
