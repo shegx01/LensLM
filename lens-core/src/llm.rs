@@ -1276,10 +1276,10 @@ fn select_provider(
         LlmRouting::Explicit { provider, model } => {
             build_pinned_provider(provider, model, models, cloud_consent)
         }
-        // Build in priority order, taking the first that succeeds: rig construction is fallible (a
-        // bad base_url yields None), so find-then-build could strand routing on an unbuildable
-        // preferred entry instead of honoring the cloud/local fallback. No-op for genai (its build
-        // never fails, so the first usable candidate always wins).
+        // Build usable candidates in priority order via find_map so an unbuildable preferred entry
+        // can't strand the cloud/local fallback. Defensive: genai's build is infallible, and rig's
+        // only formerly-reachable failure (empty-base openai-compatible) is now filtered as unusable
+        // upstream by #273 — so no config-reachable usable candidate fails to build today.
         LlmRouting::CloudFirst => {
             let cloud = models
                 .iter()
@@ -1344,13 +1344,18 @@ fn build_eligible(model: &crate::config::ModelConfig, cloud_consent: bool) -> bo
     !model.model.is_empty()
 }
 
-/// Whether an entry has a usable endpoint: a configured `base_url`, or a native cloud adapter
-/// with a canonical endpoint. Local Ollama and `openai-compatible` always require a `base_url`.
+/// Whether a provider needs an explicit `base_url` (no default host): local Ollama and
+/// `openai-compatible`. Keyed on the provider id, NOT the adapter — `openai-compatible` shares
+/// `AdapterKind::OpenAI`, so an adapter check would wrongly treat a blank-base entry as usable (#273).
+fn requires_explicit_base_url(provider: &str) -> bool {
+    provider == PROVIDER_OPENAI_COMPAT
+        || adapter_for(provider).is_none_or(|a| native_endpoint(a).is_none())
+}
+
+/// Whether an entry has a usable endpoint: a non-empty `base_url`, or a provider with a default
+/// host (see [`requires_explicit_base_url`]).
 fn has_endpoint(model: &crate::config::ModelConfig) -> bool {
-    if !model.base_url.is_empty() {
-        return true;
-    }
-    adapter_for(&model.provider.to_ascii_lowercase()).is_some_and(|a| native_endpoint(a).is_some())
+    !model.base_url.is_empty() || !requires_explicit_base_url(&model.provider.to_ascii_lowercase())
 }
 
 /// Builds the active [`LlmProvider`] for a recognized entry (caller applies [`build_eligible`]
@@ -1360,9 +1365,8 @@ fn build_provider(model: &crate::config::ModelConfig) -> Option<Arc<dyn LlmProvi
         return None;
     }
     let provider = model.provider.to_ascii_lowercase();
-    let adapter = adapter_for(&provider)?;
-    // Local Ollama / openai-compatible have no canonical default — require a configured base_url.
-    if model.base_url.is_empty() && native_endpoint(adapter).is_none() {
+    adapter_for(&provider)?;
+    if model.base_url.is_empty() && requires_explicit_base_url(&provider) {
         return None;
     }
     construct_provider(&provider, &model.model, &model.base_url, &model.api_key)
@@ -1390,8 +1394,8 @@ pub fn build_provider_raw(
         }
     }
     let lower = provider.to_ascii_lowercase();
-    let adapter = adapter_for(&lower)?;
-    if base_url.is_empty() && native_endpoint(adapter).is_none() {
+    adapter_for(&lower)?;
+    if base_url.is_empty() && requires_explicit_base_url(&lower) {
         return None;
     }
     construct_provider(&lower, model, base_url, api_key)
@@ -2158,6 +2162,60 @@ mod tests {
             model: "llama3".to_string(),
             ..ModelConfig::default()
         }));
+    }
+
+    #[test]
+    fn blank_base_openai_compatible_is_unavailable() {
+        // #273: openai-compatible shares AdapterKind::OpenAI (which has a native endpoint), but the
+        // builder requires an explicit base_url — availability must agree, not report it usable.
+        let entry = ModelConfig {
+            provider: "openai-compatible".to_string(),
+            base_url: String::new(),
+            model: "some-self-hosted-model".to_string(),
+            ..ModelConfig::default()
+        };
+        assert!(!has_endpoint(&entry));
+        assert_eq!(
+            candidate_unavailable_reason(&entry, true),
+            Some("base URL required".to_string())
+        );
+        assert!(build_provider(&entry).is_none());
+    }
+
+    #[test]
+    fn build_provider_raw_rejects_blank_base_openai_compatible() {
+        // #273: interactive validation (#90) must also fail-closed on a blank-base openai-compatible
+        // entry — otherwise the genai backend silently probes api.openai.com with the typed api_key.
+        assert!(build_provider_raw("openai-compatible", "some-model", "", "sk-typed").is_none());
+        assert!(
+            build_provider_raw(
+                "openai-compatible",
+                "some-model",
+                "http://localhost:1234",
+                "k"
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn select_provider_skips_unavailable_cloud_and_falls_to_local() {
+        // #273: a blank-base openai-compatible entry is now unusable, so CloudFirst skips it via the
+        // find_map chain and falls to the buildable local Ollama instead of stranding on it.
+        let entry = |provider: &str, base_url: &str, model: &str, api_key: &str| ModelConfig {
+            provider: provider.to_string(),
+            base_url: base_url.to_string(),
+            model: model.to_string(),
+            api_key: api_key.to_string(),
+            ..ModelConfig::default()
+        };
+        let models = vec![
+            entry("openai-compatible", "", "some-model", "k"),
+            entry("ollama", "http://localhost:11434", "llama3", ""),
+        ];
+        let provider = select_provider(&models, &LlmRouting::CloudFirst, true)
+            .expect("must fall through to the buildable local candidate");
+        assert_eq!(provider.model_id(), "llama3");
     }
 
     #[test]
@@ -3321,31 +3379,5 @@ mod rig_tests {
             "/v1/messages",
             "rig injects /v1 for anthropic — parity with genai, no break"
         );
-    }
-
-    /// M1 (#258): rig construction is fallible, so `select_provider` must fall THROUGH to the next
-    /// usable candidate when the preferred one fails to build — here an `openai-compatible` entry
-    /// with an empty base_url (usable per `has_endpoint`, but rig rejects it) must not strand
-    /// CloudFirst; routing falls back to the buildable local Ollama. genai's build is infallible, so
-    /// this scenario only arises under rig — hence the feature gate.
-    #[test]
-    fn select_provider_falls_through_when_preferred_build_fails() {
-        let entry = |provider: &str, base_url: &str, model: &str, api_key: &str| {
-            crate::config::ModelConfig {
-                provider: provider.to_string(),
-                base_url: base_url.to_string(),
-                model: model.to_string(),
-                context: 8192,
-                temperature: 0.0,
-                api_key: api_key.to_string(),
-            }
-        };
-        let models = vec![
-            entry("openai-compatible", "", "some-model", "k"),
-            entry("ollama", "http://localhost:11434", "llama3", ""),
-        ];
-        let provider = select_provider(&models, &LlmRouting::CloudFirst, true)
-            .expect("must fall through to the buildable local candidate");
-        assert_eq!(provider.model_id(), "llama3");
     }
 }
