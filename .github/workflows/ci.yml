@@ -60,33 +60,6 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-  # genai -> rig migration (epic #255): Phase 2 (#258) made `llm-backend-rig` DEFAULT-ON, so rig is
-  # now covered by the --workspace clippy job and the signoff test gate. This job guards the OPPOSITE
-  # direction — the off-default genai rollback path — running the shared lens-core suite against it
-  # so a fallback-backend regression surfaces as a red job (intentionally NOT a required status
-  # check — visible for review but not an auto-blocker; genai is deleted in Phase 3).
-  rust-genai-backend:
-    name: Rust (genai LLM backend, rollback path)
-    runs-on: ubuntu-latest
-    # Cache is keyed to the default (now rig) feature set and this job saves none of its own, so it
-    # recompiles the genai-specific tree + test binaries on EVERY run; the 45-min ceiling is that
-    # recurring budget, not a one-time cost.
-    timeout-minutes: 45
-    env:
-      RUSTFLAGS: '-D warnings'
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-      - name: Set up Rust environment
-        uses: ./.github/actions/rust-env
-        with:
-          fetch-pdfium: 'true'
-          install-nextest: 'true'
-      - name: Clippy (genai backend)
-        run: cargo clippy -p lens-core --all-targets --no-default-features --features local-whisper -- -D warnings
-      - name: Test (genai backend)
-        run: cargo nextest run -p lens-core --no-default-features --features local-whisper
-
   # ───────────────────────── Frontend ─────────────────────────
   frontend:
     name: Frontend (format + check + unit tests)

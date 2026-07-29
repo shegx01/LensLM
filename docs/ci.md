@@ -11,21 +11,18 @@ app is ready to distribute.
 Runs on every pull request and on pushes to `main`. Linux-only (`ubuntu-latest`);
 cross-platform bundling is verified later at release time.
 
-| Job                                         | What it runs                                                                                       | Blocks merge? |
-| ------------------------------------------- | -------------------------------------------------------------------------------------------------- | ------------- |
-| **Rust (fmt)**                              | `cargo fmt --all -- --check`                                                                       | Yes           |
-| **Rust (clippy)**                           | `cargo clippy --workspace --all-targets -- -D warnings`                                            | Yes           |
-| **Rust (genai LLM backend, rollback path)** | clippy + `cargo nextest run` for `lens-core` with `--no-default-features --features local-whisper` | No (advisory) |
-| **Frontend**                                | `bun run format:check`, `bun run check`, `bun run test`                                            | Yes           |
-| **E2E**                                     | Playwright against the SvelteKit dev server                                                        | Yes           |
-| **`signoff`**                               | The Rust test suite, run locally — see below                                                       | Yes           |
+| Job               | What it runs                                            | Blocks merge? |
+| ----------------- | ------------------------------------------------------- | ------------- |
+| **Rust (fmt)**    | `cargo fmt --all -- --check`                            | Yes           |
+| **Rust (clippy)** | `cargo clippy --workspace --all-targets -- -D warnings` | Yes           |
+| **Frontend**      | `bun run format:check`, `bun run check`, `bun run test` | Yes           |
+| **E2E**           | Playwright against the SvelteKit dev server             | Yes           |
+| **`signoff`**     | The Rust test suite, run locally — see below            | Yes           |
 
 CI runs fmt + clippy (the Linux compile/lint canary; `clippy --all-targets` also
-compiles the test code) plus the frontend and E2E suites. Since Phase 2 of the
-genai→rig migration (`llm-backend-rig`, epic #255) the rig backend is **default-on**,
-so the `--workspace` clippy job and the `signoff` test gate both exercise it. The
-off-default genai rollback path gets its own clippy + `nextest` job so a
-fallback-backend regression still surfaces (advisory — see the callout below). The **Rust test suite
+compiles the test code) plus the frontend and E2E suites. Since Phase 3 of the
+genai→rig migration (epic #255) removed the legacy backend, `rig` is the sole LLM
+backend, exercised by the `--workspace` clippy job and the `signoff` test gate. The **Rust test suite
 runs locally** and is gated by the `signoff` commit status, not by a CI job —
 dev hardware runs it faster than a shared runner, and the macOS-gated tests only
 run there anyway. The shared `.github/actions/rust-env` composite installs the
@@ -79,10 +76,6 @@ required:
    - `E2E (Playwright, non-blocking)`
    - `signoff` (posted locally — see [Local test signoff](#local-test-signoff))
 4. Optionally enable **Require branches to be up to date before merging**.
-
-> **Do NOT add `Rust (genai LLM backend, rollback path)` to the required set.** It is an
-> advisory job: a genai regression shows as a red check for review, but the rig backend is
-> the default and is already gated by `Rust (clippy)` + `signoff`. It is removed in Phase 3.
 
 ## Dependency updates
 

@@ -186,7 +186,7 @@ async fn process_job(
     };
 
     // Per-task model overrides: a set `coref_model` / `map_model` builds a sibling
-    // provider pinned to that model while reusing the base genai client.
+    // provider pinned to that model while reusing the base provider's HTTP client.
     let cfg_models = engine.config().await.models;
     let map_provider = crate::llm::task_provider_from_config(
         &provider,
@@ -627,8 +627,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// An Ollama `/api/chat` body carrying a model field + the given assistant text. `created_at`
-    /// is required by rig's typed `CompletionResponse` (the `llm-backend-rig` path) and ignored by
-    /// genai, so it keeps the fixture valid under both backends.
+    /// is required by rig's typed `CompletionResponse`.
     fn ollama_body(model: &str, content: &str) -> serde_json::Value {
         serde_json::json!({
             "model": model,
@@ -864,10 +863,10 @@ mod tests {
         assert!(matches!(outcome, PreflightOutcome::Proceed));
     }
 
-    /// A non-`GenaiProvider` backend that reports `is_ollama() == true`, exactly as a
-    /// `RigProvider` does. The old `downcast_ref::<GenaiProvider>()` returned `None` for such a
-    /// type, so the #90 preflight silently skipped — invisible to every existing mock (which are
-    /// all non-Ollama). This is the regression #256 §0.1 #1 guards against.
+    /// A trait-only backend that reports `is_ollama() == true` without being the concrete
+    /// provider type. The #90 preflight keys off the `is_ollama()` trait capability, NOT a
+    /// concrete-type downcast (which would return `None` here and silently skip — invisible to
+    /// every existing mock, all non-Ollama). This is the regression #256 §0.1 #1 guards against.
     struct MockOllamaProvider {
         model: String,
     }
@@ -894,7 +893,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_preflight_fires_for_non_genai_ollama_backend() {
+    async fn worker_preflight_fires_for_trait_only_ollama_backend() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/tags"))
@@ -913,7 +912,7 @@ mod tests {
                 assert!(reason.contains("llama3.2:3b"), "got {reason}")
             }
             PreflightOutcome::Proceed => panic!(
-                "preflight must fire for a non-GenaiProvider Ollama backend — a downcast would have silently skipped it"
+                "preflight must fire for a trait-only Ollama backend — a downcast would have silently skipped it"
             ),
         }
     }
