@@ -166,7 +166,7 @@ pub(crate) fn decode_pcm16_mono(bytes: &[u8], sample_rate: u32) -> Result<AudioB
     if bytes.is_empty() {
         return Err(LensError::Tts("cloud TTS returned empty audio".into()));
     }
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return Err(LensError::Tts("cloud TTS returned truncated PCM audio".into()));
     }
     let samples: Vec<f32> = bytes
