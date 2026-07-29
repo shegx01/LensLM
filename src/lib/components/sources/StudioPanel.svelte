@@ -62,7 +62,7 @@
   function phaseLabel(): string {
     const { phase, turn, total } = audioOverviewStore;
     if (phase === 'synthesizing') {
-      return total ? `Synthesizing turn ${turn}/${total}` : 'Synthesizing…';
+      return total ? `Synthesizing ${turn}/${total}` : 'Synthesizing…';
     }
     if (phase === 'stitching') return 'Stitching audio…';
     if (phase === 'encoding') return 'Encoding…';

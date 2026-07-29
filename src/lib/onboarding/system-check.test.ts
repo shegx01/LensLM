@@ -1,10 +1,12 @@
 import { mockIPC, clearMocks } from '@tauri-apps/api/mocks';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import type { TtsConfig } from '$lib/theme/types.js';
 import {
   runSystemCheck,
   downloadTtsModel,
   prepareQwenModel,
-  cancelPrepare
+  cancelPrepare,
+  nextTtsConfig
 } from './system-check.js';
 
 type ProgressChannel = {
@@ -136,5 +138,68 @@ describe('cancelPrepare', () => {
   it('is a no-op outside a Tauri host', async () => {
     delete (globalThis as { isTauri?: boolean }).isTauri;
     await expect(cancelPrepare()).resolves.toBeUndefined();
+  });
+});
+
+describe('nextTtsConfig — cloud kind selection (#40)', () => {
+  const prev: TtsConfig = {
+    version: 1,
+    backend: 'orpheus',
+    model: '',
+    cloud: null
+  };
+
+  it('defaults to open_ai_compatible when no cloudKind is given', () => {
+    const next = nextTtsConfig(prev, { provider: 'cloud', apiKey: 'sk-x', baseUrl: 'https://x' });
+    expect(next.backend).toEqual({ cloud: 'open_ai_compatible' });
+    expect(next.cloud).toEqual({
+      kind: 'open_ai_compatible',
+      api_key: 'sk-x',
+      base_url: 'https://x'
+    });
+  });
+
+  it('writes eleven_labs into both backend and cloud.kind when selected', () => {
+    const next = nextTtsConfig(prev, {
+      provider: 'cloud',
+      apiKey: 'sk-11labs',
+      baseUrl: 'https://api.elevenlabs.io',
+      cloudKind: 'eleven_labs'
+    });
+    expect(next.backend).toEqual({ cloud: 'eleven_labs' });
+    expect(next.cloud).toEqual({
+      kind: 'eleven_labs',
+      api_key: 'sk-11labs',
+      base_url: 'https://api.elevenlabs.io'
+    });
+  });
+
+  it('writes google_cloud into both backend and cloud.kind when selected', () => {
+    const next = nextTtsConfig(prev, {
+      provider: 'cloud',
+      apiKey: 'sk-google',
+      baseUrl: 'https://generativelanguage.googleapis.com',
+      cloudKind: 'google_cloud'
+    });
+    expect(next.backend).toEqual({ cloud: 'google_cloud' });
+    expect(next.cloud).toEqual({
+      kind: 'google_cloud',
+      api_key: 'sk-google',
+      base_url: 'https://generativelanguage.googleapis.com'
+    });
+  });
+
+  it('switching to a local provider preserves the previously-saved cloud config', () => {
+    const cloudPrev: TtsConfig = {
+      version: 1,
+      backend: { cloud: 'eleven_labs' },
+      model: '',
+      cloud: { kind: 'eleven_labs', api_key: 'sk-keep-me', base_url: 'https://api.elevenlabs.io' }
+    };
+
+    const next = nextTtsConfig(cloudPrev, { provider: 'orpheus', apiKey: '' });
+
+    expect(next.backend).toBe('orpheus');
+    expect(next.cloud).toEqual(cloudPrev.cloud);
   });
 });

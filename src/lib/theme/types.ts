@@ -20,7 +20,7 @@ export interface VoiceConfig {
 }
 
 // SYNC-CHECK: must match lens-core/src/tts/mod.rs CloudTtsKind — snake_case serde.
-export type CloudTtsKind = 'open_ai_compatible' | 'deepgram' | 'eleven_labs';
+export type CloudTtsKind = 'open_ai_compatible' | 'deepgram' | 'eleven_labs' | 'google_cloud';
 
 // SYNC-CHECK: must match lens-core/src/tts/mod.rs TtsBackend — externally tagged: unit
 // variants round-trip as bare strings, `Cloud(CloudTtsKind)` as `{ cloud: CloudTtsKind }`.

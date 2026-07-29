@@ -3,7 +3,7 @@
 
 import { Channel, invoke, isTauri } from '@tauri-apps/api/core';
 import { updateConfig } from '$lib/config.js';
-import type { AppConfig, TtsConfig } from '$lib/theme/types.js';
+import type { AppConfig, CloudTtsKind, TtsConfig } from '$lib/theme/types.js';
 
 export type CheckId = 'llm_runtime' | 'embedding_model';
 
@@ -245,10 +245,10 @@ export type TtsProvider = 'orpheus' | 'qwen3' | 'cloud';
 
 /**
  * Persist a TTS backend/provider selection into the current `TtsConfig` shape
- * (read-modify-write). The Cloud tab (#195) is OpenAI-compatible-first; `hostVoice`/
- * `guestVoice`, when given, overwrite `AppConfig.voices` too — a Cloud save must
- * replace whatever voice ids a previously-active local engine left behind (a
- * stale id like "leo" would otherwise be sent verbatim to the cloud provider).
+ * (read-modify-write). `hostVoice`/`guestVoice`, when given, overwrite
+ * `AppConfig.voices` too — a Cloud save must replace whatever voice ids a
+ * previously-active local engine left behind (a stale id like "leo" would
+ * otherwise be sent verbatim to the cloud provider).
  */
 export async function saveTtsProvider(input: {
   provider: TtsProvider;
@@ -256,6 +256,7 @@ export async function saveTtsProvider(input: {
   baseUrl?: string;
   hostVoice?: string;
   guestVoice?: string;
+  cloudKind?: CloudTtsKind;
 }): Promise<void> {
   await updateConfig((cfg) => ({
     ...cfg,
@@ -270,13 +271,14 @@ export async function saveTtsProvider(input: {
 /**
  * Compute the next `TtsConfig` for a provider selection. A local backend
  * deactivates cloud (the active `backend` no longer points at it) but PRESERVES
- * the saved key so switching back to Cloud doesn't lose it. Cloud kind defaults
- * to OpenAI-compatible (#195) — the only kind the backend adapter dispatches;
- * Deepgram/ElevenLabs are reserved but not user-selectable from this form.
+ * the saved key/config so switching back to Cloud doesn't lose it. `cloudKind`
+ * selects which cloud kind to activate — OpenAI-compatible, ElevenLabs, or
+ * Google Cloud (#40) are all user-selectable; it defaults to OpenAI-compatible
+ * when omitted. Deepgram remains reserved but not user-selectable from this form.
  */
 export function nextTtsConfig(
   prev: TtsConfig,
-  input: { provider: TtsProvider; apiKey: string; baseUrl?: string }
+  input: { provider: TtsProvider; apiKey: string; baseUrl?: string; cloudKind?: CloudTtsKind }
 ): TtsConfig {
   if (input.provider === 'orpheus') {
     return { ...prev, version: 1, backend: 'orpheus' };
@@ -284,12 +286,13 @@ export function nextTtsConfig(
   if (input.provider === 'qwen3') {
     return { ...prev, version: 1, backend: 'qwen3_local' };
   }
+  const kind = input.cloudKind ?? 'open_ai_compatible';
   return {
     version: 1,
-    backend: { cloud: 'open_ai_compatible' },
+    backend: { cloud: kind },
     model: prev.model,
     cloud: {
-      kind: 'open_ai_compatible',
+      kind,
       api_key: input.apiKey,
       base_url: input.baseUrl ?? ''
     }

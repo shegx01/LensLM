@@ -16,7 +16,7 @@
     type TtsEngineId
   } from '$lib/onboarding/system-check.js';
   import { prefersReducedMotion } from '$lib/motion/index.js';
-  import type { AppConfig } from '$lib/theme/types.js';
+  import type { AppConfig, CloudTtsKind } from '$lib/theme/types.js';
   import {
     Select,
     SelectTrigger,
@@ -40,6 +40,39 @@
 
   const CUSTOM_VOICE = '__custom__';
 
+  // Deepgram is a reserved `CloudTtsKind` (mirrors lens-core) but not user-selectable
+  // from this form — only these three dispatch a real cloud TTS adapter (#40).
+  const CLOUD_KIND_OPTIONS: { value: CloudTtsKind; label: string }[] = [
+    { value: 'open_ai_compatible', label: 'OpenAI-compatible' },
+    { value: 'eleven_labs', label: 'ElevenLabs' },
+    { value: 'google_cloud', label: 'Google Cloud' }
+  ];
+
+  /** Default API base URL per kind — mirrors lens-core `cloud::default_base_url`. */
+  function defaultBaseUrl(kind: CloudTtsKind): string {
+    if (kind === 'eleven_labs') return 'https://api.elevenlabs.io';
+    if (kind === 'google_cloud') return 'https://generativelanguage.googleapis.com';
+    return 'https://api.openai.com';
+  }
+
+  function curatedVoicesLabel(kind: CloudTtsKind): string {
+    if (kind === 'eleven_labs') return 'ElevenLabs';
+    if (kind === 'google_cloud') return 'Google';
+    return 'OpenAI';
+  }
+
+  function connectionHint(kind: CloudTtsKind): string {
+    if (kind === 'eleven_labs') {
+      return "Connect ElevenLabs' Text-to-Dialogue API, authenticated with an xi-api-key header.";
+    }
+    if (kind === 'google_cloud') {
+      return 'Connect the Gemini API multi-speaker TTS endpoint, authenticated with an x-goog-api-key header.';
+    }
+    return "Connect any endpoint that implements OpenAI's speech API (POST /v1/audio/speech) — OpenAI itself, hosted providers like Groq or DeepInfra, or a self-hosted server such as LocalAI. Authenticated with a bearer API key.";
+  }
+
+  let cloudKind = $state<CloudTtsKind>('open_ai_compatible');
+
   let cloudApiKey = $state('');
   // The real, currently-persisted key. Never bound to an input — only resent on
   // saves that touch other fields (base URL/voices) so masking never writes a
@@ -51,7 +84,7 @@
   let hasSavedKey = $state(false);
   let editingKey = $state(false);
 
-  let cloudBaseUrl = $state('https://api.openai.com');
+  let cloudBaseUrl = $state(defaultBaseUrl('open_ai_compatible'));
   let cloudHostPreset = $state('');
   let cloudGuestPreset = $state('');
   // Snippet parameters are read-only, so the free-text custom voice ids live in
@@ -113,7 +146,9 @@
         savedCloudApiKey = cfg.tts.cloud.api_key;
         cloudApiKey = '';
       }
-      cloudBaseUrl = cfg.tts?.cloud?.base_url?.trim() || 'https://api.openai.com';
+      const savedKind = cfg.tts?.cloud?.kind;
+      cloudKind = savedKind && savedKind !== 'deepgram' ? savedKind : 'open_ai_compatible';
+      cloudBaseUrl = cfg.tts?.cloud?.base_url?.trim() || defaultBaseUrl(cloudKind);
       // Voices are shared across engines; only trust them as Cloud picks when
       // Cloud is the currently-active backend (otherwise they belong to whatever
       // local engine is active and would be nonsense cloud voice ids).
@@ -169,7 +204,8 @@
         apiKey,
         baseUrl: cloudBaseUrl,
         hostVoice: cloudHostVoice,
-        guestVoice: cloudGuestVoice
+        guestVoice: cloudGuestVoice,
+        cloudKind
       });
       savedCloudApiKey = apiKey;
       hasSavedKey = apiKey.trim() !== '';
@@ -193,6 +229,17 @@
     if (editingKey || (!hasSavedKey && cloudApiKey.trim())) {
       void persistCloud();
     }
+  }
+
+  /** Switching provider kind swaps the base URL to its default, unless the user
+   *  already customized it away from every known kind's default. */
+  function onKindChange(kind: CloudTtsKind): void {
+    const prevDefault = defaultBaseUrl(cloudKind);
+    cloudKind = kind;
+    if (!cloudBaseUrl.trim() || cloudBaseUrl.trim() === prevDefault) {
+      cloudBaseUrl = defaultBaseUrl(kind);
+    }
+    void persistCloud();
   }
 </script>
 
@@ -286,11 +333,40 @@
 
   <div>
     <p class="text-[0.65rem] font-bold uppercase tracking-[0.08em] text-muted-foreground/70">
+      Provider
+    </p>
+    <div class="mt-3 flex flex-col gap-1.5">
+      <label for="tts-cloud-kind" class="text-[0.72rem] font-bold text-foreground">
+        Provider kind
+      </label>
+      <Select
+        type="single"
+        value={cloudKind}
+        onValueChange={(v) => {
+          if (v) onKindChange(v as CloudTtsKind);
+        }}
+        items={CLOUD_KIND_OPTIONS}
+      >
+        <SelectTrigger id="tts-cloud-kind" class="w-full">
+          <SelectValue placeholder="Select a provider" />
+        </SelectTrigger>
+        <SelectContent
+          class="origin-(--bits-select-content-transform-origin) duration-200 ease-[cubic-bezier(0.23,1,0.32,1)]"
+        >
+          {#each CLOUD_KIND_OPTIONS as opt (opt.value)}
+            <SelectItem value={opt.value} label={opt.label}>{opt.label}</SelectItem>
+          {/each}
+        </SelectContent>
+      </Select>
+    </div>
+  </div>
+
+  <div>
+    <p class="text-[0.65rem] font-bold uppercase tracking-[0.08em] text-muted-foreground/70">
       Connection
     </p>
     <p class="mt-2 text-pretty text-[0.72rem] leading-relaxed text-muted-foreground">
-      Connect any endpoint that implements OpenAI's speech API (POST /v1/audio/speech) — OpenAI
-      itself, hosted providers like Groq or DeepInfra, or a self-hosted server such as LocalAI.
+      {connectionHint(cloudKind)}
     </p>
 
     <div class="mt-3">
@@ -311,15 +387,17 @@
         id="tts-cloud-base-url"
         type="text"
         bind:value={cloudBaseUrl}
-        placeholder="https://api.openai.com"
+        placeholder={defaultBaseUrl(cloudKind)}
         autocomplete="off"
         onblur={() => void persistCloud()}
       />
-      <p class="text-[0.68rem] leading-relaxed text-muted-foreground">
-        API root only — no trailing <code
-          class="rounded bg-muted px-1 py-px font-mono text-[0.62rem]">/v1</code
-        >; it's appended automatically.
-      </p>
+      {#if cloudKind === 'open_ai_compatible'}
+        <p class="text-[0.68rem] leading-relaxed text-muted-foreground">
+          API root only — no trailing <code
+            class="rounded bg-muted px-1 py-px font-mono text-[0.62rem]">/v1</code
+          >; it's appended automatically.
+        </p>
+      {/if}
     </div>
   </div>
 
@@ -358,7 +436,8 @@
       })}
 
       <p class="text-[0.68rem] leading-relaxed text-muted-foreground">
-        Curated voices are OpenAI's. Using another provider? Enter its own voice IDs.
+        Curated voices are {curatedVoicesLabel(cloudKind)}'s. Using another provider? Enter its own
+        voice IDs.
       </p>
     </div>
   </div>
