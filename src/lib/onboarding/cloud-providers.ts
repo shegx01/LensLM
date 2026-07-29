@@ -1,6 +1,6 @@
 // Cloud LLM providers for the onboarding combobox.
-// Mirrors backend `adapter_for`/`catalog_key_for` in lens-core/src/llm.rs — every entry has a genai
-// native adapter AND a models.dev namespace. Providers without a genai adapter are absent (unservable).
+// Mirrors backend `is_known_provider` / `RigProvider::from_id` in lens-core/src/llm.rs — every entry
+// is a recognized provider with a models.dev namespace. Unrecognized providers are absent (unservable).
 
 /** Display grouping for the combobox: a small curated set first, the rest after. */
 export type CloudProviderGroup = 'popular' | 'all';
@@ -15,7 +15,7 @@ export interface CloudProvider {
   catalogKey: string | null;
   /** Combobox grouping bucket. */
   group: CloudProviderGroup;
-  /** Empty string ⇒ genai resolves the native endpoint; only custom entries supply a URL. */
+  /** Empty string ⇒ the backend resolves the provider's default host; only custom entries supply a URL. */
   baseUrl: string;
   /** Whether selecting this entry reveals the custom base-URL field. */
   custom?: boolean;

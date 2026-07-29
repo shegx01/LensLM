@@ -813,6 +813,38 @@ mod rig_backend {
             dispatch!(&self.model, model => rig_stream(model, req, style).await)
         }
     }
+
+    #[cfg(test)]
+    mod usage_tests {
+        use super::{Usage, usage_to_tokens};
+
+        fn usage(input: u64, output: u64, total: u64) -> Usage {
+            let mut u = Usage::new();
+            u.input_tokens = input;
+            u.output_tokens = output;
+            u.total_tokens = total;
+            u
+        }
+
+        #[test]
+        fn sums_split_input_and_output() {
+            assert_eq!(usage_to_tokens(&usage(10, 5, 15)), 15);
+        }
+
+        #[test]
+        fn falls_back_to_total_when_split_absent() {
+            // A provider that reports only a total (no input/output split) must still
+            // surface that total, not 0.
+            assert_eq!(usage_to_tokens(&usage(0, 0, 99)), 99);
+        }
+
+        #[test]
+        fn saturates_at_u32_max_instead_of_wrapping() {
+            let over = u64::from(u32::MAX) + 1;
+            assert_eq!(usage_to_tokens(&usage(over, 0, 0)), u32::MAX);
+            assert_eq!(usage_to_tokens(&usage(0, 0, over)), u32::MAX);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2528,6 +2560,19 @@ mod rig_tests {
     #[tokio::test]
     async fn rig_reachable_false_on_connection_refused() {
         let provider = RigProvider::new_ollama("llama3", DEAD_URL, "").unwrap();
+        assert!(!provider.reachable().await);
+    }
+
+    #[tokio::test]
+    async fn rig_reachable_false_on_non_success_version_probe() {
+        // A reachable host whose `/api/version` returns non-2xx is NOT a usable runtime.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/version"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let provider = RigProvider::new_ollama("llama3", &server.uri(), "").unwrap();
         assert!(!provider.reachable().await);
     }
 
