@@ -1,10 +1,10 @@
 // issue #71: deep `Send` auto-trait evaluation can overflow the default 128-frame
-// limit under stricter toolchains (genai's async chain).
+// limit under stricter toolchains (the LLM backend's async chain).
 #![recursion_limit = "256"]
-//! Offline HAPPY-PATH tests for the REAL genai→Ollama LLM path (#29).
+//! Offline HAPPY-PATH tests for the REAL Ollama LLM path (#29).
 //!
 //! Existing enrichment/dialogue tests mock the [`LlmProvider`] trait away, so they
-//! never exercise the concrete `GenaiProvider` request/response wiring — which is
+//! never exercise the concrete provider's request/response wiring — which is
 //! exactly where the #29 timeout + generation bugs lived. These stand up a fake
 //! Ollama `/api/chat` endpoint (wiremock, mirroring `cloud_asr`/`cloud_tts`) and
 //! drive a real provider built from an `AppConfig` via the public factory:
@@ -43,9 +43,8 @@ fn dialogue_content() -> String {
     .to_string()
 }
 
-/// A non-streamed Ollama `/api/chat` body. `prompt_eval_count + eval_count` is what
-/// genai maps into `LlmResponse::tokens_used`. `created_at` is required by rig's typed
-/// `CompletionResponse` (the `llm-backend-rig` path) and ignored by genai.
+/// A non-streamed Ollama `/api/chat` body. `prompt_eval_count + eval_count` maps into
+/// `LlmResponse::tokens_used`; `created_at` is required by rig's typed `CompletionResponse`.
 fn ollama_chat_response(content: &str) -> serde_json::Value {
     serde_json::json!({
         "model": "llama3",
@@ -115,7 +114,7 @@ async fn ollama_generate_returns_full_dialogue_content() {
     let resp = provider
         .generate(&json_request("Generate an audio overview script."))
         .await
-        .expect("buffered generate over the real genai→Ollama path must succeed");
+        .expect("buffered generate over the real Ollama path must succeed");
 
     assert_eq!(
         resp.text, content,

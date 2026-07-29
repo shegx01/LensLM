@@ -7,23 +7,14 @@
 //! [`LlmProvider::generate_stream`] lets enrichment mocks (which only implement the three core
 //! methods) compile untouched.
 //!
-//! genai → rig migration (epic #255): [`RigProvider`] over the `rig-core` crate is the DEFAULT
-//! backend (Phase 2, #258); `--no-default-features` selects the legacy [`GenaiProvider`] over the
-//! `genai` crate as the rollback (removed in Phase 3, #259).
+//! genai → rig migration (epic #255): [`RigProvider`] over the `rig-core` crate is the sole LLM
+//! backend since Phase 3 (#259) removed the legacy `genai` backend.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::Stream;
-use genai::Client;
-use genai::ModelIden;
-use genai::adapter::AdapterKind;
-use genai::chat::{
-    ChatMessage, ChatOptions, ChatRequest, ChatResponseFormat, ReasoningEffort as GenaiEffort,
-};
-use genai::resolver::{AuthData, Endpoint};
-use genai::{ModelSpec, ServiceTarget};
 use serde::{Deserialize, Serialize};
 
 use crate::config::AppConfig;
@@ -55,8 +46,8 @@ const PROVIDER_DEEPSEEK: &str = "deepseek";
 const PROVIDER_XAI: &str = "xai";
 const PROVIDER_COHERE: &str = "cohere";
 
-/// Serde-stable mirror of genai's `ReasoningEffort` so the trait API and IPC shape
-/// never leak a genai type. Enrichment never sets this; M5 chat opts in.
+/// Serde-stable typed reasoning-effort levels so the trait API and IPC shape never leak a
+/// backend type. Enrichment never sets this; M5 chat opts in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningEffort {
@@ -68,20 +59,10 @@ pub enum ReasoningEffort {
     High,
 }
 
-impl ReasoningEffort {
-    fn to_genai(self) -> GenaiEffort {
-        match self {
-            ReasoningEffort::Low => GenaiEffort::Low,
-            ReasoningEffort::Medium => GenaiEffort::Medium,
-            ReasoningEffort::High => GenaiEffort::High,
-        }
-    }
-}
-
 /// One prior conversation turn fed into a completion request as context (Plan 2 /
 /// CX-1). Role reuses [`crate::chat::ChatRole`] so the wire strings stay `user`/
 /// `assistant` and no stringly-typed role leaks in. Ordered oldest→newest; assembled
-/// between the system message and the final user `prompt` in [`GenaiProvider::map_request`].
+/// between the system message and the final user `prompt` in the provider's request mapping.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LlmMessage {
     pub role: crate::chat::ChatRole,
@@ -122,7 +103,7 @@ pub struct LlmResponse {
 }
 
 /// One event from a streamed generation ([`LlmProvider::generate_stream`]).
-/// genai's richer stream (`Start`/`ToolCallChunk`/…) is collapsed onto these three
+/// The provider's richer stream (`Start`/`ToolCallChunk`/…) is collapsed onto these three
 /// so the trait stays provider-agnostic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamChunk {
@@ -197,7 +178,7 @@ fn llm_client() -> reqwest::Client {
 /// model/semantic error. reqwest's transport-failure `Display` often lacks "timeout"/"connect": a
 /// send failure reads "error sending request", an idle read-timeout "error reading
 /// response"/"body", a deadline "deadline". Matching those keeps a genuine transport error from
-/// being misclassified as a model (bad-output) error. Shared by [`genai_err`] and the rig backend.
+/// being misclassified as a model (bad-output) error. Used by the rig backend's error mapper.
 fn looks_like_transport(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     lower.contains("connect")
@@ -212,295 +193,16 @@ fn looks_like_transport(text: &str) -> bool {
         || lower.contains("deadline")
 }
 
-/// Maps a genai error onto [`LensError`], sanitizing the message before it crosses the IPC
-/// boundary. genai wraps transport errors inside its own types with no public `reqwest::Error`
-/// accessor, so we classify by `Display` text (connect/timeout → `Network`; everything else
-/// → `Model`). The full error is logged server-side; only a generic message is surfaced over IPC.
-fn genai_err(err: genai::Error) -> LensError {
-    let is_transport = looks_like_transport(&err.to_string());
-    // Log the full detail for operators; never surface it across IPC.
-    tracing::error!(error = %err, transport = is_transport, "LLM request failed");
-    if is_transport {
-        LensError::Network(
-            "couldn't reach the language model — check that your LLM provider \
-             (e.g. local Ollama) is running and reachable"
-                .to_string(),
-        )
-    } else {
-        LensError::Model("LLM request failed (model)".to_string())
-    }
-}
-
-/// Resolved genai [`ServiceTarget`] plus metadata for the trait accessor and `reachable` probe.
-#[derive(Clone)]
-struct ResolvedTarget {
-    target: ServiceTarget,
-    model_id: String,
-    adapter: AdapterKind,
-    /// Always ends in `/`. For local Ollama, the `api/version` probe appends to this base.
-    endpoint_base: String,
-    /// Whether a non-empty API key was configured (cloud reachability signal).
-    has_key: bool,
-}
-
-/// The single LLM backend. Every call pins the fully-resolved `ServiceTarget` via
-/// `ModelSpec::Target`; the provider/model is never re-inferred from the model name.
-pub struct GenaiProvider {
-    client: Client,
-    resolved: ResolvedTarget,
-    /// The hardened reqwest client backing `client`, kept so `shared_http_client` can hand it to
-    /// sibling per-task providers (genai's `Client` does not re-expose its inner reqwest).
-    http: reqwest::Client,
-}
-
-/// Normalizes a `base_url` into the endpoint base genai expects. genai concatenates a relative
-/// path onto this base, so it must end in `/`. OpenAI/Anthropic adapters also need `/v1/`
-/// (they append `chat/completions` / `messages` after the version segment); Ollama only needs
-/// a trailing slash. Unused under `llm-backend-rig` (rig owns endpoint handling there).
-#[cfg_attr(feature = "llm-backend-rig", allow(dead_code))]
-fn normalize_endpoint(adapter: AdapterKind, base_url: &str) -> String {
-    let trimmed = base_url.trim_end_matches('/');
-    let needs_v1 = matches!(adapter, AdapterKind::OpenAI | AdapterKind::Anthropic);
-    // Don't double `/v1` when the base already ends in it.
-    if needs_v1 && !trimmed.ends_with("/v1") {
-        format!("{trimmed}/v1/")
-    } else {
-        format!("{trimmed}/")
-    }
-}
-
-/// Returns the canonical public endpoint for a native cloud adapter.
-/// genai bakes endpoints into each native adapter but exposes no public accessor, so we mirror
-/// them here. A configured non-empty `base_url` still wins (explicit override). Returns `None`
-/// for `Ollama` and `openai-compatible` where the URL is always user-supplied.
-/// **Pinned to genai 0.6.5.** On a bump, verify against
-/// `grep 'const BASE_URL' <genai>/src/adapter/adapters/*/adapter_impl.rs`.
-fn native_endpoint(adapter: AdapterKind) -> Option<Endpoint> {
-    match adapter {
-        AdapterKind::OpenAI => Some(Endpoint::from_static("https://api.openai.com/v1/")),
-        AdapterKind::Anthropic => Some(Endpoint::from_static("https://api.anthropic.com/v1/")),
-        AdapterKind::Gemini => Some(Endpoint::from_static(
-            "https://generativelanguage.googleapis.com/v1beta/",
-        )),
-        AdapterKind::Groq => Some(Endpoint::from_static("https://api.groq.com/openai/v1/")),
-        AdapterKind::DeepSeek => Some(Endpoint::from_static("https://api.deepseek.com/v1/")),
-        AdapterKind::Xai => Some(Endpoint::from_static("https://api.x.ai/v1/")),
-        AdapterKind::Cohere => Some(Endpoint::from_static("https://api.cohere.com/v1/")),
-        AdapterKind::Zai => Some(Endpoint::from_static("https://api.z.ai/api/paas/v4/")),
-        AdapterKind::OllamaCloud => Some(Endpoint::from_static("https://ollama.com/")),
-        _ => None, // local Ollama / openai-compatible: URL is always user-supplied
-    }
-}
-
-impl GenaiProvider {
-    /// Builds a provider with its own hardened client. Lib code goes through
-    /// [`new_with_http`](Self::new_with_http) (via the construction seam); this stays as a
-    /// terse test constructor.
-    #[cfg(test)]
-    fn new(adapter: AdapterKind, model: &str, base_url: &str, api_key: &str) -> Self {
-        Self::new_with_http(llm_client(), adapter, model, base_url, api_key)
-    }
-
-    /// Builds a provider over a given hardened reqwest client (only the pinned target differs),
-    /// so sibling per-task providers reuse one connection pool. Unused under `llm-backend-rig`
-    /// (rig is the active backend there) but retained as the default backend.
-    #[cfg_attr(feature = "llm-backend-rig", allow(dead_code))]
-    fn new_with_http(
-        http: reqwest::Client,
-        adapter: AdapterKind,
-        model: &str,
-        base_url: &str,
-        api_key: &str,
-    ) -> Self {
-        let client = Client::builder().with_reqwest(http.clone()).build();
-        let model_iden = ModelIden::new(adapter, model.to_string());
-        // Configured base_url wins (custom/self-hosted or explicit override). With no base_url,
-        // a native cloud adapter falls back to its canonical endpoint; otherwise normalize an
-        // empty base so construction stays infallible.
-        let normalized = normalize_endpoint(adapter, base_url);
-        let endpoint = if base_url.is_empty() {
-            native_endpoint(adapter).unwrap_or_else(|| Endpoint::from_owned(normalized.clone()))
-        } else {
-            Endpoint::from_owned(normalized.clone())
-        };
-        let auth = if api_key.is_empty() {
-            AuthData::from_single(String::new()) // local runtimes need no key
-        } else {
-            AuthData::from_single(api_key.to_string())
-        };
-        let target = ServiceTarget {
-            endpoint,
-            auth,
-            model: model_iden,
-        };
-        Self {
-            client,
-            resolved: ResolvedTarget {
-                target,
-                model_id: model.to_string(),
-                adapter,
-                endpoint_base: normalized,
-                has_key: !api_key.is_empty(),
-            },
-            http,
-        }
-    }
-
-    fn map_request(req: &LlmRequest) -> (ChatRequest, ChatOptions) {
-        let mut chat = ChatRequest::default();
-        if let Some(system) = &req.system {
-            chat = chat.with_system(system.clone());
-        }
-        // Prior turns (oldest→newest) precede the final user prompt so the model
-        // sees the conversation as [system, …history…, user(question)].
-        for msg in &req.messages {
-            chat = chat.append_message(match msg.role {
-                crate::chat::ChatRole::User => ChatMessage::user(msg.content.clone()),
-                crate::chat::ChatRole::Assistant => ChatMessage::assistant(msg.content.clone()),
-            });
-        }
-        chat = chat.append_message(ChatMessage::user(req.prompt.clone()));
-
-        let mut opts = ChatOptions::default()
-            .with_temperature(req.temperature as f64)
-            .with_max_tokens(req.max_tokens)
-            .with_capture_usage(true);
-        if req.json {
-            opts = opts.with_response_format(ChatResponseFormat::JsonMode);
-        }
-        if req.thinking {
-            let effort = req
-                .reasoning_effort
-                .unwrap_or(ReasoningEffort::Medium)
-                .to_genai();
-            opts = opts.with_reasoning_effort(effort);
-        }
-        (chat, opts)
-    }
-
-    fn model_spec(&self) -> ModelSpec {
-        ModelSpec::Target(self.resolved.target.clone())
-    }
-
-    /// Unauthenticated GET to `{endpoint_base}api/version` — never bills a token unlike a
-    /// `generate` ping. Returns `true` on HTTP success; `false` on refusal/timeout/non-success.
-    async fn ollama_alive(&self) -> bool {
-        let url = format!("{}api/version", self.resolved.endpoint_base);
-        crate::http::hardened_client(LLM_CONNECT_TIMEOUT, LLM_TIMEOUT)
-            .get(url)
-            .send()
-            .await
-            .map(|r| r.status().is_success())
-            .unwrap_or(false)
-    }
-}
-
-/// Collapses genai `Option<i32>` usage fields into a saturating `u32`;
-/// falls back to `total_tokens` when prompt/completion are both absent.
-fn usage_to_tokens(usage: &genai::chat::Usage) -> u32 {
-    let nonneg = |v: Option<i32>| u32::try_from(v.unwrap_or(0).max(0)).unwrap_or(0);
-    let prompt = nonneg(usage.prompt_tokens);
-    let completion = nonneg(usage.completion_tokens);
-    let summed = prompt.saturating_add(completion);
-    if summed > 0 {
-        summed
-    } else {
-        nonneg(usage.total_tokens)
-    }
-}
-
-#[async_trait]
-impl LlmProvider for GenaiProvider {
-    fn model_id(&self) -> &str {
-        &self.resolved.model_id
-    }
-
-    fn shared_http_client(&self) -> Option<reqwest::Client> {
-        Some(self.http.clone())
-    }
-
-    fn is_local(&self) -> bool {
-        self.is_ollama()
-    }
-
-    fn is_ollama(&self) -> bool {
-        matches!(self.resolved.adapter, AdapterKind::Ollama)
-    }
-
-    async fn reachable(&self) -> bool {
-        // Local Ollama: free unauthenticated GET to /api/version (no token cost).
-        // Cloud: treat "key configured or keyless native endpoint" as reachable without any
-        // network probe — a genuinely unreachable cloud host surfaces as an error from
-        // generate(), which the worker already maps to failed/degrade.
-        if matches!(self.resolved.adapter, AdapterKind::Ollama) {
-            return self.ollama_alive().await;
-        }
-        self.resolved.has_key || native_endpoint(self.resolved.adapter).is_some()
-    }
-
-    async fn generate(&self, req: &LlmRequest) -> Result<LlmResponse, LensError> {
-        let (chat, opts) = Self::map_request(req);
-        let res = self
-            .client
-            .exec_chat(self.model_spec(), chat, Some(&opts))
-            .await
-            .map_err(genai_err)?;
-        let text = res.first_text().unwrap_or_default().to_string();
-        let tokens_used = usage_to_tokens(&res.usage);
-        Ok(LlmResponse { text, tokens_used })
-    }
-
-    async fn generate_stream(
-        &self,
-        req: &LlmRequest,
-    ) -> Result<
-        std::pin::Pin<Box<dyn Stream<Item = Result<StreamChunk, LensError>> + Send>>,
-        LensError,
-    > {
-        use genai::chat::ChatStreamEvent;
-
-        let (chat, opts) = Self::map_request(req);
-        let res = self
-            .client
-            .exec_chat_stream(self.model_spec(), chat, Some(&opts))
-            .await
-            .map_err(genai_err)?;
-
-        let mapped = futures_util::StreamExt::filter_map(res.stream, |ev| async move {
-            match ev {
-                Ok(ChatStreamEvent::Chunk(c)) => Some(Ok(StreamChunk::TextDelta(c.content))),
-                Ok(ChatStreamEvent::ReasoningChunk(c)) => {
-                    Some(Ok(StreamChunk::ThinkingDelta(c.content)))
-                }
-                Ok(ChatStreamEvent::End(end)) => {
-                    let tokens_used = end
-                        .captured_usage
-                        .as_ref()
-                        .map(usage_to_tokens)
-                        .unwrap_or(0);
-                    Some(Ok(StreamChunk::Done { tokens_used }))
-                }
-                Ok(_) => None, // Start / ToolCallChunk / etc: not part of the text contract
-                Err(e) => Some(Err(genai_err(e))),
-            }
-        });
-        Ok(Box::pin(mapped))
-    }
-}
-
 // ---------------------------------------------------------------------------
-// rig backend (genai → rig migration, epic #255 / Phase 0 #256)
+// rig backend (sole LLM backend; genai → rig migration, epic #255)
 // ---------------------------------------------------------------------------
 
-/// The rig-backed [`LlmProvider`], gated behind the default-on `llm-backend-rig` feature and
-/// covering every provider id since Phase 1 (#257). Re-exported so tests and the factories can
-/// construct it directly.
-#[cfg(feature = "llm-backend-rig")]
-pub use rig_backend::RigProvider;
+/// The rig-backed [`LlmProvider`], the sole backend since Phase 3 (#259), covering every provider
+/// id. `pub(crate)` so tests and the factories construct it without widening the public API.
+pub(crate) use rig_backend::RigProvider;
 
-#[cfg(feature = "llm-backend-rig")]
 // The public `new_*` convenience constructors are exercised only by `#[cfg(test)]` code — the
-// lib path builds through `from_id`→`*_with_http` — so a non-test rig build would flag them.
+// lib path builds through `from_id`→`*_with_http` — so a non-test build would flag them.
 #[allow(dead_code)]
 mod rig_backend {
     use std::pin::Pin;
@@ -727,7 +429,7 @@ mod rig_backend {
 
         /// Dispatches a provider id onto its constructor, reusing `http` for every variant so a
         /// per-task sibling shares the base provider's client pool. Unknown ids error (the factory
-        /// already gates recognition via [`super::adapter_for`], so this arm is defensive).
+        /// already gates recognition via [`super::is_known_provider`], so this arm is defensive).
         pub(crate) fn from_id(
             provider: &str,
             model: &str,
@@ -782,8 +484,8 @@ mod rig_backend {
             }
         }
 
-        /// Unauthenticated GET to `{endpoint_base}api/version` — never bills a token, mirroring
-        /// [`super::GenaiProvider`]'s cheap Ollama liveness probe.
+        /// Unauthenticated GET to `{endpoint_base}api/version` — a cheap Ollama liveness probe
+        /// that never bills a token.
         async fn ollama_alive(&self) -> bool {
             let url = format!("{}api/version", self.endpoint_base);
             crate::http::hardened_client(LLM_CONNECT_TIMEOUT, LLM_TIMEOUT)
@@ -971,12 +673,12 @@ mod rig_backend {
 
     /// Maps a rig [`CompletionError`] onto [`LensError`], sanitizing every embedded string
     /// (incl. the `#[non_exhaustive]` catch-all) to a fixed generic message and logging the full
-    /// detail server-side (mirrors [`super::genai_err`]).
+    /// detail server-side.
     fn rig_err(err: CompletionError) -> LensError {
         tracing::error!(error = %err, "LLM request failed (rig)");
         // Only `HttpError::Instance` is transport (→ Network); HTTP status codes are semantic
-        // (→ Model), and `ProviderError`/`ProviderResponse` are classified by message text (shared
-        // with `genai_err`). The response body never crosses IPC.
+        // (→ Model), and `ProviderError`/`ProviderResponse` are classified by message text via
+        // `looks_like_transport`. The response body never crosses IPC.
         let is_transport = match &err {
             CompletionError::HttpError(http_client::Error::Instance(_)) => true,
             CompletionError::ProviderError(msg) => super::looks_like_transport(msg),
@@ -1079,18 +781,17 @@ mod rig_backend {
             self.is_ollama()
         }
 
-        // Matches genai (adapter == `Ollama`): true ONLY for a local Ollama runtime, NOT
-        // ollama-cloud. The `/api/tags` model-installed preflight targets the LOCAL runtime
-        // (`ollama_base_url(config)`), so firing it for a keyed cloud model would falsely fail;
-        // `adapter_for` likewise maps ollama-cloud to a distinct `OllamaCloud` adapter.
+        // True ONLY for a local Ollama runtime, NOT ollama-cloud. The `/api/tags` model-installed
+        // preflight targets the LOCAL runtime (`ollama_base_url(config)`), so firing it for a keyed
+        // cloud model would falsely fail; ollama-cloud is a distinct id built as a separate variant.
         fn is_ollama(&self) -> bool {
             self.is_local_ollama
         }
 
         async fn reachable(&self) -> bool {
             // Local Ollama probes network liveness; cloud/compat report reachable without a network
-            // probe, mirroring genai — a genuinely unreachable host or bad key surfaces from
-            // `generate`, never a billed token here.
+            // probe — a genuinely unreachable host or bad key surfaces from `generate`, never a
+            // billed token here.
             if self.is_local_ollama {
                 self.ollama_alive().await
             } else {
@@ -1110,6 +811,38 @@ mod rig_backend {
         {
             let style = param_style(&self.model);
             dispatch!(&self.model, model => rig_stream(model, req, style).await)
+        }
+    }
+
+    #[cfg(test)]
+    mod usage_tests {
+        use super::{Usage, usage_to_tokens};
+
+        fn usage(input: u64, output: u64, total: u64) -> Usage {
+            let mut u = Usage::new();
+            u.input_tokens = input;
+            u.output_tokens = output;
+            u.total_tokens = total;
+            u
+        }
+
+        #[test]
+        fn sums_split_input_and_output() {
+            assert_eq!(usage_to_tokens(&usage(10, 5, 15)), 15);
+        }
+
+        #[test]
+        fn falls_back_to_total_when_split_absent() {
+            // A provider that reports only a total (no input/output split) must still
+            // surface that total, not 0.
+            assert_eq!(usage_to_tokens(&usage(0, 0, 99)), 99);
+        }
+
+        #[test]
+        fn saturates_at_u32_max_instead_of_wrapping() {
+            let over = u64::from(u32::MAX) + 1;
+            assert_eq!(usage_to_tokens(&usage(over, 0, 0)), u32::MAX);
+            assert_eq!(usage_to_tokens(&usage(0, 0, over)), u32::MAX);
         }
     }
 }
@@ -1144,24 +877,44 @@ fn is_local_provider(provider: &str) -> bool {
     SupportedProvider::is_local(provider)
 }
 
-/// Maps a `ModelConfig.provider` id to a genai [`AdapterKind`]. `glm` is an alias for `zai`
-/// (GLM models are Z.ai's). `openai-compatible` maps to [`AdapterKind::OpenAI`] with the
-/// user-supplied base URL. Returns `None` for unrecognized providers.
-fn adapter_for(provider: &str) -> Option<AdapterKind> {
-    match provider {
-        PROVIDER_OLLAMA => Some(AdapterKind::Ollama),
-        PROVIDER_OLLAMA_CLOUD => Some(AdapterKind::OllamaCloud),
-        PROVIDER_ANTHROPIC => Some(AdapterKind::Anthropic),
-        PROVIDER_GOOGLE => Some(AdapterKind::Gemini),
-        PROVIDER_OPENAI => Some(AdapterKind::OpenAI),
-        PROVIDER_ZAI | PROVIDER_GLM => Some(AdapterKind::Zai),
-        PROVIDER_GROQ => Some(AdapterKind::Groq),
-        PROVIDER_DEEPSEEK => Some(AdapterKind::DeepSeek),
-        PROVIDER_XAI => Some(AdapterKind::Xai),
-        PROVIDER_COHERE => Some(AdapterKind::Cohere),
-        PROVIDER_OPENAI_COMPAT => Some(AdapterKind::OpenAI), // custom endpoint: OpenAI protocol
-        _ => None,
-    }
+/// Whether `provider` is a recognized LLM provider id the backend can build. `glm` is an alias
+/// for `zai` (GLM models are Z.ai's); `openai-compatible` is a user-endpoint OpenAI-wire provider.
+/// Mirrors the id set in [`RigProvider::from_id`].
+fn is_known_provider(provider: &str) -> bool {
+    matches!(
+        provider,
+        PROVIDER_OLLAMA
+            | PROVIDER_OLLAMA_CLOUD
+            | PROVIDER_ANTHROPIC
+            | PROVIDER_GOOGLE
+            | PROVIDER_OPENAI
+            | PROVIDER_ZAI
+            | PROVIDER_GLM
+            | PROVIDER_GROQ
+            | PROVIDER_DEEPSEEK
+            | PROVIDER_XAI
+            | PROVIDER_COHERE
+            | PROVIDER_OPENAI_COMPAT
+    )
+}
+
+/// Whether `provider` has a built-in default host, so an entry needs no explicit `base_url`. False
+/// for local Ollama and `openai-compatible` (user supplies the endpoint) and unknown ids; true for
+/// the native cloud providers and Ollama Cloud (`https://ollama.com`).
+fn provider_has_default_host(provider: &str) -> bool {
+    matches!(
+        provider,
+        PROVIDER_OLLAMA_CLOUD
+            | PROVIDER_ANTHROPIC
+            | PROVIDER_GOOGLE
+            | PROVIDER_OPENAI
+            | PROVIDER_ZAI
+            | PROVIDER_GLM
+            | PROVIDER_GROQ
+            | PROVIDER_DEEPSEEK
+            | PROVIDER_XAI
+            | PROVIDER_COHERE
+    )
 }
 
 /// Builds the enrichment [`LlmProvider`] from `config.models[]` under the [`LlmRouting`]
@@ -1196,10 +949,10 @@ pub fn chat_provider_from_config(
     }
 }
 
-/// Resolves a per-task enrichment provider, reusing `base`'s genai client (M4 Phase 3).
-/// When `task_model` resolves to a gated, usable entry, returns a sibling [`GenaiProvider`]
-/// pinned to that `(provider, model)` over the same client. Falls back to `base.clone()` on
-/// `None` or failed gates (unknown provider, no consent, empty model).
+/// Resolves a per-task enrichment provider, reusing `base`'s hardened HTTP client (M4 Phase 3).
+/// When `task_model` resolves to a gated, usable entry, returns a sibling provider pinned to that
+/// `(provider, model)` over the same client. Falls back to `base.clone()` on `None` or failed
+/// gates (unknown provider, no consent, empty model).
 pub fn task_provider_from_config(
     base: &Arc<dyn LlmProvider>,
     task_model: Option<&crate::config::TaskModel>,
@@ -1224,7 +977,9 @@ fn build_task_provider(
 ) -> Option<Arc<dyn LlmProvider>> {
     let want_provider = task_model.provider.to_ascii_lowercase();
     // Recognized provider only (mirrors the factory gate); unknown → fall back to base.
-    adapter_for(&want_provider)?;
+    if !is_known_provider(&want_provider) {
+        return None;
+    }
 
     // Prefer the entry matching both provider AND override model (e.g. two Ollama endpoints,
     // instruct vs. coder); fall back to the first entry for that provider.
@@ -1277,9 +1032,9 @@ fn select_provider(
             build_pinned_provider(provider, model, models, cloud_consent)
         }
         // Build usable candidates in priority order via find_map so an unbuildable preferred entry
-        // can't strand the cloud/local fallback. Defensive: genai's build is infallible, and rig's
-        // only formerly-reachable failure (empty-base openai-compatible) is now filtered as unusable
-        // upstream by #273 — so no config-reachable usable candidate fails to build today.
+        // can't strand the cloud/local fallback. Defensive: rig's only formerly-reachable failure
+        // (empty-base openai-compatible) is now filtered as unusable upstream by #273 — so no
+        // config-reachable usable candidate fails to build today.
         LlmRouting::CloudFirst => {
             let cloud = models
                 .iter()
@@ -1301,8 +1056,8 @@ fn select_provider(
     }
 }
 
-/// Resolves the `models[]` entry pinned to `(provider, model)` and builds a fresh
-/// [`GenaiProvider`] for it under the same usable gates routing selection applies
+/// Resolves the `models[]` entry pinned to `(provider, model)` and builds a fresh provider for
+/// it under the same usable gates routing selection applies
 /// (endpoint present, non-empty model, `build_eligible` consent gate). Shared by
 /// `select_provider`'s Explicit arm and the chat-model pin in [`chat_provider_from_config`]
 /// so the gate lives in exactly one place.
@@ -1332,7 +1087,7 @@ fn build_pinned_provider(
 /// providers are never eligible.
 fn build_eligible(model: &crate::config::ModelConfig, cloud_consent: bool) -> bool {
     let provider = model.provider.to_ascii_lowercase();
-    if adapter_for(&provider).is_none() {
+    if !is_known_provider(&provider) {
         return false;
     }
     if is_local_provider(&provider) {
@@ -1344,12 +1099,12 @@ fn build_eligible(model: &crate::config::ModelConfig, cloud_consent: bool) -> bo
     !model.model.is_empty()
 }
 
-/// Whether a provider needs an explicit `base_url` (no default host): local Ollama and
-/// `openai-compatible`. Keyed on the provider id, NOT the adapter — `openai-compatible` shares
-/// `AdapterKind::OpenAI`, so an adapter check would wrongly treat a blank-base entry as usable (#273).
+/// Whether a provider needs an explicit `base_url` (no default host): local Ollama,
+/// `openai-compatible`, and unknown ids. The inverse of [`provider_has_default_host`] — keyed on
+/// the provider id so `openai-compatible` correctly requires a base even though it speaks the
+/// OpenAI wire (a blank-base entry must be treated as unusable, not silently defaulted, #273).
 fn requires_explicit_base_url(provider: &str) -> bool {
-    provider == PROVIDER_OPENAI_COMPAT
-        || adapter_for(provider).is_none_or(|a| native_endpoint(a).is_none())
+    !provider_has_default_host(provider)
 }
 
 /// Whether an entry has a usable endpoint: a non-empty `base_url`, or a provider with a default
@@ -1365,7 +1120,9 @@ fn build_provider(model: &crate::config::ModelConfig) -> Option<Arc<dyn LlmProvi
         return None;
     }
     let provider = model.provider.to_ascii_lowercase();
-    adapter_for(&provider)?;
+    if !is_known_provider(&provider) {
+        return None;
+    }
     if model.base_url.is_empty() && requires_explicit_base_url(&provider) {
         return None;
     }
@@ -1394,25 +1151,24 @@ pub fn build_provider_raw(
         }
     }
     let lower = provider.to_ascii_lowercase();
-    adapter_for(&lower)?;
+    if !is_known_provider(&lower) {
+        return None;
+    }
     if base_url.is_empty() && requires_explicit_base_url(&lower) {
         return None;
     }
     construct_provider(&lower, model, base_url, api_key)
 }
 
-/// The backend-construction seam. `rig` is the default; opting out of `llm-backend-rig` swaps in
-/// the legacy [`GenaiProvider`] for every recognized id. Both backends share the id-recognition,
-/// consent, and endpoint gates in the callers (via [`adapter_for`]/[`native_endpoint`]) — this
-/// only builds the concrete provider once an entry is already deemed usable. A fresh build gets
-/// its own hardened client; [`build_task_provider`] passes the base's so the sibling shares one
-/// connection pool.
+/// The backend-construction seam over [`RigProvider`]. Callers apply the id-recognition, consent,
+/// and endpoint gates (via [`is_known_provider`]/[`requires_explicit_base_url`]) first — this only
+/// builds the concrete provider once an entry is already deemed usable. A fresh build gets its own
+/// hardened client; [`build_task_provider`] passes the base's so the sibling shares one pool.
 ///
-/// Endpoint contract (Phase-2 #258): a native cloud id with no `base_url` uses rig's own default
-/// endpoint. For a custom openai/`openai-compatible` `base_url`, rig's openai-wire client posts it
-/// VERBATIM (`<base_url>/chat/completions`) — unlike genai's force-appended `/v1/` — so it must
-/// include the version segment. Other adapters (Anthropic, Gemini, Groq, …) inject their own path
-/// segment onto the base (e.g. Anthropic → `/v1/messages`), matching genai.
+/// Endpoint contract: a native cloud id with no `base_url` uses rig's own default endpoint. For a
+/// custom openai/`openai-compatible` `base_url`, rig's openai-wire client posts it VERBATIM
+/// (`<base_url>/chat/completions`), so it must include the version segment. Other providers inject
+/// their own path segment onto the base (e.g. Anthropic → `/v1/messages`).
 fn construct_provider(
     provider: &str,
     model: &str,
@@ -1422,21 +1178,6 @@ fn construct_provider(
     construct_provider_with_http(provider, model, base_url, api_key, llm_client())
 }
 
-#[cfg(not(feature = "llm-backend-rig"))]
-fn construct_provider_with_http(
-    provider: &str,
-    model: &str,
-    base_url: &str,
-    api_key: &str,
-    http: reqwest::Client,
-) -> Option<Arc<dyn LlmProvider>> {
-    let adapter = adapter_for(provider)?;
-    Some(Arc::new(GenaiProvider::new_with_http(
-        http, adapter, model, base_url, api_key,
-    )))
-}
-
-#[cfg(feature = "llm-backend-rig")]
 fn construct_provider_with_http(
     provider: &str,
     model: &str,
@@ -1471,7 +1212,7 @@ pub struct ActiveModelCandidate {
 /// chat-model pin would resolve to (same endpoint + consent + catalog gates as
 /// [`build_pinned_provider`]), with a short `reason` otherwise. Credential-only entries
 /// (empty model) are excluded — they are not pinnable, mirroring the build gates. Entries
-/// whose provider has no genai adapter (e.g. an embedding backend) are omitted — they can
+/// whose provider is unrecognized (e.g. an embedding backend) are omitted — they can
 /// never back a chat model.
 pub fn active_model_candidates(
     config: &AppConfig,
@@ -1481,7 +1222,7 @@ pub fn active_model_candidates(
         .models
         .iter()
         .filter(|m| !m.model.is_empty())
-        .filter(|m| adapter_for(&m.provider.to_ascii_lowercase()).is_some())
+        .filter(|m| is_known_provider(&m.provider.to_ascii_lowercase()))
         .map(|m| {
             let reason = candidate_unavailable_reason(m, cloud_consent);
             ActiveModelCandidate {
@@ -1549,11 +1290,6 @@ mod tests {
     use crate::config::ModelConfig;
     use crate::model_catalog::ModelCatalog;
     use futures_util::StreamExt;
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    /// Nothing binds `127.0.0.1:1` — connection is deterministically refused.
-    const DEAD_URL: &str = "http://127.0.0.1:1";
 
     fn req() -> LlmRequest {
         LlmRequest {
@@ -1568,43 +1304,7 @@ mod tests {
         }
     }
 
-    fn ollama_chat_body(content: &str) -> serde_json::Value {
-        serde_json::json!({
-            "model": "llama3",
-            "message": { "role": "assistant", "content": content },
-            "done": true,
-            "done_reason": "stop",
-            "prompt_eval_count": 10,
-            "eval_count": 5
-        })
-    }
-
-    // --- LlmRequest mapping (determinism contract) --------------------------
-
-    #[test]
-    fn map_request_sets_temperature_and_json_mode() {
-        let (_chat, opts) = GenaiProvider::map_request(&req());
-        assert_eq!(opts.temperature, Some(0.0));
-        assert!(
-            matches!(opts.response_format, Some(ChatResponseFormat::JsonMode)),
-            "json:true must map to ChatResponseFormat::JsonMode"
-        );
-        assert_eq!(opts.max_tokens, Some(64));
-        assert!(opts.reasoning_effort.is_none());
-    }
-
-    #[test]
-    fn map_request_thinking_sets_reasoning_effort() {
-        let r = LlmRequest {
-            thinking: true,
-            reasoning_effort: Some(ReasoningEffort::High),
-            json: false,
-            ..req()
-        };
-        let (_chat, opts) = GenaiProvider::map_request(&r);
-        assert!(matches!(opts.reasoning_effort, Some(GenaiEffort::High)));
-        assert!(opts.response_format.is_none());
-    }
+    // --- LlmRequest serde contract -----------------------------------------
 
     #[test]
     fn llm_request_thinking_defaults_off_on_legacy_payload() {
@@ -1620,205 +1320,6 @@ mod tests {
         let r: LlmRequest = serde_json::from_str(json).unwrap();
         assert!(!r.thinking);
         assert!(r.reasoning_effort.is_none());
-    }
-
-    // --- endpoint normalization ---------------------------------------------
-
-    #[test]
-    fn normalize_endpoint_ollama_just_trailing_slash() {
-        assert_eq!(
-            normalize_endpoint(AdapterKind::Ollama, "http://localhost:11434"),
-            "http://localhost:11434/"
-        );
-        // An already-slashed base isn't doubled.
-        assert_eq!(
-            normalize_endpoint(AdapterKind::Ollama, "http://localhost:11434/"),
-            "http://localhost:11434/"
-        );
-    }
-
-    #[test]
-    fn normalize_endpoint_openai_anthropic_get_v1() {
-        assert_eq!(
-            normalize_endpoint(AdapterKind::OpenAI, "http://localhost:1234"),
-            "http://localhost:1234/v1/"
-        );
-        assert_eq!(
-            normalize_endpoint(AdapterKind::Anthropic, "https://api.anthropic.com"),
-            "https://api.anthropic.com/v1/"
-        );
-        // A base that already carries /v1 is not doubled.
-        assert_eq!(
-            normalize_endpoint(AdapterKind::OpenAI, "https://api.openai.com/v1"),
-            "https://api.openai.com/v1/"
-        );
-    }
-
-    // --- usage mapping ------------------------------------------------------
-
-    #[test]
-    fn usage_sums_prompt_and_completion() {
-        let usage = genai::chat::Usage {
-            prompt_tokens: Some(30),
-            completion_tokens: Some(12),
-            total_tokens: Some(42),
-            ..Default::default()
-        };
-        assert_eq!(usage_to_tokens(&usage), 42);
-    }
-
-    #[test]
-    fn usage_falls_back_to_total_when_split_absent() {
-        let usage = genai::chat::Usage {
-            prompt_tokens: None,
-            completion_tokens: None,
-            total_tokens: Some(99),
-            ..Default::default()
-        };
-        assert_eq!(usage_to_tokens(&usage), 99);
-    }
-
-    // --- GenaiProvider round-trip via wiremock (Ollama adapter) -------------
-
-    #[tokio::test]
-    async fn genai_generate_round_trips_ollama() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/api/chat"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(ollama_chat_body("hi there")))
-            .mount(&server)
-            .await;
-
-        let provider: Arc<dyn LlmProvider> = Arc::new(GenaiProvider::new(
-            AdapterKind::Ollama,
-            "llama3",
-            &server.uri(),
-            "",
-        ));
-        let resp = provider.generate(&req()).await.unwrap();
-        assert_eq!(resp.text, "hi there");
-        assert_eq!(resp.tokens_used, 15);
-    }
-
-    #[tokio::test]
-    async fn genai_reachable_true_on_ok() {
-        // The chat mock asserts expect(0): any billed generate dispatch would fail the test.
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/api/version"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "version": "0.1.0"
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/api/chat"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(ollama_chat_body("ok")))
-            .expect(0)
-            .mount(&server)
-            .await;
-
-        let provider: Arc<dyn LlmProvider> = Arc::new(GenaiProvider::new(
-            AdapterKind::Ollama,
-            "llama3",
-            &server.uri(),
-            "",
-        ));
-        assert!(provider.reachable().await);
-        drop(server); // verifies the chat endpoint was NEVER hit by the probe.
-    }
-
-    #[tokio::test]
-    async fn genai_reachable_false_on_connection_refused() {
-        let provider: Arc<dyn LlmProvider> = Arc::new(GenaiProvider::new(
-            AdapterKind::Ollama,
-            "llama3",
-            DEAD_URL,
-            "",
-        ));
-        assert!(!provider.reachable().await);
-    }
-
-    #[tokio::test]
-    async fn cloud_reachable_does_not_perform_a_billed_generate() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(0)
-            .mount(&server)
-            .await;
-
-        let provider: Arc<dyn LlmProvider> = Arc::new(GenaiProvider::new(
-            AdapterKind::Anthropic,
-            "claude-3-5-sonnet",
-            &server.uri(),
-            "sk-ant-key",
-        ));
-        assert!(
-            provider.reachable().await,
-            "a configured+consented cloud provider is reachable with no network probe"
-        );
-        drop(server); // verifies NO generate was dispatched (expect(0)).
-    }
-
-    #[tokio::test]
-    async fn cloud_generate_failure_still_degrades_gracefully() {
-        let provider: Arc<dyn LlmProvider> = Arc::new(GenaiProvider::new(
-            AdapterKind::Anthropic,
-            "claude-3-5-sonnet",
-            DEAD_URL,
-            "sk-ant-key",
-        ));
-        assert!(
-            provider.reachable().await,
-            "cloud reachable() is a cheap no-network signal"
-        );
-        let err = provider
-            .generate(&req())
-            .await
-            .expect_err("a dead cloud endpoint must error on the real generate");
-        assert!(
-            matches!(err, LensError::Network(_) | LensError::Model(_)),
-            "the real generate failure degrades gracefully; got {err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn genai_reachable_false_on_500() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/api/version"))
-            .respond_with(ResponseTemplate::new(500))
-            .mount(&server)
-            .await;
-        let provider: Arc<dyn LlmProvider> = Arc::new(GenaiProvider::new(
-            AdapterKind::Ollama,
-            "llama3",
-            &server.uri(),
-            "",
-        ));
-        assert!(!provider.reachable().await);
-    }
-
-    #[tokio::test]
-    async fn genai_generate_non_success_is_error() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/api/chat"))
-            .respond_with(ResponseTemplate::new(500))
-            .mount(&server)
-            .await;
-        let provider: Arc<dyn LlmProvider> = Arc::new(GenaiProvider::new(
-            AdapterKind::Ollama,
-            "llama3",
-            &server.uri(),
-            "",
-        ));
-        let err = provider.generate(&req()).await.unwrap_err();
-        assert!(
-            matches!(err, LensError::Model(_) | LensError::Network(_)),
-            "got {err:?}"
-        );
     }
 
     // --- streaming surface --------------------------------------------------
@@ -1853,60 +1354,6 @@ mod tests {
                 StreamChunk::Done { tokens_used: 7 },
             ]
         );
-    }
-
-    #[tokio::test]
-    async fn genai_generate_stream_yields_deltas_and_done() {
-        // genai's Ollama adapter buffers a non-streamed body into a single chunk + End,
-        // so this NDJSON-less round-trip still exercises our TextDelta + Done mapping.
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/api/chat"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(ollama_chat_body("streamed")))
-            .mount(&server)
-            .await;
-
-        let provider: Arc<dyn LlmProvider> = Arc::new(GenaiProvider::new(
-            AdapterKind::Ollama,
-            "llama3",
-            &server.uri(),
-            "",
-        ));
-        let stream = provider.generate_stream(&req()).await.unwrap();
-        let events: Vec<StreamChunk> = stream.map(|e| e.unwrap()).collect().await;
-
-        let text: String = events
-            .iter()
-            .filter_map(|e| match e {
-                StreamChunk::TextDelta(t) => Some(t.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert!(text.contains("streamed"), "got deltas: {events:?}");
-        assert!(
-            matches!(events.last(), Some(StreamChunk::Done { .. })),
-            "stream must end in Done; got {events:?}"
-        );
-    }
-
-    // --- model_id accessor (cache-key component, AC9) -----------------------
-
-    #[test]
-    fn model_id_returns_configured_model() {
-        let p = GenaiProvider::new(
-            AdapterKind::Ollama,
-            "llama3.1",
-            "http://localhost:11434",
-            "",
-        );
-        assert_eq!(p.model_id(), "llama3.1");
-        let a = GenaiProvider::new(
-            AdapterKind::Anthropic,
-            "claude-opus-4-8",
-            "https://api.anthropic.com",
-            "k",
-        );
-        assert_eq!(a.model_id(), "claude-opus-4-8");
     }
 
     // --- routing / factory (Stage 2) ----------------------------------------
@@ -2064,35 +1511,40 @@ mod tests {
     // --- newly-surfaced native cloud providers (M4 Phase 3) -----------------
 
     #[test]
-    fn adapter_for_maps_new_native_providers() {
-        assert!(matches!(adapter_for("groq"), Some(AdapterKind::Groq)));
-        assert!(matches!(
-            adapter_for("deepseek"),
-            Some(AdapterKind::DeepSeek)
-        ));
-        assert!(matches!(adapter_for("xai"), Some(AdapterKind::Xai)));
-        assert!(matches!(adapter_for("cohere"), Some(AdapterKind::Cohere)));
+    fn is_known_provider_covers_native_ids_and_rejects_unknown() {
+        for id in ["groq", "deepseek", "xai", "cohere"] {
+            assert!(is_known_provider(id), "{id} must be recognized");
+        }
+        assert!(!is_known_provider("mystery"));
     }
 
     #[test]
-    fn native_endpoint_covers_new_providers_and_skips_custom_local() {
-        for adapter in [
-            AdapterKind::Groq,
-            AdapterKind::DeepSeek,
-            AdapterKind::Xai,
-            AdapterKind::Cohere,
-            AdapterKind::OpenAI,
-            AdapterKind::Anthropic,
-            AdapterKind::Gemini,
-            AdapterKind::Zai,
-            AdapterKind::OllamaCloud,
+    fn default_host_covers_cloud_and_skips_local_and_custom() {
+        for id in [
+            "groq",
+            "deepseek",
+            "xai",
+            "cohere",
+            "openai",
+            "anthropic",
+            "google",
+            "zai",
+            "ollama-cloud",
         ] {
             assert!(
-                native_endpoint(adapter).is_some(),
-                "{adapter:?} must have a canonical endpoint"
+                provider_has_default_host(id),
+                "{id} must have a default host"
+            );
+            assert!(
+                !requires_explicit_base_url(id),
+                "{id} must not require an explicit base"
             );
         }
-        assert!(native_endpoint(AdapterKind::Ollama).is_none());
+        // Local Ollama and openai-compatible have no default host — they require an explicit base.
+        for id in ["ollama", "openai-compatible"] {
+            assert!(!provider_has_default_host(id));
+            assert!(requires_explicit_base_url(id));
+        }
     }
 
     fn native_cloud_entry(provider: &str, model: &str) -> ModelConfig {
@@ -2166,8 +1618,8 @@ mod tests {
 
     #[test]
     fn blank_base_openai_compatible_is_unavailable() {
-        // #273: openai-compatible shares AdapterKind::OpenAI (which has a native endpoint), but the
-        // builder requires an explicit base_url — availability must agree, not report it usable.
+        // #273: openai-compatible speaks the OpenAI wire but has no default host, so the builder
+        // requires an explicit base_url — availability must agree, not report it usable.
         let entry = ModelConfig {
             provider: "openai-compatible".to_string(),
             base_url: String::new(),
@@ -2185,7 +1637,7 @@ mod tests {
     #[test]
     fn build_provider_raw_rejects_blank_base_openai_compatible() {
         // #273: interactive validation (#90) must also fail-closed on a blank-base openai-compatible
-        // entry — otherwise the genai backend silently probes api.openai.com with the typed api_key.
+        // entry — otherwise it would silently default to api.openai.com with the typed api_key.
         assert!(build_provider_raw("openai-compatible", "some-model", "", "sk-typed").is_none());
         assert!(
             build_provider_raw(
@@ -2395,18 +1847,14 @@ mod tests {
 
     use crate::config::TaskModel;
 
-    fn base_genai(model: &str) -> Arc<dyn LlmProvider> {
-        Arc::new(GenaiProvider::new(
-            AdapterKind::Ollama,
-            model,
-            "http://localhost:11434",
-            "",
-        ))
+    fn base_ollama(model: &str) -> Arc<dyn LlmProvider> {
+        build_provider_raw("ollama", model, "http://localhost:11434", "")
+            .expect("local ollama base provider builds")
     }
 
     #[test]
     fn task_provider_falls_back_to_base_when_override_unset() {
-        let base = base_genai("qwen2.5-instruct");
+        let base = base_ollama("qwen2.5-instruct");
         let models = vec![ollama_entry()];
         let p = task_provider_from_config(&base, None, &models, false);
         assert_eq!(p.model_id(), "qwen2.5-instruct");
@@ -2414,7 +1862,7 @@ mod tests {
 
     #[test]
     fn task_provider_pins_local_override_model() {
-        let base = base_genai("qwen2.5-instruct");
+        let base = base_ollama("qwen2.5-instruct");
         let models = vec![ModelConfig {
             provider: "ollama".to_string(),
             base_url: "http://localhost:11434".to_string(),
@@ -2432,7 +1880,7 @@ mod tests {
     #[test]
     fn task_provider_pins_consented_catalog_valid_cloud_override() {
         let model = catalog_anthropic_model();
-        let base = base_genai("qwen2.5-instruct");
+        let base = base_ollama("qwen2.5-instruct");
         let models = vec![anthropic_entry(&model)];
         let map = TaskModel {
             provider: "anthropic".to_string(),
@@ -2445,7 +1893,7 @@ mod tests {
     #[test]
     fn task_provider_rejects_cloud_override_without_consent() {
         let model = catalog_anthropic_model();
-        let base = base_genai("qwen2.5-instruct");
+        let base = base_ollama("qwen2.5-instruct");
         let models = vec![anthropic_entry(&model)];
         let map = TaskModel {
             provider: "anthropic".to_string(),
@@ -2459,7 +1907,7 @@ mod tests {
     #[test]
     fn task_provider_pins_uncatalogued_cloud_override_with_consent() {
         // Advisory catalog: an uncatalogued cloud override still pins once consented.
-        let base = base_genai("qwen2.5-instruct");
+        let base = base_ollama("qwen2.5-instruct");
         let models = vec![anthropic_entry("totally-made-up-model")];
         let map = TaskModel {
             provider: "anthropic".to_string(),
@@ -2471,7 +1919,7 @@ mod tests {
 
     #[test]
     fn task_provider_falls_back_when_no_matching_config_entry() {
-        let base = base_genai("qwen2.5-instruct");
+        let base = base_ollama("qwen2.5-instruct");
         let models = vec![ollama_entry()];
         let coref = TaskModel {
             provider: "anthropic".to_string(),
@@ -2620,40 +2068,20 @@ mod tests {
             LlmRouting::CloudFirst,
         );
         let out = active_model_candidates(&cfg, false);
-        assert_eq!(out.len(), 1, "the embedding entry has no genai adapter");
+        assert_eq!(
+            out.len(),
+            1,
+            "the embedding entry is not a recognized provider"
+        );
         assert_eq!(out[0].provider, "ollama");
-    }
-
-    // --- is_ollama trait capability (backend-agnostic preflight seam, #256 §0.1 #1) --------
-
-    #[test]
-    fn genai_is_ollama_via_trait() {
-        // Exercised through `dyn LlmProvider` (as the preflight sites now are), not the concrete
-        // type: an Ollama target reports `true`, a cloud target `false`.
-        let ollama: Arc<dyn LlmProvider> = Arc::new(GenaiProvider::new(
-            AdapterKind::Ollama,
-            "llama3",
-            "http://x",
-            "",
-        ));
-        assert!(ollama.is_ollama());
-        assert!(ollama.is_local());
-        let cloud: Arc<dyn LlmProvider> = Arc::new(GenaiProvider::new(
-            AdapterKind::Anthropic,
-            "claude",
-            "https://api.anthropic.com",
-            "k",
-        ));
-        assert!(!cloud.is_ollama());
-        assert!(!cloud.is_local());
     }
 }
 
 // ---------------------------------------------------------------------------
-// rig backend tests (Phase 0 #256) — offline (wiremock); real-model behind
-// LENS_RUN_MODEL_TESTS is a separate exit gate not run in CI.
+// rig backend tests — offline (wiremock); real-model behind LENS_RUN_MODEL_TESTS
+// is a separate exit gate not run in CI.
 // ---------------------------------------------------------------------------
-#[cfg(all(test, feature = "llm-backend-rig"))]
+#[cfg(test)]
 mod rig_tests {
     use super::*;
     use futures_util::StreamExt;
@@ -2677,7 +2105,7 @@ mod rig_tests {
     }
 
     /// A non-streaming Ollama `/api/chat` body. `created_at` is required by rig's typed
-    /// `CompletionResponse`, unlike the genai adapter's shape.
+    /// `CompletionResponse`.
     fn ollama_chat_body(content: &str) -> serde_json::Value {
         serde_json::json!({
             "model": "llama3",
@@ -3136,6 +2564,19 @@ mod rig_tests {
     }
 
     #[tokio::test]
+    async fn rig_reachable_false_on_non_success_version_probe() {
+        // A reachable host whose `/api/version` returns non-2xx is NOT a usable runtime.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/version"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let provider = RigProvider::new_ollama("llama3", &server.uri(), "").unwrap();
+        assert!(!provider.reachable().await);
+    }
+
+    #[tokio::test]
     async fn rig_is_ollama_capability() {
         let provider = RigProvider::new_ollama("llama3", "http://localhost:11434", "").unwrap();
         assert!(provider.is_ollama());
@@ -3248,9 +2689,9 @@ mod rig_tests {
         ));
     }
 
-    /// Cloud reachability is `true` without any network probe — keyed OR keyless — mirroring
-    /// genai (a bad key surfaces from `generate`, not here). Uses an unroutable host to prove no
-    /// request is made; a billed generate is separately locked out by the reachable-Ollama test.
+    /// Cloud reachability is `true` without any network probe — keyed OR keyless — a bad key
+    /// surfaces from `generate`, not here. Uses an unroutable host to prove no request is made;
+    /// a billed generate is separately locked out by the reachable-Ollama test.
     #[tokio::test]
     async fn rig_cloud_reachable_is_true_without_network() {
         assert!(
@@ -3264,7 +2705,7 @@ mod rig_tests {
                 .unwrap()
                 .reachable()
                 .await,
-            "keyless cloud is still reachable (mirrors genai)"
+            "keyless cloud is still reachable"
         );
         assert!(
             RigProvider::new_ollama_cloud("llama3", CLOUD_URL, "k")
@@ -3287,10 +2728,10 @@ mod rig_tests {
         );
     }
 
-    /// Guards against `adapter_for`/`from_id` id-set drift: every recognized id must construct,
-    /// and an unknown id must error.
+    /// Guards against `is_known_provider`/`from_id` id-set drift: every recognized id must
+    /// construct, and an unknown id must error.
     #[tokio::test]
-    async fn rig_from_id_covers_every_adapter_for_id() {
+    async fn rig_from_id_covers_every_known_provider_id() {
         for id in [
             "ollama",
             "ollama-cloud",
@@ -3316,7 +2757,7 @@ mod rig_tests {
     }
 
     /// Characterizes rig's verbatim endpoint handling (see [`super::construct_provider`]): rig
-    /// posts `<base_url>/chat/completions` and injects no extra `/v1`, unlike genai's force-append.
+    /// posts `<base_url>/chat/completions` and injects no extra `/v1`.
     #[tokio::test]
     async fn rig_openai_compatible_posts_base_verbatim() {
         let server = MockServer::start().await;
@@ -3361,9 +2802,9 @@ mod rig_tests {
     }
 
     /// Anthropic injects its own `/v1/messages` (see [`super::construct_provider`]) — so a custom
-    /// base keeps `/v1`, matching genai with no parity break, unlike the verbatim openai case above.
+    /// base keeps `/v1`, unlike the verbatim openai case above.
     #[tokio::test]
-    async fn rig_anthropic_custom_base_keeps_v1_matching_genai() {
+    async fn rig_anthropic_custom_base_keeps_v1() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
@@ -3377,7 +2818,7 @@ mod rig_tests {
         assert_eq!(
             requests[0].url.path(),
             "/v1/messages",
-            "rig injects /v1 for anthropic — parity with genai, no break"
+            "rig injects /v1/messages for anthropic on a custom base"
         );
     }
 }

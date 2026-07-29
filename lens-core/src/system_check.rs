@@ -1516,7 +1516,7 @@ mod tests {
     use crate::config::EnrichmentConfig;
     use crate::llm::LlmRouting;
 
-    /// An OpenAI-compatible `/v1/chat/completions` success body (genai parses
+    /// An OpenAI-compatible `/v1/chat/completions` success body (the backend parses
     /// `choices[0].message.content` + `usage`).
     fn openai_chat_body(content: &str) -> serde_json::Value {
         serde_json::json!({
@@ -1554,8 +1554,8 @@ mod tests {
 
     /// Config with a single cloud (openai-compatible) enrichment entry pointed at
     /// `base_url`, consented so the provider resolves. The `/v1` segment is part of the
-    /// openai-compatible base so both backends hit `/v1/chat/completions`: genai force-appends
-    /// `/v1` for the OpenAI adapter, while rig posts `<base>/chat/completions` verbatim.
+    /// openai-compatible base because rig posts `<base>/chat/completions` verbatim, so the
+    /// base must carry `/v1` to hit `/v1/chat/completions`.
     fn config_enrichment_cloud(base_url: &str, model: &str) -> AppConfig {
         AppConfig {
             models: vec![ModelConfig {
