@@ -11,6 +11,7 @@ use crate::error::LensError;
 
 pub mod audio;
 pub mod catalog;
+pub mod chunk;
 pub mod cloud;
 pub mod orpheus;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -142,17 +143,24 @@ pub enum CloudTtsKind {
     OpenAiCompatible,
     Deepgram,
     ElevenLabs,
+    /// Google's multi-speaker dialogue TTS. Targets the Gemini API
+    /// `generateContent` surface (`generativelanguage.googleapis.com`) — the one
+    /// Google multi-speaker path callable with a plain API key. The OAuth-only
+    /// Cloud TTS `text:synthesize` product is deliberately not used (#40).
+    GoogleCloud,
 }
 
 impl CloudTtsKind {
-    /// Whether this provider accepts W3C SSML in the synthesis input. OpenAI takes
-    /// plain text + an `instructions` hint (not SSML); ElevenLabs supports SSML;
-    /// Deepgram does not. Consulted per-provider — not surfaced in the static
-    /// `TtsEngineId`-keyed catalog DTO (see #195 ADR).
+    /// Whether this provider accepts W3C SSML in the synthesis input. No wired cloud
+    /// engine does: OpenAI takes an `instructions` hint, ElevenLabs and Gemini take
+    /// inline bracketed audio cues embedded in the turn text. Consulted per-provider —
+    /// not surfaced in the static `TtsEngineId`-keyed catalog DTO (see #195 ADR).
     pub fn supports_ssml(self) -> bool {
         match self {
-            CloudTtsKind::OpenAiCompatible | CloudTtsKind::Deepgram => false,
-            CloudTtsKind::ElevenLabs => true,
+            CloudTtsKind::OpenAiCompatible
+            | CloudTtsKind::Deepgram
+            | CloudTtsKind::ElevenLabs
+            | CloudTtsKind::GoogleCloud => false,
         }
     }
 }
@@ -315,6 +323,7 @@ mod tests {
             TtsBackend::Cloud(CloudTtsKind::OpenAiCompatible),
             TtsBackend::Cloud(CloudTtsKind::Deepgram),
             TtsBackend::Cloud(CloudTtsKind::ElevenLabs),
+            TtsBackend::Cloud(CloudTtsKind::GoogleCloud),
         ] {
             assert!(resolve_tts_provider(backend, &cfg, data_dir).is_none());
         }
@@ -442,9 +451,12 @@ mod tests {
 
     #[test]
     fn cloud_kind_ssml_capability() {
+        // No wired cloud engine consumes W3C SSML (ElevenLabs + Gemini use inline
+        // bracketed audio cues; OpenAI uses an instructions hint).
         assert!(!CloudTtsKind::OpenAiCompatible.supports_ssml());
         assert!(!CloudTtsKind::Deepgram.supports_ssml());
-        assert!(CloudTtsKind::ElevenLabs.supports_ssml());
+        assert!(!CloudTtsKind::ElevenLabs.supports_ssml());
+        assert!(!CloudTtsKind::GoogleCloud.supports_ssml());
     }
 
     #[test]

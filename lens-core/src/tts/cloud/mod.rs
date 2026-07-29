@@ -22,6 +22,52 @@ use crate::tts::{CloudTtsKind, Gender, TtsBackend, TtsProvider, TtsProviderInfo,
 /// Default OpenAI-compatible TTS model when `TtsConfig.model` is empty.
 pub const DEFAULT_CLOUD_TTS_MODEL: &str = "gpt-4o-mini-tts";
 
+/// Default ElevenLabs dialogue model. Text-to-Dialogue is only supported on
+/// `eleven_v3` — do not substitute another id.
+pub const ELEVENLABS_DIALOGUE_MODEL: &str = "eleven_v3";
+
+/// Default Gemini multi-speaker TTS model (Gemini API `generateContent`).
+pub const GEMINI_TTS_MODEL: &str = "gemini-2.5-flash-preview-tts";
+
+/// ElevenLabs Text-to-Dialogue caps the combined length of all dialogue lines at
+/// 2000 characters per request; scene-chunking is sized against this.
+pub const ELEVENLABS_DIALOGUE_CHAR_LIMIT: usize = 2000;
+
+/// Conservative per-request character budget for Gemini `generateContent`. The real
+/// bound is a ~32k-token context; chunking well under it keeps every chunk safely
+/// within one request.
+pub const GEMINI_DIALOGUE_CHAR_LIMIT: usize = 5000;
+
+/// Default API base URL for a cloud kind, applied when `CloudTtsConfig.base_url` is
+/// empty so a provider selection works without the user pasting an endpoint.
+pub fn default_base_url(kind: CloudTtsKind) -> &'static str {
+    match kind {
+        CloudTtsKind::OpenAiCompatible => "https://api.openai.com",
+        CloudTtsKind::ElevenLabs => "https://api.elevenlabs.io",
+        CloudTtsKind::GoogleCloud => "https://generativelanguage.googleapis.com",
+        CloudTtsKind::Deepgram => "https://api.deepgram.com",
+    }
+}
+
+/// Default model id for a cloud kind, applied when `TtsConfig.model` is empty.
+pub fn default_model(kind: CloudTtsKind) -> &'static str {
+    match kind {
+        CloudTtsKind::OpenAiCompatible | CloudTtsKind::Deepgram => DEFAULT_CLOUD_TTS_MODEL,
+        CloudTtsKind::ElevenLabs => ELEVENLABS_DIALOGUE_MODEL,
+        CloudTtsKind::GoogleCloud => GEMINI_TTS_MODEL,
+    }
+}
+
+/// Per-request input character budget for a dialogue kind (used by scene-chunking).
+/// Per-turn providers (OpenAI/Deepgram) are not chunked, so they return `None`.
+pub fn dialogue_char_limit(kind: CloudTtsKind) -> Option<usize> {
+    match kind {
+        CloudTtsKind::ElevenLabs => Some(ELEVENLABS_DIALOGUE_CHAR_LIMIT),
+        CloudTtsKind::GoogleCloud => Some(GEMINI_DIALOGUE_CHAR_LIMIT),
+        CloudTtsKind::OpenAiCompatible | CloudTtsKind::Deepgram => None,
+    }
+}
+
 /// Mirror the LLM path's bounded timeouts (`llm.rs`): a cloud TTS turn is a single
 /// short dialogue turn, comparable to an LLM completion in latency.
 const CLOUD_TTS_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -180,6 +226,9 @@ impl TtsProvider for CloudTtsAdapter {
             )),
             CloudTtsKind::ElevenLabs => Err(LensError::Tts(
                 "ElevenLabs cloud TTS is not yet supported".into(),
+            )),
+            CloudTtsKind::GoogleCloud => Err(LensError::Tts(
+                "Google cloud TTS is not yet supported".into(),
             )),
         }
     }
