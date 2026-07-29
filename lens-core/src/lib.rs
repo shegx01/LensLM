@@ -1473,6 +1473,13 @@ impl LensEngine {
             return self.tts_sidecar().await.is_some();
         }
         let cache_root = self.cache_root().await;
+        // Cloud has no registry model of its own: usable when a key is configured OR
+        // when the offline Orpheus fallback (#40 AC6) is itself on disk, so this gate
+        // agrees with `resolve_tts_provider_full`'s no-key -> Orpheus fallback.
+        if matches!(cfg.backend, tts::TtsBackend::Cloud(_)) {
+            let has_key = cfg.cloud.as_ref().is_some_and(|c| !c.api_key.is_empty());
+            return has_key || tts::orpheus_ready(&cache_root);
+        }
         let required = cfg.backend.required_model_ids();
         !required.is_empty()
             && required
