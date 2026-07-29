@@ -9,8 +9,8 @@ use serde::Serialize;
 use crate::config::VoiceConfig;
 use crate::dialogue::{Emotion, Speaker, Turn};
 use crate::error::LensError;
-use crate::tts::audio::{self, AudioBuffer};
 use crate::tts::Gender;
+use crate::tts::audio::{self, AudioBuffer};
 
 /// Curated ElevenLabs preset voices (public library voice ids). `gender` is a UX
 /// display bucket only. A user-supplied free-text voice id overrides these.

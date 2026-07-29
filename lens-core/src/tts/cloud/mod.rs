@@ -21,7 +21,9 @@ use crate::config::{VoiceConfig, VoiceRef};
 use crate::dialogue::{Speaker, Turn};
 use crate::error::LensError;
 use crate::tts::audio::AudioBuffer;
-use crate::tts::{CloudTtsKind, Gender, TtsBackend, TtsPhase, TtsProvider, TtsProviderInfo, TtsVoice};
+use crate::tts::{
+    CloudTtsKind, Gender, TtsBackend, TtsPhase, TtsProvider, TtsProviderInfo, TtsVoice,
+};
 
 const CANCELLED_MSG: &str = "tts synthesis cancelled";
 
@@ -245,10 +247,7 @@ where
         if cancel.is_cancelled() {
             return Err(LensError::Cancelled(CANCELLED_MSG.into()));
         }
-        on_phase(TtsPhase::Synthesizing {
-            turn: i + 1,
-            total,
-        });
+        on_phase(TtsPhase::Synthesizing { turn: i + 1, total });
         let buf = tokio::select! {
             r = render_chunk(&turns[range]) => r?,
             _ = cancel.cancelled() => {
@@ -347,7 +346,9 @@ impl TtsProvider for CloudTtsAdapter {
             }
             CloudTtsKind::ElevenLabs => {
                 if self.api_key.is_empty() {
-                    return Err(LensError::Validation("no cloud TTS API key configured".into()));
+                    return Err(LensError::Validation(
+                        "no cloud TTS API key configured".into(),
+                    ));
                 }
                 synthesize_chunks(
                     &script.turns,
@@ -370,7 +371,9 @@ impl TtsProvider for CloudTtsAdapter {
             }
             CloudTtsKind::GoogleCloud => {
                 if self.api_key.is_empty() {
-                    return Err(LensError::Validation("no cloud TTS API key configured".into()));
+                    return Err(LensError::Validation(
+                        "no cloud TTS API key configured".into(),
+                    ));
                 }
                 synthesize_chunks(
                     &script.turns,
@@ -454,14 +457,23 @@ mod tests {
 
     #[test]
     fn default_base_url_and_model_per_kind() {
-        assert_eq!(default_base_url(CloudTtsKind::OpenAiCompatible), "https://api.openai.com");
-        assert_eq!(default_base_url(CloudTtsKind::ElevenLabs), "https://api.elevenlabs.io");
+        assert_eq!(
+            default_base_url(CloudTtsKind::OpenAiCompatible),
+            "https://api.openai.com"
+        );
+        assert_eq!(
+            default_base_url(CloudTtsKind::ElevenLabs),
+            "https://api.elevenlabs.io"
+        );
         assert_eq!(
             default_base_url(CloudTtsKind::GoogleCloud),
             "https://generativelanguage.googleapis.com"
         );
         assert_eq!(default_model(CloudTtsKind::ElevenLabs), "eleven_v3");
-        assert_eq!(default_model(CloudTtsKind::OpenAiCompatible), DEFAULT_CLOUD_TTS_MODEL);
+        assert_eq!(
+            default_model(CloudTtsKind::OpenAiCompatible),
+            DEFAULT_CLOUD_TTS_MODEL
+        );
         assert_eq!(dialogue_char_limit(CloudTtsKind::ElevenLabs), Some(2000));
         assert_eq!(dialogue_char_limit(CloudTtsKind::OpenAiCompatible), None);
     }
@@ -491,7 +503,12 @@ mod tests {
             &cancel,
             |_chunk| {
                 calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                async move { Ok(AudioBuffer::mono(vec![0.1; 100], crate::tts::audio::TARGET_RATE)) }
+                async move {
+                    Ok(AudioBuffer::mono(
+                        vec![0.1; 100],
+                        crate::tts::audio::TARGET_RATE,
+                    ))
+                }
             },
         )
         .await
@@ -503,7 +520,11 @@ mod tests {
         assert_eq!(recorded[1], TtsPhase::Synthesizing { turn: 2, total: 2 });
         assert_eq!(recorded[2], TtsPhase::Stitching);
         // Two 100-sample chunks joined by one scene gap.
-        assert!(out.samples.len() > 200, "stitched len {}", out.samples.len());
+        assert!(
+            out.samples.len() > 200,
+            "stitched len {}",
+            out.samples.len()
+        );
         assert_eq!(out.sample_rate, crate::tts::audio::TARGET_RATE);
     }
 
@@ -519,7 +540,12 @@ mod tests {
             |t: &Turn| t.text.chars().count(),
             &noop,
             &cancel,
-            |_chunk| async { Ok(AudioBuffer::mono(vec![0.0; 10], crate::tts::audio::TARGET_RATE)) },
+            |_chunk| async {
+                Ok(AudioBuffer::mono(
+                    vec![0.0; 10],
+                    crate::tts::audio::TARGET_RATE,
+                ))
+            },
         )
         .await
         .expect_err("cancelled");
@@ -537,7 +563,12 @@ mod tests {
             |t: &Turn| t.text.chars().count(),
             &noop,
             &cancel,
-            |_chunk| async { Ok(AudioBuffer::mono(vec![0.0; 10], crate::tts::audio::TARGET_RATE)) },
+            |_chunk| async {
+                Ok(AudioBuffer::mono(
+                    vec![0.0; 10],
+                    crate::tts::audio::TARGET_RATE,
+                ))
+            },
         )
         .await
         .expect_err("over-limit turn");

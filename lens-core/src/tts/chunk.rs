@@ -16,7 +16,8 @@ use crate::error::LensError;
 /// A single turn's rendered text exceeds the provider input cap. Actionable and
 /// IPC-safe (no provider/host detail); surfaced instead of letting the request
 /// fail as an opaque provider 413.
-const TURN_TOO_LONG: &str = "a dialogue turn is too long for the cloud voice provider; choose a shorter overview length";
+const TURN_TOO_LONG: &str =
+    "a dialogue turn is too long for the cloud voice provider; choose a shorter overview length";
 
 /// Splits `turns` into contiguous index ranges, each whose measured length sums to
 /// at most `char_limit`. Greedy: accumulate whole turns until the next would
@@ -92,7 +93,10 @@ mod tests {
     fn one_over_limit_splits_at_the_turn_boundary() {
         // 1000 + 1001 == 2001 > 2000: split before the second turn.
         let turns = vec![turn(&"a".repeat(1000)), turn(&"b".repeat(1001))];
-        assert_eq!(scene_chunks(&turns, 2000, by_text).unwrap(), vec![0..1, 1..2]);
+        assert_eq!(
+            scene_chunks(&turns, 2000, by_text).unwrap(),
+            vec![0..1, 1..2]
+        );
     }
 
     #[test]
@@ -103,7 +107,10 @@ mod tests {
             turn(&"c".repeat(800)),
         ];
         // 800+800=1600 fits; +800=2400 doesn't → [0..2],[2..3].
-        assert_eq!(scene_chunks(&turns, 2000, by_text).unwrap(), vec![0..2, 2..3]);
+        assert_eq!(
+            scene_chunks(&turns, 2000, by_text).unwrap(),
+            vec![0..2, 2..3]
+        );
     }
 
     #[test]

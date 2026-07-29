@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use crate::config::VoiceConfig;
 use crate::dialogue::{Emotion, Speaker, Turn};
 use crate::error::LensError;
-use crate::tts::audio::{self, AudioBuffer};
 use crate::tts::Gender;
+use crate::tts::audio::{self, AudioBuffer};
 
 /// Curated Gemini prebuilt voice names. `gender` is a UX display bucket only (Gemini
 /// exposes no gender attribute). A user-supplied voice name overrides these.
