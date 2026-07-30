@@ -26,19 +26,22 @@ export type CloudTtsKind = 'open_ai_compatible' | 'deepgram' | 'eleven_labs' | '
 // variants round-trip as bare strings, `Cloud(CloudTtsKind)` as `{ cloud: CloudTtsKind }`.
 export type TtsBackend = 'orpheus' | 'qwen3_local' | { cloud: CloudTtsKind };
 
-// SYNC-CHECK: must match lens-core/src/config.rs CloudTtsConfig — update both together.
-export interface CloudTtsConfig {
-  kind: CloudTtsKind;
+// SYNC-CHECK: must match lens-core/src/config.rs CloudTtsCreds — the per-provider
+// value of TtsConfig.clouds (the kind lives in the map key, not here).
+export interface CloudTtsCreds {
   api_key: string;
   base_url: string;
 }
 
 // SYNC-CHECK: must match lens-core/src/config.rs TtsConfig — update both together.
+// `clouds` holds saved credentials per cloud provider (#40); the active provider is
+// whichever CloudTtsKind `backend` points at. Serializes as a JSON object keyed by
+// the kind's snake_case name; `Partial` because only configured kinds are present.
 export interface TtsConfig {
   version: number;
   backend: TtsBackend;
   model: string;
-  cloud: CloudTtsConfig | null;
+  clouds: Partial<Record<CloudTtsKind, CloudTtsCreds>>;
 }
 
 // SYNC-CHECK: must match lens-core/src/enrichment/embedding_text.rs CorefStrategy

@@ -11,7 +11,7 @@ export function baseAppConfig(overrides?: Partial<AppConfig>): AppConfig {
     models: [],
     endpoints: {},
     voices: { host: '', guest: '' },
-    tts: { version: 1, backend: 'orpheus', model: '', cloud: null },
+    tts: { version: 1, backend: 'orpheus', model: '', clouds: {} },
     enrichment: { enabled: false, coref_strategy: 'llm_inline', cloud_consent: false },
     paths: { data_dir: '' },
     storage: { cache_quota_bytes: null },

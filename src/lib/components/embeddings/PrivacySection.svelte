@@ -47,14 +47,16 @@
     };
   }
 
-  /** Cloud TTS egress: `tts.backend` is the tagged `{ cloud: CloudTtsKind }` variant. */
+  /** Cloud TTS egress: `tts.backend` is the tagged `{ cloud: CloudTtsKind }` variant;
+   *  its base URL lives in the per-provider `tts.clouds[kind]` entry (#40). */
   function ttsEgress(cfg: AppConfig): EgressRow {
     const backend = cfg.tts?.backend;
     const active = typeof backend === 'object' && backend !== null && 'cloud' in backend;
+    const baseUrl = active ? cfg.tts?.clouds?.[backend.cloud]?.base_url?.trim() : '';
     return {
       label: 'Text-to-speech',
       active,
-      detail: active ? cfg.tts?.cloud?.base_url?.trim() || 'Cloud' : 'Local'
+      detail: active ? baseUrl || 'Cloud' : 'Local'
     };
   }
 

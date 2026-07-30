@@ -593,12 +593,15 @@ async fn probe_embedding_model(
 }
 
 fn has_cloud_tts(config: &AppConfig) -> bool {
-    matches!(config.tts.backend, crate::tts::TtsBackend::Cloud(_))
-        && config
+    if let crate::tts::TtsBackend::Cloud(kind) = &config.tts.backend {
+        config
             .tts
-            .cloud
-            .as_ref()
+            .clouds
+            .get(kind)
             .is_some_and(|c| !c.api_key.is_empty())
+    } else {
+        false
+    }
 }
 
 /// TTS readiness gate: passes when the selected local backend's model(s) are on
@@ -823,8 +826,9 @@ mod tests {
 
     #[test]
     fn has_cloud_tts_requires_cloud_backend_and_key() {
-        use crate::config::{CloudTtsConfig, TtsConfig};
+        use crate::config::{CloudTtsCreds, TtsConfig};
         use crate::tts::{CloudTtsKind, TtsBackend};
+        use std::collections::BTreeMap;
 
         let mut config = AppConfig::default();
         // Orpheus (default) is not cloud.
@@ -835,21 +839,36 @@ mod tests {
             version: 1,
             backend: TtsBackend::Cloud(CloudTtsKind::ElevenLabs),
             model: String::new(),
-            cloud: Some(CloudTtsConfig {
-                kind: CloudTtsKind::ElevenLabs,
-                api_key: String::new(),
-                base_url: String::new(),
-            }),
+            clouds: BTreeMap::from([(
+                CloudTtsKind::ElevenLabs,
+                CloudTtsCreds {
+                    api_key: String::new(),
+                    base_url: String::new(),
+                },
+            )]),
         };
         assert!(!has_cloud_tts(&config));
 
         // Cloud backend + key → configured.
-        config.tts.cloud = Some(CloudTtsConfig {
-            kind: CloudTtsKind::ElevenLabs,
-            api_key: "sk-key".to_string(),
-            base_url: String::new(),
-        });
+        config.tts.clouds.insert(
+            CloudTtsKind::ElevenLabs,
+            CloudTtsCreds {
+                api_key: "sk-key".to_string(),
+                base_url: String::new(),
+            },
+        );
         assert!(has_cloud_tts(&config));
+
+        // A key for a DIFFERENT provider does not satisfy the active backend (#40).
+        config.tts.clouds.remove(&CloudTtsKind::ElevenLabs);
+        config.tts.clouds.insert(
+            CloudTtsKind::GoogleCloud,
+            CloudTtsCreds {
+                api_key: "sk-other".to_string(),
+                base_url: String::new(),
+            },
+        );
+        assert!(!has_cloud_tts(&config));
     }
 
     #[tokio::test]
@@ -1255,11 +1274,13 @@ mod tests {
             version: 1,
             backend: crate::tts::TtsBackend::Cloud(crate::tts::CloudTtsKind::ElevenLabs),
             model: String::new(),
-            cloud: Some(crate::config::CloudTtsConfig {
-                kind: crate::tts::CloudTtsKind::ElevenLabs,
-                api_key: "sk-elevenlabs".to_string(),
-                base_url: String::new(),
-            }),
+            clouds: std::collections::BTreeMap::from([(
+                crate::tts::CloudTtsKind::ElevenLabs,
+                crate::config::CloudTtsCreds {
+                    api_key: "sk-elevenlabs".to_string(),
+                    base_url: String::new(),
+                },
+            )]),
         };
 
         let result = probe_text_to_speech(&config);

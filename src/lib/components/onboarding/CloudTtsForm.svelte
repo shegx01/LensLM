@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { untrack } from 'svelte';
   import { fade } from 'svelte/transition';
   import { invoke, isTauri } from '@tauri-apps/api/core';
   import { Input } from '$lib/components/ui/input/index.js';
@@ -25,53 +25,47 @@
     SelectItem
   } from '$lib/components/ui/select/index.js';
 
-  // Bound (not a plain prop) because refreshCatalog() reassigns `catalog` after a
-  // key save, which a child can't propagate through a plain prop in Svelte 5.
-  // See TtsConfigPanel for the ownership rationale.
+  // One form instance drives every cloud provider; `kind` (owned by the parent's
+  // engine list) selects which one it configures (#40). `catalog` is $bindable so a
+  // key save can refresh backend-derived `available`. See TtsConfigPanel for the
+  // parent/child ownership rationale.
   let {
     catalog = $bindable(),
+    kind,
     active,
     onactivated
   }: {
     catalog: TtsEngineCatalogEntry[];
+    kind: CloudTtsKind;
     active: boolean;
     onactivated?: (id: TtsEngineId) => void;
   } = $props();
 
   const CUSTOM_VOICE = '__custom__';
 
-  // Deepgram is a reserved `CloudTtsKind` (mirrors lens-core) but not user-selectable
-  // from this form — only these three dispatch a real cloud TTS adapter (#40).
-  const CLOUD_KIND_OPTIONS: { value: CloudTtsKind; label: string }[] = [
-    { value: 'open_ai_compatible', label: 'OpenAI-compatible' },
-    { value: 'eleven_labs', label: 'ElevenLabs' },
-    { value: 'google_cloud', label: 'Google Cloud' }
-  ];
-
   /** Default API base URL per kind — mirrors lens-core `cloud::default_base_url`. */
-  function defaultBaseUrl(kind: CloudTtsKind): string {
-    if (kind === 'eleven_labs') return 'https://api.elevenlabs.io';
-    if (kind === 'google_cloud') return 'https://generativelanguage.googleapis.com';
+  function defaultBaseUrl(k: CloudTtsKind): string {
+    if (k === 'eleven_labs') return 'https://api.elevenlabs.io';
+    if (k === 'google_cloud') return 'https://generativelanguage.googleapis.com';
+    if (k === 'deepgram') return 'https://api.deepgram.com';
     return 'https://api.openai.com';
   }
 
-  function curatedVoicesLabel(kind: CloudTtsKind): string {
-    if (kind === 'eleven_labs') return 'ElevenLabs';
-    if (kind === 'google_cloud') return 'Google';
+  function curatedVoicesLabel(k: CloudTtsKind): string {
+    if (k === 'eleven_labs') return 'ElevenLabs';
+    if (k === 'google_cloud') return 'Google';
     return 'OpenAI';
   }
 
-  function connectionHint(kind: CloudTtsKind): string {
-    if (kind === 'eleven_labs') {
+  function connectionHint(k: CloudTtsKind): string {
+    if (k === 'eleven_labs') {
       return "Connect ElevenLabs' Text-to-Dialogue API, authenticated with an xi-api-key header.";
     }
-    if (kind === 'google_cloud') {
+    if (k === 'google_cloud') {
       return 'Connect the Gemini API multi-speaker TTS endpoint, authenticated with an x-goog-api-key header.';
     }
     return "Connect any endpoint that implements OpenAI's speech API (POST /v1/audio/speech) — OpenAI itself, hosted providers like Groq or DeepInfra, or a self-hosted server such as LocalAI. Authenticated with a bearer API key.";
   }
-
-  let cloudKind = $state<CloudTtsKind>('open_ai_compatible');
 
   let cloudApiKey = $state('');
   // The real, currently-persisted key. Never bound to an input — only resent on
@@ -84,7 +78,8 @@
   let hasSavedKey = $state(false);
   let editingKey = $state(false);
 
-  let cloudBaseUrl = $state(defaultBaseUrl('open_ai_compatible'));
+  // Seeded by the kind-load effect below (which also resets it on a provider switch).
+  let cloudBaseUrl = $state('');
   let cloudHostPreset = $state('');
   let cloudGuestPreset = $state('');
   // Snippet parameters are read-only, so the free-text custom voice ids live in
@@ -92,7 +87,7 @@
   const host = $state({ custom: '' });
   const guest = $state({ custom: '' });
 
-  const cloudEntry = $derived(catalog.find((e) => e.id === 'cloud') ?? null);
+  const cloudEntry = $derived(catalog.find((e) => e.id === kind) ?? null);
   const cloudVoices = $derived(cloudEntry?.preset_voices ?? []);
   const cloudMaleVoices = $derived(cloudVoices.filter((v) => v.gender === 'male'));
   const cloudFemaleVoices = $derived(cloudVoices.filter((v) => v.gender === 'female'));
@@ -129,7 +124,22 @@
     return prefersReducedMotion() ? 0 : ms;
   }
 
-  onMount(async () => {
+  /** Load the saved credentials + voices for provider `k` (each provider is stored
+   *  independently in `tts.clouds[k]`, #40). `activateIfConfigured` persists — i.e.
+   *  activates — a provider that already has a key and isn't the active backend,
+   *  mirroring how picking a ready local engine activates it; never a keyless one. */
+  async function loadForKind(k: CloudTtsKind, activateIfConfigured: boolean): Promise<void> {
+    cloudApiKey = '';
+    savedCloudApiKey = '';
+    hasSavedKey = false;
+    editingKey = false;
+    cloudError = null;
+    cloudBaseUrl = defaultBaseUrl(k);
+    cloudHostPreset = '';
+    cloudGuestPreset = '';
+    host.custom = '';
+    guest.custom = '';
+
     if (!isTauri()) return;
     // The panel passes a populated catalog; only self-fetch when mounted standalone.
     if (catalog.length === 0) {
@@ -141,25 +151,24 @@
     }
     try {
       const cfg = await invoke<AppConfig>('get_config');
-      if (cfg.tts?.cloud && cfg.tts.cloud.api_key.trim() !== '') {
+      // A newer kind switch superseded this load — don't clobber its state.
+      if (kind !== k) return;
+      const creds = cfg.tts?.clouds?.[k];
+      if (creds && creds.api_key.trim() !== '') {
         hasSavedKey = true;
-        savedCloudApiKey = cfg.tts.cloud.api_key;
-        cloudApiKey = '';
+        savedCloudApiKey = creds.api_key;
       }
-      const savedKind = cfg.tts?.cloud?.kind;
-      cloudKind = savedKind && savedKind !== 'deepgram' ? savedKind : 'open_ai_compatible';
-      cloudBaseUrl = cfg.tts?.cloud?.base_url?.trim() || defaultBaseUrl(cloudKind);
-      // Voices are shared across engines; only trust them as Cloud picks when
-      // Cloud is the currently-active backend (otherwise they belong to whatever
-      // local engine is active and would be nonsense cloud voice ids).
-      const backendIsCloud = ttsBackendId(cfg.tts.backend) === 'cloud';
-      const savedHost =
-        backendIsCloud && typeof cfg.voices?.host === 'string' ? cfg.voices.host : '';
+      cloudBaseUrl = creds?.base_url?.trim() || defaultBaseUrl(k);
+      // Voices are a single shared slot tied to the active backend; only trust them
+      // as THIS provider's picks when it is the active backend (otherwise they belong
+      // to another engine and would be nonsense voice ids for this provider).
+      const isActiveKind = ttsBackendId(cfg.tts.backend) === k;
+      const savedHost = isActiveKind && typeof cfg.voices?.host === 'string' ? cfg.voices.host : '';
       const savedGuest =
-        backendIsCloud && typeof cfg.voices?.guest === 'string' ? cfg.voices.guest : '';
+        isActiveKind && typeof cfg.voices?.guest === 'string' ? cfg.voices.guest : '';
       // Read the just-fetched catalog directly — the `cloudMaleVoices` derived can
       // be stale in this async continuation right after reassigning its source.
-      const presets = (catalog.find((e) => e.id === 'cloud')?.preset_voices ?? []).slice();
+      const presets = (catalog.find((e) => e.id === k)?.preset_voices ?? []).slice();
       const maleVoices = presets.filter((v) => v.gender === 'male');
       const femaleVoices = presets.filter((v) => v.gender === 'female');
       const hostClass = classifyCloudVoice(savedHost, maleVoices);
@@ -168,14 +177,39 @@
       const guestClass = classifyCloudVoice(savedGuest, femaleVoices);
       cloudGuestPreset = guestClass.preset || femaleVoices[0]?.id || '';
       guest.custom = guestClass.custom;
+
+      if (activateIfConfigured && hasSavedKey && cloudBaseUrl.trim() && !isActiveKind) {
+        void persistCloud();
+      }
     } catch {
       // Non-fatal: fall back to the default empty Cloud form.
     }
+  }
+
+  // Reload whenever the selected provider changes. Only `kind` is tracked (untrack
+  // guards the rest); the initial load never auto-activates (that would re-persist
+  // the already-active provider on every panel open), a genuine switch may.
+  let lastKind: CloudTtsKind | null = null;
+  $effect(() => {
+    const k = kind;
+    untrack(() => {
+      if (k === lastKind) return;
+      const initial = lastKind === null;
+      lastKind = k;
+      void loadForKind(k, !initial);
+    });
   });
 
-  /** Re-fetch the catalog so Cloud's backend-derived `available` reflects the
-   *  just-saved key immediately — without this the user saves a valid key but
-   *  Cloud stays reported unselectable until app restart. */
+  /** Pin this provider when the parent re-picks it without changing the `kind` prop
+   *  (the load effect can't observe that). Activates only a key-configured provider,
+   *  else no-op so the form stays shown to add a key. Mirrors LocalTtsForm.activate. */
+  export function activate(): void {
+    if (hasSavedKey && cloudBaseUrl.trim()) void persistCloud();
+  }
+
+  /** Re-fetch the catalog so this provider's backend-derived `available` reflects the
+   *  just-saved key immediately — without this the user saves a valid key but the
+   *  engine stays reported unselectable until app restart. */
   async function refreshCatalog(): Promise<void> {
     try {
       catalog = (await ttsEngineCatalog()) ?? [];
@@ -205,14 +239,14 @@
         baseUrl: cloudBaseUrl,
         hostVoice: cloudHostVoice,
         guestVoice: cloudGuestVoice,
-        cloudKind
+        cloudKind: kind
       });
       savedCloudApiKey = apiKey;
       hasSavedKey = apiKey.trim() !== '';
       editingKey = false;
       cloudApiKey = '';
       await refreshCatalog();
-      onactivated?.('cloud');
+      onactivated?.(kind);
     } catch (err) {
       cloudError = err instanceof Error ? err.message : 'Could not save configuration.';
     }
@@ -229,17 +263,6 @@
     if (editingKey || (!hasSavedKey && cloudApiKey.trim())) {
       void persistCloud();
     }
-  }
-
-  /** Switching provider kind swaps the base URL to its default, unless the user
-   *  already customized it away from every known kind's default. */
-  function onKindChange(kind: CloudTtsKind): void {
-    const prevDefault = defaultBaseUrl(cloudKind);
-    cloudKind = kind;
-    if (!cloudBaseUrl.trim() || cloudBaseUrl.trim() === prevDefault) {
-      cloudBaseUrl = defaultBaseUrl(kind);
-    }
-    void persistCloud();
   }
 </script>
 
@@ -333,40 +356,10 @@
 
   <div>
     <p class="text-[0.65rem] font-bold uppercase tracking-[0.08em] text-muted-foreground/70">
-      Provider
-    </p>
-    <div class="mt-3 flex flex-col gap-1.5">
-      <label for="tts-cloud-kind" class="text-[0.72rem] font-bold text-foreground">
-        Provider kind
-      </label>
-      <Select
-        type="single"
-        value={cloudKind}
-        onValueChange={(v) => {
-          if (v) onKindChange(v as CloudTtsKind);
-        }}
-        items={CLOUD_KIND_OPTIONS}
-      >
-        <SelectTrigger id="tts-cloud-kind" class="w-full">
-          <SelectValue placeholder="Select a provider" />
-        </SelectTrigger>
-        <SelectContent
-          class="origin-(--bits-select-content-transform-origin) duration-200 ease-[cubic-bezier(0.23,1,0.32,1)]"
-        >
-          {#each CLOUD_KIND_OPTIONS as opt (opt.value)}
-            <SelectItem value={opt.value} label={opt.label}>{opt.label}</SelectItem>
-          {/each}
-        </SelectContent>
-      </Select>
-    </div>
-  </div>
-
-  <div>
-    <p class="text-[0.65rem] font-bold uppercase tracking-[0.08em] text-muted-foreground/70">
       Connection
     </p>
     <p class="mt-2 text-pretty text-[0.72rem] leading-relaxed text-muted-foreground">
-      {connectionHint(cloudKind)}
+      {connectionHint(kind)}
     </p>
 
     <div class="mt-3">
@@ -387,11 +380,11 @@
         id="tts-cloud-base-url"
         type="text"
         bind:value={cloudBaseUrl}
-        placeholder={defaultBaseUrl(cloudKind)}
+        placeholder={defaultBaseUrl(kind)}
         autocomplete="off"
         onblur={() => void persistCloud()}
       />
-      {#if cloudKind === 'open_ai_compatible'}
+      {#if kind === 'open_ai_compatible'}
         <p class="text-[0.68rem] leading-relaxed text-muted-foreground">
           API root only — no trailing <code
             class="rounded bg-muted px-1 py-px font-mono text-[0.62rem]">/v1</code
@@ -436,8 +429,8 @@
       })}
 
       <p class="text-[0.68rem] leading-relaxed text-muted-foreground">
-        Curated voices are {curatedVoicesLabel(cloudKind)}'s. Using another provider? Enter its own
-        voice IDs.
+        Curated voices are {curatedVoicesLabel(kind)}'s. Using another provider? Enter its own voice
+        IDs.
       </p>
     </div>
   </div>

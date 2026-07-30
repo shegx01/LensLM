@@ -13,6 +13,7 @@
     ttsModelStatus,
     nextTtsConfig,
     ttsEngineCatalog,
+    isCloudEngineId,
     type TtsVoice,
     type TtsEngineCatalogEntry,
     type TtsEngineId,
@@ -49,7 +50,7 @@
 
   function engineToProvider(id: TtsEngineId): TtsProvider {
     if (id === 'qwen3_local') return 'qwen3';
-    if (id === 'cloud') return 'cloud';
+    if (isCloudEngineId(id)) return 'cloud';
     return 'orpheus';
   }
 

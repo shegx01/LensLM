@@ -174,8 +174,16 @@ export async function listTtsVoices(): Promise<TtsVoice[]> {
   return invoke<TtsVoice[]>('list_tts_voices');
 }
 
-/** TTS engine identity. Mirrors lens-core `TtsEngineId` (serde snake_case). */
-export type TtsEngineId = 'orpheus' | 'qwen3_local' | 'cloud';
+// SYNC-CHECK: must match lens-core/src/tts/catalog.rs TtsEngineId (serde snake_case).
+// Each cloud provider is its own engine (#40); the cloud ids equal their CloudTtsKind
+// name. `deepgram` is reserved (never returned by the catalog) but kept for fidelity.
+export type TtsEngineId =
+  | 'orpheus'
+  | 'qwen3_local'
+  | 'open_ai_compatible'
+  | 'deepgram'
+  | 'eleven_labs'
+  | 'google_cloud';
 
 // SYNC-CHECK: must match lens-core/src/tts/catalog.rs EngineCatalogEntry (serde snake_case).
 /** One engine in the static capability catalog — the selector's single source of truth. */
@@ -215,11 +223,16 @@ export async function ttsModelStatus(engine: string, model: string): Promise<Tts
   return invoke<TtsModelStatus>('tts_model_status', { engine, model });
 }
 
-/** Map a persisted `TtsBackend` DTO to its engine id — every Cloud kind collapses to
- *  'cloud' (the externally-tagged object form), unit variants pass through. Single home
- *  for the discriminant so callers never re-derive it inconsistently. */
+/** Map a persisted `TtsBackend` DTO to its engine id. `{ cloud: kind }` yields the
+ *  per-provider engine id (the cloud ids equal their `CloudTtsKind` name, #40); unit
+ *  variants pass through. Single home for the discriminant. */
 export function ttsBackendId(backend: AppConfig['tts']['backend']): TtsEngineId {
-  return typeof backend === 'object' && backend !== null ? 'cloud' : backend;
+  return typeof backend === 'object' && backend !== null ? backend.cloud : backend;
+}
+
+/** Whether an engine id is a cloud provider (vs. a local, on-device engine). */
+export function isCloudEngineId(id: TtsEngineId): id is CloudTtsKind {
+  return id !== 'orpheus' && id !== 'qwen3_local';
 }
 
 /**
@@ -269,12 +282,12 @@ export async function saveTtsProvider(input: {
 }
 
 /**
- * Compute the next `TtsConfig` for a provider selection. A local backend
- * deactivates cloud (the active `backend` no longer points at it) but PRESERVES
- * the saved key/config so switching back to Cloud doesn't lose it. `cloudKind`
- * selects which cloud kind to activate — OpenAI-compatible, ElevenLabs, or
- * Google Cloud (#40) are all user-selectable; it defaults to OpenAI-compatible
- * when omitted. Deepgram remains reserved but not user-selectable from this form.
+ * Compute the next `TtsConfig` for a provider selection. A local backend just
+ * re-points `backend` (the saved per-provider `clouds` credentials are always
+ * preserved). Selecting a cloud provider activates that kind and MERGES its
+ * credentials into `clouds`, leaving every other provider's saved entry intact
+ * (#40 per-provider retention). `cloudKind` picks which kind — OpenAI-compatible,
+ * ElevenLabs, or Google Cloud are user-selectable; defaults to OpenAI-compatible.
  */
 export function nextTtsConfig(
   prev: TtsConfig,
@@ -291,10 +304,9 @@ export function nextTtsConfig(
     version: 1,
     backend: { cloud: kind },
     model: prev.model,
-    cloud: {
-      kind,
-      api_key: input.apiKey,
-      base_url: input.baseUrl ?? ''
+    clouds: {
+      ...prev.clouds,
+      [kind]: { api_key: input.apiKey, base_url: input.baseUrl ?? '' }
     }
   };
 }

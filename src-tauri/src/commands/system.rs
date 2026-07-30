@@ -1,10 +1,11 @@
 //! System / diagnostic commands.
 
 use lens_core::{
-    CheckResult, DownloadProgress, InstallProgress, LensEngine, LensError, LlmDetection,
-    StorageStats, TtsVoice, WHISPER_REGISTRY,
+    CheckResult, CloudTtsKind, DownloadProgress, InstallProgress, LensEngine, LensError,
+    LlmDetection, StorageStats, TtsVoice, WHISPER_REGISTRY,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use tauri::Manager;
 use tauri::ipc::Channel;
 
@@ -238,13 +239,15 @@ pub async fn tts_engine_catalog(
     engine: tauri::State<'_, LensEngine>,
 ) -> Result<Vec<lens_core::EngineCatalogEntry>, LensError> {
     let config = engine.config().await;
-    let cloud_key_present = config
+    // Per-provider (#40): a cloud kind gates its own engine row once it has a key.
+    let keyed_cloud_kinds: BTreeSet<CloudTtsKind> = config
         .tts
-        .cloud
-        .as_ref()
-        .map(|c| !c.api_key.is_empty())
-        .unwrap_or(false);
-    Ok(lens_core::tts_catalog_serialized(cloud_key_present))
+        .clouds
+        .iter()
+        .filter(|(_, creds)| !creds.api_key.is_empty())
+        .map(|(kind, _)| *kind)
+        .collect();
+    Ok(lens_core::tts_catalog_serialized(&keyed_cloud_kinds))
 }
 
 /// Installs an embedding model via Ollama `POST /api/pull`, streaming NDJSON progress.

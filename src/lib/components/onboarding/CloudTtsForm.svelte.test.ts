@@ -1,7 +1,7 @@
 import { render, screen, fireEvent, waitFor } from '@testing-library/svelte';
 import { mockIPC, clearMocks } from '@tauri-apps/api/mocks';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import type { AppConfig } from '$lib/theme/types.js';
+import type { AppConfig, CloudTtsKind } from '$lib/theme/types.js';
 import { baseAppConfig } from '$lib/test-fixtures.js';
 import type { TtsEngineCatalogEntry, TtsVoice } from '$lib/onboarding/system-check.js';
 import CloudTtsForm from './CloudTtsForm.svelte';
@@ -11,15 +11,18 @@ const CLOUD_VOICES: TtsVoice[] = [
   { id: 'onyx', name: 'Onyx', gender: 'male' }
 ];
 
+/** One per-provider cloud engine row (#40): the entry `id` equals its `CloudTtsKind`. */
 function catalogFixture(overrides?: {
+  kind?: CloudTtsKind;
   cloudAvailable?: boolean;
   cloudVoices?: TtsVoice[];
 }): TtsEngineCatalogEntry[] {
+  const kind = overrides?.kind ?? 'open_ai_compatible';
   const cloudAvailable = overrides?.cloudAvailable ?? false;
   const cloudVoices = overrides?.cloudVoices ?? [];
   return [
     {
-      id: 'cloud',
+      id: kind,
       platform: 'cross_platform',
       needs_key: true,
       available: cloudAvailable,
@@ -34,17 +37,16 @@ function catalogFixture(overrides?: {
   ];
 }
 
-function cloudKeyedConfig(): AppConfig {
+/** A config with one cloud provider's credentials saved in the per-provider map. */
+function cloudKeyedConfig(kind: CloudTtsKind = 'open_ai_compatible'): AppConfig {
   return {
     ...baseAppConfig(),
     tts: {
       version: 1,
-      backend: { cloud: 'open_ai_compatible' as const },
+      backend: { cloud: kind },
       model: '',
-      cloud: {
-        kind: 'open_ai_compatible' as const,
-        api_key: 'sk-already-saved',
-        base_url: 'https://api.openai.com'
+      clouds: {
+        [kind]: { api_key: 'sk-already-saved', base_url: 'https://api.openai.com' }
       }
     }
   };
@@ -68,7 +70,11 @@ describe('CloudTtsForm — single-sourced host/guest voice picker snippet (AC-6/
 
     // The parent hands down an already-populated, shared catalog.
     render(CloudTtsForm, {
-      props: { catalog: catalogFixture({ cloudVoices: CLOUD_VOICES }), active: true }
+      props: {
+        catalog: catalogFixture({ cloudVoices: CLOUD_VOICES }),
+        kind: 'open_ai_compatible',
+        active: true
+      }
     });
 
     const host = await screen.findByLabelText(/host speaker/i);
@@ -93,7 +99,7 @@ describe('CloudTtsForm — single-sourced host/guest voice picker snippet (AC-6/
       }
     });
 
-    render(CloudTtsForm, { props: { catalog: [], active: true } });
+    render(CloudTtsForm, { props: { catalog: [], kind: 'open_ai_compatible', active: true } });
 
     const hostField = await screen.findByLabelText(/host speaker/i);
     await waitFor(() => expect(hostField).toHaveValue(''));
@@ -117,7 +123,11 @@ describe('CloudTtsForm — single-sourced host/guest voice picker snippet (AC-6/
     });
 
     render(CloudTtsForm, {
-      props: { catalog: catalogFixture({ cloudVoices: CLOUD_VOICES }), active: true }
+      props: {
+        catalog: catalogFixture({ cloudVoices: CLOUD_VOICES }),
+        kind: 'open_ai_compatible',
+        active: true
+      }
     });
 
     const hostTrigger = await screen.findByLabelText(/host speaker/i);
@@ -128,6 +138,42 @@ describe('CloudTtsForm — single-sourced host/guest voice picker snippet (AC-6/
 
     const hostCustomInput = await screen.findByPlaceholderText(/e\.g\. alloy/i);
     expect(hostCustomInput).toHaveAttribute('id', 'tts-cloud-host-voice-custom');
+  });
+});
+
+describe('CloudTtsForm — per-provider config (#40)', () => {
+  it('persists to the selected provider kind and writes into the clouds map', async () => {
+    let written: AppConfig | null = null;
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return baseAppConfig();
+      if (cmd === 'tts_engine_catalog')
+        return catalogFixture({ kind: 'eleven_labs', cloudAvailable: false });
+      if (cmd === 'set_config') {
+        written = (args as { config: AppConfig }).config;
+        return null;
+      }
+    });
+
+    render(CloudTtsForm, { props: { catalog: [], kind: 'eleven_labs', active: true } });
+
+    const keyField = await screen.findByLabelText(/api key/i);
+    await fireEvent.input(keyField, { target: { value: 'sk-eleven-9' } });
+    await fireEvent.blur(keyField);
+
+    await waitFor(() => expect(written).not.toBeNull());
+    const cfg = written as unknown as AppConfig;
+    expect(cfg.tts.backend).toEqual({ cloud: 'eleven_labs' });
+    expect(cfg.tts.clouds.eleven_labs?.api_key).toBe('sk-eleven-9');
+  });
+
+  it('shows the provider-specific connection hint (ElevenLabs xi-api-key)', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return baseAppConfig();
+      if (cmd === 'tts_engine_catalog') return catalogFixture({ kind: 'eleven_labs' });
+    });
+
+    render(CloudTtsForm, { props: { catalog: [], kind: 'eleven_labs', active: true } });
+    await waitFor(() => expect(screen.getByText(/xi-api-key/i)).toBeInTheDocument());
   });
 });
 
@@ -143,7 +189,7 @@ describe('CloudTtsForm — key save refreshes availability', () => {
       }
     });
 
-    render(CloudTtsForm, { props: { catalog: [], active: true } });
+    render(CloudTtsForm, { props: { catalog: [], kind: 'open_ai_compatible', active: true } });
 
     await waitFor(() => expect(screen.getByText(/requires an api key/i)).toBeInTheDocument());
     const keyField = screen.getByLabelText(/api key/i);
