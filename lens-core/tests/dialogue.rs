@@ -69,6 +69,14 @@ struct ScriptedProvider {
     calls: Arc<AtomicU32>,
     responses: Vec<String>,
     local: bool,
+    systems: std::sync::Mutex<Vec<String>>,
+}
+
+impl ScriptedProvider {
+    /// System prompts seen so far, one per `generate` call.
+    fn captured_systems(&self) -> Vec<String> {
+        self.systems.lock().unwrap().clone()
+    }
 }
 
 impl ScriptedProvider {
@@ -87,6 +95,7 @@ impl ScriptedProvider {
             calls: calls.clone(),
             responses: responses.into_iter().map(|s| s.to_string()).collect(),
             local,
+            systems: std::sync::Mutex::new(Vec::new()),
         });
         (p, calls)
     }
@@ -103,7 +112,11 @@ impl LlmProvider for ScriptedProvider {
     async fn reachable(&self) -> bool {
         true
     }
-    async fn generate(&self, _req: &LlmRequest) -> Result<LlmResponse, lens_core::LensError> {
+    async fn generate(&self, req: &LlmRequest) -> Result<LlmResponse, lens_core::LensError> {
+        self.systems
+            .lock()
+            .unwrap()
+            .push(req.system.clone().unwrap_or_default());
         let n = self.calls.fetch_add(1, Ordering::SeqCst) as usize;
         let text = self
             .responses
@@ -312,6 +325,39 @@ async fn happy_path_one_call_returns_valid_grounded_script() {
             DialoguePhase::Generating,
             DialoguePhase::Validating
         ]
+    );
+}
+
+#[tokio::test]
+async fn outline_instruction_gated_by_provider_locality() {
+    let (_engine, pool, nb, ids, dir) = seed_two_source_notebook().await;
+    const MARKER: &str = "First produce a short `outline`";
+
+    let (remote, _) = ScriptedProvider::with_locality(vec![&valid_short_json()], false);
+    let ctx = build_ctx(
+        dir.path(),
+        &pool,
+        &nb,
+        remote.clone(),
+        ids.clone(),
+        Length::Short,
+    );
+    generate_dialogue(ctx, CancellationToken::new(), |_| {})
+        .await
+        .expect("valid script");
+    assert!(
+        remote.captured_systems()[0].contains(MARKER),
+        "non-local provider must receive the outline instruction"
+    );
+
+    let (local, _) = ScriptedProvider::with_locality(vec![&valid_short_json()], true);
+    let ctx = build_ctx(dir.path(), &pool, &nb, local.clone(), ids, Length::Short);
+    generate_dialogue(ctx, CancellationToken::new(), |_| {})
+        .await
+        .expect("valid script");
+    assert!(
+        !local.captured_systems()[0].contains(MARKER),
+        "local provider must NOT receive the outline instruction"
     );
 }
 

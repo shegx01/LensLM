@@ -189,15 +189,10 @@ pub const DIALOGUE_PROMPT_VERSION: u32 = 4;
 /// abstract set is engine-neutral; each TTS backend maps it to its own capability.
 const EMOTION_VOCAB: &str = "neutral, laugh, sigh, excited, thoughtful";
 
-/// Builds the `(system, user)` prompt from the retrieved units. The creative body
-/// (persona, arc, voice, task framing) comes from the editable `DialogueSystem`
-/// template; the code-owned security envelope — the `<<SRC:nonce>>` injection guard
-/// and the JSON-schema contract — is composed AROUND it here so an edited template
-/// can never remove them. The fenced source units live in the USER message (small
-/// local models cite better with excerpts out of the system prompt — mirrors the
-/// grounded-answer fix). Units are numbered by slice position (`[i+1]`); `title`
-/// falls back to the raw `source_id`; the `source_id=` label MUST stay inside the
-/// fence — the validator matches turns' `source_ids` against these values.
+/// Builds the `(system, user)` prompt: the `DialogueSystem` template body plus the
+/// code-owned envelope (guard + schema), with fenced units in the USER message. The
+/// `source_id=` label MUST stay inside the fence — the validator matches turns'
+/// `source_ids` against it.
 fn build_dialogue_prompt(
     store: &PromptStore,
     units: &[ContextUnit],
@@ -592,7 +587,6 @@ pub async fn generate_dialogue(
     }
 
     let nonce = fence_nonce();
-    // P1 outline is gated to non-local providers; small local models bloat/ignore it.
     let outline = !ctx.provider.is_local();
     let (system, prompt) =
         build_dialogue_prompt(&ctx.prompts, &out.units, &titles, &preset, &nonce, outline);
@@ -782,6 +776,34 @@ mod tests {
         assert_eq!(script.turns.len(), 2);
         assert_eq!(script.turns[0].speaker, Speaker::Host);
         assert_eq!(script.turns[1].speaker, Speaker::Guest);
+    }
+
+    #[test]
+    fn emotion_vocab_lists_every_variant() {
+        // The exhaustive match breaks compilation when an Emotion variant is added,
+        // forcing `label` + EMOTION_VOCAB to be updated together — the prompt vocab
+        // cannot silently drift from the enum.
+        fn label(e: Emotion) -> &'static str {
+            match e {
+                Emotion::Neutral => "neutral",
+                Emotion::Laugh => "laugh",
+                Emotion::Sigh => "sigh",
+                Emotion::Excited => "excited",
+                Emotion::Thoughtful => "thoughtful",
+            }
+        }
+        let vocab = [
+            Emotion::Neutral,
+            Emotion::Laugh,
+            Emotion::Sigh,
+            Emotion::Excited,
+            Emotion::Thoughtful,
+        ]
+        .iter()
+        .map(|&e| label(e))
+        .collect::<Vec<_>>()
+        .join(", ");
+        assert_eq!(EMOTION_VOCAB, vocab);
     }
 
     // ---- Step 3: preclean + extract_json_array + parse ----

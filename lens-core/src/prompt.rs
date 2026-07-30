@@ -68,17 +68,28 @@ impl PromptStore {
     pub(crate) fn load(&self, name: PromptName) -> Cow<'static, str> {
         if let Some(dir) = &self.override_dir {
             let path = dir.join(name.relpath());
-            if let Ok(body) = std::fs::read_to_string(&path) {
-                return Cow::Owned(body);
+            match std::fs::read_to_string(&path) {
+                Ok(body) => return Cow::Owned(body),
+                // NotFound is the normal no-override case; a present-but-unreadable
+                // override (perms, truncation, non-UTF-8) would otherwise be a silent
+                // black hole, so log it (engine-internal — no path crosses IPC).
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    tracing::warn!(
+                        template = name.relpath(),
+                        error = %e,
+                        "prompt override unreadable; using bundled default"
+                    );
+                }
+                Err(_) => {}
             }
         }
         Cow::Borrowed(name.embedded_default())
     }
 
     /// Loads `name` and substitutes each `{{key}}` placeholder with its value.
-    /// Double braces are used so the single braces in embedded JSON schema examples
-    /// are never touched. Unknown placeholders are left verbatim; unused vars are
-    /// ignored.
+    /// Double braces are used so single braces in embedded JSON examples are never
+    /// touched. Substitution is raw (not escaped): `vars` values MUST be code-owned,
+    /// never untrusted source/user text.
     pub(crate) fn render(&self, name: PromptName, vars: &[(&str, &str)]) -> String {
         let mut body = self.load(name).into_owned();
         for (key, value) in vars {
