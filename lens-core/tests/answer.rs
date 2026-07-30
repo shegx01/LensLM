@@ -236,6 +236,7 @@ fn build_ctx(
         question: question.to_string(),
         history: Vec::new(),
         chat: lens_core::ChatConfig::default(),
+        prompts: lens_core::PromptStore::for_data_dir(data_dir),
     }
 }
 

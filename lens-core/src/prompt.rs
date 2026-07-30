@@ -10,10 +10,18 @@ use std::path::{Path, PathBuf};
 
 /// A logical prompt template. Each variant maps to a bundled default (compiled in)
 /// and a relative path under `{data_dir}/prompts/` where a user override may live.
+// Variants are namespaced by module (`Answer*`, `Enrichment*`) and role (`*System`);
+// the shared affixes are intentional identifiers, not accidental naming.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PromptName {
     /// Editable creative body of the audio-overview dialogue system prompt.
     DialogueSystem,
+    /// Editable rules body of the grounded-answer system prompt (the injection
+    /// guard is appended by code, never from this template).
+    AnswerGroundedSystem,
+    /// Editable instruction body of the follow-up query-condensation prompt.
+    AnswerCondenseSystem,
 }
 
 impl PromptName {
@@ -21,6 +29,8 @@ impl PromptName {
     pub(crate) fn relpath(self) -> &'static str {
         match self {
             PromptName::DialogueSystem => "dialogue/script.system.md",
+            PromptName::AnswerGroundedSystem => "answer/grounded.system.md",
+            PromptName::AnswerCondenseSystem => "answer/condense.system.md",
         }
     }
 
@@ -30,6 +40,12 @@ impl PromptName {
         match self {
             PromptName::DialogueSystem => {
                 include_str!("../prompts/dialogue/script.system.md")
+            }
+            PromptName::AnswerGroundedSystem => {
+                include_str!("../prompts/answer/grounded.system.md")
+            }
+            PromptName::AnswerCondenseSystem => {
+                include_str!("../prompts/answer/condense.system.md")
             }
         }
     }

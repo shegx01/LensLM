@@ -1812,6 +1812,7 @@ impl LensEngine {
             question,
             history,
             chat: config.chat,
+            prompts: crate::prompt::PromptStore::for_data_dir(&self.data_dir().await),
         };
 
         Ok(crate::answer::answer_stream(ctx, cancel))
