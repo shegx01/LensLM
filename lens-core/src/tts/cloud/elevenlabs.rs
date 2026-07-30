@@ -28,16 +28,11 @@ fn default_voice(speaker: Speaker) -> &'static str {
     }
 }
 
-/// Inline bracketed audio tag for a per-line emotion (ElevenLabs v3 audio tags).
-/// `Neutral` → no tag. Prepended to the line text so it scopes to that speaker.
+/// Inline bracketed v3 audio tag for a per-line emotion, from the central table
+/// (documented tags only — an undocumented tag is spoken literally). Prepended to the
+/// line text so it scopes to that speaker.
 fn emotion_to_audio_tag(emotion: Emotion) -> Option<&'static str> {
-    match emotion {
-        Emotion::Neutral => None,
-        Emotion::Laugh => Some("[laughs]"),
-        Emotion::Sigh => Some("[sighs]"),
-        Emotion::Excited => Some("[excited]"),
-        Emotion::Thoughtful => Some("[thoughtful]"),
-    }
+    crate::tts::emotion_render(emotion).elevenlabs
 }
 
 /// Submitted length of one line — text plus any prepended emotion tag (+ a space) —

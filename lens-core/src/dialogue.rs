@@ -74,9 +74,9 @@ pub struct DialogueScript {
     pub turns: Vec<Turn>,
 }
 
-/// One dialogue turn. `emotion` is engine-forward metadata (Orpheus #161 renders it as
-/// inline tags; other backends ignore it) — an absent/unknown value deserializes to `None`,
-/// never a validation failure. `source_ids` may be empty for ungrounded turns.
+/// One dialogue turn. `emotion` is engine-neutral delivery metadata; each TTS backend
+/// maps it to its own capability (inline tag, prose style, or drop). An absent emotion
+/// deserializes to `None`. `source_ids` may be empty for ungrounded turns.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Turn {
     pub speaker: Speaker,
@@ -105,6 +105,8 @@ pub enum Emotion {
     Sigh,
     Excited,
     Thoughtful,
+    Curious,
+    Serious,
 }
 
 /// Requested script length. Drives the target turn count, the hard `min_turns`
@@ -187,7 +189,7 @@ pub const DIALOGUE_PROMPT_VERSION: u32 = 4;
 
 /// Allowed `emotion` values, rendered into the template's `{{emotions}}` slot. The
 /// abstract set is engine-neutral; each TTS backend maps it to its own capability.
-const EMOTION_VOCAB: &str = "neutral, laugh, sigh, excited, thoughtful";
+const EMOTION_VOCAB: &str = "neutral, laugh, sigh, excited, thoughtful, curious, serious";
 
 /// Builds the `(system, user)` prompt: the `DialogueSystem` template body plus the
 /// code-owned envelope (guard + schema), with fenced units in the USER message. The
@@ -790,6 +792,8 @@ mod tests {
                 Emotion::Sigh => "sigh",
                 Emotion::Excited => "excited",
                 Emotion::Thoughtful => "thoughtful",
+                Emotion::Curious => "curious",
+                Emotion::Serious => "serious",
             }
         }
         let vocab = [
@@ -798,6 +802,8 @@ mod tests {
             Emotion::Sigh,
             Emotion::Excited,
             Emotion::Thoughtful,
+            Emotion::Curious,
+            Emotion::Serious,
         ]
         .iter()
         .map(|&e| label(e))
