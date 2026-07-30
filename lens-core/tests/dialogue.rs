@@ -16,8 +16,8 @@ use lens_core::embedder::{CountingEmbedder, Embedder, EmbeddingBackend};
 use lens_core::llm::{LlmProvider, LlmRequest, LlmResponse};
 use lens_core::vector_store::{Coordinate, LanceVectorStore, VectorStore};
 use lens_core::{
-    DialogueCtx, DialoguePhase, DialogueScript, Emotion, Length, LensEngine, Reranker, Speaker,
-    generate_dialogue,
+    DialogueCtx, DialoguePhase, DialogueScript, Emotion, Length, LensEngine, PromptStore, Reranker,
+    Speaker, generate_dialogue,
 };
 use sqlx::SqlitePool;
 use tokio::sync::Notify;
@@ -235,6 +235,7 @@ fn build_ctx(
         tokenizer: None,
         length,
         selected_live_ids,
+        prompts: PromptStore::for_data_dir(data_dir),
     }
 }
 

@@ -105,6 +105,10 @@ pub use notebooks::{
     Source, TrashedSource,
 };
 pub use notes::{Note, NoteId, NoteOrigin};
+// Public only alongside the `DialogueCtx` test seam — the integration test needs to
+// build a `PromptStore` for the ctx; production keeps prompt infra crate-private.
+#[cfg(feature = "test-util")]
+pub use prompt::PromptStore;
 pub use render::JsRenderer;
 pub use retrieval::router::{ContextUnit, Provenance, RouterOutput, Tier, tiered_search};
 // Test-only: the integration test asserts `RESERVED_OUTPUT`'s value; production
@@ -1881,6 +1885,7 @@ impl LensEngine {
         // retrieval subset — so a model citing a selected-but-not-retrieved source is
         // not wrongly rejected.
         let selected_live_ids = self.selected_live_source_ids(notebook_id.as_str()).await?;
+        let prompts = crate::prompt::PromptStore::for_data_dir(&self.data_dir().await);
 
         let ctx = crate::dialogue::DialogueCtx {
             provider,
@@ -1896,6 +1901,7 @@ impl LensEngine {
             tokenizer,
             length,
             selected_live_ids,
+            prompts,
         };
 
         crate::dialogue::generate_dialogue(ctx, cancel, on_phase).await
