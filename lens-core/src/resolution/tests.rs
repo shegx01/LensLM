@@ -48,6 +48,13 @@ fn budget() -> Budget {
     )
 }
 
+#[test]
+fn adjudication_system_prompt_carries_untrusted_data_guard() {
+    let system = adjudication_system_with_guard("n0");
+    assert!(system.contains("untrusted DATA"));
+    assert!(system.contains("<<SRC:n0>>") && system.contains("<<END:n0>>"));
+}
+
 /// A [`VectorStore`] whose `entity_ann` replays a scripted neighbour list per query
 /// vector's node id. Only `entity_ann` is exercised; the rest are unreachable stubs.
 struct MockStore {
