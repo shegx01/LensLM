@@ -249,6 +249,7 @@ fn build_ctx(
         length,
         format: lens_core::OverviewFormat::DeepDive,
         language: None,
+        focus: None,
         selected_live_ids,
         prompts: PromptStore::for_data_dir(data_dir),
     }
@@ -583,6 +584,7 @@ async fn engine_generate_dialogue_errors_when_no_provider() {
             lens_core::OverviewFormat::DeepDive,
             Length::Short,
             None,
+            None,
             CancellationToken::new(),
             no_phase(),
         )
@@ -628,6 +630,7 @@ async fn engine_generate_dialogue_produces_grounded_script() {
             &nb,
             lens_core::OverviewFormat::DeepDive,
             Length::Short,
+            None,
             None,
             CancellationToken::new(),
             no_phase(),
@@ -694,6 +697,7 @@ async fn real_model_generates_valid_grounded_dialogue() {
             &nb,
             lens_core::OverviewFormat::DeepDive,
             Length::Short,
+            None,
             None,
             CancellationToken::new(),
             no_phase(),

@@ -1568,12 +1568,14 @@ impl LensEngine {
     /// [#29] Single-owner orchestration: dialogue → synth (atomic write) → persist the
     /// terminal `audio_overviews` row. `Ok(Some(path))` = success (`ready`), `Ok(None)` =
     /// user cancel ([M2], no row written), `Err` = genuine failure (`failed` persisted).
+    #[allow(clippy::too_many_arguments)]
     pub async fn generate_and_persist_overview(
         &self,
         notebook_id: &str,
         format: dialogue::OverviewFormat,
         length: dialogue::Length,
         language: Option<String>,
+        focus: Option<String>,
         on_phase: impl Fn(tts::TtsPhase) + Send + Sync,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<Option<std::path::PathBuf>, LensError> {
@@ -1590,6 +1592,7 @@ impl LensEngine {
                 format,
                 length,
                 language,
+                focus,
                 cancel.clone(),
                 |_phase| {},
             )
@@ -1829,12 +1832,14 @@ impl LensEngine {
     /// source-id set (the validator's grounding allow-list), then awaits the pure
     /// [`dialogue::generate_dialogue`]. One-shot: returns the validated script or a
     /// terminal [`LensError`]; phase markers stream via `on_phase`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn generate_dialogue(
         &self,
         notebook_id: &NotebookId,
         format: dialogue::OverviewFormat,
         length: dialogue::Length,
         language: Option<String>,
+        focus: Option<String>,
         cancel: tokio_util::sync::CancellationToken,
         on_phase: impl Fn(dialogue::DialoguePhase) + Send,
     ) -> Result<dialogue::DialogueScript, LensError> {
@@ -1909,11 +1914,55 @@ impl LensEngine {
             length,
             format,
             language,
+            focus,
             selected_live_ids,
             prompts,
         };
 
         crate::dialogue::generate_dialogue(ctx, cancel, on_phase).await
+    }
+
+    /// Proposes ONE short focus phrase for an audio overview from the notebook's selected
+    /// source titles (one cheap LLM call). Advisory — the user edits it before generating.
+    /// Titles are ingested metadata (untrusted), so they are fenced with the shared guard.
+    pub async fn suggest_overview_focus(&self, notebook_id: &str) -> Result<String, LensError> {
+        let provider = self
+            .chat_provider()
+            .await
+            .ok_or_else(|| LensError::Model("no chat model configured".into()))?;
+        let ids = self.selected_live_source_ids(notebook_id).await?;
+        if ids.is_empty() {
+            return Err(LensError::Validation(
+                "select at least one source first".into(),
+            ));
+        }
+        let pool = self.pool().await;
+        let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+        let titles: Vec<String> = crate::citation::source_titles(&pool, &id_refs)
+            .await?
+            .into_values()
+            .collect();
+        let nonce = crate::prompt::fence_nonce();
+        let system = format!(
+            "You suggest ONE specific focus angle for a short audio overview of a document \
+             set. Output ONLY the focus phrase (a few words) — no preamble, no quotes.\n\n{}",
+            crate::prompt::injection_guard(&nonce, "The document titles", "propose a focus")
+        );
+        let req = crate::llm::LlmRequest {
+            system: Some(system),
+            prompt: format!(
+                "Document titles:\n{}\nSuggested focus:",
+                crate::prompt::fence_excerpt(&nonce, &titles.join("\n"))
+            ),
+            max_tokens: 32,
+            temperature: 0.5,
+            json: false,
+            thinking: false,
+            reasoning_effort: None,
+            messages: Vec::new(),
+        };
+        let resp = provider.generate(&req).await?;
+        Ok(resp.text.trim().trim_matches('"').trim().to_string())
     }
 
     /// The selected + live (not-trashed) source ids for a notebook, over the shared

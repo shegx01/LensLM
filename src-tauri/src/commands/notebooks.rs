@@ -511,6 +511,7 @@ pub async fn generate_dialogue(
             OverviewFormat::default(),
             length,
             None,
+            None,
             (*token).clone(),
             move |phase| {
                 if let Err(e) = send_event(&on_progress_phase, StreamEvent::Chunk(phase)) {
@@ -545,6 +546,17 @@ pub async fn cancel_dialogue(
     engine: tauri::State<'_, LensEngine>,
 ) -> Result<bool, LensError> {
     Ok(engine.cancel_dialogue_generation(&notebook_id))
+}
+
+/// Suggests a short focus phrase for the audio-overview setup modal (the "Suggest
+/// with AI" button). Advisory — the user edits it before generating.
+#[tracing::instrument(skip(engine))]
+#[tauri::command]
+pub async fn suggest_overview_focus(
+    notebook_id: String,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<String, LensError> {
+    engine.suggest_overview_focus(&notebook_id).await
 }
 
 /// Generates + synthesizes the per-notebook Audio Overview at `length` (#29) and
@@ -586,6 +598,7 @@ pub async fn synthesize_overview(
             &notebook_id,
             OverviewFormat::default(),
             length,
+            None,
             None,
             move |phase| {
                 if let Err(e) = send_event(&on_progress_phase, StreamEvent::Chunk(phase)) {

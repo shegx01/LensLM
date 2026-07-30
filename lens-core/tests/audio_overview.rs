@@ -370,6 +370,7 @@ async fn dialogue_phase_failure_persists_failed_row() {
             lens_core::OverviewFormat::DeepDive,
             Length::Short,
             None,
+            None,
             no_phase(),
             CancellationToken::new(),
         )
@@ -395,6 +396,7 @@ async fn synth_phase_failure_persists_failed_row() {
             &nb,
             lens_core::OverviewFormat::DeepDive,
             Length::Short,
+            None,
             None,
             no_phase(),
             CancellationToken::new(),
@@ -430,6 +432,7 @@ async fn cancel_writes_no_failed_row_and_preserves_prior() {
             &nb,
             lens_core::OverviewFormat::DeepDive,
             Length::Short,
+            None,
             None,
             no_phase(),
             cancel,
