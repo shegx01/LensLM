@@ -20,7 +20,7 @@ use crate::{LensEngine, LensError};
 /// Resolution prompt/version tag stamped on every node a pass processes and keyed into
 /// the adjudication cache. SEPARATE from `ENRICHMENT_PROMPT_VERSION`: bumping it
 /// invalidates cached verdicts and forces a full re-resolve on the next pass.
-pub const RESOLUTION_PROMPT_VERSION: &str = "res-v1";
+pub const RESOLUTION_PROMPT_VERSION: &str = "res-v2";
 
 /// Coalesced by `notebook_id` in the background worker drain.
 #[derive(Debug, Clone, PartialEq, Eq)]

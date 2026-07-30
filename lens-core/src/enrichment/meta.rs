@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 /// Structural-map / coref prompt version (AC9 cache key component). Bump on any
 /// prompt change to invalidate prior enrichments. `2`: real coref replaced the
 /// static "[Resolve pronouns…]" hint clause — prior enrichments must re-run.
-pub const ENRICHMENT_PROMPT_VERSION: u32 = 2;
+pub const ENRICHMENT_PROMPT_VERSION: u32 = 3;
 
 /// Minimum total tokens for structural-map enrichment (Decision C).
 pub const ENRICHMENT_SIZE_GATE_TOKENS: usize = 2_000;
