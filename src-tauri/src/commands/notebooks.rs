@@ -565,11 +565,17 @@ pub async fn suggest_overview_focus(
 /// returns the WAV path for immediate `convertFileSrc` playback. A user cancel is
 /// surfaced as the `Cancelled` error kind (no `failed` row, no `Failed` event) so the
 /// card can return to idle rather than an error state.
+// `format`/`language`/`focus` are optional so the pre-redesign caller (length only)
+// keeps working while the setup modal supplies them.
+#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip(on_progress, engine))]
 #[tauri::command]
 pub async fn synthesize_overview(
     notebook_id: String,
     length: Length,
+    format: Option<OverviewFormat>,
+    language: Option<String>,
+    focus: Option<String>,
     on_progress: Channel<StreamEvent<TtsPhase>>,
     engine: tauri::State<'_, LensEngine>,
 ) -> Result<String, LensError> {
@@ -596,10 +602,10 @@ pub async fn synthesize_overview(
     let result = engine
         .generate_and_persist_overview(
             &notebook_id,
-            OverviewFormat::default(),
+            format.unwrap_or_default(),
             length,
-            None,
-            None,
+            language,
+            focus,
             move |phase| {
                 if let Err(e) = send_event(&on_progress_phase, StreamEvent::Chunk(phase)) {
                     tracing::warn!("synthesize_overview: phase send failed: {e}");
