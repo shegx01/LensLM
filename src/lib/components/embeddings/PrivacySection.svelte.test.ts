@@ -33,7 +33,7 @@ function config(opts: { textConsent: boolean; audioConsent: boolean }): Partial<
         api_key: 'x'
       }
     ],
-    tts: { version: 1, backend: 'orpheus', model: '', cloud: null },
+    tts: { version: 1, backend: 'orpheus', model: '', clouds: {} },
     asr: {
       backend: '',
       whisper_model: 'base',
@@ -128,7 +128,7 @@ describe('PrivacySection', () => {
           enrichment: { enabled: false, coref_strategy: 'none', cloud_consent: false },
           audio_cloud_consent: false,
           models: [],
-          tts: { version: 1, backend: 'orpheus', model: '', cloud: null },
+          tts: { version: 1, backend: 'orpheus', model: '', clouds: {} },
           asr: {
             backend: '',
             whisper_model: 'base',

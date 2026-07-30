@@ -9,16 +9,47 @@
 //! body, `VoiceRef::Reference` rejection, empty-key `Validation`, and the
 //! not-yet-supported Deepgram/ElevenLabs kinds. All offline.
 
+use base64::Engine;
 use lens_core::config::{VoiceConfig, VoiceRef};
-use lens_core::dialogue::{DialogueScript, Speaker, Turn};
+use lens_core::dialogue::{DialogueScript, Emotion, Speaker, Turn};
 use lens_core::error::LensError;
 use lens_core::tts::TtsProvider;
 use lens_core::tts::audio::TARGET_RATE;
 use lens_core::tts::cloud::CloudTtsAdapter;
 use lens_core::{CloudTtsKind, TtsPhase};
 use tokio_util::sync::CancellationToken;
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+fn raw_pcm16(samples: &[f32]) -> Vec<u8> {
+    samples
+        .iter()
+        .flat_map(|&s| ((s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16).to_le_bytes())
+        .collect()
+}
+
+fn dialogue_adapter(kind: CloudTtsKind, uri: &str, key: &str, model: &str) -> CloudTtsAdapter {
+    CloudTtsAdapter::with_client(kind, uri, key, model, reqwest::Client::new())
+}
+
+fn hg(host: &str, guest: &str) -> DialogueScript {
+    DialogueScript {
+        turns: vec![
+            Turn {
+                speaker: Speaker::Host,
+                text: host.to_string(),
+                emotion: Some(Emotion::Laugh),
+                source_ids: Vec::new(),
+            },
+            Turn {
+                speaker: Speaker::Guest,
+                text: guest.to_string(),
+                emotion: None,
+                source_ids: Vec::new(),
+            },
+        ],
+    }
+}
 
 fn wav_bytes(samples: &[f32], sample_rate: u32, channels: u16) -> Vec<u8> {
     let spec = hound::WavSpec {
@@ -328,16 +359,355 @@ async fn empty_api_key_yields_validation() {
 }
 
 #[tokio::test]
-async fn deepgram_and_elevenlabs_kinds_are_not_yet_supported() {
-    for kind in [CloudTtsKind::Deepgram, CloudTtsKind::ElevenLabs] {
-        let err = adapter(kind, "http://127.0.0.1:1", "k")
+async fn deepgram_turn_unsupported_dialogue_kinds_reject_single_turn() {
+    // Deepgram's per-turn path is still unimplemented -> Tts.
+    let err = adapter(CloudTtsKind::Deepgram, "http://127.0.0.1:1", "k")
+        .synthesize_turn(
+            &turn("x"),
+            &VoiceConfig::default(),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("deepgram unsupported");
+    assert!(matches!(err, LensError::Tts(_)));
+
+    // Dialogue engines have no single-turn contract; a direct synthesize_turn is a
+    // Validation error (unreachable via synthesize_overview, which calls the script path).
+    for kind in [CloudTtsKind::ElevenLabs, CloudTtsKind::GoogleCloud] {
+        let err = dialogue_adapter(kind, "http://127.0.0.1:1", "k", "m")
             .synthesize_turn(
                 &turn("x"),
                 &VoiceConfig::default(),
                 &CancellationToken::new(),
             )
             .await
-            .expect_err("unsupported kind");
-        assert!(matches!(err, LensError::Tts(_)), "kind {kind:?}");
+            .expect_err("dialogue kind rejects single turn");
+        assert!(matches!(err, LensError::Validation(_)), "kind {kind:?}");
     }
+}
+
+#[tokio::test]
+async fn openai_emotive_turn_emits_instructions_field() {
+    // AC5 on the re-homed OpenAI path: a per-turn emotion still drives the
+    // `instructions` hint through the whole-exchange contract (no behavior change).
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/audio/speech"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(wav_bytes(
+            &[0.1f32; 24],
+            TARGET_RATE,
+            1,
+        )))
+        .mount(&server)
+        .await;
+
+    let script = DialogueScript {
+        turns: vec![Turn {
+            speaker: Speaker::Host,
+            text: "hooray".into(),
+            emotion: Some(Emotion::Excited),
+            source_ids: Vec::new(),
+        }],
+    };
+    let noop = |_p: TtsPhase| {};
+    adapter(CloudTtsKind::OpenAiCompatible, &server.uri(), "k")
+        .synthesize_script(
+            &script,
+            &VoiceConfig::default(),
+            &noop,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("openai script synth");
+    let calls = server.received_requests().await.unwrap();
+    let body = String::from_utf8_lossy(&calls[0].body);
+    assert!(
+        body.contains("\"instructions\""),
+        "emotion drives instructions (AC5): {body}"
+    );
+}
+
+// ---- ElevenLabs Text-to-Dialogue (#40) ----
+
+#[tokio::test]
+async fn elevenlabs_dialogue_request_shape_auth_order_emotion_and_pcm_decode() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/text-to-dialogue"))
+        .and(query_param("output_format", "pcm_24000"))
+        .and(header("xi-api-key", "el-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(raw_pcm16(&[0.1f32; 240])))
+        .mount(&server)
+        .await;
+
+    let noop = |_p: TtsPhase| {};
+    let out = dialogue_adapter(
+        CloudTtsKind::ElevenLabs,
+        &server.uri(),
+        "el-key",
+        "eleven_v3",
+    )
+    .synthesize_script(
+        &hg("Hello there", "Hi back"),
+        &VoiceConfig::default(),
+        &noop,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("dialogue synth");
+    assert_eq!(out.sample_rate, TARGET_RATE);
+    // One chunk -> raw 240 samples (no inter-chunk gap).
+    assert_eq!(out.samples.len(), 240);
+
+    let calls = server.received_requests().await.unwrap();
+    assert_eq!(calls.len(), 1);
+    let body = String::from_utf8_lossy(&calls[0].body);
+    assert!(body.contains("\"model_id\":\"eleven_v3\""), "model: {body}");
+    assert!(body.contains("\"inputs\""), "inputs list: {body}");
+    // Per-line emotion audio tag prepended to the host line (AC5).
+    assert!(body.contains("[laughs] Hello there"), "emotion tag: {body}");
+    // Turn order preserved (host line before guest line).
+    let host_idx = body.find("Hello there").expect("host line");
+    let guest_idx = body.find("Hi back").expect("guest line");
+    assert!(host_idx < guest_idx, "turn order preserved");
+}
+
+#[tokio::test]
+async fn elevenlabs_over_limit_chunks_and_never_calls_per_turn() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/text-to-dialogue"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(raw_pcm16(&[0.1f32; 240])))
+        .mount(&server)
+        .await;
+
+    // 3 turns of 800 chars, ElevenLabs 2000-char cap -> 2 scene chunks.
+    let big = "a".repeat(800);
+    let script = DialogueScript {
+        turns: vec![
+            Turn {
+                speaker: Speaker::Host,
+                text: big.clone(),
+                emotion: None,
+                source_ids: Vec::new(),
+            },
+            Turn {
+                speaker: Speaker::Guest,
+                text: big.clone(),
+                emotion: None,
+                source_ids: Vec::new(),
+            },
+            Turn {
+                speaker: Speaker::Host,
+                text: big.clone(),
+                emotion: None,
+                source_ids: Vec::new(),
+            },
+        ],
+    };
+    let phases = std::sync::Mutex::new(Vec::new());
+    let on_phase = |p: TtsPhase| phases.lock().unwrap().push(p);
+    let out = dialogue_adapter(CloudTtsKind::ElevenLabs, &server.uri(), "k", "eleven_v3")
+        .synthesize_script(
+            &script,
+            &VoiceConfig::default(),
+            &on_phase,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("chunked synth");
+
+    let calls = server.received_requests().await.unwrap();
+    assert_eq!(calls.len(), 2, "two scene chunks -> two dialogue requests");
+    assert!(
+        calls.iter().all(|c| c.url.path() == "/v1/text-to-dialogue"),
+        "never falls back to a per-turn /v1/audio/speech call"
+    );
+    // Two chunks stitched with one scene gap between them.
+    assert!(
+        out.samples.len() > 480,
+        "stitched len {}",
+        out.samples.len()
+    );
+    assert!(
+        phases
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| matches!(p, TtsPhase::Stitching))
+    );
+}
+
+#[tokio::test]
+async fn elevenlabs_401_maps_validation_and_leaks_no_key() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/text-to-dialogue"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("bad key el-super-secret"))
+        .mount(&server)
+        .await;
+
+    let base = server.uri();
+    let noop = |_p: TtsPhase| {};
+    let err = dialogue_adapter(
+        CloudTtsKind::ElevenLabs,
+        &base,
+        "el-super-secret",
+        "eleven_v3",
+    )
+    .synthesize_script(
+        &hg("a", "b"),
+        &VoiceConfig::default(),
+        &noop,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect_err("401");
+    assert!(matches!(err, LensError::Validation(_)));
+    let msg = err.to_string();
+    assert!(!msg.contains("el-super-secret"), "xi-api-key leaked: {msg}");
+    assert!(!msg.contains(&base), "base url leaked: {msg}");
+}
+
+// ---- Google Gemini multi-speaker (#40) ----
+
+fn gemini_audio_response(samples: &[f32]) -> String {
+    let b64 = base64::engine::general_purpose::STANDARD.encode(raw_pcm16(samples));
+    format!(
+        r#"{{"candidates":[{{"content":{{"parts":[{{"inlineData":{{"mimeType":"audio/L16;codec=pcm;rate=24000","data":"{b64}"}}}}]}}}}]}}"#
+    )
+}
+
+#[tokio::test]
+async fn google_dialogue_request_shape_auth_and_base64_l16_decode() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/v1beta/models/gemini-2.5-flash-preview-tts:generateContent",
+        ))
+        .and(header("x-goog-api-key", "g-key"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(gemini_audio_response(&[0.1f32; 240])),
+        )
+        .mount(&server)
+        .await;
+
+    let script = DialogueScript {
+        turns: vec![
+            Turn {
+                speaker: Speaker::Host,
+                text: "Hello".into(),
+                emotion: Some(Emotion::Excited),
+                source_ids: Vec::new(),
+            },
+            Turn {
+                speaker: Speaker::Guest,
+                text: "Hi".into(),
+                emotion: None,
+                source_ids: Vec::new(),
+            },
+        ],
+    };
+    let noop = |_p: TtsPhase| {};
+    let out = dialogue_adapter(
+        CloudTtsKind::GoogleCloud,
+        &server.uri(),
+        "g-key",
+        "gemini-2.5-flash-preview-tts",
+    )
+    .synthesize_script(
+        &script,
+        &VoiceConfig::default(),
+        &noop,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("gemini synth");
+    assert_eq!(out.sample_rate, TARGET_RATE);
+    assert_eq!(out.samples.len(), 240);
+
+    let calls = server.received_requests().await.unwrap();
+    assert_eq!(calls.len(), 1);
+    // Google uses x-goog-api-key, NEVER bearer Authorization.
+    assert!(
+        calls[0].headers.get("authorization").is_none(),
+        "must not send bearer auth"
+    );
+    let body = String::from_utf8_lossy(&calls[0].body);
+    assert!(
+        body.contains("Host: [excited] Hello"),
+        "labelled cue line: {body}"
+    );
+    assert!(body.contains("Guest: Hi"), "guest line: {body}");
+    assert!(
+        body.contains("multiSpeakerVoiceConfig"),
+        "multi-speaker config: {body}"
+    );
+    assert!(
+        body.contains("\"speaker\":\"Host\"") && body.contains("\"speaker\":\"Guest\""),
+        "both speaker configs: {body}"
+    );
+}
+
+#[tokio::test]
+async fn google_403_maps_validation_and_leaks_no_key() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(403).set_body_string("denied for g-super-secret"))
+        .mount(&server)
+        .await;
+
+    let base = server.uri();
+    let noop = |_p: TtsPhase| {};
+    let err = dialogue_adapter(
+        CloudTtsKind::GoogleCloud,
+        &base,
+        "g-super-secret",
+        "gemini-2.5-flash-preview-tts",
+    )
+    .synthesize_script(
+        &hg("a", "b"),
+        &VoiceConfig::default(),
+        &noop,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect_err("403");
+    assert!(matches!(err, LensError::Validation(_)));
+    let msg = err.to_string();
+    assert!(
+        !msg.contains("g-super-secret"),
+        "x-goog-api-key leaked: {msg}"
+    );
+    assert!(!msg.contains(&base), "base url leaked: {msg}");
+}
+
+#[tokio::test]
+async fn google_safety_blocked_no_audio_maps_to_tts_not_panic() {
+    let server = MockServer::start().await;
+    // 200 OK but no audio part (finishReason SAFETY) — must map to Tts, not panic.
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"candidates":[{"finishReason":"SAFETY"}]}"#),
+        )
+        .mount(&server)
+        .await;
+
+    let noop = |_p: TtsPhase| {};
+    let err = dialogue_adapter(
+        CloudTtsKind::GoogleCloud,
+        &server.uri(),
+        "k",
+        "gemini-2.5-flash-preview-tts",
+    )
+    .synthesize_script(
+        &hg("a", "b"),
+        &VoiceConfig::default(),
+        &noop,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect_err("no audio");
+    assert!(matches!(err, LensError::Tts(_)));
 }

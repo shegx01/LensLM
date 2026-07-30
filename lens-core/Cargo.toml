@@ -79,6 +79,8 @@ chrono = { workspace = true }
 petgraph = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Decodes the Gemini multi-speaker TTS base64 `audioContent` (#40).
+base64 = { workspace = true }
 # Outbound HTTP client for local runtime detection (system-check probes).
 # `rustls` (reqwest 0.13 renamed `rustls-tls` → `rustls`) keeps us off
 # OpenSSL/native-tls; `default-features = false` drops the default native-tls
@@ -316,6 +318,8 @@ printpdf = "=0.7.0"
 rust_xlsxwriter = "=0.92.0"
 arrow-array = "58"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# Builds the base64 `audioContent` in the Gemini cloud-TTS wiremock fixtures (#40).
+base64 = { workspace = true }
 # Tokenizer download fallback for tokenizer-dependent tests when offline cache
 # is absent (same version the lib resolves).
 reqwest = { version = "=0.13.4", default-features = false, features = ["json", "rustls", "stream"] }

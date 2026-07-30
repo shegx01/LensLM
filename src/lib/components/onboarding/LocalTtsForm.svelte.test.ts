@@ -47,7 +47,7 @@ function catalogFixture(overrides?: { qwenAvailable?: boolean }): TtsEngineCatal
       required_model_ids: []
     },
     {
-      id: 'cloud',
+      id: 'open_ai_compatible',
       platform: 'cross_platform',
       needs_key: true,
       available: false,

@@ -4,6 +4,8 @@
 //! keyed by a non-cfg-gated [`TtsEngineId`] so every engine is enumerable on
 //! every platform (the cfg-gated [`TtsBackend`] is used only for dispatch).
 
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 
 use crate::error::LensError;
@@ -151,18 +153,44 @@ pub fn validate_qwen_language(lang: Lang) -> Result<&'static str, LensError> {
 }
 
 /// A non-cfg-gated engine identity, enumerable on every platform. Distinct from
-/// the cfg-gated [`TtsBackend`] dispatch enum.
+/// the cfg-gated [`TtsBackend`] dispatch enum. Each cloud provider is its own
+/// engine (#40) so the selector lists them alongside Orpheus/Qwen and each is
+/// configured separately; the cloud variants' serde names match [`CloudTtsKind`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TtsEngineId {
     Orpheus,
     Qwen3Local,
-    Cloud,
+    OpenAiCompatible,
+    Deepgram,
+    ElevenLabs,
+    GoogleCloud,
 }
 
 impl TtsEngineId {
-    /// Bridge to the cfg-gated dispatch enum. PARTIAL + LOSSY, not a bijection:
-    /// off Apple Silicon `TtsBackend::Qwen3Local` does not exist → `None`.
+    /// The cloud provider kind this engine dispatches to, or `None` for a local
+    /// engine. The one place the engine↔kind mapping lives.
+    fn cloud_kind(self) -> Option<CloudTtsKind> {
+        match self {
+            TtsEngineId::OpenAiCompatible => Some(CloudTtsKind::OpenAiCompatible),
+            TtsEngineId::Deepgram => Some(CloudTtsKind::Deepgram),
+            TtsEngineId::ElevenLabs => Some(CloudTtsKind::ElevenLabs),
+            TtsEngineId::GoogleCloud => Some(CloudTtsKind::GoogleCloud),
+            TtsEngineId::Orpheus | TtsEngineId::Qwen3Local => None,
+        }
+    }
+
+    fn from_cloud_kind(kind: CloudTtsKind) -> TtsEngineId {
+        match kind {
+            CloudTtsKind::OpenAiCompatible => TtsEngineId::OpenAiCompatible,
+            CloudTtsKind::Deepgram => TtsEngineId::Deepgram,
+            CloudTtsKind::ElevenLabs => TtsEngineId::ElevenLabs,
+            CloudTtsKind::GoogleCloud => TtsEngineId::GoogleCloud,
+        }
+    }
+
+    /// Bridge to the cfg-gated dispatch enum. PARTIAL, not a bijection: off Apple
+    /// Silicon `TtsBackend::Qwen3Local` does not exist → `None`.
     pub fn to_backend(self) -> Option<TtsBackend> {
         match self {
             TtsEngineId::Orpheus => Some(TtsBackend::Orpheus),
@@ -170,18 +198,18 @@ impl TtsEngineId {
             TtsEngineId::Qwen3Local => Some(TtsBackend::Qwen3Local),
             #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
             TtsEngineId::Qwen3Local => None,
-            TtsEngineId::Cloud => Some(TtsBackend::Cloud(CloudTtsKind::default())),
+            other => other.cloud_kind().map(TtsBackend::Cloud),
         }
     }
 
-    /// Collapse a dispatch backend to its catalog identity. LOSSY: `Cloud(kind)`
-    /// drops `kind` — the catalog identity is provider-agnostic by design.
+    /// Collapse a dispatch backend to its catalog identity. `Cloud(kind)` maps to
+    /// the matching per-provider engine id.
     pub fn from_backend(backend: &TtsBackend) -> TtsEngineId {
         match backend {
             TtsBackend::Orpheus => TtsEngineId::Orpheus,
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             TtsBackend::Qwen3Local => TtsEngineId::Qwen3Local,
-            TtsBackend::Cloud(_) => TtsEngineId::Cloud,
+            TtsBackend::Cloud(kind) => TtsEngineId::from_cloud_kind(*kind),
         }
     }
 
@@ -189,27 +217,36 @@ impl TtsEngineId {
         match self {
             TtsEngineId::Orpheus => LanguageSupport::Set(ORPHEUS_LANGS),
             TtsEngineId::Qwen3Local => LanguageSupport::Set(QWEN_LANGS),
-            TtsEngineId::Cloud => LanguageSupport::Multilingual,
+            TtsEngineId::OpenAiCompatible
+            | TtsEngineId::Deepgram
+            | TtsEngineId::ElevenLabs
+            | TtsEngineId::GoogleCloud => LanguageSupport::Multilingual,
         }
     }
 
     /// Preset named voices for this engine's selector display. Derived from the
-    /// canonical voice lists (no duplication): Orpheus from its adapter catalog,
-    /// Qwen from [`QWEN_VOICES`], Cloud from the curated OpenAI set.
+    /// canonical voice lists (no duplication): Orpheus/Qwen from their adapter
+    /// catalogs, and each cloud provider from its own curated voice set.
     pub fn preset_voices(self) -> Vec<TtsVoice> {
-        match self {
-            TtsEngineId::Orpheus => crate::tts::orpheus::ORPHEUS_VOICES
+        fn from_tuples(voices: &[(&'static str, &'static str, Gender)]) -> Vec<TtsVoice> {
+            voices
                 .iter()
                 .map(|&(id, name, gender)| TtsVoice::new(id, name, gender))
-                .collect(),
+                .collect()
+        }
+        match self {
+            TtsEngineId::Orpheus => from_tuples(crate::tts::orpheus::ORPHEUS_VOICES),
             TtsEngineId::Qwen3Local => QWEN_VOICES
                 .iter()
                 .map(|v| TtsVoice::new(v.id, v.display_name, v.gender))
                 .collect(),
-            TtsEngineId::Cloud => crate::tts::cloud::OPENAI_VOICES
-                .iter()
-                .map(|&(id, name, gender)| TtsVoice::new(id, name, gender))
-                .collect(),
+            TtsEngineId::OpenAiCompatible | TtsEngineId::Deepgram => {
+                from_tuples(crate::tts::cloud::OPENAI_VOICES)
+            }
+            TtsEngineId::ElevenLabs => {
+                from_tuples(crate::tts::cloud::elevenlabs::ELEVENLABS_VOICES)
+            }
+            TtsEngineId::GoogleCloud => from_tuples(crate::tts::cloud::google::GEMINI_VOICES),
         }
     }
 }
@@ -266,12 +303,28 @@ static CATALOG: &[EngineCapability] = &[
         language_capability_label: "10 languages",
     },
     EngineCapability {
-        id: TtsEngineId::Cloud,
+        id: TtsEngineId::OpenAiCompatible,
         platform: Platform::CrossPlatform,
         needs_key: true,
         languages: LanguageSupport::Multilingual,
         model_size_bytes: None,
-        language_capability_label: "Multilingual (cloud)",
+        language_capability_label: "OpenAI-compatible · multilingual",
+    },
+    EngineCapability {
+        id: TtsEngineId::ElevenLabs,
+        platform: Platform::CrossPlatform,
+        needs_key: true,
+        languages: LanguageSupport::Multilingual,
+        model_size_bytes: None,
+        language_capability_label: "ElevenLabs dialogue · multilingual",
+    },
+    EngineCapability {
+        id: TtsEngineId::GoogleCloud,
+        platform: Platform::CrossPlatform,
+        needs_key: true,
+        languages: LanguageSupport::Multilingual,
+        model_size_bytes: None,
+        language_capability_label: "Google multi-speaker · multilingual",
     },
 ];
 
@@ -306,11 +359,16 @@ pub struct EngineCatalogEntry {
 }
 
 impl EngineCatalogEntry {
-    fn from_capability(cap: &EngineCapability, cloud_key_present: bool) -> Self {
+    fn from_capability(cap: &EngineCapability, keyed_cloud_kinds: &BTreeSet<CloudTtsKind>) -> Self {
         let platform_available = cap.id.to_backend().is_some();
+        // A cloud engine is available once ITS OWN provider kind has a saved key.
+        let has_key = cap
+            .id
+            .cloud_kind()
+            .is_some_and(|k| keyed_cloud_kinds.contains(&k));
         let (available, unavailable_reason) = if !platform_available {
             (false, Some("Requires Apple Silicon".to_string()))
-        } else if cap.needs_key && !cloud_key_present {
+        } else if cap.needs_key && !has_key {
             (false, Some("Requires an API key".to_string()))
         } else {
             (true, None)
@@ -345,11 +403,14 @@ impl EngineCatalogEntry {
 }
 
 /// Serializes the full catalog for the frontend selector, resolving availability
-/// against this build (Qwen platform) and `cloud_key_present` (Cloud key gate).
-pub fn tts_catalog_serialized(cloud_key_present: bool) -> Vec<EngineCatalogEntry> {
+/// against this build (Qwen platform) and `keyed_cloud_kinds` — the set of cloud
+/// provider kinds that currently have a saved key (each gates its own engine row).
+pub fn tts_catalog_serialized(
+    keyed_cloud_kinds: &BTreeSet<CloudTtsKind>,
+) -> Vec<EngineCatalogEntry> {
     CATALOG
         .iter()
-        .map(|cap| EngineCatalogEntry::from_capability(cap, cloud_key_present))
+        .map(|cap| EngineCatalogEntry::from_capability(cap, keyed_cloud_kinds))
         .collect()
 }
 
@@ -417,9 +478,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalog_has_three_engines_with_expected_language_sets() {
+    fn catalog_lists_the_selectable_engines_with_expected_language_sets() {
         let catalog = tts_catalog();
-        assert_eq!(catalog.len(), 3);
+        // Orpheus + Qwen + three user-selectable cloud providers (Deepgram reserved).
+        assert_eq!(catalog.len(), 5);
+        assert!(!catalog.iter().any(|c| c.id == TtsEngineId::Deepgram));
 
         let orpheus = catalog
             .iter()
@@ -441,26 +504,35 @@ mod tests {
             LanguageSupport::Multilingual => panic!("qwen must be a concrete set"),
         }
 
-        let cloud = catalog.iter().find(|c| c.id == TtsEngineId::Cloud).unwrap();
-        assert_eq!(cloud.languages, LanguageSupport::Multilingual);
-        assert!(cloud.needs_key);
-        assert!(cloud.model_size_bytes.is_none());
+        for id in [
+            TtsEngineId::OpenAiCompatible,
+            TtsEngineId::ElevenLabs,
+            TtsEngineId::GoogleCloud,
+        ] {
+            let cloud = catalog.iter().find(|c| c.id == id).unwrap();
+            assert_eq!(cloud.languages, LanguageSupport::Multilingual);
+            assert!(cloud.needs_key);
+            assert!(cloud.model_size_bytes.is_none());
+        }
     }
 
     #[test]
-    fn engine_id_from_backend_is_directional_and_collapses_cloud() {
+    fn engine_id_from_backend_maps_each_cloud_kind() {
         assert_eq!(
             TtsEngineId::from_backend(&TtsBackend::Orpheus),
             TtsEngineId::Orpheus
         );
-        // Cloud(kind) collapses to a payload-less Cloud identity (intended, lossy).
         assert_eq!(
             TtsEngineId::from_backend(&TtsBackend::Cloud(CloudTtsKind::ElevenLabs)),
-            TtsEngineId::Cloud
+            TtsEngineId::ElevenLabs
+        );
+        assert_eq!(
+            TtsEngineId::from_backend(&TtsBackend::Cloud(CloudTtsKind::GoogleCloud)),
+            TtsEngineId::GoogleCloud
         );
         assert_eq!(
             TtsEngineId::from_backend(&TtsBackend::Cloud(CloudTtsKind::Deepgram)),
-            TtsEngineId::Cloud
+            TtsEngineId::Deepgram
         );
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         assert_eq!(
@@ -470,9 +542,19 @@ mod tests {
     }
 
     #[test]
-    fn engine_id_to_backend_is_partial() {
-        assert!(TtsEngineId::Orpheus.to_backend().is_some());
-        assert!(TtsEngineId::Cloud.to_backend().is_some());
+    fn engine_id_to_backend_round_trips_cloud_kinds_and_is_partial_for_qwen() {
+        assert_eq!(TtsEngineId::Orpheus.to_backend(), Some(TtsBackend::Orpheus));
+        for kind in [
+            CloudTtsKind::OpenAiCompatible,
+            CloudTtsKind::Deepgram,
+            CloudTtsKind::ElevenLabs,
+            CloudTtsKind::GoogleCloud,
+        ] {
+            assert_eq!(
+                TtsEngineId::from_cloud_kind(kind).to_backend(),
+                Some(TtsBackend::Cloud(kind))
+            );
+        }
         // Qwen3Local resolves only on Apple Silicon (cfg-gated backend variant).
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         assert!(TtsEngineId::Qwen3Local.to_backend().is_some());
@@ -566,9 +648,15 @@ mod tests {
             ("s2".to_string(), Some(Lang::Arabic)),
             ("s3".to_string(), None),
         ];
-        let v = evaluate_language_guard(TtsEngineId::Cloud, &sources);
-        assert!(v.allow);
-        assert!(v.offending.is_empty());
+        for id in [
+            TtsEngineId::OpenAiCompatible,
+            TtsEngineId::ElevenLabs,
+            TtsEngineId::GoogleCloud,
+        ] {
+            let v = evaluate_language_guard(id, &sources);
+            assert!(v.allow);
+            assert!(v.offending.is_empty());
+        }
     }
 
     #[test]
@@ -593,9 +681,21 @@ mod tests {
         assert_eq!(qwen.len(), QWEN_VOICES.len());
         assert!(qwen.iter().any(|v| v.id == "dylan"));
 
-        let cloud = TtsEngineId::Cloud.preset_voices();
-        assert_eq!(cloud.len(), crate::tts::cloud::OPENAI_VOICES.len());
-        assert!(cloud.iter().any(|v| v.id == "alloy"));
+        let openai = TtsEngineId::OpenAiCompatible.preset_voices();
+        assert_eq!(openai.len(), crate::tts::cloud::OPENAI_VOICES.len());
+        assert!(openai.iter().any(|v| v.id == "alloy"));
+
+        // Each cloud provider surfaces ITS OWN curated voices, not OpenAI's (#40).
+        let eleven = TtsEngineId::ElevenLabs.preset_voices();
+        assert_eq!(
+            eleven.len(),
+            crate::tts::cloud::elevenlabs::ELEVENLABS_VOICES.len()
+        );
+        assert!(eleven.iter().any(|v| v.name == "Rachel"));
+
+        let google = TtsEngineId::GoogleCloud.preset_voices();
+        assert_eq!(google.len(), crate::tts::cloud::google::GEMINI_VOICES.len());
+        assert!(google.iter().any(|v| v.id == "Kore"));
     }
 
     /// Every guard-comparable `Lang`, so drift checks can enumerate the full set.
@@ -652,9 +752,9 @@ mod tests {
     }
 
     #[test]
-    fn serialized_catalog_resolves_availability() {
-        let entries = tts_catalog_serialized(false);
-        assert_eq!(entries.len(), 3);
+    fn serialized_catalog_resolves_per_kind_availability() {
+        let entries = tts_catalog_serialized(&BTreeSet::new());
+        assert_eq!(entries.len(), 5);
 
         let orpheus = entries
             .iter()
@@ -666,22 +766,35 @@ mod tests {
         assert_eq!(orpheus.supported_languages, vec![Lang::English]);
         assert_eq!(orpheus.required_model_ids, vec!["orpheus", "snac"]);
 
-        let cloud = entries.iter().find(|e| e.id == TtsEngineId::Cloud).unwrap();
-        assert!(!cloud.available, "cloud without a key is unavailable");
-        assert_eq!(
-            cloud.unavailable_reason.as_deref(),
-            Some("Requires an API key")
-        );
-        assert!(cloud.multilingual);
-        assert!(cloud.supported_languages.is_empty());
-        assert!(cloud.required_model_ids.is_empty());
+        // With no keyed kinds, every cloud engine is unavailable.
+        for id in [
+            TtsEngineId::OpenAiCompatible,
+            TtsEngineId::ElevenLabs,
+            TtsEngineId::GoogleCloud,
+        ] {
+            let cloud = entries.iter().find(|e| e.id == id).unwrap();
+            assert!(!cloud.available, "{id:?} without a key must be unavailable");
+            assert_eq!(
+                cloud.unavailable_reason.as_deref(),
+                Some("Requires an API key")
+            );
+            assert!(cloud.multilingual);
+            assert!(cloud.supported_languages.is_empty());
+            assert!(cloud.required_model_ids.is_empty());
+        }
 
-        let with_key = tts_catalog_serialized(true);
-        let cloud = with_key
+        // A key for ONE provider enables only that provider's row (#40).
+        let one_keyed = tts_catalog_serialized(&BTreeSet::from([CloudTtsKind::ElevenLabs]));
+        let eleven = one_keyed
             .iter()
-            .find(|e| e.id == TtsEngineId::Cloud)
+            .find(|e| e.id == TtsEngineId::ElevenLabs)
             .unwrap();
-        assert!(cloud.available);
+        assert!(eleven.available);
+        let google = one_keyed
+            .iter()
+            .find(|e| e.id == TtsEngineId::GoogleCloud)
+            .unwrap();
+        assert!(!google.available);
 
         let qwen = entries
             .iter()

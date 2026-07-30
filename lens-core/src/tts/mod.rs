@@ -11,6 +11,7 @@ use crate::error::LensError;
 
 pub mod audio;
 pub mod catalog;
+pub mod chunk;
 pub mod cloud;
 pub mod orpheus;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -135,24 +136,34 @@ impl TtsBackend {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+// `Ord`/`Hash` so it can key the per-provider `TtsConfig.clouds` map (#40).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum CloudTtsKind {
     #[default]
     OpenAiCompatible,
     Deepgram,
     ElevenLabs,
+    /// Google's multi-speaker dialogue TTS. Targets the Gemini API
+    /// `generateContent` surface (`generativelanguage.googleapis.com`) — the one
+    /// Google multi-speaker path callable with a plain API key. The OAuth-only
+    /// Cloud TTS `text:synthesize` product is deliberately not used (#40).
+    GoogleCloud,
 }
 
 impl CloudTtsKind {
-    /// Whether this provider accepts W3C SSML in the synthesis input. OpenAI takes
-    /// plain text + an `instructions` hint (not SSML); ElevenLabs supports SSML;
-    /// Deepgram does not. Consulted per-provider — not surfaced in the static
-    /// `TtsEngineId`-keyed catalog DTO (see #195 ADR).
+    /// Whether this provider accepts W3C SSML in the synthesis input. No wired cloud
+    /// engine does: OpenAI takes an `instructions` hint, ElevenLabs and Gemini take
+    /// inline bracketed audio cues embedded in the turn text. Consulted per-provider —
+    /// not surfaced in the static `TtsEngineId`-keyed catalog DTO (see #195 ADR).
     pub fn supports_ssml(self) -> bool {
         match self {
-            CloudTtsKind::OpenAiCompatible | CloudTtsKind::Deepgram => false,
-            CloudTtsKind::ElevenLabs => true,
+            CloudTtsKind::OpenAiCompatible
+            | CloudTtsKind::Deepgram
+            | CloudTtsKind::ElevenLabs
+            | CloudTtsKind::GoogleCloud => false,
         }
     }
 }
@@ -260,23 +271,45 @@ pub fn resolve_tts_provider_full(
             sidecar.map(|s| Arc::new(qwen::QwenLocalAdapter::new(s)) as Arc<dyn TtsProvider>)
         }
         TtsBackend::Cloud(kind) => {
-            // `Some` iff a cloud config exists; the empty-key case still constructs
-            // and fails clearly at `synthesize_turn` (a real `Validation` error the
-            // FE "add an API key" UX is backed by).
-            let cloud = cfg.cloud.as_ref()?;
+            let creds = cfg.clouds.get(&kind);
+            let api_key = creds.map(|c| c.api_key.clone()).unwrap_or_default();
+            // #40 AC6: no key -> fall back to offline Orpheus iff its weights are on
+            // disk (agrees with the availability gate); else None. Selection-time only
+            // — a mid-request network failure is a Network error, not a silent swap.
+            // Probe with `tts_model_downloaded` (exact size), not paths-only `tts_model_path`.
+            if api_key.is_empty() {
+                if !orpheus_ready(cache_root) {
+                    return None;
+                }
+                let orpheus = tts_model_path(cache_root, "orpheus")?;
+                let snac = tts_model_path(cache_root, "snac")?;
+                return Some(Arc::new(orpheus::OrpheusAdapter::new(orpheus, snac)));
+            }
+            let base_url = creds
+                .map(|c| c.base_url.clone())
+                .filter(|b| !b.is_empty())
+                .unwrap_or_else(|| cloud::default_base_url(kind).to_string());
             let model = if cfg.model.is_empty() {
-                cloud::DEFAULT_CLOUD_TTS_MODEL.to_string()
+                cloud::default_model(kind).to_string()
             } else {
                 cfg.model.clone()
             };
             Some(Arc::new(cloud::CloudTtsAdapter::new(
-                kind,
-                cloud.base_url.clone(),
-                cloud.api_key.clone(),
-                model,
+                kind, base_url, api_key, model,
             )))
         }
     }
+}
+
+/// Whether the offline Orpheus default's weights are fully on disk (exact-size
+/// probe). The no-key cloud fallback (`resolve_tts_provider_full`) and the cloud
+/// availability gate (`LensEngine::tts_backend_available`) both consult this so the
+/// two never disagree about whether a keyless Cloud config can synthesize.
+pub(crate) fn orpheus_ready(cache_root: &Path) -> bool {
+    TtsBackend::Orpheus
+        .required_model_ids()
+        .iter()
+        .all(|id| tts_model_downloaded(cache_root, id))
 }
 
 /// Thin wrapper over [`resolve_tts_provider_full`] with no sidecar; sidecar-backed
@@ -306,7 +339,7 @@ mod tests {
 
     #[test]
     fn resolve_returns_none_for_non_embedded_backends() {
-        // Default config has `cloud: None`, so every Cloud kind dispatches to `None`.
+        // Default config has empty `clouds`, so every Cloud kind dispatches to `None`.
         let cfg = TtsConfig::default();
         let data_dir = Path::new("/data");
         for backend in [
@@ -315,36 +348,82 @@ mod tests {
             TtsBackend::Cloud(CloudTtsKind::OpenAiCompatible),
             TtsBackend::Cloud(CloudTtsKind::Deepgram),
             TtsBackend::Cloud(CloudTtsKind::ElevenLabs),
+            TtsBackend::Cloud(CloudTtsKind::GoogleCloud),
         ] {
             assert!(resolve_tts_provider(backend, &cfg, data_dir).is_none());
         }
     }
 
+    fn cloud_cfg(kind: CloudTtsKind, api_key: &str, base_url: &str) -> TtsConfig {
+        use crate::config::CloudTtsCreds;
+        TtsConfig {
+            version: 1,
+            backend: TtsBackend::Cloud(kind),
+            model: String::new(),
+            clouds: std::collections::BTreeMap::from([(
+                kind,
+                CloudTtsCreds {
+                    api_key: api_key.into(),
+                    base_url: base_url.into(),
+                },
+            )]),
+        }
+    }
+
     #[test]
     fn resolve_returns_some_for_cloud_with_config() {
-        use crate::config::CloudTtsConfig;
         let data_dir = Path::new("/data");
         for kind in [
             CloudTtsKind::OpenAiCompatible,
             CloudTtsKind::Deepgram,
             CloudTtsKind::ElevenLabs,
+            CloudTtsKind::GoogleCloud,
         ] {
-            let cfg = TtsConfig {
-                version: 1,
-                backend: TtsBackend::Cloud(kind),
-                model: String::new(),
-                cloud: Some(CloudTtsConfig {
-                    kind,
-                    api_key: "sk-test".into(),
-                    base_url: "https://api.example.com".into(),
-                }),
-            };
+            let cfg = cloud_cfg(kind, "sk-test", "https://api.example.com");
             let provider = resolve_tts_provider(TtsBackend::Cloud(kind), &cfg, data_dir)
                 .expect("cloud resolves with a cloud config");
             assert_eq!(provider.info().backend, TtsBackend::Cloud(kind));
-            // Empty `cfg.model` falls back to the default cloud model.
-            assert_eq!(provider.info().model, cloud::DEFAULT_CLOUD_TTS_MODEL);
+            // Empty `cfg.model` falls back to the PER-KIND default cloud model.
+            assert_eq!(provider.info().model, cloud::default_model(kind));
         }
+    }
+
+    #[test]
+    fn resolve_cloud_empty_key_falls_back_to_orpheus_when_on_disk() {
+        // Fake both Orpheus weights on disk at their exact pinned sizes (sparse
+        // files) so `orpheus_ready` is true without a real multi-GB download.
+        let dir = tempfile::tempdir().unwrap();
+        for id in ["orpheus", "snac"] {
+            let spec = resolve_tts(id).unwrap();
+            let path = tts_model_path(dir.path(), id).unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::File::create(&path)
+                .unwrap()
+                .set_len(spec.size_bytes)
+                .unwrap();
+        }
+        let kind = CloudTtsKind::ElevenLabs;
+        let cfg = cloud_cfg(kind, "", "");
+        let provider = resolve_tts_provider(TtsBackend::Cloud(kind), &cfg, dir.path())
+            .expect("empty key falls back to Orpheus when weights are on disk");
+        assert_eq!(provider.info().backend, TtsBackend::Orpheus);
+    }
+
+    #[test]
+    fn resolve_cloud_empty_key_none_when_no_orpheus_on_disk() {
+        let kind = CloudTtsKind::GoogleCloud;
+        let cfg = cloud_cfg(kind, "", "");
+        // No Orpheus weights under /data → no fallback → None.
+        assert!(resolve_tts_provider(TtsBackend::Cloud(kind), &cfg, Path::new("/data")).is_none());
+    }
+
+    #[test]
+    fn resolve_cloud_with_key_applies_per_kind_base_url_and_model_defaults() {
+        let kind = CloudTtsKind::GoogleCloud;
+        let cfg = cloud_cfg(kind, "key", "");
+        let provider = resolve_tts_provider(TtsBackend::Cloud(kind), &cfg, Path::new("/data"))
+            .expect("keyed cloud resolves");
+        assert_eq!(provider.info().model, cloud::default_model(kind));
     }
 
     #[test]
@@ -442,9 +521,12 @@ mod tests {
 
     #[test]
     fn cloud_kind_ssml_capability() {
+        // No wired cloud engine consumes W3C SSML (ElevenLabs + Gemini use inline
+        // bracketed audio cues; OpenAI uses an instructions hint).
         assert!(!CloudTtsKind::OpenAiCompatible.supports_ssml());
         assert!(!CloudTtsKind::Deepgram.supports_ssml());
-        assert!(CloudTtsKind::ElevenLabs.supports_ssml());
+        assert!(!CloudTtsKind::ElevenLabs.supports_ssml());
+        assert!(!CloudTtsKind::GoogleCloud.supports_ssml());
     }
 
     #[test]

@@ -10,37 +10,51 @@
   import {
     ttsEngineCatalog,
     ttsBackendId,
+    isCloudEngineId,
     type TtsEngineCatalogEntry,
     type TtsEngineId
   } from '$lib/onboarding/system-check.js';
-  import type { AppConfig } from '$lib/theme/types.js';
+  import type { AppConfig, CloudTtsKind } from '$lib/theme/types.js';
   import LocalTtsForm from './LocalTtsForm.svelte';
   import CloudTtsForm from './CloudTtsForm.svelte';
 
-  type LocalEngineId = Exclude<TtsEngineId, 'cloud'>;
+  type LocalEngineId = 'orpheus' | 'qwen3_local';
 
   // Parent-owned so a Cloud key save (CloudTtsForm.refreshCatalog) re-derives engine
   // availability for the list too.
   let catalog = $state<TtsEngineCatalogEntry[]>([]);
 
-  // The row highlighted in the engine list. `selectedLocalEngine` tracks which local
-  // engine LocalTtsForm shows — it only changes when a local row is picked, so picking
-  // Cloud leaves LocalTtsForm on its last engine.
+  // The row highlighted in the engine list. `selectedLocalEngine`/`selectedCloudKind`
+  // track which engine each child form shows — they only change when a row of that
+  // family is picked, so switching families leaves the other form on its last engine.
   let selectedEngine = $state<TtsEngineId>('orpheus');
   let selectedLocalEngine = $state<LocalEngineId>('orpheus');
+  let selectedCloudKind = $state<CloudTtsKind>('open_ai_compatible');
   // The persisted backend actually powering audio overviews — drives the "Active" pill.
   let activeEngine = $state<TtsEngineId | null>(null);
   let loaded = $state(false);
   let localForm = $state<{ activate: () => void } | undefined>();
+  let cloudForm = $state<{ activate: () => void } | undefined>();
 
   const selectedCapability = $derived(
     catalog.find((e) => e.id === selectedEngine)?.language_capability_label ?? ''
   );
 
   function engineLabel(id: TtsEngineId): string {
-    if (id === 'orpheus') return 'Orpheus';
-    if (id === 'qwen3_local') return 'Qwen3-TTS';
-    return 'Cloud';
+    switch (id) {
+      case 'orpheus':
+        return 'Orpheus';
+      case 'qwen3_local':
+        return 'Qwen3-TTS';
+      case 'open_ai_compatible':
+        return 'OpenAI-compatible';
+      case 'eleven_labs':
+        return 'ElevenLabs';
+      case 'google_cloud':
+        return 'Google Cloud';
+      case 'deepgram':
+        return 'Deepgram';
+    }
   }
 
   /** A child persist activated `id` — move the "Active" pill directly (no config re-read). */
@@ -61,13 +75,23 @@
     try {
       const cfg = await invoke<AppConfig>('get_config');
       activeEngine = ttsBackendId(cfg.tts.backend);
-      // A locked active engine (e.g. a stale qwen3_local config on non-Apple-Silicon)
-      // must not become the selected row — that would show a doomed download under a
-      // header naming the wrong engine. Fall back to the default local engine; the
-      // "Active" pill still marks the real backend via rowPill.
-      const lockedActive = activeEngine !== 'cloud' && isLockedId(activeEngine);
-      selectedEngine = lockedActive ? selectedLocalEngine : activeEngine;
-      if (activeEngine !== 'cloud' && !lockedActive) selectedLocalEngine = activeEngine;
+      if (isCloudEngineId(activeEngine)) {
+        // Cloud engines are never hardware-locked; select the active provider row.
+        // A reserved/unlisted kind (e.g. a hand-edited `deepgram`) has no row, so
+        // show the OpenAI-compatible form rather than an empty one.
+        selectedCloudKind = catalog.some((e) => e.id === activeEngine)
+          ? activeEngine
+          : 'open_ai_compatible';
+        selectedEngine = selectedCloudKind;
+      } else {
+        // A locked active engine (e.g. a stale qwen3_local config on non-Apple-Silicon)
+        // must not become the selected row — that would show a doomed download under a
+        // header naming the wrong engine. Fall back to the default local engine; the
+        // "Active" pill still marks the real backend via rowPill.
+        const lockedActive = isLockedId(activeEngine);
+        selectedEngine = lockedActive ? selectedLocalEngine : activeEngine;
+        if (!lockedActive) selectedLocalEngine = activeEngine;
+      }
     } catch {
       // Non-fatal: default to Orpheus selected, nothing active.
     }
@@ -89,7 +113,17 @@
   function pickEngine(e: TtsEngineCatalogEntry): void {
     if (isLocked(e) || e.id === selectedEngine) return;
     selectedEngine = e.id;
-    if (e.id === 'cloud') return;
+    if (isCloudEngineId(e.id)) {
+      // Re-picking the already-shown provider leaves the `kind` prop unchanged, so
+      // CloudTtsForm's load effect can't observe it — activate imperatively instead
+      // (mirrors the local branch below). A different kind drives it via the prop.
+      if (e.id === selectedCloudKind) {
+        cloudForm?.activate();
+      } else {
+        selectedCloudKind = e.id;
+      }
+      return;
+    }
     if (e.id === selectedLocalEngine) {
       // The `engine` prop won't change, so LocalTtsForm's load effect can't observe
       // the re-pick — activate the (already-loaded) engine imperatively instead.
@@ -194,12 +228,14 @@
             bind:this={localForm}
             bind:catalog
             engine={selectedLocalEngine}
-            active={selectedEngine !== 'cloud'}
+            active={!isCloudEngineId(selectedEngine)}
             onactivated={onActivated}
           />
           <CloudTtsForm
+            bind:this={cloudForm}
             bind:catalog
-            active={selectedEngine === 'cloud'}
+            kind={selectedCloudKind}
+            active={isCloudEngineId(selectedEngine)}
             onactivated={onActivated}
           />
         </div>

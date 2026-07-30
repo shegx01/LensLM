@@ -75,8 +75,30 @@ pub struct VoiceConfig {
     pub guest: VoiceRef,
 }
 
+/// Per-provider cloud TTS credentials — the value of the [`TtsConfig::clouds`]
+/// map, keyed by [`CloudTtsKind`] so each provider is configured independently
+/// (#40). The kind lives in the map key, not here.
+#[derive(Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct CloudTtsCreds {
+    /// Stored in PLAINTEXT — see [`ModelConfig::api_key`] for the at-rest caveat.
+    pub api_key: String,
+    pub base_url: String,
+}
+
+impl std::fmt::Debug for CloudTtsCreds {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let api_key = if self.api_key.is_empty() { "" } else { "***" };
+        f.debug_struct("CloudTtsCreds")
+            .field("api_key", &api_key)
+            .field("base_url", &self.base_url)
+            .finish()
+    }
+}
+
+/// The legacy single-slot cloud config. Retained only as the on-disk shape older
+/// configs were written in; [`RawTtsConfig`] folds it into [`TtsConfig::clouds`].
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
-pub struct CloudTtsConfig {
+pub(crate) struct CloudTtsConfig {
     pub kind: CloudTtsKind,
     /// Stored in PLAINTEXT — see [`ModelConfig::api_key`] for the at-rest caveat.
     pub api_key: String,
@@ -100,7 +122,9 @@ pub struct TtsConfig {
     pub version: u32,
     pub backend: TtsBackend,
     pub model: String,
-    pub cloud: Option<CloudTtsConfig>,
+    /// Saved credentials per cloud provider; the active provider is whichever
+    /// [`TtsBackend::Cloud`] kind `backend` points at. Empty for local backends.
+    pub clouds: BTreeMap<CloudTtsKind, CloudTtsCreds>,
 }
 
 impl Default for TtsConfig {
@@ -109,7 +133,7 @@ impl Default for TtsConfig {
             version: 1,
             backend: TtsBackend::Orpheus,
             model: String::new(),
-            cloud: None,
+            clouds: BTreeMap::new(),
         }
     }
 }
@@ -128,30 +152,55 @@ struct RawTtsConfig {
     model: Option<String>,
     #[serde(default)]
     cloud: Option<CloudTtsConfig>,
+    #[serde(default)]
+    clouds: Option<BTreeMap<CloudTtsKind, CloudTtsCreds>>,
 }
 
 impl From<RawTtsConfig> for TtsConfig {
     fn from(raw: RawTtsConfig) -> Self {
+        // Fold the legacy single `cloud` slot into the per-provider map (keyed by
+        // its kind); an explicit `clouds` map (newer configs) wins per key.
+        let mut clouds: BTreeMap<CloudTtsKind, CloudTtsCreds> = BTreeMap::new();
+        if let Some(c) = raw.cloud {
+            clouds.insert(
+                c.kind,
+                CloudTtsCreds {
+                    api_key: c.api_key,
+                    base_url: c.base_url,
+                },
+            );
+        }
+        if let Some(map) = raw.clouds {
+            clouds.extend(map);
+        }
+
         if let Some(version) = raw.version {
             return TtsConfig {
                 version,
                 backend: raw.backend.unwrap_or_default(),
                 model: raw.model.unwrap_or_default(),
-                cloud: raw.cloud,
+                clouds,
             };
         }
         match raw.provider {
-            Some(provider) if !provider.is_empty() => TtsConfig {
-                version: 1,
-                backend: TtsBackend::Cloud(CloudTtsKind::OpenAiCompatible),
-                model: String::new(),
-                cloud: Some(CloudTtsConfig {
-                    kind: CloudTtsKind::OpenAiCompatible,
-                    api_key: raw.api_key.unwrap_or_default(),
-                    base_url: String::new(),
-                }),
+            Some(provider) if !provider.is_empty() => {
+                clouds
+                    .entry(CloudTtsKind::OpenAiCompatible)
+                    .or_insert_with(|| CloudTtsCreds {
+                        api_key: raw.api_key.unwrap_or_default(),
+                        base_url: String::new(),
+                    });
+                TtsConfig {
+                    version: 1,
+                    backend: TtsBackend::Cloud(CloudTtsKind::OpenAiCompatible),
+                    model: String::new(),
+                    clouds,
+                }
+            }
+            _ => TtsConfig {
+                clouds,
+                ..TtsConfig::default()
             },
-            _ => TtsConfig::default(),
         }
     }
 }
@@ -953,11 +1002,13 @@ mod tests {
             version: 1,
             backend: TtsBackend::Cloud(CloudTtsKind::OpenAiCompatible),
             model: String::new(),
-            cloud: Some(CloudTtsConfig {
-                kind: CloudTtsKind::OpenAiCompatible,
-                api_key: "sk-elevenlabs-supersecret".to_string(),
-                base_url: String::new(),
-            }),
+            clouds: BTreeMap::from([(
+                CloudTtsKind::OpenAiCompatible,
+                CloudTtsCreds {
+                    api_key: "sk-elevenlabs-supersecret".to_string(),
+                    base_url: String::new(),
+                },
+            )]),
         };
         let debug = format!("{cfg:?}");
         assert!(!debug.contains("sk-elevenlabs-supersecret"));
@@ -969,7 +1020,7 @@ mod tests {
     fn default_tts_config_debug_has_no_redaction_marker() {
         let cfg = TtsConfig::default();
         let debug = format!("{cfg:?}");
-        assert!(debug.contains("cloud: None"));
+        assert!(debug.contains("clouds: {}"));
         assert!(!debug.contains("***"));
     }
 
@@ -978,7 +1029,7 @@ mod tests {
         assert_eq!(AppConfig::default().tts, TtsConfig::default());
         assert_eq!(AppConfig::default().tts.version, 1);
         assert_eq!(AppConfig::default().tts.backend, TtsBackend::Orpheus);
-        assert!(AppConfig::default().tts.cloud.is_none());
+        assert!(AppConfig::default().tts.clouds.is_empty());
     }
 
     #[test]
@@ -1082,11 +1133,13 @@ mod tests {
                 version: 1,
                 backend: TtsBackend::Cloud(CloudTtsKind::ElevenLabs),
                 model: "eleven-turbo".to_string(),
-                cloud: Some(CloudTtsConfig {
-                    kind: CloudTtsKind::ElevenLabs,
-                    api_key: "sk-elevenlabs".to_string(),
-                    base_url: "https://api.elevenlabs.io".to_string(),
-                }),
+                clouds: BTreeMap::from([(
+                    CloudTtsKind::ElevenLabs,
+                    CloudTtsCreds {
+                        api_key: "sk-elevenlabs".to_string(),
+                        base_url: "https://api.elevenlabs.io".to_string(),
+                    },
+                )]),
             },
             ..AppConfig::default()
         };
@@ -1096,16 +1149,70 @@ mod tests {
     }
 
     #[test]
+    fn multiple_cloud_providers_round_trip_independently() {
+        // Per-provider retention (#40): two providers' keys coexist in `clouds`.
+        let dir = tempfile::tempdir().unwrap();
+        let config = AppConfig {
+            tts: TtsConfig {
+                version: 1,
+                backend: TtsBackend::Cloud(CloudTtsKind::GoogleCloud),
+                model: String::new(),
+                clouds: BTreeMap::from([
+                    (
+                        CloudTtsKind::ElevenLabs,
+                        CloudTtsCreds {
+                            api_key: "sk-eleven".to_string(),
+                            base_url: "https://api.elevenlabs.io".to_string(),
+                        },
+                    ),
+                    (
+                        CloudTtsKind::GoogleCloud,
+                        CloudTtsCreds {
+                            api_key: "sk-google".to_string(),
+                            base_url: "https://generativelanguage.googleapis.com".to_string(),
+                        },
+                    ),
+                ]),
+            },
+            ..AppConfig::default()
+        };
+        config.save(dir.path()).unwrap();
+        let loaded = AppConfig::load(dir.path()).unwrap();
+        assert_eq!(loaded.tts, config.tts);
+        assert_eq!(loaded.tts.clouds.len(), 2);
+    }
+
+    #[test]
     fn new_tts_config_round_trips_with_version() {
         let cfg = TtsConfig {
             version: 1,
             backend: TtsBackend::Orpheus,
             model: "orpheus-3b".to_string(),
-            cloud: None,
+            clouds: BTreeMap::new(),
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let back: TtsConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(cfg, back);
+    }
+
+    #[test]
+    fn legacy_single_cloud_slot_folds_into_the_per_provider_map() {
+        // A config written with the old single `cloud` slot migrates into `clouds`
+        // keyed by its kind, preserving the key (#40 migration).
+        let json = r#"{
+            "version": 1,
+            "backend": { "cloud": "eleven_labs" },
+            "model": "",
+            "cloud": { "kind": "eleven_labs", "api_key": "sk-legacy", "base_url": "https://api.elevenlabs.io" }
+        }"#;
+        let cfg: TtsConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.backend, TtsBackend::Cloud(CloudTtsKind::ElevenLabs));
+        let creds = cfg
+            .clouds
+            .get(&CloudTtsKind::ElevenLabs)
+            .expect("legacy cloud slot must migrate into clouds");
+        assert_eq!(creds.api_key, "sk-legacy");
+        assert_eq!(creds.base_url, "https://api.elevenlabs.io");
     }
 
     #[test]
@@ -1116,10 +1223,11 @@ mod tests {
             cfg.backend,
             TtsBackend::Cloud(CloudTtsKind::OpenAiCompatible)
         );
-        let cloud = cfg
-            .cloud
+        let creds = cfg
+            .clouds
+            .get(&CloudTtsKind::OpenAiCompatible)
             .expect("legacy cloud provider must produce a cloud config");
-        assert_eq!(cloud.api_key, "sk-xyz");
+        assert_eq!(creds.api_key, "sk-xyz");
         assert_eq!(cfg.version, 1);
     }
 
@@ -1129,7 +1237,7 @@ mod tests {
         let cfg: TtsConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg, TtsConfig::default());
         assert_eq!(cfg.backend, TtsBackend::Orpheus);
-        assert!(cfg.cloud.is_none());
+        assert!(cfg.clouds.is_empty());
     }
 
     // The `Qwen3Local` variant is cfg-gated to Apple Silicon. A config naming it

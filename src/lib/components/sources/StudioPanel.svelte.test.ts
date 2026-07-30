@@ -221,7 +221,7 @@ describe('StudioPanel — generating state', () => {
     });
     render(StudioPanel, { props: { selectedCount: 2, totalCount: 3 } });
 
-    expect(screen.getByText('Synthesizing turn 2/6')).toBeInTheDocument();
+    expect(screen.getByText('Synthesizing 2/6')).toBeInTheDocument();
   });
 
   it('shows stitching/encoding labels for those phases', () => {

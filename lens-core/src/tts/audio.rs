@@ -104,6 +104,26 @@ pub(crate) fn stitch_turns(buffers: &[(Speaker, AudioBuffer)]) -> Result<AudioBu
     Ok(AudioBuffer::mono(out, TARGET_RATE))
 }
 
+/// Stitches whole-dialogue chunk buffers — each already a rendered multi-turn
+/// exchange from a dialogue engine (#40) — into one track: resample each to
+/// [`TARGET_RATE`], insert one [`CHANGE_GAP_MS`] scene gap between chunks, edge-fade
+/// each, and peak-normalize once. Keyless sibling of [`stitch_turns`]: a chunk has
+/// no per-turn speaker sequence, so the longer scene gap is used at every join.
+pub(crate) fn stitch_chunks(chunks: &[AudioBuffer]) -> Result<AudioBuffer, LensError> {
+    let fade_samples = ms_to_samples(FADE_MS);
+    let mut out: Vec<f32> = Vec::new();
+    for (i, chunk) in chunks.iter().enumerate() {
+        if i > 0 {
+            out.resize(out.len() + ms_to_samples(CHANGE_GAP_MS), 0.0);
+        }
+        let mut samples = chunk.resample_to(TARGET_RATE)?.samples;
+        apply_edge_fades(&mut samples, fade_samples);
+        out.extend_from_slice(&samples);
+    }
+    peak_normalize(&mut out, PEAK_DBFS);
+    Ok(AudioBuffer::mono(out, TARGET_RATE))
+}
+
 /// Ceiling on a single sidecar-provided turn WAV (a few seconds of 24 kHz mono is
 /// well under this) so a runaway/malicious sidecar reply can't be read fully into
 /// memory unbounded.
@@ -132,6 +152,30 @@ pub fn decode_wav_mono16(bytes: &[u8]) -> Result<AudioBuffer, LensError> {
     }
     let reader = hound::WavReader::new(std::io::Cursor::new(bytes)).map_err(hound_err)?;
     read_wav_reader(reader)
+}
+
+/// Decodes raw headerless signed-16-bit little-endian mono PCM at `sample_rate`
+/// into an `f32` [`AudioBuffer`]. Both dialogue cloud engines return this — ElevenLabs
+/// `output_format=pcm_24000` and Gemini `audio/L16;codec=pcm;rate=24000` — so a WAV
+/// container decode would fail on their bodies. The [`MAX_TURN_WAV_BYTES`] ceiling is
+/// reused as a byte-length DoS guard; an odd byte length or empty body is rejected.
+pub(crate) fn decode_pcm16_mono(bytes: &[u8], sample_rate: u32) -> Result<AudioBuffer, LensError> {
+    if bytes.len() as u64 > MAX_TURN_WAV_BYTES {
+        return Err(LensError::Internal("PCM audio exceeds size ceiling".into()));
+    }
+    if bytes.is_empty() {
+        return Err(LensError::Tts("cloud TTS returned empty audio".into()));
+    }
+    if !bytes.len().is_multiple_of(2) {
+        return Err(LensError::Tts(
+            "cloud TTS returned truncated PCM audio".into(),
+        ));
+    }
+    let samples: Vec<f32> = bytes
+        .chunks_exact(2)
+        .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / i16::MAX as f32)
+        .collect();
+    Ok(AudioBuffer::mono(samples, sample_rate))
 }
 
 fn read_wav_reader<R: std::io::Read>(
@@ -393,5 +437,69 @@ mod tests {
         let err = decode_wav_mono16(&vec![0u8; (MAX_TURN_WAV_BYTES + 1) as usize])
             .expect_err("over-cap bytes must be rejected");
         assert!(matches!(err, LensError::Internal(_)));
+    }
+
+    fn pcm16_le(samples: &[f32]) -> Vec<u8> {
+        samples
+            .iter()
+            .flat_map(|&s| {
+                ((s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
+                    .to_le_bytes()
+                    .to_vec()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn decode_pcm16_mono_round_trips_samples_and_rate() {
+        let samples = vec![0.0, 0.5, -0.5, 0.25, -1.0, 1.0];
+        let got = decode_pcm16_mono(&pcm16_le(&samples), 24_000).unwrap();
+        assert_eq!(got.sample_rate, 24_000);
+        assert_eq!(got.channels, 1);
+        assert_eq!(got.samples.len(), samples.len());
+        for (g, w) in got.samples.iter().zip(samples.iter()) {
+            assert!((g - w).abs() < 1.0 / 32_000.0, "got {g} want {w}");
+        }
+    }
+
+    #[test]
+    fn decode_pcm16_mono_rejects_odd_empty_and_over_cap() {
+        assert!(matches!(
+            decode_pcm16_mono(&[0u8; 3], 24_000),
+            Err(LensError::Tts(_))
+        ));
+        assert!(matches!(
+            decode_pcm16_mono(&[], 24_000),
+            Err(LensError::Tts(_))
+        ));
+        assert!(matches!(
+            decode_pcm16_mono(&vec![0u8; (MAX_TURN_WAV_BYTES + 2) as usize], 24_000),
+            Err(LensError::Internal(_))
+        ));
+    }
+
+    #[test]
+    fn stitch_chunks_length_is_sum_plus_scene_gaps() {
+        let a = buf(vec![0.5; 1000]);
+        let b = buf(vec![0.5; 1000]);
+        let c = buf(vec![0.5; 1000]);
+        let out = stitch_chunks(&[a, b, c]).unwrap();
+        let change_gap = (CHANGE_GAP_MS * TARGET_RATE / 1000) as usize;
+        // 3 chunks -> 2 inter-chunk scene gaps.
+        assert_eq!(out.samples.len(), 3000 + 2 * change_gap);
+        assert_eq!(out.sample_rate, TARGET_RATE);
+        assert_eq!(out.channels, 1);
+    }
+
+    #[test]
+    fn stitch_chunks_single_chunk_has_no_gap() {
+        let out = stitch_chunks(&[buf(vec![0.5; 2000])]).unwrap();
+        assert_eq!(out.samples.len(), 2000);
+    }
+
+    #[test]
+    fn stitch_chunks_silent_input_no_divide_by_zero() {
+        let out = stitch_chunks(&[buf(vec![0.0; 1000]), buf(vec![0.0; 1000])]).unwrap();
+        assert!(out.samples.iter().all(|&s| s == 0.0));
     }
 }
