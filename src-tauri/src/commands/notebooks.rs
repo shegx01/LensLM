@@ -4,7 +4,7 @@ use futures::StreamExt;
 use lens_core::{
     AddSourceOutcome, AnswerEvent, AudioOverviewRecord, ChatFeedback, ChatMessage, ChatState,
     DialoguePhase, DialogueScript, IngestProgress, Length, LensEngine, LensError, Notebook,
-    NotebookId, NotebookSummary, Source, TrashedSource, TtsPhase,
+    NotebookId, NotebookSummary, OverviewFormat, Source, TrashedSource, TtsPhase,
 };
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
@@ -508,7 +508,9 @@ pub async fn generate_dialogue(
     let result = engine
         .generate_dialogue(
             &NotebookId::from(notebook_id),
+            OverviewFormat::default(),
             length,
+            None,
             (*token).clone(),
             move |phase| {
                 if let Err(e) = send_event(&on_progress_phase, StreamEvent::Chunk(phase)) {
@@ -582,7 +584,9 @@ pub async fn synthesize_overview(
     let result = engine
         .generate_and_persist_overview(
             &notebook_id,
+            OverviewFormat::default(),
             length,
+            None,
             move |phase| {
                 if let Err(e) = send_event(&on_progress_phase, StreamEvent::Chunk(phase)) {
                     tracing::warn!("synthesize_overview: phase send failed: {e}");

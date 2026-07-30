@@ -4,6 +4,4 @@ Arc: Open with a strong hook that frames why this matters. Build complexity grad
 
 Voice: The Host opens, asks the driving questions, and steers; the Guest explains. Favor genuine curiosity and mild productive tension over constant agreement; avoid mechanical question-answer alternation. Keep each turn to one or two spoken sentences (about 5–10 seconds); split longer thoughts across turns. Use natural speech lightly — an occasional reaction is fine; do not fabricate detail for color.
 
-Aim for about {{turns}} turns that alternate between the two speakers.
-
-Cite sources by putting their exact source_id values in each turn's `source_ids` array; leave `source_ids` empty for pure transitions or backchannels. Where a line is naturally delivered with feeling, set `emotion` to one of: {{emotions}}.
+Aim for about {{turns}} turns that alternate between the two speakers. Where a line is naturally delivered with feeling, set `emotion` to one of: {{emotions}}.

@@ -78,7 +78,7 @@ pub use config::{
 };
 #[cfg(feature = "test-util")]
 pub use dialogue::{DialogueCtx, generate_dialogue};
-pub use dialogue::{DialoguePhase, DialogueScript, Emotion, Length, Speaker, Turn};
+pub use dialogue::{DialoguePhase, DialogueScript, Emotion, Length, OverviewFormat, Speaker, Turn};
 pub use embedder::{
     CountingEmbedder, DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, Embedder, EmbeddingBackend,
     EmbeddingModelSpec, FastembedEmbedder, OllamaEmbedder, REGISTRY, resolve, resolve_opt,
@@ -1571,7 +1571,9 @@ impl LensEngine {
     pub async fn generate_and_persist_overview(
         &self,
         notebook_id: &str,
+        format: dialogue::OverviewFormat,
         length: dialogue::Length,
+        language: Option<String>,
         on_phase: impl Fn(tts::TtsPhase) + Send + Sync,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<Option<std::path::PathBuf>, LensError> {
@@ -1585,7 +1587,9 @@ impl LensEngine {
         let script = match self
             .generate_dialogue(
                 &NotebookId::from(notebook_id.to_string()),
+                format,
                 length,
+                language,
                 cancel.clone(),
                 |_phase| {},
             )
@@ -1828,7 +1832,9 @@ impl LensEngine {
     pub async fn generate_dialogue(
         &self,
         notebook_id: &NotebookId,
+        format: dialogue::OverviewFormat,
         length: dialogue::Length,
+        language: Option<String>,
         cancel: tokio_util::sync::CancellationToken,
         on_phase: impl Fn(dialogue::DialoguePhase) + Send,
     ) -> Result<dialogue::DialogueScript, LensError> {
@@ -1901,6 +1907,8 @@ impl LensEngine {
             thresholds: config.tier_thresholds,
             tokenizer,
             length,
+            format,
+            language,
             selected_live_ids,
             prompts,
         };

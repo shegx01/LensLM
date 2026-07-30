@@ -15,8 +15,14 @@ use std::path::{Path, PathBuf};
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PromptName {
-    /// Editable creative body of the audio-overview dialogue system prompt.
-    DialogueSystem,
+    /// Editable creative body of the "Deep Dive" audio-overview format.
+    DialogueDeepDiveSystem,
+    /// Editable creative body of the "Brief" audio-overview format.
+    DialogueBriefSystem,
+    /// Editable creative body of the "Critique" audio-overview format.
+    DialogueCritiqueSystem,
+    /// Editable creative body of the "Debate" audio-overview format.
+    DialogueDebateSystem,
     /// Editable rules body of the grounded-answer system prompt (the injection
     /// guard is appended by code, never from this template).
     AnswerGroundedSystem,
@@ -28,7 +34,10 @@ impl PromptName {
     /// Path (relative to the prompts root) of the override file for this template.
     pub(crate) fn relpath(self) -> &'static str {
         match self {
-            PromptName::DialogueSystem => "dialogue/script.system.md",
+            PromptName::DialogueDeepDiveSystem => "dialogue/deep_dive.system.md",
+            PromptName::DialogueBriefSystem => "dialogue/brief.system.md",
+            PromptName::DialogueCritiqueSystem => "dialogue/critique.system.md",
+            PromptName::DialogueDebateSystem => "dialogue/debate.system.md",
             PromptName::AnswerGroundedSystem => "answer/grounded.system.md",
             PromptName::AnswerCondenseSystem => "answer/condense.system.md",
         }
@@ -38,8 +47,17 @@ impl PromptName {
     /// override files present.
     pub(crate) fn embedded_default(self) -> &'static str {
         match self {
-            PromptName::DialogueSystem => {
-                include_str!("../prompts/dialogue/script.system.md")
+            PromptName::DialogueDeepDiveSystem => {
+                include_str!("../prompts/dialogue/deep_dive.system.md")
+            }
+            PromptName::DialogueBriefSystem => {
+                include_str!("../prompts/dialogue/brief.system.md")
+            }
+            PromptName::DialogueCritiqueSystem => {
+                include_str!("../prompts/dialogue/critique.system.md")
+            }
+            PromptName::DialogueDebateSystem => {
+                include_str!("../prompts/dialogue/debate.system.md")
             }
             PromptName::AnswerGroundedSystem => {
                 include_str!("../prompts/answer/grounded.system.md")
@@ -172,7 +190,7 @@ mod tests {
     #[test]
     fn embedded_default_is_nonempty_and_has_placeholders() {
         let store = PromptStore::embedded();
-        let body = store.load(PromptName::DialogueSystem);
+        let body = store.load(PromptName::DialogueDeepDiveSystem);
         assert!(body.contains("{{turns}}"), "template keeps the turns slot");
         assert!(
             body.contains("{{emotions}}"),
@@ -184,7 +202,7 @@ mod tests {
     fn render_substitutes_double_brace_placeholders() {
         let store = PromptStore::embedded();
         let out = store.render(
-            PromptName::DialogueSystem,
+            PromptName::DialogueDeepDiveSystem,
             &[("turns", "25"), ("emotions", "neutral, laugh")],
         );
         assert!(out.contains("about 25 turns"));
@@ -201,12 +219,12 @@ mod tests {
         let prompts = dir.path().join("prompts").join("dialogue");
         std::fs::create_dir_all(&prompts).unwrap();
         std::fs::write(
-            prompts.join("script.system.md"),
+            prompts.join("deep_dive.system.md"),
             "shape {\"speaker\":\"host\"} and {{turns}} turns",
         )
         .unwrap();
         let store = PromptStore::for_data_dir(dir.path());
-        let out = store.render(PromptName::DialogueSystem, &[("turns", "8")]);
+        let out = store.render(PromptName::DialogueDeepDiveSystem, &[("turns", "8")]);
         assert_eq!(out, "shape {\"speaker\":\"host\"} and 8 turns");
     }
 
@@ -215,10 +233,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let prompts = dir.path().join("prompts").join("dialogue");
         std::fs::create_dir_all(&prompts).unwrap();
-        std::fs::write(prompts.join("script.system.md"), "custom body {{turns}}").unwrap();
+        std::fs::write(prompts.join("deep_dive.system.md"), "custom body {{turns}}").unwrap();
         let store = PromptStore::for_data_dir(dir.path());
         assert_eq!(
-            store.load(PromptName::DialogueSystem),
+            store.load(PromptName::DialogueDeepDiveSystem),
             "custom body {{turns}}"
         );
     }
@@ -229,8 +247,8 @@ mod tests {
         // No `prompts/` subdir created → override_dir resolves to None.
         let store = PromptStore::for_data_dir(dir.path());
         assert_eq!(
-            store.load(PromptName::DialogueSystem),
-            PromptName::DialogueSystem.embedded_default()
+            store.load(PromptName::DialogueDeepDiveSystem),
+            PromptName::DialogueDeepDiveSystem.embedded_default()
         );
     }
 
@@ -241,8 +259,8 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("prompts")).unwrap();
         let store = PromptStore::for_data_dir(dir.path());
         assert_eq!(
-            store.load(PromptName::DialogueSystem),
-            PromptName::DialogueSystem.embedded_default()
+            store.load(PromptName::DialogueDeepDiveSystem),
+            PromptName::DialogueDeepDiveSystem.embedded_default()
         );
     }
 }

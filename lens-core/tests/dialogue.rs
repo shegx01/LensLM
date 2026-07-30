@@ -247,6 +247,8 @@ fn build_ctx(
         thresholds: TierThresholds::default(),
         tokenizer: None,
         length,
+        format: lens_core::OverviewFormat::DeepDive,
+        language: None,
         selected_live_ids,
         prompts: PromptStore::for_data_dir(data_dir),
     }
@@ -576,7 +578,14 @@ async fn engine_generate_dialogue_errors_when_no_provider() {
     let engine = LensEngine::init(dir.path()).await.unwrap();
     let nb = engine.create_notebook("nb", None, None).await.unwrap().id;
     let res = engine
-        .generate_dialogue(&nb, Length::Short, CancellationToken::new(), no_phase())
+        .generate_dialogue(
+            &nb,
+            lens_core::OverviewFormat::DeepDive,
+            Length::Short,
+            None,
+            CancellationToken::new(),
+            no_phase(),
+        )
         .await;
     assert!(matches!(res, Err(lens_core::LensError::Model(_))));
 }
@@ -615,7 +624,14 @@ async fn engine_generate_dialogue_produces_grounded_script() {
     insert_chunk(&pool, "sB", "c2", "beta content").await;
 
     let script = engine
-        .generate_dialogue(&nb, Length::Short, CancellationToken::new(), no_phase())
+        .generate_dialogue(
+            &nb,
+            lens_core::OverviewFormat::DeepDive,
+            Length::Short,
+            None,
+            CancellationToken::new(),
+            no_phase(),
+        )
         .await
         .expect("grounded script");
 
@@ -674,7 +690,14 @@ async fn real_model_generates_valid_grounded_dialogue() {
     .await;
 
     let script = engine
-        .generate_dialogue(&nb, Length::Short, CancellationToken::new(), no_phase())
+        .generate_dialogue(
+            &nb,
+            lens_core::OverviewFormat::DeepDive,
+            Length::Short,
+            None,
+            CancellationToken::new(),
+            no_phase(),
+        )
         .await
         .expect("a reachable local model returns a valid grounded script");
 

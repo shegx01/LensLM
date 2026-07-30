@@ -367,7 +367,9 @@ async fn dialogue_phase_failure_persists_failed_row() {
     let res = engine
         .generate_and_persist_overview(
             nb.as_str(),
+            lens_core::OverviewFormat::DeepDive,
             Length::Short,
+            None,
             no_phase(),
             CancellationToken::new(),
         )
@@ -389,7 +391,14 @@ async fn synth_phase_failure_persists_failed_row() {
     // Dialogue succeeds (scripted provider) but no TTS backend is downloaded → synth
     // errors (Tts).
     let res = engine
-        .generate_and_persist_overview(&nb, Length::Short, no_phase(), CancellationToken::new())
+        .generate_and_persist_overview(
+            &nb,
+            lens_core::OverviewFormat::DeepDive,
+            Length::Short,
+            None,
+            no_phase(),
+            CancellationToken::new(),
+        )
         .await;
     assert!(
         matches!(res, Err(LensError::Tts(_))),
@@ -417,7 +426,14 @@ async fn cancel_writes_no_failed_row_and_preserves_prior() {
     let cancel = CancellationToken::new();
     cancel.cancel();
     let out = engine
-        .generate_and_persist_overview(&nb, Length::Short, no_phase(), cancel)
+        .generate_and_persist_overview(
+            &nb,
+            lens_core::OverviewFormat::DeepDive,
+            Length::Short,
+            None,
+            no_phase(),
+            cancel,
+        )
         .await
         .expect("cancel is not an error");
     assert!(out.is_none(), "cancel yields an idle-equivalent None");
