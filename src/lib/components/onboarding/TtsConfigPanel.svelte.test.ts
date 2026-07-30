@@ -1076,3 +1076,110 @@ describe('TtsConfigPanel — incomplete local download (#195)', () => {
     expect(screen.queryByRole('button', { name: /re-download/i })).not.toBeInTheDocument();
   });
 });
+
+describe('TtsConfigPanel — cloud activation on re-pick (#40 regression)', () => {
+  it('selecting an already-configured cloud provider activates it (imperative activate path)', async () => {
+    // M1 repro: OpenAI-compatible is keyed from a prior session but Orpheus is the
+    // active backend. The cloud row's kind equals the default selectedCloudKind, so
+    // its `kind` prop never changes on pick — activation must go through activate().
+    let written: AppConfig | null = null;
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config')
+        return {
+          ...baseConfig(),
+          tts: {
+            version: 1,
+            backend: 'orpheus' as const,
+            model: '',
+            clouds: {
+              open_ai_compatible: { api_key: 'sk-saved', base_url: 'https://api.openai.com' }
+            }
+          }
+        };
+      if (cmd === 'tts_engine_catalog') return catalogFixture({ cloudAvailable: true });
+      if (cmd === 'tts_model_status') return 'complete';
+      if (cmd === 'set_config') {
+        written = (args as { config: AppConfig }).config;
+        return null;
+      }
+    });
+
+    render(TtsConfigPanel);
+    await selectEngine(/openai-compatible/i);
+
+    await waitFor(() => expect(written).not.toBeNull());
+    expect((written as unknown as AppConfig).tts.backend).toEqual({ cloud: 'open_ai_compatible' });
+    expect((written as unknown as AppConfig).tts.clouds.open_ai_compatible?.api_key).toBe(
+      'sk-saved'
+    );
+  });
+
+  it('switching to another keyed cloud provider preserves the previous one in the map', async () => {
+    let written: AppConfig | null = null;
+    const multiCloudCatalog: TtsEngineCatalogEntry[] = [
+      ...catalogFixture({ cloudAvailable: true }),
+      {
+        id: 'eleven_labs',
+        platform: 'cross_platform',
+        needs_key: true,
+        available: true,
+        unavailable_reason: null,
+        multilingual: true,
+        supported_languages: [],
+        preset_voices: [],
+        model_size_bytes: null,
+        language_capability_label: 'ElevenLabs dialogue · multilingual',
+        required_model_ids: []
+      }
+    ];
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config')
+        return {
+          ...baseConfig(),
+          tts: {
+            version: 1,
+            backend: { cloud: 'open_ai_compatible' as const },
+            model: '',
+            clouds: {
+              open_ai_compatible: { api_key: 'sk-openai', base_url: 'https://api.openai.com' },
+              eleven_labs: { api_key: 'sk-eleven', base_url: 'https://api.elevenlabs.io' }
+            }
+          }
+        };
+      if (cmd === 'tts_engine_catalog') return multiCloudCatalog;
+      if (cmd === 'tts_model_status') return 'complete';
+      if (cmd === 'set_config') {
+        written = (args as { config: AppConfig }).config;
+        return null;
+      }
+    });
+
+    render(TtsConfigPanel);
+    await selectEngine(/elevenlabs/i);
+
+    await waitFor(() => expect(written).not.toBeNull());
+    const cfg = written as unknown as AppConfig;
+    expect(cfg.tts.backend).toEqual({ cloud: 'eleven_labs' });
+    // The previously-active provider's key is still in the map — not clobbered.
+    expect(cfg.tts.clouds.open_ai_compatible?.api_key).toBe('sk-openai');
+    expect(cfg.tts.clouds.eleven_labs?.api_key).toBe('sk-eleven');
+  });
+
+  it('does NOT auto-activate (no set_config) merely on mount of an already-active keyed cloud config', async () => {
+    const setConfigSpy = vi.fn();
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return cloudKeyedConfig();
+      if (cmd === 'tts_engine_catalog') return catalogFixture({ cloudAvailable: true });
+      if (cmd === 'tts_model_status') return 'complete';
+      if (cmd === 'set_config') {
+        setConfigSpy();
+        return null;
+      }
+    });
+
+    render(TtsConfigPanel);
+    await screen.findByRole('radio', { name: /openai-compatible/i });
+    await waitFor(() => expect(screen.getByText(/cloud is available/i)).toBeInTheDocument());
+    expect(setConfigSpy).not.toHaveBeenCalled();
+  });
+});

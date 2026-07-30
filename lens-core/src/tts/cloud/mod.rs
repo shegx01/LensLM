@@ -46,7 +46,7 @@ pub const ELEVENLABS_DIALOGUE_CHAR_LIMIT: usize = 2000;
 /// within one request.
 pub const GEMINI_DIALOGUE_CHAR_LIMIT: usize = 5000;
 
-/// Default API base URL for a cloud kind, applied when `CloudTtsConfig.base_url` is
+/// Default API base URL for a cloud kind, applied when the stored base URL is
 /// empty so a provider selection works without the user pasting an endpoint.
 pub fn default_base_url(kind: CloudTtsKind) -> &'static str {
     match kind {

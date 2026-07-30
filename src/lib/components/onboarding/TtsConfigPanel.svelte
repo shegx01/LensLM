@@ -34,6 +34,7 @@
   let activeEngine = $state<TtsEngineId | null>(null);
   let loaded = $state(false);
   let localForm = $state<{ activate: () => void } | undefined>();
+  let cloudForm = $state<{ activate: () => void } | undefined>();
 
   const selectedCapability = $derived(
     catalog.find((e) => e.id === selectedEngine)?.language_capability_label ?? ''
@@ -76,8 +77,12 @@
       activeEngine = ttsBackendId(cfg.tts.backend);
       if (isCloudEngineId(activeEngine)) {
         // Cloud engines are never hardware-locked; select the active provider row.
-        selectedEngine = activeEngine;
-        selectedCloudKind = activeEngine;
+        // A reserved/unlisted kind (e.g. a hand-edited `deepgram`) has no row, so
+        // show the OpenAI-compatible form rather than an empty one.
+        selectedCloudKind = catalog.some((e) => e.id === activeEngine)
+          ? activeEngine
+          : 'open_ai_compatible';
+        selectedEngine = selectedCloudKind;
       } else {
         // A locked active engine (e.g. a stale qwen3_local config on non-Apple-Silicon)
         // must not become the selected row — that would show a doomed download under a
@@ -109,7 +114,14 @@
     if (isLocked(e) || e.id === selectedEngine) return;
     selectedEngine = e.id;
     if (isCloudEngineId(e.id)) {
-      selectedCloudKind = e.id;
+      // Re-picking the already-shown provider leaves the `kind` prop unchanged, so
+      // CloudTtsForm's load effect can't observe it — activate imperatively instead
+      // (mirrors the local branch below). A different kind drives it via the prop.
+      if (e.id === selectedCloudKind) {
+        cloudForm?.activate();
+      } else {
+        selectedCloudKind = e.id;
+      }
       return;
     }
     if (e.id === selectedLocalEngine) {
@@ -220,6 +232,7 @@
             onactivated={onActivated}
           />
           <CloudTtsForm
+            bind:this={cloudForm}
             bind:catalog
             kind={selectedCloudKind}
             active={isCloudEngineId(selectedEngine)}

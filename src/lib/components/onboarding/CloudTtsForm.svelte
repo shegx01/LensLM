@@ -25,10 +25,9 @@
     SelectItem
   } from '$lib/components/ui/select/index.js';
 
-  // One form instance drives every cloud provider; `kind` (owned by the parent's
-  // engine list) selects which one it configures (#40). `catalog` is $bindable so a
-  // key save can refresh backend-derived `available`. See TtsConfigPanel for the
-  // parent/child ownership rationale.
+  // One form instance drives every cloud provider; `kind` selects which one it
+  // configures. `catalog` is $bindable so a key save can refresh backend-derived
+  // `available` (see TtsConfigPanel for the parent/child ownership rationale).
   let {
     catalog = $bindable(),
     kind,
@@ -124,10 +123,9 @@
     return prefersReducedMotion() ? 0 : ms;
   }
 
-  /** Load the saved credentials + voices for provider `k` (each provider is stored
-   *  independently in `tts.clouds[k]`, #40). `activateIfConfigured` persists — i.e.
-   *  activates — a provider that already has a key and isn't the active backend,
-   *  mirroring how picking a ready local engine activates it; never a keyless one. */
+  /** Load provider `k`'s saved credentials + voices from `tts.clouds[k]`.
+   *  `activateIfConfigured` activates (persists) a provider that already has a key
+   *  and isn't the active backend — mirroring a ready local-engine pick; never a keyless one. */
   async function loadForKind(k: CloudTtsKind, activateIfConfigured: boolean): Promise<void> {
     cloudApiKey = '';
     savedCloudApiKey = '';
@@ -139,6 +137,7 @@
     cloudGuestPreset = '';
     host.custom = '';
     guest.custom = '';
+    pendingActivate = false;
 
     if (!isTauri()) return;
     // The panel passes a populated catalog; only self-fetch when mounted standalone.
@@ -178,9 +177,15 @@
       cloudGuestPreset = guestClass.preset || femaleVoices[0]?.id || '';
       guest.custom = guestClass.custom;
 
-      if (activateIfConfigured && hasSavedKey && cloudBaseUrl.trim() && !isActiveKind) {
+      if (
+        (activateIfConfigured || pendingActivate) &&
+        hasSavedKey &&
+        cloudBaseUrl.trim() &&
+        !isActiveKind
+      ) {
         void persistCloud();
       }
+      pendingActivate = false;
     } catch {
       // Non-fatal: fall back to the default empty Cloud form.
     }
@@ -200,11 +205,16 @@
     });
   });
 
+  // Set by activate() when the parent re-picks this provider before its load finished;
+  // the in-flight load persists on completion (see loadForKind). Mirrors LocalTtsForm.
+  let pendingActivate = false;
+
   /** Pin this provider when the parent re-picks it without changing the `kind` prop
-   *  (the load effect can't observe that). Activates only a key-configured provider,
-   *  else no-op so the form stays shown to add a key. Mirrors LocalTtsForm.activate. */
+   *  (the load effect can't observe that). Activates a key-configured provider now,
+   *  else defers to the in-flight load; a keyless provider stays shown to add a key. */
   export function activate(): void {
     if (hasSavedKey && cloudBaseUrl.trim()) void persistCloud();
+    else pendingActivate = true;
   }
 
   /** Re-fetch the catalog so this provider's backend-derived `available` reflects the

@@ -73,8 +73,8 @@ pub use citation::{
 };
 pub use citation_source::{SnippetSegments, SourceView};
 pub use config::{
-    AppConfig, ChatConfig, CloudAsrProvider, CloudTtsConfig, CloudTtsCreds, EnrichmentConfig,
-    RerankerConfig, RerankerModel, RetrievalConfig, TaskModel, TtsConfig, VoiceConfig, VoiceRef,
+    AppConfig, ChatConfig, CloudAsrProvider, CloudTtsCreds, EnrichmentConfig, RerankerConfig,
+    RerankerModel, RetrievalConfig, TaskModel, TtsConfig, VoiceConfig, VoiceRef,
 };
 #[cfg(feature = "test-util")]
 pub use dialogue::{DialogueCtx, generate_dialogue};

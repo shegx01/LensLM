@@ -271,7 +271,6 @@ pub fn resolve_tts_provider_full(
             sidecar.map(|s| Arc::new(qwen::QwenLocalAdapter::new(s)) as Arc<dyn TtsProvider>)
         }
         TtsBackend::Cloud(kind) => {
-            // Credentials for THIS provider kind (#40: each is configured separately).
             let creds = cfg.clouds.get(&kind);
             let api_key = creds.map(|c| c.api_key.clone()).unwrap_or_default();
             // #40 AC6: no key -> fall back to offline Orpheus iff its weights are on

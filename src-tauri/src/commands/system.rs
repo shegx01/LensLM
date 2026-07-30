@@ -239,7 +239,7 @@ pub async fn tts_engine_catalog(
     engine: tauri::State<'_, LensEngine>,
 ) -> Result<Vec<lens_core::EngineCatalogEntry>, LensError> {
     let config = engine.config().await;
-    // Per-provider (#40): a cloud kind gates its own engine row once it has a key.
+    // A cloud kind gates its own engine row once it has a saved key.
     let keyed_cloud_kinds: BTreeSet<CloudTtsKind> = config
         .tts
         .clouds

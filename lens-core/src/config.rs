@@ -98,7 +98,7 @@ impl std::fmt::Debug for CloudTtsCreds {
 /// The legacy single-slot cloud config. Retained only as the on-disk shape older
 /// configs were written in; [`RawTtsConfig`] folds it into [`TtsConfig::clouds`].
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
-pub struct CloudTtsConfig {
+pub(crate) struct CloudTtsConfig {
     pub kind: CloudTtsKind,
     /// Stored in PLAINTEXT — see [`ModelConfig::api_key`] for the at-rest caveat.
     pub api_key: String,

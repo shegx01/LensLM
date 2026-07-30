@@ -361,8 +361,7 @@ pub struct EngineCatalogEntry {
 impl EngineCatalogEntry {
     fn from_capability(cap: &EngineCapability, keyed_cloud_kinds: &BTreeSet<CloudTtsKind>) -> Self {
         let platform_available = cap.id.to_backend().is_some();
-        // A cloud engine is available once ITS OWN provider kind has a saved key
-        // (#40: each cloud provider is configured independently).
+        // A cloud engine is available once ITS OWN provider kind has a saved key.
         let has_key = cap
             .id
             .cloud_kind()
