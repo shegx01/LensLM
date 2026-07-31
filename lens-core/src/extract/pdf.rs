@@ -13,10 +13,10 @@
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
-use pdfium_render::prelude::{Pdfium, PdfiumError};
+use pdfium_render::prelude::{PdfBookmark, Pdfium, PdfiumError};
 
 use crate::LensError;
-use crate::parse::{Block, BlockType};
+use crate::parse::{Block, BlockType, SectionPathStack};
 
 use super::{ExtractOutput, Extractor, SourceAnchor};
 
@@ -122,16 +122,49 @@ impl Extractor for PdfExtractor {
         let mut blocks: Vec<Block> = Vec::new();
         let mut anchors: Vec<SourceAnchor> = Vec::new();
 
+        // Prefer the embedded outline (bookmarks) for section structure (#279); fall back
+        // to the per-page font-size heading heuristic when a PDF has no outline. Either way
+        // headings become blocks so `build_sections` derives the same structure as the
+        // block-based formats.
+        let mut outline = collect_bookmarks(document.bookmarks().root());
+        outline.sort_by_key(|(_, page, _)| *page);
+        let use_outline = !outline.is_empty();
+        let mut bm_idx = 0usize;
+        let mut section = SectionPathStack::new();
+
         // page_number is 1-based (PDF convention; matches `chunks.page`).
         for (page_index, page) in document.pages().iter().enumerate() {
             let page_number = (page_index as u32) + 1;
+
+            while bm_idx < outline.len() && outline[bm_idx].1 <= page_index {
+                if outline[bm_idx].1 == page_index {
+                    let (depth, _, title) = &outline[bm_idx];
+                    section.push((*depth).clamp(1, 6), title);
+                    let char_start = extracted_text.len();
+                    extracted_text.push_str(title);
+                    let char_end = extracted_text.len();
+                    extracted_text.push('\n');
+                    blocks.push(Block {
+                        block_type: BlockType::Heading.as_str().to_string(),
+                        section_path: section.current(),
+                        text: title.clone(),
+                        char_start,
+                        char_end,
+                    });
+                    anchors.push(SourceAnchor::Pdf {
+                        page: page_number,
+                        bbox: [0.0; 4],
+                    });
+                }
+                bm_idx += 1;
+            }
 
             let text = match page.text() {
                 Ok(t) => t,
                 Err(_) => continue,
             };
 
-            let modal_font = modal_font_size(&text);
+            let modal_font = if use_outline { 0.0 } else { modal_font_size(&text) };
 
             for segment in text.segments().iter() {
                 let seg_text = segment.text();
@@ -147,10 +180,15 @@ impl Extractor for PdfExtractor {
                     bounds.top().value,
                 ];
 
-                let seg_font = segment_font_size(&segment);
-                let is_heading = seg_text.chars().count() <= HEADING_MAX_CHARS
+                // With an outline, segments are body text — structure comes from bookmarks.
+                // Without one, the font-size heuristic promotes big short runs to headings.
+                let is_heading = !use_outline
+                    && seg_text.chars().count() <= HEADING_MAX_CHARS
                     && modal_font > 0.0
-                    && seg_font >= modal_font * HEADING_FONT_RATIO;
+                    && segment_font_size(&segment) >= modal_font * HEADING_FONT_RATIO;
+                if is_heading {
+                    section.push(1, &seg_text);
+                }
                 let btype = if is_heading {
                     BlockType::Heading.as_str()
                 } else {
@@ -164,7 +202,7 @@ impl Extractor for PdfExtractor {
 
                 blocks.push(Block {
                     block_type: btype.to_string(),
-                    section_path: String::new(),
+                    section_path: section.current(),
                     text: seg_text,
                     char_start,
                     char_end,
@@ -198,6 +236,33 @@ impl Extractor for PdfExtractor {
             anchors,
             table_markdown: None,
         })
+    }
+}
+
+/// Depth-first collects the document outline as `(depth, page_index, title)` triples
+/// (depth 1 = top level). Bookmarks with no title or no resolvable page destination
+/// (named/URI/remote actions) are skipped, so the caller falls back to the heuristic.
+fn collect_bookmarks<'a>(root: Option<PdfBookmark<'a>>) -> Vec<(u8, usize, String)> {
+    let mut out = Vec::new();
+    walk_bookmarks(root, 1, &mut out);
+    out
+}
+
+fn walk_bookmarks<'a>(node: Option<PdfBookmark<'a>>, depth: u8, out: &mut Vec<(u8, usize, String)>) {
+    let mut cur = node;
+    while let Some(bm) = cur {
+        if let (Some(title), Some(dest)) = (bm.title(), bm.destination()) {
+            if let Ok(idx) = dest.page_index() {
+                if let Ok(page) = usize::try_from(idx) {
+                    let t = title.trim().to_string();
+                    if !t.is_empty() {
+                        out.push((depth, page, t));
+                    }
+                }
+            }
+        }
+        walk_bookmarks(bm.first_child(), depth.saturating_add(1), out);
+        cur = bm.next_sibling();
     }
 }
 

@@ -38,7 +38,9 @@ pub(crate) fn build_sections(blocks: &[Block]) -> Vec<Section> {
     let heading = BlockType::Heading.as_str();
     let doc_end = blocks.iter().map(|b| b.char_end).max().unwrap_or(0);
 
-    // First pass: heading level (trail segment count) + title + start, in order.
+    // First pass: heading level (self-inclusive trail depth) + title + start, in order.
+    // Every extractor emits headings with a trail that ends in the heading itself, so the
+    // segment count is the depth (see `parse::SectionPathStack` and each extractor).
     let mut raw: Vec<(u8, String, usize)> = Vec::new();
     for b in blocks {
         if b.block_type != heading || b.section_path.is_empty() {
@@ -148,7 +150,8 @@ mod tests {
 
     #[test]
     fn heading_without_a_trail_is_ignored() {
-        // A malformed heading block with empty section_path contributes nothing.
+        // Every extractor emits self-inclusive trails, so an empty section_path marks a
+        // malformed heading block that contributes nothing.
         let blocks = vec![heading("", "orphan", 0), heading("Real", "Real", 10)];
         let s = build_sections(&blocks);
         assert_eq!(s.len(), 1);

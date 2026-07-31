@@ -9,11 +9,11 @@
 //!
 //! # Block model
 //!
-//! `rs_trafilatura` returns a flat `content_text` string — it does NOT expose a
-//! structured block tree. We produce one block per non-empty line-group of the
-//! extracted text, with `block_type = "paragraph"` and `section_path = ""`.
-//! Each block's `text_offset` is the block's start byte index as a decimal
-//! string (a stable, round-trippable pointer into the canonical text buffer).
+//! We request `rs_trafilatura`'s GitHub-Flavored-Markdown output and parse it with the
+//! shared Markdown parser, so `<h1>–<h6>` become `section_path`-bearing heading blocks
+//! (#279). When markdown is unavailable we fall back to the flat `content_text`, one
+//! `paragraph` block per line-group with `section_path = ""`. Each block's `text_offset`
+//! is its start byte index as a decimal string (a stable pointer into the text buffer).
 //!
 //! # needs_js detection
 //!
@@ -36,8 +36,36 @@ pub struct UrlExtractor;
 
 impl Extractor for UrlExtractor {
     fn extract(&self, raw: &[u8]) -> Result<ExtractOutput, LensError> {
-        let result = rs_trafilatura::extract_bytes(raw)
+        let options = rs_trafilatura::Options {
+            output_markdown: true,
+            ..Default::default()
+        };
+        let result = rs_trafilatura::extract_bytes_with_options(raw, &options)
             .map_err(|e| LensError::Validation(format!("URL content extraction failed: {e}")))?;
+
+        // Prefer the structured Markdown: its `#` headings feed the shared markdown parser,
+        // which populates `section_path` so positional queries resolve (#279). Fall back to
+        // the flat `content_text` when markdown is unavailable.
+        if let Some(md) = result
+            .content_markdown
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+        {
+            let blocks = crate::parse::parse_blocks(md, crate::parse::SourceKind::Markdown);
+            let anchors = blocks
+                .iter()
+                .map(|b| SourceAnchor::Url {
+                    text_offset: b.char_start.to_string(),
+                })
+                .collect();
+            return Ok(ExtractOutput {
+                extracted_text: md.to_string(),
+                blocks,
+                anchors,
+                table_markdown: None,
+            });
+        }
 
         let extracted_text = result.content_text;
 

@@ -654,16 +654,18 @@ fn parse_markdown(src: &str) -> Vec<Block> {
                 }
             }
             Event::End(TagEnd::Heading(level)) => {
-                if let Some((BlockContext::Heading, byte_start, path)) = ctx_stack.pop() {
+                if let Some((BlockContext::Heading, byte_start, _path)) = ctx_stack.pop() {
                     let byte_end = range.end;
                     let raw = &src[byte_start..byte_end];
                     let heading_text = extract_heading_text(raw);
+                    // Push BEFORE recording the trail so the heading carries its OWN section
+                    // (self-inclusive), matching docx/odt/epub/pdf — see `docx` and #279.
                     heading_stack.push(heading_level_u8(level), heading_text);
                     let (start, end) = locate_in_src(src, heading_text, byte_start, byte_end);
                     if end > start {
                         blocks.push(Block {
                             block_type: BlockType::Heading.as_str().to_string(),
-                            section_path: path,
+                            section_path: heading_stack.current(),
                             text: heading_text.to_string(),
                             char_start: start,
                             char_end: end,
