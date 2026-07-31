@@ -19,8 +19,7 @@
     DialogContent,
     DialogHeader,
     DialogTitle,
-    DialogDescription,
-    DialogFooter
+    DialogDescription
   } from '$lib/components/ui/dialog/index.js';
   import {
     Select,
@@ -208,9 +207,7 @@
     showCloseButton={true}
     class="flex max-h-[85vh] w-full flex-col gap-0 overflow-hidden rounded-2xl border-border bg-card p-0 sm:max-w-3xl"
   >
-    <DialogHeader
-      class="flex-row items-center gap-3 border-b border-border px-6 py-4 space-y-0 text-left shrink-0"
-    >
+    <DialogHeader class="flex-row items-center gap-3 px-6 py-4 space-y-0 text-left shrink-0">
       <div class="header-icon" aria-hidden="true">
         <Sparkles class="size-[19px]" strokeWidth={2} />
       </div>
@@ -252,123 +249,126 @@
         </div>
       </div>
 
-      <div class="config-pane no-scrollbar">
-        <div class="fmt-desc-card">
-          <span class="fmt-desc-icon" aria-hidden="true">
-            <selectedFormat.icon class="size-4" strokeWidth={1.9} />
-          </span>
-          <p>{selectedFormat.desc}</p>
-        </div>
+      <div class="config-col">
+        <div class="config-pane no-scrollbar">
+          <div class="fmt-desc-card">
+            <span class="fmt-desc-icon" aria-hidden="true">
+              <selectedFormat.icon class="size-4" strokeWidth={1.9} />
+            </span>
+            <p>{selectedFormat.desc}</p>
+          </div>
 
-        <section>
-          <p class="section-label">
-            Length
-            {#if lengthIsSuggested}
-              <span class="suggested-chip">Suggested</span>
-            {/if}
-          </p>
-          <div class="len-group">
-            {#each LENGTHS as opt (opt.value)}
+          <section>
+            <p class="section-label">
+              Length
+              {#if lengthIsSuggested}
+                <span class="suggested-chip">Suggested</span>
+              {/if}
+            </p>
+            <div class="len-group">
+              {#each LENGTHS as opt (opt.value)}
+                <button
+                  type="button"
+                  class="len-btn"
+                  data-active={length === opt.value}
+                  aria-label={opt.label}
+                  aria-pressed={length === opt.value}
+                  onclick={() => pickLength(opt.value)}
+                >
+                  <span class="len-label">{opt.label}</span>
+                  <span class="len-hint">{opt.hint}</span>
+                </button>
+              {/each}
+            </div>
+          </section>
+
+          {#if langOptions.length > 0}
+            <section>
+              <p id="overview-language-label" class="section-label">
+                <Languages class="size-3.5 text-muted-foreground" strokeWidth={2} />
+                Language
+              </p>
+              <Select
+                type="single"
+                value={language}
+                onValueChange={(v) => (language = v ?? '')}
+                items={languageItems}
+              >
+                <SelectTrigger
+                  id="overview-language"
+                  aria-labelledby="overview-language-label"
+                  class="h-10 w-full rounded-xl"
+                >
+                  <SelectValue placeholder="Auto — match sources" />
+                </SelectTrigger>
+                <SelectContent
+                  class="origin-(--bits-select-content-transform-origin) duration-200 ease-[cubic-bezier(0.23,1,0.32,1)]"
+                >
+                  {#each languageItems as opt (opt.value)}
+                    <SelectItem value={opt.value} label={opt.label}>{opt.label}</SelectItem>
+                  {/each}
+                </SelectContent>
+              </Select>
+            </section>
+          {/if}
+
+          <section>
+            <div class="mb-2 flex items-center justify-between">
+              <label for="overview-focus" class="section-label mb-0">
+                Focus <span class="font-medium normal-case tracking-normal text-muted-foreground/70"
+                  >· optional</span
+                >
+              </label>
               <button
                 type="button"
-                class="len-btn"
-                data-active={length === opt.value}
-                aria-label={opt.label}
-                aria-pressed={length === opt.value}
-                onclick={() => pickLength(opt.value)}
+                class="suggest-btn"
+                disabled={suggesting || !notebookId}
+                aria-busy={suggesting}
+                onclick={suggest}
               >
-                <span class="len-label">{opt.label}</span>
-                <span class="len-hint">{opt.hint}</span>
+                {#if suggesting}
+                  <span class="suggest-spinner" aria-hidden="true"></span>
+                {:else}
+                  <WandSparkles class="size-3" strokeWidth={2} />
+                {/if}
+                {suggesting ? 'Suggesting…' : 'Suggest'}
               </button>
-            {/each}
-          </div>
-        </section>
-
-        {#if langOptions.length > 0}
-          <section>
-            <p id="overview-language-label" class="section-label">
-              <Languages class="size-3.5 text-muted-foreground" strokeWidth={2} />
-              Language
-            </p>
-            <Select
-              type="single"
-              value={language}
-              onValueChange={(v) => (language = v ?? '')}
-              items={languageItems}
-            >
-              <SelectTrigger
-                id="overview-language"
-                aria-labelledby="overview-language-label"
-                class="h-10 w-full rounded-xl"
+            </div>
+            <textarea
+              id="overview-focus"
+              bind:value={focus}
+              oninput={onFocusInput}
+              placeholder="What the hosts should focus on — or tap Suggest for topics drawn from your sources."
+              rows="5"
+              class="focus-area"
+            ></textarea>
+            {#if suggestError}
+              <p
+                class="mt-1.5 flex items-center gap-1.5 text-[0.7rem] text-destructive"
+                role="alert"
               >
-                <SelectValue placeholder="Auto — match sources" />
-              </SelectTrigger>
-              <SelectContent
-                class="origin-(--bits-select-content-transform-origin) duration-200 ease-[cubic-bezier(0.23,1,0.32,1)]"
-              >
-                {#each languageItems as opt (opt.value)}
-                  <SelectItem value={opt.value} label={opt.label}>{opt.label}</SelectItem>
-                {/each}
-              </SelectContent>
-            </Select>
+                <TriangleAlert class="size-3 shrink-0" strokeWidth={2} />
+                {suggestError}
+              </p>
+            {/if}
           </section>
-        {/if}
+        </div>
 
-        <section>
-          <div class="mb-2 flex items-center justify-between">
-            <label for="overview-focus" class="section-label mb-0">
-              Focus <span class="font-medium normal-case tracking-normal text-muted-foreground/70"
-                >· optional</span
-              >
-            </label>
-            <button
-              type="button"
-              class="suggest-btn"
-              disabled={suggesting || !notebookId}
-              aria-busy={suggesting}
-              onclick={suggest}
-            >
-              {#if suggesting}
-                <span class="suggest-spinner" aria-hidden="true"></span>
-              {:else}
-                <WandSparkles class="size-3" strokeWidth={2} />
-              {/if}
-              {suggesting ? 'Suggesting…' : 'Suggest'}
+        <div class="config-footer">
+          <span class="scope-pill">
+            <FileText class="size-3.5" strokeWidth={2} />
+            {scopeLabel}
+          </span>
+          <div class="flex items-center gap-2">
+            <button type="button" class="ghost-btn" onclick={cancel}>Cancel</button>
+            <button type="button" class="generate-btn" onclick={generate}>
+              <Sparkles class="size-[14px]" strokeWidth={2} />
+              Generate
             </button>
           </div>
-          <textarea
-            id="overview-focus"
-            bind:value={focus}
-            oninput={onFocusInput}
-            placeholder="What the hosts should focus on — or tap Suggest for topics drawn from your sources."
-            rows="5"
-            class="focus-area"
-          ></textarea>
-          {#if suggestError}
-            <p class="mt-1.5 flex items-center gap-1.5 text-[0.7rem] text-destructive" role="alert">
-              <TriangleAlert class="size-3 shrink-0" strokeWidth={2} />
-              {suggestError}
-            </p>
-          {/if}
-        </section>
+        </div>
       </div>
     </div>
-
-    <DialogFooter
-      class="flex-row items-center justify-between gap-3 border-t border-border px-6 py-4 space-x-0 shrink-0"
-    >
-      <span class="scope-pill">
-        <FileText class="size-3.5" strokeWidth={2} />
-        {scopeLabel}
-      </span>
-      <div class="flex items-center gap-2">
-        <button type="button" class="ghost-btn" onclick={cancel}>Cancel</button>
-        <button type="button" class="generate-btn" onclick={generate}>
-          <Sparkles class="size-[14px]" strokeWidth={2} />
-          Generate
-        </button>
-      </div>
-    </DialogFooter>
   </DialogContent>
 </Dialog>
 
@@ -420,14 +420,30 @@
     background: color-mix(in oklch, var(--muted) 55%, transparent);
     overflow-y: auto;
   }
+  /* Right column: scrolling config above, a pinned footer below — so the footer never
+     spans the format rail, letting the rail run the full height of the modal. */
+  .config-col {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-width: 0;
+  }
   .config-pane {
     display: flex;
     flex-direction: column;
     gap: 18px;
     flex: 1;
-    min-width: 0;
-    padding: 18px 22px 20px;
+    min-height: 0;
+    padding: 18px 22px 18px;
     overflow-y: auto;
+  }
+  .config-footer {
+    display: flex;
+    flex: none;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 12px 22px 16px;
   }
 
   /* Format rows — horizontal cards (icon · label + tag · check). Selected reads as an
@@ -644,11 +660,11 @@
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    height: 38px;
-    padding: 0 18px;
+    height: 33px;
+    padding: 0 15px;
     border: 0;
-    border-radius: 11px;
-    font-size: 0.82rem;
+    border-radius: 9px;
+    font-size: 0.8rem;
     font-weight: 650;
     cursor: pointer;
     color: var(--primary-foreground);
@@ -670,11 +686,11 @@
   }
 
   .ghost-btn {
-    height: 38px;
-    padding: 0 16px;
+    height: 33px;
+    padding: 0 14px;
     border: 1px solid var(--border);
-    border-radius: 11px;
-    font-size: 0.82rem;
+    border-radius: 9px;
+    font-size: 0.8rem;
     font-weight: 600;
     cursor: pointer;
     color: var(--muted-foreground);
