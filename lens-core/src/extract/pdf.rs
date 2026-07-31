@@ -13,10 +13,10 @@
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
-use pdfium_render::prelude::{Pdfium, PdfiumError};
+use pdfium_render::prelude::{PdfBookmark, Pdfium, PdfiumError};
 
 use crate::LensError;
-use crate::parse::{Block, BlockType};
+use crate::parse::{Block, BlockType, SectionPathStack};
 
 use super::{ExtractOutput, Extractor, SourceAnchor};
 
@@ -122,16 +122,51 @@ impl Extractor for PdfExtractor {
         let mut blocks: Vec<Block> = Vec::new();
         let mut anchors: Vec<SourceAnchor> = Vec::new();
 
+        // Section structure (#279): the embedded outline when present, else the per-page
+        // font-size heading heuristic. Both emit heading blocks for `build_sections`.
+        let mut outline = collect_bookmarks(document.bookmarks().root());
+        outline.sort_by_key(|(_, page, _)| *page);
+        let use_outline = !outline.is_empty();
+        let mut bm_idx = 0usize;
+        let mut section = SectionPathStack::new();
+
         // page_number is 1-based (PDF convention; matches `chunks.page`).
         for (page_index, page) in document.pages().iter().enumerate() {
             let page_number = (page_index as u32) + 1;
+
+            while bm_idx < outline.len() && outline[bm_idx].1 <= page_index {
+                if outline[bm_idx].1 == page_index {
+                    let (depth, _, title) = &outline[bm_idx];
+                    section.push((*depth).clamp(1, 6), title);
+                    let char_start = extracted_text.len();
+                    extracted_text.push_str(title);
+                    let char_end = extracted_text.len();
+                    extracted_text.push('\n');
+                    blocks.push(Block {
+                        block_type: BlockType::Heading.as_str().to_string(),
+                        section_path: section.current(),
+                        text: title.clone(),
+                        char_start,
+                        char_end,
+                    });
+                    anchors.push(SourceAnchor::Pdf {
+                        page: page_number,
+                        bbox: [0.0; 4],
+                    });
+                }
+                bm_idx += 1;
+            }
 
             let text = match page.text() {
                 Ok(t) => t,
                 Err(_) => continue,
             };
 
-            let modal_font = modal_font_size(&text);
+            let modal_font = if use_outline {
+                0.0
+            } else {
+                modal_font_size(&text)
+            };
 
             for segment in text.segments().iter() {
                 let seg_text = segment.text();
@@ -147,10 +182,14 @@ impl Extractor for PdfExtractor {
                     bounds.top().value,
                 ];
 
-                let seg_font = segment_font_size(&segment);
-                let is_heading = seg_text.chars().count() <= HEADING_MAX_CHARS
+                // No outline → the font-size heuristic promotes big short runs to headings.
+                let is_heading = !use_outline
+                    && seg_text.chars().count() <= HEADING_MAX_CHARS
                     && modal_font > 0.0
-                    && seg_font >= modal_font * HEADING_FONT_RATIO;
+                    && segment_font_size(&segment) >= modal_font * HEADING_FONT_RATIO;
+                if is_heading {
+                    section.push(1, &seg_text);
+                }
                 let btype = if is_heading {
                     BlockType::Heading.as_str()
                 } else {
@@ -164,7 +203,7 @@ impl Extractor for PdfExtractor {
 
                 blocks.push(Block {
                     block_type: btype.to_string(),
-                    section_path: String::new(),
+                    section_path: section.current(),
                     text: seg_text,
                     char_start,
                     char_end,
@@ -198,6 +237,48 @@ impl Extractor for PdfExtractor {
             anchors,
             table_markdown: None,
         })
+    }
+}
+
+/// Depth-first collects the outline as `(depth, page_index, title)` triples (depth 1 =
+/// top level). Bookmarks with no title or no resolvable page destination are skipped.
+fn collect_bookmarks<'a>(root: Option<PdfBookmark<'a>>) -> Vec<(u8, usize, String)> {
+    let mut out = Vec::new();
+    walk_bookmarks(root, 1, &mut out);
+    out
+}
+
+/// Bounds against a malicious PDF outline (deep nesting → stack overflow; sibling/child
+/// cycles → hang). The sibling cap catches a cycle of title-less nodes that never grow `out`.
+const MAX_BOOKMARK_DEPTH: u8 = 32;
+const MAX_BOOKMARK_NODES: usize = 10_000;
+
+fn walk_bookmarks<'a>(
+    node: Option<PdfBookmark<'a>>,
+    depth: u8,
+    out: &mut Vec<(u8, usize, String)>,
+) {
+    if depth > MAX_BOOKMARK_DEPTH {
+        return;
+    }
+    let mut cur = node;
+    let mut siblings = 0usize;
+    while let Some(bm) = cur {
+        if out.len() >= MAX_BOOKMARK_NODES || siblings >= MAX_BOOKMARK_NODES {
+            return;
+        }
+        siblings += 1;
+        if let (Some(title), Some(dest)) = (bm.title(), bm.destination())
+            && let Ok(idx) = dest.page_index()
+            && let Ok(page) = usize::try_from(idx)
+        {
+            let t = title.trim().to_string();
+            if !t.is_empty() {
+                out.push((depth, page, t));
+            }
+        }
+        walk_bookmarks(bm.first_child(), depth.saturating_add(1), out);
+        cur = bm.next_sibling();
     }
 }
 
@@ -274,6 +355,59 @@ mod tests {
         doc.save(&mut BufWriter::new(&mut buf))
             .expect("serialize no-text fixture PDF to bytes");
         buf
+    }
+
+    /// A 2-page PDF with a flat embedded outline (one bookmark per page).
+    fn build_bookmarked_pdf() -> Vec<u8> {
+        use printpdf::{BuiltinFont, Mm, PdfDocument};
+        use std::io::BufWriter;
+
+        let (doc, page1, layer1) =
+            PdfDocument::new("outline-fixture", Mm(210.0), Mm(297.0), "Layer 1");
+        let font = doc
+            .add_builtin_font(BuiltinFont::Helvetica)
+            .expect("add builtin font");
+        doc.get_page(page1).get_layer(layer1).use_text(
+            "Chapter one body text.",
+            14.0,
+            Mm(20.0),
+            Mm(270.0),
+            &font,
+        );
+        let (page2, layer2) = doc.add_page(Mm(210.0), Mm(297.0), "Layer 1");
+        doc.get_page(page2).get_layer(layer2).use_text(
+            "Chapter two body text.",
+            14.0,
+            Mm(20.0),
+            Mm(270.0),
+            &font,
+        );
+        doc.add_bookmark("Chapter One", page1);
+        doc.add_bookmark("Chapter Two", page2);
+
+        let mut buf = Vec::new();
+        doc.save(&mut BufWriter::new(&mut buf))
+            .expect("serialize bookmarked fixture PDF to bytes");
+        buf
+    }
+
+    /// The embedded outline becomes the section structure (#279).
+    #[test]
+    fn pdf_outline_becomes_section_structure() {
+        let raw = build_bookmarked_pdf();
+        let Some(out) = try_extract(&raw) else {
+            return;
+        };
+        let sections = crate::section::build_sections(&out.blocks);
+        let got: Vec<(u8, u32, &str)> = sections
+            .iter()
+            .map(|s| (s.level, s.ordinal, s.title.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![(1, 1, "Chapter One"), (1, 2, "Chapter Two")],
+            "flat outline → two top-level sections in page order"
+        );
     }
 
     /// Returns `None` (skip) when libpdfium is unavailable; panics on other errors.

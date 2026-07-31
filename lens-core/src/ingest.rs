@@ -971,12 +971,16 @@ impl IngestContext<'_> {
         // #155: entity-vector drop (same ordering as the chunk-vector drop above).
         store.drop_entity_source(&coord, source_id).await?;
 
+        let sections = crate::section::build_sections(blocks);
+
         let mut tx = pool.begin().await?;
         delete_chunks_for_source(&mut tx, source_id).await?;
+        delete_sections_for_source(&mut tx, source_id).await?;
         // #157: clear the source-keyed entity_nodes here and now (see the helper for why
         // it's explicit) rather than waiting on the re-enqueued enrichment to replace them.
         crate::notebooks::delete_entity_nodes_for_source(&mut tx, source_id).await?;
         insert_chunks(&mut tx, source_id, &chunks).await?;
+        insert_sections(&mut tx, source_id, &sections).await?;
         tx.commit().await?;
 
         // Content changed (unchanged-content paths returned early): stale enrichment reset
@@ -1652,6 +1656,7 @@ async fn wipe_source_content(
     store.drop_entity_source(&coord, source_id).await?;
     let mut tx = pool.begin().await?;
     delete_chunks_for_source(&mut tx, source_id).await?;
+    delete_sections_for_source(&mut tx, source_id).await?;
     // #157: clear source-keyed entity_nodes explicitly (see the helper).
     crate::notebooks::delete_entity_nodes_for_source(&mut tx, source_id).await?;
     tx.commit().await?;
@@ -1693,9 +1698,53 @@ async fn delete_chunks_for_source(
     Ok(())
 }
 
+/// Clears a source's outline rows before re-ingest (#279).
+async fn delete_sections_for_source(
+    conn: &mut sqlx::SqliteConnection,
+    source_id: &str,
+) -> Result<(), LensError> {
+    sqlx::query("DELETE FROM sections WHERE source_id = ?")
+        .bind(source_id)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+/// Persists the per-source outline (#279); `page` is NULL (spans are char-keyed).
+async fn insert_sections(
+    conn: &mut sqlx::SqliteConnection,
+    source_id: &str,
+    sections: &[crate::section::Section],
+) -> Result<(), LensError> {
+    if sections.is_empty() {
+        return Ok(());
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    for batch in sections.chunks(SECTION_INSERT_BATCH) {
+        let mut qb = sqlx::QueryBuilder::new(
+            "INSERT INTO sections \
+                 (id, source_id, level, ordinal, title, char_start, char_end, page, created_at) ",
+        );
+        qb.push_values(batch, |mut b, section| {
+            b.push_bind(uuid::Uuid::now_v7().to_string())
+                .push_bind(source_id)
+                .push_bind(section.level as i64)
+                .push_bind(section.ordinal as i64)
+                .push_bind(&section.title)
+                .push_bind(section.char_start as i64)
+                .push_bind(section.char_end as i64)
+                .push_bind(Option::<i64>::None)
+                .push_bind(&now);
+        });
+        qb.build().execute(&mut *conn).await?;
+    }
+    Ok(())
+}
+
 /// Batch size for multi-row `INSERT`. Each row binds 15 variables; 60 × 15 = 900,
 /// comfortably under SQLite's 999-variable limit.
 const CHUNK_INSERT_BATCH: usize = 60;
+const SECTION_INSERT_BATCH: usize = 100;
 
 /// Inserts chunk rows for `source_id`. Parents first (FK ordering), then children,
 /// in multi-row INSERT batches of [`CHUNK_INSERT_BATCH`] inside the caller's transaction.
