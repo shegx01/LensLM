@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
+use crate::dialogue::DialogueScript;
 use crate::error::LensError;
 
 /// Overview lifecycle across the IPC boundary (see module header for the
@@ -44,12 +45,15 @@ impl AudioOverviewStatus {
 }
 
 /// A persisted (and read-time reconciled) Audio Overview record, returned across IPC.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AudioOverviewRecord {
     pub path: String,
     pub generated_at: String,
     pub status: AudioOverviewStatus,
     pub source_set_hash: String,
+    /// The dialogue script the audio was synthesized from — powers the Studio
+    /// Transcript tab. `None` on `failed` rows and pre-0024 overviews.
+    pub script: Option<DialogueScript>,
 }
 
 /// [M1] Upsert the terminal row for a notebook. `ON CONFLICT DO UPDATE` (not
@@ -62,32 +66,36 @@ pub(crate) async fn upsert_overview(
     generated_at: &str,
     status: AudioOverviewStatus,
     source_set_hash: &str,
+    script_json: Option<&str>,
 ) -> Result<(), LensError> {
     sqlx::query(
-        "INSERT INTO audio_overviews (notebook_id, path, generated_at, status, source_set_hash) \
-         VALUES (?, ?, ?, ?, ?) \
+        "INSERT INTO audio_overviews \
+         (notebook_id, path, generated_at, status, source_set_hash, script) \
+         VALUES (?, ?, ?, ?, ?, ?) \
          ON CONFLICT(notebook_id) DO UPDATE SET \
          path = excluded.path, generated_at = excluded.generated_at, \
-         status = excluded.status, source_set_hash = excluded.source_set_hash",
+         status = excluded.status, source_set_hash = excluded.source_set_hash, \
+         script = excluded.script",
     )
     .bind(notebook_id)
     .bind(path)
     .bind(generated_at)
     .bind(status.as_db_str())
     .bind(source_set_hash)
+    .bind(script_json)
     .execute(pool)
     .await?;
     Ok(())
 }
 
 /// Raw read of the stored row (no file reconciliation). Returns
-/// `(path, generated_at, status_str, source_set_hash)`.
+/// `(path, generated_at, status_str, source_set_hash, script_json)`.
 pub(crate) async fn read_overview_row(
     pool: &SqlitePool,
     notebook_id: &str,
-) -> Result<Option<(String, String, String, String)>, LensError> {
-    let row = sqlx::query_as::<_, (String, String, String, String)>(
-        "SELECT path, generated_at, status, source_set_hash \
+) -> Result<Option<(String, String, String, String, Option<String>)>, LensError> {
+    let row = sqlx::query_as::<_, (String, String, String, String, Option<String>)>(
+        "SELECT path, generated_at, status, source_set_hash, script \
          FROM audio_overviews WHERE notebook_id = ?",
     )
     .bind(notebook_id)

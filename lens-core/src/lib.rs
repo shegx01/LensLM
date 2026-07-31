@@ -1629,6 +1629,7 @@ impl LensEngine {
         };
 
         let generated_at = chrono::Utc::now().to_rfc3339();
+        let script_json = serde_json::to_string(&script).ok();
         audio_overview::upsert_overview(
             &self.pool().await,
             notebook_id,
@@ -1636,6 +1637,7 @@ impl LensEngine {
             &generated_at,
             AudioOverviewStatus::Ready,
             &source_set_hash,
+            script_json.as_deref(),
         )
         .await?;
         Ok(Some(path))
@@ -1659,6 +1661,7 @@ impl LensEngine {
             &generated_at,
             AudioOverviewStatus::Failed,
             source_set_hash,
+            None,
         )
         .await
     }
@@ -1672,12 +1675,13 @@ impl LensEngine {
         notebook_id: &str,
     ) -> Result<Option<AudioOverviewRecord>, LensError> {
         let pool = self.pool().await;
-        let Some((path, generated_at, status_str, source_set_hash)) =
+        let Some((path, generated_at, status_str, source_set_hash, script_json)) =
             audio_overview::read_overview_row(&pool, notebook_id).await?
         else {
             return Ok(None);
         };
         let stored = AudioOverviewStatus::from_db_str(&status_str)?;
+        let script = script_json.and_then(|j| serde_json::from_str(&j).ok());
         // Reconcile a `ready` row at read time. Missing (file gone) wins over Stale
         // (sources changed): a vanished file is the more urgent regenerate signal. Only
         // a `ready` row is reconciled — a `failed` row stays `failed`.
@@ -1697,6 +1701,7 @@ impl LensEngine {
             generated_at,
             status,
             source_set_hash,
+            script,
         }))
     }
 

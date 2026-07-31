@@ -9,7 +9,8 @@ import {
   isOverviewGenerating,
   cancelSynthesis,
   type AudioOverviewStatus,
-  type Length,
+  type OverviewSetup,
+  type TranscriptScript,
   type TtsPhase
 } from './audio-ipc.js';
 import type { StreamEvent } from './types.js';
@@ -29,6 +30,7 @@ let overviewPath = $state<string | null>(null);
 let generatedAt = $state<string | null>(null);
 let errorMessage = $state<string | null>(null);
 let modelReady = $state(false);
+let transcript = $state<TranscriptScript | null>(null);
 
 // A stale hydrate resolving after a newer one (fast notebook switching) must not
 // clobber the current notebook's state — same guard shape as chat-state's streamGeneration.
@@ -61,6 +63,9 @@ export const audioOverviewStore = {
   get modelReady() {
     return modelReady;
   },
+  get transcript() {
+    return transcript;
+  },
   get canGenerate(): boolean {
     return modelReady && overviewStatus !== 'generating' && sourcesStore.selectedCount > 0;
   }
@@ -74,6 +79,7 @@ function resetOverviewState(): void {
   overviewPath = null;
   generatedAt = null;
   errorMessage = null;
+  transcript = null;
 }
 
 /** Hydrate from the persisted record + in-flight generation probe (notebook-open/restart). */
@@ -101,6 +107,7 @@ export async function hydrateOverview(notebookId: string): Promise<void> {
       overviewStatus = record.status;
       overviewPath = record.path;
       generatedAt = record.generated_at;
+      transcript = record.script;
     }
   } catch (err) {
     console.error('hydrateOverview: failed for notebook', notebookId, err);
@@ -154,16 +161,17 @@ function applyPhaseEvent(data: TtsPhase): void {
  * Kicks off generation. Resolves once the run reaches a terminal state (ready,
  * failed, or — on cancel — re-hydrated back to the prior persisted state).
  */
-export async function generateOverview(notebookId: string, length: Length): Promise<void> {
+export async function generateOverview(notebookId: string, setup: OverviewSetup): Promise<void> {
   const gen = ++hydrateGeneration;
   overviewStatus = 'generating';
   phase = 'starting';
   turn = null;
   total = null;
   errorMessage = null;
+  transcript = null;
 
   try {
-    const path = await synthesizeOverview(notebookId, length, (e: StreamEvent<TtsPhase>) => {
+    const path = await synthesizeOverview(notebookId, setup, (e: StreamEvent<TtsPhase>) => {
       if (e.type === 'chunk') applyPhaseEvent(e.data);
     });
     if (gen !== hydrateGeneration) return;
@@ -171,6 +179,19 @@ export async function generateOverview(notebookId: string, length: Length): Prom
     overviewPath = path;
     generatedAt = new Date().toISOString();
     phase = 'idle';
+    // Pull the just-persisted script for the Transcript tab. A targeted read of the
+    // `script` field only — never overwrites the fresh `ready` status set above (which
+    // a full re-hydrate could flip to `stale` on a mid-run source edit).
+    try {
+      const record = await getAudioOverviewStatus(notebookId);
+      if (gen === hydrateGeneration) transcript = record?.script ?? null;
+    } catch (scriptErr) {
+      console.error(
+        'generateOverview: transcript fetch failed for notebook',
+        notebookId,
+        scriptErr
+      );
+    }
   } catch (err) {
     if (gen !== hydrateGeneration) return;
     phase = 'idle';

@@ -195,9 +195,9 @@ fn no_phase() -> impl Fn(lens_core::TtsPhase) + Send + Sync {
 }
 
 #[tokio::test]
-async fn migration_applies_and_table_exists_at_count_23() {
+async fn migration_applies_and_table_exists_at_count_24() {
     let engine = LensEngine::for_test().await;
-    assert_eq!(engine.migration_count().await.unwrap(), 23);
+    assert_eq!(engine.migration_count().await.unwrap(), 24);
     let pool = engine.pool().await;
     let exists: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='audio_overviews'",

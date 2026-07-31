@@ -7,6 +7,33 @@ import type { StreamEvent } from './types.js';
 /** Requested script length. Wire strings are snake_case (lowercase); mirrors lens-core `dialogue::Length`. */
 export type Length = 'short' | 'medium' | 'long';
 
+// SYNC-CHECK: wire strings mirror lens-core `dialogue::OverviewFormat` (serde snake_case).
+export type OverviewFormat = 'deep_dive' | 'brief' | 'critique' | 'debate';
+
+// SYNC-CHECK: mirrors lens-core `dialogue::Speaker` (serde snake_case).
+export type TranscriptSpeaker = 'host' | 'guest';
+
+/** One spoken line of the persisted dialogue script — powers the Transcript tab. */
+export interface TranscriptTurn {
+  speaker: TranscriptSpeaker;
+  text: string;
+}
+
+/** The persisted `DialogueScript` (extra per-turn fields like emotion/source_ids are ignored here). */
+export interface TranscriptScript {
+  turns: TranscriptTurn[];
+}
+
+/** Parameters the setup modal supplies to a generate run. */
+export interface OverviewSetup {
+  length: Length;
+  format: OverviewFormat;
+  /** Human-readable target language (e.g. "Spanish"); omit for the default. */
+  language?: string;
+  /** Free-text steer; omit or blank for none. */
+  focus?: string;
+}
+
 // SYNC-CHECK: mirrors lens-core AudioOverviewStatus (see that module for the status model).
 export type AudioOverviewStatus = 'ready' | 'failed' | 'stale' | 'missing';
 
@@ -16,6 +43,7 @@ export interface AudioOverviewRecord {
   generated_at: string;
   status: AudioOverviewStatus;
   source_set_hash: string;
+  script: TranscriptScript | null;
 }
 
 // SYNC-CHECK: must match lens-core/src/tts/mod.rs TtsPhase (externally tagged, snake_case).
@@ -30,13 +58,30 @@ export type TtsPhase = { synthesizing: { turn: number; total: number } } | 'stit
  */
 export async function synthesizeOverview(
   notebookId: string,
-  length: Length,
+  setup: OverviewSetup,
   onProgress: (e: StreamEvent<TtsPhase>) => void
 ): Promise<string> {
   if (!isTauri()) throw new Error('synthesizeOverview: not running under Tauri');
   const channel = new Channel<StreamEvent<TtsPhase>>();
   channel.onmessage = onProgress;
-  return invoke<string>('synthesize_overview', { notebookId, length, onProgress: channel });
+  const focus = setup.focus?.trim();
+  return invoke<string>('synthesize_overview', {
+    notebookId,
+    length: setup.length,
+    format: setup.format,
+    language: setup.language ?? null,
+    focus: focus ? focus : null,
+    onProgress: channel
+  });
+}
+
+/**
+ * One cheap LLM call over the selected source titles that proposes a short focus
+ * phrase for the Focus field. Returns an empty string outside Tauri.
+ */
+export async function suggestOverviewFocus(notebookId: string): Promise<string> {
+  if (!isTauri()) return '';
+  return invoke<string>('suggest_overview_focus', { notebookId });
 }
 
 /**

@@ -76,6 +76,7 @@ function record(overrides?: Partial<AudioOverviewRecord>): AudioOverviewRecord {
     generated_at: '2026-07-01T00:00:00Z',
     status: 'ready',
     source_set_hash: 'hash-1',
+    script: null,
     ...overrides
   };
 }
@@ -142,6 +143,15 @@ describe('hydrateOverview', () => {
 
     expect(audioOverviewStore.overviewStatus).toBe('none');
     expect(audioOverviewStore.overviewPath).toBeNull();
+  });
+
+  it('hydrates the transcript from the persisted record script', async () => {
+    const script = { turns: [{ speaker: 'host' as const, text: 'Hello.' }] };
+    vi.mocked(getAudioOverviewStatus).mockResolvedValue(record({ status: 'ready', script }));
+
+    await hydrateOverview('nb-001');
+
+    expect(audioOverviewStore.transcript).toEqual(script);
   });
 
   it('overrides to "generating" when a run is in flight, even with a persisted record', async () => {
@@ -222,7 +232,7 @@ describe('generateOverview', () => {
       () => new Promise((resolve) => (resolvePromise = resolve))
     );
 
-    const promise = generateOverview('nb-001', 'medium');
+    const promise = generateOverview('nb-001', { format: 'deep_dive', length: 'medium' });
     expect(audioOverviewStore.overviewStatus).toBe('generating');
     expect(audioOverviewStore.phase).toBe('starting');
 
@@ -232,12 +242,12 @@ describe('generateOverview', () => {
 
   it('maps TtsPhase chunk events to the phase/turn/total fields', async () => {
     let capturedOnProgress: Progress = () => {};
-    vi.mocked(synthesizeOverview).mockImplementation(async (_id, _len, onProgress) => {
+    vi.mocked(synthesizeOverview).mockImplementation(async (_id, _setup, onProgress) => {
       capturedOnProgress = onProgress as Progress;
       return new Promise(() => {}); // never resolves within this test
     });
 
-    void generateOverview('nb-001', 'short');
+    void generateOverview('nb-001', { format: 'brief', length: 'short' });
     await Promise.resolve();
 
     capturedOnProgress({ type: 'chunk', data: { synthesizing: { turn: 2, total: 6 } } });
@@ -256,7 +266,7 @@ describe('generateOverview', () => {
   it('on success, sets status ready with the resolved path and a fresh generatedAt', async () => {
     vi.mocked(synthesizeOverview).mockResolvedValue('/data/notebooks/nb-001/overview.wav');
 
-    await generateOverview('nb-001', 'long');
+    await generateOverview('nb-001', { format: 'debate', length: 'long' });
 
     expect(audioOverviewStore.overviewStatus).toBe('ready');
     expect(audioOverviewStore.overviewPath).toBe('/data/notebooks/nb-001/overview.wav');
@@ -264,11 +274,24 @@ describe('generateOverview', () => {
     expect(audioOverviewStore.phase).toBe('idle');
   });
 
+  it('on success, populates the transcript from a follow-up record fetch (status stays ready)', async () => {
+    const script = { turns: [{ speaker: 'guest' as const, text: 'Great question.' }] };
+    vi.mocked(synthesizeOverview).mockResolvedValue('/data/notebooks/nb-001/overview.wav');
+    // The post-success read carries the just-persisted script; a `stale` status here
+    // must NOT clobber the fresh `ready` set by the successful run.
+    vi.mocked(getAudioOverviewStatus).mockResolvedValue(record({ status: 'stale', script }));
+
+    await generateOverview('nb-001', { format: 'deep_dive', length: 'medium' });
+
+    expect(audioOverviewStore.overviewStatus).toBe('ready');
+    expect(audioOverviewStore.transcript).toEqual(script);
+  });
+
   it('on a genuine failure, sets status failed with the error message', async () => {
     vi.mocked(synthesizeOverview).mockRejectedValue({ kind: 'Tts', message: 'no backend' });
     const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
-    await generateOverview('nb-001', 'medium');
+    await generateOverview('nb-001', { format: 'deep_dive', length: 'medium' });
 
     expect(audioOverviewStore.overviewStatus).toBe('failed');
     expect(audioOverviewStore.errorMessage).toBe('no backend');
@@ -283,7 +306,7 @@ describe('generateOverview', () => {
     // The re-hydrate call after cancel finds the prior persisted ready row untouched.
     vi.mocked(getAudioOverviewStatus).mockResolvedValue(record({ status: 'ready' }));
 
-    await generateOverview('nb-001', 'medium');
+    await generateOverview('nb-001', { format: 'deep_dive', length: 'medium' });
 
     expect(audioOverviewStore.overviewStatus).toBe('ready');
     expect(audioOverviewStore.errorMessage).toBeNull();
@@ -293,7 +316,7 @@ describe('generateOverview', () => {
     vi.mocked(synthesizeOverview).mockRejectedValue({ kind: 'Cancelled', message: 'cancelled' });
     vi.mocked(getAudioOverviewStatus).mockResolvedValue(null);
 
-    await generateOverview('nb-001', 'medium');
+    await generateOverview('nb-001', { format: 'deep_dive', length: 'medium' });
 
     expect(audioOverviewStore.overviewStatus).toBe('none');
   });
