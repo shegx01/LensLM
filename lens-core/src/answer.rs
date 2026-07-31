@@ -190,6 +190,80 @@ fn sanitize_title(title: &str) -> String {
         .collect()
 }
 
+/// Strips leaked prompt fence markers (`<<SRC:nonce>>` / `<<END:nonce>>`) from the model's
+/// streamed answer before it reaches the UI. A weak local model sometimes echoes the whole
+/// fenced source block back; those markers — and the per-request nonce — are internal
+/// scaffolding that must NEVER be displayed. Holds back a bounded trailing run so a marker
+/// split across stream deltas is still caught.
+struct FenceRedactor {
+    markers: Vec<String>,
+    max_len: usize,
+    buf: String,
+}
+
+impl FenceRedactor {
+    fn new(nonce: &str) -> Self {
+        // Double-bracket form is what the prompt uses; single-bracket variants guard against
+        // a model that mangles one bracket while echoing.
+        let markers = vec![
+            format!("<<SRC:{nonce}>>"),
+            format!("<<END:{nonce}>>"),
+            format!("<SRC:{nonce}>"),
+            format!("<END:{nonce}>"),
+        ];
+        let max_len = markers.iter().map(String::len).max().unwrap_or(0);
+        Self {
+            markers,
+            max_len,
+            buf: String::new(),
+        }
+    }
+
+    /// Feed a stream delta; returns the text now safe to emit (complete markers removed,
+    /// a possible partial-marker tail held back for the next delta).
+    fn push(&mut self, delta: &str) -> String {
+        self.buf.push_str(delta);
+        self.strip_complete();
+        let split = self.safe_split();
+        let emit = self.buf[..split].to_string();
+        self.buf.replace_range(..split, "");
+        emit
+    }
+
+    /// Drain the held-back tail at end of stream (any complete marker still removed).
+    fn flush(&mut self) -> String {
+        self.strip_complete();
+        std::mem::take(&mut self.buf)
+    }
+
+    fn strip_complete(&mut self) {
+        let mut buf = std::mem::take(&mut self.buf);
+        for m in &self.markers {
+            while let Some(i) = buf.find(m.as_str()) {
+                buf.replace_range(i..i + m.len(), "");
+            }
+        }
+        self.buf = buf;
+    }
+
+    /// Byte offset up to which `buf` is safe to emit — everything except a trailing run that
+    /// is a proper prefix of some marker (and so could still complete on the next delta).
+    fn safe_split(&self) -> usize {
+        let maxk = self.max_len.saturating_sub(1).min(self.buf.len());
+        for k in (1..=maxk).rev() {
+            let start = self.buf.len() - k;
+            if !self.buf.is_char_boundary(start) {
+                continue;
+            }
+            let tail = &self.buf[start..];
+            if self.markers.iter().any(|m| m.starts_with(tail)) {
+                return start;
+            }
+        }
+        self.buf.len()
+    }
+}
+
 /// Batched `SELECT id, title` over the distinct `source_id`s in `units`, into a
 /// `HashMap`. Chunks the `IN (…)` list under the SQLite bind limit. Absent titles
 /// are simply missing (the prompt builder falls back to `source_id`).
@@ -558,6 +632,7 @@ pub fn answer_stream(
         };
 
         let mut answer_text = String::new();
+        let mut redactor = FenceRedactor::new(&nonce);
         let mut thinking_started = false;
         let mut answering_started = false;
         let mut tokens_used: u32 = 0;
@@ -580,7 +655,10 @@ pub fn answer_stream(
                         yield Ok(AnswerEvent::Stage(AnswerStage::Answering));
                     }
                     answer_text.push_str(&s);
-                    yield Ok(AnswerEvent::TextDelta(s));
+                    let safe = redactor.push(&s);
+                    if !safe.is_empty() {
+                        yield Ok(AnswerEvent::TextDelta(safe));
+                    }
                 }
                 Ok(StreamChunk::Done { tokens_used: t }) => {
                     tokens_used = t;
@@ -596,6 +674,12 @@ pub fn answer_stream(
 
         if cancel.is_cancelled() {
             return;
+        }
+
+        // Flush any held-back tail (e.g. text trailing after the last stripped marker).
+        let tail = redactor.flush();
+        if !tail.is_empty() {
+            yield Ok(AnswerEvent::TextDelta(tail));
         }
 
         // Extract citations over the accumulated answer text only (never thinking),
@@ -1148,6 +1232,51 @@ mod tests {
             cites.iter().all(|c| c.ordinal as usize <= units.len()),
             "every citation maps to a real source unit"
         );
+    }
+
+    #[test]
+    fn fence_redactor_passes_normal_text_through() {
+        let mut r = FenceRedactor::new("deadbeef0000");
+        let mut out = r.push("The sky is blue [2] because of ");
+        out.push_str(&r.push("Rayleigh scattering."));
+        out.push_str(&r.flush());
+        assert_eq!(out, "The sky is blue [2] because of Rayleigh scattering.");
+    }
+
+    #[test]
+    fn fence_redactor_removes_a_marker_split_across_deltas() {
+        let nonce = "abc123def456";
+        let src = format!("<<SRC:{nonce}>>");
+        let mid = src.len() / 2;
+        let mut r = FenceRedactor::new(nonce);
+        let mut out = r.push("Answer per [1]. ");
+        out.push_str(&r.push(&src[..mid]));
+        out.push_str(&r.push(&src[mid..]));
+        out.push_str(&r.push("the excerpt body"));
+        out.push_str(&r.flush());
+        assert_eq!(out, "Answer per [1]. the excerpt body");
+        assert!(!out.contains("SRC:"));
+    }
+
+    #[test]
+    fn fence_redactor_strips_a_fully_echoed_source_block() {
+        let nonce = "019fb83fba1d";
+        let src = format!("<<SRC:{nonce}>>");
+        let end = format!("<<END:{nonce}>>");
+        let mut r = FenceRedactor::new(nonce);
+        let mut out = r.push(&format!(
+            "[11] (Doc.pdf):\n{src}\nThe next chapters...\n{end}\n"
+        ));
+        out.push_str(&r.flush());
+        assert!(
+            !out.contains("SRC:") && !out.contains("END:"),
+            "no nonce/markers leak"
+        );
+        assert!(
+            out.contains("The next chapters..."),
+            "legit source text is kept"
+        );
+        assert!(out.contains("[11]"), "citation marker is kept");
     }
 
     #[test]
