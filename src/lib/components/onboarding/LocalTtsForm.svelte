@@ -125,11 +125,18 @@
   // the in-flight load persists on completion (see loadEngine). Reset per fresh load.
   let pendingActivate = false;
 
+  // Monotonic generation token: every fresh load (handleEngine) bumps it, and both
+  // load and download bail once their captured generation is stale. One cancellation
+  // contract for a superseded engine selection, shared by load + download.
+  let gen = 0;
+
   /** Probe `id`'s on-disk status and, when complete, populate the voice pickers.
+   *  `my` is this load's generation token (see `gen`).
    *  `prefillFromConfig` (initial engine only) seeds host/guest from saved config;
    *  a switch uses catalog defaults. `persist` pins an already-installed engine. */
   async function loadEngine(
     id: TtsEngineId,
+    my: number,
     opts: { persist: boolean; prefillFromConfig: boolean }
   ): Promise<void> {
     status = 'absent';
@@ -153,7 +160,7 @@
       return;
     }
     // A newer selection superseded this load while probing — don't clobber its state.
-    if (engine !== id) return;
+    if (my !== gen) return;
     status = probed;
     if (probed !== 'complete') return;
 
@@ -168,7 +175,7 @@
         // Non-fatal: fall back to catalog defaults below.
       }
     }
-    if (engine !== id) return;
+    if (my !== gen) return;
     seedVoicePickers(presetVoicesFor(id), savedHost, savedGuest);
 
     if ((opts.persist || pendingActivate) && !voicesUnavailable) {
@@ -178,8 +185,7 @@
   }
 
   // Only `engine` is tracked (untrack guards the rest) so a catalog refresh never
-  // re-triggers a load; `lastLoaded` dedupes and the `engine !== id` checks in
-  // loadEngine act as its cancellation token against superseded loads.
+  // re-triggers a load; `lastLoaded` dedupes repeat selections, `gen` (above) cancels.
   let lastLoaded: TtsEngineId | null = null;
   $effect(() => {
     const id = engine;
@@ -201,6 +207,7 @@
    *  `modelIds` (catalog-derived), which would wrongly aggregate to `complete` over
    *  an empty list if probed before the catalog resolved. */
   async function handleEngine(id: TtsEngineId): Promise<void> {
+    const my = ++gen;
     const isInitial = lastLoaded === null;
     lastLoaded = id;
     if (catalog.length === 0 && isTauri()) {
@@ -210,7 +217,7 @@
         catalog = [];
       }
     }
-    await loadEngine(id, { persist: !isInitial, prefillFromConfig: isInitial });
+    await loadEngine(id, my, { persist: !isInitial, prefillFromConfig: isInitial });
   }
 
   /** Apply one progress callback tick: `null` (unknown total) flips the
@@ -226,38 +233,40 @@
   }
 
   async function handleDownload(): Promise<void> {
-    // Pin the target so a mid-download engine switch can't make the completion
-    // path probe/persist/reveal-voices for the newly-selected engine instead.
+    // Pin the target engine + this download's generation so a mid-download engine
+    // switch (which bumps `gen` via handleEngine) can't make the completion path
+    // probe/persist/reveal-voices for the newly-selected engine instead.
     const dlId = engine;
+    const my = gen;
     downloadError = null;
     status = 'absent';
     downloadProgress = 0;
     downloadIndeterminate = false;
     // Pin the model list at the start: `modelIds` is a derived that recomputes to
     // the newly-selected engine on a mid-download switch (0-length for Qwen →
-    // division by zero), and the `engine === dlId` guard drops stale progress ticks.
+    // division by zero), and the `gen === my` guard drops stale progress ticks.
     const ids = [...modelIds];
     try {
       if (dlId === 'qwen3_local') {
         await prepareQwenModel((pct) => {
-          if (engine === dlId) applyProgress(pct, (p) => p);
+          if (gen === my) applyProgress(pct, (p) => p);
         });
       } else {
         for (const [i, model] of ids.entries()) {
           await downloadTtsModel(dlId, model, (pct) => {
-            if (engine === dlId)
+            if (gen === my)
               applyProgress(pct, (p) => Math.round(((i + p / 100) / ids.length) * 100));
           });
         }
       }
-      if (engine !== dlId) return;
+      if (gen !== my) return;
       downloadIndeterminate = false;
       downloadProgress = 100;
       // Re-run the on-disk presence check before flipping to "ready": a download
       // that reported done can still be truncated/partial. If it isn't actually
       // complete, surface the re-download affordance instead of a false-ready.
       const rechecked = await engineStatus(dlId);
-      if (engine !== dlId) return;
+      if (gen !== my) return;
       if (rechecked !== 'complete') {
         status = 'partial';
         downloadProgress = null;
@@ -268,7 +277,7 @@
       seedVoicePickers(presetVoicesFor(dlId));
       if (!voicesUnavailable) void persistLocalTts();
     } catch (err) {
-      if (engine !== dlId) return;
+      if (gen !== my) return;
       downloadIndeterminate = false;
       downloadProgress = null;
       // A deliberate cancel (unmount during a Qwen download) isn't a failure —
