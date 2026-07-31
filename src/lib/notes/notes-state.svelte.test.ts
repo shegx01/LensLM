@@ -265,8 +265,8 @@ describe('remove', () => {
 
 describe('groupedBySource', () => {
   it('groups notes by the ordinal-1 citation source_id, newest-first preserved', async () => {
-    const citationsA: Citation[] = [{ source_id: 'src-a', ordinal: 1, locators: [] }];
-    const citationsB: Citation[] = [{ source_id: 'src-b', ordinal: 1, locators: [] }];
+    const citationsA: Citation[] = [{ source_id: 'src-a', ordinal: 1, markers: [1], locators: [] }];
+    const citationsB: Citation[] = [{ source_id: 'src-b', ordinal: 1, markers: [1], locators: [] }];
     const newest = makeNote({
       id: 'n3',
       content: 'newest',
@@ -322,7 +322,7 @@ describe('editNote', () => {
       content: 'old',
       source_title: 'Src A',
       source_message_id: 'msg-001',
-      citations: JSON.stringify([{ source_id: 'src-a', ordinal: 1, locators: [] }])
+      citations: JSON.stringify([{ source_id: 'src-a', ordinal: 1, markers: [1], locators: [] }])
     });
     vi.mocked(listNotes).mockResolvedValue([original]);
     await hydrate(NB);
@@ -445,7 +445,9 @@ describe('setPinned', () => {
       pinned: true,
       created_at: '2026-07-12T00:00:00Z'
     });
-    const citations = JSON.stringify([{ source_id: 'src-a', ordinal: 1, locators: [] }]);
+    const citations = JSON.stringify([
+      { source_id: 'src-a', ordinal: 1, markers: [1], locators: [] }
+    ]);
     const chatOld = makeNote({
       id: 'c1',
       origin: 'chat',

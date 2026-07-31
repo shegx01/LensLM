@@ -64,6 +64,10 @@ pub struct Citation {
     pub source_id: String,
     /// 1-based first-appearance rank among surviving citations.
     pub ordinal: u32,
+    /// The ORIGINAL `[n]` marker numbers (unit positions) in the answer that resolved to
+    /// this source, sorted+distinct. The UI links each inline `[n]` chip by these — the
+    /// model writes `[n]` by unit position, not by `ordinal`, so linking must key on these.
+    pub markers: Vec<u32>,
     pub locators: Vec<Locator>,
 }
 
@@ -146,8 +150,8 @@ fn in_range(n: usize, len: usize) -> bool {
 /// source collapse to one [`Citation`] with locators deduped by `chunk_id`.
 pub fn extract_citations(answer: &str, units: &[ContextUnit]) -> Vec<Citation> {
     // Insertion-ordered grouping by source_id (no indexmap dep): parallel vec of
-    // (source_id, locators) with a linear membership scan — group counts are small.
-    let mut groups: Vec<(String, Vec<Locator>)> = Vec::new();
+    // (source_id, locators, markers) with a linear membership scan — group counts are small.
+    let mut groups: Vec<(String, Vec<Locator>, Vec<u32>)> = Vec::new();
 
     for (_pos, n) in parse_markers(answer) {
         if !in_range(n, units.len()) {
@@ -159,6 +163,7 @@ pub fn extract_citations(answer: &str, units: &[ContextUnit]) -> Vec<Citation> {
             continue;
         }
         let unit = &units[n - 1];
+        let marker = n as u32;
         let locator = Locator {
             chunk_id: unit.chunk_id.clone(),
             anchor: unit.locator.clone(),
@@ -167,13 +172,16 @@ pub fn extract_citations(answer: &str, units: &[ContextUnit]) -> Vec<Citation> {
             char_start: None,
             char_end: None,
         };
-        match groups.iter_mut().find(|(sid, _)| *sid == unit.source_id) {
-            Some((_, locators)) => {
+        match groups.iter_mut().find(|(sid, _, _)| *sid == unit.source_id) {
+            Some((_, locators, markers)) => {
                 if !locators.iter().any(|l| l.chunk_id == locator.chunk_id) {
                     locators.push(locator);
                 }
+                if !markers.contains(&marker) {
+                    markers.push(marker);
+                }
             }
-            None => groups.push((unit.source_id.clone(), vec![locator])),
+            None => groups.push((unit.source_id.clone(), vec![locator], vec![marker])),
         }
     }
 
@@ -181,10 +189,14 @@ pub fn extract_citations(answer: &str, units: &[ContextUnit]) -> Vec<Citation> {
     groups
         .into_iter()
         .enumerate()
-        .map(|(idx, (source_id, locators))| Citation {
-            source_id,
-            ordinal: (idx + 1) as u32,
-            locators,
+        .map(|(idx, (source_id, locators, mut markers))| {
+            markers.sort_unstable();
+            Citation {
+                source_id,
+                ordinal: (idx + 1) as u32,
+                markers,
+                locators,
+            }
         })
         .collect()
 }

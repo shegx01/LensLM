@@ -21,6 +21,8 @@ export interface Citation {
   source_id: string;
   /** 1-based first-appearance rank among surviving citations. */
   ordinal: number;
+  /** Original `[n]` marker numbers pointing to this source — inline chips link by these. */
+  markers: number[];
   locators: Locator[];
 }
 

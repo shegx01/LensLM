@@ -1284,6 +1284,7 @@ mod tests {
         let cites = vec![Citation {
             source_id: "sA".into(),
             ordinal: 1,
+            markers: vec![1],
             locators: vec![
                 crate::citation::Locator {
                     chunk_id: "c1".into(),

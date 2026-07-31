@@ -94,7 +94,7 @@ describe('hydrate / grouping', () => {
   });
 
   it('parses citations JSON on the assistant row', async () => {
-    const citations: Citation[] = [{ source_id: 'src-1', ordinal: 1, locators: [] }];
+    const citations: Citation[] = [{ source_id: 'src-1', ordinal: 1, markers: [1], locators: [] }];
     const assistant = makeChatMessage({
       id: 'a1',
       role: 'assistant',
@@ -110,7 +110,7 @@ describe('send / persist-exactly-once fixture', () => {
     const savedAssistant = makeChatMessage({ id: 'a1', role: 'assistant', content: 'ab' });
     vi.mocked(saveChatAssistant).mockResolvedValue(savedAssistant);
 
-    const citations: Citation[] = [{ source_id: 'src-1', ordinal: 1, locators: [] }];
+    const citations: Citation[] = [{ source_id: 'src-1', ordinal: 1, markers: [1], locators: [] }];
 
     vi.mocked(askNotebook).mockImplementation(
       async (_nb: string, _turnId: string, _q: string, handlers: AskNotebookHandlers) => {
@@ -141,8 +141,8 @@ describe('send / persist-exactly-once fixture', () => {
   it('freshly-answered parity: the pushed version round-trips citations without a reload (S6.5)', async () => {
     vi.mocked(saveChatUser).mockResolvedValue(makeChatMessage({ id: 'u1', turn_id: 'ignored' }));
     const citations: Citation[] = [
-      { source_id: 'src-1', ordinal: 1, locators: [] },
-      { source_id: 'src-2', ordinal: 2, locators: [] }
+      { source_id: 'src-1', ordinal: 1, markers: [1], locators: [] },
+      { source_id: 'src-2', ordinal: 2, markers: [2], locators: [] }
     ];
     // Mirror insert_assistant (chat.rs:282): the saved row carries citations as a JSON string.
     vi.mocked(saveChatAssistant).mockResolvedValue(
