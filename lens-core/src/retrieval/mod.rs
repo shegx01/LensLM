@@ -13,6 +13,7 @@ pub mod bm25;
 pub mod rerank;
 pub mod router;
 pub mod rrf;
+pub mod structural;
 
 use std::collections::HashMap;
 

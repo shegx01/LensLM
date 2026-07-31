@@ -38,6 +38,7 @@ pub mod relocate;
 pub mod render;
 pub mod resolution;
 pub mod retrieval;
+pub(crate) mod section;
 pub mod storage;
 pub mod system_check;
 pub mod transcription;

@@ -53,6 +53,9 @@ const GRAPH_MIN_CONFIDENCE: f32 = 0.1;
 /// Which tier the router selected for a query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
+    /// A positional query ("chapter 2") resolved to a document section (#279); that
+    /// section's chunks are injected in document order, bypassing similarity search.
+    Tier0,
     /// Raw selected corpus fits the budget — inject it directly.
     Tier1,
     /// Corpus overflows — fused retrieval with parent auto-merge.
@@ -339,6 +342,129 @@ async fn assemble_tier1(
         });
     }
     Ok(units)
+}
+
+/// Tier-0 structural resolver (#279). Returns section-scoped parent chunks in document
+/// order when `target` resolves to a real section in the selected corpus, or `None` to
+/// fall through to normal retrieval — the low-confidence gate: an ordinal/name matching
+/// no section must NOT scope to a wrong one. Ordinal kinds map onto the shallowest
+/// heading level a document uses (sub-section precision is a non-goal); a section's
+/// chunks are those whose `char_start` falls in its `[char_start, char_end)` span.
+async fn resolve_structural(
+    pool: &SqlitePool,
+    source_ids: &[String],
+    source_rank: &HashMap<String, usize>,
+    target: &super::structural::StructuralTarget,
+    cap: usize,
+) -> Result<Option<Vec<ContextUnit>>, LensError> {
+    use super::structural::StructuralTarget;
+
+    let mut spans: Vec<(String, i64, i64)> = Vec::new();
+    for source_id in source_ids {
+        match target {
+            StructuralTarget::Ordinal { ordinal, .. } => {
+                let row = sqlx::query_as::<_, (i64, i64)>(
+                    "SELECT char_start, char_end FROM sections \
+                     WHERE source_id = ?1 AND ordinal = ?2 \
+                       AND level = (SELECT MIN(level) FROM sections WHERE source_id = ?1) \
+                     LIMIT 1",
+                )
+                .bind(source_id)
+                .bind(*ordinal as i64)
+                .fetch_optional(pool)
+                .await?;
+                if let Some((cs, ce)) = row {
+                    spans.push((source_id.clone(), cs, ce));
+                }
+            }
+            StructuralTarget::Named(named) => {
+                let cands = sqlx::query_as::<_, (String, i64, i64)>(
+                    "SELECT title, char_start, char_end FROM sections \
+                     WHERE source_id = ? ORDER BY level ASC, char_start ASC",
+                )
+                .bind(source_id)
+                .fetch_all(pool)
+                .await?;
+                if let Some((_, cs, ce)) = cands.into_iter().find(|(title, _, _)| {
+                    let t = title.to_lowercase();
+                    named.title_keywords().iter().any(|kw| t.contains(kw))
+                }) {
+                    spans.push((source_id.clone(), cs, ce));
+                }
+            }
+        }
+    }
+
+    if spans.is_empty() {
+        return Ok(None);
+    }
+
+    struct SpanRow {
+        rank: usize,
+        char_start: i64,
+        chunk_id: String,
+        source_id: String,
+        text: String,
+        locator: Option<String>,
+    }
+    let mut rows: Vec<SpanRow> = Vec::new();
+    for (source_id, cs, ce) in &spans {
+        let recs = sqlx::query_as::<_, (String, String, Option<String>, String, i64)>(&format!(
+            "SELECT c.id, c.text, c.source_anchor, c.section_path, c.char_start \
+             FROM chunks c JOIN sources s ON s.id = c.source_id \
+             WHERE c.source_id = ? AND c.kind = ? AND c.char_start >= ? AND c.char_start < ? \
+               AND {RETRIEVAL_LIVE_WHERE} \
+             ORDER BY c.char_start ASC"
+        ))
+        .bind(source_id)
+        .bind(kind::PARENT)
+        .bind(cs)
+        .bind(ce)
+        .fetch_all(pool)
+        .await?;
+        let rank = *source_rank.get(source_id).unwrap_or(&usize::MAX);
+        for (chunk_id, text, anchor, section_path, char_start) in recs {
+            rows.push(SpanRow {
+                rank,
+                char_start,
+                chunk_id,
+                source_id: source_id.clone(),
+                text,
+                locator: anchor.or(Some(section_path)),
+            });
+        }
+    }
+
+    // A matched section with no parent chunks (degenerate) falls back rather than
+    // grounding on nothing.
+    if rows.is_empty() {
+        return Ok(None);
+    }
+
+    rows.sort_by(|a, b| a.rank.cmp(&b.rank).then(a.char_start.cmp(&b.char_start)));
+
+    let mut units = Vec::with_capacity(rows.len());
+    let mut running = 0usize;
+    for (order_index, r) in rows.into_iter().enumerate() {
+        let cost = estimate_tokens(&r.text);
+        if running + cost > cap && !units.is_empty() {
+            break;
+        }
+        running += cost;
+        units.push(ContextUnit {
+            text: r.text,
+            source_id: r.source_id,
+            chunk_id: r.chunk_id,
+            parent_id: None,
+            locator: r.locator,
+            order_index,
+            provenance: Provenance {
+                source: HitSource::Dense,
+                graph_confidence: None,
+            },
+        });
+    }
+    Ok(Some(units))
 }
 
 /// A retrieved child chunk with its parent linkage, provenance, fused score, and
@@ -1021,6 +1147,23 @@ pub async fn tiered_search(
         .enumerate()
         .map(|(i, id)| (id.clone(), i))
         .collect();
+
+    // Tier-0 (#279): a positional query resolved against the `sections` outline scopes
+    // retrieval to that section. `query_text` is the caller's (condensed) retrieval
+    // query, so anaphoric follow-ups detect correctly. An unresolved/ambiguous target
+    // returns None and falls through, leaving non-structural queries byte-identical.
+    if let Some(target) = super::structural::detect_structural_target(query_text) {
+        if let Some(units) =
+            resolve_structural(pool_db, &source_ids, &source_rank, &target, caps.tier2_cap).await?
+        {
+            let total_tokens = units.iter().map(|u| estimate_tokens(&u.text)).sum();
+            return Ok(RouterOutput {
+                tier: Tier::Tier0,
+                units,
+                total_tokens,
+            });
+        }
+    }
 
     // Tier selection: Σ cached token_count vs the derived tier-1 cap. A single
     // oversized source (its own count > cap) forces Tier-2.

@@ -55,26 +55,78 @@ async fn insert_chunk(
     token_start: i64,
     text: &str,
 ) {
+    insert_chunk_at(
+        pool, source_id, chunk_id, parent_id, kind, level, token_start, 0, "Intro", text,
+    )
+    .await;
+}
+
+/// Like [`insert_chunk`] but with an explicit `char_start` and `section_path` so
+/// tests can place chunks inside distinct `sections` spans (#279 Tier-0).
+#[allow(clippy::too_many_arguments)]
+async fn insert_chunk_at(
+    pool: &SqlitePool,
+    source_id: &str,
+    chunk_id: &str,
+    parent_id: Option<&str>,
+    kind: &str,
+    level: i32,
+    token_start: i64,
+    char_start: i64,
+    section_path: &str,
+    text: &str,
+) {
     sqlx::query(
         "INSERT INTO chunks \
          (id, source_id, parent_id, kind, level, section_path, text, \
           token_start, token_end, char_start, char_end, block_type, source_anchor, created_at) \
-         VALUES (?, ?, ?, ?, ?, 'Intro', ?, ?, ?, 0, ?, 'paragraph', ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'paragraph', ?, ?)",
     )
     .bind(chunk_id)
     .bind(source_id)
     .bind(parent_id)
     .bind(kind)
     .bind(level)
+    .bind(section_path)
     .bind(text)
     .bind(token_start)
     .bind(token_start + 1)
-    .bind(text.len() as i64)
+    .bind(char_start)
+    .bind(char_start + text.len() as i64)
     .bind(format!("anchor-{chunk_id}"))
     .bind(chrono::Utc::now().to_rfc3339())
     .execute(pool)
     .await
     .expect("insert chunk");
+}
+
+/// Seeds one `sections` row (#279 Tier-0 outline).
+#[allow(clippy::too_many_arguments)]
+async fn insert_section(
+    pool: &SqlitePool,
+    source_id: &str,
+    level: i32,
+    ordinal: i64,
+    title: &str,
+    char_start: i64,
+    char_end: i64,
+) {
+    sqlx::query(
+        "INSERT INTO sections \
+         (id, source_id, level, ordinal, title, char_start, char_end, page, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)",
+    )
+    .bind(format!("sec-{source_id}-{level}-{ordinal}"))
+    .bind(source_id)
+    .bind(level)
+    .bind(ordinal)
+    .bind(title)
+    .bind(char_start)
+    .bind(char_end)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(pool)
+    .await
+    .expect("insert section");
 }
 
 fn store_and_coord(
@@ -1108,4 +1160,105 @@ async fn dense_prefilter_batches_beyond_512_sources_preserves_recall() {
         ids.contains(&"c0519"),
         "nearest vector in the overflow batch must be retrieved, got {ids:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #279 — Tier-0 structural resolver
+// ---------------------------------------------------------------------------
+
+async fn tier0_search(
+    pool: &SqlitePool,
+    store: &LanceVectorStore,
+    coord: &Coordinate,
+    reranker: &Reranker,
+    query: &str,
+) -> lens_core::retrieval::router::RouterOutput {
+    tiered_search(
+        pool,
+        store,
+        reranker,
+        None,
+        coord,
+        query,
+        &axis_vec(0),
+        &model_ctx(10_000),
+        10,
+        &RetrievalConfig::default(),
+        None,
+        &TierThresholds::default(),
+        None,
+        0,
+    )
+    .await
+    .expect("tiered_search")
+}
+
+/// A positional query scopes retrieval to exactly its section's chunks.
+#[tokio::test]
+async fn tier0_scopes_a_positional_query_to_its_section() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = LensEngine::init(dir.path()).await.unwrap();
+    let pool = engine.pool().await;
+    let nb = engine.create_notebook("nb", None, None).await.unwrap().id;
+    insert_source(&pool, &nb, "s1", 100).await;
+    insert_chunk_at(&pool, "s1", "p1", None, "parent", 0, 0, 0, "Chapter 1", "chapter one body").await;
+    insert_chunk_at(&pool, "s1", "p2", None, "parent", 0, 1, 100, "Chapter 2", "chapter two body").await;
+    insert_chunk_at(&pool, "s1", "p3", None, "parent", 0, 2, 200, "Chapter 3", "chapter three body").await;
+    insert_section(&pool, "s1", 1, 1, "Chapter 1", 0, 100).await;
+    insert_section(&pool, "s1", 1, 2, "Chapter 2", 100, 200).await;
+    insert_section(&pool, "s1", 1, 3, "Chapter 3", 200, 300).await;
+
+    let (store, coord) = store_and_coord(&engine, dir.path(), pool.clone(), &nb);
+    let reranker = Reranker::new(dir.path());
+    let out = tier0_search(&pool, &store, &coord, &reranker, "what is the summary of chapter 2?").await;
+
+    assert_eq!(out.tier, Tier::Tier0);
+    assert_eq!(out.units.len(), 1, "only chapter 2's chunk is in scope, got {:?}", out.units);
+    assert_eq!(out.units[0].chunk_id, "p2");
+    assert!(out.units[0].text.contains("two"));
+}
+
+/// An unresolvable structural target ("chapter 9") must fall through to normal
+/// retrieval — output byte-identical to a non-structural baseline, not a mis-scope.
+#[tokio::test]
+async fn tier0_unresolved_target_falls_back_identically_to_baseline() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = LensEngine::init(dir.path()).await.unwrap();
+    let pool = engine.pool().await;
+    let nb = engine.create_notebook("nb", None, None).await.unwrap().id;
+    insert_source(&pool, &nb, "s1", 100).await;
+    insert_chunk_at(&pool, "s1", "p1", None, "parent", 0, 0, 0, "Chapter 1", "chapter one body").await;
+    insert_chunk_at(&pool, "s1", "p2", None, "parent", 0, 1, 100, "Chapter 2", "chapter two body").await;
+    insert_section(&pool, "s1", 1, 1, "Chapter 1", 0, 100).await;
+    insert_section(&pool, "s1", 1, 2, "Chapter 2", 100, 200).await;
+
+    let (store, coord) = store_and_coord(&engine, dir.path(), pool.clone(), &nb);
+    let reranker = Reranker::new(dir.path());
+    let unresolved = tier0_search(&pool, &store, &coord, &reranker, "summarize chapter 9").await;
+    let baseline = tier0_search(&pool, &store, &coord, &reranker, "tell me everything").await;
+
+    assert_ne!(unresolved.tier, Tier::Tier0, "unresolved target must not scope");
+    assert_eq!(unresolved, baseline, "fallback is identical to the non-structural baseline");
+}
+
+/// A named section ("the introduction") resolves by title, not ordinal.
+#[tokio::test]
+async fn tier0_resolves_a_named_section_by_title() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = LensEngine::init(dir.path()).await.unwrap();
+    let pool = engine.pool().await;
+    let nb = engine.create_notebook("nb", None, None).await.unwrap().id;
+    insert_source(&pool, &nb, "s1", 100).await;
+    insert_chunk_at(&pool, "s1", "p1", None, "parent", 0, 0, 0, "Introduction", "the intro body").await;
+    insert_chunk_at(&pool, "s1", "p2", None, "parent", 0, 1, 100, "Chapter 1", "chapter one body").await;
+    insert_section(&pool, "s1", 1, 1, "Introduction", 0, 100).await;
+    insert_section(&pool, "s1", 1, 2, "Chapter 1", 100, 200).await;
+
+    let (store, coord) = store_and_coord(&engine, dir.path(), pool.clone(), &nb);
+    let reranker = Reranker::new(dir.path());
+    let out = tier0_search(&pool, &store, &coord, &reranker, "summarize the introduction").await;
+
+    assert_eq!(out.tier, Tier::Tier0);
+    assert_eq!(out.units.len(), 1);
+    assert_eq!(out.units[0].chunk_id, "p1");
 }
