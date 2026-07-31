@@ -357,6 +357,103 @@ describe('LocalTtsForm — cancel on unmount (engine-guarded)', () => {
   });
 });
 
+describe('LocalTtsForm — superseded load cancellation (#246)', () => {
+  it('drops a stale same-engine load superseded across an A→B→A switch', async () => {
+    // A→B→A returns to Orpheus, so the old prop guard (`engine !== id`, A === A)
+    // would NOT bail the stale mount load — only the generation token does. The
+    // stale probe resolves to a DIFFERENT status so a clobber is observable.
+    const firstOrpheusProbe: { resolve?: (s: TtsModelStatus) => void } = {};
+    let orpheusProbeCalls = 0;
+    const cat = catalogFixture({ qwenAvailable: true });
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return baseAppConfig();
+      if (cmd === 'tts_engine_catalog') return cat;
+      if (cmd === 'tts_model_status') {
+        const a = args as { engine: string };
+        if (a.engine === 'qwen3_local') return 'complete';
+        orpheusProbeCalls += 1;
+        if (orpheusProbeCalls === 1) {
+          return new Promise<TtsModelStatus>((res) => {
+            firstOrpheusProbe.resolve = res;
+          });
+        }
+        return 'complete';
+      }
+      if (cmd === 'set_config') return null;
+    });
+
+    const { rerender } = render(LocalTtsForm, {
+      props: { catalog: cat, engine: 'orpheus', active: true }
+    });
+    // Mount load is stuck on its (hung) first probe.
+    await waitFor(() => expect(firstOrpheusProbe.resolve).toBeDefined());
+
+    // Detour through Qwen (bumps the generation) then back to Orpheus, which loads
+    // cleanly and reveals its voices.
+    await rerender({ catalog: cat, engine: 'qwen3_local', active: true });
+    await waitFor(() => expect(screen.getByLabelText(/^host voice/i)).toBeInTheDocument());
+    await rerender({ catalog: cat, engine: 'orpheus', active: true });
+    await waitFor(() => expect(screen.getByLabelText(/^host voice/i)).toBeInTheDocument());
+
+    firstOrpheusProbe.resolve?.('absent');
+    await new Promise((r) => setTimeout(r, 0));
+    expect(screen.getByLabelText(/^host voice/i)).toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: /download voice engine/i })
+    ).not.toBeInTheDocument();
+  });
+
+  it('drops a superseded download when the engine switches mid-download', async () => {
+    // The download path shares the load path's generation token; a stale download
+    // completing must not persist or reveal voices over the newly-selected engine.
+    const orpheusDl: { channel?: ProgressChannel; finish?: () => void } = {};
+    let persistCount = 0;
+    const cat = catalogFixture({ qwenAvailable: true });
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return baseAppConfig();
+      if (cmd === 'tts_engine_catalog') return cat;
+      if (cmd === 'tts_model_status') {
+        const a = args as { engine: string };
+        return a.engine === 'qwen3_local' ? 'complete' : 'absent';
+      }
+      if (cmd === 'download_tts_model') {
+        orpheusDl.channel = (args as { onProgress: ProgressChannel }).onProgress;
+        return new Promise<null>((res) => {
+          orpheusDl.finish = () => res(null);
+        });
+      }
+      if (cmd === 'set_config') {
+        persistCount += 1;
+        return null;
+      }
+    });
+
+    const { rerender } = render(LocalTtsForm, {
+      props: { catalog: cat, engine: 'orpheus', active: true }
+    });
+    await fireEvent.click(await screen.findByRole('button', { name: /download voice engine/i }));
+    await waitFor(() => expect(orpheusDl.channel).toBeDefined());
+    orpheusDl.channel?.onmessage({ received: 20, total: 100, done: false });
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: /downloading/i })).toBeInTheDocument()
+    );
+
+    // Switch to Qwen mid-download → bumps the generation; the download is now stale.
+    await rerender({ catalog: cat, engine: 'qwen3_local', active: true });
+    await waitFor(() => expect(screen.getByLabelText(/^host voice/i)).toBeInTheDocument());
+    const persistAfterSwitch = persistCount;
+
+    // A late tick + completion from the superseded download must be ignored: no
+    // persist, and the Qwen voices card is not clobbered to a (re-)download prompt.
+    orpheusDl.channel?.onmessage({ received: 90, total: 100, done: false });
+    orpheusDl.finish?.();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(screen.getByLabelText(/^host voice/i)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /download/i })).not.toBeInTheDocument();
+    expect(persistCount).toBe(persistAfterSwitch);
+  });
+});
+
 describe('LocalTtsForm — cancellation is not surfaced as a download failure', () => {
   it('a Cancelled error from prepare_qwen_model resets to idle without an error alert', async () => {
     mockIPC((cmd) => {

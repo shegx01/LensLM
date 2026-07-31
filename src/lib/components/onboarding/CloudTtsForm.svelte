@@ -228,12 +228,29 @@
     }
   }
 
+  /** Reject non-http(s) or malformed base URLs before saving — the base URL is the
+   *  endpoint the API key is transmitted to. */
+  function isValidBaseUrl(raw: string): boolean {
+    let parsed: URL;
+    try {
+      parsed = new URL(raw);
+    } catch {
+      return false;
+    }
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+  }
+
   /** Reactive Cloud persist (mirrors persistLocalTts); no Save button. */
   async function persistCloud(): Promise<void> {
     cloudError = null;
+    const baseUrl = cloudBaseUrl.trim();
     // Don't activate an unusable cloud backend: require a base URL and either a
     // saved key or a freshly-typed one (this is the guard the old Save gate gave).
-    if (!cloudBaseUrl.trim() || (!hasSavedKey && !cloudApiKey.trim())) return;
+    if (!baseUrl || (!hasSavedKey && !cloudApiKey.trim())) return;
+    if (!isValidBaseUrl(baseUrl)) {
+      cloudError = 'Enter a valid base URL starting with http:// or https://.';
+      return;
+    }
     try {
       // Only a freshly-typed key replaces the stored one; otherwise resend the
       // saved key — a blank field can never overwrite a real key.
@@ -246,7 +263,7 @@
       await saveTtsProvider({
         provider: 'cloud',
         apiKey,
-        baseUrl: cloudBaseUrl,
+        baseUrl,
         hostVoice: cloudHostVoice,
         guestVoice: cloudGuestVoice,
         cloudKind: kind
