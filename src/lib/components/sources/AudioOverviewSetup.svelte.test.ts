@@ -122,7 +122,7 @@ describe('AudioOverviewSetup — focus', () => {
   it('passes a trimmed focus string through to the generate setup', async () => {
     const onGenerate = open();
 
-    await fireEvent.input(screen.getByPlaceholderText(/executive-level/i), {
+    await fireEvent.input(screen.getByPlaceholderText(/hosts should focus/i), {
       target: { value: '  lead with the numbers  ' }
     });
     await fireEvent.click(screen.getByRole('button', { name: 'Generate' }));

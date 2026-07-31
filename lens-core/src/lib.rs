@@ -1927,9 +1927,10 @@ impl LensEngine {
         crate::dialogue::generate_dialogue(ctx, cancel, on_phase).await
     }
 
-    /// Proposes ONE short focus phrase for an audio overview from the notebook's selected
-    /// source titles (one cheap LLM call). Advisory — the user edits it before generating.
-    /// Titles are ingested metadata (untrusted), so they are fenced with the shared guard.
+    /// Proposes focus topics for an audio overview from the notebook's selected sources
+    /// (one cheap LLM call over a bounded sample of their actual content). Returns a short
+    /// Markdown bullet list of specific, source-grounded topics the hosts could cover — the
+    /// user edits it before generating. Content is untrusted, so it is fenced.
     pub async fn suggest_overview_focus(&self, notebook_id: &str) -> Result<String, LensError> {
         let provider = self
             .chat_provider()
@@ -1943,31 +1944,77 @@ impl LensEngine {
         }
         let pool = self.pool().await;
         let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
-        let titles: Vec<String> = crate::citation::source_titles(&pool, &id_refs)
-            .await?
-            .into_values()
-            .collect();
+        let titles = crate::citation::source_titles(&pool, &id_refs).await?;
+        let excerpts = self
+            .sample_source_excerpts(&pool, &id_refs, &titles)
+            .await?;
         let nonce = crate::prompt::fence_nonce();
         let system = format!(
-            "You suggest ONE specific focus angle for a short audio overview of a document \
-             set. Output ONLY the focus phrase (a few words) — no preamble, no quotes.\n\n{}",
-            crate::prompt::injection_guard(&nonce, "The document titles", "propose a focus")
+            "You are planning a short, two-host audio overview of a set of documents. From the \
+             excerpts, propose four to six specific topics or angles the hosts should cover. \
+             Each must be grounded in what the material actually discusses — name the concrete \
+             thing (a decision, number, event, tension, claim), not a generic label like \
+             \"key points\" or \"background\".\n\n\
+             Return ONLY a Markdown bullet list: one topic per line, each line starting with \
+             \"- \" followed by a short specific phrase (no headings, no numbering, no \
+             sub-bullets, no preamble, no closing remarks).\n\n{}",
+            crate::prompt::injection_guard(&nonce, "The document excerpts", "propose focus topics")
         );
         let req = crate::llm::LlmRequest {
             system: Some(system),
             prompt: format!(
-                "Document titles:\n{}\nSuggested focus:",
-                crate::prompt::fence_excerpt(&nonce, &titles.join("\n"))
+                "Document excerpts:\n{}\nTopics:",
+                crate::prompt::fence_excerpt(&nonce, &excerpts)
             ),
-            max_tokens: 32,
-            temperature: 0.5,
+            max_tokens: 256,
+            temperature: 0.6,
             json: false,
             thinking: false,
             reasoning_effort: None,
             messages: Vec::new(),
         };
         let resp = provider.generate(&req).await?;
-        Ok(resp.text.trim().trim_matches('"').trim().to_string())
+        Ok(clean_focus_topics(&resp.text))
+    }
+
+    /// A bounded, leading sample of the selected sources' content for topic suggestion:
+    /// each source's first parent chunk(s), title-labelled, capped so the whole prompt
+    /// stays cheap. Parents are preferred over child chunks; falls back to any chunk.
+    async fn sample_source_excerpts(
+        &self,
+        pool: &sqlx::SqlitePool,
+        id_refs: &[&str],
+        titles: &std::collections::HashMap<String, String>,
+    ) -> Result<String, LensError> {
+        const PER_SOURCE_CHARS: usize = 1200;
+        const TOTAL_CHARS: usize = 7000;
+        let mut out = String::new();
+        let mut budget = TOTAL_CHARS;
+        for id in id_refs {
+            if budget == 0 {
+                break;
+            }
+            let rows = sqlx::query_scalar::<_, String>(
+                "SELECT text FROM chunks WHERE source_id = ? \
+                 ORDER BY (kind = 'parent') DESC, char_start ASC LIMIT 2",
+            )
+            .bind(id)
+            .fetch_all(pool)
+            .await?;
+            let title = titles.get(*id).map(String::as_str).unwrap_or(*id);
+            let mut taken = 0usize;
+            for text in rows {
+                if budget == 0 || taken >= PER_SOURCE_CHARS {
+                    break;
+                }
+                let cap = budget.min(PER_SOURCE_CHARS - taken);
+                let snippet: String = text.chars().take(cap).collect();
+                taken += snippet.chars().count();
+                budget = budget.saturating_sub(snippet.chars().count());
+                out.push_str(&format!("## {title}\n{snippet}\n\n"));
+            }
+        }
+        Ok(out.trim().to_string())
     }
 
     /// The selected + live (not-trashed) source ids for a notebook, over the shared
@@ -3155,6 +3202,84 @@ fn audio_file_is_nonempty(path: &str) -> bool {
     std::fs::metadata(path)
         .map(|m| m.is_file() && m.len() > 0)
         .unwrap_or(false)
+}
+
+/// Normalizes a suggested topic list into clean Markdown bullets: keeps only the
+/// list-item lines (dropping any preamble/closing prose a small model adds), strips the
+/// original bullet or `1.`/`1)` numbering plus stray quotes, and re-emits each as `- `.
+/// Falls back to the first non-empty line when the model returned no list at all.
+fn clean_focus_topics(raw: &str) -> String {
+    let bullet = |c: char| matches!(c, '-' | '•' | '*' | '–');
+    let mut items: Vec<String> = Vec::new();
+    for line in raw.trim().lines() {
+        let l = line.trim();
+        if l.is_empty() {
+            continue;
+        }
+        let is_dash = l.starts_with(bullet);
+        let is_numbered = {
+            let digits: String = l.chars().take_while(char::is_ascii_digit).collect();
+            !digits.is_empty() && l[digits.len()..].starts_with(['.', ')'])
+        };
+        if !is_dash && !is_numbered {
+            continue;
+        }
+        let mut item = l.trim_start_matches(bullet).trim_start();
+        if is_numbered {
+            item = item
+                .trim_start_matches(|c: char| c.is_ascii_digit())
+                .trim_start_matches(['.', ')'])
+                .trim_start();
+        }
+        let item = item
+            .trim()
+            .trim_matches(|c: char| matches!(c, '"' | '\'' | '“' | '”'))
+            .trim();
+        if !item.is_empty() {
+            items.push(format!("- {item}"));
+        }
+    }
+    if items.is_empty() {
+        return raw
+            .trim()
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("")
+            .to_string();
+    }
+    items.join("\n")
+}
+
+#[cfg(test)]
+mod focus_topics_tests {
+    use super::clean_focus_topics;
+
+    #[test]
+    fn keeps_a_markdown_bullet_list() {
+        let raw = "- the Q3 revenue drivers\n- the biggest risks to watch\n- the FY outlook";
+        assert_eq!(
+            clean_focus_topics(raw),
+            "- the Q3 revenue drivers\n- the biggest risks to watch\n- the FY outlook"
+        );
+    }
+
+    #[test]
+    fn normalizes_numbering_and_drops_preamble_and_closing() {
+        let raw = "Here are some topics:\n1. the migration trade-offs\n2) why Postgres won\n\nHope this helps!";
+        assert_eq!(
+            clean_focus_topics(raw),
+            "- the migration trade-offs\n- why Postgres won"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_plain_text_when_no_list() {
+        assert_eq!(
+            clean_focus_topics("lead with the numbers"),
+            "lead with the numbers"
+        );
+    }
 }
 
 /// Best-effort removal of a managed source file and its `.extracted.txt` /

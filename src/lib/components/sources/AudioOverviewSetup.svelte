@@ -12,6 +12,7 @@
   import Swords from '@lucide/svelte/icons/swords';
   import Languages from '@lucide/svelte/icons/languages';
   import Check from '@lucide/svelte/icons/check';
+  import FileText from '@lucide/svelte/icons/file-text';
   import TriangleAlert from '@lucide/svelte/icons/triangle-alert';
   import {
     Dialog,
@@ -196,161 +197,177 @@
     });
     open = false;
   }
+
+  function cancel(): void {
+    open = false;
+  }
 </script>
 
 <Dialog {open} onOpenChange={(v) => (open = v)}>
   <DialogContent
     showCloseButton={true}
-    class="flex max-h-[88vh] w-full max-w-md flex-col gap-0 overflow-hidden rounded-2xl border-border bg-card p-0"
+    class="flex max-h-[85vh] w-full flex-col gap-0 overflow-hidden rounded-2xl border-border bg-card p-0 sm:max-w-3xl"
   >
     <DialogHeader
-      class="flex-row items-center gap-3 border-b border-border px-5 py-4 space-y-0 text-left"
+      class="flex-row items-center gap-3 border-b border-border px-6 py-4 space-y-0 text-left shrink-0"
     >
       <div class="header-icon" aria-hidden="true">
-        <Sparkles class="size-[18px]" strokeWidth={2} />
+        <Sparkles class="size-[19px]" strokeWidth={2} />
       </div>
-      <div class="flex min-w-0 flex-col gap-0.5">
-        <DialogTitle class="text-[0.95rem] font-bold leading-none text-foreground">
+      <div class="flex min-w-0 flex-col gap-1">
+        <DialogTitle class="text-base font-bold leading-none text-foreground">
           Audio Overview
         </DialogTitle>
-        <DialogDescription class="text-[0.72rem] leading-tight text-muted-foreground">
-          Two AI hosts, grounded in {scopeLabel}
+        <DialogDescription class="text-[0.75rem] leading-tight text-muted-foreground">
+          Two AI hosts discuss your sources — grounded in {scopeLabel}
         </DialogDescription>
       </div>
     </DialogHeader>
 
-    <div class="no-scrollbar min-h-0 flex-1 overflow-y-auto px-5 py-4">
-      <section class="mb-5">
+    <div class="flex min-h-0 flex-1 overflow-hidden">
+      <div class="format-rail no-scrollbar">
         <p class="section-label">Format</p>
-        <div class="grid grid-cols-2 gap-2">
+        <div class="flex flex-col gap-1.5">
           {#each FORMATS as opt (opt.value)}
             <button
               type="button"
-              class="fmt-card"
+              class="fmt-row"
               data-active={format === opt.value}
               aria-label={opt.label}
               aria-pressed={format === opt.value}
               onclick={() => pickFormat(opt)}
             >
-              <span class="fmt-check" aria-hidden="true">
+              <span class="fmt-row-icon" aria-hidden="true">
+                <opt.icon class="size-[18px]" strokeWidth={1.9} />
+              </span>
+              <span class="fmt-row-text">
+                <span class="fmt-row-label">{opt.label}</span>
+                <span class="fmt-row-tag">{opt.tag}</span>
+              </span>
+              <span class="fmt-row-check" aria-hidden="true">
                 {#if format === opt.value}<Check class="size-3" strokeWidth={3} />{/if}
               </span>
-              <span class="fmt-icon" aria-hidden="true">
-                <opt.icon class="size-[17px]" strokeWidth={1.9} />
-              </span>
-              <span class="fmt-label">{opt.label}</span>
-              <span class="fmt-tag">{opt.tag}</span>
             </button>
           {/each}
         </div>
-        <p class="mt-2.5 text-[0.73rem] leading-relaxed text-muted-foreground">
-          {selectedFormat.desc}
-        </p>
-      </section>
+      </div>
 
-      <section class="mb-5">
-        <p class="section-label">
-          Length
-          {#if lengthIsSuggested}
-            <span class="suggested-chip">Suggested</span>
-          {/if}
-        </p>
-        <div class="len-group">
-          {#each LENGTHS as opt (opt.value)}
+      <div class="config-pane no-scrollbar">
+        <div class="fmt-desc-card">
+          <span class="fmt-desc-icon" aria-hidden="true">
+            <selectedFormat.icon class="size-4" strokeWidth={1.9} />
+          </span>
+          <p>{selectedFormat.desc}</p>
+        </div>
+
+        <section>
+          <p class="section-label">
+            Length
+            {#if lengthIsSuggested}
+              <span class="suggested-chip">Suggested</span>
+            {/if}
+          </p>
+          <div class="len-group">
+            {#each LENGTHS as opt (opt.value)}
+              <button
+                type="button"
+                class="len-btn"
+                data-active={length === opt.value}
+                aria-label={opt.label}
+                aria-pressed={length === opt.value}
+                onclick={() => pickLength(opt.value)}
+              >
+                <span class="len-label">{opt.label}</span>
+                <span class="len-hint">{opt.hint}</span>
+              </button>
+            {/each}
+          </div>
+        </section>
+
+        {#if langOptions.length > 0}
+          <section>
+            <p id="overview-language-label" class="section-label">
+              <Languages class="size-3.5 text-muted-foreground" strokeWidth={2} />
+              Language
+            </p>
+            <Select
+              type="single"
+              value={language}
+              onValueChange={(v) => (language = v ?? '')}
+              items={languageItems}
+            >
+              <SelectTrigger
+                id="overview-language"
+                aria-labelledby="overview-language-label"
+                class="h-10 w-full rounded-xl"
+              >
+                <SelectValue placeholder="Auto — match sources" />
+              </SelectTrigger>
+              <SelectContent
+                class="origin-(--bits-select-content-transform-origin) duration-200 ease-[cubic-bezier(0.23,1,0.32,1)]"
+              >
+                {#each languageItems as opt (opt.value)}
+                  <SelectItem value={opt.value} label={opt.label}>{opt.label}</SelectItem>
+                {/each}
+              </SelectContent>
+            </Select>
+          </section>
+        {/if}
+
+        <section>
+          <div class="mb-2 flex items-center justify-between">
+            <label for="overview-focus" class="section-label mb-0">
+              Focus <span class="font-medium normal-case tracking-normal text-muted-foreground/70"
+                >· optional</span
+              >
+            </label>
             <button
               type="button"
-              class="len-btn"
-              data-active={length === opt.value}
-              aria-label={opt.label}
-              aria-pressed={length === opt.value}
-              onclick={() => pickLength(opt.value)}
+              class="suggest-btn"
+              disabled={suggesting || !notebookId}
+              aria-busy={suggesting}
+              onclick={suggest}
             >
-              <span class="len-label">{opt.label}</span>
-              <span class="len-hint">{opt.hint}</span>
+              {#if suggesting}
+                <span class="suggest-spinner" aria-hidden="true"></span>
+              {:else}
+                <WandSparkles class="size-3" strokeWidth={2} />
+              {/if}
+              {suggesting ? 'Suggesting…' : 'Suggest'}
             </button>
-          {/each}
-        </div>
-      </section>
-
-      {#if langOptions.length > 0}
-        <section class="mb-5">
-          <p id="overview-language-label" class="section-label">
-            <Languages class="size-3.5 text-muted-foreground" strokeWidth={2} />
-            Language
-          </p>
-          <Select
-            type="single"
-            value={language}
-            onValueChange={(v) => (language = v ?? '')}
-            items={languageItems}
-          >
-            <SelectTrigger
-              id="overview-language"
-              aria-labelledby="overview-language-label"
-              class="h-10 w-full rounded-xl"
-            >
-              <SelectValue placeholder="Auto — match sources" />
-            </SelectTrigger>
-            <SelectContent
-              class="origin-(--bits-select-content-transform-origin) duration-200 ease-[cubic-bezier(0.23,1,0.32,1)]"
-            >
-              {#each languageItems as opt (opt.value)}
-                <SelectItem value={opt.value} label={opt.label}>{opt.label}</SelectItem>
-              {/each}
-            </SelectContent>
-          </Select>
+          </div>
+          <textarea
+            id="overview-focus"
+            bind:value={focus}
+            oninput={onFocusInput}
+            placeholder="What the hosts should focus on — or tap Suggest for topics drawn from your sources."
+            rows="5"
+            class="focus-area"
+          ></textarea>
+          {#if suggestError}
+            <p class="mt-1.5 flex items-center gap-1.5 text-[0.7rem] text-destructive" role="alert">
+              <TriangleAlert class="size-3 shrink-0" strokeWidth={2} />
+              {suggestError}
+            </p>
+          {/if}
         </section>
-      {/if}
-
-      <section>
-        <div class="mb-2 flex items-center justify-between">
-          <label for="overview-focus" class="section-label mb-0">
-            Focus <span class="font-medium normal-case tracking-normal text-muted-foreground/70"
-              >· optional</span
-            >
-          </label>
-          <button
-            type="button"
-            class="suggest-btn"
-            disabled={suggesting || !notebookId}
-            aria-busy={suggesting}
-            onclick={suggest}
-          >
-            {#if suggesting}
-              <span class="suggest-spinner" aria-hidden="true"></span>
-            {:else}
-              <WandSparkles class="size-3" strokeWidth={2} />
-            {/if}
-            {suggesting ? 'Suggesting…' : 'Suggest'}
-          </button>
-        </div>
-        <textarea
-          id="overview-focus"
-          bind:value={focus}
-          oninput={onFocusInput}
-          placeholder="e.g. keep it executive-level, lead with the numbers"
-          rows="3"
-          class="focus-area"
-        ></textarea>
-        {#if suggestError}
-          <p class="mt-1.5 flex items-center gap-1.5 text-[0.7rem] text-destructive" role="alert">
-            <TriangleAlert class="size-3 shrink-0" strokeWidth={2} />
-            {suggestError}
-          </p>
-        {/if}
-      </section>
+      </div>
     </div>
 
     <DialogFooter
-      class="flex-row items-center justify-between gap-2 border-t border-border px-5 py-3.5 space-x-0"
+      class="flex-row items-center justify-between gap-3 border-t border-border px-6 py-4 space-x-0 shrink-0"
     >
-      <span class="text-[0.72rem] text-muted-foreground">
-        Grounded in <span class="font-semibold text-foreground">{scopeLabel}</span>
+      <span class="scope-pill">
+        <FileText class="size-3.5" strokeWidth={2} />
+        {scopeLabel}
       </span>
-      <button type="button" class="generate-btn" onclick={generate}>
-        <Sparkles class="size-[14px]" strokeWidth={2} />
-        Generate
-      </button>
+      <div class="flex items-center gap-2">
+        <button type="button" class="ghost-btn" onclick={cancel}>Cancel</button>
+        <button type="button" class="generate-btn" onclick={generate}>
+          <Sparkles class="size-[14px]" strokeWidth={2} />
+          Generate
+        </button>
+      </div>
     </DialogFooter>
   </DialogContent>
 </Dialog>
@@ -395,75 +412,94 @@
     background: color-mix(in oklch, var(--primary) 13%, transparent);
   }
 
-  /* Format cards — a selectable tile with icon, label and tagline. Selected reads as an
-     accent-filled card (tinted surface + accent ring + a corner check), not a flat pill. */
-  .fmt-card {
-    position: relative;
+  /* Two-pane body: a format chooser rail on the left, the run config on the right. */
+  .format-rail {
+    flex: none;
+    width: 15.5rem;
+    padding: 18px 16px;
+    background: color-mix(in oklch, var(--muted) 55%, transparent);
+    overflow-y: auto;
+  }
+  .config-pane {
     display: flex;
     flex-direction: column;
-    align-items: flex-start;
-    gap: 2px;
-    padding: 11px 12px;
-    border-radius: 13px;
-    border: 1.5px solid var(--border);
-    background: var(--card);
+    gap: 18px;
+    flex: 1;
+    min-width: 0;
+    padding: 18px 22px 20px;
+    overflow-y: auto;
+  }
+
+  /* Format rows — horizontal cards (icon · label + tag · check). Selected reads as an
+     accent-filled row, so the chosen format is unmistakable at a glance. */
+  .fmt-row {
+    display: flex;
+    align-items: center;
+    gap: 11px;
+    width: 100%;
+    padding: 10px 11px;
+    border-radius: 12px;
+    border: 1.5px solid transparent;
+    background: transparent;
     cursor: pointer;
     text-align: left;
     transition:
       border-color 0.16s var(--ease-out, ease),
       background 0.16s var(--ease-out, ease),
-      transform 0.16s var(--ease-out, ease),
       box-shadow 0.16s var(--ease-out, ease);
   }
-  .fmt-card:hover:not([data-active='true']) {
-    border-color: color-mix(in oklch, var(--primary) 40%, var(--border));
-    transform: translateY(calc(-1px * var(--rail-motion, 1)));
+  .fmt-row:hover:not([data-active='true']) {
+    background: color-mix(in oklch, var(--foreground) 5%, transparent);
+  }
+  .fmt-row[data-active='true'] {
+    border-color: var(--primary);
+    background: color-mix(in oklch, var(--primary) 11%, var(--card));
     box-shadow: var(--shadow-tile);
   }
-  .fmt-card[data-active='true'] {
-    border-color: var(--primary);
-    background: color-mix(in oklch, var(--primary) 8%, var(--card));
-    box-shadow: 0 0 0 1px var(--primary);
-  }
-  .fmt-card:focus-visible {
+  .fmt-row:focus-visible {
     outline: none;
     box-shadow: 0 0 0 2px var(--ring);
   }
-  .fmt-icon {
+  .fmt-row-icon {
     display: grid;
     place-items: center;
-    width: 30px;
-    height: 30px;
-    margin-bottom: 5px;
-    border-radius: 9px;
+    width: 34px;
+    height: 34px;
+    flex: none;
+    border-radius: 10px;
     color: var(--muted-foreground);
-    background: var(--muted);
+    background: color-mix(in oklch, var(--foreground) 6%, transparent);
     transition:
       color 0.16s var(--ease-out, ease),
       background 0.16s var(--ease-out, ease);
   }
-  .fmt-card[data-active='true'] .fmt-icon {
+  .fmt-row[data-active='true'] .fmt-row-icon {
     color: var(--primary);
-    background: color-mix(in oklch, var(--primary) 15%, transparent);
+    background: color-mix(in oklch, var(--primary) 16%, transparent);
   }
-  .fmt-label {
+  .fmt-row-text {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    min-width: 0;
+    flex: 1;
+  }
+  .fmt-row-label {
     font-size: 0.82rem;
     font-weight: 650;
     color: var(--foreground);
   }
-  .fmt-tag {
+  .fmt-row-tag {
     font-size: 0.66rem;
-    line-height: 1.2;
+    line-height: 1.25;
     color: var(--muted-foreground);
   }
-  .fmt-check {
-    position: absolute;
-    top: 9px;
-    right: 9px;
+  .fmt-row-check {
     display: grid;
     place-items: center;
-    width: 16px;
-    height: 16px;
+    width: 18px;
+    height: 18px;
+    flex: none;
     border-radius: 999px;
     color: var(--primary-foreground);
     background: var(--primary);
@@ -473,9 +509,33 @@
       opacity 0.16s var(--ease-out, ease),
       transform 0.16s var(--ease-spring, ease);
   }
-  .fmt-card[data-active='true'] .fmt-check {
+  .fmt-row[data-active='true'] .fmt-row-check {
     opacity: 1;
     transform: scale(1);
+  }
+
+  /* Selected-format blurb at the top of the config pane. */
+  .fmt-desc-card {
+    display: flex;
+    gap: 11px;
+    padding: 13px 15px;
+    border-radius: 12px;
+    background: color-mix(in oklch, var(--primary) 7%, transparent);
+  }
+  .fmt-desc-icon {
+    display: grid;
+    place-items: center;
+    width: 28px;
+    height: 28px;
+    flex: none;
+    border-radius: 8px;
+    color: var(--primary);
+    background: color-mix(in oklch, var(--primary) 14%, transparent);
+  }
+  .fmt-desc-card p {
+    font-size: 0.75rem;
+    line-height: 1.5;
+    color: var(--foreground);
   }
 
   /* Length — segmented control; each cell shows a label + rough duration hint. */
@@ -607,6 +667,42 @@
   .generate-btn:focus-visible {
     outline: none;
     box-shadow: 0 0 0 2px var(--ring);
+  }
+
+  .ghost-btn {
+    height: 38px;
+    padding: 0 16px;
+    border: 1px solid var(--border);
+    border-radius: 11px;
+    font-size: 0.82rem;
+    font-weight: 600;
+    cursor: pointer;
+    color: var(--muted-foreground);
+    background: var(--card);
+    transition:
+      color 0.16s var(--ease-out, ease),
+      background 0.16s var(--ease-out, ease);
+  }
+  .ghost-btn:hover {
+    color: var(--foreground);
+    background: color-mix(in oklch, var(--foreground) 5%, var(--card));
+  }
+  .ghost-btn:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 2px var(--ring);
+  }
+
+  .scope-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 28px;
+    padding: 0 12px 0 10px;
+    border-radius: 999px;
+    font-size: 0.73rem;
+    font-weight: 600;
+    color: var(--muted-foreground);
+    background: color-mix(in oklch, var(--foreground) 6%, transparent);
   }
 
   .suggest-spinner {

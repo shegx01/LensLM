@@ -281,7 +281,15 @@ fn build_dialogue_prompt(
     };
     // User-authored steer (trusted — the user's own input); a code-owned brief line.
     let focus_line = match focus {
-        Some(f) if !f.trim().is_empty() => format!("\n\nGive particular focus to: {}", f.trim()),
+        Some(f) if !f.trim().is_empty() => {
+            let f = f.trim();
+            // A multi-line steer (e.g. a suggested topic list) reads better on its own lines.
+            if f.contains('\n') {
+                format!("\n\nGive particular focus to these topics:\n{f}")
+            } else {
+                format!("\n\nGive particular focus to: {f}")
+            }
+        }
         _ => String::new(),
     };
     let system = format!(
