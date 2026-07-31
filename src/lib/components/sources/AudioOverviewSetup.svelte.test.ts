@@ -91,6 +91,20 @@ describe('AudioOverviewSetup — language gating', () => {
   });
 });
 
+describe('AudioOverviewSetup — accessible labels', () => {
+  it('labels the Focus textarea programmatically (not placeholder-only)', () => {
+    open();
+    expect(screen.getByLabelText(/Focus/)).toBeInstanceOf(HTMLTextAreaElement);
+  });
+
+  it('gives the Language picker an accessible name when it is shown', async () => {
+    overviewLanguageOptions.mockResolvedValue(['spanish', 'french']);
+    open();
+    await screen.findByText('Language');
+    expect(screen.getByLabelText('Language')).toBeInTheDocument();
+  });
+});
+
 describe('AudioOverviewSetup — focus', () => {
   it('passes a trimmed focus string through to the generate setup', async () => {
     const onGenerate = open();

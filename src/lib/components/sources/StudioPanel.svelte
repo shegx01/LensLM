@@ -218,7 +218,9 @@
               <button
                 type="button"
                 role="tab"
+                id="audio-tab-player"
                 aria-selected={audioTab === 'player'}
+                aria-controls="audio-tabpanel"
                 class="tab-btn"
                 data-active={audioTab === 'player'}
                 onclick={() => (audioTab = 'player')}
@@ -228,7 +230,9 @@
               <button
                 type="button"
                 role="tab"
+                id="audio-tab-transcript"
                 aria-selected={audioTab === 'transcript'}
+                aria-controls="audio-tabpanel"
                 class="tab-btn"
                 data-active={audioTab === 'transcript'}
                 onclick={() => (audioTab = 'transcript')}
@@ -239,9 +243,13 @@
           {/if}
 
           {#if audioTab === 'transcript' && transcriptTurns.length > 0}
+            <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
             <div
+              id="audio-tabpanel"
               class="transcript no-scrollbar flex flex-col gap-2.5 overflow-y-auto"
               role="tabpanel"
+              aria-labelledby="audio-tab-transcript"
+              tabindex="0"
             >
               {#each transcriptTurns as turn, i (i)}
                 <div>
@@ -251,6 +259,10 @@
                   <p class="text-xs leading-relaxed text-muted-foreground">{turn.text}</p>
                 </div>
               {/each}
+            </div>
+          {:else if transcriptTurns.length > 0}
+            <div id="audio-tabpanel" role="tabpanel" aria-labelledby="audio-tab-player">
+              <AudioPlayer path={audioOverviewStore.overviewPath} />
             </div>
           {:else}
             <AudioPlayer path={audioOverviewStore.overviewPath} />

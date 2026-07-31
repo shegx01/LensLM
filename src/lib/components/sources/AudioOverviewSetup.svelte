@@ -1,7 +1,6 @@
-<!-- Audio Overview setup modal (#29 redesign). Collects Format / Length / Language /
-     Focus, then hands a resolved OverviewSetup back to the caller which owns the
-     generate lifecycle. Format sets a default length that stays adjustable; the
-     Language picker is hidden when the active TTS engine is single-language. -->
+<!-- Audio Overview setup modal (#29 redesign). Hands a resolved OverviewSetup to the
+     caller (which owns the generate lifecycle). Format sets a default length that stays
+     adjustable; the Language picker hides when the active TTS engine is single-language. -->
 <script lang="ts">
   import Sparkles from '@lucide/svelte/icons/sparkles';
   import Headphones from '@lucide/svelte/icons/headphones';
@@ -77,6 +76,7 @@
     { value: 'long', label: 'Long' }
   ];
 
+  // SYNC-CHECK: keys mirror lens-core tts::catalog::Lang (serde snake_case).
   const LANG_LABELS: Record<string, string> = {
     english: 'English',
     chinese: 'Chinese',
@@ -226,7 +226,10 @@
 
       {#if langOptions.length > 0}
         <div class="mb-5 flex flex-col gap-2">
-          <span class="text-[0.7rem] font-bold uppercase tracking-wide text-muted-foreground">
+          <span
+            id="overview-language-label"
+            class="text-[0.7rem] font-bold uppercase tracking-wide text-muted-foreground"
+          >
             Language
           </span>
           <Select
@@ -235,7 +238,11 @@
             onValueChange={(v) => (language = v ?? '')}
             items={languageItems}
           >
-            <SelectTrigger class="w-full">
+            <SelectTrigger
+              id="overview-language"
+              aria-labelledby="overview-language-label"
+              class="w-full"
+            >
               <SelectValue placeholder="Auto — match sources" />
             </SelectTrigger>
             <SelectContent
@@ -251,15 +258,19 @@
 
       <div class="flex flex-col gap-2">
         <div class="flex items-center justify-between">
-          <span class="text-[0.7rem] font-bold uppercase tracking-wide text-muted-foreground">
+          <label
+            for="overview-focus"
+            class="text-[0.7rem] font-bold uppercase tracking-wide text-muted-foreground"
+          >
             Focus <span class="font-medium normal-case tracking-normal text-muted-foreground/70"
               >· optional</span
             >
-          </span>
+          </label>
           <button
             type="button"
             class="inline-flex items-center gap-1.5 rounded-full bg-primary/12 px-2.5 py-1 text-[0.7rem] font-semibold text-primary transition-opacity hover:opacity-80 disabled:cursor-not-allowed disabled:opacity-50"
             disabled={suggesting || !notebookId}
+            aria-busy={suggesting}
             onclick={suggest}
           >
             {#if suggesting}
@@ -271,6 +282,7 @@
           </button>
         </div>
         <textarea
+          id="overview-focus"
           bind:value={focus}
           placeholder="e.g. keep it executive-level, lead with the numbers"
           rows="3"

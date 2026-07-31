@@ -251,7 +251,8 @@ export async function isTtsReady(): Promise<boolean> {
   return true;
 }
 
-/** Curated language set offered for a `multilingual` (Cloud) engine, in enum order. */
+// SYNC-CHECK: mirrors lens-core tts::catalog::Lang (serde snake_case), in enum order.
+/** Curated language set offered for a `multilingual` (Cloud) engine. */
 const MULTILINGUAL_OVERVIEW_LANGS = [
   'english',
   'chinese',
