@@ -1,10 +1,18 @@
 <!-- Audio Overview setup modal (#29 redesign). Hands a resolved OverviewSetup to the
-     caller (which owns the generate lifecycle). Format sets a default length that stays
-     adjustable; the Language picker hides when the active TTS engine is single-language. -->
+     caller (which owns the generate lifecycle). Format suggests a length that the user
+     can override; once overridden, switching format no longer moves it. The Language
+     picker hides when the active TTS engine is single-language. -->
 <script lang="ts">
+  import type { Component } from 'svelte';
   import Sparkles from '@lucide/svelte/icons/sparkles';
-  import Headphones from '@lucide/svelte/icons/headphones';
-  import Wand from '@lucide/svelte/icons/wand-sparkles';
+  import WandSparkles from '@lucide/svelte/icons/wand-sparkles';
+  import Telescope from '@lucide/svelte/icons/telescope';
+  import Zap from '@lucide/svelte/icons/zap';
+  import Scale from '@lucide/svelte/icons/scale';
+  import Swords from '@lucide/svelte/icons/swords';
+  import Languages from '@lucide/svelte/icons/languages';
+  import Check from '@lucide/svelte/icons/check';
+  import TriangleAlert from '@lucide/svelte/icons/triangle-alert';
   import {
     Dialog,
     DialogContent,
@@ -39,41 +47,51 @@
   type FormatOption = {
     value: OverviewFormat;
     label: string;
+    tag: string;
     desc: string;
     defaultLength: Length;
+    icon: Component;
   };
 
   const FORMATS: FormatOption[] = [
     {
       value: 'deep_dive',
       label: 'Deep dive',
+      tag: 'Thorough & exploratory',
       desc: 'A longer two-host conversation that explores the sources thoroughly, with analysis and back-and-forth.',
-      defaultLength: 'medium'
+      defaultLength: 'medium',
+      icon: Telescope
     },
     {
       value: 'brief',
       label: 'Brief',
-      desc: 'A short, high-signal rundown that gets to the essentials fast.',
-      defaultLength: 'short'
+      tag: 'Short & high-signal',
+      desc: 'A short, high-signal rundown that gets straight to the essentials.',
+      defaultLength: 'short',
+      icon: Zap
     },
     {
       value: 'critique',
       label: 'Critique',
+      tag: 'Strengths & gaps',
       desc: 'A critical evaluation — weighing strengths, weaknesses, gaps and open questions rather than just summarizing.',
-      defaultLength: 'medium'
+      defaultLength: 'medium',
+      icon: Scale
     },
     {
       value: 'debate',
       label: 'Debate',
+      tag: 'Opposing positions',
       desc: 'Two hosts argue opposing positions, pressure-testing each claim from the sources.',
-      defaultLength: 'long'
+      defaultLength: 'long',
+      icon: Swords
     }
   ];
 
-  const LENGTHS: { value: Length; label: string }[] = [
-    { value: 'short', label: 'Short' },
-    { value: 'medium', label: 'Medium' },
-    { value: 'long', label: 'Long' }
+  const LENGTHS: { value: Length; label: string; hint: string }[] = [
+    { value: 'short', label: 'Short', hint: '~5 min' },
+    { value: 'medium', label: 'Medium', hint: '~10 min' },
+    { value: 'long', label: 'Long', hint: '~15 min' }
   ];
 
   // SYNC-CHECK: keys mirror lens-core tts::catalog::Lang (serde snake_case).
@@ -95,14 +113,18 @@
 
   let format = $state<OverviewFormat>('deep_dive');
   let length = $state<Length>('medium');
+  /** Once the user picks a length, switching format no longer moves it (no "jumping"). */
+  let lengthTouched = $state(false);
   /** '' = auto / source language (omitted from the request). */
   let language = $state('');
   let focus = $state('');
   let langOptions = $state<string[]>([]);
   let suggesting = $state(false);
+  let suggestError = $state<string | null>(null);
 
   const selectedFormat = $derived(FORMATS.find((f) => f.value === format) ?? FORMATS[0]);
   const scopeLabel = $derived(`${selectedCount} source${selectedCount === 1 ? '' : 's'}`);
+  const lengthIsSuggested = $derived(!lengthTouched && length === selectedFormat.defaultLength);
 
   const languageItems = $derived([
     { value: '', label: 'Auto — match sources' },
@@ -117,9 +139,11 @@
     if (!open) return;
     format = 'deep_dive';
     length = 'medium';
+    lengthTouched = false;
     language = '';
     focus = '';
     suggesting = false;
+    suggestError = null;
     void (async () => {
       try {
         langOptions = await overviewLanguageOptions();
@@ -132,20 +156,34 @@
 
   function pickFormat(f: FormatOption): void {
     format = f.value;
-    length = f.defaultLength;
+    // The default is only a suggestion — honour an explicit length the user already set.
+    if (!lengthTouched) length = f.defaultLength;
+  }
+
+  function pickLength(value: Length): void {
+    length = value;
+    lengthTouched = true;
   }
 
   async function suggest(): Promise<void> {
     if (!notebookId || suggesting) return;
     suggesting = true;
+    suggestError = null;
     try {
       const phrase = await suggestOverviewFocus(notebookId);
-      if (phrase.trim()) focus = phrase.trim();
+      const trimmed = phrase.trim();
+      if (trimmed) focus = trimmed;
+      else suggestError = 'No suggestion came back — add your own focus below.';
     } catch (err) {
       console.error('AudioOverviewSetup: suggest focus failed', err);
+      suggestError = "Couldn't reach the model. Add your own focus, or check it in Settings.";
     } finally {
       suggesting = false;
     }
+  }
+
+  function onFocusInput(): void {
+    if (suggestError) suggestError = null;
   }
 
   function generate(): void {
@@ -163,75 +201,83 @@
 <Dialog {open} onOpenChange={(v) => (open = v)}>
   <DialogContent
     showCloseButton={true}
-    class="flex max-h-[86vh] w-full max-w-md flex-col gap-0 overflow-hidden rounded-xl border-border bg-card p-0"
+    class="flex max-h-[88vh] w-full max-w-md flex-col gap-0 overflow-hidden rounded-2xl border-border bg-card p-0"
   >
     <DialogHeader
-      class="flex-row items-center gap-2.5 border-b border-border px-5 py-4 space-y-0 text-left"
+      class="flex-row items-center gap-3 border-b border-border px-5 py-4 space-y-0 text-left"
     >
-      <div
-        class="flex size-8 shrink-0 items-center justify-center rounded-lg bg-primary/15 text-primary"
-        aria-hidden="true"
-      >
-        <Headphones class="size-4" strokeWidth={2} />
+      <div class="header-icon" aria-hidden="true">
+        <Sparkles class="size-[18px]" strokeWidth={2} />
       </div>
-      <div class="flex min-w-0 flex-col">
-        <DialogTitle class="text-sm font-bold text-foreground">Generate Audio Overview</DialogTitle>
-        <DialogDescription class="text-[11px] text-muted-foreground">
-          Grounded in {scopeLabel}
+      <div class="flex min-w-0 flex-col gap-0.5">
+        <DialogTitle class="text-[0.95rem] font-bold leading-none text-foreground">
+          Audio Overview
+        </DialogTitle>
+        <DialogDescription class="text-[0.72rem] leading-tight text-muted-foreground">
+          Two AI hosts, grounded in {scopeLabel}
         </DialogDescription>
       </div>
     </DialogHeader>
 
-    <div class="min-h-0 flex-1 overflow-y-auto px-5 py-4">
-      <fieldset class="mb-5">
-        <legend class="mb-2 text-[0.7rem] font-bold uppercase tracking-wide text-muted-foreground">
-          Format
-        </legend>
-        <div class="flex flex-wrap gap-1.5">
+    <div class="no-scrollbar min-h-0 flex-1 overflow-y-auto px-5 py-4">
+      <section class="mb-5">
+        <p class="section-label">Format</p>
+        <div class="grid grid-cols-2 gap-2">
           {#each FORMATS as opt (opt.value)}
             <button
               type="button"
-              class="pill"
+              class="fmt-card"
               data-active={format === opt.value}
+              aria-label={opt.label}
               aria-pressed={format === opt.value}
               onclick={() => pickFormat(opt)}
             >
-              {opt.label}
+              <span class="fmt-check" aria-hidden="true">
+                {#if format === opt.value}<Check class="size-3" strokeWidth={3} />{/if}
+              </span>
+              <span class="fmt-icon" aria-hidden="true">
+                <opt.icon class="size-[17px]" strokeWidth={1.9} />
+              </span>
+              <span class="fmt-label">{opt.label}</span>
+              <span class="fmt-tag">{opt.tag}</span>
             </button>
           {/each}
         </div>
-        <p class="mt-2 text-[0.72rem] leading-relaxed text-muted-foreground">
+        <p class="mt-2.5 text-[0.73rem] leading-relaxed text-muted-foreground">
           {selectedFormat.desc}
         </p>
-      </fieldset>
+      </section>
 
-      <fieldset class="mb-5">
-        <legend class="mb-2 text-[0.7rem] font-bold uppercase tracking-wide text-muted-foreground">
+      <section class="mb-5">
+        <p class="section-label">
           Length
-        </legend>
-        <div class="flex flex-wrap gap-1.5">
+          {#if lengthIsSuggested}
+            <span class="suggested-chip">Suggested</span>
+          {/if}
+        </p>
+        <div class="len-group">
           {#each LENGTHS as opt (opt.value)}
             <button
               type="button"
-              class="pill flex-1"
+              class="len-btn"
               data-active={length === opt.value}
+              aria-label={opt.label}
               aria-pressed={length === opt.value}
-              onclick={() => (length = opt.value)}
+              onclick={() => pickLength(opt.value)}
             >
-              {opt.label}
+              <span class="len-label">{opt.label}</span>
+              <span class="len-hint">{opt.hint}</span>
             </button>
           {/each}
         </div>
-      </fieldset>
+      </section>
 
       {#if langOptions.length > 0}
-        <div class="mb-5 flex flex-col gap-2">
-          <span
-            id="overview-language-label"
-            class="text-[0.7rem] font-bold uppercase tracking-wide text-muted-foreground"
-          >
+        <section class="mb-5">
+          <p id="overview-language-label" class="section-label">
+            <Languages class="size-3.5 text-muted-foreground" strokeWidth={2} />
             Language
-          </span>
+          </p>
           <Select
             type="single"
             value={language}
@@ -241,7 +287,7 @@
             <SelectTrigger
               id="overview-language"
               aria-labelledby="overview-language-label"
-              class="w-full"
+              class="h-10 w-full rounded-xl"
             >
               <SelectValue placeholder="Auto — match sources" />
             </SelectTrigger>
@@ -253,22 +299,19 @@
               {/each}
             </SelectContent>
           </Select>
-        </div>
+        </section>
       {/if}
 
-      <div class="flex flex-col gap-2">
-        <div class="flex items-center justify-between">
-          <label
-            for="overview-focus"
-            class="text-[0.7rem] font-bold uppercase tracking-wide text-muted-foreground"
-          >
+      <section>
+        <div class="mb-2 flex items-center justify-between">
+          <label for="overview-focus" class="section-label mb-0">
             Focus <span class="font-medium normal-case tracking-normal text-muted-foreground/70"
               >· optional</span
             >
           </label>
           <button
             type="button"
-            class="inline-flex items-center gap-1.5 rounded-full bg-primary/12 px-2.5 py-1 text-[0.7rem] font-semibold text-primary transition-opacity hover:opacity-80 disabled:cursor-not-allowed disabled:opacity-50"
+            class="suggest-btn"
             disabled={suggesting || !notebookId}
             aria-busy={suggesting}
             onclick={suggest}
@@ -276,31 +319,36 @@
             {#if suggesting}
               <span class="suggest-spinner" aria-hidden="true"></span>
             {:else}
-              <Wand class="size-3" strokeWidth={2} />
+              <WandSparkles class="size-3" strokeWidth={2} />
             {/if}
-            Suggest
+            {suggesting ? 'Suggesting…' : 'Suggest'}
           </button>
         </div>
         <textarea
           id="overview-focus"
           bind:value={focus}
+          oninput={onFocusInput}
           placeholder="e.g. keep it executive-level, lead with the numbers"
           rows="3"
-          class="w-full resize-none rounded-lg border border-border bg-background px-3 py-2 text-xs leading-relaxed text-foreground outline-none placeholder:text-muted-foreground/60 focus-visible:ring-2 focus-visible:ring-ring"
+          class="focus-area"
         ></textarea>
-      </div>
+        {#if suggestError}
+          <p class="mt-1.5 flex items-center gap-1.5 text-[0.7rem] text-destructive" role="alert">
+            <TriangleAlert class="size-3 shrink-0" strokeWidth={2} />
+            {suggestError}
+          </p>
+        {/if}
+      </section>
     </div>
 
     <DialogFooter
       class="flex-row items-center justify-between gap-2 border-t border-border px-5 py-3.5 space-x-0"
     >
-      <span class="text-[0.7rem] text-muted-foreground">{scopeLabel}</span>
-      <button
-        type="button"
-        class="press inline-flex items-center gap-1.5 rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground transition-[opacity,transform] hover:opacity-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-        onclick={generate}
-      >
-        <Sparkles class="size-[13px]" strokeWidth={2} />
+      <span class="text-[0.72rem] text-muted-foreground">
+        Grounded in <span class="font-semibold text-foreground">{scopeLabel}</span>
+      </span>
+      <button type="button" class="generate-btn" onclick={generate}>
+        <Sparkles class="size-[14px]" strokeWidth={2} />
         Generate
       </button>
     </DialogFooter>
@@ -308,38 +356,259 @@
 </Dialog>
 
 <style>
-  .pill {
-    min-width: 4.5rem;
-    height: 2.25rem;
-    padding: 0 0.85rem;
-    border-radius: 0.55rem;
-    border: 1px solid var(--border);
-    background: var(--muted);
-    color: var(--muted-foreground);
-    font-size: 0.75rem;
-    font-weight: 600;
-    cursor: pointer;
-    transition:
-      background 0.15s var(--ease-out, ease),
-      color 0.15s var(--ease-out, ease),
-      border-color 0.15s var(--ease-out, ease);
-  }
-  .pill:hover:not([data-active='true']) {
-    color: var(--foreground);
-    border-color: color-mix(in oklch, var(--foreground) 20%, transparent);
-  }
-  .pill[data-active='true'] {
-    background: var(--primary);
-    border-color: var(--primary);
+  .header-icon {
+    display: grid;
+    place-items: center;
+    width: 38px;
+    height: 38px;
+    flex: none;
+    border-radius: 11px;
     color: var(--primary-foreground);
+    background: linear-gradient(
+      135deg,
+      var(--primary),
+      color-mix(in oklch, var(--primary) 78%, black)
+    );
+    box-shadow: 0 4px 12px -4px color-mix(in oklch, var(--primary) 55%, transparent);
   }
-  .pill:focus-visible {
+
+  .section-label {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    margin-bottom: 9px;
+    font-size: 0.7rem;
+    font-weight: 700;
+    letter-spacing: 0.055em;
+    text-transform: uppercase;
+    color: var(--muted-foreground);
+  }
+
+  .suggested-chip {
+    text-transform: none;
+    letter-spacing: 0;
+    font-size: 0.62rem;
+    font-weight: 600;
+    padding: 1px 7px;
+    border-radius: 999px;
+    color: var(--primary);
+    background: color-mix(in oklch, var(--primary) 13%, transparent);
+  }
+
+  /* Format cards — a selectable tile with icon, label and tagline. Selected reads as an
+     accent-filled card (tinted surface + accent ring + a corner check), not a flat pill. */
+  .fmt-card {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+    padding: 11px 12px;
+    border-radius: 13px;
+    border: 1.5px solid var(--border);
+    background: var(--card);
+    cursor: pointer;
+    text-align: left;
+    transition:
+      border-color 0.16s var(--ease-out, ease),
+      background 0.16s var(--ease-out, ease),
+      transform 0.16s var(--ease-out, ease),
+      box-shadow 0.16s var(--ease-out, ease);
+  }
+  .fmt-card:hover:not([data-active='true']) {
+    border-color: color-mix(in oklch, var(--primary) 40%, var(--border));
+    transform: translateY(calc(-1px * var(--rail-motion, 1)));
+    box-shadow: var(--shadow-tile);
+  }
+  .fmt-card[data-active='true'] {
+    border-color: var(--primary);
+    background: color-mix(in oklch, var(--primary) 8%, var(--card));
+    box-shadow: 0 0 0 1px var(--primary);
+  }
+  .fmt-card:focus-visible {
     outline: none;
     box-shadow: 0 0 0 2px var(--ring);
   }
-  .press:active {
+  .fmt-icon {
+    display: grid;
+    place-items: center;
+    width: 30px;
+    height: 30px;
+    margin-bottom: 5px;
+    border-radius: 9px;
+    color: var(--muted-foreground);
+    background: var(--muted);
+    transition:
+      color 0.16s var(--ease-out, ease),
+      background 0.16s var(--ease-out, ease);
+  }
+  .fmt-card[data-active='true'] .fmt-icon {
+    color: var(--primary);
+    background: color-mix(in oklch, var(--primary) 15%, transparent);
+  }
+  .fmt-label {
+    font-size: 0.82rem;
+    font-weight: 650;
+    color: var(--foreground);
+  }
+  .fmt-tag {
+    font-size: 0.66rem;
+    line-height: 1.2;
+    color: var(--muted-foreground);
+  }
+  .fmt-check {
+    position: absolute;
+    top: 9px;
+    right: 9px;
+    display: grid;
+    place-items: center;
+    width: 16px;
+    height: 16px;
+    border-radius: 999px;
+    color: var(--primary-foreground);
+    background: var(--primary);
+    opacity: 0;
+    transform: scale(0.6);
+    transition:
+      opacity 0.16s var(--ease-out, ease),
+      transform 0.16s var(--ease-spring, ease);
+  }
+  .fmt-card[data-active='true'] .fmt-check {
+    opacity: 1;
+    transform: scale(1);
+  }
+
+  /* Length — segmented control; each cell shows a label + rough duration hint. */
+  .len-group {
+    display: grid;
+    grid-auto-flow: column;
+    grid-auto-columns: 1fr;
+    gap: 4px;
+    padding: 4px;
+    border-radius: 12px;
+    background: var(--muted);
+  }
+  .len-btn {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 1px;
+    padding: 6px 4px;
+    border: 0;
+    border-radius: 9px;
+    background: transparent;
+    cursor: pointer;
+    color: var(--muted-foreground);
+    transition:
+      color 0.16s var(--ease-out, ease),
+      background 0.16s var(--ease-out, ease),
+      box-shadow 0.16s var(--ease-out, ease);
+  }
+  .len-btn[data-active='true'] {
+    background: var(--card);
+    box-shadow: var(--shadow-tile);
+  }
+  .len-btn:not([data-active='true']):hover {
+    color: var(--foreground);
+  }
+  .len-btn:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 2px var(--ring);
+  }
+  .len-label {
+    font-size: 0.76rem;
+    font-weight: 650;
+  }
+  .len-btn[data-active='true'] .len-label {
+    color: var(--card-foreground);
+  }
+  .len-hint {
+    font-size: 0.62rem;
+    color: var(--muted-foreground);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .suggest-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    height: 26px;
+    padding: 0 11px;
+    border: 0;
+    border-radius: 999px;
+    font-size: 0.7rem;
+    font-weight: 650;
+    cursor: pointer;
+    color: var(--primary);
+    background: color-mix(in oklch, var(--primary) 12%, transparent);
+    transition:
+      background 0.16s var(--ease-out, ease),
+      opacity 0.16s var(--ease-out, ease);
+  }
+  .suggest-btn:hover:not(:disabled) {
+    background: color-mix(in oklch, var(--primary) 20%, transparent);
+  }
+  .suggest-btn:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+  }
+  .suggest-btn:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 2px var(--ring);
+  }
+
+  .focus-area {
+    width: 100%;
+    resize: none;
+    border-radius: 12px;
+    border: 1.5px solid var(--border);
+    background: var(--background);
+    padding: 10px 12px;
+    font-size: 0.78rem;
+    line-height: 1.55;
+    color: var(--foreground);
+    outline: none;
+    transition:
+      border-color 0.16s var(--ease-out, ease),
+      box-shadow 0.16s var(--ease-out, ease);
+  }
+  .focus-area::placeholder {
+    color: color-mix(in oklch, var(--muted-foreground) 70%, transparent);
+  }
+  .focus-area:focus-visible {
+    border-color: var(--primary);
+    box-shadow: 0 0 0 3px color-mix(in oklch, var(--primary) 18%, transparent);
+  }
+
+  .generate-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 38px;
+    padding: 0 18px;
+    border: 0;
+    border-radius: 11px;
+    font-size: 0.82rem;
+    font-weight: 650;
+    cursor: pointer;
+    color: var(--primary-foreground);
+    background: var(--primary);
+    box-shadow: 0 4px 12px -4px color-mix(in oklch, var(--primary) 55%, transparent);
+    transition:
+      opacity 0.16s var(--ease-out, ease),
+      transform 0.16s var(--ease-out, ease);
+  }
+  .generate-btn:hover {
+    opacity: 0.94;
+  }
+  .generate-btn:active {
     transform: scale(calc(1 - 0.03 * var(--rail-motion, 1)));
   }
+  .generate-btn:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 2px var(--ring);
+  }
+
   .suggest-spinner {
     width: 0.7rem;
     height: 0.7rem;

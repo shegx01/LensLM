@@ -69,6 +69,19 @@ describe('AudioOverviewSetup — format & length', () => {
     );
   });
 
+  it('keeps a manually chosen length when the format later changes (no jumping)', async () => {
+    const onGenerate = open();
+
+    // Pick Short explicitly, then switch to Debate (whose default is Long).
+    await fireEvent.click(screen.getByRole('button', { name: 'Short' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Debate' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Generate' }));
+
+    expect(onGenerate).toHaveBeenCalledWith(
+      expect.objectContaining({ format: 'debate', length: 'short' })
+    );
+  });
+
   it('shows the selected format description', async () => {
     open();
     await fireEvent.click(screen.getByRole('button', { name: 'Debate' }));
@@ -128,5 +141,16 @@ describe('AudioOverviewSetup — focus', () => {
     const textarea = await screen.findByDisplayValue('emphasise the Q3 revenue drivers');
     expect(textarea).toBeInTheDocument();
     expect(suggestOverviewFocus).toHaveBeenCalledWith('nb-001');
+  });
+
+  it('surfaces an error when Suggest fails (never fails silently)', async () => {
+    suggestOverviewFocus.mockRejectedValue({ kind: 'Model', message: 'LLM request failed' });
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    open();
+
+    await fireEvent.click(screen.getByRole('button', { name: /Suggest/ }));
+
+    expect(await screen.findByRole('alert')).toBeInTheDocument();
+    consoleSpy.mockRestore();
   });
 });
