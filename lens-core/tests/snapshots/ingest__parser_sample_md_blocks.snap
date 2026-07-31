@@ -1,12 +1,12 @@
 ---
 source: lens-core/tests/ingest.rs
-assertion_line: 150
+assertion_line: 119
 expression: shape
 ---
 [
     (
-        0,
-        "",
+        1,
+        "A",
         "heading",
         "A",
     ),
@@ -17,8 +17,8 @@ expression: shape
         "Content directly under A.",
     ),
     (
-        1,
-        "A",
+        2,
+        "A > B",
         "heading",
         "B",
     ),
@@ -29,8 +29,8 @@ expression: shape
         "Content directly under B.",
     ),
     (
-        2,
-        "A > B",
+        3,
+        "A > B > C",
         "heading",
         "C",
     ),

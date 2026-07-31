@@ -116,8 +116,14 @@ mod tests {
         ];
         let s = build_sections(&blocks);
         assert_eq!(s.len(), 2);
-        assert_eq!((s[0].level, s[0].ordinal, s[0].title.as_str()), (1, 1, "Chapter 1"));
-        assert_eq!((s[1].level, s[1].ordinal, s[1].title.as_str()), (1, 2, "Chapter 2"));
+        assert_eq!(
+            (s[0].level, s[0].ordinal, s[0].title.as_str()),
+            (1, 1, "Chapter 1")
+        );
+        assert_eq!(
+            (s[1].level, s[1].ordinal, s[1].title.as_str()),
+            (1, 2, "Chapter 2")
+        );
         // Section 1 ends where section 2 begins; section 2 runs to document end.
         assert_eq!(s[0].char_start, 0);
         assert_eq!(s[0].char_end, 100);
@@ -136,11 +142,19 @@ mod tests {
         ];
         let s = build_sections(&blocks);
         // A(l1,o1), B(l2,o1), C(l2,o2), D(l1,o2), E(l2,o1 — resets under new parent D)
-        let got: Vec<(u8, u32, &str)> =
-            s.iter().map(|x| (x.level, x.ordinal, x.title.as_str())).collect();
+        let got: Vec<(u8, u32, &str)> = s
+            .iter()
+            .map(|x| (x.level, x.ordinal, x.title.as_str()))
+            .collect();
         assert_eq!(
             got,
-            vec![(1, 1, "A"), (2, 1, "B"), (2, 2, "C"), (1, 2, "D"), (2, 1, "E")]
+            vec![
+                (1, 1, "A"),
+                (2, 1, "B"),
+                (2, 2, "C"),
+                (1, 2, "D"),
+                (2, 1, "E")
+            ]
         );
         // A spans to the next level<=1 heading (D@30); B spans to C@20; D spans to doc end.
         assert_eq!(s[0].char_end, 30);

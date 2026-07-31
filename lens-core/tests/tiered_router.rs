@@ -56,7 +56,16 @@ async fn insert_chunk(
     text: &str,
 ) {
     insert_chunk_at(
-        pool, source_id, chunk_id, parent_id, kind, level, token_start, 0, "Intro", text,
+        pool,
+        source_id,
+        chunk_id,
+        parent_id,
+        kind,
+        level,
+        token_start,
+        0,
+        "Intro",
+        text,
     )
     .await;
 }
@@ -1201,19 +1210,67 @@ async fn tier0_scopes_a_positional_query_to_its_section() {
     let pool = engine.pool().await;
     let nb = engine.create_notebook("nb", None, None).await.unwrap().id;
     insert_source(&pool, &nb, "s1", 100).await;
-    insert_chunk_at(&pool, "s1", "p1", None, "parent", 0, 0, 0, "Chapter 1", "chapter one body").await;
-    insert_chunk_at(&pool, "s1", "p2", None, "parent", 0, 1, 100, "Chapter 2", "chapter two body").await;
-    insert_chunk_at(&pool, "s1", "p3", None, "parent", 0, 2, 200, "Chapter 3", "chapter three body").await;
+    insert_chunk_at(
+        &pool,
+        "s1",
+        "p1",
+        None,
+        "parent",
+        0,
+        0,
+        0,
+        "Chapter 1",
+        "chapter one body",
+    )
+    .await;
+    insert_chunk_at(
+        &pool,
+        "s1",
+        "p2",
+        None,
+        "parent",
+        0,
+        1,
+        100,
+        "Chapter 2",
+        "chapter two body",
+    )
+    .await;
+    insert_chunk_at(
+        &pool,
+        "s1",
+        "p3",
+        None,
+        "parent",
+        0,
+        2,
+        200,
+        "Chapter 3",
+        "chapter three body",
+    )
+    .await;
     insert_section(&pool, "s1", 1, 1, "Chapter 1", 0, 100).await;
     insert_section(&pool, "s1", 1, 2, "Chapter 2", 100, 200).await;
     insert_section(&pool, "s1", 1, 3, "Chapter 3", 200, 300).await;
 
     let (store, coord) = store_and_coord(&engine, dir.path(), pool.clone(), &nb);
     let reranker = Reranker::new(dir.path());
-    let out = tier0_search(&pool, &store, &coord, &reranker, "what is the summary of chapter 2?").await;
+    let out = tier0_search(
+        &pool,
+        &store,
+        &coord,
+        &reranker,
+        "what is the summary of chapter 2?",
+    )
+    .await;
 
     assert_eq!(out.tier, Tier::Tier0);
-    assert_eq!(out.units.len(), 1, "only chapter 2's chunk is in scope, got {:?}", out.units);
+    assert_eq!(
+        out.units.len(),
+        1,
+        "only chapter 2's chunk is in scope, got {:?}",
+        out.units
+    );
     assert_eq!(out.units[0].chunk_id, "p2");
     assert!(out.units[0].text.contains("two"));
 }
@@ -1227,8 +1284,32 @@ async fn tier0_unresolved_target_falls_back_identically_to_baseline() {
     let pool = engine.pool().await;
     let nb = engine.create_notebook("nb", None, None).await.unwrap().id;
     insert_source(&pool, &nb, "s1", 100).await;
-    insert_chunk_at(&pool, "s1", "p1", None, "parent", 0, 0, 0, "Chapter 1", "chapter one body").await;
-    insert_chunk_at(&pool, "s1", "p2", None, "parent", 0, 1, 100, "Chapter 2", "chapter two body").await;
+    insert_chunk_at(
+        &pool,
+        "s1",
+        "p1",
+        None,
+        "parent",
+        0,
+        0,
+        0,
+        "Chapter 1",
+        "chapter one body",
+    )
+    .await;
+    insert_chunk_at(
+        &pool,
+        "s1",
+        "p2",
+        None,
+        "parent",
+        0,
+        1,
+        100,
+        "Chapter 2",
+        "chapter two body",
+    )
+    .await;
     insert_section(&pool, "s1", 1, 1, "Chapter 1", 0, 100).await;
     insert_section(&pool, "s1", 1, 2, "Chapter 2", 100, 200).await;
 
@@ -1237,8 +1318,15 @@ async fn tier0_unresolved_target_falls_back_identically_to_baseline() {
     let unresolved = tier0_search(&pool, &store, &coord, &reranker, "summarize chapter 9").await;
     let baseline = tier0_search(&pool, &store, &coord, &reranker, "tell me everything").await;
 
-    assert_ne!(unresolved.tier, Tier::Tier0, "unresolved target must not scope");
-    assert_eq!(unresolved, baseline, "fallback is identical to the non-structural baseline");
+    assert_ne!(
+        unresolved.tier,
+        Tier::Tier0,
+        "unresolved target must not scope"
+    );
+    assert_eq!(
+        unresolved, baseline,
+        "fallback is identical to the non-structural baseline"
+    );
 }
 
 /// A named section ("the introduction") resolves by title, not ordinal.
@@ -1249,14 +1337,45 @@ async fn tier0_resolves_a_named_section_by_title() {
     let pool = engine.pool().await;
     let nb = engine.create_notebook("nb", None, None).await.unwrap().id;
     insert_source(&pool, &nb, "s1", 100).await;
-    insert_chunk_at(&pool, "s1", "p1", None, "parent", 0, 0, 0, "Introduction", "the intro body").await;
-    insert_chunk_at(&pool, "s1", "p2", None, "parent", 0, 1, 100, "Chapter 1", "chapter one body").await;
+    insert_chunk_at(
+        &pool,
+        "s1",
+        "p1",
+        None,
+        "parent",
+        0,
+        0,
+        0,
+        "Introduction",
+        "the intro body",
+    )
+    .await;
+    insert_chunk_at(
+        &pool,
+        "s1",
+        "p2",
+        None,
+        "parent",
+        0,
+        1,
+        100,
+        "Chapter 1",
+        "chapter one body",
+    )
+    .await;
     insert_section(&pool, "s1", 1, 1, "Introduction", 0, 100).await;
     insert_section(&pool, "s1", 1, 2, "Chapter 1", 100, 200).await;
 
     let (store, coord) = store_and_coord(&engine, dir.path(), pool.clone(), &nb);
     let reranker = Reranker::new(dir.path());
-    let out = tier0_search(&pool, &store, &coord, &reranker, "summarize the introduction").await;
+    let out = tier0_search(
+        &pool,
+        &store,
+        &coord,
+        &reranker,
+        "summarize the introduction",
+    )
+    .await;
 
     assert_eq!(out.tier, Tier::Tier0);
     assert_eq!(out.units.len(), 1);

@@ -164,7 +164,11 @@ impl Extractor for PdfExtractor {
                 Err(_) => continue,
             };
 
-            let modal_font = if use_outline { 0.0 } else { modal_font_size(&text) };
+            let modal_font = if use_outline {
+                0.0
+            } else {
+                modal_font_size(&text)
+            };
 
             for segment in text.segments().iter() {
                 let seg_text = segment.text();
@@ -248,17 +252,20 @@ fn collect_bookmarks<'a>(root: Option<PdfBookmark<'a>>) -> Vec<(u8, usize, Strin
     out
 }
 
-fn walk_bookmarks<'a>(node: Option<PdfBookmark<'a>>, depth: u8, out: &mut Vec<(u8, usize, String)>) {
+fn walk_bookmarks<'a>(
+    node: Option<PdfBookmark<'a>>,
+    depth: u8,
+    out: &mut Vec<(u8, usize, String)>,
+) {
     let mut cur = node;
     while let Some(bm) = cur {
-        if let (Some(title), Some(dest)) = (bm.title(), bm.destination()) {
-            if let Ok(idx) = dest.page_index() {
-                if let Ok(page) = usize::try_from(idx) {
-                    let t = title.trim().to_string();
-                    if !t.is_empty() {
-                        out.push((depth, page, t));
-                    }
-                }
+        if let (Some(title), Some(dest)) = (bm.title(), bm.destination())
+            && let Ok(idx) = dest.page_index()
+            && let Ok(page) = usize::try_from(idx)
+        {
+            let t = title.trim().to_string();
+            if !t.is_empty() {
+                out.push((depth, page, t));
             }
         }
         walk_bookmarks(bm.first_child(), depth.saturating_add(1), out);

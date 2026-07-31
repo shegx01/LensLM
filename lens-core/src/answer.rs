@@ -1003,7 +1003,10 @@ mod tests {
             ),
         );
         let user = build_grounded_user(&units, &HashMap::new(), &sections, "q", "n0");
-        assert!(!user.contains(")\n"), "no close-paren + newline breakout via section");
+        assert!(
+            !user.contains(")\n"),
+            "no close-paren + newline breakout via section"
+        );
         let injected = user
             .lines()
             .find(|l| l.contains("SYSTEM OVERRIDE"))

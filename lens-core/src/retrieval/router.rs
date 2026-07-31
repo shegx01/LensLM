@@ -1152,17 +1152,16 @@ pub async fn tiered_search(
     // retrieval to that section. `query_text` is the caller's (condensed) retrieval
     // query, so anaphoric follow-ups detect correctly. An unresolved/ambiguous target
     // returns None and falls through, leaving non-structural queries byte-identical.
-    if let Some(target) = super::structural::detect_structural_target(query_text) {
-        if let Some(units) =
+    if let Some(target) = super::structural::detect_structural_target(query_text)
+        && let Some(units) =
             resolve_structural(pool_db, &source_ids, &source_rank, &target, caps.tier2_cap).await?
-        {
-            let total_tokens = units.iter().map(|u| estimate_tokens(&u.text)).sum();
-            return Ok(RouterOutput {
-                tier: Tier::Tier0,
-                units,
-                total_tokens,
-            });
-        }
+    {
+        let total_tokens = units.iter().map(|u| estimate_tokens(&u.text)).sum();
+        return Ok(RouterOutput {
+            tier: Tier::Tier0,
+            units,
+            total_tokens,
+        });
     }
 
     // Tier selection: Σ cached token_count vs the derived tier-1 cap. A single

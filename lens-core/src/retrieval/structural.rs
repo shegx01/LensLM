@@ -52,24 +52,31 @@ pub fn detect_structural_target(query: &str) -> Option<StructuralTarget> {
 
     // Ordinal form: a structural noun adjacent to a cardinal, in either order.
     for i in 0..toks.len() {
-        if let Some(kind) = structural_noun(toks[i]) {
-            if let Some(next) = toks.get(i + 1).and_then(|t| parse_cardinal(t)) {
-                return Some(StructuralTarget::Ordinal { kind, ordinal: next });
-            }
-            if i > 0 {
-                if let Some(prev) = parse_cardinal(toks[i - 1]) {
-                    return Some(StructuralTarget::Ordinal { kind, ordinal: prev });
-                }
-            }
+        let Some(kind) = structural_noun(toks[i]) else {
+            continue;
+        };
+        if let Some(next) = toks.get(i + 1).and_then(|t| parse_cardinal(t)) {
+            return Some(StructuralTarget::Ordinal {
+                kind,
+                ordinal: next,
+            });
+        }
+        if i > 0
+            && let Some(prev) = parse_cardinal(toks[i - 1])
+        {
+            return Some(StructuralTarget::Ordinal {
+                kind,
+                ordinal: prev,
+            });
         }
     }
 
     // Named form: "the <named>" only, to avoid firing on prose like "in conclusion".
     for w in toks.windows(2) {
-        if w[0] == "the" {
-            if let Some(named) = named_section(w[1]) {
-                return Some(StructuralTarget::Named(named));
-            }
+        if w[0] == "the"
+            && let Some(named) = named_section(w[1])
+        {
+            return Some(StructuralTarget::Named(named));
         }
     }
 
@@ -115,14 +122,48 @@ fn parse_cardinal(tok: &str) -> Option<u32> {
 
 fn word_cardinal(tok: &str) -> Option<u32> {
     const WORDS: [&str; 20] = [
-        "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
-        "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen",
-        "eighteen", "nineteen", "twenty",
+        "one",
+        "two",
+        "three",
+        "four",
+        "five",
+        "six",
+        "seven",
+        "eight",
+        "nine",
+        "ten",
+        "eleven",
+        "twelve",
+        "thirteen",
+        "fourteen",
+        "fifteen",
+        "sixteen",
+        "seventeen",
+        "eighteen",
+        "nineteen",
+        "twenty",
     ];
     const ORDINALS: [&str; 20] = [
-        "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth",
-        "ninth", "tenth", "eleventh", "twelfth", "thirteenth", "fourteenth", "fifteenth",
-        "sixteenth", "seventeenth", "eighteenth", "nineteenth", "twentieth",
+        "first",
+        "second",
+        "third",
+        "fourth",
+        "fifth",
+        "sixth",
+        "seventh",
+        "eighth",
+        "ninth",
+        "tenth",
+        "eleventh",
+        "twelfth",
+        "thirteenth",
+        "fourteenth",
+        "fifteenth",
+        "sixteenth",
+        "seventeenth",
+        "eighteenth",
+        "nineteenth",
+        "twentieth",
     ];
     WORDS
         .iter()
@@ -173,8 +214,14 @@ mod tests {
     #[case("overview of part II", Some(StructuralTarget::Ordinal { kind: Part, ordinal: 2 }))]
     #[case("section 5 please", Some(StructuralTarget::Ordinal { kind: Section, ordinal: 5 }))]
     #[case("ch 3 summary", Some(StructuralTarget::Ordinal { kind: Chapter, ordinal: 3 }))]
-    #[case("summarize the introduction", Some(StructuralTarget::Named(NamedSection::Introduction)))]
-    #[case("what's in the conclusion?", Some(StructuralTarget::Named(NamedSection::Conclusion)))]
+    #[case(
+        "summarize the introduction",
+        Some(StructuralTarget::Named(NamedSection::Introduction))
+    )]
+    #[case(
+        "what's in the conclusion?",
+        Some(StructuralTarget::Named(NamedSection::Conclusion))
+    )]
     fn detects_positional_queries(#[case] q: &str, #[case] want: Option<StructuralTarget>) {
         assert_eq!(detect_structural_target(q), want);
     }
@@ -199,7 +246,19 @@ mod tests {
         let ch = detect_structural_target("chapter 2");
         let sec = detect_structural_target("section 2");
         assert_ne!(ch, sec);
-        assert_eq!(ch, Some(StructuralTarget::Ordinal { kind: Chapter, ordinal: 2 }));
-        assert_eq!(sec, Some(StructuralTarget::Ordinal { kind: Section, ordinal: 2 }));
+        assert_eq!(
+            ch,
+            Some(StructuralTarget::Ordinal {
+                kind: Chapter,
+                ordinal: 2
+            })
+        );
+        assert_eq!(
+            sec,
+            Some(StructuralTarget::Ordinal {
+                kind: Section,
+                ordinal: 2
+            })
+        );
     }
 }
