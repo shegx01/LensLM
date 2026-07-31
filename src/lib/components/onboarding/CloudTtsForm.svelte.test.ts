@@ -200,3 +200,98 @@ describe('CloudTtsForm — key save refreshes availability', () => {
     expect(screen.queryByText(/requires an api key/i)).not.toBeInTheDocument();
   });
 });
+
+describe('CloudTtsForm — base URL scheme validation (#245)', () => {
+  function renderOpenAiCompatible(): void {
+    render(CloudTtsForm, {
+      props: {
+        catalog: catalogFixture({ cloudAvailable: true }),
+        kind: 'open_ai_compatible',
+        active: true
+      }
+    });
+  }
+
+  async function baseUrlField(): Promise<HTMLElement> {
+    const field = await screen.findByLabelText(/base url/i);
+    await waitFor(() => expect(field).toHaveValue('https://api.openai.com'));
+    return field;
+  }
+
+  // Includes the schemes the ticket names explicitly (javascript:/data:/file:),
+  // which hit the allowlist's protocol branch, plus a scheme-less string that
+  // fails URL parsing — a blocklist-style regression would leak the former.
+  it.each([
+    ['ftp://evil.example.com'],
+    ['javascript:alert(1)'],
+    ['data:text/html,hi'],
+    ['file:///etc/passwd'],
+    ['api.openai.com']
+  ])('rejects %s with an inline error and does not save', async (value) => {
+    let saved = false;
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return cloudKeyedConfig();
+      if (cmd === 'tts_engine_catalog') return catalogFixture({ cloudAvailable: true });
+      if (cmd === 'set_config') {
+        saved = true;
+        return null;
+      }
+    });
+
+    renderOpenAiCompatible();
+    const field = await baseUrlField();
+    await fireEvent.input(field, { target: { value } });
+    await fireEvent.blur(field);
+
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent(/valid base url/i));
+    expect(saved).toBe(false);
+  });
+
+  // http:// must stay accepted — plaintext localhost / self-hosted (LocalAI) is a
+  // supported endpoint, so the guard is an allowlist of schemes, not https-only.
+  it.each([['https://api.groq.com'], ['http://localhost:1234/v1']])(
+    'accepts %s and persists it',
+    async (value) => {
+      let written: AppConfig | null = null;
+      mockIPC((cmd, args) => {
+        if (cmd === 'get_config') return cloudKeyedConfig();
+        if (cmd === 'tts_engine_catalog') return catalogFixture({ cloudAvailable: true });
+        if (cmd === 'set_config') {
+          written = (args as { config: AppConfig }).config;
+          return null;
+        }
+      });
+
+      renderOpenAiCompatible();
+      const field = await baseUrlField();
+      await fireEvent.input(field, { target: { value } });
+      await fireEvent.blur(field);
+
+      await waitFor(() => expect(written).not.toBeNull());
+      expect((written as unknown as AppConfig).tts.clouds.open_ai_compatible?.base_url).toBe(value);
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    }
+  );
+
+  it('persists the trimmed (vetted) base URL, not the raw input', async () => {
+    let written: AppConfig | null = null;
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return cloudKeyedConfig();
+      if (cmd === 'tts_engine_catalog') return catalogFixture({ cloudAvailable: true });
+      if (cmd === 'set_config') {
+        written = (args as { config: AppConfig }).config;
+        return null;
+      }
+    });
+
+    renderOpenAiCompatible();
+    const field = await baseUrlField();
+    await fireEvent.input(field, { target: { value: '  https://api.groq.com  ' } });
+    await fireEvent.blur(field);
+
+    await waitFor(() => expect(written).not.toBeNull());
+    expect((written as unknown as AppConfig).tts.clouds.open_ai_compatible?.base_url).toBe(
+      'https://api.groq.com'
+    );
+  });
+});
