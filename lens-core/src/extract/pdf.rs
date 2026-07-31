@@ -122,10 +122,8 @@ impl Extractor for PdfExtractor {
         let mut blocks: Vec<Block> = Vec::new();
         let mut anchors: Vec<SourceAnchor> = Vec::new();
 
-        // Prefer the embedded outline (bookmarks) for section structure (#279); fall back
-        // to the per-page font-size heading heuristic when a PDF has no outline. Either way
-        // headings become blocks so `build_sections` derives the same structure as the
-        // block-based formats.
+        // Section structure (#279): the embedded outline when present, else the per-page
+        // font-size heading heuristic. Both emit heading blocks for `build_sections`.
         let mut outline = collect_bookmarks(document.bookmarks().root());
         outline.sort_by_key(|(_, page, _)| *page);
         let use_outline = !outline.is_empty();
@@ -184,8 +182,7 @@ impl Extractor for PdfExtractor {
                     bounds.top().value,
                 ];
 
-                // With an outline, segments are body text — structure comes from bookmarks.
-                // Without one, the font-size heuristic promotes big short runs to headings.
+                // No outline → the font-size heuristic promotes big short runs to headings.
                 let is_heading = !use_outline
                     && seg_text.chars().count() <= HEADING_MAX_CHARS
                     && modal_font > 0.0
@@ -243,19 +240,16 @@ impl Extractor for PdfExtractor {
     }
 }
 
-/// Depth-first collects the document outline as `(depth, page_index, title)` triples
-/// (depth 1 = top level). Bookmarks with no title or no resolvable page destination
-/// (named/URI/remote actions) are skipped, so the caller falls back to the heuristic.
+/// Depth-first collects the outline as `(depth, page_index, title)` triples (depth 1 =
+/// top level). Bookmarks with no title or no resolvable page destination are skipped.
 fn collect_bookmarks<'a>(root: Option<PdfBookmark<'a>>) -> Vec<(u8, usize, String)> {
     let mut out = Vec::new();
     walk_bookmarks(root, 1, &mut out);
     out
 }
 
-/// Outline bounds: an untrusted PDF may nest bookmarks thousands deep or cycle its
-/// sibling/child links. Depth caps recursion (stack-overflow guard), the node cap bounds
-/// total output, and the per-level sibling cap bounds a `next_sibling` cycle whose nodes
-/// carry no title (so `out` never grows to trip the node cap).
+/// Bounds against a malicious PDF outline (deep nesting → stack overflow; sibling/child
+/// cycles → hang). The sibling cap catches a cycle of title-less nodes that never grow `out`.
 const MAX_BOOKMARK_DEPTH: u8 = 32;
 const MAX_BOOKMARK_NODES: usize = 10_000;
 
@@ -363,9 +357,7 @@ mod tests {
         buf
     }
 
-    /// Builds a 2-page PDF with a flat embedded outline (one bookmark per page). printpdf
-    /// keys bookmarks by page in a `HashMap` (non-deterministic order); the extractor sorts
-    /// by page, so the resulting outline order is stable.
+    /// A 2-page PDF with a flat embedded outline (one bookmark per page).
     fn build_bookmarked_pdf() -> Vec<u8> {
         use printpdf::{BuiltinFont, Mm, PdfDocument};
         use std::io::BufWriter;
@@ -399,8 +391,7 @@ mod tests {
         buf
     }
 
-    /// The embedded outline becomes the section structure (#279): each bookmark is a
-    /// self-inclusive heading block, and `build_sections` derives the level/ordinal outline.
+    /// The embedded outline becomes the section structure (#279).
     #[test]
     fn pdf_outline_becomes_section_structure() {
         let raw = build_bookmarked_pdf();

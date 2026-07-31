@@ -352,12 +352,10 @@ fn title_has_word(title: &str, word: &str) -> bool {
         .any(|tok| tok.eq_ignore_ascii_case(word))
 }
 
-/// Tier-0 structural resolver (#279). Returns section-scoped parent chunks in document
-/// order when `target` resolves to a real section in the selected corpus, or `None` to
-/// fall through to normal retrieval — the low-confidence gate: an ordinal/name matching
-/// no section must NOT scope to a wrong one. "chapter N" prefers the Nth section whose
-/// title names the kind, else the Nth shallowest-level section (sub-section precision is a
-/// non-goal). A parent chunk is attributed to the section holding its midpoint.
+/// Tier-0 structural resolver (#279): section-scoped parent chunks for a resolved `target`,
+/// or `None` to fall through to normal retrieval (an ordinal/name matching no section must
+/// NOT scope to a wrong one). "chapter N" prefers the Nth section whose title names the
+/// kind, else the Nth shallowest-level section; a parent is attributed by its midpoint.
 async fn resolve_structural(
     pool: &SqlitePool,
     source_ids: &[String],
@@ -369,8 +367,6 @@ async fn resolve_structural(
 
     let mut spans: Vec<(String, i64, i64)> = Vec::new();
     for source_id in source_ids {
-        // Resolve against this source's outline in Rust with WHOLE-WORD title matching so
-        // "part" doesn't match "Department" nor "introduction" match "reintroduction".
         let sections = sqlx::query_as::<_, (String, i64, i64, i64)>(
             "SELECT title, char_start, char_end, level FROM sections \
              WHERE source_id = ? ORDER BY char_start ASC",
@@ -381,9 +377,8 @@ async fn resolve_structural(
         let picked = match target {
             StructuralTarget::Ordinal { kind, ordinal } => {
                 let n = (*ordinal as usize).saturating_sub(1);
-                // Prefer the Nth section whose title NAMES the kind ("Chapter 2"), so
-                // "chapter 2" in a Part→Chapter book resolves to the chapter, not Part II.
-                // Fall back to the Nth section at the shallowest level (single-level books).
+                // Nth title naming the kind (so "chapter 2" ≠ "Part II"), else Nth at the
+                // shallowest level.
                 let by_title: Vec<&(String, i64, i64, i64)> = sections
                     .iter()
                     .filter(|(t, _, _, _)| title_has_word(t, kind.title_keyword()))
@@ -429,10 +424,9 @@ async fn resolve_structural(
     }
     let mut rows: Vec<SpanRow> = Vec::new();
     for (source_id, cs, ce) in &spans {
-        // MIDPOINT attribution: parents pack by token budget and never flush at a heading, so
-        // one can straddle a boundary. Attributing it to the section holding its MIDPOINT keeps
-        // the opening (a mostly-in-section straddler) yet won't drag in the whole previous
-        // section — the balance between start-containment (drops opening) and overlap. Bind cs, ce.
+        // A parent packs by token budget and never flushes at a heading, so attribute a
+        // boundary-straddler by its MIDPOINT — keeps the opening without pulling in the
+        // neighbour (start-containment drops the opening; overlap over-includes it).
         let recs = sqlx::query_as::<_, (String, String, Option<String>, String, i64)>(&format!(
             "SELECT c.id, c.text, c.source_anchor, c.section_path, c.char_start \
              FROM chunks c JOIN sources s ON s.id = c.source_id \
@@ -460,8 +454,7 @@ async fn resolve_structural(
         }
     }
 
-    // A matched section with no parent chunks (degenerate) falls back rather than
-    // grounding on nothing.
+    // Matched a section but it has no live parent chunks → fall back, don't ground on nothing.
     if rows.is_empty() {
         return Ok(None);
     }
@@ -1173,10 +1166,8 @@ pub async fn tiered_search(
         .map(|(i, id)| (id.clone(), i))
         .collect();
 
-    // Tier-0 (#279): a positional query resolved against the `sections` outline scopes
-    // retrieval to that section. `query_text` is the caller's (condensed) retrieval
-    // query, so anaphoric follow-ups detect correctly. An unresolved/ambiguous target
-    // returns None and falls through, leaving non-structural queries byte-identical.
+    // Tier-0 (#279): detect on the caller's (condensed) `query_text` so anaphoric follow-ups
+    // work; an unresolved target falls through, leaving non-structural queries byte-identical.
     if let Some(target) = super::structural::detect_structural_target(query_text)
         && let Some(units) =
             resolve_structural(pool_db, &source_ids, &source_rank, &target, caps.tier2_cap).await?

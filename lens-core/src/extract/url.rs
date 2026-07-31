@@ -9,11 +9,10 @@
 //!
 //! # Block model
 //!
-//! We request `rs_trafilatura`'s GitHub-Flavored-Markdown output and parse it with the
-//! shared Markdown parser, so `<h1>–<h6>` become `section_path`-bearing heading blocks
-//! (#279). When markdown is unavailable we fall back to the flat `content_text`, one
-//! `paragraph` block per line-group with `section_path = ""`. Each block's `text_offset`
-//! is its start byte index as a decimal string (a stable pointer into the text buffer).
+//! We parse `rs_trafilatura`'s GFM output with the shared Markdown parser so `<h1>–<h6>`
+//! become `section_path`-bearing heading blocks (#279), falling back to the flat
+//! `content_text` (one `paragraph` block per line-group) when markdown is unavailable.
+//! Each block's `text_offset` is its start byte index (a stable pointer into the buffer).
 //!
 //! # needs_js detection
 //!
@@ -43,9 +42,7 @@ impl Extractor for UrlExtractor {
         let result = rs_trafilatura::extract_bytes_with_options(raw, &options)
             .map_err(|e| LensError::Validation(format!("URL content extraction failed: {e}")))?;
 
-        // Prefer the structured Markdown: its `#` headings feed the shared markdown parser,
-        // which populates `section_path` so positional queries resolve (#279). Fall back to
-        // the flat `content_text` when markdown is unavailable.
+        // Structured Markdown (headings → `section_path`, #279) when available, else the flat text.
         if let Some(md) = result
             .content_markdown
             .as_deref()

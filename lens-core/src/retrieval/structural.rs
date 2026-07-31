@@ -3,9 +3,8 @@
 //! Pure and deterministic; unclear queries return `None` and fall through to normal
 //! retrieval. Precision over recall — a false positive scopes to the wrong section.
 
-/// The structural unit a positional query refers to. Kept distinct from heading
-/// `level` because "chapter"/"section"/"part" are user vocabulary the resolver maps
-/// onto whatever heading depth a given document actually uses.
+/// The structural unit a positional query names — user vocabulary the resolver maps onto
+/// the document's actual heading depth.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StructuralKind {
     Chapter,

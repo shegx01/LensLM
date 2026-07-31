@@ -1698,9 +1698,7 @@ async fn delete_chunks_for_source(
     Ok(())
 }
 
-/// Replaces a source's outline rows (#279). Called before `insert_sections` so a
-/// re-ingest never leaves stale sections; `sections` has no self-FK so one DELETE
-/// suffices (unlike the parent/child `chunks` two-step above).
+/// Clears a source's outline rows before re-ingest (#279).
 async fn delete_sections_for_source(
     conn: &mut sqlx::SqliteConnection,
     source_id: &str,
@@ -1712,8 +1710,7 @@ async fn delete_sections_for_source(
     Ok(())
 }
 
-/// Persists the per-source outline (#279). `page` is NULL — section spans are keyed
-/// by `char_start`/`char_end` in the chunk coordinate space, not page.
+/// Persists the per-source outline (#279); `page` is NULL (spans are char-keyed).
 async fn insert_sections(
     conn: &mut sqlx::SqliteConnection,
     source_id: &str,

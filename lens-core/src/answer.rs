@@ -172,8 +172,7 @@ fn build_grounded_user(
     for (i, u) in units.iter().enumerate() {
         let title = titles.get(&u.source_id).unwrap_or(&u.source_id);
         let mut label = sanitize_title(title);
-        // The section trail/page are untrusted document text; sanitize them the same way
-        // as the title before they enter the UNFENCED label (#279 breakout guard).
+        // Untrusted document text → sanitize like the title before the unfenced label (#279).
         if let Some((section, page)) = sections.get(&u.chunk_id) {
             if let Some(s) = section {
                 let s = sanitize_title(s);
@@ -196,11 +195,9 @@ fn build_grounded_user(
     )
 }
 
-/// Neutralizes source-derived (untrusted) text before it enters the UNFENCED `[n] (…)`
-/// label: maps `)` so a crafted value can't close the parenthetical early, collapses ALL
-/// whitespace — including Unicode line/paragraph separators U+2028/U+2029 — to a space so
-/// nothing starts a new (directive) line, drops control + bidi/zero-width format chars,
-/// and caps length. The excerpt body stays fenced separately.
+/// Neutralizes untrusted source text before the UNFENCED `[n] (…)` label: maps `)` so it
+/// can't close the parenthetical, collapses all whitespace (incl. U+2028/U+2029) to a space
+/// so nothing starts a new line, and drops control + bidi/zero-width format chars.
 fn sanitize_title(title: &str) -> String {
     title
         .chars()
@@ -322,9 +319,8 @@ struct SectionLabelRow {
     page: Option<i64>,
 }
 
-/// Batched `SELECT id, section_path, page` over the units' chunk ids, into a
-/// `chunk_id → (section, page)` map for the grounded label (#279). An empty
-/// `section_path` maps to `None` so the label shows no section.
+/// Batched `chunk_id → (section, page)` over the units for the grounded label (#279); an
+/// empty `section_path` maps to `None`.
 async fn load_section_labels(
     pool: &SqlitePool,
     units: &[ContextUnit],
@@ -1012,8 +1008,6 @@ mod tests {
 
     #[test]
     fn hostile_section_heading_cannot_break_out_of_the_label() {
-        // The section trail enters the SAME unfenced label as the title and is equally
-        // untrusted document text; a crafted heading must not break out (#279).
         let units = vec![unit("sA", "c1", "body", 0)];
         let mut sections = HashMap::new();
         sections.insert(

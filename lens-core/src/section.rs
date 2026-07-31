@@ -1,13 +1,6 @@
-//! Document outline extraction (#279).
-//!
-//! [`build_sections`] derives a per-source outline (the `sections` table) from the
-//! flat [`Block`] list every extractor already produces. It relies on the shared
-//! convention that a heading block's `section_path` includes itself (see
-//! [`crate::parse::SectionPathStack`]): a heading's **level** is the segment count
-//! of its trail, its **title** is the heading text, and its span runs until the next
-//! heading of the same-or-shallower level. Structure-aware retrieval resolves
-//! positional queries ("summary of chapter 2") against these ordinals instead of
-//! matching the lossy heading string.
+//! Document outline extraction (#279): [`build_sections`] derives the per-source `sections`
+//! table from the flat [`Block`] list. A heading block's `section_path` is self-inclusive
+//! (see [`crate::parse::SectionPathStack`]), so its trail's segment count is its level.
 
 use crate::parse::{Block, BlockType};
 
@@ -38,9 +31,6 @@ pub(crate) fn build_sections(blocks: &[Block]) -> Vec<Section> {
     let heading = BlockType::Heading.as_str();
     let doc_end = blocks.iter().map(|b| b.char_end).max().unwrap_or(0);
 
-    // First pass: heading level (self-inclusive trail depth) + title + start, in order.
-    // Every extractor emits headings with a trail that ends in the heading itself, so the
-    // segment count is the depth (see `parse::SectionPathStack` and each extractor).
     let mut raw: Vec<(u8, String, usize)> = Vec::new();
     for b in blocks {
         if b.block_type != heading || b.section_path.is_empty() {
@@ -50,8 +40,7 @@ pub(crate) fn build_sections(blocks: &[Block]) -> Vec<Section> {
         raw.push((level, b.text.clone(), b.char_start));
     }
 
-    // Second pass: sibling ordinals (a shallower heading resets deeper counters) and
-    // the char span (next same-or-shallower heading start, else document end).
+    // Sibling ordinals: a shallower heading resets deeper counters.
     let mut counters = [0u32; 7];
     let mut out = Vec::with_capacity(raw.len());
     for (i, (level, title, char_start)) in raw.iter().enumerate() {
