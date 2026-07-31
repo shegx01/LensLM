@@ -5,8 +5,8 @@
 
 use serde::Serialize;
 
+use super::instructions::emotion_to_instruction;
 use super::map_status_error;
-use super::ssml::emotion_to_instruction;
 use crate::dialogue::Turn;
 use crate::error::LensError;
 use crate::tts::audio::{self, AudioBuffer};

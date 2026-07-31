@@ -10,7 +10,9 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use async_trait::async_trait;
 use lens_core::embedder::{CountingEmbedder, Embedder, EmbeddingBackend};
 use lens_core::llm::{LlmProvider, LlmRequest, LlmResponse};
-use lens_core::{AudioOverviewStatus, Length, LensEngine, LensError};
+use lens_core::{
+    AudioOverviewStatus, DialogueScript, Length, LensEngine, LensError, Speaker, Turn,
+};
 use sqlx::SqlitePool;
 use tokio_util::sync::CancellationToken;
 
@@ -65,16 +67,19 @@ async fn insert_overview_row(
     path: &str,
     status: &str,
     source_set_hash: &str,
+    script: Option<&str>,
 ) {
     sqlx::query(
-        "INSERT INTO audio_overviews (notebook_id, path, generated_at, status, source_set_hash) \
-         VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO audio_overviews \
+         (notebook_id, path, generated_at, status, source_set_hash, script) \
+         VALUES (?, ?, ?, ?, ?, ?)",
     )
     .bind(notebook_id)
     .bind(path)
     .bind(chrono::Utc::now().to_rfc3339())
     .bind(status)
     .bind(source_set_hash)
+    .bind(script)
     .execute(pool)
     .await
     .expect("insert audio_overviews row");
@@ -195,9 +200,9 @@ fn no_phase() -> impl Fn(lens_core::TtsPhase) + Send + Sync {
 }
 
 #[tokio::test]
-async fn migration_applies_and_table_exists_at_count_23() {
+async fn migration_applies_and_table_exists_at_count_24() {
     let engine = LensEngine::for_test().await;
-    assert_eq!(engine.migration_count().await.unwrap(), 23);
+    assert_eq!(engine.migration_count().await.unwrap(), 24);
     let pool = engine.pool().await;
     let exists: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='audio_overviews'",
@@ -205,7 +210,10 @@ async fn migration_applies_and_table_exists_at_count_23() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(exists, 1, "audio_overviews table must exist after 0023");
+    assert_eq!(
+        exists, 1,
+        "audio_overviews table must exist after 0023/0024"
+    );
 }
 
 // Read-path round-trip + reconciliation
@@ -222,7 +230,7 @@ async fn ready_row_reads_back_then_downgrades_to_missing_when_file_gone() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(tmp.path(), b"RIFF....WAVE").unwrap();
     let path = tmp.path().to_string_lossy().into_owned();
-    insert_overview_row(&pool, nb.as_str(), &path, "ready", &hash).await;
+    insert_overview_row(&pool, nb.as_str(), &path, "ready", &hash, None).await;
 
     let rec = engine
         .get_audio_overview_status(nb.as_str())
@@ -246,6 +254,81 @@ async fn ready_row_reads_back_then_downgrades_to_missing_when_file_gone() {
 }
 
 #[tokio::test]
+async fn ready_row_round_trips_the_persisted_transcript_script() {
+    let engine = LensEngine::for_test().await;
+    let pool = engine.pool().await;
+    let nb = engine.create_notebook("nb", None, None).await.unwrap().id;
+
+    let hash = engine.source_set_hash_for_test(nb.as_str()).await.unwrap();
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(tmp.path(), b"RIFF....WAVE").unwrap();
+    let path = tmp.path().to_string_lossy().into_owned();
+
+    let script = DialogueScript {
+        turns: vec![
+            Turn {
+                speaker: Speaker::Host,
+                text: "Welcome to the overview.".into(),
+                emotion: None,
+                source_ids: vec!["s1".into()],
+            },
+            Turn {
+                speaker: Speaker::Guest,
+                text: "Glad to dig in.".into(),
+                emotion: None,
+                source_ids: vec![],
+            },
+        ],
+    };
+    let script_json = serde_json::to_string(&script).unwrap();
+    insert_overview_row(
+        &pool,
+        nb.as_str(),
+        &path,
+        "ready",
+        &hash,
+        Some(&script_json),
+    )
+    .await;
+
+    let rec = engine
+        .get_audio_overview_status(nb.as_str())
+        .await
+        .unwrap()
+        .expect("row present");
+    assert_eq!(rec.status, AudioOverviewStatus::Ready);
+    assert_eq!(
+        rec.script,
+        Some(script),
+        "the persisted script must round-trip byte-for-byte through the read path"
+    );
+}
+
+#[tokio::test]
+async fn ready_row_without_a_script_reads_back_none() {
+    let engine = LensEngine::for_test().await;
+    let pool = engine.pool().await;
+    let nb = engine.create_notebook("nb", None, None).await.unwrap().id;
+
+    let hash = engine.source_set_hash_for_test(nb.as_str()).await.unwrap();
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(tmp.path(), b"RIFF....WAVE").unwrap();
+    let path = tmp.path().to_string_lossy().into_owned();
+    insert_overview_row(&pool, nb.as_str(), &path, "ready", &hash, None).await;
+
+    let rec = engine
+        .get_audio_overview_status(nb.as_str())
+        .await
+        .unwrap()
+        .expect("row present");
+    assert_eq!(rec.status, AudioOverviewStatus::Ready);
+    assert_eq!(
+        rec.script, None,
+        "a legacy (pre-0024) row reads back with no transcript"
+    );
+}
+
+#[tokio::test]
 async fn ready_row_with_changed_sources_reads_as_stale() {
     let engine = LensEngine::for_test().await;
     let pool = engine.pool().await;
@@ -261,6 +344,7 @@ async fn ready_row_with_changed_sources_reads_as_stale() {
         &tmp.path().to_string_lossy(),
         "ready",
         &hash_before,
+        None,
     )
     .await;
 
@@ -299,6 +383,7 @@ async fn failed_row_reads_back_as_failed() {
         "/nonexistent/overview.wav",
         "failed",
         "h",
+        None,
     )
     .await;
 
@@ -309,6 +394,7 @@ async fn failed_row_reads_back_as_failed() {
         .unwrap();
     // A failed row is NOT reconciled against the file — it stays failed.
     assert_eq!(rec.status, AudioOverviewStatus::Failed);
+    assert_eq!(rec.script, None, "a failed row carries no transcript");
 }
 
 #[tokio::test]
@@ -367,7 +453,10 @@ async fn dialogue_phase_failure_persists_failed_row() {
     let res = engine
         .generate_and_persist_overview(
             nb.as_str(),
+            lens_core::OverviewFormat::DeepDive,
             Length::Short,
+            None,
+            None,
             no_phase(),
             CancellationToken::new(),
         )
@@ -389,7 +478,15 @@ async fn synth_phase_failure_persists_failed_row() {
     // Dialogue succeeds (scripted provider) but no TTS backend is downloaded → synth
     // errors (Tts).
     let res = engine
-        .generate_and_persist_overview(&nb, Length::Short, no_phase(), CancellationToken::new())
+        .generate_and_persist_overview(
+            &nb,
+            lens_core::OverviewFormat::DeepDive,
+            Length::Short,
+            None,
+            None,
+            no_phase(),
+            CancellationToken::new(),
+        )
         .await;
     assert!(
         matches!(res, Err(LensError::Tts(_))),
@@ -412,12 +509,28 @@ async fn cancel_writes_no_failed_row_and_preserves_prior() {
     let hash = engine.source_set_hash_for_test(&nb).await.unwrap();
     let tmp = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(tmp.path(), b"RIFF....WAVE").unwrap();
-    insert_overview_row(&pool, &nb, &tmp.path().to_string_lossy(), "ready", &hash).await;
+    insert_overview_row(
+        &pool,
+        &nb,
+        &tmp.path().to_string_lossy(),
+        "ready",
+        &hash,
+        None,
+    )
+    .await;
 
     let cancel = CancellationToken::new();
     cancel.cancel();
     let out = engine
-        .generate_and_persist_overview(&nb, Length::Short, no_phase(), cancel)
+        .generate_and_persist_overview(
+            &nb,
+            lens_core::OverviewFormat::DeepDive,
+            Length::Short,
+            None,
+            None,
+            no_phase(),
+            cancel,
+        )
         .await
         .expect("cancel is not an error");
     assert!(out.is_none(), "cancel yields an idle-equivalent None");
@@ -440,7 +553,7 @@ async fn purge_notebook_cascades_audio_overview_row() {
     let engine = LensEngine::for_test().await;
     let pool = engine.pool().await;
     let nb = engine.create_notebook("nb", None, None).await.unwrap().id;
-    insert_overview_row(&pool, nb.as_str(), "/tmp/overview.wav", "failed", "h").await;
+    insert_overview_row(&pool, nb.as_str(), "/tmp/overview.wav", "failed", "h", None).await;
 
     // Purge (the hard-delete path that fires FK cascade) requires a trashed notebook.
     engine.trash_notebook(&nb).await.unwrap();

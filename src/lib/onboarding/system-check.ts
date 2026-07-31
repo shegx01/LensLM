@@ -251,6 +251,38 @@ export async function isTtsReady(): Promise<boolean> {
   return true;
 }
 
+// SYNC-CHECK: mirrors lens-core tts::catalog::Lang (serde snake_case), in enum order.
+/** Curated language set offered for a `multilingual` (Cloud) engine. */
+const MULTILINGUAL_OVERVIEW_LANGS = [
+  'english',
+  'chinese',
+  'german',
+  'italian',
+  'portuguese',
+  'spanish',
+  'japanese',
+  'korean',
+  'french',
+  'russian',
+  'dutch',
+  'arabic',
+  'hindi'
+];
+
+/**
+ * The languages the ACTIVE TTS engine can voice an Audio Overview in (snake_case ids).
+ * Empty when the engine is effectively single-language (e.g. Orpheus → English only)
+ * so the setup modal can hide the picker entirely.
+ */
+export async function overviewLanguageOptions(): Promise<string[]> {
+  if (!isTauri()) return [];
+  const [cfg, catalog] = await Promise.all([invoke<AppConfig>('get_config'), ttsEngineCatalog()]);
+  const entry = catalog.find((e) => e.id === ttsBackendId(cfg.tts.backend));
+  if (!entry) return [];
+  if (entry.multilingual) return MULTILINGUAL_OVERVIEW_LANGS;
+  return entry.supported_languages.length > 1 ? entry.supported_languages : [];
+}
+
 // SYNC-CHECK: a UI selector mapped to the wire `TtsBackend` (lens-core/src/tts/mod.rs) by
 // `nextTtsConfig` — NOT the wire type itself: it maps 'qwen3' → qwen3_local and every
 // Cloud kind → 'cloud'.

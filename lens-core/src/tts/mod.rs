@@ -155,9 +155,9 @@ pub enum CloudTtsKind {
 
 impl CloudTtsKind {
     /// Whether this provider accepts W3C SSML in the synthesis input. No wired cloud
-    /// engine does: OpenAI takes an `instructions` hint, ElevenLabs and Gemini take
-    /// inline bracketed audio cues embedded in the turn text. Consulted per-provider —
-    /// not surfaced in the static `TtsEngineId`-keyed catalog DTO (see #195 ADR).
+    /// engine does: OpenAI takes an `instructions` hint, ElevenLabs takes inline
+    /// bracketed audio tags, and Gemini takes natural-language style cues in the turn
+    /// text. Consulted per-provider — not in the static catalog DTO (see #195 ADR).
     pub fn supports_ssml(self) -> bool {
         match self {
             CloudTtsKind::OpenAiCompatible
@@ -322,13 +322,48 @@ pub fn resolve_tts_provider(
     resolve_tts_provider_full(backend, cfg, cache_root, None)
 }
 
+/// Single source of truth for rendering an abstract [`Emotion`] per TTS modality:
+/// each adapter reads the field for its own capability, so the engine maps can't
+/// drift. Unsupported emotions are `None` and degrade to plain delivery.
+pub(crate) struct EmotionRender {
+    /// Orpheus inline paralinguistic tag (a discrete sound), e.g. `<laugh>`.
+    pub orpheus: Option<&'static str>,
+    /// ElevenLabs v3 audio tag — DOCUMENTED tags only; an undocumented tag is spoken
+    /// literally rather than performed.
+    pub elevenlabs: Option<&'static str>,
+    /// Natural-language style, fitting `"Speak with {..}."` for the OpenAI
+    /// `instructions` field and a per-line parenthetical for Gemini.
+    pub style: Option<&'static str>,
+}
+
+pub(crate) fn emotion_render(emotion: Emotion) -> EmotionRender {
+    let (orpheus, elevenlabs, style) = match emotion {
+        Emotion::Neutral => (None, None, None),
+        Emotion::Laugh => (
+            Some("<laugh>"),
+            Some("[laughs]"),
+            Some("warm, light laughter"),
+        ),
+        Emotion::Sigh => (Some("<sigh>"), Some("[sighs]"), Some("a soft, weary sigh")),
+        Emotion::Excited => (
+            None,
+            Some("[excited]"),
+            Some("bright, energetic excitement"),
+        ),
+        Emotion::Thoughtful => (None, None, Some("a measured, thoughtful tone")),
+        Emotion::Curious => (None, Some("[curious]"), Some("genuine, engaged curiosity")),
+        Emotion::Serious => (None, None, Some("a serious, grounded tone")),
+    };
+    EmotionRender {
+        orpheus,
+        elevenlabs,
+        style,
+    }
+}
+
 pub fn emotion_tag(emotion: Emotion, backend: TtsBackend) -> Option<String> {
     match backend {
-        TtsBackend::Orpheus => match emotion {
-            Emotion::Laugh => Some("<laugh>".to_string()),
-            Emotion::Sigh => Some("<sigh>".to_string()),
-            Emotion::Neutral | Emotion::Excited | Emotion::Thoughtful => None,
-        },
+        TtsBackend::Orpheus => emotion_render(emotion).orpheus.map(str::to_string),
         _ => None,
     }
 }

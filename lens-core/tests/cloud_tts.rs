@@ -635,8 +635,8 @@ async fn google_dialogue_request_shape_auth_and_base64_l16_decode() {
     );
     let body = String::from_utf8_lossy(&calls[0].body);
     assert!(
-        body.contains("Host: [excited] Hello"),
-        "labelled cue line: {body}"
+        body.contains("Host: (bright, energetic excitement) Hello"),
+        "labelled natural-language style line: {body}"
     );
     assert!(body.contains("Guest: Hi"), "guest line: {body}");
     assert!(

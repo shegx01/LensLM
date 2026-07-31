@@ -64,18 +64,21 @@
     current ? renderMarkdown(current.content, { highlight: highlightCode }) : ''
   );
 
-  // Ordinal → source, resolved against the live sources store so a removed source
-  // flips its inline chip to the disabled state (AC5) without a full re-render.
+  // Marker `[n]` → source, resolved against the live sources store so a removed source
+  // flips its inline chip to the disabled state (AC5) without a full re-render. Keyed by
+  // each ORIGINAL `[n]` the model wrote (a source may be cited via several), NOT the
+  // re-ranked `ordinal` — the answer text keeps the model's numbers, so linking must too.
   const citationTargets = $derived.by(() => {
     const map = new Map<number, CitationTarget>();
     for (const c of citations ?? []) {
       const src = sourcesStore.sources.find((s) => s.id === c.source_id);
-      map.set(c.ordinal, {
+      const target: CitationTarget = {
         source_id: c.source_id,
         title: src?.title ?? 'Removed source',
         live: !!src,
         locators: c.locators
-      });
+      };
+      for (const marker of c.markers) map.set(marker, target);
     }
     return map;
   });

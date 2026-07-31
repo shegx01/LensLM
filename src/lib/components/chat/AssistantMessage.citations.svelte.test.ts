@@ -90,8 +90,8 @@ describe('AssistantMessage — inline citation chips', () => {
       makeSource({ id: 'src-b', title: 'Beta' })
     ]);
     const msg = makeAssistant('See [1] and [2].', [
-      { source_id: 'src-a', ordinal: 1, locators: [] },
-      { source_id: 'src-b', ordinal: 2, locators: [] }
+      { source_id: 'src-a', ordinal: 1, markers: [1], locators: [] },
+      { source_id: 'src-b', ordinal: 2, markers: [2], locators: [] }
     ]);
     const { container } = render(AssistantMessage, { versions: [msg], ...baseProps });
 
@@ -107,9 +107,25 @@ describe('AssistantMessage — inline citation chips', () => {
     expect(prose.textContent).not.toContain('[2]');
   });
 
+  it('links a marker whose number differs from the re-ranked ordinal', async () => {
+    // The model wrote [11] (11th retrieved unit) but it is the FIRST cited source, so the
+    // engine re-ranks its ordinal to 1. Linking must key on the marker (11), not the
+    // ordinal (1) — regression for chips silently rendering as plain text.
+    mockSourcesStore._setSources([makeSource({ id: 'src-a', title: 'Alpha' })]);
+    const msg = makeAssistant('Chapter 2 covers [11].', [
+      { source_id: 'src-a', ordinal: 1, markers: [11], locators: [] }
+    ]);
+    render(AssistantMessage, { versions: [msg], ...baseProps });
+
+    const chip = await screen.findByRole('button', { name: 'Source 11: Alpha' });
+    expect(chip.textContent).toBe('11');
+  });
+
   it('reveals the source in the rail when a live chip is clicked', async () => {
     mockSourcesStore._setSources([makeSource({ id: 'src-a', title: 'Alpha' })]);
-    const msg = makeAssistant('Grew 34%[1].', [{ source_id: 'src-a', ordinal: 1, locators: [] }]);
+    const msg = makeAssistant('Grew 34%[1].', [
+      { source_id: 'src-a', ordinal: 1, markers: [1], locators: [] }
+    ]);
     render(AssistantMessage, { versions: [msg], ...baseProps });
 
     await fireEvent.click(await screen.findByRole('button', { name: 'Source 1: Alpha' }));
@@ -118,7 +134,9 @@ describe('AssistantMessage — inline citation chips', () => {
 
   it('renders a disabled chip for a citation whose source was removed', async () => {
     mockSourcesStore._setSources([]); // src-a not present
-    const msg = makeAssistant('Gone [1].', [{ source_id: 'src-a', ordinal: 1, locators: [] }]);
+    const msg = makeAssistant('Gone [1].', [
+      { source_id: 'src-a', ordinal: 1, markers: [1], locators: [] }
+    ]);
     render(AssistantMessage, { versions: [msg], ...baseProps });
 
     const chip = await screen.findByRole('button', {
@@ -140,7 +158,9 @@ describe('AssistantMessage — inline citation chips', () => {
     mockSourcesStore._setSources([makeSource({ id: 'src-a', title: 'Alpha' })]);
     const oncopy = vi.fn();
     const raw = 'Grew 34%[1].';
-    const msg = makeAssistant(raw, [{ source_id: 'src-a', ordinal: 1, locators: [] }]);
+    const msg = makeAssistant(raw, [
+      { source_id: 'src-a', ordinal: 1, markers: [1], locators: [] }
+    ]);
     render(AssistantMessage, { versions: [msg], ...baseProps, oncopy });
 
     await fireEvent.click(screen.getByLabelText('Copy answer'));

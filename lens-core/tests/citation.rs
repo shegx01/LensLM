@@ -37,6 +37,7 @@ fn citation_serde_round_trip() {
     let citation = Citation {
         source_id: "src-1".to_string(),
         ordinal: 1,
+        markers: vec![1],
         locators: vec![Locator {
             chunk_id: "c1".to_string(),
             anchor: Some("Intro".to_string()),
@@ -58,6 +59,7 @@ fn citation_serialized_shape() {
     let citation = Citation {
         source_id: "src-1".to_string(),
         ordinal: 1,
+        markers: vec![1],
         locators: vec![
             Locator {
                 chunk_id: "c1".to_string(),
@@ -81,6 +83,9 @@ fn citation_serialized_shape() {
     {
       "source_id": "src-1",
       "ordinal": 1,
+      "markers": [
+        1
+      ],
       "locators": [
         {
           "chunk_id": "c1",
@@ -157,6 +162,10 @@ fn ordinal_is_first_appearance_over_survivors() {
     assert_eq!(citations[0].ordinal, 1);
     assert_eq!(citations[1].source_id, "src-a");
     assert_eq!(citations[1].ordinal, 2);
+    // `markers` keeps the ORIGINAL `[n]` the model wrote (3, 1) — distinct from the
+    // re-ranked ordinals (1, 2). The UI links inline chips by these, so `[3]` resolves.
+    assert_eq!(citations[0].markers, vec![3]);
+    assert_eq!(citations[1].markers, vec![1]);
 }
 
 #[test]
@@ -166,6 +175,8 @@ fn duplicate_markers_collapse_and_dedup_locators() {
     let citations = extract_citations("[1][2]", &units);
     assert_eq!(citations.len(), 1);
     assert_eq!(citations[0].locators.len(), 2);
+    // Both markers for the one source, sorted+distinct — the UI links `[1]` AND `[2]`.
+    assert_eq!(citations[0].markers, vec![1, 2]);
 
     // Same source, same chunk cited twice → one Citation, one Locator.
     let citations = extract_citations("[1][1]", &units);
@@ -206,6 +217,7 @@ fn hydrate_fills_present_rows_and_leaves_missing_none() {
     let mut citations = vec![Citation {
         source_id: "src-a".to_string(),
         ordinal: 1,
+        markers: vec![1],
         locators: vec![
             Locator {
                 chunk_id: "c1".to_string(),

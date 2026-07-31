@@ -7,8 +7,8 @@
 
 pub mod elevenlabs;
 pub mod google;
+pub mod instructions;
 pub mod openai_compat;
-pub mod ssml;
 
 use crate::dialogue::DialogueScript;
 

@@ -196,6 +196,7 @@ fn main() {
             commands::notebooks::cancel_ask,
             commands::notebooks::generate_dialogue,
             commands::notebooks::cancel_dialogue,
+            commands::notebooks::suggest_overview_focus,
             commands::notebooks::synthesize_overview,
             commands::notebooks::cancel_synthesis,
             commands::notebooks::get_audio_overview_status,

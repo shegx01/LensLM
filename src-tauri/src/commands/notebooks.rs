@@ -4,7 +4,7 @@ use futures::StreamExt;
 use lens_core::{
     AddSourceOutcome, AnswerEvent, AudioOverviewRecord, ChatFeedback, ChatMessage, ChatState,
     DialoguePhase, DialogueScript, IngestProgress, Length, LensEngine, LensError, Notebook,
-    NotebookId, NotebookSummary, Source, TrashedSource, TtsPhase,
+    NotebookId, NotebookSummary, OverviewFormat, Source, TrashedSource, TtsPhase,
 };
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
@@ -508,7 +508,10 @@ pub async fn generate_dialogue(
     let result = engine
         .generate_dialogue(
             &NotebookId::from(notebook_id),
+            OverviewFormat::default(),
             length,
+            None,
+            None,
             (*token).clone(),
             move |phase| {
                 if let Err(e) = send_event(&on_progress_phase, StreamEvent::Chunk(phase)) {
@@ -545,17 +548,34 @@ pub async fn cancel_dialogue(
     Ok(engine.cancel_dialogue_generation(&notebook_id))
 }
 
+/// Suggests a short focus phrase for the audio-overview setup modal (the "Suggest
+/// with AI" button). Advisory — the user edits it before generating.
+#[tracing::instrument(skip(engine))]
+#[tauri::command]
+pub async fn suggest_overview_focus(
+    notebook_id: String,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<String, LensError> {
+    engine.suggest_overview_focus(&notebook_id).await
+}
+
 /// Generates + synthesizes the per-notebook Audio Overview at `length` (#29) and
 /// persists the terminal `audio_overviews` row (see
 /// [`LensEngine::generate_and_persist_overview`]). Streams `TtsPhase` progress and
 /// returns the WAV path for immediate `convertFileSrc` playback. A user cancel is
 /// surfaced as the `Cancelled` error kind (no `failed` row, no `Failed` event) so the
 /// card can return to idle rather than an error state.
+// `format`/`language`/`focus` are optional so the pre-redesign caller (length only)
+// keeps working while the setup modal supplies them.
+#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip(on_progress, engine))]
 #[tauri::command]
 pub async fn synthesize_overview(
     notebook_id: String,
     length: Length,
+    format: Option<OverviewFormat>,
+    language: Option<String>,
+    focus: Option<String>,
     on_progress: Channel<StreamEvent<TtsPhase>>,
     engine: tauri::State<'_, LensEngine>,
 ) -> Result<String, LensError> {
@@ -582,7 +602,10 @@ pub async fn synthesize_overview(
     let result = engine
         .generate_and_persist_overview(
             &notebook_id,
+            format.unwrap_or_default(),
             length,
+            language,
+            focus,
             move |phase| {
                 if let Err(e) = send_event(&on_progress_phase, StreamEvent::Chunk(phase)) {
                     tracing::warn!("synthesize_overview: phase send failed: {e}");

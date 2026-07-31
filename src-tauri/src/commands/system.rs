@@ -729,7 +729,7 @@ mod tests {
 
         let status = health_check(engine).await.unwrap();
         assert!(status.db_ok);
-        assert_eq!(status.migration_count, 23);
+        assert_eq!(status.migration_count, 24);
     }
 
     #[tokio::test]

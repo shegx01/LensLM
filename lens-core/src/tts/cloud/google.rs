@@ -39,20 +39,17 @@ fn speaker_label(speaker: Speaker) -> &'static str {
     }
 }
 
-fn emotion_cue(emotion: Emotion) -> Option<&'static str> {
-    match emotion {
-        Emotion::Neutral => None,
-        Emotion::Laugh => Some("[laughing]"),
-        Emotion::Sigh => Some("[sighing]"),
-        Emotion::Excited => Some("[excited]"),
-        Emotion::Thoughtful => Some("[thoughtful]"),
-    }
+/// Gemini steers tone via natural-language prompt text, not bracketed cues (an
+/// undocumented `[tag]` is read literally). Emit the central style descriptor as a
+/// per-line parenthetical stage direction instead.
+fn emotion_style(emotion: Emotion) -> Option<&'static str> {
+    crate::tts::emotion_render(emotion).style
 }
 
 fn line(turn: &Turn) -> String {
     let label = speaker_label(turn.speaker);
-    match turn.emotion.and_then(emotion_cue) {
-        Some(cue) => format!("{label}: {cue} {}", turn.text),
+    match turn.emotion.and_then(emotion_style) {
+        Some(style) => format!("{label}: ({style}) {}", turn.text),
         None => format!("{label}: {}", turn.text),
     }
 }
@@ -271,11 +268,12 @@ mod tests {
     }
 
     #[test]
-    fn line_labels_speaker_and_prepends_cue() {
+    fn line_labels_speaker_and_prepends_style() {
         assert_eq!(line(&t(Speaker::Host, "hi", None)), "Host: hi");
+        // Natural-language parenthetical, not a bracketed cue (audit fix).
         assert_eq!(
             line(&t(Speaker::Guest, "yo", Some(Emotion::Excited))),
-            "Guest: [excited] yo"
+            "Guest: (bright, energetic excitement) yo"
         );
     }
 

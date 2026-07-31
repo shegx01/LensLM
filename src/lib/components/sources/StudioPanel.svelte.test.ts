@@ -25,7 +25,8 @@ const {
     generatedAt: null as string | null,
     errorMessage: null as string | null,
     modelReady: true,
-    canGenerate: true
+    canGenerate: true,
+    transcript: null as { turns: { speaker: 'host' | 'guest'; text: string }[] } | null
   };
 
   const mockAudioStore = {
@@ -56,6 +57,9 @@ const {
     get canGenerate() {
       return state.canGenerate;
     },
+    get transcript() {
+      return state.transcript;
+    },
     _set(overrides: Partial<typeof state>) {
       Object.assign(state, overrides);
     },
@@ -69,7 +73,8 @@ const {
         generatedAt: null,
         errorMessage: null,
         modelReady: true,
-        canGenerate: true
+        canGenerate: true,
+        transcript: null
       });
     }
   };
@@ -185,21 +190,29 @@ describe('StudioPanel — Audio Overview idle state', () => {
     expect(screen.getByRole('button', { name: 'Generate Audio Overview' })).toBeEnabled();
   });
 
-  it('clicking Generate calls generateOverview with the notebook id and default (medium) length', async () => {
+  it('clicking Generate opens the setup modal (does not generate directly)', async () => {
     render(StudioPanel, { props: { selectedCount: 2, totalCount: 3 } });
 
     await fireEvent.click(screen.getByRole('button', { name: 'Generate Audio Overview' }));
 
-    expect(generateOverview).toHaveBeenCalledWith('nb-001', 'medium');
+    expect(await screen.findByRole('dialog')).toBeInTheDocument();
+    expect(screen.getByText('Format')).toBeInTheDocument();
+    expect(generateOverview).not.toHaveBeenCalled();
   });
 
-  it('switching the length segmented control changes the length passed to Generate', async () => {
+  it('the setup modal Generate fires generateOverview with the chosen setup and default format', async () => {
     render(StudioPanel, { props: { selectedCount: 2, totalCount: 3 } });
 
-    await fireEvent.click(screen.getByRole('radio', { name: 'Long' }));
     await fireEvent.click(screen.getByRole('button', { name: 'Generate Audio Overview' }));
+    await screen.findByRole('dialog');
+    await fireEvent.click(screen.getByRole('button', { name: 'Generate' }));
 
-    expect(generateOverview).toHaveBeenCalledWith('nb-001', 'long');
+    expect(generateOverview).toHaveBeenCalledWith('nb-001', {
+      format: 'deep_dive',
+      length: 'medium',
+      language: undefined,
+      focus: undefined
+    });
   });
 });
 
@@ -244,11 +257,10 @@ describe('StudioPanel — generating state', () => {
     expect(cancelOverview).toHaveBeenCalledWith('nb-001');
   });
 
-  it('does not render the length picker or a player while generating', () => {
+  it('does not render a player while generating', () => {
     mockAudioStore._set({ overviewStatus: 'generating', phase: 'starting' });
     render(StudioPanel, { props: { selectedCount: 2, totalCount: 3 } });
 
-    expect(screen.queryByRole('radiogroup')).not.toBeInTheDocument();
     expect(screen.queryByTestId('audio-player-stub')).not.toBeInTheDocument();
   });
 });
@@ -267,7 +279,7 @@ describe('StudioPanel — ready / stale states', () => {
     expect(screen.getByText(/Generated/)).toBeInTheDocument();
   });
 
-  it('the regenerate icon button has an accessible name and fires generateOverview', async () => {
+  it('the regenerate icon button has an accessible name and opens the setup modal', async () => {
     mockAudioStore._set({
       overviewStatus: 'ready',
       overviewPath: '/data/notebooks/nb-001/overview.wav',
@@ -280,7 +292,8 @@ describe('StudioPanel — ready / stale states', () => {
 
     await fireEvent.click(regenBtn);
 
-    expect(generateOverview).toHaveBeenCalledWith('nb-001', 'medium');
+    expect(await screen.findByRole('dialog')).toBeInTheDocument();
+    expect(generateOverview).not.toHaveBeenCalled();
   });
 
   it('disables the regenerate icon and explains why when generation is blocked', () => {
@@ -311,6 +324,43 @@ describe('StudioPanel — ready / stale states', () => {
     expect(screen.getByTestId('audio-player-stub')).toBeInTheDocument();
   });
 
+  it('shows Player | Transcript tabs only when a transcript is present, and switches to it', async () => {
+    mockAudioStore._set({
+      overviewStatus: 'ready',
+      overviewPath: '/data/notebooks/nb-001/overview.wav',
+      generatedAt: new Date().toISOString(),
+      transcript: {
+        turns: [
+          { speaker: 'host', text: 'Welcome to the overview.' },
+          { speaker: 'guest', text: 'Glad to dig in.' }
+        ]
+      }
+    });
+    render(StudioPanel, { props: { selectedCount: 2, totalCount: 3 } });
+
+    expect(screen.getByRole('tab', { name: 'Player' })).toBeInTheDocument();
+    expect(screen.getByTestId('audio-player-stub')).toBeInTheDocument();
+
+    await fireEvent.click(screen.getByRole('tab', { name: 'Transcript' }));
+
+    expect(screen.getByText('Welcome to the overview.')).toBeInTheDocument();
+    expect(screen.getByText('Glad to dig in.')).toBeInTheDocument();
+    expect(screen.queryByTestId('audio-player-stub')).not.toBeInTheDocument();
+  });
+
+  it('shows no tabs when the overview has no persisted transcript (legacy row)', () => {
+    mockAudioStore._set({
+      overviewStatus: 'ready',
+      overviewPath: '/data/notebooks/nb-001/overview.wav',
+      generatedAt: new Date().toISOString(),
+      transcript: null
+    });
+    render(StudioPanel, { props: { selectedCount: 2, totalCount: 3 } });
+
+    expect(screen.queryByRole('tab', { name: 'Transcript' })).not.toBeInTheDocument();
+    expect(screen.getByTestId('audio-player-stub')).toBeInTheDocument();
+  });
+
   it('does NOT show the stale hint when ready (not stale)', () => {
     mockAudioStore._set({
       overviewStatus: 'ready',
@@ -332,13 +382,14 @@ describe('StudioPanel — failed / missing states', () => {
     expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument();
   });
 
-  it('clicking Retry calls generateOverview again', async () => {
+  it('clicking Retry opens the setup modal', async () => {
     mockAudioStore._set({ overviewStatus: 'failed', errorMessage: 'no TTS backend available' });
     render(StudioPanel, { props: { selectedCount: 2, totalCount: 3 } });
 
     await fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
 
-    expect(generateOverview).toHaveBeenCalledWith('nb-001', 'medium');
+    expect(await screen.findByRole('dialog')).toBeInTheDocument();
+    expect(generateOverview).not.toHaveBeenCalled();
   });
 
   it('shows a missing-file message and a Generate button (no player) when missing', () => {

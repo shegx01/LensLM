@@ -21,6 +21,7 @@ async fn user_and_assistant_round_trip_with_citations() {
     let citations = vec![Citation {
         source_id: "src-1".into(),
         ordinal: 1,
+        markers: vec![1],
         locators: vec![Locator {
             chunk_id: "chunk-1".into(),
             anchor: Some("s1".into()),

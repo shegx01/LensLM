@@ -1,6 +1,7 @@
 <!-- StudioPanel — Studio surface for the right rail (M4). The Audio Overview card
-     (#29) is a live per-notebook lifecycle: idle (length + Generate) → generating
-     (phase + progress + Cancel) → ready/stale (player + regenerate) → failed/missing
+     (#29) is a live per-notebook lifecycle: idle (Generate → setup modal for
+     format/length/language/focus) → generating (phase + progress + Cancel) →
+     ready/stale (Player | Transcript tabs + regenerate) → failed/missing
      (functional error + retry). The study/report tools below remain a "coming soon"
      preview (M6/M7 land those separately) — every action stays aria-disabled there. -->
 <script lang="ts">
@@ -32,13 +33,14 @@
   } from '$lib/components/ui/tooltip/index.js';
   import AudioPlayer from '$lib/components/audio/AudioPlayer.svelte';
   import ProgressBar from '$lib/components/ui/ProgressBar.svelte';
+  import AudioOverviewSetup from './AudioOverviewSetup.svelte';
   import {
     audioOverviewStore,
     generateOverview,
     cancelOverview
   } from '$lib/sources/audio-state.svelte.js';
   import { sourcesStore } from '$lib/sources/sources-state.svelte.js';
-  import type { Length } from '$lib/sources/audio-ipc.js';
+  import type { OverviewSetup } from '$lib/sources/audio-ipc.js';
 
   let {
     selectedCount = 0,
@@ -51,13 +53,10 @@
   const notebookId = $derived(notebookStore.activeNotebookId);
   const status = $derived(audioOverviewStore.overviewStatus);
   const hasPlayableAudio = $derived(status === 'ready' || status === 'stale');
+  const transcriptTurns = $derived(audioOverviewStore.transcript?.turns ?? []);
 
-  let length = $state<Length>('medium');
-  const LENGTH_OPTIONS: { value: Length; label: string }[] = [
-    { value: 'short', label: 'Short' },
-    { value: 'medium', label: 'Med' },
-    { value: 'long', label: 'Long' }
-  ];
+  let setupOpen = $state(false);
+  let audioTab = $state<'player' | 'transcript'>('player');
 
   function phaseLabel(): string {
     const { phase, turn, total } = audioOverviewStore;
@@ -95,9 +94,15 @@
         : 'Regenerate overview'
   );
 
-  async function handleGenerate(): Promise<void> {
+  function openSetup(): void {
     if (!notebookId || !audioOverviewStore.canGenerate) return;
-    await generateOverview(notebookId, length);
+    setupOpen = true;
+  }
+
+  async function runGenerate(setup: OverviewSetup): Promise<void> {
+    if (!notebookId) return;
+    audioTab = 'player';
+    await generateOverview(notebookId, setup);
   }
 
   async function handleCancel(): Promise<void> {
@@ -174,7 +179,7 @@
                 title={regenerateTooltip}
                 disabled={!audioOverviewStore.canGenerate}
                 style="-webkit-app-region: no-drag;"
-                onclick={handleGenerate}
+                onclick={openSetup}
               >
                 <RotateCw class="size-[13px]" strokeWidth={2} />
               </button>
@@ -207,27 +212,64 @@
           <ProgressBar value={progressPct} />
         </div>
       {:else if hasPlayableAudio && notebookId && audioOverviewStore.overviewPath}
-        <div class="card-body mt-3 flex flex-col justify-center">
-          <AudioPlayer path={audioOverviewStore.overviewPath} />
+        <div class="card-body mt-3 flex flex-col">
+          {#if transcriptTurns.length > 0}
+            <div class="tab-group" role="tablist" aria-label="Audio overview view">
+              <button
+                type="button"
+                role="tab"
+                id="audio-tab-player"
+                aria-selected={audioTab === 'player'}
+                aria-controls="audio-tabpanel"
+                class="tab-btn"
+                data-active={audioTab === 'player'}
+                onclick={() => (audioTab = 'player')}
+              >
+                Player
+              </button>
+              <button
+                type="button"
+                role="tab"
+                id="audio-tab-transcript"
+                aria-selected={audioTab === 'transcript'}
+                aria-controls="audio-tabpanel"
+                class="tab-btn"
+                data-active={audioTab === 'transcript'}
+                onclick={() => (audioTab = 'transcript')}
+              >
+                Transcript
+              </button>
+            </div>
+          {/if}
+
+          {#if audioTab === 'transcript' && transcriptTurns.length > 0}
+            <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+            <div
+              id="audio-tabpanel"
+              class="transcript no-scrollbar flex flex-col gap-2.5 overflow-y-auto"
+              role="tabpanel"
+              aria-labelledby="audio-tab-transcript"
+              tabindex="0"
+            >
+              {#each transcriptTurns as turn, i (i)}
+                <div>
+                  <p class="text-[0.625rem] font-extrabold uppercase tracking-wide text-primary">
+                    {turn.speaker === 'host' ? 'Host' : 'Guest'}
+                  </p>
+                  <p class="text-xs leading-relaxed text-muted-foreground">{turn.text}</p>
+                </div>
+              {/each}
+            </div>
+          {:else if transcriptTurns.length > 0}
+            <div id="audio-tabpanel" role="tabpanel" aria-labelledby="audio-tab-player">
+              <AudioPlayer path={audioOverviewStore.overviewPath} />
+            </div>
+          {:else}
+            <AudioPlayer path={audioOverviewStore.overviewPath} />
+          {/if}
         </div>
       {:else}
         <div class="card-body mt-3 flex flex-col justify-center gap-2">
-          <div class="seg3" role="radiogroup" aria-label="Overview length" data-len={length}>
-            <span class="seg-ind" aria-hidden="true"></span>
-            {#each LENGTH_OPTIONS as opt (opt.value)}
-              <button
-                type="button"
-                role="radio"
-                aria-checked={length === opt.value}
-                class="seg-btn"
-                data-active={length === opt.value}
-                onclick={() => (length = opt.value)}
-              >
-                {opt.label}
-              </button>
-            {/each}
-          </div>
-
           {#if status === 'failed' && audioOverviewStore.errorMessage}
             <p class="text-[0.7rem] text-destructive" role="alert">
               {audioOverviewStore.errorMessage}
@@ -243,7 +285,7 @@
             class="press flex w-full items-center justify-center gap-1.5 rounded-lg bg-primary px-3 py-2 text-sm font-semibold text-primary-foreground transition-[opacity,transform] hover:opacity-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
             disabled={!audioOverviewStore.canGenerate}
             style="-webkit-app-region: no-drag;"
-            onclick={handleGenerate}
+            onclick={openSetup}
           >
             <Sparkles class="size-[12px]" strokeWidth={2} />
             {status === 'failed' ? 'Retry' : 'Generate Audio Overview'}
@@ -326,6 +368,13 @@
   </div>
 </section>
 
+<AudioOverviewSetup
+  bind:open={setupOpen}
+  selectedCount={sourcesStore.selectedCount}
+  {notebookId}
+  onGenerate={runGenerate}
+/>
+
 <style>
   /* Gated press-scale (calm mode / reduced-motion drops it); the button's
      transition-[opacity,transform] utility animates it. */
@@ -357,55 +406,43 @@
     min-height: 9.5rem;
   }
 
-  .seg3 {
-    position: relative;
+  .tab-group {
     display: grid;
     grid-auto-flow: column;
     grid-auto-columns: 1fr;
-    padding: 2px;
-    border-radius: 10px;
+    gap: 3px;
+    padding: 3px;
+    margin-bottom: 12px;
+    border-radius: 9px;
     background: var(--muted);
   }
-  .seg-ind {
-    position: absolute;
-    top: 2px;
-    left: 2px;
-    height: calc(100% - 4px);
-    width: calc(33.333% - 1.33px);
-    border-radius: 8px;
-    background: var(--card);
-    box-shadow: var(--shadow-tile);
-    transform: translateX(0);
-    transition: transform calc(0.32s * var(--rail-motion, 1)) var(--ease-spring, ease);
-  }
-  .seg3[data-len='medium'] .seg-ind {
-    transform: translateX(100%);
-  }
-  .seg3[data-len='long'] .seg-ind {
-    transform: translateX(200%);
-  }
-  .seg-btn {
-    position: relative;
-    z-index: 1;
+  .tab-btn {
     height: 26px;
     border: 0;
+    border-radius: 6px;
     background: transparent;
-    border-radius: 8px;
     font-size: 0.7rem;
     font-weight: 600;
     cursor: pointer;
     color: var(--muted-foreground);
-    transition: color 0.18s var(--ease-out, ease);
+    transition:
+      color 0.16s var(--ease-out, ease),
+      background 0.16s var(--ease-out, ease);
     outline: none;
   }
-  .seg-btn[data-active='true'] {
+  .tab-btn[data-active='true'] {
+    background: var(--card);
     color: var(--card-foreground);
+    box-shadow: var(--shadow-tile);
   }
-  .seg-btn:not([data-active='true']):hover {
+  .tab-btn:not([data-active='true']):hover {
     color: var(--foreground);
   }
-  .seg-btn:focus-visible {
+  .tab-btn:focus-visible {
     box-shadow: 0 0 0 2px var(--ring);
+  }
+  .transcript {
+    max-height: 15rem;
   }
 
   /* Container and elements all share the card surface. The top edge combines a hairline

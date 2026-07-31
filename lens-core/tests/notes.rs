@@ -9,6 +9,7 @@ fn citation(source_id: &str, ordinal: u32) -> Citation {
     Citation {
         source_id: source_id.into(),
         ordinal,
+        markers: vec![ordinal],
         locators: vec![Locator {
             chunk_id: format!("chunk-{source_id}"),
             anchor: Some("s1".into()),

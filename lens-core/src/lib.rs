@@ -78,7 +78,7 @@ pub use config::{
 };
 #[cfg(feature = "test-util")]
 pub use dialogue::{DialogueCtx, generate_dialogue};
-pub use dialogue::{DialoguePhase, DialogueScript, Emotion, Length, Speaker, Turn};
+pub use dialogue::{DialoguePhase, DialogueScript, Emotion, Length, OverviewFormat, Speaker, Turn};
 pub use embedder::{
     CountingEmbedder, DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, Embedder, EmbeddingBackend,
     EmbeddingModelSpec, FastembedEmbedder, OllamaEmbedder, REGISTRY, resolve, resolve_opt,
@@ -105,6 +105,10 @@ pub use notebooks::{
     Source, TrashedSource,
 };
 pub use notes::{Note, NoteId, NoteOrigin};
+// Public only alongside the `DialogueCtx` test seam — the integration test needs to
+// build a `PromptStore` for the ctx; production keeps prompt infra crate-private.
+#[cfg(feature = "test-util")]
+pub use prompt::PromptStore;
 pub use render::JsRenderer;
 pub use retrieval::router::{ContextUnit, Provenance, RouterOutput, Tier, tiered_search};
 // Test-only: the integration test asserts `RESERVED_OUTPUT`'s value; production
@@ -1564,10 +1568,14 @@ impl LensEngine {
     /// [#29] Single-owner orchestration: dialogue → synth (atomic write) → persist the
     /// terminal `audio_overviews` row. `Ok(Some(path))` = success (`ready`), `Ok(None)` =
     /// user cancel ([M2], no row written), `Err` = genuine failure (`failed` persisted).
+    #[allow(clippy::too_many_arguments)]
     pub async fn generate_and_persist_overview(
         &self,
         notebook_id: &str,
+        format: dialogue::OverviewFormat,
         length: dialogue::Length,
+        language: Option<String>,
+        focus: Option<String>,
         on_phase: impl Fn(tts::TtsPhase) + Send + Sync,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<Option<std::path::PathBuf>, LensError> {
@@ -1581,7 +1589,10 @@ impl LensEngine {
         let script = match self
             .generate_dialogue(
                 &NotebookId::from(notebook_id.to_string()),
+                format,
                 length,
+                language,
+                focus,
                 cancel.clone(),
                 |_phase| {},
             )
@@ -1618,6 +1629,7 @@ impl LensEngine {
         };
 
         let generated_at = chrono::Utc::now().to_rfc3339();
+        let script_json = serde_json::to_string(&script).ok();
         audio_overview::upsert_overview(
             &self.pool().await,
             notebook_id,
@@ -1625,6 +1637,7 @@ impl LensEngine {
             &generated_at,
             AudioOverviewStatus::Ready,
             &source_set_hash,
+            script_json.as_deref(),
         )
         .await?;
         Ok(Some(path))
@@ -1648,6 +1661,7 @@ impl LensEngine {
             &generated_at,
             AudioOverviewStatus::Failed,
             source_set_hash,
+            None,
         )
         .await
     }
@@ -1661,12 +1675,13 @@ impl LensEngine {
         notebook_id: &str,
     ) -> Result<Option<AudioOverviewRecord>, LensError> {
         let pool = self.pool().await;
-        let Some((path, generated_at, status_str, source_set_hash)) =
+        let Some((path, generated_at, status_str, source_set_hash, script_json)) =
             audio_overview::read_overview_row(&pool, notebook_id).await?
         else {
             return Ok(None);
         };
         let stored = AudioOverviewStatus::from_db_str(&status_str)?;
+        let script = script_json.and_then(|j| serde_json::from_str(&j).ok());
         // Reconcile a `ready` row at read time. Missing (file gone) wins over Stale
         // (sources changed): a vanished file is the more urgent regenerate signal. Only
         // a `ready` row is reconciled — a `failed` row stays `failed`.
@@ -1686,6 +1701,7 @@ impl LensEngine {
             generated_at,
             status,
             source_set_hash,
+            script,
         }))
     }
 
@@ -1808,6 +1824,7 @@ impl LensEngine {
             question,
             history,
             chat: config.chat,
+            prompts: crate::prompt::PromptStore::for_data_dir(&self.data_dir().await),
         };
 
         Ok(crate::answer::answer_stream(ctx, cancel))
@@ -1820,10 +1837,14 @@ impl LensEngine {
     /// source-id set (the validator's grounding allow-list), then awaits the pure
     /// [`dialogue::generate_dialogue`]. One-shot: returns the validated script or a
     /// terminal [`LensError`]; phase markers stream via `on_phase`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn generate_dialogue(
         &self,
         notebook_id: &NotebookId,
+        format: dialogue::OverviewFormat,
         length: dialogue::Length,
+        language: Option<String>,
+        focus: Option<String>,
         cancel: tokio_util::sync::CancellationToken,
         on_phase: impl Fn(dialogue::DialoguePhase) + Send,
     ) -> Result<dialogue::DialogueScript, LensError> {
@@ -1881,6 +1902,7 @@ impl LensEngine {
         // retrieval subset — so a model citing a selected-but-not-retrieved source is
         // not wrongly rejected.
         let selected_live_ids = self.selected_live_source_ids(notebook_id.as_str()).await?;
+        let prompts = crate::prompt::PromptStore::for_data_dir(&self.data_dir().await);
 
         let ctx = crate::dialogue::DialogueCtx {
             provider,
@@ -1895,10 +1917,106 @@ impl LensEngine {
             thresholds: config.tier_thresholds,
             tokenizer,
             length,
+            format,
+            language,
+            focus,
             selected_live_ids,
+            prompts,
         };
 
         crate::dialogue::generate_dialogue(ctx, cancel, on_phase).await
+    }
+
+    /// Proposes a focus brief for an audio overview from the notebook's selected sources
+    /// (one cheap LLM call over a bounded sample of their actual content): a short framing
+    /// paragraph followed by a Markdown bullet list of specific, source-grounded points the
+    /// hosts could cover — the user edits it before generating. Content is fenced (untrusted).
+    pub async fn suggest_overview_focus(&self, notebook_id: &str) -> Result<String, LensError> {
+        let provider = self
+            .chat_provider()
+            .await
+            .ok_or_else(|| LensError::Model("no chat model configured".into()))?;
+        let ids = self.selected_live_source_ids(notebook_id).await?;
+        if ids.is_empty() {
+            return Err(LensError::Validation(
+                "select at least one source first".into(),
+            ));
+        }
+        let pool = self.pool().await;
+        let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+        let titles = crate::citation::source_titles(&pool, &id_refs).await?;
+        let excerpts = self
+            .sample_source_excerpts(&pool, &id_refs, &titles)
+            .await?;
+        let nonce = crate::prompt::fence_nonce();
+        let system = format!(
+            "You are planning a short, two-host audio overview of a set of documents. From the \
+             excerpts, write a focus brief in two parts:\n\
+             1. A short framing paragraph (two to four sentences) naming the most important \
+             thing the overview should get across and any orienting context a listener needs.\n\
+             2. A blank line, then a Markdown bullet list of four to six specific points or \
+             angles to cover — each line starts with \"- \" and names a concrete thing (a \
+             decision, number, event, tension, claim) from the material, not a generic label \
+             like \"key points\" or \"background\".\n\n\
+             Ground everything in what the excerpts actually discuss. Output only the paragraph \
+             and the bullet list — no heading, no numbering on the bullets, no closing remarks.\n\n{}",
+            crate::prompt::injection_guard(&nonce, "The document excerpts", "write a focus brief")
+        );
+        let req = crate::llm::LlmRequest {
+            system: Some(system),
+            prompt: format!(
+                "Document excerpts:\n{}\nFocus brief:",
+                crate::prompt::fence_excerpt(&nonce, &excerpts)
+            ),
+            max_tokens: 320,
+            temperature: 0.6,
+            json: false,
+            thinking: false,
+            reasoning_effort: None,
+            messages: Vec::new(),
+        };
+        let resp = provider.generate(&req).await?;
+        Ok(clean_focus_topics(&resp.text))
+    }
+
+    /// A bounded, leading sample of the selected sources' content for topic suggestion:
+    /// each source's first parent chunk(s), title-labelled, capped so the whole prompt
+    /// stays cheap. Parents are preferred over child chunks; falls back to any chunk.
+    async fn sample_source_excerpts(
+        &self,
+        pool: &sqlx::SqlitePool,
+        id_refs: &[&str],
+        titles: &std::collections::HashMap<String, String>,
+    ) -> Result<String, LensError> {
+        const PER_SOURCE_CHARS: usize = 1200;
+        const TOTAL_CHARS: usize = 7000;
+        let mut out = String::new();
+        let mut budget = TOTAL_CHARS;
+        for id in id_refs {
+            if budget == 0 {
+                break;
+            }
+            let rows = sqlx::query_scalar::<_, String>(
+                "SELECT text FROM chunks WHERE source_id = ? \
+                 ORDER BY (kind = 'parent') DESC, char_start ASC LIMIT 2",
+            )
+            .bind(id)
+            .fetch_all(pool)
+            .await?;
+            let title = titles.get(*id).map(String::as_str).unwrap_or(*id);
+            let mut taken = 0usize;
+            for text in rows {
+                if budget == 0 || taken >= PER_SOURCE_CHARS {
+                    break;
+                }
+                let cap = budget.min(PER_SOURCE_CHARS - taken);
+                let snippet: String = text.chars().take(cap).collect();
+                taken += snippet.chars().count();
+                budget = budget.saturating_sub(snippet.chars().count());
+                out.push_str(&format!("## {title}\n{snippet}\n\n"));
+            }
+        }
+        Ok(out.trim().to_string())
     }
 
     /// The selected + live (not-trashed) source ids for a notebook, over the shared
@@ -3086,6 +3204,104 @@ fn audio_file_is_nonempty(path: &str) -> bool {
     std::fs::metadata(path)
         .map(|m| m.is_file() && m.len() > 0)
         .unwrap_or(false)
+}
+
+/// Tidies a suggested focus into a short framing paragraph followed by a Markdown bullet
+/// list: keeps the intro prose BEFORE the first bullet (joined into one paragraph), keeps
+/// every bullet/numbered item (normalized to `- `, numbering/quotes stripped), and drops
+/// any trailing prose a small model adds after the list. Returns the raw prose unchanged
+/// when the model produced no list at all.
+fn clean_focus_topics(raw: &str) -> String {
+    let bullet = |c: char| matches!(c, '-' | '•' | '*' | '–');
+    let leading_ordinal = |l: &str| -> usize {
+        let digits = l.chars().take_while(char::is_ascii_digit).count();
+        if digits > 0 && l[digits..].starts_with(['.', ')']) {
+            digits + 1
+        } else {
+            0
+        }
+    };
+    let is_item = |l: &str| l.starts_with(bullet) || leading_ordinal(l) > 0;
+    let normalize = |l: &str| -> String {
+        let body = if l.starts_with(bullet) {
+            l.trim_start_matches(bullet).trim_start()
+        } else {
+            l[leading_ordinal(l)..].trim_start()
+        };
+        let body = body
+            .trim()
+            .trim_matches(|c: char| matches!(c, '"' | '\'' | '“' | '”'))
+            .trim();
+        format!("- {body}")
+    };
+
+    let lines: Vec<&str> = raw.trim().lines().map(str::trim).collect();
+    let Some(first) = lines.iter().position(|l| is_item(l)) else {
+        return raw.trim().to_string();
+    };
+    let intro = lines[..first]
+        .iter()
+        .filter(|l| !l.is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let items: Vec<String> = lines[first..]
+        .iter()
+        .filter(|l| is_item(l))
+        .map(|l| normalize(l))
+        .filter(|s| s.len() > 2)
+        .collect();
+    if items.is_empty() {
+        return raw.trim().to_string();
+    }
+    let list = items.join("\n");
+    if intro.is_empty() {
+        list
+    } else {
+        format!("{intro}\n\n{list}")
+    }
+}
+
+#[cfg(test)]
+mod focus_topics_tests {
+    use super::clean_focus_topics;
+
+    #[test]
+    fn keeps_intro_paragraph_then_the_bullets() {
+        let raw = "This overview should center the Q3 turnaround and what drove it.\n\n- the revenue drivers\n- the biggest risks to watch";
+        assert_eq!(
+            clean_focus_topics(raw),
+            "This overview should center the Q3 turnaround and what drove it.\n\n\
+             - the revenue drivers\n- the biggest risks to watch"
+        );
+    }
+
+    #[test]
+    fn normalizes_numbering_and_drops_only_trailing_prose() {
+        let raw =
+            "Focus on the migration.\n1. the trade-offs\n2) why Postgres won\n\nHope this helps!";
+        assert_eq!(
+            clean_focus_topics(raw),
+            "Focus on the migration.\n\n- the trade-offs\n- why Postgres won"
+        );
+    }
+
+    #[test]
+    fn returns_a_bare_list_when_there_is_no_intro() {
+        let raw = "- the revenue drivers\n- the FY outlook";
+        assert_eq!(
+            clean_focus_topics(raw),
+            "- the revenue drivers\n- the FY outlook"
+        );
+    }
+
+    #[test]
+    fn keeps_plain_prose_when_no_list() {
+        assert_eq!(
+            clean_focus_topics("lead with the numbers"),
+            "lead with the numbers"
+        );
+    }
 }
 
 /// Best-effort removal of a managed source file and its `.extracted.txt` /

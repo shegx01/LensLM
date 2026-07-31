@@ -16,8 +16,8 @@ use lens_core::embedder::{CountingEmbedder, Embedder, EmbeddingBackend};
 use lens_core::llm::{LlmProvider, LlmRequest, LlmResponse};
 use lens_core::vector_store::{Coordinate, LanceVectorStore, VectorStore};
 use lens_core::{
-    DialogueCtx, DialoguePhase, DialogueScript, Emotion, Length, LensEngine, Reranker, Speaker,
-    generate_dialogue,
+    DialogueCtx, DialoguePhase, DialogueScript, Emotion, Length, LensEngine, PromptStore, Reranker,
+    Speaker, generate_dialogue,
 };
 use sqlx::SqlitePool;
 use tokio::sync::Notify;
@@ -69,6 +69,14 @@ struct ScriptedProvider {
     calls: Arc<AtomicU32>,
     responses: Vec<String>,
     local: bool,
+    systems: std::sync::Mutex<Vec<String>>,
+}
+
+impl ScriptedProvider {
+    /// System prompts seen so far, one per `generate` call.
+    fn captured_systems(&self) -> Vec<String> {
+        self.systems.lock().unwrap().clone()
+    }
 }
 
 impl ScriptedProvider {
@@ -87,6 +95,7 @@ impl ScriptedProvider {
             calls: calls.clone(),
             responses: responses.into_iter().map(|s| s.to_string()).collect(),
             local,
+            systems: std::sync::Mutex::new(Vec::new()),
         });
         (p, calls)
     }
@@ -103,7 +112,11 @@ impl LlmProvider for ScriptedProvider {
     async fn reachable(&self) -> bool {
         true
     }
-    async fn generate(&self, _req: &LlmRequest) -> Result<LlmResponse, lens_core::LensError> {
+    async fn generate(&self, req: &LlmRequest) -> Result<LlmResponse, lens_core::LensError> {
+        self.systems
+            .lock()
+            .unwrap()
+            .push(req.system.clone().unwrap_or_default());
         let n = self.calls.fetch_add(1, Ordering::SeqCst) as usize;
         let text = self
             .responses
@@ -234,7 +247,11 @@ fn build_ctx(
         thresholds: TierThresholds::default(),
         tokenizer: None,
         length,
+        format: lens_core::OverviewFormat::DeepDive,
+        language: None,
+        focus: None,
         selected_live_ids,
+        prompts: PromptStore::for_data_dir(data_dir),
     }
 }
 
@@ -311,6 +328,39 @@ async fn happy_path_one_call_returns_valid_grounded_script() {
             DialoguePhase::Generating,
             DialoguePhase::Validating
         ]
+    );
+}
+
+#[tokio::test]
+async fn outline_instruction_gated_by_provider_locality() {
+    let (_engine, pool, nb, ids, dir) = seed_two_source_notebook().await;
+    const MARKER: &str = "First produce a short `outline`";
+
+    let (remote, _) = ScriptedProvider::with_locality(vec![&valid_short_json()], false);
+    let ctx = build_ctx(
+        dir.path(),
+        &pool,
+        &nb,
+        remote.clone(),
+        ids.clone(),
+        Length::Short,
+    );
+    generate_dialogue(ctx, CancellationToken::new(), |_| {})
+        .await
+        .expect("valid script");
+    assert!(
+        remote.captured_systems()[0].contains(MARKER),
+        "non-local provider must receive the outline instruction"
+    );
+
+    let (local, _) = ScriptedProvider::with_locality(vec![&valid_short_json()], true);
+    let ctx = build_ctx(dir.path(), &pool, &nb, local.clone(), ids, Length::Short);
+    generate_dialogue(ctx, CancellationToken::new(), |_| {})
+        .await
+        .expect("valid script");
+    assert!(
+        !local.captured_systems()[0].contains(MARKER),
+        "local provider must NOT receive the outline instruction"
     );
 }
 
@@ -529,7 +579,15 @@ async fn engine_generate_dialogue_errors_when_no_provider() {
     let engine = LensEngine::init(dir.path()).await.unwrap();
     let nb = engine.create_notebook("nb", None, None).await.unwrap().id;
     let res = engine
-        .generate_dialogue(&nb, Length::Short, CancellationToken::new(), no_phase())
+        .generate_dialogue(
+            &nb,
+            lens_core::OverviewFormat::DeepDive,
+            Length::Short,
+            None,
+            None,
+            CancellationToken::new(),
+            no_phase(),
+        )
         .await;
     assert!(matches!(res, Err(lens_core::LensError::Model(_))));
 }
@@ -568,7 +626,15 @@ async fn engine_generate_dialogue_produces_grounded_script() {
     insert_chunk(&pool, "sB", "c2", "beta content").await;
 
     let script = engine
-        .generate_dialogue(&nb, Length::Short, CancellationToken::new(), no_phase())
+        .generate_dialogue(
+            &nb,
+            lens_core::OverviewFormat::DeepDive,
+            Length::Short,
+            None,
+            None,
+            CancellationToken::new(),
+            no_phase(),
+        )
         .await
         .expect("grounded script");
 
@@ -627,7 +693,15 @@ async fn real_model_generates_valid_grounded_dialogue() {
     .await;
 
     let script = engine
-        .generate_dialogue(&nb, Length::Short, CancellationToken::new(), no_phase())
+        .generate_dialogue(
+            &nb,
+            lens_core::OverviewFormat::DeepDive,
+            Length::Short,
+            None,
+            None,
+            CancellationToken::new(),
+            no_phase(),
+        )
         .await
         .expect("a reachable local model returns a valid grounded script");
 

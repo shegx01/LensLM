@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::graph::{Relation, ResolvedNode};
 use crate::llm::LlmProvider;
 use crate::notebooks::EnrichmentChunk;
+use crate::prompt::{fence_excerpt, fence_nonce, injection_guard};
 
 use super::is_nonprose_block;
 use super::map::{MapError, run_llm_with_retries};
@@ -25,6 +26,15 @@ Use ONLY predicates from the provided list. Use ONLY entity names from the provi
 list. Each chunk_id MUST be one of the provided ids. confidence is your certainty the \
 relation is stated or strongly implied in the cited chunk. If nothing qualifies, return \
 an empty relations array. Do not add any other keys.";
+
+/// Appends the code-owned injection guard (keyed to `nonce`) to the relations system
+/// prompt; each chunk's text in the user message is wrapped in the matching fence.
+fn relations_system_with_guard(nonce: &str) -> String {
+    format!(
+        "{RELATIONS_SYSTEM_PROMPT}\n\n{}",
+        injection_guard(nonce, "The chunk text", "extract relations")
+    )
+}
 
 /// Raw LLM triple (unvalidated). `deny_unknown_fields` triggers a reprompt on a
 /// garbled shape rather than silent acceptance.
@@ -110,6 +120,7 @@ pub fn build_relations_prompt(
     batch: &[(usize, &EnrichmentChunk)],
     entities: &[String],
     predicates: &[String],
+    nonce: &str,
 ) -> String {
     let entity_line = if entities.is_empty() {
         "(none)".to_string()
@@ -132,7 +143,12 @@ pub fn build_relations_prompt(
     prompt.push_str(&chunk_ids.join(", "));
     prompt.push_str("\n\nExtract relations from these chunks:\n");
     for (id, chunk) in batch {
-        prompt.push_str(&format!("[chunk_id={id}]\n{}\n\n", chunk.text));
+        // chunk_id label stays outside the fence (the model must echo it); only the
+        // untrusted chunk text is wrapped.
+        prompt.push_str(&format!(
+            "[chunk_id={id}]\n{}",
+            fence_excerpt(nonce, &chunk.text)
+        ));
     }
     prompt
 }
@@ -197,6 +213,8 @@ pub async fn extract_relations(
         return Ok(Vec::new());
     }
 
+    let nonce = fence_nonce();
+    let system = relations_system_with_guard(&nonce);
     let mut all: Vec<RelationTriple> = Vec::new();
     for batch in sampled.chunks(RELATIONS_BATCH_SIZE) {
         // Positional prompt id (string) -> real chunks.id, for validate + FK.
@@ -204,12 +222,13 @@ pub async fn extract_relations(
             .iter()
             .map(|(i, c)| (i.to_string(), c.id.clone()))
             .collect();
-        let prompt = build_relations_prompt(batch, entities, &sorted_vocab(predicate_vocab));
+        let prompt =
+            build_relations_prompt(batch, entities, &sorted_vocab(predicate_vocab), &nonce);
 
         let raw = match run_llm_with_retries(
             provider,
             budget,
-            RELATIONS_SYSTEM_PROMPT,
+            &system,
             &prompt,
             RELATIONS_MAX_TOKENS,
             parse_relations_response,
@@ -412,13 +431,16 @@ mod tests {
         let predicates = vec!["founded".to_string(), "employed_by".to_string()];
         let chunks = [chunk("c0", 1, None, "Ada founded it.")];
         let batch: Vec<(usize, &EnrichmentChunk)> = vec![(0, &chunks[0])];
-        let prompt = build_relations_prompt(&batch, &entities, &predicates);
+        let prompt = build_relations_prompt(&batch, &entities, &predicates, "n0");
         assert!(prompt.contains("Ada"));
         assert!(prompt.contains("Babbage"));
         assert!(prompt.contains("founded"));
         assert!(prompt.contains("employed_by"));
         assert!(prompt.contains("chunk_id=0"));
         assert!(RELATIONS_SYSTEM_PROMPT.contains("\"relations\""));
+        // The untrusted chunk text is fenced; the guard lives in the system prompt.
+        assert!(prompt.contains("<<SRC:n0>>") && prompt.contains("<<END:n0>>"));
+        assert!(relations_system_with_guard("n0").contains("untrusted DATA"));
     }
 
     #[tokio::test]
