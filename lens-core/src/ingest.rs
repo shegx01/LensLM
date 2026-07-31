@@ -1656,6 +1656,7 @@ async fn wipe_source_content(
     store.drop_entity_source(&coord, source_id).await?;
     let mut tx = pool.begin().await?;
     delete_chunks_for_source(&mut tx, source_id).await?;
+    delete_sections_for_source(&mut tx, source_id).await?;
     // #157: clear source-keyed entity_nodes explicitly (see the helper).
     crate::notebooks::delete_entity_nodes_for_source(&mut tx, source_id).await?;
     tx.commit().await?;

@@ -344,12 +344,20 @@ async fn assemble_tier1(
     Ok(units)
 }
 
+/// Whole-word, case-insensitive title match (tokenizing on non-alphanumerics) so a
+/// keyword matches a real heading word, not a substring ("part" ≠ "Department").
+fn title_has_word(title: &str, word: &str) -> bool {
+    title
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|tok| tok.eq_ignore_ascii_case(word))
+}
+
 /// Tier-0 structural resolver (#279). Returns section-scoped parent chunks in document
 /// order when `target` resolves to a real section in the selected corpus, or `None` to
 /// fall through to normal retrieval — the low-confidence gate: an ordinal/name matching
-/// no section must NOT scope to a wrong one. Ordinal kinds map onto the shallowest
-/// heading level a document uses (sub-section precision is a non-goal); a section's
-/// chunks are those whose `char_start` falls in its `[char_start, char_end)` span.
+/// no section must NOT scope to a wrong one. "chapter N" prefers the Nth section whose
+/// title names the kind, else the Nth shallowest-level section (sub-section precision is a
+/// non-goal). A parent chunk is attributed to the section holding its midpoint.
 async fn resolve_structural(
     pool: &SqlitePool,
     source_ids: &[String],
@@ -361,37 +369,49 @@ async fn resolve_structural(
 
     let mut spans: Vec<(String, i64, i64)> = Vec::new();
     for source_id in source_ids {
-        match target {
-            StructuralTarget::Ordinal { ordinal, .. } => {
-                let row = sqlx::query_as::<_, (i64, i64)>(
-                    "SELECT char_start, char_end FROM sections \
-                     WHERE source_id = ?1 AND ordinal = ?2 \
-                       AND level = (SELECT MIN(level) FROM sections WHERE source_id = ?1) \
-                     LIMIT 1",
-                )
-                .bind(source_id)
-                .bind(*ordinal as i64)
-                .fetch_optional(pool)
-                .await?;
-                if let Some((cs, ce)) = row {
-                    spans.push((source_id.clone(), cs, ce));
+        // Resolve against this source's outline in Rust with WHOLE-WORD title matching so
+        // "part" doesn't match "Department" nor "introduction" match "reintroduction".
+        let sections = sqlx::query_as::<_, (String, i64, i64, i64)>(
+            "SELECT title, char_start, char_end, level FROM sections \
+             WHERE source_id = ? ORDER BY char_start ASC",
+        )
+        .bind(source_id)
+        .fetch_all(pool)
+        .await?;
+        let picked = match target {
+            StructuralTarget::Ordinal { kind, ordinal } => {
+                let n = (*ordinal as usize).saturating_sub(1);
+                // Prefer the Nth section whose title NAMES the kind ("Chapter 2"), so
+                // "chapter 2" in a Part→Chapter book resolves to the chapter, not Part II.
+                // Fall back to the Nth section at the shallowest level (single-level books).
+                let by_title: Vec<&(String, i64, i64, i64)> = sections
+                    .iter()
+                    .filter(|(t, _, _, _)| title_has_word(t, kind.title_keyword()))
+                    .collect();
+                if !by_title.is_empty() {
+                    by_title.get(n).map(|(_, cs, ce, _)| (*cs, *ce))
+                } else if let Some(min_level) = sections.iter().map(|(_, _, _, l)| *l).min() {
+                    sections
+                        .iter()
+                        .filter(|(_, _, _, l)| *l == min_level)
+                        .nth(n)
+                        .map(|(_, cs, ce, _)| (*cs, *ce))
+                } else {
+                    None
                 }
             }
-            StructuralTarget::Named(named) => {
-                let cands = sqlx::query_as::<_, (String, i64, i64)>(
-                    "SELECT title, char_start, char_end FROM sections \
-                     WHERE source_id = ? ORDER BY level ASC, char_start ASC",
-                )
-                .bind(source_id)
-                .fetch_all(pool)
-                .await?;
-                if let Some((_, cs, ce)) = cands.into_iter().find(|(title, _, _)| {
-                    let t = title.to_lowercase();
-                    named.title_keywords().iter().any(|kw| t.contains(kw))
-                }) {
-                    spans.push((source_id.clone(), cs, ce));
-                }
-            }
+            StructuralTarget::Named(named) => sections
+                .iter()
+                .find(|(t, _, _, _)| {
+                    named
+                        .title_keywords()
+                        .iter()
+                        .any(|kw| title_has_word(t, kw))
+                })
+                .map(|(_, cs, ce, _)| (*cs, *ce)),
+        };
+        if let Some((cs, ce)) = picked {
+            spans.push((source_id.clone(), cs, ce));
         }
     }
 
@@ -409,10 +429,15 @@ async fn resolve_structural(
     }
     let mut rows: Vec<SpanRow> = Vec::new();
     for (source_id, cs, ce) in &spans {
+        // MIDPOINT attribution: parents pack by token budget and never flush at a heading, so
+        // one can straddle a boundary. Attributing it to the section holding its MIDPOINT keeps
+        // the opening (a mostly-in-section straddler) yet won't drag in the whole previous
+        // section — the balance between start-containment (drops opening) and overlap. Bind cs, ce.
         let recs = sqlx::query_as::<_, (String, String, Option<String>, String, i64)>(&format!(
             "SELECT c.id, c.text, c.source_anchor, c.section_path, c.char_start \
              FROM chunks c JOIN sources s ON s.id = c.source_id \
-             WHERE c.source_id = ? AND c.kind = ? AND c.char_start >= ? AND c.char_start < ? \
+             WHERE c.source_id = ? AND c.kind = ? \
+               AND (c.char_start + c.char_end) / 2 >= ? AND (c.char_start + c.char_end) / 2 < ? \
                AND {RETRIEVAL_LIVE_WHERE} \
              ORDER BY c.char_start ASC"
         ))

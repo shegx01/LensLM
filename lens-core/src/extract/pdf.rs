@@ -252,13 +252,28 @@ fn collect_bookmarks<'a>(root: Option<PdfBookmark<'a>>) -> Vec<(u8, usize, Strin
     out
 }
 
+/// Outline bounds: an untrusted PDF may nest bookmarks thousands deep or cycle its
+/// sibling/child links. Depth caps recursion (stack-overflow guard), the node cap bounds
+/// total output, and the per-level sibling cap bounds a `next_sibling` cycle whose nodes
+/// carry no title (so `out` never grows to trip the node cap).
+const MAX_BOOKMARK_DEPTH: u8 = 32;
+const MAX_BOOKMARK_NODES: usize = 10_000;
+
 fn walk_bookmarks<'a>(
     node: Option<PdfBookmark<'a>>,
     depth: u8,
     out: &mut Vec<(u8, usize, String)>,
 ) {
+    if depth > MAX_BOOKMARK_DEPTH {
+        return;
+    }
     let mut cur = node;
+    let mut siblings = 0usize;
     while let Some(bm) = cur {
+        if out.len() >= MAX_BOOKMARK_NODES || siblings >= MAX_BOOKMARK_NODES {
+            return;
+        }
+        siblings += 1;
         if let (Some(title), Some(dest)) = (bm.title(), bm.destination())
             && let Ok(idx) = dest.page_index()
             && let Ok(page) = usize::try_from(idx)
@@ -346,6 +361,62 @@ mod tests {
         doc.save(&mut BufWriter::new(&mut buf))
             .expect("serialize no-text fixture PDF to bytes");
         buf
+    }
+
+    /// Builds a 2-page PDF with a flat embedded outline (one bookmark per page). printpdf
+    /// keys bookmarks by page in a `HashMap` (non-deterministic order); the extractor sorts
+    /// by page, so the resulting outline order is stable.
+    fn build_bookmarked_pdf() -> Vec<u8> {
+        use printpdf::{BuiltinFont, Mm, PdfDocument};
+        use std::io::BufWriter;
+
+        let (doc, page1, layer1) =
+            PdfDocument::new("outline-fixture", Mm(210.0), Mm(297.0), "Layer 1");
+        let font = doc
+            .add_builtin_font(BuiltinFont::Helvetica)
+            .expect("add builtin font");
+        doc.get_page(page1).get_layer(layer1).use_text(
+            "Chapter one body text.",
+            14.0,
+            Mm(20.0),
+            Mm(270.0),
+            &font,
+        );
+        let (page2, layer2) = doc.add_page(Mm(210.0), Mm(297.0), "Layer 1");
+        doc.get_page(page2).get_layer(layer2).use_text(
+            "Chapter two body text.",
+            14.0,
+            Mm(20.0),
+            Mm(270.0),
+            &font,
+        );
+        doc.add_bookmark("Chapter One", page1);
+        doc.add_bookmark("Chapter Two", page2);
+
+        let mut buf = Vec::new();
+        doc.save(&mut BufWriter::new(&mut buf))
+            .expect("serialize bookmarked fixture PDF to bytes");
+        buf
+    }
+
+    /// The embedded outline becomes the section structure (#279): each bookmark is a
+    /// self-inclusive heading block, and `build_sections` derives the level/ordinal outline.
+    #[test]
+    fn pdf_outline_becomes_section_structure() {
+        let raw = build_bookmarked_pdf();
+        let Some(out) = try_extract(&raw) else {
+            return;
+        };
+        let sections = crate::section::build_sections(&out.blocks);
+        let got: Vec<(u8, u32, &str)> = sections
+            .iter()
+            .map(|s| (s.level, s.ordinal, s.title.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![(1, 1, "Chapter One"), (1, 2, "Chapter Two")],
+            "flat outline → two top-level sections in page order"
+        );
     }
 
     /// Returns `None` (skip) when libpdfium is unavailable; panics on other errors.

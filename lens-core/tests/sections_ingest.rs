@@ -1,6 +1,13 @@
 //! End-to-end: ingesting a document populates the `sections` outline (#279), so a
 //! positional query has real structure to resolve against. Offline — fake embedder.
 
+use lens_core::Tier;
+use lens_core::config::{ModelConfig, RetrievalConfig, TierThresholds};
+use lens_core::embedder::EmbeddingBackend;
+use lens_core::retrieval::Reranker;
+use lens_core::retrieval::router::tiered_search;
+use lens_core::vector_store::{Coordinate, LanceVectorStore};
+
 mod support;
 use support::{file_engine, inject_fake_embedder};
 
@@ -66,4 +73,69 @@ async fn re_ingest_replaces_the_outline() {
         .await
         .unwrap();
     assert_eq!(count, 1, "re-ingest must not duplicate outline rows");
+}
+
+/// A positional query resolves via Tier-0 against REAL ingested chunk offsets (not
+/// hand-aligned fixtures): "chapter 2" scopes to chapter 2's content even though the
+/// bulky chapters chunk into multiple parents, some straddling a heading boundary.
+#[tokio::test]
+async fn positional_query_scopes_to_the_real_chapter() {
+    let (dir, engine) = file_engine().await;
+    inject_fake_embedder(&engine);
+    let nb = engine.create_notebook("book", None, None).await.unwrap();
+
+    // Bulky, marker-tagged chapters so real chunking yields multiple parents, including a
+    // parent straddling the Ch1/Ch2 boundary (the M1 span-overlap case).
+    let ch1 = "APPLE ".repeat(400);
+    let ch2 = "ORANGE ".repeat(400);
+    let ch3 = "BANANA ".repeat(400);
+    let md = format!("# Chapter 1\n\n{ch1}\n\n# Chapter 2\n\n{ch2}\n\n# Chapter 3\n\n{ch3}\n");
+    let src = engine
+        .add_text_source(&nb.id, "Book", &md, "markdown")
+        .await
+        .unwrap()
+        .source;
+    engine.ingest_source(&src.id, |_p| {}).await.unwrap();
+
+    let pool = engine.pool().await;
+    let store = LanceVectorStore::new(dir.path(), pool.clone());
+    let coord = Coordinate::new(nb.id.to_string(), EmbeddingBackend::Fastembed, "m", 4);
+    let reranker = Reranker::new(dir.path());
+    // Tier-0 resolves from SQLite before any vector access, so the query vector is unused.
+    let out = tiered_search(
+        &pool,
+        &store,
+        &reranker,
+        None,
+        &coord,
+        "what is the summary of chapter 2?",
+        &[0.0f32; 4],
+        &ModelConfig::default(),
+        10,
+        &RetrievalConfig::default(),
+        None,
+        &TierThresholds::default(),
+        None,
+        0,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        out.tier,
+        Tier::Tier0,
+        "positional query must resolve via Tier-0"
+    );
+    let text: String = out.units.iter().map(|u| u.text.as_str()).collect();
+    let oranges = text.matches("ORANGE").count();
+    let apples = text.matches("APPLE").count();
+    let bananas = text.matches("BANANA").count();
+    assert!(
+        oranges > 0,
+        "chapter 2's content (incl. its opening) must be present"
+    );
+    assert!(
+        oranges > apples && oranges > bananas,
+        "chapter 2 dominates the scoped result (oranges={oranges} apples={apples} bananas={bananas})"
+    );
 }

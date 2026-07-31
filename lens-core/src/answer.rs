@@ -196,17 +196,38 @@ fn build_grounded_user(
     )
 }
 
-/// Neutralizes the source-derived (untrusted) `title` before it enters the UNFENCED
-/// `[n] (title):` label: drops control chars (newline/CR breakout) and maps `)` so a
-/// crafted `sources.title` cannot close the parenthetical early and inject instructions
-/// into the trusted region; caps length. The excerpt body stays fenced separately.
+/// Neutralizes source-derived (untrusted) text before it enters the UNFENCED `[n] (…)`
+/// label: maps `)` so a crafted value can't close the parenthetical early, collapses ALL
+/// whitespace — including Unicode line/paragraph separators U+2028/U+2029 — to a space so
+/// nothing starts a new (directive) line, drops control + bidi/zero-width format chars,
+/// and caps length. The excerpt body stays fenced separately.
 fn sanitize_title(title: &str) -> String {
     title
         .chars()
-        .map(|c| if c == ')' { ']' } else { c })
-        .filter(|c| !c.is_control())
+        .map(|c| {
+            if c == ')' {
+                ']'
+            } else if c.is_whitespace() {
+                ' '
+            } else {
+                c
+            }
+        })
+        .filter(|c| !c.is_control() && !is_format_char(*c))
         .take(200)
         .collect()
+}
+
+/// Bidi/zero-width format characters (Unicode category Cf) that `char::is_control` misses
+/// but that can hide or reorder text inside the unfenced label.
+fn is_format_char(c: char) -> bool {
+    matches!(c,
+        '\u{200B}'..='\u{200F}'   // zero-width space .. RTL mark
+        | '\u{202A}'..='\u{202E}' // bidi embeddings / overrides
+        | '\u{2060}'..='\u{2064}' // word joiner .. invisible operators
+        | '\u{2066}'..='\u{2069}' // bidi isolates
+        | '\u{FEFF}'              // BOM / zero-width no-break space
+    )
 }
 
 /// Strips leaked prompt fence markers (`<<SRC:nonce>>` / `<<END:nonce>>`) from the model's

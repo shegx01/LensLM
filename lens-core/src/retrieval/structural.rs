@@ -13,6 +13,17 @@ pub enum StructuralKind {
     Part,
 }
 
+impl StructuralKind {
+    /// The lowercase noun that names this unit in a heading title ("Chapter 2").
+    pub fn title_keyword(self) -> &'static str {
+        match self {
+            Self::Chapter => "chapter",
+            Self::Section => "section",
+            Self::Part => "part",
+        }
+    }
+}
+
 /// A named front/back-matter section addressable by name rather than number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NamedSection {
