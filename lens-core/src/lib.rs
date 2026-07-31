@@ -1927,10 +1927,10 @@ impl LensEngine {
         crate::dialogue::generate_dialogue(ctx, cancel, on_phase).await
     }
 
-    /// Proposes focus topics for an audio overview from the notebook's selected sources
-    /// (one cheap LLM call over a bounded sample of their actual content). Returns a short
-    /// Markdown bullet list of specific, source-grounded topics the hosts could cover — the
-    /// user edits it before generating. Content is untrusted, so it is fenced.
+    /// Proposes a focus brief for an audio overview from the notebook's selected sources
+    /// (one cheap LLM call over a bounded sample of their actual content): a short framing
+    /// paragraph followed by a Markdown bullet list of specific, source-grounded points the
+    /// hosts could cover — the user edits it before generating. Content is fenced (untrusted).
     pub async fn suggest_overview_focus(&self, notebook_id: &str) -> Result<String, LensError> {
         let provider = self
             .chat_provider()
@@ -1951,22 +1951,24 @@ impl LensEngine {
         let nonce = crate::prompt::fence_nonce();
         let system = format!(
             "You are planning a short, two-host audio overview of a set of documents. From the \
-             excerpts, propose four to six specific topics or angles the hosts should cover. \
-             Each must be grounded in what the material actually discusses — name the concrete \
-             thing (a decision, number, event, tension, claim), not a generic label like \
-             \"key points\" or \"background\".\n\n\
-             Return ONLY a Markdown bullet list: one topic per line, each line starting with \
-             \"- \" followed by a short specific phrase (no headings, no numbering, no \
-             sub-bullets, no preamble, no closing remarks).\n\n{}",
-            crate::prompt::injection_guard(&nonce, "The document excerpts", "propose focus topics")
+             excerpts, write a focus brief in two parts:\n\
+             1. A short framing paragraph (two to four sentences) naming the most important \
+             thing the overview should get across and any orienting context a listener needs.\n\
+             2. A blank line, then a Markdown bullet list of four to six specific points or \
+             angles to cover — each line starts with \"- \" and names a concrete thing (a \
+             decision, number, event, tension, claim) from the material, not a generic label \
+             like \"key points\" or \"background\".\n\n\
+             Ground everything in what the excerpts actually discuss. Output only the paragraph \
+             and the bullet list — no heading, no numbering on the bullets, no closing remarks.\n\n{}",
+            crate::prompt::injection_guard(&nonce, "The document excerpts", "write a focus brief")
         );
         let req = crate::llm::LlmRequest {
             system: Some(system),
             prompt: format!(
-                "Document excerpts:\n{}\nTopics:",
+                "Document excerpts:\n{}\nFocus brief:",
                 crate::prompt::fence_excerpt(&nonce, &excerpts)
             ),
-            max_tokens: 256,
+            max_tokens: 320,
             temperature: 0.6,
             json: false,
             thinking: false,
@@ -3204,51 +3206,60 @@ fn audio_file_is_nonempty(path: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Normalizes a suggested topic list into clean Markdown bullets: keeps only the
-/// list-item lines (dropping any preamble/closing prose a small model adds), strips the
-/// original bullet or `1.`/`1)` numbering plus stray quotes, and re-emits each as `- `.
-/// Falls back to the first non-empty line when the model returned no list at all.
+/// Tidies a suggested focus into a short framing paragraph followed by a Markdown bullet
+/// list: keeps the intro prose BEFORE the first bullet (joined into one paragraph), keeps
+/// every bullet/numbered item (normalized to `- `, numbering/quotes stripped), and drops
+/// any trailing prose a small model adds after the list. Returns the raw prose unchanged
+/// when the model produced no list at all.
 fn clean_focus_topics(raw: &str) -> String {
     let bullet = |c: char| matches!(c, '-' | '•' | '*' | '–');
-    let mut items: Vec<String> = Vec::new();
-    for line in raw.trim().lines() {
-        let l = line.trim();
-        if l.is_empty() {
-            continue;
+    let leading_ordinal = |l: &str| -> usize {
+        let digits = l.chars().take_while(char::is_ascii_digit).count();
+        if digits > 0 && l[digits..].starts_with(['.', ')']) {
+            digits + 1
+        } else {
+            0
         }
-        let is_dash = l.starts_with(bullet);
-        let is_numbered = {
-            let digits: String = l.chars().take_while(char::is_ascii_digit).collect();
-            !digits.is_empty() && l[digits.len()..].starts_with(['.', ')'])
+    };
+    let is_item = |l: &str| l.starts_with(bullet) || leading_ordinal(l) > 0;
+    let normalize = |l: &str| -> String {
+        let body = if l.starts_with(bullet) {
+            l.trim_start_matches(bullet).trim_start()
+        } else {
+            l[leading_ordinal(l)..].trim_start()
         };
-        if !is_dash && !is_numbered {
-            continue;
-        }
-        let mut item = l.trim_start_matches(bullet).trim_start();
-        if is_numbered {
-            item = item
-                .trim_start_matches(|c: char| c.is_ascii_digit())
-                .trim_start_matches(['.', ')'])
-                .trim_start();
-        }
-        let item = item
+        let body = body
             .trim()
             .trim_matches(|c: char| matches!(c, '"' | '\'' | '“' | '”'))
             .trim();
-        if !item.is_empty() {
-            items.push(format!("- {item}"));
-        }
-    }
+        format!("- {body}")
+    };
+
+    let lines: Vec<&str> = raw.trim().lines().map(str::trim).collect();
+    let Some(first) = lines.iter().position(|l| is_item(l)) else {
+        return raw.trim().to_string();
+    };
+    let intro = lines[..first]
+        .iter()
+        .filter(|l| !l.is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let items: Vec<String> = lines[first..]
+        .iter()
+        .filter(|l| is_item(l))
+        .map(|l| normalize(l))
+        .filter(|s| s.len() > 2)
+        .collect();
     if items.is_empty() {
-        return raw
-            .trim()
-            .lines()
-            .map(str::trim)
-            .find(|l| !l.is_empty())
-            .unwrap_or("")
-            .to_string();
+        return raw.trim().to_string();
     }
-    items.join("\n")
+    let list = items.join("\n");
+    if intro.is_empty() {
+        list
+    } else {
+        format!("{intro}\n\n{list}")
+    }
 }
 
 #[cfg(test)]
@@ -3256,25 +3267,36 @@ mod focus_topics_tests {
     use super::clean_focus_topics;
 
     #[test]
-    fn keeps_a_markdown_bullet_list() {
-        let raw = "- the Q3 revenue drivers\n- the biggest risks to watch\n- the FY outlook";
+    fn keeps_intro_paragraph_then_the_bullets() {
+        let raw = "This overview should center the Q3 turnaround and what drove it.\n\n- the revenue drivers\n- the biggest risks to watch";
         assert_eq!(
             clean_focus_topics(raw),
-            "- the Q3 revenue drivers\n- the biggest risks to watch\n- the FY outlook"
+            "This overview should center the Q3 turnaround and what drove it.\n\n\
+             - the revenue drivers\n- the biggest risks to watch"
         );
     }
 
     #[test]
-    fn normalizes_numbering_and_drops_preamble_and_closing() {
-        let raw = "Here are some topics:\n1. the migration trade-offs\n2) why Postgres won\n\nHope this helps!";
+    fn normalizes_numbering_and_drops_only_trailing_prose() {
+        let raw =
+            "Focus on the migration.\n1. the trade-offs\n2) why Postgres won\n\nHope this helps!";
         assert_eq!(
             clean_focus_topics(raw),
-            "- the migration trade-offs\n- why Postgres won"
+            "Focus on the migration.\n\n- the trade-offs\n- why Postgres won"
         );
     }
 
     #[test]
-    fn falls_back_to_plain_text_when_no_list() {
+    fn returns_a_bare_list_when_there_is_no_intro() {
+        let raw = "- the revenue drivers\n- the FY outlook";
+        assert_eq!(
+            clean_focus_topics(raw),
+            "- the revenue drivers\n- the FY outlook"
+        );
+    }
+
+    #[test]
+    fn keeps_plain_prose_when_no_list() {
         assert_eq!(
             clean_focus_topics("lead with the numbers"),
             "lead with the numbers"

@@ -283,9 +283,9 @@ fn build_dialogue_prompt(
     let focus_line = match focus {
         Some(f) if !f.trim().is_empty() => {
             let f = f.trim();
-            // A multi-line steer (e.g. a suggested topic list) reads better on its own lines.
+            // A multi-line steer (e.g. a suggested focus brief) reads better on its own lines.
             if f.contains('\n') {
-                format!("\n\nGive particular focus to these topics:\n{f}")
+                format!("\n\nGive particular focus to the following:\n{f}")
             } else {
                 format!("\n\nGive particular focus to: {f}")
             }
