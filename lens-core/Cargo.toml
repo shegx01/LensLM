@@ -133,7 +133,7 @@ whisper-rs = { workspace = true, optional = true }
 # Default `reqwest` feature injects our hardened client via `ClientBuilder::http_client(...)` (SSRF/
 # timeout policy carries over); `rustls` keeps the pure-Rust TLS stack; `reqwest ^0.13` dedupes with
 # our =0.13.4 pin. Pre-1.0: `=`-pinned; re-run `cargo deny check` on every bump. MIT — deny.toml.
-rig-core = { version = "=0.40.0" }
+rig-core = { version = "=0.41.0" }
 
 # SHA256 integrity verification of downloaded models. Pinned to the
 # version already resolved in the lock tree (transitive) so no new copy is added.
