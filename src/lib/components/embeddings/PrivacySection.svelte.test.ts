@@ -40,7 +40,8 @@ function config(opts: { textConsent: boolean; audioConsent: boolean }): Partial<
       translate: false,
       cloud_base_url: '',
       cloud_model: '',
-      cloud_api_key: ''
+      cloud_api_key: '',
+      apple_min_confidence: 0.5
     }
   };
 }
@@ -135,7 +136,8 @@ describe('PrivacySection', () => {
             translate: false,
             cloud_base_url: '',
             cloud_model: '',
-            cloud_api_key: ''
+            cloud_api_key: '',
+            apple_min_confidence: 0.5
           }
         };
     });

@@ -80,17 +80,23 @@ export interface EnrichmentConfig {
 // SYNC-CHECK: must match lens-core/src/config.rs CloudAsrProvider — snake_case serde.
 export type CloudAsrProvider = 'open_ai_compatible' | 'deepgram';
 
+// SYNC-CHECK: must match lens-core/src/asr/mod.rs Lang's named variants — no
+// `rename_all`, so the wire token is PascalCase ("En"), not "en".
+export type AsrLang = 'En' | 'De' | 'Fr' | 'Es' | 'It' | 'Pt' | 'Nl' | 'Ru' | 'Zh' | 'Ja' | 'Ko';
+
 // SYNC-CHECK: must match lens-core/src/config.rs AsrConfig — update both together.
 // Older configs have no `asr` key; Rust defaults via `#[serde(default)]`.
 export interface AsrConfig {
   backend: string;
   whisper_model: string;
-  language?: string | { Other: string } | null;
+  language?: AsrLang | { Other: string } | null;
   translate: boolean;
   cloud_provider?: CloudAsrProvider | null;
   cloud_base_url: string;
   cloud_model: string;
   cloud_api_key: string;
+  // Rust default 0.5 (config.rs default_apple_min_confidence).
+  apple_min_confidence: number;
 }
 
 export interface PathConfig {
