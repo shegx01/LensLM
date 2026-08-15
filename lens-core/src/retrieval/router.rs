@@ -53,6 +53,9 @@ const GRAPH_MIN_CONFIDENCE: f32 = 0.1;
 /// Which tier the router selected for a query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
+    /// A positional query ("chapter 2") resolved to a document section (#279); that
+    /// section's chunks are injected in document order, bypassing similarity search.
+    Tier0,
     /// Raw selected corpus fits the budget — inject it directly.
     Tier1,
     /// Corpus overflows — fused retrieval with parent auto-merge.
@@ -339,6 +342,147 @@ async fn assemble_tier1(
         });
     }
     Ok(units)
+}
+
+/// Whole-word, case-insensitive title match (tokenizing on non-alphanumerics) so a
+/// keyword matches a real heading word, not a substring ("part" ≠ "Department").
+fn title_has_word(title: &str, word: &str) -> bool {
+    title
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|tok| tok.eq_ignore_ascii_case(word))
+}
+
+/// Tier-0 structural resolver (#279): section-scoped parent chunks for a resolved `target`,
+/// or `None` to fall through to normal retrieval (an ordinal/name matching no section must
+/// NOT scope to a wrong one). "chapter N" prefers the Nth section whose title names the
+/// kind, else the Nth shallowest-level section; a parent is attributed by its midpoint.
+async fn resolve_structural(
+    pool: &SqlitePool,
+    source_ids: &[String],
+    source_rank: &HashMap<String, usize>,
+    target: &super::structural::StructuralTarget,
+    cap: usize,
+) -> Result<Option<Vec<ContextUnit>>, LensError> {
+    use super::structural::StructuralTarget;
+
+    let mut spans: Vec<(String, i64, i64)> = Vec::new();
+    for source_id in source_ids {
+        let sections = sqlx::query_as::<_, (String, i64, i64, i64)>(
+            "SELECT title, char_start, char_end, level FROM sections \
+             WHERE source_id = ? ORDER BY char_start ASC",
+        )
+        .bind(source_id)
+        .fetch_all(pool)
+        .await?;
+        let picked = match target {
+            StructuralTarget::Ordinal { kind, ordinal } => {
+                let n = (*ordinal as usize).saturating_sub(1);
+                // Nth title naming the kind (so "chapter 2" ≠ "Part II"), else Nth at the
+                // shallowest level.
+                let by_title: Vec<&(String, i64, i64, i64)> = sections
+                    .iter()
+                    .filter(|(t, _, _, _)| title_has_word(t, kind.title_keyword()))
+                    .collect();
+                if !by_title.is_empty() {
+                    by_title.get(n).map(|(_, cs, ce, _)| (*cs, *ce))
+                } else if let Some(min_level) = sections.iter().map(|(_, _, _, l)| *l).min() {
+                    sections
+                        .iter()
+                        .filter(|(_, _, _, l)| *l == min_level)
+                        .nth(n)
+                        .map(|(_, cs, ce, _)| (*cs, *ce))
+                } else {
+                    None
+                }
+            }
+            StructuralTarget::Named(named) => sections
+                .iter()
+                .find(|(t, _, _, _)| {
+                    named
+                        .title_keywords()
+                        .iter()
+                        .any(|kw| title_has_word(t, kw))
+                })
+                .map(|(_, cs, ce, _)| (*cs, *ce)),
+        };
+        if let Some((cs, ce)) = picked {
+            spans.push((source_id.clone(), cs, ce));
+        }
+    }
+
+    if spans.is_empty() {
+        return Ok(None);
+    }
+
+    struct SpanRow {
+        rank: usize,
+        char_start: i64,
+        chunk_id: String,
+        source_id: String,
+        text: String,
+        locator: Option<String>,
+    }
+    let mut rows: Vec<SpanRow> = Vec::new();
+    for (source_id, cs, ce) in &spans {
+        // A parent packs by token budget and never flushes at a heading, so attribute a
+        // boundary-straddler by its MIDPOINT — keeps the opening without pulling in the
+        // neighbour (start-containment drops the opening; overlap over-includes it).
+        let recs = sqlx::query_as::<_, (String, String, Option<String>, String, i64)>(&format!(
+            "SELECT c.id, c.text, c.source_anchor, c.section_path, c.char_start \
+             FROM chunks c JOIN sources s ON s.id = c.source_id \
+             WHERE c.source_id = ? AND c.kind = ? \
+               AND (c.char_start + c.char_end) / 2 >= ? AND (c.char_start + c.char_end) / 2 < ? \
+               AND {RETRIEVAL_LIVE_WHERE} \
+             ORDER BY c.char_start ASC"
+        ))
+        .bind(source_id)
+        .bind(kind::PARENT)
+        .bind(cs)
+        .bind(ce)
+        .fetch_all(pool)
+        .await?;
+        let rank = *source_rank.get(source_id).unwrap_or(&usize::MAX);
+        for (chunk_id, text, anchor, section_path, char_start) in recs {
+            rows.push(SpanRow {
+                rank,
+                char_start,
+                chunk_id,
+                source_id: source_id.clone(),
+                text,
+                locator: anchor.or(Some(section_path)),
+            });
+        }
+    }
+
+    // Matched a section but it has no live parent chunks → fall back, don't ground on nothing.
+    if rows.is_empty() {
+        return Ok(None);
+    }
+
+    rows.sort_by(|a, b| a.rank.cmp(&b.rank).then(a.char_start.cmp(&b.char_start)));
+
+    let mut units = Vec::with_capacity(rows.len());
+    let mut running = 0usize;
+    for (order_index, r) in rows.into_iter().enumerate() {
+        let cost = estimate_tokens(&r.text);
+        if running + cost > cap && !units.is_empty() {
+            break;
+        }
+        running += cost;
+        units.push(ContextUnit {
+            text: r.text,
+            source_id: r.source_id,
+            chunk_id: r.chunk_id,
+            parent_id: None,
+            locator: r.locator,
+            order_index,
+            provenance: Provenance {
+                source: HitSource::Dense,
+                graph_confidence: None,
+            },
+        });
+    }
+    Ok(Some(units))
 }
 
 /// A retrieved child chunk with its parent linkage, provenance, fused score, and
@@ -1021,6 +1165,20 @@ pub async fn tiered_search(
         .enumerate()
         .map(|(i, id)| (id.clone(), i))
         .collect();
+
+    // Tier-0 (#279): detect on the caller's (condensed) `query_text` so anaphoric follow-ups
+    // work; an unresolved target falls through, leaving non-structural queries byte-identical.
+    if let Some(target) = super::structural::detect_structural_target(query_text)
+        && let Some(units) =
+            resolve_structural(pool_db, &source_ids, &source_rank, &target, caps.tier2_cap).await?
+    {
+        let total_tokens = units.iter().map(|u| estimate_tokens(&u.text)).sum();
+        return Ok(RouterOutput {
+            tier: Tier::Tier0,
+            units,
+            total_tokens,
+        });
+    }
 
     // Tier selection: Σ cached token_count vs the derived tier-1 cap. A single
     // oversized source (its own count > cap) forces Tier-2.
