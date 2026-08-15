@@ -135,13 +135,26 @@ export function asrCapability(
 }
 
 /**
- * Notice copy for enabling translate while Apple is the resolved engine: it
- * reroutes to Local Whisper (lib.rs:2100-2104), which fails outright with no
- * Whisper model on disk (`(AppleNative, None)` has no degradation path).
+ * Notice copy for enabling translate while Apple is the resolved engine: the
+ * reroute (lib.rs:2102-2104) sends it through the LocalWhisper arm (lib.rs:2158),
+ * which errors out if no Whisper model is on disk (lib.rs:2343-2348).
  */
 export function appleTranslateRerouteNotice(whisperModelDownloaded: boolean): string {
   const base = 'Enabling translate reroutes Apple transcription to Local Whisper.';
   return whisperModelDownloaded
     ? base
     : `${base} No Whisper model is downloaded yet, so transcription will fail until one is.`;
+}
+
+/**
+ * Notice copy for enabling translate under Automatic: whichever engine the
+ * router resolves to, translate lands on Local Whisper either way (directly,
+ * or via the Apple reroute above), so the same no-model failure applies.
+ */
+export function automaticTranslateNotice(whisperModelDownloaded: boolean): string {
+  const base =
+    'Automatic prefers on-device Apple transcription where supported, otherwise Local Whisper — enabling translate always routes through Local Whisper either way.';
+  return whisperModelDownloaded
+    ? base
+    : `${base} No Whisper model is downloaded yet, so translate will fail until one is.`;
 }

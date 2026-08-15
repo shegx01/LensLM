@@ -1,9 +1,9 @@
-<!-- Global Language + translate block for the Transcription panel (#136 Step 7). One
-     control set for every engine, with a tri-state notice for how the active engine
-     handles `translate` — the only field that diverges (language is honoured by all four). -->
+<!-- Global Language + translate block for the Transcription panel. One control set for
+     every engine, with a tri-state notice for how the active engine handles `translate`
+     — the only field that diverges (language is honoured by all four). -->
 <script lang="ts">
   import { onMount, untrack } from 'svelte';
-  import { Checkbox } from 'bits-ui';
+  import { Switch } from '$lib/components/ui/switch/index.js';
   import {
     Select,
     SelectTrigger,
@@ -14,12 +14,12 @@
   import { Input } from '$lib/components/ui/input/index.js';
   import Info from '@lucide/svelte/icons/info';
   import TriangleAlert from '@lucide/svelte/icons/triangle-alert';
-  import Check from '@lucide/svelte/icons/check';
   import { cn } from '$lib/utils.js';
   import {
     ASR_LANGUAGE_OPTIONS,
     asrCapability,
     appleTranslateRerouteNotice,
+    automaticTranslateNotice,
     isOtherAsrLanguage,
     type AsrEngineId,
     type AsrLanguageValue
@@ -86,14 +86,15 @@
     await persist((cfg) => ({ ...cfg, asr: { ...cfg.asr, translate: checked } }));
   }
 
-  // Only the Apple reroute case needs a live disk probe (AC 6.3's dangerous case);
-  // every other capability reads statically from ASR_CAPABILITY_MATRIX.
+  // Only the two cases that can land on Local Whisper via a translate reroute
+  // (explicit Apple, or Automatic possibly resolving to Apple) need a live disk
+  // probe; every other capability reads statically from ASR_CAPABILITY_MATRIX.
   let whisperPresent = $state<boolean | null>(null);
   $effect(() => {
     const engine = activeEngine;
     const translateOn = translate;
     const modelId = appConfigStore.asr?.whisper_model ?? 'base';
-    if (engine !== 'apple_native' || !translateOn) {
+    if ((engine !== 'apple_native' && engine !== 'automatic') || !translateOn) {
       whisperPresent = null;
       return;
     }
@@ -118,10 +119,13 @@
   ): CapabilityNotice | null {
     if (engine === null) return null;
     if (engine === 'automatic') {
-      return {
-        tone: 'info',
-        text: 'Automatic prefers on-device Apple transcription where supported, otherwise Local Whisper — enabling translate always routes through Local Whisper either way.'
-      };
+      if (!translateOn) {
+        return {
+          tone: 'info',
+          text: 'Automatic prefers on-device Apple transcription where supported, otherwise Local Whisper — enabling translate always routes through Local Whisper either way.'
+        };
+      }
+      return { tone: 'warning', text: automaticTranslateNotice(whisperOn ?? false) };
     }
     const mode = asrCapability(engine, 'translate');
     if (mode === 'reroutes') {
@@ -200,18 +204,11 @@
         Ask the engine to translate spoken audio into English instead of transcribing it verbatim.
       </span>
     </span>
-    <Checkbox.Root
+    <Switch
       checked={translate}
       onCheckedChange={handleTranslateChange}
       aria-label="Translate to English"
-      class="flex size-[18px] shrink-0 items-center justify-center rounded border border-input bg-background text-primary-foreground transition-colors data-[state=checked]:border-primary data-[state=checked]:bg-primary"
-    >
-      {#snippet children({ checked })}
-        {#if checked}
-          <Check class="size-3.5" aria-hidden="true" />
-        {/if}
-      {/snippet}
-    </Checkbox.Root>
+    />
   </label>
 
   {#if capabilityNotice}

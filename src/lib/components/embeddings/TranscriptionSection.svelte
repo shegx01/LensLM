@@ -1,8 +1,8 @@
 <!--
   TranscriptionSection — engine picker for source transcription (mirrors
   TtsConfigPanel's two-column master-detail shell). Selection is local state
-  seeded from the persisted asr.backend, not derived from it (AC 2.2): this is
-  what lets the Apple row be selected without ever writing an unusable backend.
+  seeded from the persisted asr.backend, not derived from it: this is what
+  lets the Apple row be selected without ever writing an unusable backend.
 -->
 <script lang="ts">
   import { onMount } from 'svelte';
@@ -17,6 +17,7 @@
   } from '$lib/asr/catalog.js';
   import { whisperModelDownloaded } from '$lib/asr/ipc.js';
   import { appConfigStore, ensureLoaded, persist } from '$lib/models/app-config.svelte.js';
+  import { toLensError } from '$lib/sources/lens-error.js';
   import TranscriptionApplePane from './TranscriptionApplePane.svelte';
   import TranscriptionWhisperPane from './TranscriptionWhisperPane.svelte';
   import TranscriptionCloudPane from './TranscriptionCloudPane.svelte';
@@ -26,6 +27,7 @@
   let appleAvailable = $state(false);
   let whisperPresent = $state(false);
   let ready = $state(false);
+  let error = $state<string | null>(null);
 
   const persistedEngine = $derived(asrEngineIdFromBackend(appConfigStore.asr?.backend ?? ''));
   const selectedEntry = $derived(ASR_ENGINE_CATALOG.find((e) => e.id === selectedEngine));
@@ -46,9 +48,10 @@
         return whisperPresent;
       case 'cloud':
         return (
-          !!appConfigStore.asr?.cloud_base_url &&
-          !!appConfigStore.asr?.cloud_model &&
-          !!appConfigStore.asr?.cloud_api_key &&
+          !!appConfigStore.asr?.cloud_provider &&
+          !!appConfigStore.asr?.cloud_base_url.trim() &&
+          !!appConfigStore.asr?.cloud_model.trim() &&
+          !!appConfigStore.asr?.cloud_api_key.trim() &&
           appConfigStore.audioCloudConsent
         );
     }
@@ -85,21 +88,30 @@
     ready = true;
   });
 
+  async function persistBackend(backend: string): Promise<void> {
+    error = null;
+    try {
+      await persist((cfg) => ({ ...cfg, asr: { ...cfg.asr, backend } }));
+    } catch (err) {
+      error = toLensError(err).message;
+    }
+  }
+
   /** Only writes `asr.backend` for rows already usable at select time (Automatic's `""`
-   *  is always safe). Apple never writes while unavailable (R11); a row that is still
+   *  is always safe). Apple never writes while unavailable; a row that is still
    *  blocked activates later from the pane that clears the blocker. */
   function pickEngine(id: AsrEngineId): void {
     if (id === selectedEngine) return;
     selectedEngine = id;
     if (id !== 'automatic' && !isUsable(id)) return;
-    void persist((cfg) => ({ ...cfg, asr: { ...cfg.asr, backend: asrBackendToken(id) } }));
+    void persistBackend(asrBackendToken(id));
   }
 
   function handleWhisperPresenceChange(modelId: string, downloaded: boolean): void {
     if (modelId !== appConfigStore.asr?.whisper_model) return;
     whisperPresent = downloaded;
     if (downloaded && selectedEngine === 'local_whisper') {
-      void persist((cfg) => ({ ...cfg, asr: { ...cfg.asr, backend: 'local_whisper' } }));
+      void persistBackend('local_whisper');
     }
   }
 </script>
@@ -109,6 +121,10 @@
   <p class="mt-1 text-[0.8rem] text-muted-foreground">
     Choose how audio and video sources are transcribed to text.
   </p>
+
+  {#if error}
+    <p class="mt-6 text-[0.8rem] text-destructive" role="alert">{error}</p>
+  {/if}
 
   {#if appConfigStore.loadError}
     <p class="mt-6 text-[0.8rem] text-destructive" role="alert">{appConfigStore.loadError}</p>

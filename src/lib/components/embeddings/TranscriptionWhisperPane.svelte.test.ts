@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AppConfig } from '$lib/theme/types.js';
 import { baseAppConfig } from '$lib/test-fixtures.js';
 import { resetConfig } from '$lib/models/app-config.svelte.js';
-import TranscriptionWhisperPane from './TranscriptionWhisperPane.svelte';
+import TranscriptionWhisperPane, { resetActiveDownloads } from './TranscriptionWhisperPane.svelte';
 
 type ProgressChannel = {
   onmessage: (m: { received: number; total: number | null; done: boolean }) => void;
@@ -24,6 +24,7 @@ afterEach(() => {
   clearMocks();
   delete (globalThis as { isTauri?: boolean }).isTauri;
   resetConfig();
+  resetActiveDownloads();
 });
 
 /** Wires the IPC surface this pane depends on. `downloaded` seeds
@@ -71,13 +72,22 @@ function mount(opts: {
   return { ...result, onPresenceChange };
 }
 
+/** The radio button's accessible name is the bare model id (`aria-label={m.id}`),
+ *  so rows are looked up by role+name rather than by visible text. The Download
+ *  button/"Downloaded" badge live in a sibling slot outside the radio (see the
+ *  a11y test below) — `.parentElement` is the shared row that contains both. */
+function rowFor(modelId: string): HTMLElement {
+  return screen.getByRole('radio', { name: modelId }).parentElement as HTMLElement;
+}
+
 describe('TranscriptionWhisperPane', () => {
   it('lists tiny/base/small with size labels and marks the default model', async () => {
     mount({ downloaded: {} });
 
-    const tinyRow = (await screen.findByText('tiny')).closest('[role="radio"]') as HTMLElement;
-    const baseRow = screen.getByText('base').closest('[role="radio"]') as HTMLElement;
-    const smallRow = screen.getByText('small').closest('[role="radio"]') as HTMLElement;
+    await screen.findByRole('radio', { name: 'tiny' });
+    const tinyRow = rowFor('tiny');
+    const baseRow = rowFor('base');
+    const smallRow = rowFor('small');
 
     expect(within(tinyRow).getByText(/74 ?mb/i)).toBeInTheDocument();
     expect(within(baseRow).getByText(/141 ?mb/i)).toBeInTheDocument();
@@ -91,11 +101,23 @@ describe('TranscriptionWhisperPane', () => {
   it('reflects per-model downloaded presence', async () => {
     mount({ downloaded: { tiny: false, base: true, small: false } });
 
-    const baseRow = (await screen.findByText('base')).closest('[role="radio"]') as HTMLElement;
-    await waitFor(() => expect(within(baseRow).getByText(/downloaded/i)).toBeInTheDocument());
+    await waitFor(() =>
+      expect(within(rowFor('base')).getByText(/downloaded/i)).toBeInTheDocument()
+    );
+    expect(
+      within(rowFor('tiny')).getByRole('button', { name: /download tiny/i })
+    ).toBeInTheDocument();
+  });
 
-    const tinyRow = screen.getByText('tiny').closest('[role="radio"]') as HTMLElement;
-    expect(within(tinyRow).getByRole('button', { name: /download tiny/i })).toBeInTheDocument();
+  it('the radio has no interactive descendant, so assistive tech is never pruned from the Download action', async () => {
+    mount({ downloaded: {} });
+    await screen.findByRole('radio', { name: 'tiny' });
+
+    const tinyRadio = screen.getByRole('radio', { name: 'tiny' });
+    expect(tinyRadio.querySelector('button, [role="button"]')).toBeNull();
+    expect(
+      within(rowFor('tiny')).getByRole('button', { name: /download tiny/i })
+    ).toBeInTheDocument();
   });
 
   it('download shows determinate progress, then re-probes and flips presence on completion', async () => {
@@ -124,7 +146,8 @@ describe('TranscriptionWhisperPane', () => {
 
     render(TranscriptionWhisperPane, { props: { onPresenceChange: vi.fn() } });
 
-    const tinyRow = (await screen.findByText('tiny')).closest('[role="radio"]') as HTMLElement;
+    await screen.findByRole('radio', { name: 'tiny' });
+    const tinyRow = rowFor('tiny');
     await fireEvent.click(within(tinyRow).getByRole('button', { name: /download tiny/i }));
 
     await waitFor(() => {
@@ -161,8 +184,8 @@ describe('TranscriptionWhisperPane', () => {
 
     await waitFor(() => expect(onPresenceChange).toHaveBeenCalledWith('base', true));
 
-    const smallRadio = (await screen.findByText('small')).closest('[role="radio"]') as HTMLElement;
-    await fireEvent.click(smallRadio);
+    await screen.findByRole('radio', { name: 'small' });
+    await fireEvent.click(screen.getByRole('radio', { name: 'small' }));
     await waitFor(() => expect(onPresenceChange).toHaveBeenCalledWith('small', false));
 
     await fireEvent.click(screen.getByRole('button', { name: /download small/i }));
@@ -174,20 +197,125 @@ describe('TranscriptionWhisperPane', () => {
     );
   });
 
-  it('persists the selected model as asr.whisper_model via the shared store', async () => {
+  it('persists an already-downloaded selection as asr.whisper_model via the shared store', async () => {
     let saved: AppConfig | undefined;
     mount({
       whisperModel: 'base',
-      downloaded: {},
+      downloaded: { small: true },
       setConfigSpy: (cfg) => {
         saved = cfg;
       }
     });
 
-    const smallRadio = (await screen.findByText('small')).closest('[role="radio"]') as HTMLElement;
-    await fireEvent.click(smallRadio);
+    // Wait for the presence probe to resolve — clicking before `downloadedMap`
+    // settles would race the fail-closed guard with stale (undownloaded) data.
+    await waitFor(() =>
+      expect(within(rowFor('small')).getByText(/downloaded/i)).toBeInTheDocument()
+    );
+    await fireEvent.click(screen.getByRole('radio', { name: 'small' }));
 
     await waitFor(() => expect(saved?.asr.whisper_model).toBe('small'));
+  });
+
+  it('never persists an undownloaded selection (fail-closed: no degradation arm for LocalWhisper + missing model)', async () => {
+    const setConfigSpy = vi.fn();
+    mount({
+      whisperModel: 'base',
+      downloaded: {},
+      setConfigSpy
+    });
+
+    await screen.findByRole('radio', { name: 'small' });
+    await fireEvent.click(screen.getByRole('radio', { name: 'small' }));
+
+    // Selection still updates locally (the row highlights, size stays browsable)
+    // — only the persisted config must not point at an undownloaded model.
+    await waitFor(() =>
+      expect(screen.getByRole('radio', { name: 'small' })).toHaveAttribute('aria-checked', 'true')
+    );
+    expect(setConfigSpy).not.toHaveBeenCalled();
+  });
+
+  it("disables only the downloading row's own button, leaving siblings clickable", async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return baseAppConfig();
+      if (cmd === 'list_whisper_models') return MODELS;
+      if (cmd === 'whisper_model_downloaded') return false;
+      if (cmd === 'download_whisper_model') return new Promise(() => {});
+    });
+
+    render(TranscriptionWhisperPane, { props: { onPresenceChange: vi.fn() } });
+    await screen.findByRole('radio', { name: 'tiny' });
+
+    await fireEvent.click(within(rowFor('tiny')).getByRole('button', { name: /download tiny/i }));
+
+    await waitFor(() =>
+      expect(within(rowFor('tiny')).getByRole('button', { name: /download tiny/i })).toBeDisabled()
+    );
+    expect(
+      within(rowFor('small')).getByRole('button', { name: /download small/i })
+    ).not.toBeDisabled();
+    expect(
+      within(rowFor('base')).getByRole('button', { name: /download base/i })
+    ).not.toBeDisabled();
+  });
+
+  it('guards against a remounted pane starting a second invoke of a model already downloading', async () => {
+    let invokeCount = 0;
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return baseAppConfig();
+      if (cmd === 'list_whisper_models') return MODELS;
+      if (cmd === 'whisper_model_downloaded') return false;
+      if (cmd === 'download_whisper_model') {
+        invokeCount += 1;
+        return new Promise(() => {});
+      }
+    });
+
+    const first = render(TranscriptionWhisperPane, { props: { onPresenceChange: vi.fn() } });
+    await screen.findByRole('radio', { name: 'tiny' });
+    await fireEvent.click(within(rowFor('tiny')).getByRole('button', { name: /download tiny/i }));
+    await waitFor(() => expect(invokeCount).toBe(1));
+
+    first.unmount();
+
+    render(TranscriptionWhisperPane, { props: { onPresenceChange: vi.fn() } });
+    await screen.findByRole('radio', { name: 'tiny' });
+    const downloadBtn = within(rowFor('tiny')).getByRole('button', { name: /download tiny/i });
+
+    expect(downloadBtn).toBeDisabled();
+    await fireEvent.click(downloadBtn);
+    expect(invokeCount).toBe(1);
+  });
+
+  it('surfaces a Tauri LensError message for the model list instead of the generic fallback', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return baseAppConfig();
+      if (cmd === 'list_whisper_models') {
+        throw { kind: 'Internal', message: 'engine not started' };
+      }
+    });
+
+    render(TranscriptionWhisperPane, { props: { onPresenceChange: vi.fn() } });
+
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('engine not started'));
+  });
+
+  it('surfaces a Tauri LensError message for a failed download instead of the generic fallback', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return baseAppConfig();
+      if (cmd === 'list_whisper_models') return MODELS;
+      if (cmd === 'whisper_model_downloaded') return false;
+      if (cmd === 'download_whisper_model') {
+        throw { kind: 'Io', message: 'disk unavailable' };
+      }
+    });
+
+    render(TranscriptionWhisperPane, { props: { onPresenceChange: vi.fn() } });
+    await screen.findByRole('radio', { name: 'tiny' });
+    await fireEvent.click(within(rowFor('tiny')).getByRole('button', { name: /download tiny/i }));
+
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('disk unavailable'));
   });
 
   it('renders no Cancel control, including mid-download', async () => {
@@ -205,7 +333,8 @@ describe('TranscriptionWhisperPane', () => {
 
     render(TranscriptionWhisperPane, { props: { onPresenceChange: vi.fn() } });
 
-    const tinyRow = (await screen.findByText('tiny')).closest('[role="radio"]') as HTMLElement;
+    await screen.findByRole('radio', { name: 'tiny' });
+    const tinyRow = rowFor('tiny');
     await fireEvent.click(within(tinyRow).getByRole('button', { name: /download tiny/i }));
 
     await waitFor(() => expect(within(tinyRow).getByRole('progressbar')).toBeInTheDocument());

@@ -129,6 +129,80 @@ describe('TranscriptionSection', () => {
     expect(within(row).getByText('Needs setup')).toBeInTheDocument();
   });
 
+  it('a persisted cloud backend with no provider set renders Needs setup, not Active', async () => {
+    mount({
+      asr: {
+        backend: 'cloud',
+        cloud_provider: null,
+        cloud_base_url: 'https://api.openai.com',
+        cloud_model: 'whisper-1',
+        cloud_api_key: 'sk-test'
+      },
+      audioCloudConsent: true
+    });
+    await screen.findByRole('radiogroup', { name: 'Transcription engine' });
+    const row = rowFor('Cloud');
+    await waitFor(() => expect(row).toHaveAttribute('aria-checked', 'true'));
+    expect(within(row).getByText('Needs setup')).toBeInTheDocument();
+  });
+
+  it('a persisted cloud backend with whitespace-only fields renders Needs setup, not Active', async () => {
+    mount({
+      asr: {
+        backend: 'cloud',
+        cloud_provider: 'open_ai_compatible',
+        cloud_base_url: '   ',
+        cloud_model: '   ',
+        cloud_api_key: '   '
+      },
+      audioCloudConsent: true
+    });
+    await screen.findByRole('radiogroup', { name: 'Transcription engine' });
+    const row = rowFor('Cloud');
+    await waitFor(() => expect(row).toHaveAttribute('aria-checked', 'true'));
+    expect(within(row).getByText('Needs setup')).toBeInTheDocument();
+  });
+
+  it('selecting Cloud with a complete, consented config activates it immediately', async () => {
+    const setConfigSpy = vi.fn();
+    mount({
+      asr: {
+        backend: 'local_whisper',
+        cloud_provider: 'open_ai_compatible',
+        cloud_base_url: 'https://api.openai.com',
+        cloud_model: 'whisper-1',
+        cloud_api_key: 'sk-test'
+      },
+      audioCloudConsent: true,
+      setConfigSpy
+    });
+    await screen.findByRole('radiogroup', { name: 'Transcription engine' });
+    const row = rowFor('Cloud');
+    await fireEvent.click(row);
+    await waitFor(() => expect(setConfigSpy).toHaveBeenCalled());
+    const cfg = setConfigSpy.mock.calls.at(-1)![0] as AppConfig;
+    expect(cfg.asr.backend).toBe('cloud');
+  });
+
+  it('surfaces a failed persist as an alert instead of silently no-writing', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') {
+        return baseAppConfig({ asr: baseAsr({ backend: 'local_whisper' }) });
+      }
+      if (cmd === 'set_config') {
+        throw { kind: 'Internal', message: 'disk write failed' };
+      }
+      if (cmd === 'asr_apple_native_available') return false;
+      if (cmd === 'list_whisper_models') return MODELS;
+      if (cmd === 'whisper_model_downloaded') return false;
+    });
+    render(TranscriptionSection);
+    await screen.findByRole('radiogroup', { name: 'Transcription engine' });
+    const row = rowFor('Automatic');
+    await fireEvent.click(row);
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent(/disk write failed/i));
+  });
+
   it('whisper presence flipping to true activates Local Whisper', async () => {
     const setConfigSpy = vi.fn();
     const downloaded: Record<string, boolean> = { base: false };

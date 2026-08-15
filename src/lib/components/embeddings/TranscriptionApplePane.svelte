@@ -26,14 +26,14 @@
       id: 'strict',
       label: 'Strict',
       value: 0.7,
-      description: 'Keeps only the most confident words.'
+      description: 'Re-transcribes the whole clip on Local Whisper more readily.'
     },
     { id: 'balanced', label: 'Balanced', value: 0.5, description: 'The recommended default.' },
     {
       id: 'lenient',
       label: 'Lenient',
       value: 0.3,
-      description: 'Keeps more words at the cost of accuracy.'
+      description: 'Only falls back to Whisper when Apple is barely confident at all.'
     }
   ];
 
@@ -62,6 +62,12 @@
 </script>
 
 <div class="flex flex-col gap-3">
+  <p class="text-[0.68rem] leading-relaxed text-muted-foreground">
+    If Apple's confidence for the whole clip falls below this threshold, the clip is re-transcribed
+    on Local Whisper. Needs a Whisper model already downloaded — otherwise the low-confidence Apple
+    result is kept as-is.
+  </p>
+
   {#if !available}
     <p class="text-[0.72rem] text-muted-foreground">
       This threshold takes effect once Apple on-device transcription is available on this device.

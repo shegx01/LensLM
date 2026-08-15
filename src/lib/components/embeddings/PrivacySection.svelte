@@ -10,6 +10,7 @@
   import type { AppConfig } from '$lib/theme/types.js';
   import { updateConfig } from '$lib/config.js';
   import { appConfigStore, ensureLoaded, persist } from '$lib/models/app-config.svelte.js';
+  import { toLensError } from '$lib/sources/lens-error.js';
   import { providerDescriptors } from '$lib/models/providers.js';
 
   interface EgressRow {
@@ -18,14 +19,18 @@
     detail: string;
   }
 
-  // tts isn't a field the shared store owns (R14), so it's read separately from the
-  // same mount-time fetch that seeds textConsent — both stay out of this step's scope.
+  // tts isn't a field the shared store owns, so it's read separately from the
+  // same mount-time fetch that seeds textConsent.
   let ttsCfg = $state<AppConfig['tts'] | undefined>(undefined);
   let textConsent = $state(false);
   let saving = $state(false);
   let saveError = $state<string | null>(null);
+  let ttsLoadError = $state<string | null>(null);
 
   const audioConsent = $derived(appConfigStore.audioCloudConsent);
+  // The egress list reads both this mount's own tts/enrichment fetch and the shared store;
+  // either failing means the list can't be trusted, so it must say so rather than assert "local".
+  const egressLoadError = $derived(appConfigStore.loadError ?? ttsLoadError);
 
   /** True when `url` is a non-empty base URL that is not a loopback host. */
   function isRemoteUrl(url: string | undefined): boolean {
@@ -84,8 +89,8 @@
       const cfg = await invoke<AppConfig>('get_config');
       ttsCfg = cfg.tts;
       textConsent = cfg.enrichment?.cloud_consent ?? false;
-    } catch {
-      // Non-fatal: tts row and text consent stay at defaults; ASR/consent come from the store.
+    } catch (err) {
+      ttsLoadError = toLensError(err).message;
     }
     // Kept after the raw fetch above (not raced against it) so this extra hop can't land after
     // a user's own click and stomp an optimistic write — see the text-consent handler below.
@@ -102,7 +107,7 @@
         enrichment: { ...cfg.enrichment, cloud_consent: checked }
       }));
     } catch (err) {
-      saveError = err instanceof Error ? err.message : 'Could not save setting.';
+      saveError = toLensError(err).message;
       textConsent = !checked;
     } finally {
       saving = false;
@@ -114,8 +119,9 @@
     saveError = null;
     try {
       await persist((cfg) => ({ ...cfg, audio_cloud_consent: checked }));
+      if (appConfigStore.persistError) saveError = appConfigStore.persistError;
     } catch (err) {
-      saveError = err instanceof Error ? err.message : 'Could not save setting.';
+      saveError = toLensError(err).message;
     } finally {
       saving = false;
     }
@@ -133,7 +139,14 @@
       Data leaving this device
     </p>
 
-    {#if anyActive}
+    {#if egressLoadError}
+      <p
+        class="mt-3 rounded-[10px] border border-border bg-muted px-3.5 py-3 text-[0.75rem] text-muted-foreground"
+        role="status"
+      >
+        Couldn't verify what leaves this device — {egressLoadError}
+      </p>
+    {:else if anyActive}
       <div class="mt-3 flex flex-col gap-2">
         {#each egressRows as row (row.label)}
           <div

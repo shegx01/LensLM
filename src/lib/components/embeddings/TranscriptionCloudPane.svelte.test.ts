@@ -153,18 +153,58 @@ describe('TranscriptionCloudPane', () => {
     expect(savedConfigs.at(-1)?.asr.backend).not.toBe('cloud');
   });
 
-  it('activates Cloud automatically once consent is granted through the shared store', async () => {
+  it('granting consent through the shared store alone does not activate Cloud from this pane', async () => {
     const { savedConfigs } = mockBackend(cloudConfig({ audioCloudConsent: false }));
     render(TranscriptionCloudPane);
 
     const baseUrlInput = await screen.findByLabelText<HTMLInputElement>(/base url/i);
     await waitFor(() => expect(baseUrlInput.value).toBe('https://api.openai.com'));
 
-    // Simulates PrivacySection granting consent through the same shared store — no
-    // further interaction with this pane.
+    // Simulates PrivacySection granting consent through the same shared store, with no
+    // further interaction with this pane. Activation now happens by selecting the Cloud
+    // row in TranscriptionSection (see TranscriptionSection.svelte.test.ts), not here.
     await persist((cfg) => ({ ...cfg, audio_cloud_consent: true }));
+    await new Promise((r) => setTimeout(r, 0));
 
-    await waitFor(() => expect(savedConfigs.at(-1)?.asr.backend).toBe('cloud'));
-    expect(savedConfigs.at(-1)?.asr.cloud_api_key).toBe('sk-already-saved');
+    expect(savedConfigs.length).toBe(1);
+    expect(savedConfigs.at(-1)?.asr.backend).not.toBe('cloud');
+  });
+
+  it("switching provider clears the previous provider's API key instead of carrying it forward", async () => {
+    const { savedConfigs } = mockBackend(cloudConfig());
+    render(TranscriptionCloudPane);
+
+    const baseUrlInput = await screen.findByLabelText<HTMLInputElement>(/base url/i);
+    await waitFor(() => expect(baseUrlInput.value).toBe('https://api.openai.com'));
+
+    const providerTrigger = screen.getByLabelText(/^provider$/i);
+    await fireEvent.keyDown(providerTrigger, { key: 'Enter' });
+    const deepgramOption = await screen.findByRole('option', { name: /deepgram/i });
+    await fireEvent.pointerUp(deepgramOption);
+
+    await waitFor(() => expect(savedConfigs.length).toBeGreaterThan(0));
+    expect(savedConfigs.at(-1)?.asr.cloud_provider).toBe('deepgram');
+    expect(savedConfigs.at(-1)?.asr.cloud_api_key).toBe('');
+    expect(savedConfigs.at(-1)?.asr.backend).not.toBe('cloud');
+  });
+
+  it('surfaces a Tauri LensError message instead of the generic fallback', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return cloudConfig();
+      if (cmd === 'set_config') {
+        throw { kind: 'Validation', message: 'cloud ASR base URL rejected by backend' };
+      }
+    });
+    render(TranscriptionCloudPane);
+
+    const baseUrlInput = await screen.findByLabelText<HTMLInputElement>(/base url/i);
+    await waitFor(() => expect(baseUrlInput.value).toBe('https://api.openai.com'));
+
+    await fireEvent.input(baseUrlInput, { target: { value: 'http://localhost:9999' } });
+    await fireEvent.blur(baseUrlInput);
+
+    await waitFor(() =>
+      expect(screen.getByRole('alert')).toHaveTextContent('cloud ASR base URL rejected by backend')
+    );
   });
 });

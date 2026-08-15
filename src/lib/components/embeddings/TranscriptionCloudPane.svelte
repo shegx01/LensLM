@@ -1,7 +1,7 @@
 <!--
-  TranscriptionCloudPane — Cloud ASR detail pane (issue #136, Step 6). No props: every
-  field it reads/writes lives on the shared `appConfigStore` snapshot (`asr` +
-  `audioCloudConsent`), so PrivacySection's consent toggle and this pane can never disagree.
+  TranscriptionCloudPane — Cloud ASR detail pane. No props: every field it reads/writes
+  lives on the shared `appConfigStore` snapshot (`asr` + `audioCloudConsent`), so
+  PrivacySection's consent toggle and this pane can never disagree.
 -->
 <script lang="ts">
   import { onMount } from 'svelte';
@@ -18,6 +18,7 @@
   import { CLOUD_ASR_PRESETS } from '$lib/asr/catalog.js';
   import type { CloudAsrProvider } from '$lib/theme/types.js';
   import { appConfigStore, ensureLoaded, persist } from '$lib/models/app-config.svelte.js';
+  import { toLensError } from '$lib/sources/lens-error.js';
 
   const PROVIDER_LABELS: Record<CloudAsrProvider, string> = {
     open_ai_compatible: 'OpenAI-compatible',
@@ -39,9 +40,6 @@
   let error = $state<string | null>(null);
 
   let hydrated = false;
-  // Skips the effect's first run so merely mounting this pane (or opening Settings)
-  // never auto-activates Cloud — only a later, live consent change does (AC 5.4).
-  let sawInitialConsent = false;
 
   onMount(() => {
     void ensureLoaded();
@@ -58,28 +56,6 @@
     savedApiKey = asr.cloud_api_key;
   });
 
-  // AC 5.4: granting consent in PrivacySection (a different mount) must activate an
-  // otherwise-complete Cloud config on its own — read the live store fields here,
-  // not local edit state, so a pending unblurred edit can't falsely count as saved.
-  $effect(() => {
-    const consent = appConfigStore.audioCloudConsent;
-    const asr = appConfigStore.asr;
-    if (!asr) return;
-    if (!sawInitialConsent) {
-      sawInitialConsent = true;
-      return;
-    }
-    if (
-      consent &&
-      asr.backend !== 'cloud' &&
-      asr.cloud_base_url.trim() !== '' &&
-      asr.cloud_model.trim() !== '' &&
-      asr.cloud_api_key.trim() !== ''
-    ) {
-      void persistCloud();
-    }
-  });
-
   /** Reject non-http(s) or malformed base URLs before saving — the base URL is the
    *  endpoint the API key is bearer-transmitted to (`openai_compat.rs:59`). */
   function isValidBaseUrl(raw: string): boolean {
@@ -93,7 +69,7 @@
   }
 
   /** Reactive Cloud persist; no Save button. Only flips `backend` to `"cloud"` when the
-   *  config is actually usable (AC 4.4) — an incomplete edit still saves its own field. */
+   *  config is actually usable — an incomplete edit still saves its own field. */
   async function persistCloud(): Promise<void> {
     error = null;
     const trimmedBaseUrl = baseUrl.trim();
@@ -127,15 +103,22 @@
       editingKey = false;
       apiKey = '';
     } catch (err) {
-      error = err instanceof Error ? err.message : 'Could not save configuration.';
+      error = toLensError(err).message;
     }
   }
 
+  /** A provider switch must never carry the previous provider's key to the new vendor —
+   *  clear all key state so the new provider starts unconfigured (and thus inactive)
+   *  until the user enters its own key. */
   function handleProviderChange(value: string): void {
     provider = value as CloudAsrProvider;
     const preset = CLOUD_ASR_PRESETS[provider];
     baseUrl = preset.base_url;
     model = preset.model;
+    apiKey = '';
+    savedApiKey = '';
+    hasSavedKey = false;
+    editingKey = false;
     void persistCloud();
   }
 

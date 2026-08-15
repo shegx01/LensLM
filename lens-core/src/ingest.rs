@@ -543,7 +543,14 @@ async fn run_audio_ingest(
         Some(100),
     ));
     let (asr_tx, mut asr_rx) = tokio::sync::mpsc::unbounded_channel::<f32>();
-    let asr_config = crate::asr::TranscribeConfig::default();
+    // `language`/`translate` reach the engine ONLY through this argument — every other
+    // AsrConfig field is read from `guard.config.asr` inside `transcribe`. A default here
+    // silently discards whatever the settings panel persisted (#136).
+    let asr_settings = engine.config().await.asr;
+    let asr_config = crate::asr::TranscribeConfig {
+        language: asr_settings.language,
+        translate: asr_settings.translate,
+    };
     let mut transcribe_fut =
         std::pin::pin!(engine.transcribe(&pcm, &asr_config, Some(asr_tx), Some(token.clone())));
     let (segments, effective_backend) = loop {

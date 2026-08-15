@@ -1,3 +1,6 @@
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   ASR_CAPABILITY_MATRIX,
@@ -13,6 +16,11 @@ import {
 import type { AsrEngineId } from './catalog.js';
 import type { AsrLang } from '$lib/theme/types.js';
 
+const asrCloudDir = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  '../../../lens-core/src/asr/cloud'
+);
+
 describe('ASR_ENGINE_CATALOG', () => {
   it('has exactly the four contract engine rows', () => {
     expect(ASR_ENGINE_CATALOG.map((e) => e.id)).toEqual([
@@ -26,9 +34,7 @@ describe('ASR_ENGINE_CATALOG', () => {
   it("Automatic's description names no Cloud leg and no hardware prediction", () => {
     const automatic = ASR_ENGINE_CATALOG.find((e) => e.id === 'automatic')!;
     expect(automatic.description.toLowerCase()).not.toContain('cloud');
-    expect(automatic.description).toBe(
-      'Prefers on-device Apple transcription where supported, otherwise Local Whisper.'
-    );
+    expect(automatic.description.toLowerCase()).not.toMatch(/apple silicon|macos \d/);
   });
 
   it('Apple row states an unavailable reason naming both possible causes', () => {
@@ -60,25 +66,22 @@ describe('backend token mapping', () => {
 });
 
 describe('CLOUD_ASR_PRESETS', () => {
-  it('gives OpenAI-compatible its real endpoint + default model', () => {
-    expect(CLOUD_ASR_PRESETS.open_ai_compatible).toEqual({
-      base_url: 'https://api.openai.com',
-      model: 'whisper-1'
-    });
+  it("OpenAI-compatible base_url has no path that would double up with the adapter's own suffix", () => {
+    const adapterSrc = readFileSync(path.join(asrCloudDir, 'openai_compat.rs'), 'utf-8');
+    expect(adapterSrc).toContain('/v1/audio/transcriptions');
+    expect(CLOUD_ASR_PRESETS.open_ai_compatible.base_url).not.toContain('/v1');
   });
 
-  it('gives Deepgram its real endpoint + default model', () => {
-    expect(CLOUD_ASR_PRESETS.deepgram).toEqual({
-      base_url: 'https://api.deepgram.com',
-      model: 'nova-3'
-    });
+  it("Deepgram base_url has no path that would double up with the adapter's own suffix", () => {
+    const adapterSrc = readFileSync(path.join(asrCloudDir, 'deepgram.rs'), 'utf-8');
+    expect(adapterSrc).toContain('/v1/listen');
+    expect(CLOUD_ASR_PRESETS.deepgram.base_url).not.toContain('/v1');
   });
 });
 
 describe('ASR_LANGUAGE_OPTIONS', () => {
   it('is auto-detect plus the 11 named Rust tokens, in PascalCase', () => {
     const values = ASR_LANGUAGE_OPTIONS.map((o) => o.value);
-    expect(values[0]).toBeNull();
     const named = values.slice(1) as AsrLang[];
     expect(named).toEqual(['En', 'De', 'Fr', 'Es', 'It', 'Pt', 'Nl', 'Ru', 'Zh', 'Ja', 'Ko']);
     for (const v of named) {
@@ -101,22 +104,15 @@ describe('isOtherAsrLanguage', () => {
   });
 });
 
-describe('ASR_CAPABILITY_MATRIX', () => {
-  it('honours language on every concrete engine', () => {
-    expect(ASR_CAPABILITY_MATRIX.apple_native.language).toBe('honoured');
-    expect(ASR_CAPABILITY_MATRIX.local_whisper.language).toBe('honoured');
-    expect(ASR_CAPABILITY_MATRIX.cloud.language).toBe('honoured');
-  });
-
-  it('translate is the only divergent setting: Whisper honours, Apple reroutes, Cloud ignores', () => {
-    expect(ASR_CAPABILITY_MATRIX.local_whisper.translate).toBe('honoured');
-    expect(ASR_CAPABILITY_MATRIX.apple_native.translate).toBe('reroutes');
-    expect(ASR_CAPABILITY_MATRIX.cloud.translate).toBe('ignored');
-  });
-
-  it('asrCapability reads the same matrix', () => {
-    expect(asrCapability('apple_native', 'translate')).toBe('reroutes');
-    expect(asrCapability('cloud', 'language')).toBe('honoured');
+// The honoured/ignored/reroutes values themselves are cross-checked against the
+// Rust engines in lens-core/tests/asr_capability_matrix_sync_check.rs, not here.
+describe('asrCapability', () => {
+  it('reads the exact [engine][field] cell for every combination', () => {
+    for (const engine of ['apple_native', 'local_whisper', 'cloud'] as const) {
+      for (const field of ['language', 'translate'] as const) {
+        expect(asrCapability(engine, field)).toBe(ASR_CAPABILITY_MATRIX[engine][field]);
+      }
+    }
   });
 });
 

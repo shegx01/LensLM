@@ -115,4 +115,12 @@ describe('TranscriptionApplePane', () => {
     const row = screen.getByText('Strict').closest('[role="radio"]') as HTMLElement;
     expect(row).not.toHaveAttribute('disabled');
   });
+
+  it('describes whole-clip re-transcription, not word-level filtering, and the no-model caveat', async () => {
+    mount({});
+    await screen.findByText('Strict');
+    expect(screen.getByText(/re-transcribed on local whisper/i)).toBeInTheDocument();
+    expect(screen.getByText(/kept as-is/i)).toBeInTheDocument();
+    expect(screen.queryByText(/most confident words/i)).not.toBeInTheDocument();
+  });
 });

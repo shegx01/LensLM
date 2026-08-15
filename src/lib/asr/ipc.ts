@@ -4,8 +4,9 @@
 import { Channel, invoke, isTauri } from '@tauri-apps/api/core';
 import type { DownloadProgress } from '$lib/onboarding/system-check.js';
 
-// SYNC-CHECK: must match src-tauri/src/commands/system.rs WhisperModelInfo (serde default,
-// camelCase JS keys). `is_default` is computed on the DTO, not a registry field.
+// SYNC-CHECK: must match src-tauri/src/commands/system.rs WhisperModelInfo (plain
+// derive(Serialize), no rename_all -> snake_case keys, as declared below).
+// `is_default` is computed on the DTO, not a registry field.
 export interface WhisperModelInfo {
   id: string;
   approx_mb: number;
