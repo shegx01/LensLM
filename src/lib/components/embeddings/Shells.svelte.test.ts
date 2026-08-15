@@ -57,6 +57,7 @@ describe('PreferencesShell', () => {
       'General',
       'AI Model',
       'Embeddings',
+      'Transcription',
       'Storage',
       'Privacy',
       'Shortcuts',
@@ -80,6 +81,18 @@ describe('PreferencesShell', () => {
     // The panel's own heading (an h2, distinct from the nav button) proves it mounted.
     expect(await screen.findByRole('heading', { name: /text-to-speech/i })).toBeInTheDocument();
     expect(screen.getByText(/choose the voice engine/i)).toBeInTheDocument();
+  });
+
+  it('mounts TranscriptionSection under the Transcription nav item (#136)', async () => {
+    notebookStore.settingsOpen = true;
+    render(PreferencesShell);
+
+    const asrNav = screen.getByRole('button', { name: /transcription/i });
+    expect(asrNav).not.toHaveAttribute('aria-disabled', 'true');
+    await fireEvent.click(asrNav);
+
+    expect(await screen.findByRole('heading', { name: /transcription/i })).toBeInTheDocument();
+    expect(screen.getByText(/how audio and video sources are transcribed/i)).toBeInTheDocument();
   });
 
   it('is hidden when settingsOpen is false', () => {

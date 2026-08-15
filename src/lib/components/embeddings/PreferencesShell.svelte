@@ -10,6 +10,7 @@
   import AiModelSection from './AiModelSection.svelte';
   import IngestionSection from './IngestionSection.svelte';
   import TtsConfigPanel from '../onboarding/TtsConfigPanel.svelte';
+  import TranscriptionSection from './TranscriptionSection.svelte';
   import StorageSection from './StorageSection.svelte';
   import PrivacySection from './PrivacySection.svelte';
   import ShortcutsSection from './ShortcutsSection.svelte';
@@ -19,6 +20,7 @@
   import Share2 from '@lucide/svelte/icons/share-2';
   import Download from '@lucide/svelte/icons/download';
   import Volume2 from '@lucide/svelte/icons/volume-2';
+  import Mic from '@lucide/svelte/icons/mic';
   import HardDrive from '@lucide/svelte/icons/hard-drive';
   import Shield from '@lucide/svelte/icons/shield';
   import Keyboard from '@lucide/svelte/icons/keyboard';
@@ -33,6 +35,7 @@
     { id: 'embeddings', label: 'Embeddings', icon: Share2, stub: false },
     { id: 'ingestion', label: 'Ingestion', icon: Download, stub: false },
     { id: 'text_to_speech', label: 'Text-to-Speech', icon: Volume2, stub: false },
+    { id: 'transcription', label: 'Transcription', icon: Mic, stub: false },
     { id: 'storage', label: 'Storage', icon: HardDrive, stub: false },
     { id: 'privacy', label: 'Privacy', icon: Shield, stub: false },
     { id: 'shortcuts', label: 'Shortcuts', icon: Keyboard, stub: false },
@@ -65,6 +68,8 @@
           <IngestionSection />
         {:else if active === 'text_to_speech'}
           <TtsConfigPanel />
+        {:else if active === 'transcription'}
+          <TranscriptionSection />
         {:else if active === 'storage'}
           <StorageSection />
         {:else if active === 'privacy'}
