@@ -119,7 +119,7 @@ symphonia = { version = "=0.5.5", features = ["all"] }
 # the moving-target adapter API). The sinc filter retains state across blocks,
 # so windowed output equals whole-buffer output (issue #41 D2/D8).
 # MIT — in deny.toml allowlist.
-rubato = "=0.16.2"
+rubato = "=5.0.0"
 
 # issue #190: 16-bit PCM WAV encoding for the stitched TTS overview.
 # Apache-2.0 — deny.toml allowlist.
