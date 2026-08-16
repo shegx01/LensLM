@@ -672,13 +672,21 @@ fn preflight_whitespace_only_key_returns_validation_error() {
     assert!(err.message().contains("key") || err.message().contains("API"));
 }
 
-// The webview blocks these too, but `set_config` accepts any config it is handed,
-// so the bearer-token-over-cleartext guard has to hold at the engine boundary.
+// SYNC-CHECK: this table and the accept table below mirror the `isValidBaseUrl` tables in
+// `TranscriptionCloudPane.svelte.test.ts`; a case added here belongs there too.
 #[rstest]
-#[case::plain_http("http://api.example.com")]
+#[case::plain_http("http://api.openai.com")]
+#[case::plain_http_other_host("http://api.example.com")]
 #[case::http_lookalike_host("http://localhost.evil.example")]
-#[case::ftp("ftp://api.example.com")]
+#[case::rfc1918_lookalike_domain("http://10.0.0.1.evil.com")]
+#[case::below_the_172_16_block("http://172.15.0.1")]
+#[case::above_the_172_31_block("http://172.32.0.1")]
+#[case::link_local("http://169.254.1.1")]
+#[case::unspecified("http://0.0.0.0")]
+#[case::public_ipv4("http://93.184.216.34")]
+#[case::ftp("ftp://x")]
 #[case::relative("api.example.com")]
+#[case::garbage("not a url at all")]
 #[case::file("file:///etc/passwd")]
 fn preflight_rejects_a_base_url_that_is_not_transport_safe(#[case] base_url: &str) {
     let cfg = app_config_with_cloud_endpoint(
@@ -705,9 +713,15 @@ fn preflight_rejects_a_base_url_that_is_not_transport_safe(#[case] base_url: &st
 #[rstest]
 #[case::https("https://api.openai.com")]
 #[case::https_custom_port("https://asr.internal.example:8443/v1")]
-#[case::loopback_name("http://localhost:8090")]
-#[case::loopback_v4("http://127.0.0.1:8090")]
-#[case::loopback_v6("http://[::1]:8090")]
+#[case::loopback_name("http://localhost:9000")]
+#[case::loopback_v4("http://127.0.0.1")]
+#[case::loopback_v4_upper_range("http://127.1.2.3")]
+#[case::loopback_v6("http://[::1]:1234")]
+#[case::rfc1918_10("http://10.0.0.5:9000")]
+#[case::rfc1918_172_low("http://172.16.0.1")]
+#[case::rfc1918_172_high("http://172.31.255.254")]
+#[case::rfc1918_192_168("http://192.168.1.5:9000")]
+#[case::mdns_local("http://whisper.local")]
 fn preflight_accepts_a_transport_safe_base_url(#[case] base_url: &str) {
     let cfg = app_config_with_cloud_endpoint(
         true,
@@ -1817,6 +1831,56 @@ async fn transcribe_cloud_fallback_returns_fallback_label() {
         label.contains("fallback"),
         "label must contain fallback: {label}"
     );
+}
+
+/// Drives the Cloud arm against `base_url` with a local engine injected, returning the
+/// `effective_backend` label the degradation produced.
+async fn cloud_degradation_label(base_url: &str) -> String {
+    let engine = LensEngine::for_test().await;
+    let mut config = engine.config().await;
+    config.asr.backend = "cloud".to_string();
+    config.asr.cloud_base_url = base_url.to_string();
+    config.asr.cloud_model = "whisper-1".to_string();
+    config.asr.cloud_api_key = "sk-label-test".to_string();
+    config.asr.cloud_provider = Some(CloudAsrProvider::OpenAiCompatible);
+    config.audio_cloud_consent = true;
+    engine.set_config(config).await;
+
+    let canned = vec![TranscriptSegment {
+        text: "local".into(),
+        start_second: 0.0,
+        end_second: 1.0,
+    }];
+    engine
+        .set_asr_engine(Some(Arc::new(MockAsrEngine::new(canned))))
+        .await;
+
+    let (_segs, label) = engine
+        .transcribe(&tiny_pcm(), &TranscribeConfig::default(), None, None)
+        .await
+        .expect("a cloud failure must degrade to local, not hard-fail");
+    label.to_string()
+}
+
+/// A pre-flight rejection is the user's to fix and permanent until they do; a provider
+/// 500 is neither. Collapsing the two markers would bury the actionable case inside the
+/// retryable one, so both exact strings and their inequality are pinned.
+#[tokio::test]
+async fn a_preflight_rejection_and_a_transient_failure_get_distinct_labels() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    let transient = cloud_degradation_label(&server.uri()).await;
+
+    // Cleartext on a public host: rejected by the transport gate before any request, and
+    // parseable, so deleting that gate would emit a request and flip this to `(fallback)`.
+    let misconfigured = cloud_degradation_label("http://asr.example.com").await;
+
+    assert_eq!(transient, "apple_native (fallback)");
+    assert_eq!(misconfigured, "apple_native (cloud misconfigured)");
+    assert_ne!(misconfigured, transient);
 }
 
 // ===========================================================================

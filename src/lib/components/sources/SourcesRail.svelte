@@ -166,16 +166,21 @@
   }
 
   /**
-   * Caption for a degraded ASR run (#297 AC4.4). Additive-only per A-5: a missing
-   * marker must never read as "clean", so only fallback/degraded values render.
+   * Caption for a marked ASR run (#297). Additive-only: the marker is session-scoped, so
+   * its absence must never read as "clean" — only explicitly marked values render.
    */
   function fallbackCaption(marker: string): string | null {
-    const match = /^(.+)\s\((fallback|degraded)\)$/i.exec(marker);
+    const match = /^(.+)\s\((fallback|degraded|cloud misconfigured)\)$/i.exec(marker);
     if (!match) return null;
     const label = ASR_ENGINE_CATALOG.find((e) => e.id === match[1])?.label ?? match[1];
-    return match[2].toLowerCase() === 'fallback'
-      ? `Fell back to ${label} for this recording.`
-      : `Ran in degraded mode (${label}) for this recording.`;
+    switch (match[2].toLowerCase()) {
+      case 'fallback':
+        return `Fell back to ${label} for this recording.`;
+      case 'degraded':
+        return `Ran in degraded mode (${label}) for this recording.`;
+      default:
+        return `Cloud transcription is misconfigured, so ${label} was used. Fix it in Settings → Transcription.`;
+    }
   }
 
   // statusDotClass is shared with EmbeddingsInspector — see $lib/sources/status.ts.

@@ -263,29 +263,35 @@ pub fn preflight_check(config: &AppConfig) -> Result<(), LensError> {
     }
     if !is_transport_safe_base_url(config.asr.cloud_base_url.trim()) {
         return Err(LensError::Validation(
-            "cloud ASR base URL must be https, or http on a loopback host".into(),
+            "cloud ASR base URL must be https, or http on a loopback or private-network host"
+                .into(),
         ));
     }
     Ok(())
 }
 
-/// The API key is bearer-sent to this URL, so cleartext http is only acceptable on a
-/// loopback host. The webview applies the same rule, but `set_config` accepts whatever
-/// it is handed — this is the boundary control.
-/// SYNC-CHECK: mirrors `isValidBaseUrl` in `TranscriptionCloudPane.svelte`.
+/// The boundary control — `set_config` accepts whatever the webview sends.
+/// SYNC-CHECK: mirrors `isValidBaseUrl` in `TranscriptionCloudPane.svelte`, which
+/// records why cleartext http is accepted on a private network.
 fn is_transport_safe_base_url(raw: &str) -> bool {
     let Ok(url) = url::Url::parse(raw) else {
         return false;
     };
     match url.scheme() {
         "https" => true,
-        "http" => matches!(
-            url.host(),
-            Some(url::Host::Domain("localhost"))
-                | Some(url::Host::Ipv4(std::net::Ipv4Addr::LOCALHOST))
-                | Some(url::Host::Ipv6(std::net::Ipv6Addr::LOCALHOST))
-        ),
+        "http" => url.host().is_some_and(is_private_network_host),
         _ => false,
+    }
+}
+
+fn is_private_network_host(host: url::Host<&str>) -> bool {
+    match host {
+        url::Host::Domain(name) => {
+            let name = name.to_ascii_lowercase();
+            name == "localhost" || name.ends_with(".local")
+        }
+        url::Host::Ipv4(ip) => ip.is_loopback() || ip.is_private(),
+        url::Host::Ipv6(ip) => ip.is_loopback(),
     }
 }
 

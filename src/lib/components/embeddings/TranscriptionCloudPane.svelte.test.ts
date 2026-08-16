@@ -138,7 +138,7 @@ describe('TranscriptionCloudPane', () => {
     expect(savedConfigs.length).toBe(0);
   });
 
-  it('rejects a cleartext http:// base URL on a non-loopback host — the API key is bearer-sent there', async () => {
+  it('names the accepted hosts when it rejects cleartext http:// on a public host', async () => {
     const { savedConfigs } = mockBackend(cloudConfig());
     render(TranscriptionCloudPane);
 
@@ -152,23 +152,58 @@ describe('TranscriptionCloudPane', () => {
     expect(savedConfigs.length).toBe(0);
   });
 
-  it.each(['http://localhost:8090', 'http://127.0.0.1:8090', 'http://[::1]:8090'])(
-    'accepts a loopback http:// base URL (%s) for self-hosted servers',
-    async (url) => {
-      const { savedConfigs } = mockBackend(cloudConfig());
-      render(TranscriptionCloudPane);
+  // SYNC-CHECK: these two tables mirror the transport-safety rstest tables in
+  // `lens-core/tests/cloud_asr.rs`; a case added there belongs here too.
+  it.each([
+    'http://api.openai.com',
+    'http://localhost.evil.example',
+    'http://10.0.0.1.evil.com',
+    'http://172.15.0.1',
+    'http://172.32.0.1',
+    'http://169.254.1.1',
+    'http://0.0.0.0',
+    'http://93.184.216.34',
+    'ftp://x',
+    'not a url at all'
+  ])('rejects a base URL that is not transport-safe (%s)', async (url) => {
+    const { savedConfigs } = mockBackend(cloudConfig());
+    render(TranscriptionCloudPane);
 
-      const baseUrlInput = await screen.findByLabelText<HTMLInputElement>(/base url/i);
-      await waitFor(() => expect(baseUrlInput.value).toBe('https://api.openai.com'));
+    const baseUrlInput = await screen.findByLabelText<HTMLInputElement>(/base url/i);
+    await waitFor(() => expect(baseUrlInput.value).toBe('https://api.openai.com'));
 
-      await fireEvent.input(baseUrlInput, { target: { value: url } });
-      await fireEvent.blur(baseUrlInput);
+    await fireEvent.input(baseUrlInput, { target: { value: url } });
+    await fireEvent.blur(baseUrlInput);
 
-      await waitFor(() => expect(savedConfigs.length).toBeGreaterThan(0));
-      expect(savedConfigs.at(-1)?.asr.cloud_base_url).toBe(url);
-      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
-    }
-  );
+    await waitFor(() => expect(screen.getByRole('alert')).toBeInTheDocument());
+    expect(savedConfigs.length).toBe(0);
+  });
+
+  it.each([
+    'https://api.openai.com',
+    'http://localhost:9000',
+    'http://127.0.0.1',
+    'http://127.1.2.3',
+    'http://[::1]:1234',
+    'http://10.0.0.5:9000',
+    'http://172.16.0.1',
+    'http://172.31.255.254',
+    'http://192.168.1.5:9000',
+    'http://whisper.local'
+  ])('accepts a transport-safe base URL (%s) for self-hosted servers', async (url) => {
+    const { savedConfigs } = mockBackend(cloudConfig());
+    render(TranscriptionCloudPane);
+
+    const baseUrlInput = await screen.findByLabelText<HTMLInputElement>(/base url/i);
+    await waitFor(() => expect(baseUrlInput.value).toBe('https://api.openai.com'));
+
+    await fireEvent.input(baseUrlInput, { target: { value: url } });
+    await fireEvent.blur(baseUrlInput);
+
+    await waitFor(() => expect(savedConfigs.length).toBeGreaterThan(0));
+    expect(savedConfigs.at(-1)?.asr.cloud_base_url).toBe(url);
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
 
   it('shows why cloud is unavailable and does not activate while consent is off', async () => {
     const { savedConfigs } = mockBackend(cloudConfig({ audioCloudConsent: false }));

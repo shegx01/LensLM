@@ -2242,11 +2242,11 @@ impl LensEngine {
                     .await
                 {
                     Ok(segments) => Ok((segments, "cloud")),
-                    Err(cloud_err) => {
+                    Err((cloud_err, cause)) => {
                         if is_user_cancel(&cloud_err) {
                             return Err(cloud_err);
                         }
-                        tracing::warn!(error = %cloud_err, "cloud ASR failed, falling back to local");
+                        tracing::warn!(error = %cloud_err, ?cause, "cloud ASR failed, falling back to local");
                         self.cloud_fallback_to_local(
                             pcm,
                             config,
@@ -2254,6 +2254,7 @@ impl LensEngine {
                             injected_local,
                             progress_tx,
                             cloud_err,
+                            cause,
                             cancel,
                         )
                         .await
@@ -2272,20 +2273,26 @@ impl LensEngine {
         config: &TranscribeConfig,
         app_config: &config::AppConfig,
         progress_tx: Option<mpsc::UnboundedSender<f32>>,
-    ) -> Result<Vec<TranscriptSegment>, LensError> {
-        asr::cloud::preflight_check(app_config)?;
+    ) -> Result<Vec<TranscriptSegment>, (LensError, CloudDegradeCause)> {
+        asr::cloud::preflight_check(app_config)
+            .map_err(|e| (e, CloudDegradeCause::Misconfigured))?;
         let asr_cfg = &app_config.asr;
-        let provider = asr_cfg
-            .cloud_provider
-            .ok_or_else(|| LensError::Validation("no cloud ASR provider configured".into()))?;
+        let provider = asr_cfg.cloud_provider.ok_or_else(|| {
+            (
+                LensError::Validation("no cloud ASR provider configured".into()),
+                CloudDegradeCause::Misconfigured,
+            )
+        })?;
         let engine = asr::cloud::CloudAsrEngine::new(
             provider,
             asr_cfg.cloud_base_url.clone(),
             asr_cfg.cloud_model.clone(),
             asr_cfg.cloud_api_key.clone(),
         );
-        let TranscriptOutput { segments, .. } =
-            engine.transcribe_pcm(pcm, config, progress_tx).await?;
+        let TranscriptOutput { segments, .. } = engine
+            .transcribe_pcm(pcm, config, progress_tx)
+            .await
+            .map_err(|e| (e, CloudDegradeCause::Transient))?;
         Ok(segments)
     }
 
@@ -2300,19 +2307,18 @@ impl LensEngine {
         injected: Option<Arc<dyn asr::AsrEngine>>,
         progress_tx: Option<mpsc::UnboundedSender<f32>>,
         cloud_err: LensError,
+        cause: CloudDegradeCause,
         cancel: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<(Vec<TranscriptSegment>, &'static str), LensError> {
         if let Some(engine) = injected {
             match engine.transcribe_pcm(pcm, config, progress_tx).await {
-                Ok(TranscriptOutput { segments: segs, .. }) => {
-                    Ok((segs, "apple_native (fallback)"))
-                }
+                Ok(TranscriptOutput { segments: segs, .. }) => Ok((segs, cause.apple_label())),
                 Err(apple_err) => {
                     if !is_user_cancel(&apple_err) && self.local_whisper_available(asr_cfg).await {
                         let segs = self
                             .transcribe_local_whisper(pcm, config, None, asr_cfg, cancel)
                             .await?;
-                        Ok((segs, "local_whisper (fallback)"))
+                        Ok((segs, cause.whisper_label()))
                     } else {
                         Err(apple_err)
                     }
@@ -2322,7 +2328,7 @@ impl LensEngine {
             let segs = self
                 .transcribe_local_whisper(pcm, config, progress_tx, asr_cfg, cancel)
                 .await?;
-            Ok((segs, "local_whisper (fallback)"))
+            Ok((segs, cause.whisper_label()))
         } else {
             Err(cloud_err)
         }
@@ -3395,6 +3401,31 @@ fn remove_file_best_effort(path: &Path) {
             path = %path.display(),
             "failed to remove managed source file: {e}"
         ),
+    }
+}
+
+/// Why the cloud ASR arm degraded to local, tracked explicitly because the error variant
+/// cannot carry it: a runtime 401/413 is also [`LensError::Validation`], so only the
+/// pre-flight caller knows the failure is a misconfiguration the user must fix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CloudDegradeCause {
+    Misconfigured,
+    Transient,
+}
+
+impl CloudDegradeCause {
+    fn apple_label(self) -> &'static str {
+        match self {
+            Self::Misconfigured => "apple_native (cloud misconfigured)",
+            Self::Transient => "apple_native (fallback)",
+        }
+    }
+
+    fn whisper_label(self) -> &'static str {
+        match self {
+            Self::Misconfigured => "local_whisper (cloud misconfigured)",
+            Self::Transient => "local_whisper (fallback)",
+        }
     }
 }
 

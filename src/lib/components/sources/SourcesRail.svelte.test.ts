@@ -514,11 +514,22 @@ describe('SourcesRail — ASR fallback caption (#297 AC4.4)', () => {
     expect(screen.getByText(/fell back to local whisper/i)).toBeInTheDocument();
   });
 
+  it('points a cloud-misconfiguration marker at the setting that fixes it', () => {
+    mockSourcesStore._setSources([makeSource({ id: 'src-001', kind: 'audio', title: 'Call.mp3' })]);
+    mockSourcesStore._setEffectiveBackend('src-001', 'local_whisper (cloud misconfigured)');
+    render(SourcesRail);
+    const caption = screen.getByText(/cloud transcription is misconfigured/i);
+    expect(caption).toBeInTheDocument();
+    expect(caption).toHaveTextContent(/settings\s*→\s*transcription/i);
+    expect(screen.queryByText(/fell back to/i)).not.toBeInTheDocument();
+  });
+
   it('shows no caption for an audio source with a clean (non-degraded) marker', () => {
     mockSourcesStore._setSources([makeSource({ id: 'src-001', kind: 'audio', title: 'Call.mp3' })]);
     mockSourcesStore._setEffectiveBackend('src-001', 'local_whisper');
     render(SourcesRail);
     expect(screen.queryByText(/fell back/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/misconfigured/i)).not.toBeInTheDocument();
   });
 
   it('shows no caption for an audio source with no marker at all (absence is not "clean")', () => {
@@ -526,6 +537,7 @@ describe('SourcesRail — ASR fallback caption (#297 AC4.4)', () => {
     render(SourcesRail);
     expect(screen.queryByText(/fell back/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/degraded/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/misconfigured/i)).not.toBeInTheDocument();
   });
 
   it('shows no caption for a non-audio source even if a marker is somehow present', () => {
