@@ -3,10 +3,14 @@ import { mockIPC, clearMocks } from '@tauri-apps/api/mocks';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AppConfig } from '$lib/theme/types.js';
 import { baseAppConfig } from '$lib/test-fixtures.js';
+import { resetConfig } from '$lib/models/app-config.svelte.js';
 import type { TtsEngineCatalogEntry, TtsVoice } from '$lib/onboarding/system-check.js';
 import TtsConfigPanel from './TtsConfigPanel.svelte';
 
-const baseConfig = baseAppConfig;
+// Consent granted by default: this file's cloud cases are about provider selection
+// and credentials, not the Privacy consent gate (covered in CloudTtsForm's tests).
+const baseConfig = (overrides?: Partial<AppConfig>): AppConfig =>
+  baseAppConfig({ tts_cloud_consent: true, ...overrides });
 
 const DEFAULT_PRESET_VOICES: TtsVoice[] = [
   { id: 'leo', name: 'Leo', gender: 'male' },
@@ -124,6 +128,7 @@ beforeEach(() => {
 afterEach(() => {
   clearMocks();
   delete (globalThis as { isTauri?: boolean }).isTauri;
+  resetConfig();
 });
 
 describe('TtsConfigPanel — voices', () => {
@@ -319,7 +324,7 @@ describe('TtsConfigPanel — cloud (OpenAI-compatible, reactive, #195)', () => {
     render(TtsConfigPanel);
     await selectEngine(/openai-compatible/i);
 
-    await waitFor(() => expect(screen.getByText(/add an api key below/i)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/requires an api key/i)).toBeInTheDocument());
 
     const keyField = screen.getByLabelText(/api key/i);
     await fireEvent.input(keyField, { target: { value: 'sk-openai-1234' } });
@@ -447,7 +452,7 @@ describe('TtsConfigPanel — cloud (OpenAI-compatible, reactive, #195)', () => {
     render(TtsConfigPanel);
     await selectEngine(/openai-compatible/i);
 
-    await waitFor(() => expect(screen.getByText(/add an api key below/i)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/requires an api key/i)).toBeInTheDocument());
   });
 
   it('editing the base URL and blurring persists it, resending the already-saved key', async () => {

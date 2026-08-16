@@ -128,13 +128,13 @@ pub use transcription::{WindowConfig, decode_and_resample_audio, decode_resample
 // the crate root — `asr::{Lang, Platform}` already own those names here. The TTS
 // language types stay reachable via `lens_core::tts::{Lang, Platform, ...}`.
 pub use tts::{
-    AudioBuffer, CloudTtsKind, DownloadProgress, EngineCapability, EngineCatalogEntry, Gender,
-    GuardVerdict, OffendingSource, QwenVoice, TTS_REGISTRY, TtsBackend, TtsEngineId, TtsModelSpec,
-    TtsPhase, TtsProvider, TtsProviderInfo, TtsSidecar, TtsVoice, code_to_lang, download_tts_model,
-    emotion_tag, evaluate_language_guard, lang_to_qwen_name, qwen_voice, read_wav_mono16,
-    resolve_tts, resolve_tts_provider, resolve_tts_provider_full, tts_catalog,
-    tts_catalog_serialized, tts_model_downloaded, tts_model_file_present, tts_model_path,
-    validate_qwen_language,
+    AudioBuffer, CLOUD_TTS_CONSENT_REASON, CloudTtsConsent, CloudTtsKind, DownloadProgress,
+    EngineCapability, EngineCatalogEntry, Gender, GuardVerdict, OffendingSource, QwenVoice,
+    TTS_REGISTRY, TtsBackend, TtsEngineId, TtsModelSpec, TtsPhase, TtsProvider, TtsProviderInfo,
+    TtsSidecar, TtsVoice, cloud_tts_usable, code_to_lang, download_tts_model, emotion_tag,
+    evaluate_language_guard, lang_to_qwen_name, qwen_voice, read_wav_mono16, resolve_tts,
+    resolve_tts_provider, resolve_tts_provider_full, tts_catalog, tts_catalog_serialized,
+    tts_model_downloaded, tts_model_file_present, tts_model_path, validate_qwen_language,
 };
 pub use vector_store::{LanceVectorStore, VectorStore};
 
@@ -1062,6 +1062,10 @@ impl LensEngine {
         guard.config.cache_root(&data_dir)
     }
 
+    pub(crate) async fn cloud_tts_consent(&self) -> tts::CloudTtsConsent {
+        tts::CloudTtsConsent::from_flag(self.read().await.config.tts_cloud_consent)
+    }
+
     /// Test-only accessor: `pub(crate)` `data_dir` is unreachable from the test
     /// crate; this exposes it. Absent from production builds.
     #[cfg(feature = "test-util")]
@@ -1495,12 +1499,12 @@ impl LensEngine {
             return self.tts_sidecar().await.is_some();
         }
         let cache_root = self.cache_root().await;
-        // Cloud has no registry model of its own: usable when a key is configured OR
-        // when the offline Orpheus fallback (#40 AC6) is itself on disk, so this gate
-        // agrees with `resolve_tts_provider_full`'s no-key -> Orpheus fallback.
+        // Cloud has no registry model of its own: usable when consent and a key are
+        // both in place OR when the offline Orpheus fallback (#40 AC6) is itself on
+        // disk, so this gate agrees with `resolve_tts_provider_full`.
         if let tts::TtsBackend::Cloud(kind) = &cfg.backend {
-            let has_key = cfg.clouds.get(kind).is_some_and(|c| !c.api_key.is_empty());
-            return has_key || tts::orpheus_ready(&cache_root);
+            let consent = self.cloud_tts_consent().await;
+            return tts::cloud_tts_usable(cfg, *kind, consent) || tts::orpheus_ready(&cache_root);
         }
         let required = cfg.backend.required_model_ids();
         !required.is_empty()
@@ -1523,9 +1527,15 @@ impl LensEngine {
         // (Orpheus). `data_dir` supplies embedded model paths.
         let data_dir = self.data_dir().await;
         let cache_root = self.cache_root().await;
-        let provider =
-            tts::resolve_tts_provider_full(cfg.backend, cfg, &cache_root, self.tts_sidecar().await)
-                .ok_or_else(|| LensError::Tts("no TTS backend available".into()))?;
+        let consent = self.cloud_tts_consent().await;
+        let provider = tts::resolve_tts_provider_full(
+            cfg.backend,
+            cfg,
+            consent,
+            &cache_root,
+            self.tts_sidecar().await,
+        )
+        .ok_or_else(|| LensError::Tts(no_tts_backend_reason(cfg, consent).into()))?;
         let buffer: tts::AudioBuffer = provider
             .synthesize_script(script, voices, &on_phase, cancel)
             .await?;
@@ -2292,7 +2302,14 @@ impl LensEngine {
         let TranscriptOutput { segments, .. } = engine
             .transcribe_pcm(pcm, config, progress_tx)
             .await
-            .map_err(|e| (e, CloudDegradeCause::Transient))?;
+            .map_err(|e| {
+                let cause = if asr::cloud::is_key_rejection(&e) {
+                    CloudDegradeCause::Misconfigured
+                } else {
+                    CloudDegradeCause::Transient
+                };
+                (e, cause)
+            })?;
         Ok(segments)
     }
 
@@ -3404,9 +3421,24 @@ fn remove_file_best_effort(path: &Path) {
     }
 }
 
+/// Why no provider resolved for `cfg.backend`. A cloud user whose only blocker is
+/// consent gets told so here — the catalog's reason surface lives in Settings and
+/// never reaches someone who just pressed Generate.
+fn no_tts_backend_reason(cfg: &config::TtsConfig, consent: tts::CloudTtsConsent) -> &'static str {
+    if let tts::TtsBackend::Cloud(kind) = cfg.backend
+        && consent == tts::CloudTtsConsent::Withheld
+        && tts::cloud_tts_usable(cfg, kind, tts::CloudTtsConsent::Granted)
+    {
+        return "Cloud text-to-speech is configured but not permitted. Turn on \
+                \"Allow cloud text-to-speech\" in Privacy settings, or install the \
+                on-device voice.";
+    }
+    "no TTS backend available"
+}
+
 /// Why the cloud ASR arm degraded to local, tracked explicitly because the error variant
-/// cannot carry it: a runtime 401/413 is also [`LensError::Validation`], so only the
-/// pre-flight caller knows the failure is a misconfiguration the user must fix.
+/// cannot carry it: 413 is also [`LensError::Validation`] yet is not something the user
+/// fixes in Settings, so each call site classifies its own failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CloudDegradeCause {
     Misconfigured,

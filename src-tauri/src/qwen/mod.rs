@@ -740,7 +740,8 @@ mod tests {
 mod e2e_tests {
     use super::*;
     use lens_core::{
-        DialogueScript, Speaker, TtsBackend, TtsConfig, TtsPhase, Turn, resolve_tts_provider_full,
+        CloudTtsConsent, DialogueScript, Speaker, TtsBackend, TtsConfig, TtsPhase, Turn,
+        resolve_tts_provider_full,
     };
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
@@ -838,6 +839,7 @@ for line in sys.stdin:
         resolve_tts_provider_full(
             TtsBackend::Qwen3Local,
             &TtsConfig::default(),
+            CloudTtsConsent::Withheld,
             Path::new("/unused"),
             Some(sidecar),
         )

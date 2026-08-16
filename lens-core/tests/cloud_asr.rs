@@ -392,6 +392,25 @@ fn app_config_audio_cloud_consent_defaults_false() {
 }
 
 #[test]
+fn app_config_tts_cloud_consent_defaults_false() {
+    let cfg = AppConfig::default();
+    assert!(
+        !cfg.tts_cloud_consent,
+        "tts_cloud_consent must default to false"
+    );
+
+    // Every existing on-disk config predates this field; absent must read as withheld,
+    // never grandfathered on from audio_cloud_consent or a saved key.
+    let json = r#"{"theme":"dark","user_name":"","embedding_model":"","embedding_backend":"","max_source_mb":"","models":[],"endpoints":{},"voices":{"host":"","guest":""},"audio_cloud_consent":true,"tts":{"version":1,"backend":{"cloud":"open_ai_compatible"},"model":"","clouds":{"open_ai_compatible":{"api_key":"sk-key","base_url":""}}},"paths":{"data_dir":""},"tier_thresholds":{"tier1_token_cap":4000,"tier2_token_cap":16000},"onboarding_complete":false}"#;
+    let cfg2: AppConfig = serde_json::from_str(json).expect("old config must parse");
+    assert!(
+        !cfg2.tts_cloud_consent,
+        "tts_cloud_consent must default to false when absent from old JSON"
+    );
+    assert!(cfg2.audio_cloud_consent, "the ASR consent key is unrenamed");
+}
+
+#[test]
 fn asr_config_backward_compat_old_json_no_cloud_fields() {
     // Old config without cloud keys must parse fine, cloud fields get defaults
     let json = r#"{"backend":"local_whisper","whisper_model":"base"}"#;
@@ -1673,6 +1692,7 @@ async fn assert_cloud_error_falls_back_to_mock(
     server: &MockServer,
     _route_path: &str,
     status: u16,
+    expected_label: &str,
 ) {
     let engine = LensEngine::for_test().await;
 
@@ -1700,23 +1720,33 @@ async fn assert_cloud_error_falls_back_to_mock(
         .unwrap_or_else(|e| panic!("status {status} must fallback, not hard-fail: {e:?}"));
 
     assert_eq!(out, canned, "fallback segments must match mock");
-    assert!(
-        label.contains("fallback"),
-        "backend label must indicate fallback: {label}"
+    assert_eq!(
+        label, expected_label,
+        "status {status} must produce its own degrade marker"
     );
 }
 
+/// A rejected key only surfaces at request time — pre-flight cannot know the provider
+/// will refuse it — so this is where the misconfigured marker has to be earned.
 #[tokio::test]
-async fn cloud_401_triggers_fallback_to_local() {
+async fn cloud_401_falls_back_to_local_and_is_marked_misconfigured() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/audio/transcriptions"))
         .respond_with(ResponseTemplate::new(401))
         .mount(&server)
         .await;
-    assert_cloud_error_falls_back_to_mock(&server, "/v1/audio/transcriptions", 401).await;
+    assert_cloud_error_falls_back_to_mock(
+        &server,
+        "/v1/audio/transcriptions",
+        401,
+        "apple_native (cloud misconfigured)",
+    )
+    .await;
 }
 
+/// 413 is `Validation` like a rejected key, but an oversized payload is not something
+/// the user fixes in Settings — tagging on the variant would misdirect them.
 #[tokio::test]
 async fn cloud_413_triggers_fallback_to_local() {
     let server = MockServer::start().await;
@@ -1725,7 +1755,13 @@ async fn cloud_413_triggers_fallback_to_local() {
         .respond_with(ResponseTemplate::new(413))
         .mount(&server)
         .await;
-    assert_cloud_error_falls_back_to_mock(&server, "/v1/audio/transcriptions", 413).await;
+    assert_cloud_error_falls_back_to_mock(
+        &server,
+        "/v1/audio/transcriptions",
+        413,
+        "apple_native (fallback)",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -1736,7 +1772,13 @@ async fn cloud_429_triggers_fallback_to_local() {
         .respond_with(ResponseTemplate::new(429))
         .mount(&server)
         .await;
-    assert_cloud_error_falls_back_to_mock(&server, "/v1/audio/transcriptions", 429).await;
+    assert_cloud_error_falls_back_to_mock(
+        &server,
+        "/v1/audio/transcriptions",
+        429,
+        "apple_native (fallback)",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -1747,7 +1789,13 @@ async fn cloud_500_triggers_fallback_to_local() {
         .respond_with(ResponseTemplate::new(500))
         .mount(&server)
         .await;
-    assert_cloud_error_falls_back_to_mock(&server, "/v1/audio/transcriptions", 500).await;
+    assert_cloud_error_falls_back_to_mock(
+        &server,
+        "/v1/audio/transcriptions",
+        500,
+        "apple_native (fallback)",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -1762,7 +1810,13 @@ async fn cloud_malformed_200_triggers_fallback_to_local() {
         )
         .mount(&server)
         .await;
-    assert_cloud_error_falls_back_to_mock(&server, "/v1/audio/transcriptions", 200).await;
+    assert_cloud_error_falls_back_to_mock(
+        &server,
+        "/v1/audio/transcriptions",
+        200,
+        "apple_native (fallback)",
+    )
+    .await;
 }
 
 // ===========================================================================

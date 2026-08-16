@@ -711,3 +711,57 @@ async fn google_safety_blocked_no_audio_maps_to_tts_not_panic() {
     .expect_err("no audio");
     assert!(matches!(err, LensError::Tts(_)));
 }
+
+// ===========================================================================
+// Consent gate: `tts_backend_available` (the notebook-side availability gate)
+// ===========================================================================
+
+/// Fakes both Orpheus weights at their exact pinned sizes so `orpheus_ready` is true
+/// without a real multi-GB download.
+fn fake_orpheus_on_disk(cache_root: &std::path::Path) {
+    for id in ["orpheus", "snac"] {
+        let spec = lens_core::resolve_tts(id).expect("registry spec");
+        let path = lens_core::tts_model_path(cache_root, id).expect("model path");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::File::create(&path)
+            .expect("create")
+            .set_len(spec.size_bytes)
+            .expect("set_len");
+    }
+}
+
+async fn tts_available(consent: bool, api_key: &str, orpheus_on_disk: bool) -> bool {
+    let dir = tempfile::tempdir().expect("tempdir");
+    if orpheus_on_disk {
+        fake_orpheus_on_disk(dir.path());
+    }
+    let engine = lens_core::LensEngine::for_test().await;
+    let mut config = engine.config().await;
+    config.paths.data_dir = dir.path().display().to_string();
+    config.tts_cloud_consent = consent;
+    config.tts = lens_core::config::TtsConfig {
+        version: 1,
+        backend: lens_core::TtsBackend::Cloud(CloudTtsKind::OpenAiCompatible),
+        model: String::new(),
+        clouds: std::collections::BTreeMap::from([(
+            CloudTtsKind::OpenAiCompatible,
+            lens_core::config::CloudTtsCreds {
+                api_key: api_key.to_string(),
+                base_url: String::new(),
+            },
+        )]),
+    };
+    let cfg = config.tts.clone();
+    engine.set_config(config).await;
+    engine.tts_backend_available(&cfg).await
+}
+
+/// The gate must equal `cloud_tts_usable || orpheus_ready`: a keyed cloud backend with
+/// consent withheld is available only because the offline voice can stand in for it.
+#[tokio::test]
+async fn tts_backend_available_tracks_consent_and_the_orpheus_fallback() {
+    assert!(tts_available(true, "sk-key", false).await);
+    assert!(!tts_available(false, "sk-key", false).await);
+    assert!(!tts_available(true, "", false).await);
+    assert!(tts_available(false, "sk-key", true).await);
+}

@@ -594,11 +594,11 @@ async fn probe_embedding_model(
 
 fn has_cloud_tts(config: &AppConfig) -> bool {
     if let crate::tts::TtsBackend::Cloud(kind) = &config.tts.backend {
-        config
-            .tts
-            .clouds
-            .get(kind)
-            .is_some_and(|c| !c.api_key.is_empty())
+        crate::tts::cloud_tts_usable(
+            &config.tts,
+            *kind,
+            crate::tts::CloudTtsConsent::from_flag(config.tts_cloud_consent),
+        )
     } else {
         false
     }
@@ -830,7 +830,12 @@ mod tests {
         use crate::tts::{CloudTtsKind, TtsBackend};
         use std::collections::BTreeMap;
 
-        let mut config = AppConfig::default();
+        // Consent is a separate gate with its own test below; hold it granted here
+        // so this case stays about the backend and the key.
+        let mut config = AppConfig {
+            tts_cloud_consent: true,
+            ..AppConfig::default()
+        };
         // Orpheus (default) is not cloud.
         assert!(!has_cloud_tts(&config));
 
@@ -869,6 +874,98 @@ mod tests {
             },
         );
         assert!(!has_cloud_tts(&config));
+    }
+
+    /// The #273 shape is three gates that each decide "is cloud TTS usable" on their
+    /// own. Drive every consent × key × weights-on-disk cell through the resolver, the
+    /// shared predicate, this module's gate and the catalog, and require one answer.
+    #[test]
+    fn every_cloud_tts_gate_agrees_across_consent_and_key() {
+        use crate::config::{CloudTtsCreds, TtsConfig};
+        use crate::tts::{
+            CloudTtsConsent, CloudTtsKind, TtsBackend, TtsEngineId, cloud_tts_usable,
+            resolve_tts_provider_full, tts_catalog_serialized, tts_model_path,
+        };
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let kind = CloudTtsKind::OpenAiCompatible;
+        for consent_granted in [false, true] {
+            for has_key in [false, true] {
+                for orpheus_on_disk in [false, true] {
+                    let dir = tempfile::tempdir().unwrap();
+                    if orpheus_on_disk {
+                        for id in ["orpheus", "snac"] {
+                            let spec = crate::tts::resolve_tts(id).unwrap();
+                            let path = tts_model_path(dir.path(), id).unwrap();
+                            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                            std::fs::File::create(&path)
+                                .unwrap()
+                                .set_len(spec.size_bytes)
+                                .unwrap();
+                        }
+                    }
+                    let api_key = if has_key { "sk-key" } else { "" };
+                    let config = AppConfig {
+                        tts_cloud_consent: consent_granted,
+                        tts: TtsConfig {
+                            version: 1,
+                            // `has_cloud_tts` also requires the backend be Cloud, so pin it:
+                            // with Orpheus selected the chain would break for an unrelated reason.
+                            backend: TtsBackend::Cloud(kind),
+                            model: String::new(),
+                            clouds: BTreeMap::from([(
+                                kind,
+                                CloudTtsCreds {
+                                    api_key: api_key.into(),
+                                    base_url: String::new(),
+                                },
+                            )]),
+                        },
+                        ..AppConfig::default()
+                    };
+
+                    let consent = CloudTtsConsent::from_flag(consent_granted);
+                    let expected = consent_granted && has_key;
+                    let cell = format!(
+                        "consent={consent_granted} key={has_key} orpheus={orpheus_on_disk}"
+                    );
+
+                    assert_eq!(
+                        cloud_tts_usable(&config.tts, kind, consent),
+                        expected,
+                        "{cell}"
+                    );
+                    assert_eq!(has_cloud_tts(&config), expected, "{cell}");
+
+                    let keyed: BTreeSet<CloudTtsKind> = if has_key {
+                        BTreeSet::from([kind])
+                    } else {
+                        BTreeSet::new()
+                    };
+                    let entry = tts_catalog_serialized(&keyed, consent)
+                        .into_iter()
+                        .find(|e| e.id == TtsEngineId::OpenAiCompatible)
+                        .unwrap();
+                    assert_eq!(entry.available, expected, "{cell}");
+
+                    // `.is_some()` would be true in every orpheus-on-disk cell — the
+                    // resolved backend is what distinguishes cloud from the fallback.
+                    let resolved = resolve_tts_provider_full(
+                        config.tts.backend,
+                        &config.tts,
+                        consent,
+                        dir.path(),
+                        None,
+                    )
+                    .map(|p| p.info().backend);
+                    assert_eq!(
+                        resolved == Some(TtsBackend::Cloud(kind)),
+                        expected,
+                        "{cell}: resolved {resolved:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -1283,9 +1380,19 @@ mod tests {
             )]),
         };
 
+        config.tts_cloud_consent = true;
         let result = probe_text_to_speech(&config);
         assert_eq!(result.status, CheckStatus::Pass);
         assert_eq!(result.detail, "Cloud voice configured");
+
+        // A saved key is not consent: the readiness gate must not report a cloud voice
+        // the synthesis path would refuse to use.
+        config.tts_cloud_consent = false;
+        assert_eq!(
+            probe_text_to_speech(&config).status,
+            CheckStatus::Fail,
+            "a keyed cloud voice must not pass readiness without consent"
+        );
     }
 
     #[tokio::test]

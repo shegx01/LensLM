@@ -62,6 +62,9 @@ export const appConfigStore = {
   get audioCloudConsent(): boolean {
     return cfg?.audio_cloud_consent ?? false;
   },
+  get ttsCloudConsent(): boolean {
+    return cfg?.tts_cloud_consent ?? false;
+  },
   /** Non-null when no snapshot has ever loaded successfully — every getter above is
    *  falling back to its unloaded default. */
   get loadError(): string | null {

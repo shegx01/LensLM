@@ -635,11 +635,15 @@ pub struct AppConfig {
     /// [`ChatConfig::default`] (6 history turns, follow-up condensation on).
     #[serde(default)]
     pub chat: ChatConfig,
-    /// Explicit consent to upload raw audio to a cloud ASR provider (#45). A NEW
-    /// flag, SEPARATE from `EnrichmentConfig::cloud_consent` (audio is more
-    /// sensitive than text). Cloud ASR is refused (falls back to local) unless true.
+    /// Explicit consent to upload raw audio to a cloud SPEECH-TO-TEXT provider (#45);
+    /// cloud ASR falls back to local unless true. The serde key is load-bearing —
+    /// renaming it resets existing users' consent to false on their next load.
     #[serde(default)]
     pub audio_cloud_consent: bool,
+    /// Explicit consent to send text to a cloud TEXT-TO-SPEECH provider. Withheld by
+    /// default; a saved API key never implies it.
+    #[serde(default)]
+    pub tts_cloud_consent: bool,
     /// SPA JS-render fallback (#78). Defaults to `true`; absent key reads as `true`.
     #[serde(default = "default_js_render_enabled")]
     pub js_render_enabled: bool,
@@ -675,6 +679,7 @@ impl Default for AppConfig {
             retrieval: RetrievalConfig::default(),
             chat: ChatConfig::default(),
             audio_cloud_consent: false,
+            tts_cloud_consent: false,
             js_render_enabled: default_js_render_enabled(),
             reopen_last_notebook: default_reopen_last_notebook(),
             animations: default_animations(),

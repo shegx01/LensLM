@@ -166,8 +166,8 @@
       class="flex items-center gap-2 rounded-[10px] bg-destructive/10 px-3.5 py-3 text-[0.72rem] text-destructive ring-1 ring-destructive/30"
     >
       <CircleAlert class="size-3.5 shrink-0" aria-hidden="true" />
-      Cloud transcription needs audio consent. Turn on "Allow cloud audio" in Privacy settings to enable
-      this provider.
+      Cloud transcription needs audio consent. Turn on "Allow cloud speech-to-text" in Privacy settings
+      to enable this provider.
     </p>
   {/if}
 

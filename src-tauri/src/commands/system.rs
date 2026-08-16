@@ -1,8 +1,8 @@
 //! System / diagnostic commands.
 
 use lens_core::{
-    AsrBackend, CheckResult, CloudTtsKind, DownloadProgress, InstallProgress, LensEngine,
-    LensError, LlmDetection, StorageStats, TtsVoice, WHISPER_REGISTRY,
+    AsrBackend, CheckResult, CloudTtsConsent, CloudTtsKind, DownloadProgress, InstallProgress,
+    LensEngine, LensError, LlmDetection, StorageStats, TtsVoice, WHISPER_REGISTRY,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -220,12 +220,18 @@ pub async fn list_tts_voices(
 ) -> Result<Vec<TtsVoice>, LensError> {
     let cache_root = resolved_cache_root(&engine).await;
     let config = engine.config().await;
-    Ok(resolve_voices(&config.tts, &cache_root))
+    let consent = CloudTtsConsent::from_flag(config.tts_cloud_consent);
+    Ok(resolve_voices(&config.tts, consent, &cache_root))
 }
 
-/// Testable core of [`list_tts_voices`] (no `AppHandle`/engine state).
-fn resolve_voices(cfg: &lens_core::TtsConfig, cache_root: &std::path::Path) -> Vec<TtsVoice> {
-    lens_core::resolve_tts_provider(cfg.backend, cfg, cache_root)
+/// Testable core of [`list_tts_voices`] (no `AppHandle`/engine state). Takes consent
+/// so a consent-blocked cloud backend cannot leak its voice names into the picker.
+fn resolve_voices(
+    cfg: &lens_core::TtsConfig,
+    consent: CloudTtsConsent,
+    cache_root: &std::path::Path,
+) -> Vec<TtsVoice> {
+    lens_core::resolve_tts_provider(cfg.backend, cfg, consent, cache_root)
         .map(|provider| provider.voices())
         .unwrap_or_default()
 }
@@ -247,7 +253,10 @@ pub async fn tts_engine_catalog(
         .filter(|(_, creds)| !creds.api_key.is_empty())
         .map(|(kind, _)| *kind)
         .collect();
-    Ok(lens_core::tts_catalog_serialized(&keyed_cloud_kinds))
+    Ok(lens_core::tts_catalog_serialized(
+        &keyed_cloud_kinds,
+        CloudTtsConsent::from_flag(config.tts_cloud_consent),
+    ))
 }
 
 /// Installs an embedding model via Ollama `POST /api/pull`, streaming NDJSON progress.
@@ -886,9 +895,45 @@ mod tests {
     #[test]
     fn resolve_voices_default_orpheus_returns_named_catalog() {
         let cfg = lens_core::TtsConfig::default();
-        let voices = resolve_voices(&cfg, std::path::Path::new("/data"));
+        let voices = resolve_voices(
+            &cfg,
+            CloudTtsConsent::Granted,
+            std::path::Path::new("/data"),
+        );
         assert_eq!(voices.len(), 8);
         assert!(voices.iter().any(|v| v.id == "tara"));
+    }
+
+    /// Without consent the picker must not enumerate the provider's voices — a saved
+    /// key alone would otherwise list cloud voice names for a backend that cannot run.
+    #[test]
+    fn resolve_voices_lists_no_cloud_voices_without_consent() {
+        let kind = lens_core::CloudTtsKind::OpenAiCompatible;
+        let cfg = lens_core::TtsConfig {
+            version: 1,
+            backend: lens_core::TtsBackend::Cloud(kind),
+            model: String::new(),
+            clouds: std::collections::BTreeMap::from([(
+                kind,
+                lens_core::config::CloudTtsCreds {
+                    api_key: "sk-key".to_string(),
+                    base_url: String::new(),
+                },
+            )]),
+        };
+        let cloud_root = std::path::Path::new("/data");
+
+        let granted = resolve_voices(&cfg, CloudTtsConsent::Granted, cloud_root);
+        assert!(
+            !granted.is_empty(),
+            "a keyed cloud backend lists its voices"
+        );
+
+        let withheld = resolve_voices(&cfg, CloudTtsConsent::Withheld, cloud_root);
+        assert!(
+            withheld.is_empty(),
+            "consent withheld must leak no cloud voices, got {withheld:?}"
+        );
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -900,7 +945,11 @@ mod tests {
             backend: lens_core::TtsBackend::Qwen3Local,
             ..lens_core::TtsConfig::default()
         };
-        let voices = resolve_voices(&cfg, std::path::Path::new("/data"));
+        let voices = resolve_voices(
+            &cfg,
+            CloudTtsConsent::Granted,
+            std::path::Path::new("/data"),
+        );
         assert!(voices.is_empty());
     }
 

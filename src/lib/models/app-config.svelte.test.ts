@@ -27,9 +27,37 @@ describe('appConfigStore unloaded-state contract', () => {
     expect(appConfigStore.enrichment).toEqual(DEFAULT_ENRICHMENT);
     expect(appConfigStore.asr).toBeNull();
     expect(appConfigStore.audioCloudConsent).toBe(false);
+    expect(appConfigStore.ttsCloudConsent).toBe(false);
     expect(appConfigStore.loadError).toBeNull();
     expect(appConfigStore.staleError).toBeNull();
     expect(appConfigStore.persistError).toBeNull();
+  });
+});
+
+describe('appConfigStore.ttsCloudConsent', () => {
+  it('reads tts_cloud_consent as withheld when a loaded config omits the key', async () => {
+    const { tts_cloud_consent: _omitted, ...withoutConsent } = baseAppConfig({
+      tts_cloud_consent: true
+    });
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return withoutConsent;
+    });
+
+    await ensureLoaded();
+
+    expect(appConfigStore.ttsCloudConsent).toBe(false);
+  });
+
+  it('reads a persisted tts_cloud_consent independently of audio_cloud_consent', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config')
+        return baseAppConfig({ tts_cloud_consent: true, audio_cloud_consent: false });
+    });
+
+    await ensureLoaded();
+
+    expect(appConfigStore.ttsCloudConsent).toBe(true);
+    expect(appConfigStore.audioCloudConsent).toBe(false);
   });
 });
 

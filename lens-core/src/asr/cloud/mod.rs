@@ -298,9 +298,20 @@ fn is_private_network_host(host: url::Host<&str>) -> bool {
 /// Maps a provider HTTP status to a [`LensError`] without leaking provider
 /// internals. Connectivity-class statuses (429/5xx) → `Network`; misconfiguration
 /// (401/403) → `Validation`; oversize (413) → `Validation`; else `Transcription`.
+/// Message for a rejected key. Named so the degrade path can recognise this exact
+/// failure: 413 is also `Validation`, and "fix your oversized payload in Settings"
+/// would be wrong advice.
+pub(crate) const KEY_REJECTED: &str = "cloud ASR rejected the API key";
+
+/// Whether `err` is the provider rejecting the configured credentials — a
+/// misconfiguration only the user can fix, not a transient failure worth retrying.
+pub(crate) fn is_key_rejection(err: &LensError) -> bool {
+    matches!(err, LensError::Validation(m) if m == KEY_REJECTED)
+}
+
 pub(crate) fn map_status_error(status: u16) -> LensError {
     match status {
-        401 | 403 => LensError::Validation("cloud ASR rejected the API key".into()),
+        401 | 403 => LensError::Validation(KEY_REJECTED.into()),
         413 => LensError::Validation("cloud ASR audio payload too large".into()),
         429 => LensError::Network("cloud ASR rate limited".into()),
         500..=599 => LensError::Network(format!("cloud ASR provider error ({status})")),
