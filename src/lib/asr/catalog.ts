@@ -84,6 +84,43 @@ export function asrEngineIdFromBackend(backend: string): AsrEngineId {
   }
 }
 
+/**
+ * Display label for a wire `AsrConfig.backend` token, or `null` when it names no engine
+ * row. Returning `null` rather than the token keeps a raw wire value out of UI copy, so
+ * a Rust-side rename surfaces as an explicit unknown state instead of leaking through.
+ */
+export function asrBackendLabel(backend: string): string | null {
+  const id = asrEngineIdFromBackend(backend);
+  if (id === 'automatic') return null;
+  return ASR_ENGINE_CATALOG.find((e) => e.id === id)?.label ?? null;
+}
+
+function isPrivateNetworkHost(hostname: string): boolean {
+  const host = hostname.toLowerCase();
+  if (host === 'localhost' || host === '[::1]' || host.endsWith('.local')) return true;
+  const octets = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (!octets) return false;
+  const a = Number(octets[1]);
+  const b = Number(octets[2]);
+  return a === 127 || a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
+}
+
+/**
+ * The single client-side transport gate for a cloud ASR endpoint. The API key is
+ * bearer-transmitted, so cleartext http: is confined to loopback and private/LAN hosts.
+ * SYNC-CHECK: mirrors `is_transport_safe_base_url` in `lens-core/src/asr/cloud/mod.rs`.
+ */
+export function isTransportSafeBaseUrl(raw: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol === 'https:') return true;
+  return parsed.protocol === 'http:' && isPrivateNetworkHost(parsed.hostname);
+}
+
 export interface CloudAsrPreset {
   base_url: string;
   model: string;
@@ -147,11 +184,13 @@ export const ASR_CAPABILITY_MATRIX: Record<
   cloud: { language: 'honoured', translate: 'ignored' }
 };
 
+/** `null` for an engine with no matrix row: the argument is a wire token at runtime,
+ *  so an unrecognized one must degrade to "no claim", not throw inside a render. */
 export function asrCapability(
   engine: Exclude<AsrEngineId, 'automatic'>,
   field: 'language' | 'translate'
-): AsrCapabilityMode {
-  return ASR_CAPABILITY_MATRIX[engine][field];
+): AsrCapabilityMode | null {
+  return ASR_CAPABILITY_MATRIX[engine]?.[field] ?? null;
 }
 
 /**
@@ -167,14 +206,13 @@ export function appleTranslateRerouteNotice(whisperModelDownloaded: boolean): st
 }
 
 /**
- * Notice copy for enabling translate under Automatic: whichever engine the
- * router resolves to, translate lands on Local Whisper either way (directly,
- * or via the Apple reroute above), so the same no-model failure applies.
+ * Notice copy when Local Whisper is the resolved engine. It honours translate itself,
+ * but the same missing-model failure as the reroute above applies — saying only
+ * "honoured" would promise a run that cannot happen.
  */
-export function automaticTranslateNotice(whisperModelDownloaded: boolean): string {
-  const base =
-    'Automatic prefers on-device Apple transcription where supported, otherwise Local Whisper — enabling translate always routes through Local Whisper either way.';
+export function whisperTranslateNotice(whisperModelDownloaded: boolean): string {
+  const base = 'This engine honours translate directly.';
   return whisperModelDownloaded
     ? base
-    : `${base} No Whisper model is downloaded yet, so translate will fail until one is.`;
+    : `${base} No Whisper model is downloaded yet, so transcription will fail until one is.`;
 }

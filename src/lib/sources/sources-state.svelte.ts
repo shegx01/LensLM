@@ -10,6 +10,7 @@ import {
   trashSource,
   restoreSource
 } from './ipc.js';
+import { SvelteMap } from 'svelte/reactivity';
 import type { Source, SourceStatus, StreamEvent, IngestProgress, ErrorMeta } from './types.js';
 import { notebookStore, refreshTrashedSources } from '$lib/notebooks/notebooks-state.svelte.js';
 
@@ -57,9 +58,10 @@ interface SourceViewerRequest {
 let sourceViewerRequest = $state<SourceViewerRequest | null>(null);
 let sourceViewerNonce = $state(0);
 
-// Session-scoped only, by design (#297 AC4.4/G7): which ASR backend actually
-// transcribed each audio source. Not persisted — vanishes on reload.
-let effectiveBackendBySource = $state(new Map<string, string>());
+// Which ASR backend actually transcribed each audio source. Session-scoped by design:
+// not persisted, so it vanishes on reload. SvelteMap, not Map — `$state(new Map())`
+// does not track `.set()`, so readers would never see a marker arrive.
+const effectiveBackendBySource = new SvelteMap<string, string>();
 
 // ---------------------------------------------------------------------------
 // Exported store object
@@ -106,7 +108,7 @@ export const sourcesStore = {
   get sourceViewerNonce(): number {
     return sourceViewerNonce;
   },
-  /** Session-scoped ASR marker for `sourceId` (#297 AC4.4); `null` if none was captured. */
+  /** The ASR marker captured for `sourceId`, or `null` if none was. */
   effectiveBackendFor(sourceId: string): string | null {
     return effectiveBackendBySource.get(sourceId) ?? null;
   }
@@ -433,7 +435,7 @@ export function resetSourcesStore(): void {
   focusNonce = 0;
   sourceViewerRequest = null;
   sourceViewerNonce = 0;
-  effectiveBackendBySource = new Map();
+  effectiveBackendBySource.clear();
   for (const entry of trashQueue) {
     clearTimeout(entry.timeoutId);
   }

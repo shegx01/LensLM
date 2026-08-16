@@ -33,7 +33,7 @@
   import { notebookStore } from '$lib/notebooks/index.js';
   import type { SourceStatus } from '$lib/sources/types.js';
   import { statusDotClass } from '$lib/sources/status.js';
-  import { ASR_ENGINE_CATALOG } from '$lib/asr/catalog.js';
+  import { asrBackendLabel } from '$lib/asr/catalog.js';
   import AddSourcesModal from './AddSourcesModal.svelte';
   import StudioPanel from './StudioPanel.svelte';
 
@@ -165,14 +165,19 @@
     return '';
   }
 
+  // SYNC-CHECK: the `"<backend> (<cause>)"` wire form and its three cause suffixes are
+  // produced by `CloudDegradeCause::apple_label`/`whisper_label` in lens-core/src/lib.rs;
+  // renaming a suffix there without matching it here silently drops this caption.
+  const ASR_MARKER_RE = /^(.+)\s\((fallback|degraded|cloud misconfigured)\)$/i;
+
   /**
    * Caption for a marked ASR run (#297). Additive-only: the marker is session-scoped, so
    * its absence must never read as "clean" — only explicitly marked values render.
    */
   function fallbackCaption(marker: string): string | null {
-    const match = /^(.+)\s\((fallback|degraded|cloud misconfigured)\)$/i.exec(marker);
+    const match = ASR_MARKER_RE.exec(marker);
     if (!match) return null;
-    const label = ASR_ENGINE_CATALOG.find((e) => e.id === match[1])?.label ?? match[1];
+    const label = asrBackendLabel(match[1]) ?? 'a different engine';
     switch (match[2].toLowerCase()) {
       case 'fallback':
         return `Fell back to ${label} for this recording.`;
@@ -416,7 +421,11 @@
                 {/if}
               </div>
               {#if asrCaption}
-                <p class="mt-0.5 truncate text-[0.65rem] text-destructive">{asrCaption}</p>
+                <!-- Wraps rather than truncating: the actionable half of the
+                     misconfiguration copy sits past the rail's width. -->
+                <p class="mt-0.5 text-[0.65rem] leading-snug text-destructive" title={asrCaption}>
+                  {asrCaption}
+                </p>
               {/if}
             </div>
 

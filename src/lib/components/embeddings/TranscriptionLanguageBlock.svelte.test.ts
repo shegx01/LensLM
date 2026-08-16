@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { AppConfig } from '$lib/theme/types.js';
 import { baseAppConfig } from '$lib/test-fixtures.js';
 import { resetConfig } from '$lib/models/app-config.svelte.js';
-import type { AsrEngineId } from '$lib/asr/catalog.js';
+import type { AsrBackend } from '$lib/asr/ipc.js';
 import TranscriptionLanguageBlock from './TranscriptionLanguageBlock.svelte';
 
 beforeEach(() => {
@@ -166,7 +166,7 @@ describe('TranscriptionLanguageBlock — translate persistence', () => {
 
 describe('TranscriptionLanguageBlock — tri-state capability notice', () => {
   async function renderWithEngine(
-    engine: AsrEngineId | null,
+    engine: AsrBackend | null,
     asrOverrides?: Partial<AppConfig['asr']>
   ) {
     mockIPC((cmd) => {
@@ -226,31 +226,27 @@ describe('TranscriptionLanguageBlock — tri-state capability notice', () => {
     expect(screen.getByRole('alert')).not.toHaveTextContent(/fail/i);
   });
 
-  it('Automatic with translate off: describes the routing policy, with no per-machine prediction', async () => {
-    await renderWithEngine('automatic', { translate: false });
-    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent(/automatic/i));
-    expect(screen.getByRole('status')).toHaveTextContent(/local whisper/i);
-  });
-
-  it('Automatic with translate on and no Whisper model downloaded: warns of the same failure risk', async () => {
-    await renderWithEngine('automatic', { translate: true });
+  // "Honoured" alone is the dangerous half-truth: the run still needs the model on disk,
+  // and whisper_engine_for has no fallback arm when it is missing.
+  it('Local Whisper with translate on and no Whisper model downloaded: warns of the failure', async () => {
+    await renderWithEngine('local_whisper', { translate: true });
     await waitFor(() =>
-      expect(screen.getByRole('alert')).toHaveTextContent(/routes through local whisper/i)
+      expect(screen.getByRole('alert')).toHaveTextContent(/no whisper model is downloaded/i)
     );
     expect(screen.getByRole('alert')).toHaveTextContent(/fail/i);
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
   });
 
-  it('Automatic with translate on and a Whisper model already downloaded: same notice without the failure warning', async () => {
+  it('Local Whisper with translate on and a Whisper model already downloaded: no failure warning', async () => {
     mockIPC((cmd) => {
       if (cmd === 'get_config') return config({ translate: true });
       if (cmd === 'whisper_model_downloaded') return true;
     });
-    render(TranscriptionLanguageBlock, { props: { activeEngine: 'automatic' } });
+    render(TranscriptionLanguageBlock, { props: { activeEngine: 'local_whisper' } });
 
-    await waitFor(() =>
-      expect(screen.getByRole('alert')).toHaveTextContent(/routes through local whisper/i)
-    );
-    expect(screen.getByRole('alert')).not.toHaveTextContent(/fail/i);
+    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent(/honours translate/i));
+    expect(screen.getByRole('status')).not.toHaveTextContent(/fail/i);
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
   it('updates the notice when the activeEngine prop changes', async () => {

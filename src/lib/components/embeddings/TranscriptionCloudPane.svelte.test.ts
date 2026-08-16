@@ -153,9 +153,10 @@ describe('TranscriptionCloudPane', () => {
   });
 
   // SYNC-CHECK: these two tables mirror the transport-safety rstest tables in
-  // `lens-core/tests/cloud_asr.rs`; a case added there belongs here too.
+  // `lens-core/tests/cloud_asr.rs` case-for-case; a case added there belongs here too.
   it.each([
     'http://api.openai.com',
+    'http://api.example.com',
     'http://localhost.evil.example',
     'http://10.0.0.1.evil.com',
     'http://172.15.0.1',
@@ -164,7 +165,9 @@ describe('TranscriptionCloudPane', () => {
     'http://0.0.0.0',
     'http://93.184.216.34',
     'ftp://x',
-    'not a url at all'
+    'api.example.com',
+    'not a url at all',
+    'file:///etc/passwd'
   ])('rejects a base URL that is not transport-safe (%s)', async (url) => {
     const { savedConfigs } = mockBackend(cloudConfig());
     render(TranscriptionCloudPane);
@@ -181,6 +184,7 @@ describe('TranscriptionCloudPane', () => {
 
   it.each([
     'https://api.openai.com',
+    'https://asr.internal.example:8443/v1',
     'http://localhost:9000',
     'http://127.0.0.1',
     'http://127.1.2.3',
@@ -217,7 +221,7 @@ describe('TranscriptionCloudPane', () => {
     await fireEvent.blur(baseUrlInput);
 
     await waitFor(() => expect(savedConfigs.length).toBeGreaterThan(0));
-    expect(savedConfigs.at(-1)?.asr.backend).not.toBe('cloud');
+    expect(savedConfigs.at(-1)?.asr.backend).toBe('local_whisper');
   });
 
   it('granting consent through the shared store alone does not activate Cloud from this pane', async () => {
@@ -234,7 +238,7 @@ describe('TranscriptionCloudPane', () => {
     await new Promise((r) => setTimeout(r, 0));
 
     expect(savedConfigs.length).toBe(1);
-    expect(savedConfigs.at(-1)?.asr.backend).not.toBe('cloud');
+    expect(savedConfigs.at(-1)?.asr.backend).toBe('local_whisper');
   });
 
   it('a typeahead keypress resolving to the already-selected provider is a no-op that preserves the saved key', async () => {
@@ -271,7 +275,7 @@ describe('TranscriptionCloudPane', () => {
     await waitFor(() => expect(savedConfigs.length).toBeGreaterThan(0));
     expect(savedConfigs.at(-1)?.asr.cloud_provider).toBe('deepgram');
     expect(savedConfigs.at(-1)?.asr.cloud_api_key).toBe('');
-    expect(savedConfigs.at(-1)?.asr.backend).not.toBe('cloud');
+    expect(savedConfigs.at(-1)?.asr.backend).toBe('local_whisper');
   });
 
   it('clearing the Base URL while cloud is the active backend demotes it instead of leaving it pointed at cloud', async () => {

@@ -506,7 +506,7 @@ describe('SourcesRail — Studio shell', () => {
   });
 });
 
-describe('SourcesRail — ASR fallback caption (#297 AC4.4)', () => {
+describe('SourcesRail — ASR degradation caption', () => {
   it('shows a fallback caption for an audio source with a fallback marker', () => {
     mockSourcesStore._setSources([makeSource({ id: 'src-001', kind: 'audio', title: 'Call.mp3' })]);
     mockSourcesStore._setEffectiveBackend('src-001', 'local_whisper (fallback)');
@@ -545,6 +545,26 @@ describe('SourcesRail — ASR fallback caption (#297 AC4.4)', () => {
     mockSourcesStore._setEffectiveBackend('src-001', 'local_whisper (fallback)');
     render(SourcesRail);
     expect(screen.queryByText(/fell back/i)).not.toBeInTheDocument();
+  });
+
+  it('never renders a raw wire token the engine catalog cannot name', () => {
+    mockSourcesStore._setSources([makeSource({ id: 'src-001', kind: 'audio', title: 'Call.mp3' })]);
+    mockSourcesStore._setEffectiveBackend('src-001', 'faster_whisper (fallback)');
+    render(SourcesRail);
+    const caption = screen.getByText(/fell back to/i);
+    expect(caption).toHaveTextContent('Fell back to a different engine for this recording.');
+    expect(document.body.textContent).not.toContain('faster_whisper');
+  });
+
+  // The misconfiguration copy is the longest caption and names the fix at its very end,
+  // so clipping it removes the only actionable half.
+  it('keeps the misconfiguration caption readable rather than clipping it', () => {
+    mockSourcesStore._setSources([makeSource({ id: 'src-001', kind: 'audio', title: 'Call.mp3' })]);
+    mockSourcesStore._setEffectiveBackend('src-001', 'local_whisper (cloud misconfigured)');
+    render(SourcesRail);
+    const caption = screen.getByText(/cloud transcription is misconfigured/i);
+    expect(caption.className).not.toMatch(/\btruncate\b/);
+    expect(caption).toHaveAttribute('title', caption.textContent?.trim() ?? '');
   });
 });
 

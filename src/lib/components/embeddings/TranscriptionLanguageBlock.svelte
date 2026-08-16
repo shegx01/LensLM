@@ -19,17 +19,21 @@
     ASR_LANGUAGE_OPTIONS,
     asrCapability,
     appleTranslateRerouteNotice,
-    automaticTranslateNotice,
+    whisperTranslateNotice,
     isOtherAsrLanguage,
-    type AsrEngineId,
     type AsrLanguageValue
   } from '$lib/asr/catalog.js';
-  import { whisperModelDownloaded } from '$lib/asr/ipc.js';
+  import { whisperModelDownloaded, type AsrBackend } from '$lib/asr/ipc.js';
   import { appConfigStore, ensureLoaded, persist } from '$lib/models/app-config.svelte.js';
   import { toLensError } from '$lib/sources/lens-error.js';
   import type { AsrLang } from '$lib/theme/types.js';
 
-  let { activeEngine }: { activeEngine: AsrEngineId | null } = $props();
+  /** `activeEngine` is the router's resolved backend, so it is never the `automatic` UI id.
+   *  `onRouterInputChange` fires after each write here, both of which the router reads. */
+  let {
+    activeEngine,
+    onRouterInputChange
+  }: { activeEngine: AsrBackend | null; onRouterInputChange?: () => void } = $props();
 
   const AUTO_TOKEN = '__auto__';
   const OTHER_TOKEN = '__other__';
@@ -73,6 +77,7 @@
     try {
       error = null;
       await persist((cfg) => ({ ...cfg, asr: { ...cfg.asr, language: value } }));
+      onRouterInputChange?.();
     } catch (err) {
       error = toLensError(err).message;
     }
@@ -94,20 +99,21 @@
     try {
       error = null;
       await persist((cfg) => ({ ...cfg, asr: { ...cfg.asr, translate: checked } }));
+      onRouterInputChange?.();
     } catch (err) {
       error = toLensError(err).message;
     }
   }
 
-  // Only the two cases that can land on Local Whisper via a translate reroute
-  // (explicit Apple, or Automatic possibly resolving to Apple) need a live disk
-  // probe; every other capability reads statically from ASR_CAPABILITY_MATRIX.
+  // Only the cases that end up executing on Local Whisper need a live disk probe —
+  // it directly (local_whisper) or via the translate reroute (apple_native). Every
+  // other capability reads statically from ASR_CAPABILITY_MATRIX.
   let whisperPresent = $state<boolean | null>(null);
   $effect(() => {
     const engine = activeEngine;
     const translateOn = translate;
     const modelId = appConfigStore.asr?.whisper_model ?? 'base';
-    if ((engine !== 'apple_native' && engine !== 'automatic') || !translateOn) {
+    if ((engine !== 'apple_native' && engine !== 'local_whisper') || !translateOn) {
       whisperPresent = null;
       return;
     }
@@ -126,18 +132,13 @@
   }
 
   function computeNotice(
-    engine: AsrEngineId | null,
+    engine: AsrBackend | null,
     translateOn: boolean,
     whisperOn: boolean | null
   ): CapabilityNotice | null {
     if (engine === null) return null;
-    if (engine === 'automatic') {
-      if (!translateOn) {
-        return { tone: 'info', text: automaticTranslateNotice(true) };
-      }
-      return { tone: 'warning', text: automaticTranslateNotice(whisperOn ?? false) };
-    }
     const mode = asrCapability(engine, 'translate');
+    if (mode === null) return null;
     if (mode === 'reroutes') {
       if (!translateOn) {
         return { tone: 'info', text: appleTranslateRerouteNotice(true) };
@@ -150,7 +151,9 @@
         text: 'This engine ignores translate — audio is transcribed in its spoken language regardless.'
       };
     }
-    return { tone: 'info', text: 'This engine honours translate directly.' };
+    return translateOn && whisperOn === false
+      ? { tone: 'warning', text: whisperTranslateNotice(false) }
+      : { tone: 'info', text: whisperTranslateNotice(true) };
   }
 
   const capabilityNotice = $derived(computeNotice(activeEngine, translate, whisperPresent));

@@ -11,8 +11,10 @@
   import {
     ASR_ENGINE_CATALOG,
     appleAsrUnavailableReason,
+    asrBackendLabel,
     asrBackendToken,
     asrEngineIdFromBackend,
+    isTransportSafeBaseUrl,
     type AsrEngineId
   } from '$lib/asr/catalog.js';
   import {
@@ -63,14 +65,16 @@
         return appleAvailable;
       case 'local_whisper':
         return whisperPresent;
-      case 'cloud':
+      case 'cloud': {
+        const baseUrl = appConfigStore.asr?.cloud_base_url.trim() ?? '';
         return (
           !!appConfigStore.asr?.cloud_provider &&
-          !!appConfigStore.asr?.cloud_base_url.trim() &&
+          isTransportSafeBaseUrl(baseUrl) &&
           !!appConfigStore.asr?.cloud_model.trim() &&
           !!appConfigStore.asr?.cloud_api_key.trim() &&
           appConfigStore.audioCloudConsent
         );
+      }
     }
   }
 
@@ -144,18 +148,17 @@
     }
   }
 
+  const UNKNOWN_RESOLUTION = "Couldn't determine which engine Automatic will use right now.";
+
   const automaticStatusText = $derived.by(() => {
     if (!automaticUsable) {
       return "Apple transcription isn't available on this device and no Local Whisper model is downloaded yet. Download a model to enable Automatic.";
     }
     const resolved = resolvedBackend;
     if (resolved.status === 'loading') return 'Determining which engine Automatic will use…';
-    if (resolved.status === 'error') {
-      return "Couldn't determine which engine Automatic will use right now.";
-    }
-    const label =
-      ASR_ENGINE_CATALOG.find((e) => e.id === resolved.backend)?.label ?? resolved.backend;
-    return `Automatic currently resolves to ${label}.`;
+    if (resolved.status === 'error') return UNKNOWN_RESOLUTION;
+    const label = asrBackendLabel(resolved.backend);
+    return label === null ? UNKNOWN_RESOLUTION : `Automatic currently resolves to ${label}.`;
   });
 </script>
 
@@ -254,12 +257,15 @@
           {:else if selectedEngine === 'local_whisper'}
             <TranscriptionWhisperPane onPresenceChange={handleWhisperPresenceChange} />
           {:else if selectedEngine === 'cloud'}
-            <TranscriptionCloudPane />
+            <TranscriptionCloudPane onRouterInputChange={() => void refreshResolvedBackend()} />
           {/if}
         </div>
       </div>
     </div>
 
-    <TranscriptionLanguageBlock {activeEngine} />
+    <TranscriptionLanguageBlock
+      {activeEngine}
+      onRouterInputChange={() => void refreshResolvedBackend()}
+    />
   {/if}
 </section>

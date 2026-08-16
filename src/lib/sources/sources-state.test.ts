@@ -421,8 +421,6 @@ describe('ingest', () => {
     expect(sourcesStore.sources[0].status).toBe('embedding');
   });
 
-  // T-FE-9: the terminal transcribing chunk's effective_backend must land in the
-  // session store — sources-state.svelte.ts used to discard this payload.
   it('captures effective_backend from a terminal transcribing chunk', async () => {
     vi.mocked(listSources).mockResolvedValue([makeSource({ id: 'src-001', status: 'queued' })]);
     await loadSources('nb-001');

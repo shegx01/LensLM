@@ -1,7 +1,7 @@
 <!--
-  TranscriptionCloudPane — Cloud ASR detail pane. No props: every field it reads/writes
-  lives on the shared `appConfigStore` snapshot (`asr` + `audioCloudConsent`), so
-  PrivacySection's consent toggle and this pane can never disagree.
+  TranscriptionCloudPane — Cloud ASR detail pane. Every field it reads/writes lives on the
+  shared `appConfigStore` snapshot (`asr` + `audioCloudConsent`), so PrivacySection's
+  consent toggle and this pane can never disagree.
 -->
 <script lang="ts">
   import { onMount } from 'svelte';
@@ -15,10 +15,14 @@
     SelectItem
   } from '$lib/components/ui/select/index.js';
   import CircleAlert from '@lucide/svelte/icons/circle-alert';
-  import { CLOUD_ASR_PRESETS } from '$lib/asr/catalog.js';
+  import { CLOUD_ASR_PRESETS, isTransportSafeBaseUrl } from '$lib/asr/catalog.js';
   import type { CloudAsrProvider } from '$lib/theme/types.js';
   import { appConfigStore, ensureLoaded, persist } from '$lib/models/app-config.svelte.js';
   import { toLensError } from '$lib/sources/lens-error.js';
+
+  /** Fired after any write that can change what the ASR router resolves to, so the
+   *  owner can re-ask the engine instead of holding a stale answer until remount. */
+  let { onRouterInputChange }: { onRouterInputChange?: () => void } = $props();
 
   const PROVIDER_LABELS: Record<CloudAsrProvider, string> = {
     open_ai_compatible: 'OpenAI-compatible',
@@ -56,37 +60,13 @@
     savedApiKey = asr.cloud_api_key;
   });
 
-  /** The API key is bearer-transmitted here, so cleartext http: is confined to loopback and
-   *  private/LAN hosts — on a LAN it still crosses the wire in the clear, a deliberate trade.
-   *  SYNC-CHECK: mirrors `is_transport_safe_base_url` in `lens-core/src/asr/cloud/mod.rs`. */
-  function isPrivateNetworkHost(hostname: string): boolean {
-    const host = hostname.toLowerCase();
-    if (host === 'localhost' || host === '[::1]' || host.endsWith('.local')) return true;
-    const octets = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
-    if (!octets) return false;
-    const a = Number(octets[1]);
-    const b = Number(octets[2]);
-    return a === 127 || a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
-  }
-
-  function isValidBaseUrl(raw: string): boolean {
-    let parsed: URL;
-    try {
-      parsed = new URL(raw);
-    } catch {
-      return false;
-    }
-    if (parsed.protocol === 'https:') return true;
-    return parsed.protocol === 'http:' && isPrivateNetworkHost(parsed.hostname);
-  }
-
   /** Reactive Cloud persist; no Save button. Only flips `backend` to `"cloud"` when the
    *  config is usable; a blank required field demotes an active `"cloud"` backend so the
    *  engine's blank-filling default can never keep a cleared endpoint live. */
   async function persistCloud(): Promise<void> {
     error = null;
     const trimmedBaseUrl = baseUrl.trim();
-    if (trimmedBaseUrl !== '' && !isValidBaseUrl(trimmedBaseUrl)) {
+    if (trimmedBaseUrl !== '' && !isTransportSafeBaseUrl(trimmedBaseUrl)) {
       error =
         'Enter an https:// URL. Plain http:// is only accepted for localhost or a private-network address.';
       return;
@@ -125,6 +105,7 @@
         baseUrl = appConfigStore.asr.cloud_base_url;
         model = appConfigStore.asr.cloud_model;
       }
+      onRouterInputChange?.();
     } catch (err) {
       error = toLensError(err).message;
     }
