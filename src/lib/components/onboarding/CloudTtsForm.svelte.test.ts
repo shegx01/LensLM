@@ -229,7 +229,11 @@ describe('CloudTtsForm — base URL scheme validation (#245)', () => {
     ['javascript:alert(1)'],
     ['data:text/html,hi'],
     ['file:///etc/passwd'],
-    ['api.openai.com']
+    ['api.openai.com'],
+    // Cleartext to a public host would bearer-send the key over the open internet.
+    // The engine refuses it, so accepting it here would disable cloud TTS with no cause shown.
+    ['http://tts.vendor.example'],
+    ['http://172.32.0.1']
   ])('rejects %s with an inline error and does not save', async (value) => {
     let saved = false;
     mockIPC((cmd) => {
@@ -250,31 +254,33 @@ describe('CloudTtsForm — base URL scheme validation (#245)', () => {
     expect(saved).toBe(false);
   });
 
-  // http:// must stay accepted — plaintext localhost / self-hosted (LocalAI) is a
-  // supported endpoint, so the guard is an allowlist of schemes, not https-only.
-  it.each([['https://api.groq.com'], ['http://localhost:1234/v1']])(
-    'accepts %s and persists it',
-    async (value) => {
-      let written: AppConfig | null = null;
-      mockIPC((cmd, args) => {
-        if (cmd === 'get_config') return cloudKeyedConfig();
-        if (cmd === 'tts_engine_catalog') return catalogFixture({ cloudAvailable: true });
-        if (cmd === 'set_config') {
-          written = (args as { config: AppConfig }).config;
-          return null;
-        }
-      });
+  // http:// stays accepted for loopback and private/LAN hosts — self-hosted (LocalAI) is
+  // a supported endpoint. The guard is scheme plus host reach, matching the engine.
+  it.each([
+    ['https://api.groq.com'],
+    ['http://localhost:1234/v1'],
+    ['http://192.168.1.5:9000'],
+    ['http://10.0.0.5/v1']
+  ])('accepts %s and persists it', async (value) => {
+    let written: AppConfig | null = null;
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return cloudKeyedConfig();
+      if (cmd === 'tts_engine_catalog') return catalogFixture({ cloudAvailable: true });
+      if (cmd === 'set_config') {
+        written = (args as { config: AppConfig }).config;
+        return null;
+      }
+    });
 
-      renderOpenAiCompatible();
-      const field = await baseUrlField();
-      await fireEvent.input(field, { target: { value } });
-      await fireEvent.blur(field);
+    renderOpenAiCompatible();
+    const field = await baseUrlField();
+    await fireEvent.input(field, { target: { value } });
+    await fireEvent.blur(field);
 
-      await waitFor(() => expect(written).not.toBeNull());
-      expect((written as unknown as AppConfig).tts.clouds.open_ai_compatible?.base_url).toBe(value);
-      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
-    }
-  );
+    await waitFor(() => expect(written).not.toBeNull());
+    expect((written as unknown as AppConfig).tts.clouds.open_ai_compatible?.base_url).toBe(value);
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
 
   it('persists the trimmed (vetted) base URL, not the raw input', async () => {
     let written: AppConfig | null = null;

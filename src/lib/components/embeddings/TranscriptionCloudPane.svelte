@@ -15,7 +15,8 @@
     SelectItem
   } from '$lib/components/ui/select/index.js';
   import CircleAlert from '@lucide/svelte/icons/circle-alert';
-  import { CLOUD_ASR_PRESETS, isTransportSafeBaseUrl } from '$lib/asr/catalog.js';
+  import { CLOUD_ASR_PRESETS } from '$lib/asr/catalog.js';
+  import { isTransportSafeBaseUrl } from '$lib/net/transport.js';
   import type { CloudAsrProvider } from '$lib/theme/types.js';
   import { appConfigStore, ensureLoaded, persist } from '$lib/models/app-config.svelte.js';
   import { toLensError } from '$lib/sources/lens-error.js';

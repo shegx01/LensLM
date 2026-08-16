@@ -70,9 +70,7 @@ objc2 = "0.6"
 # `native-ml-metal` precedent above).
 #
 # NOTE: the Apple-native ASR bridge (#42) is NOT a cargo feature — a binary crate
-# cannot self-activate one per target. `build.rs` compiles it whenever the Swift
-# toolchain allows and sets the `apple_asr_bridge` cfg; see that file for the
-# strictness modes and `scripts/signoff.sh` for the build-cache caveat.
+# cannot self-activate one per target. `build.rs` owns it end to end.
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 lens-core = { path = "../lens-core", features = ["native-ml-metal", "local-whisper"] }
 # 161e: the Qwen3-TTS CustomVoice sidecar host (`qwen` module, aarch64-macOS only).

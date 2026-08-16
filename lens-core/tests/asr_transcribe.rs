@@ -100,7 +100,7 @@ async fn transcribe_apple_forced_without_engine_or_whisper_errors() {
     );
 }
 
-/// AC 2.6: with a Whisper model present, that same forced `apple_native` routes into
+/// With a Whisper model present, that same forced `apple_native` routes into
 /// the LocalWhisper fallback — the loader error proves it, since a preserved-original
 /// run would still say "no engine is injected". The fixture MUST stay 0 bytes: a file
 /// whose first four bytes match the ggml magic makes whisper.cpp SIGSEGV on garbage
@@ -198,8 +198,9 @@ async fn transcribe_local_whisper_missing_model_errors() {
     );
 }
 
-/// T-INT-4: the resolved-backend seam the UI consumes, end-to-end through the real
-/// engine, returning the typed enum rather than a re-derived string.
+/// The resolved-backend seam the UI consumes, end-to-end through the real engine,
+/// returning the typed enum rather than a re-derived string. A stored preference
+/// that cannot run is reported as the backend that WILL run, not as itself.
 #[tokio::test]
 async fn resolve_asr_backend_reports_the_engine_decision() {
     let engine = LensEngine::for_test().await;
@@ -225,7 +226,13 @@ async fn resolve_asr_backend_reports_the_engine_decision() {
         "an injected engine with no override → Apple"
     );
 
-    for token in ["local_whisper", "cloud", "apple_native"] {
+    // `cloud` is stored but unconfigured, so it resolves to the local cascade the
+    // run would actually take — the Apple engine injected above.
+    for (token, expected) in [
+        ("local_whisper", AsrBackend::LocalWhisper),
+        ("cloud", AsrBackend::AppleNative),
+        ("apple_native", AsrBackend::AppleNative),
+    ] {
         let mut config = engine.config().await;
         config.asr.backend = token.to_string();
         engine.set_config(config).await;
@@ -233,12 +240,73 @@ async fn resolve_asr_backend_reports_the_engine_decision() {
             .resolve_asr_backend(None, false)
             .await
             .expect("resolve");
-        assert_eq!(resolved.as_str(), token, "an explicit override must win");
+        assert_eq!(resolved, expected, "stored backend {token}");
     }
 }
 
-/// T-INT-5. Equal answers alone would not catch a re-read across an await racing a
-/// concurrent `set_asr_engine`, so the single-observation property is asserted too.
+/// Settings said "Cloud" while every ingest ran Whisper: consent revoked on an
+/// otherwise complete cloud config, with no Apple engine to catch it.
+#[tokio::test]
+async fn resolve_asr_backend_demotes_a_cloud_backend_left_without_consent() {
+    let engine = LensEngine::for_test().await;
+    let mut config = engine.config().await;
+    config.asr.backend = "cloud".to_string();
+    config.asr.cloud_provider = Some(lens_core::config::CloudAsrProvider::OpenAiCompatible);
+    config.asr.cloud_base_url = "https://api.openai.com".to_string();
+    config.asr.cloud_model = "whisper-1".to_string();
+    config.asr.cloud_api_key = "sk-test".to_string();
+    config.audio_cloud_consent = true;
+    engine.set_config(config.clone()).await;
+    assert_eq!(
+        engine
+            .resolve_asr_backend(None, false)
+            .await
+            .expect("resolve"),
+        AsrBackend::Cloud,
+        "a complete, consented cloud config resolves to Cloud"
+    );
+
+    config.audio_cloud_consent = false;
+    engine.set_config(config).await;
+    assert_eq!(
+        engine
+            .resolve_asr_backend(None, false)
+            .await
+            .expect("resolve"),
+        AsrBackend::LocalWhisper,
+        "revoking consent must change what the UI is told"
+    );
+}
+
+/// Persisting the same revocation also repairs the stored value, so the config on
+/// disk cannot keep naming a backend the engine will never run.
+#[test]
+fn saving_a_config_without_audio_consent_demotes_a_cloud_backend() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut config = lens_core::AppConfig {
+        audio_cloud_consent: false,
+        ..lens_core::AppConfig::default()
+    };
+    // Fully configured, so the withheld consent is the ONLY reason to demote.
+    config.asr.backend = "cloud".to_string();
+    config.asr.cloud_provider = Some(lens_core::config::CloudAsrProvider::OpenAiCompatible);
+    config.asr.cloud_base_url = "https://api.openai.com".to_string();
+    config.asr.cloud_model = "whisper-1".to_string();
+    config.asr.cloud_api_key = "sk-test".to_string();
+    config.save(dir.path()).expect("save");
+
+    assert_eq!(config.asr.backend, "");
+    assert_eq!(
+        lens_core::AppConfig::load(dir.path())
+            .expect("load")
+            .asr
+            .backend,
+        ""
+    );
+}
+
+/// Equal answers alone would not catch a re-read across an await racing a concurrent
+/// `set_asr_engine`, so the single-observation property is asserted too.
 #[tokio::test]
 async fn resolve_asr_backend_agrees_with_transcribe_and_reads_the_engine_once() {
     let engine = LensEngine::for_test().await;

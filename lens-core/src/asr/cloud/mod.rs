@@ -199,10 +199,9 @@ impl AsrEngine for CloudAsrEngine {
     }
 }
 
-/// Default API base URL for a provider.
+/// Default API base URL for a provider. Each id names exactly one host, so unlike
+/// #273's open LLM provider set, defaulting a blank base guesses nothing.
 /// SYNC-CHECK: mirrored by `CLOUD_ASR_PRESETS` in `src/lib/asr/catalog.ts`.
-/// Defaulting a blank base diverges from #273 (`llm.rs`) deliberately: unlike LLM's
-/// open provider set, each id here names one host, so nothing is being guessed at.
 pub fn default_base_url(provider: CloudAsrProvider) -> &'static str {
     match provider {
         CloudAsrProvider::OpenAiCompatible => "https://api.openai.com",
@@ -261,38 +260,13 @@ pub fn preflight_check(config: &AppConfig) -> Result<(), LensError> {
             "no cloud ASR model configured".into(),
         ));
     }
-    if !is_transport_safe_base_url(config.asr.cloud_base_url.trim()) {
+    if !crate::http::is_transport_safe_base_url(config.asr.cloud_base_url.trim()) {
         return Err(LensError::Validation(
             "cloud ASR base URL must be https, or http on a loopback or private-network host"
                 .into(),
         ));
     }
     Ok(())
-}
-
-/// The boundary control — `set_config` accepts whatever the webview sends.
-/// SYNC-CHECK: mirrors `isValidBaseUrl` in `TranscriptionCloudPane.svelte`, which
-/// records why cleartext http is accepted on a private network.
-fn is_transport_safe_base_url(raw: &str) -> bool {
-    let Ok(url) = url::Url::parse(raw) else {
-        return false;
-    };
-    match url.scheme() {
-        "https" => true,
-        "http" => url.host().is_some_and(is_private_network_host),
-        _ => false,
-    }
-}
-
-fn is_private_network_host(host: url::Host<&str>) -> bool {
-    match host {
-        url::Host::Domain(name) => {
-            let name = name.to_ascii_lowercase();
-            name == "localhost" || name.ends_with(".local")
-        }
-        url::Host::Ipv4(ip) => ip.is_loopback() || ip.is_private(),
-        url::Host::Ipv6(ip) => ip.is_loopback(),
-    }
 }
 
 /// Maps a provider HTTP status to a [`LensError`] without leaking provider

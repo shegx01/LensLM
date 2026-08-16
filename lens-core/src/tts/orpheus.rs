@@ -49,10 +49,10 @@ const N_CTX: u32 = 8192;
 const BATCH_CAP: usize = 512;
 const MAX_NEW_TOKENS: usize = 4096;
 // Cancel is polled every N generated tokens so a long detached blocking loop
-// aborts promptly, not only at turn boundaries (AC2.3).
+// aborts promptly, not only at turn boundaries.
 const CANCEL_POLL_INTERVAL: usize = 16;
 const BASE_SEED: u32 = 1234;
-// Early-EOS guard (AC2.6): estimate a token floor from word count and regenerate
+// Early-EOS guard: estimate a token floor from word count and regenerate
 // (fresh seed) up to K times when a run falls well short, then accept the longest.
 const MAX_RETRIES: usize = 2;
 const TOKENS_PER_WORD_EST: usize = 30;
@@ -308,7 +308,7 @@ enum TokenStep {
 /// Drives a token generator until it stops, the budget is hit, or cancellation.
 /// Cancellation is polled every `poll_interval` tokens so a detached blocking run
 /// aborts promptly. Generic over the step source so the loop (incl. cancel) is
-/// unit-testable with a fake generator (AC2.3).
+/// unit-testable with a fake generator.
 fn run_token_loop<N>(
     mut next: N,
     max_new: usize,
@@ -333,7 +333,7 @@ where
 
 /// Retries generation up to `max_retries` times when a run falls below the
 /// early-EOS floor, then accepts the longest. Generic over the per-attempt
-/// generator so the retry/decision policy is unit-testable (AC2.6).
+/// generator so the retry/decision policy is unit-testable.
 fn generate_with_retry<G>(
     floor: usize,
     cancel: &CancellationToken,
@@ -382,7 +382,7 @@ fn expected_token_floor(text: &str) -> usize {
 
 /// Resolves a turn's [`VoiceRef`] to a named Orpheus voice. Cloning
 /// (`VoiceRef::Reference`) and unknown/non-Orpheus names error — no silent
-/// fallback (AC2.4).
+/// fallback.
 fn voice_id(voice: &VoiceRef, speaker: Speaker) -> Result<&'static str, LensError> {
     match voice {
         VoiceRef::Reference { .. } => Err(LensError::Tts(
@@ -535,7 +535,7 @@ mod tests {
     #[test]
     fn token_loop_aborts_mid_generation_on_cancel() {
         // A fake generator yields audio forever; cancelling mid-stream must stop
-        // the loop promptly (AC2.3), not run to the budget.
+        // the loop promptly, not run to the budget.
         let cancel = CancellationToken::new();
         let produced = AtomicUsize::new(0);
         let next = || {
@@ -570,7 +570,7 @@ mod tests {
         assert_eq!(ids, vec![1, 2, 3]);
     }
 
-    // Gated end-to-end (AC2.9): needs the real 1.9 GB GGUF + SNAC weights. Set
+    // Gated end-to-end: needs the real 1.9 GB GGUF + SNAC weights. Set
     // `LENS_RUN_MODEL_TESTS=1`, `LENS_ORPHEUS_GGUF=<...Q4_K_M.gguf>`, and
     // `LENS_SNAC_WEIGHTS=<...pytorch_model.bin>`. Asserts a short script
     // synthesizes to a non-silent 24 kHz mono buffer.

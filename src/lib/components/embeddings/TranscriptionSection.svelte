@@ -14,9 +14,9 @@
     asrBackendLabel,
     asrBackendToken,
     asrEngineIdFromBackend,
-    isTransportSafeBaseUrl,
     type AsrEngineId
   } from '$lib/asr/catalog.js';
+  import { isTransportSafeBaseUrl } from '$lib/net/transport.js';
   import {
     appleAsrAvailability,
     whisperModelDownloaded,

@@ -1,7 +1,4 @@
 use std::env;
-// Only the Swift compile itself needs these; the Linux fmt/clippy jobs never
-// reach it and would otherwise see unused imports.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -10,15 +7,20 @@ use std::{
 
 const SWIFT_SRC: &str = "src/asr/bridge.swift";
 const SWIFT_HEADER: &str = "src/asr/bridge.h";
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const LIB_NAME: &str = "lens_asr_bridge";
+/// The only target that links the bridge. Host arch is irrelevant: the swiftc
+/// invocation below is already a cross-compile (`-target` plus an explicit `-sdk`)
+/// and Xcode's Swift toolchain is universal.
+const BRIDGE_TARGET: &str = "aarch64-apple-darwin";
 /// SpeechAnalyzer/SpeechTranscriber floor — the deployment target the bridge is
 /// compiled against, and the SDK major the probe requires.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const MACOS_TARGET_MAJOR: u32 = 26;
+/// `xcode-select -s` rewrites this symlink and touches no env var, so it has to be
+/// a tracked input or Cargo replays a stale toolchain decision.
+const XCODE_SELECT_LINK: &str = "/var/db/xcode_select_link";
 
-/// How a missing or broken Swift toolchain is treated (DEC-3).
-#[derive(Clone, Copy)]
+/// How a missing or broken Swift toolchain is treated.
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum BridgeMode {
     AllowMissing,
     Require,
@@ -38,45 +40,44 @@ fn main() {
         println!("cargo:rerun-if-env-changed={var}");
     }
 
-    // Only the shipping target links the bridge. Returning here keeps the arm64
-    // deployment target and link flags out of every other build, including an
-    // x86_64-apple-darwin cross-build from an Apple Silicon host.
-    if env::var("TARGET").as_deref() != Ok("aarch64-apple-darwin") {
+    let shipping_target = env::var("TARGET").as_deref() == Ok(BRIDGE_TARGET);
+    let mode = bridge_mode(shipping_target);
+    if !shipping_target {
+        // An explicit `require` is a promise about THIS artifact, so it must fail
+        // here too — otherwise the flag is a no-op on every non-Apple machine.
+        if mode == BridgeMode::Require {
+            bridge_unavailable(
+                mode,
+                &format!(
+                    "the build target is not {BRIDGE_TARGET}, which is the only one that links it"
+                ),
+            );
+        }
         return;
     }
 
-    // Decided outside the host gate below, so a non-Apple host cross-compiling
-    // the shipping target still fails loudly instead of skipping in silence.
-    let mode = bridge_mode();
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     build_apple_asr_bridge(mode);
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    bridge_unavailable(
-        mode,
-        "this host cannot run swiftc (not Apple Silicon macOS)",
-    );
 }
 
-/// `LENS_ASR_BRIDGE` overrides the profile default; unset means strict in release
-/// (a shipped bundle must carry the bridge) and lenient in debug.
-fn bridge_mode() -> BridgeMode {
+/// `LENS_ASR_BRIDGE` overrides the profile default; unset means strict for a release
+/// build of the shipping target (a bundle users install must carry the bridge) and
+/// lenient everywhere else.
+fn bridge_mode(shipping_target: bool) -> BridgeMode {
     match env::var("LENS_ASR_BRIDGE").as_deref() {
         Ok("require") => BridgeMode::Require,
         Ok("allow-missing") => BridgeMode::AllowMissing,
         Ok(other) => panic!(
             "LENS_ASR_BRIDGE={other:?} is not a recognized value; use `require`, `allow-missing`, or leave it unset"
         ),
-        Err(_) => match env::var("PROFILE").as_deref() {
-            Ok("release") => BridgeMode::Require,
-            _ => BridgeMode::AllowMissing,
-        },
+        Err(_) if shipping_target && env::var("PROFILE").as_deref() == Ok("release") => {
+            BridgeMode::Require
+        }
+        Err(_) => BridgeMode::AllowMissing,
     }
 }
 
 /// Reports a bridge the build could not produce, emitting no cfg or link
-/// directives either way. Every `reason` names `swiftc` or the SDK so the
-/// signoff grep can find it.
+/// directives either way.
 fn bridge_unavailable(mode: BridgeMode, reason: &str) {
     match mode {
         BridgeMode::AllowMissing => {
@@ -89,7 +90,6 @@ fn bridge_unavailable(mode: BridgeMode, reason: &str) {
 /// Compiles `bridge.swift` into a static library and emits the link flags for it
 /// plus the Apple frameworks it drives (SpeechAnalyzer/AVAudioPCMBuffer/CMTime).
 /// Success is what sets `apple_asr_bridge`; nothing else does.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn build_apple_asr_bridge(mode: BridgeMode) {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR is always set by cargo"));
     let lib_path = out_dir.join(format!("lib{LIB_NAME}.a"));
@@ -131,6 +131,13 @@ fn build_apple_asr_bridge(mode: BridgeMode) {
         abandon_bridge(mode, &lib_path, &reason);
         return;
     }
+    // The cfg promises a linkable archive. A replayed-but-cleaned OUT_DIR would
+    // otherwise emit link directives pointing at nothing.
+    assert!(
+        lib_path.exists(),
+        "swiftc reported success but {} is missing",
+        lib_path.display()
+    );
 
     println!("cargo:rustc-cfg=apple_asr_bridge");
     println!("cargo:rustc-link-search=native={}", out_dir.display());
@@ -149,13 +156,13 @@ fn build_apple_asr_bridge(mode: BridgeMode) {
     for lib in ["swiftCore", "swiftFoundation"] {
         println!("cargo:rustc-link-lib=dylib={lib}");
     }
-    // Ensure the dynamic loader can find the Swift runtime at run time.
+    // Ensure the dynamic loader can find the Swift runtime at run time. `scripts/
+    // signoff.sh` greps the linked binary for this rpath as the bridge's proof.
     println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
 }
 
 /// Drops the archive an earlier capable build left behind — it would otherwise
 /// stay linkable — then reports per `mode`.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn abandon_bridge(mode: BridgeMode, lib_path: &Path, reason: &str) {
     let _ = fs::remove_file(lib_path);
     bridge_unavailable(mode, reason);
@@ -165,8 +172,11 @@ fn abandon_bridge(mode: BridgeMode, lib_path: &Path, reason: &str) {
 /// PATH fails to load the Swift stdlib) and the SDK must be new enough for the
 /// deployment target. The bridge compile itself is the authoritative trial, so
 /// this only avoids a run that is guaranteed to fail. Returns the SDK path.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn probe_toolchain() -> Result<Option<String>, String> {
+    // Installing Xcode or switching toolchains changes neither a source file nor
+    // an env var, so the inputs this decision really depends on are tracked here.
+    println!("cargo:rerun-if-changed={XCODE_SELECT_LINK}");
+
     if xcrun_capture(&["-f", "swiftc"]).is_none() {
         return Err("swiftc was not found via `xcrun -f swiftc`".to_string());
     }
@@ -175,12 +185,19 @@ fn probe_toolchain() -> Result<Option<String>, String> {
             "the macOS SDK version is unreadable via `xcrun --show-sdk-version`".to_string(),
         );
     };
+    let sdk_path = xcrun_capture(&["--show-sdk-path"]);
+    if let Some(sdk) = &sdk_path {
+        println!(
+            "cargo:rerun-if-changed={}",
+            Path::new(sdk).join("SDKSettings.plist").display()
+        );
+    }
     match version
         .split('.')
         .next()
         .and_then(|m| m.parse::<u32>().ok())
     {
-        Some(major) if major >= MACOS_TARGET_MAJOR => Ok(xcrun_capture(&["--show-sdk-path"])),
+        Some(major) if major >= MACOS_TARGET_MAJOR => Ok(sdk_path),
         Some(major) => Err(format!(
             "the macOS SDK is version {major}, but the bridge targets macOS {MACOS_TARGET_MAJOR}"
         )),
@@ -189,7 +206,6 @@ fn probe_toolchain() -> Result<Option<String>, String> {
 }
 
 /// Trimmed stdout of a successful `xcrun` call, `None` on failure or empty output.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn xcrun_capture(args: &[&str]) -> Option<String> {
     Command::new("xcrun")
         .args(args)
@@ -203,7 +219,6 @@ fn xcrun_capture(args: &[&str]) -> Option<String> {
 /// Locates the toolchain's static Swift stdlib dir (`.../lib/swift/macosx`).
 /// Returns `None` if it cannot be resolved; the default loader search paths
 /// then apply.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn swift_static_lib_dir() -> Option<String> {
     let dev_dir = Command::new("xcode-select")
         .arg("-p")

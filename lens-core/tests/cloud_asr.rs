@@ -867,6 +867,8 @@ fn cloud_asr_defaults_match_the_frontend_presets(
 // Unit: AppConfig::normalize + save wiring (no network)
 // ===========================================================================
 
+/// Consent is granted throughout: a persisted `cloud` backend WITHOUT it is its own
+/// defect with its own case, and these cases isolate the endpoint-fill behaviour.
 fn asr_cloud_config(
     backend: &str,
     provider: Option<CloudAsrProvider>,
@@ -874,6 +876,7 @@ fn asr_cloud_config(
     model: &str,
 ) -> AppConfig {
     AppConfig {
+        audio_cloud_consent: true,
         asr: AsrConfig {
             backend: backend.to_string(),
             cloud_provider: provider,
@@ -883,6 +886,14 @@ fn asr_cloud_config(
         },
         ..AppConfig::default()
     }
+}
+
+/// `save` is the only normalization funnel, so these cases exercise it rather than
+/// the crate-private routine — the returned value is what both memory and disk hold.
+fn normalized(mut cfg: AppConfig) -> AppConfig {
+    let dir = tempfile::tempdir().unwrap();
+    cfg.save(dir.path()).unwrap();
+    cfg
 }
 
 #[rstest]
@@ -897,8 +908,7 @@ fn normalize_fills_blank_endpoint_fields_under_a_set_provider(
     #[case] base_url: &str,
     #[case] model: &str,
 ) {
-    let mut cfg = asr_cloud_config("local_whisper", Some(provider), "", "");
-    cfg.normalize();
+    let cfg = normalized(asr_cloud_config("local_whisper", Some(provider), "", ""));
     assert_eq!(cfg.asr.cloud_base_url, base_url);
     assert_eq!(cfg.asr.cloud_model, model);
     assert_eq!(
@@ -907,7 +917,7 @@ fn normalize_fills_blank_endpoint_fields_under_a_set_provider(
     );
 }
 
-// The end state AC 1.3 actually promises: a provider choice alone, with nothing else
+// The end state a bare provider choice promises: nothing else
 // filled in, is enough for the cloud pre-flight to pass.
 #[rstest]
 #[case::openai_inactive(CloudAsrProvider::OpenAiCompatible, "")]
@@ -921,7 +931,7 @@ fn normalize_makes_a_bare_provider_choice_pass_preflight(
     let mut cfg = asr_cloud_config(backend, Some(provider), "", "");
     cfg.audio_cloud_consent = true;
     cfg.asr.cloud_api_key = "sk-test".to_string();
-    cfg.normalize();
+    let cfg = normalized(cfg);
     assert!(
         preflight_check(&cfg).is_ok(),
         "normalized config must clear pre-flight: {:?}",
@@ -936,22 +946,19 @@ fn normalize_makes_a_bare_provider_choice_pass_preflight(
 #[case::whitespace_both("   ", " \t ")]
 #[case::already_normalized("https://api.openai.com", "whisper-1")]
 fn normalize_is_idempotent(#[case] base_url: &str, #[case] model: &str) {
-    let mut once = asr_cloud_config(
+    let once = normalized(asr_cloud_config(
         "cloud",
         Some(CloudAsrProvider::OpenAiCompatible),
         base_url,
         model,
-    );
-    once.normalize();
-    let mut twice = once.clone();
-    twice.normalize();
+    ));
+    let twice = normalized(once.clone());
     assert_eq!(twice, once, "a second normalize must be a no-op");
 }
 
 #[test]
 fn normalize_is_a_noop_without_a_provider() {
-    let mut cfg = asr_cloud_config("cloud", None, "", "");
-    cfg.normalize();
+    let cfg = normalized(asr_cloud_config("cloud", None, "", ""));
     assert_eq!(cfg.asr.cloud_base_url, "");
     assert_eq!(cfg.asr.cloud_model, "");
     assert_eq!(cfg.asr.backend, "cloud");
@@ -959,15 +966,13 @@ fn normalize_is_a_noop_without_a_provider() {
 
 #[test]
 fn normalize_leaves_populated_fields_unchanged() {
-    let mut cfg = asr_cloud_config(
+    let before = asr_cloud_config(
         "cloud",
         Some(CloudAsrProvider::Deepgram),
         "https://asr.internal.example",
         "custom-model",
     );
-    let before = cfg.clone();
-    cfg.normalize();
-    assert_eq!(cfg, before);
+    assert_eq!(normalized(before.clone()), before);
 }
 
 // The fill is what makes the demotion load-bearing: without it the blank would be
@@ -983,8 +988,7 @@ fn normalize_demotes_an_active_cloud_backend_before_filling(
     #[case] base_url: &str,
     #[case] model: &str,
 ) {
-    let mut cfg = asr_cloud_config("cloud", Some(provider), base_url, model);
-    cfg.normalize();
+    let cfg = normalized(asr_cloud_config("cloud", Some(provider), base_url, model));
     assert_eq!(cfg.asr.backend, "", "active cloud backend must be demoted");
     assert_eq!(cfg.asr.cloud_base_url, default_base_url(provider));
     assert_eq!(cfg.asr.cloud_model, default_model(provider));
@@ -992,8 +996,12 @@ fn normalize_demotes_an_active_cloud_backend_before_filling(
 
 #[test]
 fn normalize_fills_when_no_cloud_backend_is_active() {
-    let mut cfg = asr_cloud_config("", Some(CloudAsrProvider::Deepgram), "", "");
-    cfg.normalize();
+    let cfg = normalized(asr_cloud_config(
+        "",
+        Some(CloudAsrProvider::Deepgram),
+        "",
+        "",
+    ));
     assert_eq!(cfg.asr.backend, "", "an inactive backend stays untouched");
     assert_eq!(cfg.asr.cloud_base_url, "https://api.deepgram.com");
     assert_eq!(cfg.asr.cloud_model, "nova-3");
@@ -1017,6 +1025,32 @@ fn load_does_not_normalize() {
     assert_eq!(loaded.asr.backend, "cloud");
     assert_eq!(loaded.asr.cloud_base_url, "");
     assert_eq!(loaded.asr.cloud_model, "");
+}
+
+/// The saved config holds a plaintext cloud API key, so it must never be readable
+/// by another account — and the temp file it is staged through must not survive.
+#[cfg(unix)]
+#[test]
+fn save_leaves_the_config_private_and_no_temp_file_behind() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg =
+        app_config_with_cloud(true, "sk-secret", Some(CloudAsrProvider::OpenAiCompatible));
+    cfg.save(dir.path()).unwrap();
+
+    let mode = std::fs::metadata(dir.path().join("config.json"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600, "mode was {:o}", mode & 0o777);
+
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+        .filter(|n| n != "config.json")
+        .collect();
+    assert!(leftovers.is_empty(), "stray files: {leftovers:?}");
 }
 
 #[test]
@@ -2175,4 +2209,61 @@ fn ingest_progress_effective_backend_roundtrip_and_omit() {
         !json_none.contains("effective_backend"),
         "None effective_backend must be omitted from JSON: {json_none}"
     );
+}
+
+/// The pre-flight validates the TRIMMED base URL, so the request has to use the same
+/// value — otherwise a stray space clears the gate and dies at request time, which is
+/// exactly the outcome the gate exists to prevent.
+#[tokio::test]
+async fn cloud_request_uses_the_trimmed_endpoint_the_preflight_validated() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/audio/transcriptions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_segments_response()))
+        .mount(&server)
+        .await;
+
+    let engine = LensEngine::for_test().await;
+    let mut config = engine.config().await;
+    config.asr.backend = "cloud".to_string();
+    config.asr.cloud_provider = Some(CloudAsrProvider::OpenAiCompatible);
+    config.asr.cloud_base_url = format!("  {}  ", server.uri());
+    config.asr.cloud_model = "  whisper-1  ".to_string();
+    config.asr.cloud_api_key = "  sk-test  ".to_string();
+    config.audio_cloud_consent = true;
+    engine.set_config(config).await;
+
+    let (_segments, label) = engine
+        .transcribe(&tiny_pcm(), &TranscribeConfig::default(), None, None)
+        .await
+        .expect("a padded but otherwise valid endpoint must still reach the cloud");
+    assert_eq!(label, "cloud");
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+/// When nothing produces segments, the broken cloud config is the failure the user
+/// can act on; the local error that followed it is a symptom and must not mask it.
+#[tokio::test]
+async fn a_cloud_misconfiguration_outranks_the_local_failure_that_follows_it() {
+    let engine = LensEngine::for_test().await;
+    let mut config = engine.config().await;
+    config.asr.backend = "cloud".to_string();
+    config.asr.cloud_provider = Some(CloudAsrProvider::OpenAiCompatible);
+    config.asr.cloud_base_url = "https://api.openai.com".to_string();
+    config.asr.cloud_model = "whisper-1".to_string();
+    config.asr.cloud_api_key = "sk-test".to_string();
+    config.audio_cloud_consent = false;
+    engine.set_config(config).await;
+    engine
+        .set_asr_engine(Some(Arc::new(MockAsrEngine::failing(
+            "apple on-device asset missing",
+        ))))
+        .await;
+
+    let err = engine
+        .transcribe(&tiny_pcm(), &TranscribeConfig::default(), None, None)
+        .await
+        .expect_err("neither cloud nor local can produce segments");
+    assert_eq!(err.kind(), "Validation", "got {err:?}");
+    assert_eq!(err.message(), "audio cloud consent not granted");
 }

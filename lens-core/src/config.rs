@@ -728,10 +728,16 @@ impl AppConfig {
         }
     }
 
-    /// Fills a blank cloud-ASR endpoint/model from the vendor default under a set
-    /// provider. Demotion runs first and unconditionally, so the fill can never
-    /// retarget an ACTIVE cloud backend at a vendor the user did not choose.
-    pub fn normalize(&mut self) {
+    /// Brings the stored cloud-ASR fields into a state the engine can run. Demotion
+    /// (consent withdrawn, or half-configured) runs before the vendor-default fill, so
+    /// the fill can never retarget an ACTIVE backend at a host the user did not pick.
+    pub(crate) fn normalize(&mut self) {
+        let cloud_selected = crate::asr::AsrBackend::from_opt_str(Some(&self.asr.backend))
+            == Some(crate::asr::AsrBackend::Cloud);
+        if cloud_selected && !self.audio_cloud_consent {
+            self.asr.backend.clear();
+            tracing::debug!("demoted cloud ASR backend: audio cloud consent is not granted");
+        }
         let Some(provider) = self.asr.cloud_provider else {
             return;
         };
@@ -759,9 +765,9 @@ impl AppConfig {
         }
     }
 
-    /// Writes config to `{dir}/config.json` (pretty JSON) with `0o600` permissions
-    /// on Unix (plaintext `api_key` stopgap until M2).
-    /// Runs [`AppConfig::normalize`] on `self` first, so disk and caller agree.
+    /// Normalizes, then writes `{dir}/config.json` (pretty JSON) via a private
+    /// temp file renamed into place — the plaintext `api_key` (stopgap until M2) is
+    /// never world-readable, not even for the instant between write and chmod.
     #[tracing::instrument(skip_all, fields(dir = %dir.as_ref().display()))]
     pub fn save(&mut self, dir: impl AsRef<Path>) -> Result<(), LensError> {
         self.normalize();
@@ -772,30 +778,42 @@ impl AppConfig {
         })?;
         let path = dir.join(CONFIG_FILE_NAME);
         let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, json).map_err(|e| {
+        write_private_file(&path, json.as_bytes()).map_err(|e| {
             tracing::error!("failed to write config at {}: {e}", path.display());
             LensError::Io(format!("failed to write {CONFIG_FILE_NAME}: {e}"))
         })?;
-        Self::restrict_permissions(&path)?;
         tracing::debug!("saved config to {}", path.display());
         Ok(())
     }
+}
 
+/// Creates a sibling temp file with `0o600` (Unix), fills it, and renames it over
+/// `path`. `create_new` plus the mode means the secret is private from the moment
+/// the inode exists, and the rename keeps readers off a half-written config.
+fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp = parent.join(format!(".{CONFIG_FILE_NAME}.{}.tmp", uuid::Uuid::now_v7()));
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
     #[cfg(unix)]
-    fn restrict_permissions(path: &Path) -> Result<(), LensError> {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(path, perms).map_err(|e| {
-            tracing::error!("failed to set permissions on {}: {e}", path.display());
-            LensError::Io(format!("failed to secure {CONFIG_FILE_NAME}: {e}"))
-        })?;
-        Ok(())
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
     }
 
-    #[cfg(not(unix))]
-    fn restrict_permissions(_path: &Path) -> Result<(), LensError> {
-        Ok(())
+    // No fsync: settings persist reactively on every blur, and the rename already
+    // rules out a half-written config. Durability across a power cut is not worth
+    // a disk sync per keystroke-blur.
+    let written = opts
+        .open(&tmp)
+        .and_then(|mut f| f.write_all(bytes))
+        .and_then(|()| std::fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
+    written
 }
 
 #[cfg(test)]

@@ -497,10 +497,9 @@ pub async fn asr_apple_native_available() -> Result<AppleAsrAvailability, LensEr
     ))
 }
 
-/// Pure core of [`asr_apple_native_available`], so the precedence is testable off
-/// a Mac. The OS gate deliberately precedes the bridge gate: an outdated macOS is
-/// a blocker no rebuild can clear, and `NotBuilt` would send the user to install
-/// Xcode for no benefit.
+/// Pure core of [`asr_apple_native_available`], so the precedence is testable off a
+/// Mac. The OS gate deliberately precedes the bridge gate: an outdated macOS is a
+/// blocker no rebuild clears, so `NotBuilt` would send the user to Xcode for nothing.
 fn classify_apple_asr(
     apple_silicon_build: bool,
     bridge_built: bool,
@@ -892,6 +891,106 @@ mod tests {
         assert!(matches!(err, LensError::Validation(_)));
     }
 
+    /// Stands in for the Apple-native seam: its presence is what makes the router
+    /// prefer `apple_native`, and `supports_locale` drives the locale gate.
+    struct StubAppleEngine {
+        supports_locale: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl lens_core::AsrEngine for StubAppleEngine {
+        async fn transcribe_pcm(
+            &self,
+            _pcm: &[f32],
+            _config: &lens_core::TranscribeConfig,
+            _progress_tx: Option<tokio::sync::mpsc::UnboundedSender<f32>>,
+        ) -> Result<lens_core::TranscriptOutput, LensError> {
+            Ok(lens_core::TranscriptOutput {
+                segments: Vec::new(),
+                confidence: None,
+            })
+        }
+
+        fn supports_locale(&self, _lang: &lens_core::Lang) -> bool {
+            self.supports_locale
+        }
+    }
+
+    async fn resolve_backend_via_command(
+        engine_state: &LensEngine,
+        stored_language: Option<lens_core::Lang>,
+        stored_translate: bool,
+        apple: Option<StubAppleEngine>,
+    ) -> AsrBackend {
+        let app = tauri::test::mock_app();
+        let mut config = engine_state.config().await;
+        config.asr.language = stored_language;
+        config.asr.translate = stored_translate;
+        engine_state.set_config(config).await;
+        engine_state
+            .set_asr_engine(
+                apple.map(|e| std::sync::Arc::new(e) as std::sync::Arc<dyn lens_core::AsrEngine>),
+            )
+            .await;
+        app.manage(engine_state.clone());
+        resolve_asr_backend(app.state::<LensEngine>())
+            .await
+            .expect("resolve_asr_backend command")
+    }
+
+    /// Drives the IPC command itself, not the engine method behind it: the frontend
+    /// mocks this command away, so nothing else proves the body forwards the stored
+    /// language and translate flag instead of defaults.
+    #[tokio::test]
+    async fn resolve_asr_backend_command_forwards_the_stored_asr_settings() {
+        let engine = LensEngine::for_test().await;
+
+        assert_eq!(
+            resolve_backend_via_command(&engine, None, false, None).await,
+            AsrBackend::LocalWhisper,
+            "no Apple engine → Whisper"
+        );
+        assert_eq!(
+            resolve_backend_via_command(
+                &engine,
+                None,
+                false,
+                Some(StubAppleEngine {
+                    supports_locale: true
+                })
+            )
+            .await,
+            AsrBackend::AppleNative,
+            "an injected Apple engine with nothing else set → Apple"
+        );
+        assert_eq!(
+            resolve_backend_via_command(
+                &engine,
+                None,
+                true,
+                Some(StubAppleEngine {
+                    supports_locale: true
+                })
+            )
+            .await,
+            AsrBackend::LocalWhisper,
+            "a stored translate=true must reach the router (Apple cannot translate)"
+        );
+        assert_eq!(
+            resolve_backend_via_command(
+                &engine,
+                Some(lens_core::Lang::Ko),
+                false,
+                Some(StubAppleEngine {
+                    supports_locale: false
+                })
+            )
+            .await,
+            AsrBackend::LocalWhisper,
+            "a stored language must reach the router (locale unsupported)"
+        );
+    }
+
     #[test]
     fn resolve_voices_default_orpheus_returns_named_catalog() {
         let cfg = lens_core::TtsConfig::default();
@@ -1006,8 +1105,6 @@ mod tests {
         );
     }
 
-    /// An outdated macOS outranks a missing bridge: rebuilding cannot clear it, so
-    /// `NotBuilt` would send the user to install Xcode for no benefit.
     #[test]
     fn classify_apple_asr_reports_old_macos_before_missing_bridge() {
         for bridge_built in [false, true] {

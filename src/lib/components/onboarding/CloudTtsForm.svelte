@@ -15,6 +15,7 @@
     type TtsEngineCatalogEntry,
     type TtsEngineId
   } from '$lib/onboarding/system-check.js';
+  import { isTransportSafeBaseUrl } from '$lib/net/transport.js';
   import { prefersReducedMotion } from '$lib/motion/index.js';
   import { appConfigStore, ensureLoaded } from '$lib/models/app-config.svelte.js';
   import type { AppConfig, CloudTtsKind } from '$lib/theme/types.js';
@@ -229,17 +230,9 @@
     }
   }
 
-  /** Reject non-http(s) or malformed base URLs before saving — the base URL is the
-   *  endpoint the API key is transmitted to. */
-  function isValidBaseUrl(raw: string): boolean {
-    let parsed: URL;
-    try {
-      parsed = new URL(raw);
-    } catch {
-      return false;
-    }
-    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
-  }
+  /** Same gate the engine applies, so a URL this form accepts cannot be one that
+   *  `cloud_tts_usable` then refuses — which would disable cloud TTS with no visible cause. */
+  const isValidBaseUrl = isTransportSafeBaseUrl;
 
   /** Reactive Cloud persist (mirrors persistLocalTts); no Save button. */
   async function persistCloud(): Promise<void> {

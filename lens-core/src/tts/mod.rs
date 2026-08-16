@@ -265,12 +265,24 @@ impl CloudTtsConsent {
     }
 }
 
-/// The ONE predicate every cloud-TTS gate consults: resolution, availability, the
-/// system check, the voice list and the engine catalog. Sites cannot disagree
-/// because there is a single boolean (#273).
+/// The ONE predicate every cloud-TTS gate consults — resolution, availability, the
+/// system check, the voice list, the engine catalog (#273). Its transport clause is
+/// the gate cloud ASR uses: a cleartext endpoint leaks the key AND the dialogue.
 pub fn cloud_tts_usable(cfg: &TtsConfig, kind: CloudTtsKind, consent: CloudTtsConsent) -> bool {
     consent == CloudTtsConsent::Granted
         && cfg.clouds.get(&kind).is_some_and(|c| !c.api_key.is_empty())
+        && crate::http::is_transport_safe_base_url(&effective_cloud_base_url(cfg, kind))
+}
+
+/// The endpoint a cloud request would actually hit: the stored base URL, or the
+/// vendor default when it is blank. Gate and adapter must read the same value.
+fn effective_cloud_base_url(cfg: &TtsConfig, kind: CloudTtsKind) -> String {
+    cfg.clouds
+        .get(&kind)
+        .map(|c| c.base_url.trim())
+        .filter(|b| !b.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| cloud::default_base_url(kind).to_string())
 }
 
 /// User-facing reason a cloud engine is unselectable because consent is withheld.
@@ -317,10 +329,7 @@ pub fn resolve_tts_provider_full(
                 return Some(Arc::new(orpheus::OrpheusAdapter::new(orpheus, snac)));
             }
             let api_key = creds.map(|c| c.api_key.clone()).unwrap_or_default();
-            let base_url = creds
-                .map(|c| c.base_url.clone())
-                .filter(|b| !b.is_empty())
-                .unwrap_or_else(|| cloud::default_base_url(kind).to_string());
+            let base_url = effective_cloud_base_url(cfg, kind);
             let model = if cfg.model.is_empty() {
                 cloud::default_model(kind).to_string()
             } else {
