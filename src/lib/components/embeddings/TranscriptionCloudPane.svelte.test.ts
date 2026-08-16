@@ -3,7 +3,7 @@ import { mockIPC, clearMocks } from '@tauri-apps/api/mocks';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { AppConfig } from '$lib/theme/types.js';
 import { baseAppConfig } from '$lib/test-fixtures.js';
-import { persist, resetConfig } from '$lib/models/app-config.svelte.js';
+import { appConfigStore, persist, resetConfig } from '$lib/models/app-config.svelte.js';
 import TranscriptionCloudPane from './TranscriptionCloudPane.svelte';
 
 /** A config with a complete, ready-to-activate Cloud setup except for what `opts` overrides. */
@@ -253,35 +253,45 @@ describe('TranscriptionCloudPane', () => {
     expect(savedConfigs.at(-1)?.asr.backend).toBe('');
   });
 
-  it('clearing the Base URL also clears cloud_provider so the demotion cannot be re-armed by a stale provider', async () => {
-    const { savedConfigs } = mockBackend(cloudConfig({ backend: 'cloud' }));
-    render(TranscriptionCloudPane);
+  // Every other test here asserts within a single mount. The pane's `hydrated` flag is
+  // component-local and the engine rows sit in an {:else if} chain, so switching rows
+  // and back genuinely remounts — that is where a key can end up under a wrong vendor.
+  it('keeps a saved key bound to its own provider across a remount after a required field is cleared', async () => {
+    const { savedConfigs } = mockBackend(
+      cloudConfig({
+        backend: 'cloud',
+        cloud_provider: 'deepgram',
+        cloud_base_url: 'https://api.deepgram.com',
+        cloud_model: 'nova-3',
+        cloud_api_key: 'dg-secret'
+      })
+    );
+    const firstMount = render(TranscriptionCloudPane);
 
     const baseUrlInput = await screen.findByLabelText<HTMLInputElement>(/base url/i);
-    await waitFor(() => expect(baseUrlInput.value).toBe('https://api.openai.com'));
+    await waitFor(() => expect(baseUrlInput.value).toBe('https://api.deepgram.com'));
 
     await fireEvent.input(baseUrlInput, { target: { value: '' } });
     await fireEvent.blur(baseUrlInput);
 
-    await waitFor(() => expect(savedConfigs.length).toBeGreaterThan(0));
-    expect(savedConfigs.at(-1)?.asr.cloud_provider).toBeNull();
+    // The store re-read lands after the write is recorded; the remount must hydrate from
+    // the settled snapshot, or it reads pre-write state and proves nothing.
+    await waitFor(() => expect(appConfigStore.asr?.cloud_base_url).toBe(''));
     expect(savedConfigs.at(-1)?.asr.backend).toBe('');
-  });
+    expect(savedConfigs.at(-1)?.asr.cloud_provider).toBe('deepgram');
 
-  it('consent being off does not clear the provider when both required fields stay populated (negative control for A-2)', async () => {
-    const { savedConfigs } = mockBackend(
-      cloudConfig({ audioCloudConsent: false, backend: 'local_whisper' })
-    );
+    firstMount.unmount();
     render(TranscriptionCloudPane);
 
-    const baseUrlInput = await screen.findByLabelText<HTMLInputElement>(/base url/i);
-    await waitFor(() => expect(baseUrlInput.value).toBe('https://api.openai.com'));
+    const remountedBaseUrl = await screen.findByLabelText<HTMLInputElement>(/base url/i);
+    await waitFor(() => expect(remountedBaseUrl.value).toBe('https://api.deepgram.com'));
 
-    await fireEvent.input(baseUrlInput, { target: { value: 'https://api.openai.com' } });
-    await fireEvent.blur(baseUrlInput);
+    await fireEvent.input(remountedBaseUrl, { target: { value: 'https://api.deepgram.com/v2' } });
+    await fireEvent.blur(remountedBaseUrl);
 
-    await waitFor(() => expect(savedConfigs.length).toBeGreaterThan(0));
-    expect(savedConfigs.at(-1)?.asr.cloud_provider).toBe('open_ai_compatible');
+    await waitFor(() => expect(savedConfigs.length).toBeGreaterThan(1));
+    expect(savedConfigs.at(-1)?.asr.cloud_api_key).toBe('dg-secret');
+    expect(savedConfigs.at(-1)?.asr.cloud_provider).toBe('deepgram');
   });
 
   it('re-syncs the displayed model from the stored config after a successful persist, not the value that was typed', async () => {
@@ -308,8 +318,19 @@ describe('TranscriptionCloudPane', () => {
     await waitFor(() => expect(modelInput.value).toBe('engine-assigned-model'));
   });
 
-  it('clearing the Base URL displays it as empty afterward, not refilled with the provider preset', async () => {
-    const { savedConfigs } = mockBackend(cloudConfig({ backend: 'cloud' }));
+  it('after clearing the Base URL, displays what the engine stored — not the typed blank, nor the provider preset', async () => {
+    // The stored value is distinct from both the typed blank and the preset, so the
+    // assertion can only pass if the resync read the store.
+    const engineNormalized = 'https://engine-normalized.example';
+    let stored = cloudConfig({ backend: 'cloud' });
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return stored;
+      if (cmd === 'set_config') {
+        const sent = (args as { config: AppConfig }).config;
+        stored = { ...sent, asr: { ...sent.asr, cloud_base_url: engineNormalized } };
+        return null;
+      }
+    });
     render(TranscriptionCloudPane);
 
     const baseUrlInput = await screen.findByLabelText<HTMLInputElement>(/base url/i);
@@ -318,8 +339,7 @@ describe('TranscriptionCloudPane', () => {
     await fireEvent.input(baseUrlInput, { target: { value: '' } });
     await fireEvent.blur(baseUrlInput);
 
-    await waitFor(() => expect(savedConfigs.length).toBeGreaterThan(0));
-    expect(baseUrlInput.value).toBe('');
+    await waitFor(() => expect(baseUrlInput.value).toBe(engineNormalized));
   });
 
   it('surfaces a Tauri LensError message instead of the generic fallback', async () => {

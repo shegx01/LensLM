@@ -74,9 +74,8 @@
   }
 
   /** Reactive Cloud persist; no Save button. Only flips `backend` to `"cloud"` when the
-   *  config is usable. A blank required field demotes an active `"cloud"` backend and
-   *  clears `cloud_provider` instead of leaving both pointed at a config the engine
-   *  would otherwise normalize to a vendor default (#297 P4/R13/R14). */
+   *  config is usable; a blank required field demotes an active `"cloud"` backend so the
+   *  engine's blank-filling default can never keep a cleared endpoint live. */
   async function persistCloud(): Promise<void> {
     error = null;
     const trimmedBaseUrl = baseUrl.trim();
@@ -87,7 +86,6 @@
     }
     const trimmedModel = model.trim();
     const keyToSave = editingKey && apiKey.trim() ? apiKey : hasSavedKey ? savedApiKey : apiKey;
-    const blanked = trimmedBaseUrl === '' || trimmedModel === '';
     try {
       await persist((cfg) => {
         const usable =
@@ -95,15 +93,18 @@
           trimmedModel !== '' &&
           keyToSave.trim() !== '' &&
           cfg.audio_cloud_consent;
+        let backend = cfg.asr.backend;
+        if (usable) backend = 'cloud';
+        else if (backend === 'cloud') backend = '';
         return {
           ...cfg,
           asr: {
             ...cfg.asr,
-            cloud_provider: blanked ? null : provider,
+            cloud_provider: provider,
             cloud_base_url: trimmedBaseUrl,
             cloud_model: trimmedModel,
             cloud_api_key: keyToSave,
-            backend: usable ? 'cloud' : cfg.asr.backend === 'cloud' ? '' : cfg.asr.backend
+            backend
           }
         };
       });
@@ -112,7 +113,7 @@
       editingKey = false;
       apiKey = '';
       // Verbatim from the store, no preset fallback (unlike the mount-time hydration
-      // above) — falling back here would refill a field just deliberately cleared.
+      // above) — the engine may have rewritten what was just sent.
       if (appConfigStore.asr) {
         baseUrl = appConfigStore.asr.cloud_base_url;
         model = appConfigStore.asr.cloud_model;

@@ -199,9 +199,10 @@ impl AsrEngine for CloudAsrEngine {
     }
 }
 
-/// Default API base URL for a provider, applied when the stored base URL is blank
-/// so a provider selection works without the user pasting an endpoint.
+/// Default API base URL for a provider.
 /// SYNC-CHECK: mirrored by `CLOUD_ASR_PRESETS` in `src/lib/asr/catalog.ts`.
+/// Defaulting a blank base diverges from #273 (`llm.rs`) deliberately: unlike LLM's
+/// open provider set, each id here names one host, so nothing is being guessed at.
 pub fn default_base_url(provider: CloudAsrProvider) -> &'static str {
     match provider {
         CloudAsrProvider::OpenAiCompatible => "https://api.openai.com",
@@ -222,7 +223,7 @@ pub fn default_model(provider: CloudAsrProvider) -> &'static str {
 /// No reachability probe — the unreachable case is handled by runtime fallback.
 pub fn preflight_check(config: &AppConfig) -> Result<(), LensError> {
     let consent = config.audio_cloud_consent;
-    let key_present = !config.asr.cloud_api_key.is_empty();
+    let key_present = !config.asr.cloud_api_key.trim().is_empty();
     let provider_set = config.asr.cloud_provider.is_some();
     let base_url_present = !config.asr.cloud_base_url.trim().is_empty();
     let model_present = !config.asr.cloud_model.trim().is_empty();
@@ -260,7 +261,32 @@ pub fn preflight_check(config: &AppConfig) -> Result<(), LensError> {
             "no cloud ASR model configured".into(),
         ));
     }
+    if !is_transport_safe_base_url(config.asr.cloud_base_url.trim()) {
+        return Err(LensError::Validation(
+            "cloud ASR base URL must be https, or http on a loopback host".into(),
+        ));
+    }
     Ok(())
+}
+
+/// The API key is bearer-sent to this URL, so cleartext http is only acceptable on a
+/// loopback host. The webview applies the same rule, but `set_config` accepts whatever
+/// it is handed — this is the boundary control.
+/// SYNC-CHECK: mirrors `isValidBaseUrl` in `TranscriptionCloudPane.svelte`.
+fn is_transport_safe_base_url(raw: &str) -> bool {
+    let Ok(url) = url::Url::parse(raw) else {
+        return false;
+    };
+    match url.scheme() {
+        "https" => true,
+        "http" => matches!(
+            url.host(),
+            Some(url::Host::Domain("localhost"))
+                | Some(url::Host::Ipv4(std::net::Ipv4Addr::LOCALHOST))
+                | Some(url::Host::Ipv6(std::net::Ipv6Addr::LOCALHOST))
+        ),
+        _ => false,
+    }
 }
 
 /// Maps a provider HTTP status to a [`LensError`] without leaking provider

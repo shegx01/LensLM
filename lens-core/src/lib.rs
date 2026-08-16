@@ -2232,7 +2232,7 @@ impl LensEngine {
                     ))
                 }
             }
-            // Cloud (#45): pre-flight (consent/key/provider) + request; any failure
+            // Cloud (#45): pre-flight (consent/key/provider/endpoint) + request; any failure
             // that is not a user-cancel transparently degrades to the local cascade
             // (Apple-if-injected → Whisper), mirroring the Apple→Whisper symmetry.
             (asr::AsrBackend::Cloud, injected_local) => {
@@ -2265,7 +2265,7 @@ impl LensEngine {
 
     /// Runs the cloud pre-flight then a [`CloudAsrEngine`] transcription. Pre-flight
     /// failure returns before any request, so the fallback path issues zero cloud
-    /// requests when consent/key/provider are missing (#45).
+    /// requests when consent, key, provider, or a usable endpoint is missing (#45).
     async fn cloud_transcribe(
         &self,
         pcm: &[f32],

@@ -723,25 +723,34 @@ impl AppConfig {
         }
     }
 
-    /// Makes the stored cloud-ASR block self-describing under a set provider: a blank
-    /// required field either demotes an ACTIVE `cloud` backend or is filled from the
-    /// vendor default — never both, since filling a field the user deliberately
-    /// cleared would silently retarget a live upload.
+    /// Fills a blank cloud-ASR endpoint/model from the vendor default under a set
+    /// provider. Demotion runs first and unconditionally, so the fill can never
+    /// retarget an ACTIVE cloud backend at a vendor the user did not choose.
     pub fn normalize(&mut self) {
         let Some(provider) = self.asr.cloud_provider else {
             return;
         };
-        let blank_required =
-            self.asr.cloud_base_url.trim().is_empty() || self.asr.cloud_model.trim().is_empty();
-        if blank_required && self.asr.backend == "cloud" {
+        let blank_base = self.asr.cloud_base_url.trim().is_empty();
+        let blank_model = self.asr.cloud_model.trim().is_empty();
+        let demote = (blank_base || blank_model)
+            && crate::asr::AsrBackend::from_opt_str(Some(&self.asr.backend))
+                == Some(crate::asr::AsrBackend::Cloud);
+        if demote {
             self.asr.backend.clear();
-        } else {
-            if self.asr.cloud_base_url.trim().is_empty() {
-                self.asr.cloud_base_url = crate::asr::cloud::default_base_url(provider).to_string();
-            }
-            if self.asr.cloud_model.trim().is_empty() {
-                self.asr.cloud_model = crate::asr::cloud::default_model(provider).to_string();
-            }
+        }
+        if blank_base {
+            self.asr.cloud_base_url = crate::asr::cloud::default_base_url(provider).to_string();
+        }
+        if blank_model {
+            self.asr.cloud_model = crate::asr::cloud::default_model(provider).to_string();
+        }
+        if demote || blank_base || blank_model {
+            tracing::debug!(
+                demoted_cloud_backend = demote,
+                filled_base_url = blank_base,
+                filled_model = blank_model,
+                "normalized stored cloud ASR config"
+            );
         }
     }
 

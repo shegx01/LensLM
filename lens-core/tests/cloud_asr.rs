@@ -576,17 +576,17 @@ fn preflight_no_provider_returns_validation_error() {
 }
 
 #[rstest]
-#[case::empty("")]
-#[case::spaces("   ")]
-#[case::tab_newline(" \t\n ")]
-fn preflight_blank_base_url_returns_validation_error(#[case] base_url: &str) {
-    let cfg = app_config_with_cloud_endpoint(
-        true,
-        "sk-test",
-        Some(CloudAsrProvider::OpenAiCompatible),
-        base_url,
-        "whisper-1",
-    );
+#[case::empty(CloudAsrProvider::OpenAiCompatible, "")]
+#[case::spaces(CloudAsrProvider::OpenAiCompatible, "   ")]
+#[case::tab_newline(CloudAsrProvider::OpenAiCompatible, " \t\n ")]
+#[case::deepgram_empty(CloudAsrProvider::Deepgram, "")]
+#[case::deepgram_spaces(CloudAsrProvider::Deepgram, "   ")]
+fn preflight_blank_base_url_returns_validation_error(
+    #[case] provider: CloudAsrProvider,
+    #[case] base_url: &str,
+) {
+    let cfg =
+        app_config_with_cloud_endpoint(true, "sk-test", Some(provider), base_url, "whisper-1");
     let err = preflight_check(&cfg).unwrap_err();
     assert_eq!(err.kind(), "Validation");
     assert!(
@@ -597,15 +597,20 @@ fn preflight_blank_base_url_returns_validation_error(#[case] base_url: &str) {
 }
 
 #[rstest]
-#[case::empty("")]
-#[case::spaces("   ")]
-#[case::tab_newline(" \t\n ")]
-fn preflight_blank_model_returns_validation_error(#[case] model: &str) {
+#[case::empty(CloudAsrProvider::OpenAiCompatible, "")]
+#[case::spaces(CloudAsrProvider::OpenAiCompatible, "   ")]
+#[case::tab_newline(CloudAsrProvider::OpenAiCompatible, " \t\n ")]
+#[case::deepgram_empty(CloudAsrProvider::Deepgram, "")]
+#[case::deepgram_spaces(CloudAsrProvider::Deepgram, "   ")]
+fn preflight_blank_model_returns_validation_error(
+    #[case] provider: CloudAsrProvider,
+    #[case] model: &str,
+) {
     let cfg = app_config_with_cloud_endpoint(
         true,
         "sk-test",
-        Some(CloudAsrProvider::OpenAiCompatible),
-        "https://api.openai.com",
+        Some(provider),
+        default_base_url(provider),
         model,
     );
     let err = preflight_check(&cfg).unwrap_err();
@@ -643,6 +648,82 @@ fn preflight_blank_base_url_and_model_messages_are_distinct() {
 }
 
 #[test]
+fn preflight_reports_the_base_url_first_when_both_fields_are_blank() {
+    let cfg = app_config_with_cloud_endpoint(
+        true,
+        "sk-test",
+        Some(CloudAsrProvider::OpenAiCompatible),
+        "",
+        "",
+    );
+    let err = preflight_check(&cfg).unwrap_err();
+    assert!(
+        err.message().contains("base URL"),
+        "base URL is the earlier gate: {}",
+        err.message()
+    );
+}
+
+#[test]
+fn preflight_whitespace_only_key_returns_validation_error() {
+    let cfg = app_config_with_cloud(true, "   ", Some(CloudAsrProvider::OpenAiCompatible));
+    let err = preflight_check(&cfg).unwrap_err();
+    assert_eq!(err.kind(), "Validation");
+    assert!(err.message().contains("key") || err.message().contains("API"));
+}
+
+// The webview blocks these too, but `set_config` accepts any config it is handed,
+// so the bearer-token-over-cleartext guard has to hold at the engine boundary.
+#[rstest]
+#[case::plain_http("http://api.example.com")]
+#[case::http_lookalike_host("http://localhost.evil.example")]
+#[case::ftp("ftp://api.example.com")]
+#[case::relative("api.example.com")]
+#[case::file("file:///etc/passwd")]
+fn preflight_rejects_a_base_url_that_is_not_transport_safe(#[case] base_url: &str) {
+    let cfg = app_config_with_cloud_endpoint(
+        true,
+        "sk-test",
+        Some(CloudAsrProvider::OpenAiCompatible),
+        base_url,
+        "whisper-1",
+    );
+    let err = preflight_check(&cfg).unwrap_err();
+    assert_eq!(err.kind(), "Validation");
+    assert!(
+        err.message().contains("https"),
+        "error must name the required scheme: {}",
+        err.message()
+    );
+    assert!(
+        !err.message().contains(base_url),
+        "error must not echo the configured URL: {}",
+        err.message()
+    );
+}
+
+#[rstest]
+#[case::https("https://api.openai.com")]
+#[case::https_custom_port("https://asr.internal.example:8443/v1")]
+#[case::loopback_name("http://localhost:8090")]
+#[case::loopback_v4("http://127.0.0.1:8090")]
+#[case::loopback_v6("http://[::1]:8090")]
+fn preflight_accepts_a_transport_safe_base_url(#[case] base_url: &str) {
+    let cfg = app_config_with_cloud_endpoint(
+        true,
+        "sk-test",
+        Some(CloudAsrProvider::OpenAiCompatible),
+        base_url,
+        "whisper-1",
+    );
+    assert!(
+        preflight_check(&cfg).is_ok(),
+        "{base_url} must pass: {:?}",
+        preflight_check(&cfg)
+    );
+}
+
+#[test]
 fn preflight_consent_fails_before_the_endpoint_gates() {
     let cfg =
         app_config_with_cloud_endpoint(false, "", Some(CloudAsrProvider::OpenAiCompatible), "", "");
@@ -654,28 +735,32 @@ fn preflight_consent_fails_before_the_endpoint_gates() {
     );
 }
 
+// Every case carries a set provider so the consent/key gates are reached with the
+// secrets present, rather than short-circuiting before the message is built.
 #[test]
 fn preflight_messages_leak_no_internals() {
     let secret_key = "sk-super-secret-key";
     let secret_url = "https://internal.corp.example/asr";
     let secret_model = "internal-model-v9";
+    let openai = Some(CloudAsrProvider::OpenAiCompatible);
     let cases = [
-        app_config_with_cloud_endpoint(false, secret_key, None, secret_url, secret_model),
-        app_config_with_cloud_endpoint(true, "", None, secret_url, secret_model),
+        app_config_with_cloud_endpoint(false, secret_key, openai, secret_url, secret_model),
+        app_config_with_cloud_endpoint(true, "", openai, secret_url, secret_model),
         app_config_with_cloud_endpoint(true, secret_key, None, secret_url, secret_model),
-        app_config_with_cloud_endpoint(
-            true,
-            secret_key,
-            Some(CloudAsrProvider::OpenAiCompatible),
-            "",
-            secret_model,
-        ),
+        app_config_with_cloud_endpoint(true, secret_key, openai, "", secret_model),
         app_config_with_cloud_endpoint(
             true,
             secret_key,
             Some(CloudAsrProvider::Deepgram),
             secret_url,
             "",
+        ),
+        app_config_with_cloud_endpoint(
+            true,
+            secret_key,
+            openai,
+            "http://internal.corp.example/asr",
+            secret_model,
         ),
     ];
     for cfg in cases {
@@ -697,21 +782,52 @@ fn preflight_messages_leak_no_internals() {
     }
 }
 
-#[test]
-fn cloud_asr_defaults_match_the_frontend_presets() {
+/// Reads `<field>: '<value>'` out of one entry of the live `CLOUD_ASR_PRESETS`
+/// literal in `src/lib/asr/catalog.ts` — parsed, not grepped, so a comment
+/// mentioning the value cannot satisfy the check.
+fn frontend_preset(entry: &str, field: &str) -> String {
+    let path =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../src/lib/asr/catalog.ts");
+    let src = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    let decl = src
+        .find("CLOUD_ASR_PRESETS")
+        .expect("CLOUD_ASR_PRESETS not found in catalog.ts");
+    let body = &src[decl..];
+    let estart = body
+        .find(&format!("{entry}:"))
+        .unwrap_or_else(|| panic!("{entry} missing from CLOUD_ASR_PRESETS"));
+    let obj = &body[estart..];
+    let obj_end = obj.find('}').expect("preset entry never closes");
+    let obj = &obj[..obj_end];
+    let fstart = obj
+        .find(&format!("{field}:"))
+        .unwrap_or_else(|| panic!("{entry}.{field} missing from CLOUD_ASR_PRESETS"));
+    let after = &obj[fstart..];
+    let q = after.find(['\'', '"']).expect("quoted value expected");
+    let quote = after.as_bytes()[q] as char;
+    let rest = &after[q + 1..];
+    let end = rest.find(quote).expect("closing quote expected");
+    rest[..end].to_string()
+}
+
+#[rstest]
+#[case::openai(CloudAsrProvider::OpenAiCompatible, "open_ai_compatible")]
+#[case::deepgram(CloudAsrProvider::Deepgram, "deepgram")]
+fn cloud_asr_defaults_match_the_frontend_presets(
+    #[case] provider: CloudAsrProvider,
+    #[case] entry: &str,
+) {
     assert_eq!(
-        default_base_url(CloudAsrProvider::OpenAiCompatible),
-        "https://api.openai.com"
+        default_base_url(provider),
+        frontend_preset(entry, "base_url"),
+        "{entry}.base_url drifted from CLOUD_ASR_PRESETS in src/lib/asr/catalog.ts"
     );
     assert_eq!(
-        default_model(CloudAsrProvider::OpenAiCompatible),
-        "whisper-1"
+        default_model(provider),
+        frontend_preset(entry, "model"),
+        "{entry}.model drifted from CLOUD_ASR_PRESETS in src/lib/asr/catalog.ts"
     );
-    assert_eq!(
-        default_base_url(CloudAsrProvider::Deepgram),
-        "https://api.deepgram.com"
-    );
-    assert_eq!(default_model(CloudAsrProvider::Deepgram), "nova-3");
 }
 
 // ===========================================================================
@@ -736,20 +852,67 @@ fn asr_cloud_config(
     }
 }
 
-// The non-"cloud" backend pin is load-bearing: an ACTIVE cloud backend demotes
-// instead of filling (see below), so pinning it would make this assert nothing.
-#[test]
-fn normalize_fills_blank_endpoint_fields_under_a_set_provider() {
-    let mut cfg = asr_cloud_config(
-        "local_whisper",
-        Some(CloudAsrProvider::OpenAiCompatible),
-        "",
-        "",
-    );
+#[rstest]
+#[case::openai(
+    CloudAsrProvider::OpenAiCompatible,
+    "https://api.openai.com",
+    "whisper-1"
+)]
+#[case::deepgram(CloudAsrProvider::Deepgram, "https://api.deepgram.com", "nova-3")]
+fn normalize_fills_blank_endpoint_fields_under_a_set_provider(
+    #[case] provider: CloudAsrProvider,
+    #[case] base_url: &str,
+    #[case] model: &str,
+) {
+    let mut cfg = asr_cloud_config("local_whisper", Some(provider), "", "");
     cfg.normalize();
-    assert_eq!(cfg.asr.cloud_base_url, "https://api.openai.com");
-    assert_eq!(cfg.asr.cloud_model, "whisper-1");
-    assert_eq!(cfg.asr.backend, "local_whisper");
+    assert_eq!(cfg.asr.cloud_base_url, base_url);
+    assert_eq!(cfg.asr.cloud_model, model);
+    assert_eq!(
+        cfg.asr.backend, "local_whisper",
+        "a non-cloud backend must not be demoted"
+    );
+}
+
+// The end state AC 1.3 actually promises: a provider choice alone, with nothing else
+// filled in, is enough for the cloud pre-flight to pass.
+#[rstest]
+#[case::openai_inactive(CloudAsrProvider::OpenAiCompatible, "")]
+#[case::openai_active(CloudAsrProvider::OpenAiCompatible, "cloud")]
+#[case::deepgram_inactive(CloudAsrProvider::Deepgram, "")]
+#[case::deepgram_active(CloudAsrProvider::Deepgram, "cloud")]
+fn normalize_makes_a_bare_provider_choice_pass_preflight(
+    #[case] provider: CloudAsrProvider,
+    #[case] backend: &str,
+) {
+    let mut cfg = asr_cloud_config(backend, Some(provider), "", "");
+    cfg.audio_cloud_consent = true;
+    cfg.asr.cloud_api_key = "sk-test".to_string();
+    cfg.normalize();
+    assert!(
+        preflight_check(&cfg).is_ok(),
+        "normalized config must clear pre-flight: {:?}",
+        preflight_check(&cfg)
+    );
+}
+
+#[rstest]
+#[case::blank_both("", "")]
+#[case::blank_base_url("", "whisper-1")]
+#[case::blank_model("https://api.openai.com", "")]
+#[case::whitespace_both("   ", " \t ")]
+#[case::already_normalized("https://api.openai.com", "whisper-1")]
+fn normalize_is_idempotent(#[case] base_url: &str, #[case] model: &str) {
+    let mut once = asr_cloud_config(
+        "cloud",
+        Some(CloudAsrProvider::OpenAiCompatible),
+        base_url,
+        model,
+    );
+    once.normalize();
+    let mut twice = once.clone();
+    twice.normalize();
+    assert_eq!(twice, once, "a second normalize must be a no-op");
 }
 
 #[test]
@@ -774,30 +937,24 @@ fn normalize_leaves_populated_fields_unchanged() {
     assert_eq!(cfg, before);
 }
 
+// The fill is what makes the demotion load-bearing: without it the blank would be
+// refilled on the next pass and cloud would silently re-arm.
 #[rstest]
-#[case::blank_base_url("", "whisper-1")]
-#[case::blank_model("https://api.openai.com", "")]
-#[case::whitespace_base_url("   ", "whisper-1")]
-fn normalize_demotes_an_active_cloud_backend_instead_of_filling(
+#[case::openai_blank_base_url(CloudAsrProvider::OpenAiCompatible, "", "whisper-1")]
+#[case::openai_blank_model(CloudAsrProvider::OpenAiCompatible, "https://api.openai.com", "")]
+#[case::openai_whitespace_base_url(CloudAsrProvider::OpenAiCompatible, "   ", "whisper-1")]
+#[case::deepgram_blank_base_url(CloudAsrProvider::Deepgram, "", "nova-3")]
+#[case::deepgram_blank_model(CloudAsrProvider::Deepgram, "https://api.deepgram.com", "")]
+fn normalize_demotes_an_active_cloud_backend_before_filling(
+    #[case] provider: CloudAsrProvider,
     #[case] base_url: &str,
     #[case] model: &str,
 ) {
-    let mut cfg = asr_cloud_config(
-        "cloud",
-        Some(CloudAsrProvider::OpenAiCompatible),
-        base_url,
-        model,
-    );
+    let mut cfg = asr_cloud_config("cloud", Some(provider), base_url, model);
     cfg.normalize();
     assert_eq!(cfg.asr.backend, "", "active cloud backend must be demoted");
-    assert_eq!(
-        cfg.asr.cloud_base_url, base_url,
-        "demotion must not fill the base URL"
-    );
-    assert_eq!(
-        cfg.asr.cloud_model, model,
-        "demotion must not fill the model"
-    );
+    assert_eq!(cfg.asr.cloud_base_url, default_base_url(provider));
+    assert_eq!(cfg.asr.cloud_model, default_model(provider));
 }
 
 #[test]
@@ -809,8 +966,26 @@ fn normalize_fills_when_no_cloud_backend_is_active() {
     assert_eq!(cfg.asr.cloud_model, "nova-3");
 }
 
-// Asserted through disk rather than on the value: a `normalize` that exists but
-// is never called from `save` must fail here.
+// `load` is a read; normalizing there would rewrite a config the caller never
+// asked to change, and would mask a `save` that forgot to normalize.
+#[test]
+fn load_does_not_normalize() {
+    let dir = tempfile::tempdir().unwrap();
+    let raw = serde_json::to_string_pretty(&asr_cloud_config(
+        "cloud",
+        Some(CloudAsrProvider::Deepgram),
+        "",
+        "",
+    ))
+    .unwrap();
+    std::fs::write(dir.path().join("config.json"), raw).unwrap();
+
+    let loaded = AppConfig::load(dir.path()).unwrap();
+    assert_eq!(loaded.asr.backend, "cloud");
+    assert_eq!(loaded.asr.cloud_base_url, "");
+    assert_eq!(loaded.asr.cloud_model, "");
+}
+
 #[test]
 fn save_normalizes_before_writing_to_disk() {
     let dir = tempfile::tempdir().unwrap();
@@ -836,7 +1011,7 @@ fn save_persists_the_demotion_of_an_active_cloud_backend() {
 
     let loaded = AppConfig::load(dir.path()).unwrap();
     assert_eq!(loaded.asr.backend, "");
-    assert_eq!(loaded.asr.cloud_base_url, "");
+    assert_eq!(loaded.asr.cloud_base_url, "https://api.openai.com");
 }
 
 // `set_config` is an in-memory apply, not a persist; normalizing here would
@@ -1370,26 +1545,42 @@ async fn preflight_no_provider_zero_cloud_requests() {
     .await;
 }
 
-// The helper persists via `set_config` (in-memory, no `save`), so `normalize`
-// never runs and the blank reaches pre-flight intact. Routing it through `save`
-// would silently make both cases vacuous.
+// Zero-requests alone cannot discriminate here: a blank base URL also fails while
+// BUILDING the request, so the count is 0 with the gate deleted too. Asserting the
+// surfaced error instead — with no local engine to fall back to — does discriminate.
 #[tokio::test]
-async fn preflight_blank_base_url_zero_cloud_requests() {
+async fn preflight_blank_base_url_surfaces_the_gate_error_with_zero_cloud_requests() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200).set_body_json(openai_segments_response()))
         .mount(&server)
         .await;
 
-    assert_preflight_blocks_with_zero_requests(&server, |cfg| {
-        cfg.audio_cloud_consent = true;
-        cfg.asr.cloud_api_key = "sk-test".to_string();
-        cfg.asr.cloud_provider = Some(CloudAsrProvider::OpenAiCompatible);
-        cfg.asr.cloud_base_url = "   ".to_string();
-    })
-    .await;
+    let engine = LensEngine::for_test().await;
+    let mut config = engine.config().await;
+    config.asr.backend = "cloud".to_string();
+    config.audio_cloud_consent = true;
+    config.asr.cloud_api_key = "sk-test".to_string();
+    config.asr.cloud_provider = Some(CloudAsrProvider::OpenAiCompatible);
+    config.asr.cloud_base_url = "   ".to_string();
+    config.asr.cloud_model = "whisper-1".to_string();
+    engine.set_config(config).await;
+
+    let err = engine
+        .transcribe(&tiny_pcm(), &TranscribeConfig::default(), None, None)
+        .await
+        .expect_err("no local engine is injected, so the cloud error must surface");
+    assert_eq!(err.kind(), "Validation", "got {err:?}");
+    assert_eq!(
+        err.message(),
+        "no cloud ASR base URL configured",
+        "must be the blank-field gate, not the scheme gate or a request-build failure"
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 0);
 }
 
+// The helper persists via `set_config` (in-memory, no `save`), so `normalize`
+// never runs and the blank reaches pre-flight intact.
 #[tokio::test]
 async fn preflight_blank_model_zero_cloud_requests() {
     let server = MockServer::start().await;
