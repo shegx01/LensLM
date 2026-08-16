@@ -72,7 +72,8 @@ export interface CloudAsrPreset {
 
 // SYNC-CHECK: base_url/model must match what each adapter actually requests —
 // openai_compat.rs posts to `{base_url}/v1/audio/transcriptions`; deepgram.rs
-// posts to `{base_url}/v1/listen`.
+// posts to `{base_url}/v1/listen` — and lens-core/src/asr/cloud/mod.rs's
+// default_base_url/default_model, which AppConfig::normalize fills blanks with.
 export const CLOUD_ASR_PRESETS = {
   open_ai_compatible: { base_url: 'https://api.openai.com', model: 'whisper-1' },
   deepgram: { base_url: 'https://api.deepgram.com', model: 'nova-3' }

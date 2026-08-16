@@ -39,7 +39,7 @@ async fn apply_config(engine: &LensEngine, config: AppConfig) -> Result<(), Lens
 /// the persist-then-apply order lives in one place.
 async fn persist_and_apply(
     engine: &LensEngine,
-    config: AppConfig,
+    mut config: AppConfig,
     app: &tauri::AppHandle,
 ) -> Result<(), LensError> {
     let data_dir = app

@@ -19,11 +19,12 @@ use std::sync::Arc;
 use lens_core::LensEngine;
 use lens_core::asr::cloud::chunk::{split_if_needed, stitch_segments};
 use lens_core::asr::cloud::wav::{WAV_HEADER_BYTES, pcm_to_wav};
-use lens_core::asr::cloud::{CloudAsrEngine, preflight_check};
+use lens_core::asr::cloud::{CloudAsrEngine, default_base_url, default_model, preflight_check};
 use lens_core::asr::{
     AsrEngine, MockAsrEngine, TranscribeConfig, TranscriptOutput, TranscriptSegment,
 };
 use lens_core::config::{AppConfig, AsrConfig, CloudAsrProvider};
+use rstest::rstest;
 use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -504,22 +505,38 @@ fn audio_cloud_consent_independent_from_enrichment_cloud_consent() {
 // Unit: preflight_check gates (no network)
 // ===========================================================================
 
-fn app_config_with_cloud(
+fn app_config_with_cloud_endpoint(
     consent: bool,
     api_key: &str,
     provider: Option<CloudAsrProvider>,
+    base_url: &str,
+    model: &str,
 ) -> AppConfig {
     AppConfig {
         audio_cloud_consent: consent,
         asr: AsrConfig {
             cloud_provider: provider,
             cloud_api_key: api_key.to_string(),
-            cloud_base_url: "https://api.openai.com".to_string(),
-            cloud_model: "whisper-1".to_string(),
+            cloud_base_url: base_url.to_string(),
+            cloud_model: model.to_string(),
             ..AsrConfig::default()
         },
         ..AppConfig::default()
     }
+}
+
+fn app_config_with_cloud(
+    consent: bool,
+    api_key: &str,
+    provider: Option<CloudAsrProvider>,
+) -> AppConfig {
+    app_config_with_cloud_endpoint(
+        consent,
+        api_key,
+        provider,
+        "https://api.openai.com",
+        "whisper-1",
+    )
 }
 
 #[test]
@@ -556,6 +573,288 @@ fn preflight_no_provider_returns_validation_error() {
         "error must mention provider: {}",
         err.message()
     );
+}
+
+#[rstest]
+#[case::empty("")]
+#[case::spaces("   ")]
+#[case::tab_newline(" \t\n ")]
+fn preflight_blank_base_url_returns_validation_error(#[case] base_url: &str) {
+    let cfg = app_config_with_cloud_endpoint(
+        true,
+        "sk-test",
+        Some(CloudAsrProvider::OpenAiCompatible),
+        base_url,
+        "whisper-1",
+    );
+    let err = preflight_check(&cfg).unwrap_err();
+    assert_eq!(err.kind(), "Validation");
+    assert!(
+        err.message().contains("base URL"),
+        "error must name the base URL: {}",
+        err.message()
+    );
+}
+
+#[rstest]
+#[case::empty("")]
+#[case::spaces("   ")]
+#[case::tab_newline(" \t\n ")]
+fn preflight_blank_model_returns_validation_error(#[case] model: &str) {
+    let cfg = app_config_with_cloud_endpoint(
+        true,
+        "sk-test",
+        Some(CloudAsrProvider::OpenAiCompatible),
+        "https://api.openai.com",
+        model,
+    );
+    let err = preflight_check(&cfg).unwrap_err();
+    assert_eq!(err.kind(), "Validation");
+    assert!(
+        err.message().contains("model"),
+        "error must name the model: {}",
+        err.message()
+    );
+}
+
+#[test]
+fn preflight_blank_base_url_and_model_messages_are_distinct() {
+    let blank_url = app_config_with_cloud_endpoint(
+        true,
+        "sk-test",
+        Some(CloudAsrProvider::OpenAiCompatible),
+        "",
+        "whisper-1",
+    );
+    let blank_model = app_config_with_cloud_endpoint(
+        true,
+        "sk-test",
+        Some(CloudAsrProvider::OpenAiCompatible),
+        "https://api.openai.com",
+        "",
+    );
+    let url_err = preflight_check(&blank_url).unwrap_err();
+    let model_err = preflight_check(&blank_model).unwrap_err();
+    assert_ne!(
+        url_err.message(),
+        model_err.message(),
+        "blank base URL and blank model must report distinct messages"
+    );
+}
+
+#[test]
+fn preflight_consent_fails_before_the_endpoint_gates() {
+    let cfg =
+        app_config_with_cloud_endpoint(false, "", Some(CloudAsrProvider::OpenAiCompatible), "", "");
+    let err = preflight_check(&cfg).unwrap_err();
+    assert!(
+        err.message().contains("consent"),
+        "consent must be the first gate reported: {}",
+        err.message()
+    );
+}
+
+#[test]
+fn preflight_messages_leak_no_internals() {
+    let secret_key = "sk-super-secret-key";
+    let secret_url = "https://internal.corp.example/asr";
+    let secret_model = "internal-model-v9";
+    let cases = [
+        app_config_with_cloud_endpoint(false, secret_key, None, secret_url, secret_model),
+        app_config_with_cloud_endpoint(true, "", None, secret_url, secret_model),
+        app_config_with_cloud_endpoint(true, secret_key, None, secret_url, secret_model),
+        app_config_with_cloud_endpoint(
+            true,
+            secret_key,
+            Some(CloudAsrProvider::OpenAiCompatible),
+            "",
+            secret_model,
+        ),
+        app_config_with_cloud_endpoint(
+            true,
+            secret_key,
+            Some(CloudAsrProvider::Deepgram),
+            secret_url,
+            "",
+        ),
+    ];
+    for cfg in cases {
+        let err = preflight_check(&cfg).unwrap_err();
+        let msg = err.message();
+        for leak in [
+            secret_key,
+            secret_url,
+            secret_model,
+            "internal.corp.example",
+            "OpenAiCompatible",
+            "Deepgram",
+        ] {
+            assert!(
+                !msg.contains(leak),
+                "pre-flight message leaked {leak:?}: {msg}"
+            );
+        }
+    }
+}
+
+#[test]
+fn cloud_asr_defaults_match_the_frontend_presets() {
+    assert_eq!(
+        default_base_url(CloudAsrProvider::OpenAiCompatible),
+        "https://api.openai.com"
+    );
+    assert_eq!(
+        default_model(CloudAsrProvider::OpenAiCompatible),
+        "whisper-1"
+    );
+    assert_eq!(
+        default_base_url(CloudAsrProvider::Deepgram),
+        "https://api.deepgram.com"
+    );
+    assert_eq!(default_model(CloudAsrProvider::Deepgram), "nova-3");
+}
+
+// ===========================================================================
+// Unit: AppConfig::normalize + save wiring (no network)
+// ===========================================================================
+
+fn asr_cloud_config(
+    backend: &str,
+    provider: Option<CloudAsrProvider>,
+    base_url: &str,
+    model: &str,
+) -> AppConfig {
+    AppConfig {
+        asr: AsrConfig {
+            backend: backend.to_string(),
+            cloud_provider: provider,
+            cloud_base_url: base_url.to_string(),
+            cloud_model: model.to_string(),
+            ..AsrConfig::default()
+        },
+        ..AppConfig::default()
+    }
+}
+
+// The non-"cloud" backend pin is load-bearing: an ACTIVE cloud backend demotes
+// instead of filling (see below), so pinning it would make this assert nothing.
+#[test]
+fn normalize_fills_blank_endpoint_fields_under_a_set_provider() {
+    let mut cfg = asr_cloud_config(
+        "local_whisper",
+        Some(CloudAsrProvider::OpenAiCompatible),
+        "",
+        "",
+    );
+    cfg.normalize();
+    assert_eq!(cfg.asr.cloud_base_url, "https://api.openai.com");
+    assert_eq!(cfg.asr.cloud_model, "whisper-1");
+    assert_eq!(cfg.asr.backend, "local_whisper");
+}
+
+#[test]
+fn normalize_is_a_noop_without_a_provider() {
+    let mut cfg = asr_cloud_config("cloud", None, "", "");
+    cfg.normalize();
+    assert_eq!(cfg.asr.cloud_base_url, "");
+    assert_eq!(cfg.asr.cloud_model, "");
+    assert_eq!(cfg.asr.backend, "cloud");
+}
+
+#[test]
+fn normalize_leaves_populated_fields_unchanged() {
+    let mut cfg = asr_cloud_config(
+        "cloud",
+        Some(CloudAsrProvider::Deepgram),
+        "https://asr.internal.example",
+        "custom-model",
+    );
+    let before = cfg.clone();
+    cfg.normalize();
+    assert_eq!(cfg, before);
+}
+
+#[rstest]
+#[case::blank_base_url("", "whisper-1")]
+#[case::blank_model("https://api.openai.com", "")]
+#[case::whitespace_base_url("   ", "whisper-1")]
+fn normalize_demotes_an_active_cloud_backend_instead_of_filling(
+    #[case] base_url: &str,
+    #[case] model: &str,
+) {
+    let mut cfg = asr_cloud_config(
+        "cloud",
+        Some(CloudAsrProvider::OpenAiCompatible),
+        base_url,
+        model,
+    );
+    cfg.normalize();
+    assert_eq!(cfg.asr.backend, "", "active cloud backend must be demoted");
+    assert_eq!(
+        cfg.asr.cloud_base_url, base_url,
+        "demotion must not fill the base URL"
+    );
+    assert_eq!(
+        cfg.asr.cloud_model, model,
+        "demotion must not fill the model"
+    );
+}
+
+#[test]
+fn normalize_fills_when_no_cloud_backend_is_active() {
+    let mut cfg = asr_cloud_config("", Some(CloudAsrProvider::Deepgram), "", "");
+    cfg.normalize();
+    assert_eq!(cfg.asr.backend, "", "an inactive backend stays untouched");
+    assert_eq!(cfg.asr.cloud_base_url, "https://api.deepgram.com");
+    assert_eq!(cfg.asr.cloud_model, "nova-3");
+}
+
+// Asserted through disk rather than on the value: a `normalize` that exists but
+// is never called from `save` must fail here.
+#[test]
+fn save_normalizes_before_writing_to_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = asr_cloud_config("local_whisper", Some(CloudAsrProvider::Deepgram), "", "");
+    cfg.save(dir.path()).unwrap();
+
+    let loaded = AppConfig::load(dir.path()).unwrap();
+    assert_eq!(loaded.asr.cloud_base_url, "https://api.deepgram.com");
+    assert_eq!(loaded.asr.cloud_model, "nova-3");
+    assert_eq!(loaded.asr, cfg.asr, "in-memory and disk must agree");
+}
+
+#[test]
+fn save_persists_the_demotion_of_an_active_cloud_backend() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = asr_cloud_config(
+        "cloud",
+        Some(CloudAsrProvider::OpenAiCompatible),
+        "",
+        "whisper-1",
+    );
+    cfg.save(dir.path()).unwrap();
+
+    let loaded = AppConfig::load(dir.path()).unwrap();
+    assert_eq!(loaded.asr.backend, "");
+    assert_eq!(loaded.asr.cloud_base_url, "");
+}
+
+// `set_config` is an in-memory apply, not a persist; normalizing here would
+// diverge memory from disk on any path that applies without saving.
+#[tokio::test]
+async fn set_config_does_not_normalize() {
+    let engine = LensEngine::for_test().await;
+    let mut cfg = engine.config().await;
+    cfg.asr.backend = "cloud".to_string();
+    cfg.asr.cloud_provider = Some(CloudAsrProvider::OpenAiCompatible);
+    cfg.asr.cloud_base_url = String::new();
+    cfg.asr.cloud_model = String::new();
+    engine.set_config(cfg).await;
+
+    let back = engine.config().await;
+    assert_eq!(back.asr.backend, "cloud");
+    assert_eq!(back.asr.cloud_base_url, "");
+    assert_eq!(back.asr.cloud_model, "");
 }
 
 #[test]
@@ -1069,6 +1368,84 @@ async fn preflight_no_provider_zero_cloud_requests() {
         cfg.asr.cloud_provider = None; // no provider
     })
     .await;
+}
+
+// The helper persists via `set_config` (in-memory, no `save`), so `normalize`
+// never runs and the blank reaches pre-flight intact. Routing it through `save`
+// would silently make both cases vacuous.
+#[tokio::test]
+async fn preflight_blank_base_url_zero_cloud_requests() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_segments_response()))
+        .mount(&server)
+        .await;
+
+    assert_preflight_blocks_with_zero_requests(&server, |cfg| {
+        cfg.audio_cloud_consent = true;
+        cfg.asr.cloud_api_key = "sk-test".to_string();
+        cfg.asr.cloud_provider = Some(CloudAsrProvider::OpenAiCompatible);
+        cfg.asr.cloud_base_url = "   ".to_string();
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn preflight_blank_model_zero_cloud_requests() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_segments_response()))
+        .mount(&server)
+        .await;
+
+    assert_preflight_blocks_with_zero_requests(&server, |cfg| {
+        cfg.audio_cloud_consent = true;
+        cfg.asr.cloud_api_key = "sk-test".to_string();
+        cfg.asr.cloud_provider = Some(CloudAsrProvider::OpenAiCompatible);
+        cfg.asr.cloud_model = String::new();
+    })
+    .await;
+}
+
+// ===========================================================================
+// Integration: router gate 1 — a demoted backend can never reach Cloud
+// ===========================================================================
+
+/// What makes a demoted backend durable: with `backend: ""` the router has no
+/// explicit override, so the Cloud arm is unreachable however usable the cloud
+/// block is. A Cloud selection would show up as a `(fallback)` marker instead.
+#[tokio::test]
+async fn empty_backend_never_selects_cloud_despite_a_usable_cloud_block() {
+    let engine = LensEngine::for_test().await;
+
+    let mut config = engine.config().await;
+    config.audio_cloud_consent = true;
+    config.asr.backend = String::new();
+    config.asr.cloud_provider = Some(CloudAsrProvider::OpenAiCompatible);
+    config.asr.cloud_base_url = "https://api.openai.com".to_string();
+    config.asr.cloud_model = "whisper-1".to_string();
+    config.asr.cloud_api_key = "sk-test".to_string();
+    engine.set_config(config).await;
+
+    let canned = vec![TranscriptSegment {
+        text: "local only".into(),
+        start_second: 0.0,
+        end_second: 1.0,
+    }];
+    engine
+        .set_asr_engine(Some(Arc::new(MockAsrEngine::new(canned.clone()))))
+        .await;
+
+    let (out, backend) = engine
+        .transcribe(&tiny_pcm(), &TranscribeConfig::default(), None, None)
+        .await
+        .expect("router must resolve to the injected local engine");
+
+    assert_eq!(out, canned);
+    assert_eq!(
+        backend, "apple_native",
+        "a demoted backend must not route through cloud, got {backend}"
+    );
 }
 
 // ===========================================================================

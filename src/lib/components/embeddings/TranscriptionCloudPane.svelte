@@ -74,7 +74,9 @@
   }
 
   /** Reactive Cloud persist; no Save button. Only flips `backend` to `"cloud"` when the
-   *  config is actually usable — an incomplete edit still saves its own field. */
+   *  config is usable. A blank required field demotes an active `"cloud"` backend and
+   *  clears `cloud_provider` instead of leaving both pointed at a config the engine
+   *  would otherwise normalize to a vendor default (#297 P4/R13/R14). */
   async function persistCloud(): Promise<void> {
     error = null;
     const trimmedBaseUrl = baseUrl.trim();
@@ -85,6 +87,7 @@
     }
     const trimmedModel = model.trim();
     const keyToSave = editingKey && apiKey.trim() ? apiKey : hasSavedKey ? savedApiKey : apiKey;
+    const blanked = trimmedBaseUrl === '' || trimmedModel === '';
     try {
       await persist((cfg) => {
         const usable =
@@ -96,11 +99,11 @@
           ...cfg,
           asr: {
             ...cfg.asr,
-            cloud_provider: provider,
+            cloud_provider: blanked ? null : provider,
             cloud_base_url: trimmedBaseUrl,
             cloud_model: trimmedModel,
             cloud_api_key: keyToSave,
-            backend: usable ? 'cloud' : cfg.asr.backend
+            backend: usable ? 'cloud' : cfg.asr.backend === 'cloud' ? '' : cfg.asr.backend
           }
         };
       });
@@ -108,6 +111,12 @@
       hasSavedKey = keyToSave.trim() !== '';
       editingKey = false;
       apiKey = '';
+      // Verbatim from the store, no preset fallback (unlike the mount-time hydration
+      // above) — falling back here would refill a field just deliberately cleared.
+      if (appConfigStore.asr) {
+        baseUrl = appConfigStore.asr.cloud_base_url;
+        model = appConfigStore.asr.cloud_model;
+      }
     } catch (err) {
       error = toLensError(err).message;
     }

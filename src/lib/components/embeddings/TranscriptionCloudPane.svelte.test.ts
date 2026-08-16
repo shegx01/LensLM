@@ -239,6 +239,89 @@ describe('TranscriptionCloudPane', () => {
     expect(savedConfigs.at(-1)?.asr.backend).not.toBe('cloud');
   });
 
+  it('clearing the Base URL while cloud is the active backend demotes it instead of leaving it pointed at cloud', async () => {
+    const { savedConfigs } = mockBackend(cloudConfig({ backend: 'cloud' }));
+    render(TranscriptionCloudPane);
+
+    const baseUrlInput = await screen.findByLabelText<HTMLInputElement>(/base url/i);
+    await waitFor(() => expect(baseUrlInput.value).toBe('https://api.openai.com'));
+
+    await fireEvent.input(baseUrlInput, { target: { value: '' } });
+    await fireEvent.blur(baseUrlInput);
+
+    await waitFor(() => expect(savedConfigs.length).toBeGreaterThan(0));
+    expect(savedConfigs.at(-1)?.asr.backend).toBe('');
+  });
+
+  it('clearing the Base URL also clears cloud_provider so the demotion cannot be re-armed by a stale provider', async () => {
+    const { savedConfigs } = mockBackend(cloudConfig({ backend: 'cloud' }));
+    render(TranscriptionCloudPane);
+
+    const baseUrlInput = await screen.findByLabelText<HTMLInputElement>(/base url/i);
+    await waitFor(() => expect(baseUrlInput.value).toBe('https://api.openai.com'));
+
+    await fireEvent.input(baseUrlInput, { target: { value: '' } });
+    await fireEvent.blur(baseUrlInput);
+
+    await waitFor(() => expect(savedConfigs.length).toBeGreaterThan(0));
+    expect(savedConfigs.at(-1)?.asr.cloud_provider).toBeNull();
+    expect(savedConfigs.at(-1)?.asr.backend).toBe('');
+  });
+
+  it('consent being off does not clear the provider when both required fields stay populated (negative control for A-2)', async () => {
+    const { savedConfigs } = mockBackend(
+      cloudConfig({ audioCloudConsent: false, backend: 'local_whisper' })
+    );
+    render(TranscriptionCloudPane);
+
+    const baseUrlInput = await screen.findByLabelText<HTMLInputElement>(/base url/i);
+    await waitFor(() => expect(baseUrlInput.value).toBe('https://api.openai.com'));
+
+    await fireEvent.input(baseUrlInput, { target: { value: 'https://api.openai.com' } });
+    await fireEvent.blur(baseUrlInput);
+
+    await waitFor(() => expect(savedConfigs.length).toBeGreaterThan(0));
+    expect(savedConfigs.at(-1)?.asr.cloud_provider).toBe('open_ai_compatible');
+  });
+
+  it('re-syncs the displayed model from the stored config after a successful persist, not the value that was typed', async () => {
+    let stored = cloudConfig();
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return stored;
+      if (cmd === 'set_config') {
+        const sent = (args as { config: AppConfig }).config;
+        // Simulates engine-side normalization returning a different value than what
+        // this pane sent — proves the resync reads the store, not the local echo.
+        stored = { ...sent, asr: { ...sent.asr, cloud_model: 'engine-assigned-model' } };
+        return null;
+      }
+    });
+    render(TranscriptionCloudPane);
+
+    const baseUrlInput = await screen.findByLabelText<HTMLInputElement>(/base url/i);
+    await waitFor(() => expect(baseUrlInput.value).toBe('https://api.openai.com'));
+
+    const modelInput = screen.getByLabelText<HTMLInputElement>(/model/i);
+    await fireEvent.input(modelInput, { target: { value: 'typed-model' } });
+    await fireEvent.blur(modelInput);
+
+    await waitFor(() => expect(modelInput.value).toBe('engine-assigned-model'));
+  });
+
+  it('clearing the Base URL displays it as empty afterward, not refilled with the provider preset', async () => {
+    const { savedConfigs } = mockBackend(cloudConfig({ backend: 'cloud' }));
+    render(TranscriptionCloudPane);
+
+    const baseUrlInput = await screen.findByLabelText<HTMLInputElement>(/base url/i);
+    await waitFor(() => expect(baseUrlInput.value).toBe('https://api.openai.com'));
+
+    await fireEvent.input(baseUrlInput, { target: { value: '' } });
+    await fireEvent.blur(baseUrlInput);
+
+    await waitFor(() => expect(savedConfigs.length).toBeGreaterThan(0));
+    expect(baseUrlInput.value).toBe('');
+  });
+
   it('surfaces a Tauri LensError message instead of the generic fallback', async () => {
     mockIPC((cmd) => {
       if (cmd === 'get_config') return cloudConfig();

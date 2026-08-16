@@ -199,6 +199,24 @@ impl AsrEngine for CloudAsrEngine {
     }
 }
 
+/// Default API base URL for a provider, applied when the stored base URL is blank
+/// so a provider selection works without the user pasting an endpoint.
+/// SYNC-CHECK: mirrored by `CLOUD_ASR_PRESETS` in `src/lib/asr/catalog.ts`.
+pub fn default_base_url(provider: CloudAsrProvider) -> &'static str {
+    match provider {
+        CloudAsrProvider::OpenAiCompatible => "https://api.openai.com",
+        CloudAsrProvider::Deepgram => "https://api.deepgram.com",
+    }
+}
+
+/// Default model id for a provider, applied when the stored model is blank.
+pub fn default_model(provider: CloudAsrProvider) -> &'static str {
+    match provider {
+        CloudAsrProvider::OpenAiCompatible => "whisper-1",
+        CloudAsrProvider::Deepgram => "nova-3",
+    }
+}
+
 /// Consent + config pre-flight (#45), run BEFORE any cloud request. Order is
 /// deliberate: consent is checked first so a mis-set backend never leaks audio.
 /// No reachability probe — the unreachable case is handled by runtime fallback.
@@ -206,7 +224,16 @@ pub fn preflight_check(config: &AppConfig) -> Result<(), LensError> {
     let consent = config.audio_cloud_consent;
     let key_present = !config.asr.cloud_api_key.is_empty();
     let provider_set = config.asr.cloud_provider.is_some();
-    tracing::debug!(consent, key_present, provider_set, "cloud ASR pre-flight");
+    let base_url_present = !config.asr.cloud_base_url.trim().is_empty();
+    let model_present = !config.asr.cloud_model.trim().is_empty();
+    tracing::debug!(
+        consent,
+        key_present,
+        provider_set,
+        base_url_present,
+        model_present,
+        "cloud ASR pre-flight"
+    );
 
     if !consent {
         return Err(LensError::Validation(
@@ -221,6 +248,16 @@ pub fn preflight_check(config: &AppConfig) -> Result<(), LensError> {
     if !provider_set {
         return Err(LensError::Validation(
             "no cloud ASR provider configured".into(),
+        ));
+    }
+    if !base_url_present {
+        return Err(LensError::Validation(
+            "no cloud ASR base URL configured".into(),
+        ));
+    }
+    if !model_present {
+        return Err(LensError::Validation(
+            "no cloud ASR model configured".into(),
         ));
     }
     Ok(())

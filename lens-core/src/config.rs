@@ -710,7 +710,7 @@ impl AppConfig {
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 tracing::debug!("no config at {}, writing default", path.display());
-                let config = AppConfig::default();
+                let mut config = AppConfig::default();
                 config.save(dir)?;
                 Ok(config)
             }
@@ -723,10 +723,34 @@ impl AppConfig {
         }
     }
 
+    /// Makes the stored cloud-ASR block self-describing under a set provider: a blank
+    /// required field either demotes an ACTIVE `cloud` backend or is filled from the
+    /// vendor default — never both, since filling a field the user deliberately
+    /// cleared would silently retarget a live upload.
+    pub fn normalize(&mut self) {
+        let Some(provider) = self.asr.cloud_provider else {
+            return;
+        };
+        let blank_required =
+            self.asr.cloud_base_url.trim().is_empty() || self.asr.cloud_model.trim().is_empty();
+        if blank_required && self.asr.backend == "cloud" {
+            self.asr.backend.clear();
+        } else {
+            if self.asr.cloud_base_url.trim().is_empty() {
+                self.asr.cloud_base_url = crate::asr::cloud::default_base_url(provider).to_string();
+            }
+            if self.asr.cloud_model.trim().is_empty() {
+                self.asr.cloud_model = crate::asr::cloud::default_model(provider).to_string();
+            }
+        }
+    }
+
     /// Writes config to `{dir}/config.json` (pretty JSON) with `0o600` permissions
     /// on Unix (plaintext `api_key` stopgap until M2).
+    /// Runs [`AppConfig::normalize`] on `self` first, so disk and caller agree.
     #[tracing::instrument(skip_all, fields(dir = %dir.as_ref().display()))]
-    pub fn save(&self, dir: impl AsRef<Path>) -> Result<(), LensError> {
+    pub fn save(&mut self, dir: impl AsRef<Path>) -> Result<(), LensError> {
+        self.normalize();
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir).map_err(|e| {
             tracing::error!("failed to create config dir {}: {e}", dir.display());
@@ -839,7 +863,7 @@ mod tests {
     #[test]
     fn explicit_user_name_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let config = AppConfig {
+        let mut config = AppConfig {
             user_name: "Jamie".to_string(),
             ..AppConfig::default()
         };
@@ -872,7 +896,7 @@ mod tests {
     #[test]
     fn explicit_embedding_model_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let config = AppConfig {
+        let mut config = AppConfig {
             embedding_model: "nomic-embed-text".to_string(),
             ..AppConfig::default()
         };
@@ -885,7 +909,7 @@ mod tests {
     #[test]
     fn credential_only_model_config_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let config = AppConfig {
+        let mut config = AppConfig {
             models: vec![ModelConfig {
                 provider: "anthropic".to_string(),
                 base_url: String::new(),
@@ -911,7 +935,7 @@ mod tests {
     #[test]
     fn model_config_context_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let config = AppConfig {
+        let mut config = AppConfig {
             models: vec![ModelConfig {
                 provider: "ollama".to_string(),
                 base_url: "http://localhost:11434".to_string(),
@@ -952,7 +976,7 @@ mod tests {
     #[test]
     fn explicit_embedding_backend_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let config = AppConfig {
+        let mut config = AppConfig {
             embedding_backend: "ollama".to_string(),
             ..AppConfig::default()
         };
@@ -987,7 +1011,7 @@ mod tests {
     #[test]
     fn test_max_source_mb_explicit_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let config = AppConfig {
+        let mut config = AppConfig {
             max_source_mb: "100".to_string(),
             ..AppConfig::default()
         };
@@ -1093,7 +1117,7 @@ mod tests {
     #[test]
     fn explicit_asr_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let config = AppConfig {
+        let mut config = AppConfig {
             asr: AsrConfig {
                 backend: "apple_native".to_string(),
                 whisper_model: "small".to_string(),
@@ -1128,7 +1152,7 @@ mod tests {
     #[test]
     fn explicit_tts_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let config = AppConfig {
+        let mut config = AppConfig {
             tts: TtsConfig {
                 version: 1,
                 backend: TtsBackend::Cloud(CloudTtsKind::ElevenLabs),
@@ -1152,7 +1176,7 @@ mod tests {
     fn multiple_cloud_providers_round_trip_independently() {
         // Per-provider retention (#40): two providers' keys coexist in `clouds`.
         let dir = tempfile::tempdir().unwrap();
-        let config = AppConfig {
+        let mut config = AppConfig {
             tts: TtsConfig {
                 version: 1,
                 backend: TtsBackend::Cloud(CloudTtsKind::GoogleCloud),
@@ -1274,7 +1298,7 @@ mod tests {
     #[test]
     fn explicit_accent_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let config = AppConfig {
+        let mut config = AppConfig {
             accent: "emerald".to_string(),
             ..AppConfig::default()
         };
@@ -1357,7 +1381,7 @@ mod tests {
     #[test]
     fn explicit_enrichment_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let config = AppConfig {
+        let mut config = AppConfig {
             enrichment: EnrichmentConfig {
                 enabled: true,
                 coref_strategy: CorefStrategy::None,
@@ -1438,7 +1462,7 @@ mod tests {
     #[test]
     fn explicit_per_task_models_round_trip() {
         let dir = tempfile::tempdir().unwrap();
-        let config = AppConfig {
+        let mut config = AppConfig {
             enrichment: EnrichmentConfig {
                 enabled: true,
                 coref_model: Some(TaskModel {
@@ -1475,7 +1499,7 @@ mod tests {
     #[test]
     fn chat_model_round_trips_persist_and_reload() {
         let dir = tempfile::tempdir().unwrap();
-        let config = AppConfig {
+        let mut config = AppConfig {
             enrichment: EnrichmentConfig {
                 enabled: true,
                 chat_model: Some(TaskModel {
@@ -1643,7 +1667,7 @@ mod tests {
     #[test]
     fn explicit_retrieval_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let config = AppConfig {
+        let mut config = AppConfig {
             retrieval: RetrievalConfig {
                 hybrid_enabled: false,
                 reranker: RerankerConfig {
@@ -1730,7 +1754,7 @@ mod tests {
     #[test]
     fn explicit_animations_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let config = AppConfig {
+        let mut config = AppConfig {
             animations: "off".to_string(),
             ..AppConfig::default()
         };
