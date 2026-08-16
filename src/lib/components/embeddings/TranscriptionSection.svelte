@@ -18,7 +18,9 @@
   import {
     appleAsrAvailability,
     whisperModelDownloaded,
-    type AppleAsrAvailability
+    resolveAsrBackend,
+    type AppleAsrAvailability,
+    type AsrBackend
   } from '$lib/asr/ipc.js';
   import { appConfigStore, ensureLoaded, persist } from '$lib/models/app-config.svelte.js';
   import { toLensError } from '$lib/sources/lens-error.js';
@@ -33,6 +35,13 @@
   let ready = $state(false);
   let error = $state<string | null>(null);
 
+  /** The router's real answer for "what runs right now" — never a client guess. */
+  type ResolvedBackend =
+    | { status: 'loading' }
+    | { status: 'ready'; backend: AsrBackend }
+    | { status: 'error' };
+  let resolvedBackend = $state<ResolvedBackend>({ status: 'loading' });
+
   const persistedEngine = $derived(asrEngineIdFromBackend(appConfigStore.asr?.backend ?? ''));
   const selectedEntry = $derived(ASR_ENGINE_CATALOG.find((e) => e.id === selectedEngine));
 
@@ -40,9 +49,11 @@
   const appleReason = $derived(appleAsrUnavailableReason(appleAvailability));
   const automaticUsable = $derived(appleAvailable || whisperPresent);
 
-  // The engine actually powering transcription — persisted AND usable. Drives the
-  // language block's capability notice, which must describe the real engine, not the row.
-  const activeEngine = $derived(isUsable(persistedEngine) ? persistedEngine : null);
+  // Drives the language block's capability notice, sourced from resolveAsrBackend
+  // (the same seam transcribe() uses) rather than a persisted/usable guess.
+  const activeEngine = $derived(
+    resolvedBackend.status === 'ready' ? resolvedBackend.backend : null
+  );
 
   function isUsable(id: AsrEngineId): boolean {
     switch (id) {
@@ -80,6 +91,15 @@
     }
   }
 
+  async function refreshResolvedBackend(): Promise<void> {
+    try {
+      const backend = await resolveAsrBackend();
+      resolvedBackend = { status: 'ready', backend };
+    } catch {
+      resolvedBackend = { status: 'error' };
+    }
+  }
+
   onMount(async () => {
     await ensureLoaded();
     selectedEngine = asrEngineIdFromBackend(appConfigStore.asr?.backend ?? '');
@@ -90,6 +110,7 @@
     ]);
     appleAvailability = apple;
     whisperPresent = whisper;
+    await refreshResolvedBackend();
     ready = true;
   });
 
@@ -97,6 +118,7 @@
     error = null;
     try {
       await persist((cfg) => ({ ...cfg, asr: { ...cfg.asr, backend } }));
+      await refreshResolvedBackend();
     } catch (err) {
       error = toLensError(err).message;
     }
@@ -116,9 +138,25 @@
     if (modelId !== appConfigStore.asr?.whisper_model) return;
     whisperPresent = downloaded;
     if (downloaded && selectedEngine === 'local_whisper') {
-      void persistBackend('local_whisper');
+      void persistBackend('local_whisper'); // already refreshes resolvedBackend
+    } else {
+      void refreshResolvedBackend();
     }
   }
+
+  const automaticStatusText = $derived.by(() => {
+    if (!automaticUsable) {
+      return "Apple transcription isn't available on this device and no Local Whisper model is downloaded yet. Download a model to enable Automatic.";
+    }
+    const resolved = resolvedBackend;
+    if (resolved.status === 'loading') return 'Determining which engine Automatic will use…';
+    if (resolved.status === 'error') {
+      return "Couldn't determine which engine Automatic will use right now.";
+    }
+    const label =
+      ASR_ENGINE_CATALOG.find((e) => e.id === resolved.backend)?.label ?? resolved.backend;
+    return `Automatic currently resolves to ${label}.`;
+  });
 </script>
 
 <section class="flex flex-col" aria-label="Transcription settings">
@@ -195,20 +233,21 @@
         </div>
 
         <div class="mt-4">
-          {#if selectedEngine === 'automatic' && !automaticUsable}
+          {#if selectedEngine === 'automatic'}
             <div class="rounded-[10px] border border-border bg-muted/40 p-3">
               <p class="text-[0.72rem] text-muted-foreground">
-                Apple transcription isn't available on this device and no Local Whisper model is
-                downloaded yet. Download a model to enable Automatic.
+                {automaticStatusText}
               </p>
-              <Button
-                type="button"
-                size="sm"
-                class="mt-2"
-                onclick={() => pickEngine('local_whisper')}
-              >
-                Set up Local Whisper
-              </Button>
+              {#if !automaticUsable}
+                <Button
+                  type="button"
+                  size="sm"
+                  class="mt-2"
+                  onclick={() => pickEngine('local_whisper')}
+                >
+                  Set up Local Whisper
+                </Button>
+              {/if}
             </div>
           {:else if selectedEngine === 'apple_native'}
             <TranscriptionApplePane available={appleAvailable} />

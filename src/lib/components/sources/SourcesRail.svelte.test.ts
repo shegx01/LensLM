@@ -11,6 +11,7 @@ const { mockSourcesStore, mockNotebookStore } = vi.hoisted(() => {
   let _recentlyTrashed = false;
   let _focusedSourceId: string | null = null;
   let _focusNonce = 0;
+  let _effectiveBackends = new Map<string, string>();
 
   const mockSourcesStore = {
     get sources() {
@@ -48,6 +49,15 @@ const { mockSourcesStore, mockNotebookStore } = vi.hoisted(() => {
     _resetFocus() {
       _focusedSourceId = null;
       _focusNonce = 0;
+    },
+    effectiveBackendFor(sourceId: string) {
+      return _effectiveBackends.get(sourceId) ?? null;
+    },
+    _setEffectiveBackend(sourceId: string, marker: string) {
+      _effectiveBackends.set(sourceId, marker);
+    },
+    _resetEffectiveBackends() {
+      _effectiveBackends = new Map();
     }
   };
 
@@ -155,6 +165,7 @@ beforeEach(() => {
   mockSourcesStore._setSources([]);
   mockSourcesStore._setRecentlyTrashed(false);
   mockSourcesStore._resetFocus();
+  mockSourcesStore._resetEffectiveBackends();
   mockNotebookStore._setRightRailCollapsed(false);
 });
 
@@ -162,6 +173,7 @@ afterEach(() => {
   mockSourcesStore._setSources([]);
   mockSourcesStore._setRecentlyTrashed(false);
   mockSourcesStore._resetFocus();
+  mockSourcesStore._resetEffectiveBackends();
   mockNotebookStore._setRightRailCollapsed(false);
 });
 
@@ -491,6 +503,36 @@ describe('SourcesRail — Studio shell', () => {
     mockNotebookStore._setRightRailCollapsed(true);
     render(SourcesRail);
     expect(screen.queryByText('Audio Overview')).not.toBeInTheDocument();
+  });
+});
+
+describe('SourcesRail — ASR fallback caption (#297 AC4.4)', () => {
+  it('shows a fallback caption for an audio source with a fallback marker', () => {
+    mockSourcesStore._setSources([makeSource({ id: 'src-001', kind: 'audio', title: 'Call.mp3' })]);
+    mockSourcesStore._setEffectiveBackend('src-001', 'local_whisper (fallback)');
+    render(SourcesRail);
+    expect(screen.getByText(/fell back to local whisper/i)).toBeInTheDocument();
+  });
+
+  it('shows no caption for an audio source with a clean (non-degraded) marker', () => {
+    mockSourcesStore._setSources([makeSource({ id: 'src-001', kind: 'audio', title: 'Call.mp3' })]);
+    mockSourcesStore._setEffectiveBackend('src-001', 'local_whisper');
+    render(SourcesRail);
+    expect(screen.queryByText(/fell back/i)).not.toBeInTheDocument();
+  });
+
+  it('shows no caption for an audio source with no marker at all (absence is not "clean")', () => {
+    mockSourcesStore._setSources([makeSource({ id: 'src-001', kind: 'audio', title: 'Call.mp3' })]);
+    render(SourcesRail);
+    expect(screen.queryByText(/fell back/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/degraded/i)).not.toBeInTheDocument();
+  });
+
+  it('shows no caption for a non-audio source even if a marker is somehow present', () => {
+    mockSourcesStore._setSources([makeSource({ id: 'src-001', kind: 'file', title: 'Doc.md' })]);
+    mockSourcesStore._setEffectiveBackend('src-001', 'local_whisper (fallback)');
+    render(SourcesRail);
+    expect(screen.queryByText(/fell back/i)).not.toBeInTheDocument();
   });
 });
 

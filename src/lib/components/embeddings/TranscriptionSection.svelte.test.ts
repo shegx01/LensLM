@@ -1,7 +1,7 @@
 import { render, screen, fireEvent, waitFor, within } from '@testing-library/svelte';
 import { mockIPC, clearMocks } from '@tauri-apps/api/mocks';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { AppleAsrAvailability } from '$lib/asr/ipc.js';
+import type { AppleAsrAvailability, AsrBackend } from '$lib/asr/ipc.js';
 import type { AppConfig, AsrConfig } from '$lib/theme/types.js';
 import { baseAppConfig } from '$lib/test-fixtures.js';
 import { resetConfig } from '$lib/models/app-config.svelte.js';
@@ -47,6 +47,8 @@ function mount(opts: {
   audioCloudConsent?: boolean;
   appleAvailability?: AppleAsrAvailability;
   whisperDownloaded?: Record<string, boolean>;
+  /** `'reject'` simulates `resolve_asr_backend` throwing (T-FE-2b). */
+  resolvedBackend?: AsrBackend | 'reject';
   setConfigSpy?: (cfg: AppConfig) => void;
   onDownloadChannel?: (ch: ProgressChannel, model: string) => void;
 }) {
@@ -69,6 +71,12 @@ function mount(opts: {
       const ch = (args as { on_progress: ProgressChannel }).on_progress;
       opts.onDownloadChannel?.(ch, (args as { model: string }).model);
       return null;
+    }
+    if (cmd === 'resolve_asr_backend') {
+      if (opts.resolvedBackend === 'reject') {
+        throw { kind: 'Internal', message: 'router unavailable' };
+      }
+      return opts.resolvedBackend ?? 'local_whisper';
     }
   });
   return render(TranscriptionSection);
@@ -213,6 +221,7 @@ describe('TranscriptionSection', () => {
       if (cmd === 'asr_apple_native_available') return 'not_built';
       if (cmd === 'list_whisper_models') return MODELS;
       if (cmd === 'whisper_model_downloaded') return false;
+      if (cmd === 'resolve_asr_backend') return 'local_whisper';
     });
     render(TranscriptionSection);
     await screen.findByRole('radiogroup', { name: 'Transcription engine' });
@@ -243,5 +252,32 @@ describe('TranscriptionSection', () => {
     await waitFor(() => expect(within(whisperRow).getByText('Active')).toBeInTheDocument());
     const cfg = setConfigSpy.mock.calls.at(-1)![0] as AppConfig;
     expect(cfg.asr.backend).toBe('local_whisper');
+  });
+
+  it('T-FE-1: the displayed active engine comes from resolve_asr_backend, not a client guess', async () => {
+    // Apple is available, so the deleted client-side prediction would have picked
+    // Apple; the command says Whisper instead, and the UI must follow the command.
+    mount({ appleAvailability: 'available', resolvedBackend: 'local_whisper' });
+    await screen.findByRole('radiogroup', { name: 'Transcription engine' });
+    await waitFor(() =>
+      expect(screen.getByText(/currently resolves to Local Whisper/i)).toBeInTheDocument()
+    );
+  });
+
+  it('T-FE-2: Automatic states which engine it resolves to', async () => {
+    mount({ appleAvailability: 'available', resolvedBackend: 'apple_native' });
+    await screen.findByRole('radiogroup', { name: 'Transcription engine' });
+    await waitFor(() =>
+      expect(screen.getByText(/currently resolves to Apple \(on-device\)/i)).toBeInTheDocument()
+    );
+  });
+
+  it('T-FE-2b: a rejected resolve_asr_backend renders an explicit unknown state, never a guess', async () => {
+    mount({ appleAvailability: 'available', resolvedBackend: 'reject' });
+    await screen.findByRole('radiogroup', { name: 'Transcription engine' });
+    await waitFor(() =>
+      expect(screen.getByText(/couldn't determine which engine/i)).toBeInTheDocument()
+    );
+    expect(screen.queryByText(/currently resolves to/i)).toBeNull();
   });
 });

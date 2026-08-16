@@ -355,6 +355,9 @@ pub struct LensEngine {
     /// version stamp but BEFORE the canonical updates (single-txn atomicity assertion).
     #[cfg(feature = "test-util")]
     resolution_write_fault: Arc<std::sync::atomic::AtomicBool>,
+    /// #297 test seam: counts `asr_engine()` reads; tests delta it around a call.
+    #[cfg(feature = "test-util")]
+    asr_engine_reads: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl LensEngine {
@@ -460,6 +463,8 @@ impl LensEngine {
             resolution_pass_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             #[cfg(feature = "test-util")]
             resolution_write_fault: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(feature = "test-util")]
+            asr_engine_reads: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         };
 
         enrichment::spawn_worker(engine.clone(), enrichment_rx);
@@ -552,6 +557,8 @@ impl LensEngine {
             resolution_pass_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             #[cfg(feature = "test-util")]
             resolution_write_fault: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(feature = "test-util")]
+            asr_engine_reads: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         };
         enrichment::spawn_worker(engine.clone(), enrichment_rx);
         crate::resolution::spawn_resolution_worker(engine.clone(), resolution_rx);
@@ -1239,7 +1246,17 @@ impl LensEngine {
     /// Returns a clone of the injected Apple-native ASR engine, or `None` when
     /// none is installed (LocalWhisper is then the routed backend).
     pub async fn asr_engine(&self) -> Option<Arc<dyn asr::AsrEngine>> {
+        #[cfg(feature = "test-util")]
+        self.asr_engine_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.asr_engine.read().await.clone()
+    }
+
+    /// Current value of the `asr_engine_reads` seam.
+    #[cfg(feature = "test-util")]
+    pub fn asr_engine_reads(&self) -> u32 {
+        self.asr_engine_reads
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Registers a fresh cancellation token for an in-flight audio ingest,
@@ -2039,6 +2056,74 @@ impl LensEngine {
         Ok(rows.into_iter().collect())
     }
 
+    /// Total decision seam: takes every router input the caller already holds, so the
+    /// resolution path reads config and the engine slot once each (#297) —
+    /// [`transcribe`](Self::transcribe) and the UI can never disagree.
+    pub async fn resolve_asr_backend_with(
+        &self,
+        config_backend: Option<asr::AsrBackend>,
+        injected: Option<&Arc<dyn asr::AsrEngine>>,
+        language: Option<&asr::Lang>,
+        translate: bool,
+    ) -> Result<asr::AsrBackend, LensError> {
+        let apple_available = injected.is_some();
+
+        // lens-core stays OS-probe-free: authoritative platform/version facts are
+        // enforced in src-tauri BEFORE injecting the engine, so a present engine
+        // implies a capable Apple platform. Derive Platform consistently with that
+        // seam rather than probing the OS here (no OS-probe crate in lens-core).
+        let platform = asr::Platform {
+            is_apple_silicon_macos: apple_available,
+            macos_major: apple_available.then_some(asr::MIN_MACOS_FOR_APPLE_ASR),
+        };
+        // Probe the injected Apple engine for locale support, only for an explicit
+        // language, off the async runtime (the probe crosses blocking FFI in prod);
+        // auto-detect or no engine trusts Apple, with the downstream confidence
+        // check as the runtime backstop.
+        let apple_supports_locale = match (language, injected) {
+            (Some(lang), Some(engine)) => {
+                let (engine, lang) = (engine.clone(), lang.clone());
+                tokio::task::spawn_blocking(move || engine.supports_locale(&lang))
+                    .await
+                    .map_err(|e| {
+                        LensError::Transcription(format!("locale probe task failed: {e}"))
+                    })?
+            }
+            _ => true,
+        };
+
+        let mut backend = asr::select_asr_backend(
+            config_backend,
+            platform,
+            apple_available,
+            apple_supports_locale,
+        );
+
+        // SpeechTranscriber has no translate task (translation is Whisper-only).
+        // If the caller requests translation and the router picked Apple, fall back
+        // to LocalWhisper so the translate request can be fulfilled.
+        if translate && backend == asr::AsrBackend::AppleNative {
+            backend = asr::AsrBackend::LocalWhisper;
+        }
+        Ok(backend)
+    }
+
+    /// [`resolve_asr_backend_with`](Self::resolve_asr_backend_with) for callers
+    /// holding no router inputs of their own (the Tauri command).
+    pub async fn resolve_asr_backend(
+        &self,
+        language: Option<&asr::Lang>,
+        translate: bool,
+    ) -> Result<asr::AsrBackend, LensError> {
+        let config_backend = {
+            let guard = self.read().await;
+            asr::AsrBackend::from_opt_str(Some(guard.config.asr.backend.as_str()))
+        };
+        let injected = self.asr_engine().await;
+        self.resolve_asr_backend_with(config_backend, injected.as_ref(), language, translate)
+            .await
+    }
+
     /// Transcribes 16 kHz mono f32 PCM (#41 output), selecting the backend via
     /// [`select_asr_backend`](asr::select_asr_backend): an explicit `AsrConfig`
     /// override wins, else the injected Apple engine when present, else LocalWhisper.
@@ -2063,45 +2148,15 @@ impl LensEngine {
         let config_backend = asr::AsrBackend::from_opt_str(Some(asr_cfg.backend.as_str()));
 
         let injected = self.asr_engine().await;
-        let apple_available = injected.is_some();
 
-        // lens-core stays OS-probe-free: authoritative platform/version facts are
-        // enforced in src-tauri BEFORE injecting the engine, so a present engine
-        // implies a capable Apple platform. Derive Platform consistently with that
-        // seam rather than probing the OS here (no OS-probe crate in lens-core).
-        let platform = asr::Platform {
-            is_apple_silicon_macos: apple_available,
-            macos_major: apple_available.then_some(asr::MIN_MACOS_FOR_APPLE_ASR),
-        };
-        // Probe the injected Apple engine for locale support, only for an explicit
-        // language, off the async runtime (the probe crosses blocking FFI in prod);
-        // auto-detect or no engine trusts Apple, with the downstream confidence
-        // check as the runtime backstop.
-        let apple_supports_locale = match (&config.language, &injected) {
-            (Some(lang), Some(engine)) => {
-                let (engine, lang) = (engine.clone(), lang.clone());
-                tokio::task::spawn_blocking(move || engine.supports_locale(&lang))
-                    .await
-                    .map_err(|e| {
-                        LensError::Transcription(format!("locale probe task failed: {e}"))
-                    })?
-            }
-            _ => true,
-        };
-
-        let mut backend = asr::select_asr_backend(
-            config_backend,
-            platform,
-            apple_available,
-            apple_supports_locale,
-        );
-
-        // SpeechTranscriber has no translate task (translation is Whisper-only).
-        // If the caller requests translation and the router picked Apple, fall back
-        // to LocalWhisper so the translate request can be fulfilled.
-        if config.translate && backend == asr::AsrBackend::AppleNative {
-            backend = asr::AsrBackend::LocalWhisper;
-        }
+        let backend = self
+            .resolve_asr_backend_with(
+                config_backend,
+                injected.as_ref(),
+                config.language.as_ref(),
+                config.translate,
+            )
+            .await?;
 
         // The injected engine is the Apple-native seam (Apple in prod, a mock in
         // tests); it is used ONLY when the router selects AppleNative. LocalWhisper
@@ -3736,6 +3791,84 @@ mod transcribe_tests {
             .expect("apple transcription");
         assert_eq!(label, "apple_native");
         assert_eq!(segs, canned);
+    }
+
+    fn mock_asr_engine(supports_locale: bool) -> Arc<dyn asr::AsrEngine> {
+        Arc::new(
+            asr::MockAsrEngine::new(canned_apple_segment()).with_locale_support(supports_locale),
+        )
+    }
+
+    /// T-U-10 gate 1. Gate 3 is deliberately absent from T-U-10: `Platform` is
+    /// derived inside the seam from engine presence, so no caller can drive it —
+    /// it stays covered by `asr::router`'s own unit tests.
+    #[tokio::test]
+    async fn resolve_config_override_wins_over_every_other_gate() {
+        let engine = LensEngine::for_test().await;
+        let mock = mock_asr_engine(true);
+        for (override_backend, injected) in [
+            (asr::AsrBackend::LocalWhisper, Some(&mock)),
+            (asr::AsrBackend::AppleNative, None),
+            (asr::AsrBackend::Cloud, Some(&mock)),
+        ] {
+            let resolved = engine
+                .resolve_asr_backend_with(Some(override_backend), injected, None, false)
+                .await
+                .expect("resolve");
+            assert_eq!(resolved, override_backend);
+        }
+    }
+
+    /// T-U-10 gate 2.
+    #[tokio::test]
+    async fn resolve_without_injected_engine_is_whisper() {
+        let engine = LensEngine::for_test().await;
+        let resolved = engine
+            .resolve_asr_backend_with(None, None, Some(&asr::Lang::En), false)
+            .await
+            .expect("resolve");
+        assert_eq!(resolved, asr::AsrBackend::LocalWhisper);
+    }
+
+    /// T-U-10 gate 4.
+    #[tokio::test]
+    async fn resolve_unsupported_locale_is_whisper() {
+        let engine = LensEngine::for_test().await;
+        let mock = mock_asr_engine(false);
+        let resolved = engine
+            .resolve_asr_backend_with(None, Some(&mock), Some(&asr::Lang::En), false)
+            .await
+            .expect("resolve");
+        assert_eq!(resolved, asr::AsrBackend::LocalWhisper);
+    }
+
+    /// T-U-10 gate 5.
+    #[tokio::test]
+    async fn resolve_supported_locale_with_engine_is_apple() {
+        let engine = LensEngine::for_test().await;
+        let mock = mock_asr_engine(true);
+        let resolved = engine
+            .resolve_asr_backend_with(None, Some(&mock), Some(&asr::Lang::En), false)
+            .await
+            .expect("resolve");
+        assert_eq!(resolved, asr::AsrBackend::AppleNative);
+    }
+
+    /// T-U-10 translate override, with its negative control.
+    #[tokio::test]
+    async fn resolve_translate_demotes_apple_to_whisper() {
+        let engine = LensEngine::for_test().await;
+        let mock = mock_asr_engine(true);
+        let resolved = engine
+            .resolve_asr_backend_with(None, Some(&mock), None, true)
+            .await
+            .expect("resolve");
+        assert_eq!(resolved, asr::AsrBackend::LocalWhisper);
+        let resolved = engine
+            .resolve_asr_backend_with(None, Some(&mock), None, false)
+            .await
+            .expect("resolve");
+        assert_eq!(resolved, asr::AsrBackend::AppleNative);
     }
 }
 

@@ -33,6 +33,7 @@
   import { notebookStore } from '$lib/notebooks/index.js';
   import type { SourceStatus } from '$lib/sources/types.js';
   import { statusDotClass } from '$lib/sources/status.js';
+  import { ASR_ENGINE_CATALOG } from '$lib/asr/catalog.js';
   import AddSourcesModal from './AddSourcesModal.svelte';
   import StudioPanel from './StudioPanel.svelte';
 
@@ -162,6 +163,19 @@
       return `~${approxWords} words`;
     }
     return '';
+  }
+
+  /**
+   * Caption for a degraded ASR run (#297 AC4.4). Additive-only per A-5: a missing
+   * marker must never read as "clean", so only fallback/degraded values render.
+   */
+  function fallbackCaption(marker: string): string | null {
+    const match = /^(.+)\s\((fallback|degraded)\)$/i.exec(marker);
+    if (!match) return null;
+    const label = ASR_ENGINE_CATALOG.find((e) => e.id === match[1])?.label ?? match[1];
+    return match[2].toLowerCase() === 'fallback'
+      ? `Fell back to ${label} for this recording.`
+      : `Ran in degraded mode (${label}) for this recording.`;
   }
 
   // statusDotClass is shared with EmbeddingsInspector — see $lib/sources/status.ts.
@@ -350,6 +364,9 @@
           {@const badge = typeBadge(source.kind, source.locator, source.title)}
           {@const meta = metaLine(source.token_count)}
           {@const status = source.status as SourceStatus}
+          {@const asrMarker =
+            source.kind === 'audio' ? sourcesStore.effectiveBackendFor(source.id) : null}
+          {@const asrCaption = asrMarker ? fallbackCaption(asrMarker) : null}
           <li
             data-source-id={source.id}
             data-pulsing={pulsingId === source.id}
@@ -393,6 +410,9 @@
                   <span class="text-xs text-muted-foreground/50">{meta}</span>
                 {/if}
               </div>
+              {#if asrCaption}
+                <p class="mt-0.5 truncate text-[0.65rem] text-destructive">{asrCaption}</p>
+              {/if}
             </div>
 
             <!-- Fixed-width slot: status dot fades out on hover, action buttons fade in.

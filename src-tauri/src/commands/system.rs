@@ -1,8 +1,8 @@
 //! System / diagnostic commands.
 
 use lens_core::{
-    CheckResult, CloudTtsKind, DownloadProgress, InstallProgress, LensEngine, LensError,
-    LlmDetection, StorageStats, TtsVoice, WHISPER_REGISTRY,
+    AsrBackend, CheckResult, CloudTtsKind, DownloadProgress, InstallProgress, LensEngine,
+    LensError, LlmDetection, StorageStats, TtsVoice, WHISPER_REGISTRY,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -439,6 +439,20 @@ pub async fn whisper_model_downloaded(
 ) -> Result<bool, LensError> {
     let cache_root = resolved_cache_root(&engine).await;
     Ok(lens_core::whisper_model_downloaded(&cache_root, &model))
+}
+
+/// The backend the engine would resolve right now for the configured default
+/// language, so the UI reports reality instead of re-deriving it (#297). Per-source
+/// language is not in scope — this answers for the Settings default.
+#[tracing::instrument(skip_all)]
+#[tauri::command]
+pub async fn resolve_asr_backend(
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<AsrBackend, LensError> {
+    let asr = engine.config().await.asr;
+    engine
+        .resolve_asr_backend(asr.language.as_ref(), asr.translate)
+        .await
 }
 
 /// Whether Apple-native ASR is usable on this device, and when it is not, why.

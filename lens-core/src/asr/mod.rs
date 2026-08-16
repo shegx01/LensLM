@@ -69,7 +69,11 @@ pub struct TranscribeConfig {
 
 /// Which speech-to-text backend runs a transcription. Strong-typed; selection is
 /// explicit/router-driven, so there is deliberately no `Default`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `rename_all` is load-bearing: the wire form must stay the same token
+/// [`as_str`](AsrBackend::as_str) yields and the config persists, or the UI and the
+/// stored value silently desync. Bound by `asr_backend_wire_form_equals_as_str`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AsrBackend {
     AppleNative,
     LocalWhisper,
@@ -225,6 +229,21 @@ mod tests {
             AsrBackend::Cloud,
         ] {
             assert_eq!(AsrBackend::from_opt_str(Some(b.as_str())), Some(b));
+        }
+    }
+
+    /// T-U-11. A bare derive would emit `"AppleNative"` and pass every other test.
+    #[test]
+    fn asr_backend_wire_form_equals_as_str() {
+        for b in [
+            AsrBackend::AppleNative,
+            AsrBackend::LocalWhisper,
+            AsrBackend::Cloud,
+        ] {
+            let json = serde_json::to_string(&b).expect("serialize backend");
+            assert_eq!(json, format!("\"{}\"", b.as_str()));
+            let back: AsrBackend = serde_json::from_str(&json).expect("deserialize backend");
+            assert_eq!(back, b);
         }
     }
 

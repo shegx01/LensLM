@@ -21,7 +21,7 @@ use lens_core::asr::cloud::chunk::{split_if_needed, stitch_segments};
 use lens_core::asr::cloud::wav::{WAV_HEADER_BYTES, pcm_to_wav};
 use lens_core::asr::cloud::{CloudAsrEngine, default_base_url, default_model, preflight_check};
 use lens_core::asr::{
-    AsrEngine, MockAsrEngine, TranscribeConfig, TranscriptOutput, TranscriptSegment,
+    AsrBackend, AsrEngine, MockAsrEngine, TranscribeConfig, TranscriptOutput, TranscriptSegment,
 };
 use lens_core::config::{AppConfig, AsrConfig, CloudAsrProvider};
 use rstest::rstest;
@@ -1435,6 +1435,16 @@ async fn empty_backend_never_selects_cloud_despite_a_usable_cloud_block() {
     engine
         .set_asr_engine(Some(Arc::new(MockAsrEngine::new(canned.clone()))))
         .await;
+
+    let resolved = engine
+        .resolve_asr_backend(None, false)
+        .await
+        .expect("resolve");
+    assert_ne!(
+        resolved,
+        AsrBackend::Cloud,
+        "the resolution seam the UI reads must not report cloud either"
+    );
 
     let (out, backend) = engine
         .transcribe(&tiny_pcm(), &TranscribeConfig::default(), None, None)

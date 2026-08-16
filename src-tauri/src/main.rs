@@ -237,6 +237,7 @@ fn main() {
             commands::system::download_whisper_model,
             commands::system::whisper_model_downloaded,
             commands::system::asr_apple_native_available,
+            commands::system::resolve_asr_backend,
             commands::system::fastembed_models_cached,
             commands::system::warm_fastembed_model,
             commands::system::gpu_accelerated_models,

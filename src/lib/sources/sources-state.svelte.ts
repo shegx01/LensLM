@@ -57,6 +57,10 @@ interface SourceViewerRequest {
 let sourceViewerRequest = $state<SourceViewerRequest | null>(null);
 let sourceViewerNonce = $state(0);
 
+// Session-scoped only, by design (#297 AC4.4/G7): which ASR backend actually
+// transcribed each audio source. Not persisted — vanishes on reload.
+let effectiveBackendBySource = $state(new Map<string, string>());
+
 // ---------------------------------------------------------------------------
 // Exported store object
 // ---------------------------------------------------------------------------
@@ -101,6 +105,10 @@ export const sourcesStore = {
   /** Bumps on every `openSourceViewer` call so reopening the same source+span re-fires. */
   get sourceViewerNonce(): number {
     return sourceViewerNonce;
+  },
+  /** Session-scoped ASR marker for `sourceId` (#297 AC4.4); `null` if none was captured. */
+  effectiveBackendFor(sourceId: string): string | null {
+    return effectiveBackendBySource.get(sourceId) ?? null;
   }
 };
 
@@ -243,6 +251,9 @@ function makeIngestHandler(sourceId: string): (e: StreamEvent<IngestProgress>) =
   return function handleEvent(e: StreamEvent<IngestProgress>): void {
     if (e.type === 'chunk' && e.data) {
       updateSourceStatus(sourceId, phaseToStatus(e.data.phase));
+      if (e.data.effective_backend) {
+        effectiveBackendBySource.set(sourceId, e.data.effective_backend);
+      }
     } else if (e.type === 'progress') {
       // reserved for future progress bar
     } else if (e.type === 'done') {
@@ -422,6 +433,7 @@ export function resetSourcesStore(): void {
   focusNonce = 0;
   sourceViewerRequest = null;
   sourceViewerNonce = 0;
+  effectiveBackendBySource = new Map();
   for (const entry of trashQueue) {
     clearTimeout(entry.timeoutId);
   }

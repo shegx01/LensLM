@@ -7,11 +7,11 @@
 
 use std::sync::Arc;
 
+use lens_core::{AsrBackend, LensEngine, MockAsrEngine, TranscribeConfig, TranscriptSegment};
 #[cfg(feature = "local-whisper")]
 use lens_core::{
     DEFAULT_WHISPER_MODEL_ID, download_whisper_model, resolve_whisper, whisper_model_path,
 };
-use lens_core::{LensEngine, MockAsrEngine, TranscribeConfig, TranscriptSegment};
 
 fn canned() -> Vec<TranscriptSegment> {
     vec![
@@ -196,4 +196,79 @@ async fn transcribe_local_whisper_missing_model_errors() {
         msg.contains("not downloaded") || msg.contains("feature not built"),
         "message: {msg}"
     );
+}
+
+/// T-INT-4: the resolved-backend seam the UI consumes, end-to-end through the real
+/// engine, returning the typed enum rather than a re-derived string.
+#[tokio::test]
+async fn resolve_asr_backend_reports_the_engine_decision() {
+    let engine = LensEngine::for_test().await;
+
+    assert_eq!(
+        engine
+            .resolve_asr_backend(None, false)
+            .await
+            .expect("resolve"),
+        AsrBackend::LocalWhisper,
+        "no injected engine → Whisper"
+    );
+
+    engine
+        .set_asr_engine(Some(Arc::new(MockAsrEngine::new(canned()))))
+        .await;
+    assert_eq!(
+        engine
+            .resolve_asr_backend(None, false)
+            .await
+            .expect("resolve"),
+        AsrBackend::AppleNative,
+        "an injected engine with no override → Apple"
+    );
+
+    for token in ["local_whisper", "cloud", "apple_native"] {
+        let mut config = engine.config().await;
+        config.asr.backend = token.to_string();
+        engine.set_config(config).await;
+        let resolved = engine
+            .resolve_asr_backend(None, false)
+            .await
+            .expect("resolve");
+        assert_eq!(resolved.as_str(), token, "an explicit override must win");
+    }
+}
+
+/// T-INT-5. Equal answers alone would not catch a re-read across an await racing a
+/// concurrent `set_asr_engine`, so the single-observation property is asserted too.
+#[tokio::test]
+async fn resolve_asr_backend_agrees_with_transcribe_and_reads_the_engine_once() {
+    let engine = LensEngine::for_test().await;
+    let expected = canned();
+    engine
+        .set_asr_engine(Some(Arc::new(MockAsrEngine::new(expected.clone()))))
+        .await;
+
+    let before = engine.asr_engine_reads();
+    let resolved = engine
+        .resolve_asr_backend(None, false)
+        .await
+        .expect("resolve");
+    assert_eq!(
+        engine.asr_engine_reads() - before,
+        1,
+        "the resolution path must read the engine slot exactly once"
+    );
+
+    let before = engine.asr_engine_reads();
+    let (out, label) = engine
+        .transcribe(&[0.0_f32; 16], &TranscribeConfig::default(), None, None)
+        .await
+        .expect("transcribe");
+    assert_eq!(
+        engine.asr_engine_reads() - before,
+        1,
+        "transcribe must reach the same decision from a single engine read"
+    );
+
+    assert_eq!(out, expected);
+    assert_eq!(label, resolved.as_str());
 }
