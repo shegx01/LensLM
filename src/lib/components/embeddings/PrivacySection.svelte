@@ -9,6 +9,8 @@
   import { Switch } from '$lib/components/ui/switch/index.js';
   import type { AppConfig } from '$lib/theme/types.js';
   import { updateConfig } from '$lib/config.js';
+  import { appConfigStore, ensureLoaded, persist } from '$lib/models/app-config.svelte.js';
+  import { toLensError } from '$lib/sources/lens-error.js';
   import { providerDescriptors } from '$lib/models/providers.js';
 
   interface EgressRow {
@@ -17,13 +19,21 @@
     detail: string;
   }
 
-  let egressRows = $state<EgressRow[]>([]);
+  // tts isn't a field the shared store owns, so it's read separately from the
+  // same mount-time fetch that seeds textConsent.
+  let ttsCfg = $state<AppConfig['tts'] | undefined>(undefined);
   let textConsent = $state(false);
-  let audioConsent = $state(false);
   let saving = $state(false);
   let saveError = $state<string | null>(null);
+  let ttsLoadError = $state<string | null>(null);
 
-  const anyActive = $derived(egressRows.some((row) => row.active));
+  const audioConsent = $derived(appConfigStore.audioCloudConsent);
+  // The egress list reads both this mount's own tts/enrichment fetch and the shared store;
+  // any of the three failing (no data, stale data, or this mount's own fetch) means the list
+  // can't be trusted, so it must say so rather than assert "local".
+  const egressLoadError = $derived(
+    appConfigStore.loadError ?? appConfigStore.staleError ?? ttsLoadError
+  );
 
   /** True when `url` is a non-empty base URL that is not a loopback host. */
   function isRemoteUrl(url: string | undefined): boolean {
@@ -33,10 +43,10 @@
   }
 
   /** Cloud LLM egress: active when the pinned chat model belongs to a non-local provider. */
-  function llmEgress(cfg: AppConfig): EgressRow {
-    const pin = cfg.enrichment?.chat_model;
+  function llmEgress(): EgressRow {
+    const pin = appConfigStore.enrichment.chat_model;
     const descriptor = pin ? providerDescriptors().find((d) => d.id === pin.provider) : undefined;
-    const entry = pin ? cfg.models?.find((m) => m.provider === pin.provider) : undefined;
+    const entry = pin ? appConfigStore.models.find((m) => m.provider === pin.provider) : undefined;
     // Fail safe for a privacy surface: a known provider follows its descriptor kind,
     // but an unknown provider counts as active cloud egress if its base_url is remote.
     const active = descriptor != null ? descriptor.kind !== 'local' : isRemoteUrl(entry?.base_url);
@@ -49,10 +59,10 @@
 
   /** Cloud TTS egress: `tts.backend` is the tagged `{ cloud: CloudTtsKind }` variant;
    *  its base URL lives in the per-provider `tts.clouds[kind]` entry (#40). */
-  function ttsEgress(cfg: AppConfig): EgressRow {
-    const backend = cfg.tts?.backend;
+  function ttsEgress(): EgressRow {
+    const backend = ttsCfg?.backend;
     const active = typeof backend === 'object' && backend !== null && 'cloud' in backend;
-    const baseUrl = active ? cfg.tts?.clouds?.[backend.cloud]?.base_url?.trim() : '';
+    const baseUrl = active ? ttsCfg?.clouds?.[backend.cloud]?.base_url?.trim() : '';
     return {
       label: 'Text-to-speech',
       active,
@@ -60,26 +70,34 @@
     };
   }
 
-  /** Cloud ASR egress: `asr.backend` is a plain string; `"cloud"` is the explicit override. */
-  function asrEgress(cfg: AppConfig): EgressRow {
-    const active = cfg.asr?.backend === 'cloud';
+  /** Cloud ASR egress: reads the same store snapshot the Transcription panel writes,
+   *  so this row can't disagree with it (`asr.backend` is a plain string; `"cloud"` is
+   *  the explicit override). */
+  function asrEgress(): EgressRow {
+    const asr = appConfigStore.asr;
+    const active = asr?.backend === 'cloud';
     return {
       label: 'Speech-to-text',
       active,
-      detail: active ? cfg.asr?.cloud_base_url?.trim() || 'Cloud' : 'Local'
+      detail: active ? asr?.cloud_base_url?.trim() || 'Cloud' : 'Local'
     };
   }
+
+  const egressRows = $derived<EgressRow[]>([llmEgress(), ttsEgress(), asrEgress()]);
+  const anyActive = $derived(egressRows.some((row) => row.active));
 
   onMount(async () => {
     if (!isTauri()) return;
     try {
       const cfg = await invoke<AppConfig>('get_config');
-      egressRows = [llmEgress(cfg), ttsEgress(cfg), asrEgress(cfg)];
+      ttsCfg = cfg.tts;
       textConsent = cfg.enrichment?.cloud_consent ?? false;
-      audioConsent = cfg.audio_cloud_consent ?? false;
-    } catch {
-      // Non-fatal: leave defaults (all local, consent off).
+    } catch (err) {
+      ttsLoadError = toLensError(err).message;
     }
+    // Kept after the raw fetch above (not raced against it) so this extra hop can't land after
+    // a user's own click and stomp an optimistic write — see the text-consent handler below.
+    await ensureLoaded();
   });
 
   async function handleTextConsent(checked: boolean): Promise<void> {
@@ -92,7 +110,7 @@
         enrichment: { ...cfg.enrichment, cloud_consent: checked }
       }));
     } catch (err) {
-      saveError = err instanceof Error ? err.message : 'Could not save setting.';
+      saveError = toLensError(err).message;
       textConsent = !checked;
     } finally {
       saving = false;
@@ -100,14 +118,13 @@
   }
 
   async function handleAudioConsent(checked: boolean): Promise<void> {
-    audioConsent = checked;
     saving = true;
     saveError = null;
     try {
-      await updateConfig((cfg) => ({ ...cfg, audio_cloud_consent: checked }));
+      await persist((cfg) => ({ ...cfg, audio_cloud_consent: checked }));
+      if (appConfigStore.persistError) saveError = appConfigStore.persistError;
     } catch (err) {
-      saveError = err instanceof Error ? err.message : 'Could not save setting.';
-      audioConsent = !checked;
+      saveError = toLensError(err).message;
     } finally {
       saving = false;
     }
@@ -125,7 +142,14 @@
       Data leaving this device
     </p>
 
-    {#if anyActive}
+    {#if egressLoadError}
+      <p
+        class="mt-3 rounded-[10px] border border-border bg-muted px-3.5 py-3 text-[0.75rem] text-muted-foreground"
+        role="status"
+      >
+        Couldn't verify what leaves this device — {egressLoadError}
+      </p>
+    {:else if anyActive}
       <div class="mt-3 flex flex-col gap-2">
         {#each egressRows as row (row.label)}
           <div
@@ -180,22 +204,31 @@
       />
     </label>
 
-    <label
-      class="mt-3 flex cursor-pointer items-center justify-between gap-4 rounded-[10px] border border-border bg-card px-4 py-3.5 transition-colors hover:border-border/80"
-    >
-      <span class="min-w-0 flex-1">
-        <span class="block text-[0.78rem] font-bold text-foreground">Allow cloud audio</span>
-        <span class="mt-0.5 block text-[0.68rem] text-muted-foreground">
-          Lets text-to-speech and speech-to-text use a cloud provider when one is configured.
+    {#if appConfigStore.loadError}
+      <p
+        class="mt-3 rounded-[10px] border border-border bg-muted px-4 py-3.5 text-[0.75rem] text-muted-foreground"
+        role="status"
+      >
+        Couldn't load cloud audio consent — {appConfigStore.loadError}
+      </p>
+    {:else}
+      <label
+        class="mt-3 flex cursor-pointer items-center justify-between gap-4 rounded-[10px] border border-border bg-card px-4 py-3.5 transition-colors hover:border-border/80"
+      >
+        <span class="min-w-0 flex-1">
+          <span class="block text-[0.78rem] font-bold text-foreground">Allow cloud audio</span>
+          <span class="mt-0.5 block text-[0.68rem] text-muted-foreground">
+            Lets text-to-speech and speech-to-text use a cloud provider when one is configured.
+          </span>
         </span>
-      </span>
-      <Switch
-        checked={audioConsent}
-        disabled={saving}
-        aria-label="Allow cloud audio"
-        onCheckedChange={handleAudioConsent}
-      />
-    </label>
+        <Switch
+          checked={audioConsent}
+          disabled={saving}
+          aria-label="Allow cloud audio"
+          onCheckedChange={handleAudioConsent}
+        />
+      </label>
+    {/if}
   </div>
 
   {#if saveError}

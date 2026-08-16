@@ -11,8 +11,12 @@ use sha2::{Digest, Sha256};
 use crate::LensError;
 use crate::tts::DownloadProgress;
 
-/// Only the connect phase is bounded; the body stream may take minutes on a slow link.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Idle read timeout: resets on each received chunk, not a total-request deadline, so a
+/// large legitimate download never times out — but a fully stalled response body does
+/// (see `llm::LLM_GENERATION_IDLE_TIMEOUT` for the same idiom).
+const IDLE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Reads `Content-Length` from response headers (works for HEAD responses too).
 fn content_length_header(headers: &reqwest::header::HeaderMap) -> Option<u64> {
@@ -45,6 +49,7 @@ where
 {
     let client = reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(IDLE_READ_TIMEOUT)
         .build()
         .map_err(|e| LensError::Network(format!("download client init failed: {e}")))?;
 

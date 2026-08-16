@@ -28,7 +28,8 @@ export function baseAppConfig(overrides?: Partial<AppConfig>): AppConfig {
       cloud_provider: null,
       cloud_base_url: '',
       cloud_model: '',
-      cloud_api_key: ''
+      cloud_api_key: '',
+      apple_min_confidence: 0.5
     },
     audio_cloud_consent: false,
     js_render_enabled: true,

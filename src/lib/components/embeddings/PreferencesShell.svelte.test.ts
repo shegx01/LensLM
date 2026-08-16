@@ -26,7 +26,8 @@ describe('PreferencesShell deep-link (AC-7)', () => {
   it.each([
     ['storage', 'Storage'],
     ['privacy', 'Privacy'],
-    ['shortcuts', 'Shortcuts']
+    ['shortcuts', 'Shortcuts'],
+    ['transcription', 'Transcription']
   ])('renders the %s panel when deep-linked (issue #32)', async (section, heading) => {
     notebookStore.openSettings(section);
     render(PreferencesShell);

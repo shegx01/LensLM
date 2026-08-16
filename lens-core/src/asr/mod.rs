@@ -131,6 +131,7 @@ pub struct MockAsrEngine {
     segments: Vec<TranscriptSegment>,
     confidence: Option<f32>,
     supports_locale: bool,
+    seen_config: Option<std::sync::Arc<std::sync::Mutex<Option<TranscribeConfig>>>>,
 }
 
 #[cfg(any(test, feature = "test-util"))]
@@ -140,7 +141,18 @@ impl MockAsrEngine {
             segments,
             confidence: None,
             supports_locale: true,
+            seen_config: None,
         }
+    }
+
+    /// Records the [`TranscribeConfig`] each `transcribe_pcm` call receives, so a
+    /// test can assert what the caller actually forwarded rather than what it stored.
+    pub fn recording_config(
+        mut self,
+        sink: std::sync::Arc<std::sync::Mutex<Option<TranscribeConfig>>>,
+    ) -> Self {
+        self.seen_config = Some(sink);
+        self
     }
 
     /// Sets the aggregate clip confidence this mock reports.
@@ -162,9 +174,14 @@ impl AsrEngine for MockAsrEngine {
     async fn transcribe_pcm(
         &self,
         _pcm: &[f32],
-        _config: &TranscribeConfig,
+        config: &TranscribeConfig,
         progress_tx: Option<tokio::sync::mpsc::UnboundedSender<f32>>,
     ) -> Result<TranscriptOutput, LensError> {
+        if let Some(sink) = &self.seen_config
+            && let Ok(mut slot) = sink.lock()
+        {
+            *slot = Some(config.clone());
+        }
         if let Some(tx) = progress_tx {
             let _ = tx.send(0.5);
             let _ = tx.send(1.0);
