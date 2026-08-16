@@ -6,16 +6,20 @@
 -->
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { invoke, isTauri } from '@tauri-apps/api/core';
   import { cn } from '$lib/utils.js';
   import { Button } from '$lib/components/ui/button/index.js';
   import {
     ASR_ENGINE_CATALOG,
+    appleAsrUnavailableReason,
     asrBackendToken,
     asrEngineIdFromBackend,
     type AsrEngineId
   } from '$lib/asr/catalog.js';
-  import { whisperModelDownloaded } from '$lib/asr/ipc.js';
+  import {
+    appleAsrAvailability,
+    whisperModelDownloaded,
+    type AppleAsrAvailability
+  } from '$lib/asr/ipc.js';
   import { appConfigStore, ensureLoaded, persist } from '$lib/models/app-config.svelte.js';
   import { toLensError } from '$lib/sources/lens-error.js';
   import TranscriptionApplePane from './TranscriptionApplePane.svelte';
@@ -24,7 +28,7 @@
   import TranscriptionLanguageBlock from './TranscriptionLanguageBlock.svelte';
 
   let selectedEngine = $state<AsrEngineId>('automatic');
-  let appleAvailable = $state(false);
+  let appleAvailability = $state<AppleAsrAvailability | null>(null);
   let whisperPresent = $state(false);
   let ready = $state(false);
   let error = $state<string | null>(null);
@@ -32,6 +36,8 @@
   const persistedEngine = $derived(asrEngineIdFromBackend(appConfigStore.asr?.backend ?? ''));
   const selectedEntry = $derived(ASR_ENGINE_CATALOG.find((e) => e.id === selectedEngine));
 
+  const appleAvailable = $derived(appleAvailability === 'available');
+  const appleReason = $derived(appleAsrUnavailableReason(appleAvailability));
   const automaticUsable = $derived(appleAvailable || whisperPresent);
 
   // The engine actually powering transcription — persisted AND usable. Drives the
@@ -66,12 +72,11 @@
       : { text: 'Needs setup', tone: 'setup' };
   }
 
-  async function probeAppleAvailable(): Promise<boolean> {
-    if (!isTauri()) return false;
+  async function probeAppleAvailability(): Promise<AppleAsrAvailability | null> {
     try {
-      return await invoke<boolean>('asr_apple_native_available');
+      return await appleAsrAvailability();
     } catch {
-      return false;
+      return null;
     }
   }
 
@@ -80,10 +85,10 @@
     selectedEngine = asrEngineIdFromBackend(appConfigStore.asr?.backend ?? '');
     const model = appConfigStore.asr?.whisper_model ?? '';
     const [apple, whisper] = await Promise.all([
-      probeAppleAvailable(),
+      probeAppleAvailability(),
       model ? whisperModelDownloaded(model).catch(() => false) : Promise.resolve(false)
     ]);
-    appleAvailable = apple;
+    appleAvailability = apple;
     whisperPresent = whisper;
     ready = true;
   });
@@ -140,7 +145,7 @@
         {#each ASR_ENGINE_CATALOG as e (e.id)}
           {@const checked = e.id === selectedEngine}
           {@const pill = rowPill(e.id)}
-          {@const unavailable = e.id === 'apple_native' && !appleAvailable}
+          {@const unavailableNote = e.id === 'apple_native' ? appleReason : null}
           <button
             type="button"
             role="radio"
@@ -174,7 +179,7 @@
                 {/if}
               </span>
               <span class="mt-px block truncate text-[0.68rem] text-muted-foreground">
-                {unavailable && e.unavailableReason ? e.unavailableReason : e.description}
+                {unavailableNote ?? e.description}
               </span>
             </span>
           </button>

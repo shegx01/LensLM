@@ -8,13 +8,9 @@
 #![recursion_limit = "256"]
 
 // The Apple-native ASR bridge (issue #42): `AppleSpeechEngine` (SpeechAnalyzer via
-// a Swift @_cdecl C ABI). aarch64-apple-darwin + `apple-native-asr` only; elsewhere
-// it compiles out and the router picks Whisper.
-#[cfg(all(
-    target_os = "macos",
-    target_arch = "aarch64",
-    feature = "apple-native-asr"
-))]
+// a Swift @_cdecl C ABI). Present only when build.rs actually compiled the Swift
+// bridge (`apple_asr_bridge`); elsewhere it compiles out and the router picks Whisper.
+#[cfg(apple_asr_bridge)]
 mod asr;
 
 mod commands;
@@ -119,11 +115,7 @@ fn main() {
             // `set_js_renderer` above. The runtime macOS>=26 gate lives here (not
             // in lens-core) because OS probing is an src-tauri responsibility;
             // lens-core treats a present engine as authoritative.
-            #[cfg(all(
-                target_os = "macos",
-                target_arch = "aarch64",
-                feature = "apple-native-asr"
-            ))]
+            #[cfg(apple_asr_bridge)]
             {
                 let macos_ok = commands::system::macos_major_version()
                     .map(|v| v >= lens_core::MIN_MACOS_FOR_APPLE_ASR)

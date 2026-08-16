@@ -1,6 +1,7 @@
 // Static ASR catalog data: engine rows, cloud presets, language options, and the
 // per-engine capability matrix. Pure data + lookups — no Tauri calls.
 
+import type { AppleAsrAvailability } from '$lib/asr/ipc.js';
 import type { AsrLang, CloudAsrProvider } from '$lib/theme/types.js';
 
 /** UI engine row id. Distinct from the wire `AsrConfig.backend` token — see `asrBackendToken`. */
@@ -10,8 +11,6 @@ export interface AsrEngineCatalogEntry {
   id: AsrEngineId;
   label: string;
   description: string;
-  /** Only set for rows whose unavailability needs explaining (today: `apple_native`). */
-  unavailableReason?: string;
 }
 
 // SYNC-CHECK: tokens must match lens-core/src/config.rs AsrConfig.backend doc and
@@ -26,9 +25,7 @@ export const ASR_ENGINE_CATALOG: AsrEngineCatalogEntry[] = [
   {
     id: 'apple_native',
     label: 'Apple (on-device)',
-    description: 'On-device transcription via the macOS Speech framework. Private, no network.',
-    unavailableReason:
-      'Unavailable — needs an Apple silicon Mac on macOS 26 with the Apple speech bridge built in.'
+    description: 'On-device transcription via the macOS Speech framework. Private, no network.'
   },
   {
     id: 'local_whisper',
@@ -41,6 +38,28 @@ export const ASR_ENGINE_CATALOG: AsrEngineCatalogEntry[] = [
     description: 'Sends audio to a cloud provider for transcription. Requires consent.'
   }
 ];
+
+/**
+ * Why the Apple row is unavailable, or `null` when it is available. Blockers read
+ * differently because they call for different actions; a `null` availability means
+ * the probe has not answered, which is not itself a claim about the device.
+ */
+export function appleAsrUnavailableReason(
+  availability: AppleAsrAvailability | null
+): string | null {
+  if (availability === null) return 'Unavailable — availability could not be determined.';
+  if (availability === 'available') return null;
+  if (availability === 'not_built') {
+    return 'Unavailable — this build of LensLM does not include the Apple speech bridge.';
+  }
+  const cause = availability.unsupported;
+  if (cause === 'not_apple_silicon') return 'Unavailable — needs an Apple silicon Mac.';
+  if (cause === 'version_probe_failed') {
+    return "Unavailable — this Mac's macOS version could not be read.";
+  }
+  const { found, required } = cause.macos_too_old;
+  return `Unavailable — needs macOS ${required} or later; this Mac runs macOS ${found}.`;
+}
 
 /** Maps a UI engine id to the wire `AsrConfig.backend` token (`""` for Automatic). */
 export function asrBackendToken(id: AsrEngineId): string {

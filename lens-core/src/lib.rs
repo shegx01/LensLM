@@ -2161,9 +2161,22 @@ impl LensEngine {
                     .await?;
                 Ok((segs, "local_whisper"))
             }
-            (asr::AsrBackend::AppleNative, None) => Err(LensError::Transcription(
-                "apple-native backend selected but no engine is injected".into(),
-            )),
+            // A forced apple_native with nothing injected (the Swift bridge was not
+            // built, or the OS gate rejected it at startup) still must not leave the
+            // user without a transcription — same Whisper fallback as an Apple
+            // runtime failure above, keeping the original error when there is none.
+            (asr::AsrBackend::AppleNative, None) => {
+                if self.local_whisper_available(&asr_cfg).await {
+                    let segs = self
+                        .transcribe_local_whisper(pcm, config, progress_tx, &asr_cfg, cancel)
+                        .await?;
+                    Ok((segs, "local_whisper (fallback)"))
+                } else {
+                    Err(LensError::Transcription(
+                        "apple-native backend selected but no engine is injected".into(),
+                    ))
+                }
+            }
             // Cloud (#45): pre-flight (consent/key/provider) + request; any failure
             // that is not a user-cancel transparently degrades to the local cascade
             // (Apple-if-injected → Whisper), mirroring the Apple→Whisper symmetry.

@@ -441,24 +441,64 @@ pub async fn whisper_model_downloaded(
     Ok(lens_core::whisper_model_downloaded(&cache_root, &model))
 }
 
-/// Returns `true` when Apple-native ASR is available on this device:
-/// compiled with the `apple-native-asr` feature AND running on macOS >= 26.
-/// Used by the onboarding UI to skip the Whisper download step — this is a
-/// UI signal only, NOT a router input (backend selection is `select_asr_backend`).
+/// Whether Apple-native ASR is usable on this device, and when it is not, why.
+/// Externally tagged like `TtsBackend::Cloud(kind)`; `required` rides the wire so
+/// no TS constant has to mirror `MIN_MACOS_FOR_APPLE_ASR`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppleAsrAvailability {
+    Available,
+    NotBuilt,
+    Unsupported(AppleAsrUnsupported),
+}
+
+/// The blocker behind [`AppleAsrAvailability::Unsupported`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppleAsrUnsupported {
+    NotAppleSilicon,
+    MacosTooOld { found: u32, required: u32 },
+    VersionProbeFailed,
+}
+
+/// Reports Apple-native ASR availability. Used by the onboarding UI to skip the
+/// Whisper download step — a UI signal only, NOT a router input (backend selection
+/// is `select_asr_backend`).
 #[tracing::instrument(skip_all)]
 #[tauri::command]
-pub async fn asr_apple_native_available() -> Result<bool, LensError> {
-    // Compile-time gate: the feature must be present and the target must be
-    // aarch64-apple-darwin; this is false on every other platform/feature.
-    if !cfg!(all(
-        target_os = "macos",
-        target_arch = "aarch64",
-        feature = "apple-native-asr"
-    )) {
-        return Ok(false);
+pub async fn asr_apple_native_available() -> Result<AppleAsrAvailability, LensError> {
+    Ok(classify_apple_asr(
+        cfg!(all(target_os = "macos", target_arch = "aarch64")),
+        cfg!(apple_asr_bridge),
+        macos_major_version(),
+    ))
+}
+
+/// Pure core of [`asr_apple_native_available`], so the precedence is testable off
+/// a Mac. The OS gate deliberately precedes the bridge gate: an outdated macOS is
+/// a blocker no rebuild can clear, and `NotBuilt` would send the user to install
+/// Xcode for no benefit.
+fn classify_apple_asr(
+    apple_silicon_build: bool,
+    bridge_built: bool,
+    version: Result<u32, LensError>,
+) -> AppleAsrAvailability {
+    if !apple_silicon_build {
+        return AppleAsrAvailability::Unsupported(AppleAsrUnsupported::NotAppleSilicon);
     }
-    // Runtime gate: macOS >= 26 is required for SpeechAnalyzer/SpeechTranscriber.
-    Ok(macos_major_version()? >= lens_core::MIN_MACOS_FOR_APPLE_ASR)
+    let Ok(found) = version else {
+        return AppleAsrAvailability::Unsupported(AppleAsrUnsupported::VersionProbeFailed);
+    };
+    if found < lens_core::MIN_MACOS_FOR_APPLE_ASR {
+        return AppleAsrAvailability::Unsupported(AppleAsrUnsupported::MacosTooOld {
+            found,
+            required: lens_core::MIN_MACOS_FOR_APPLE_ASR,
+        });
+    }
+    if !bridge_built {
+        return AppleAsrAvailability::NotBuilt;
+    }
+    AppleAsrAvailability::Available
 }
 
 /// Parses the macOS major version from `sw_vers -productVersion`.
@@ -883,5 +923,90 @@ mod tests {
                 StreamEvent::Done,
             ]
         );
+    }
+
+    fn probe_failed() -> Result<u32, LensError> {
+        Err(LensError::Internal("sw_vers failed".into()))
+    }
+
+    #[test]
+    fn classify_apple_asr_reports_non_apple_hardware_first() {
+        for bridge_built in [false, true] {
+            assert_eq!(
+                classify_apple_asr(false, bridge_built, Ok(26)),
+                AppleAsrAvailability::Unsupported(AppleAsrUnsupported::NotAppleSilicon)
+            );
+        }
+        assert_eq!(
+            classify_apple_asr(false, true, probe_failed()),
+            AppleAsrAvailability::Unsupported(AppleAsrUnsupported::NotAppleSilicon)
+        );
+    }
+
+    /// An outdated macOS outranks a missing bridge: rebuilding cannot clear it, so
+    /// `NotBuilt` would send the user to install Xcode for no benefit.
+    #[test]
+    fn classify_apple_asr_reports_old_macos_before_missing_bridge() {
+        for bridge_built in [false, true] {
+            assert_eq!(
+                classify_apple_asr(true, bridge_built, Ok(15)),
+                AppleAsrAvailability::Unsupported(AppleAsrUnsupported::MacosTooOld {
+                    found: 15,
+                    required: 26,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn classify_apple_asr_reports_missing_bridge_on_a_capable_machine() {
+        assert_eq!(
+            classify_apple_asr(true, false, Ok(26)),
+            AppleAsrAvailability::NotBuilt
+        );
+    }
+
+    #[test]
+    fn classify_apple_asr_reports_available_when_everything_lines_up() {
+        assert_eq!(
+            classify_apple_asr(true, true, Ok(26)),
+            AppleAsrAvailability::Available
+        );
+    }
+
+    #[test]
+    fn classify_apple_asr_reports_a_failed_version_probe() {
+        for bridge_built in [false, true] {
+            assert_eq!(
+                classify_apple_asr(true, bridge_built, probe_failed()),
+                AppleAsrAvailability::Unsupported(AppleAsrUnsupported::VersionProbeFailed)
+            );
+        }
+    }
+
+    #[test]
+    fn apple_asr_availability_wire_form_is_externally_tagged() {
+        let cases = [
+            (AppleAsrAvailability::Available, r#""available""#),
+            (AppleAsrAvailability::NotBuilt, r#""not_built""#),
+            (
+                AppleAsrAvailability::Unsupported(AppleAsrUnsupported::NotAppleSilicon),
+                r#"{"unsupported":"not_apple_silicon"}"#,
+            ),
+            (
+                AppleAsrAvailability::Unsupported(AppleAsrUnsupported::MacosTooOld {
+                    found: 15,
+                    required: 26,
+                }),
+                r#"{"unsupported":{"macos_too_old":{"found":15,"required":26}}}"#,
+            ),
+        ];
+        for (value, wire) in cases {
+            assert_eq!(serde_json::to_string(&value).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_str::<AppleAsrAvailability>(wire).unwrap(),
+                value
+            );
+        }
     }
 }

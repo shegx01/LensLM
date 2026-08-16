@@ -25,6 +25,26 @@ export async function whisperModelDownloaded(model: string): Promise<boolean> {
   return invoke<boolean>('whisper_model_downloaded', { model });
 }
 
+// SYNC-CHECK: must match src-tauri/src/commands/system.rs AppleAsrUnsupported
+// (externally tagged, snake_case). `required` rides the wire, so nothing here
+// mirrors MIN_MACOS_FOR_APPLE_ASR.
+export type AppleAsrUnsupported =
+  | 'not_apple_silicon'
+  | 'version_probe_failed'
+  | { macos_too_old: { found: number; required: number } };
+
+// SYNC-CHECK: must match src-tauri/src/commands/system.rs AppleAsrAvailability.
+export type AppleAsrAvailability = 'available' | 'not_built' | { unsupported: AppleAsrUnsupported };
+
+/**
+ * Whether Apple-native ASR is usable on this device, and if not, why. Outside
+ * Tauri there is no bridge at all, which is exactly `not_built`.
+ */
+export async function appleAsrAvailability(): Promise<AppleAsrAvailability> {
+  if (!isTauri()) return 'not_built';
+  return invoke<AppleAsrAvailability>('asr_apple_native_available');
+}
+
 /** Clamp a 0..1 ratio to an integer 0..100 percentage. */
 function toPct(received: number, total: number | null): number | null {
   if (total === null || total <= 0) return null;

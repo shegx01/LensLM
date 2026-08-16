@@ -1,6 +1,7 @@
 import { render, screen, fireEvent, waitFor, within } from '@testing-library/svelte';
 import { mockIPC, clearMocks } from '@tauri-apps/api/mocks';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { AppleAsrAvailability } from '$lib/asr/ipc.js';
 import type { AppConfig, AsrConfig } from '$lib/theme/types.js';
 import { baseAppConfig } from '$lib/test-fixtures.js';
 import { resetConfig } from '$lib/models/app-config.svelte.js';
@@ -44,7 +45,7 @@ function baseAsr(overrides?: Partial<AsrConfig>): AsrConfig {
 function mount(opts: {
   asr?: Partial<AsrConfig>;
   audioCloudConsent?: boolean;
-  appleAvailable?: boolean;
+  appleAvailability?: AppleAsrAvailability;
   whisperDownloaded?: Record<string, boolean>;
   setConfigSpy?: (cfg: AppConfig) => void;
   onDownloadChannel?: (ch: ProgressChannel, model: string) => void;
@@ -59,7 +60,7 @@ function mount(opts: {
       opts.setConfigSpy?.((args as { config: AppConfig }).config);
       return null;
     }
-    if (cmd === 'asr_apple_native_available') return opts.appleAvailable ?? false;
+    if (cmd === 'asr_apple_native_available') return opts.appleAvailability ?? 'not_built';
     if (cmd === 'list_whisper_models') return MODELS;
     if (cmd === 'whisper_model_downloaded') {
       return downloaded[(args as { model: string }).model] ?? false;
@@ -82,6 +83,23 @@ function rowFor(name: RegExp | string): HTMLElement {
 }
 
 describe('TranscriptionSection', () => {
+  it('the Apple row names an outdated macOS as the blocker', async () => {
+    mount({ appleAvailability: { unsupported: { macos_too_old: { found: 15, required: 26 } } } });
+    await screen.findByRole('radiogroup', { name: 'Transcription engine' });
+    const row = rowFor('Apple (on-device)');
+    await waitFor(() =>
+      expect(within(row).getByText(/needs macOS 26 or later/i)).toBeInTheDocument()
+    );
+  });
+
+  it('the Apple row names a missing bridge differently from an unsupported device', async () => {
+    mount({ appleAvailability: 'not_built' });
+    await screen.findByRole('radiogroup', { name: 'Transcription engine' });
+    const row = rowFor('Apple (on-device)');
+    await waitFor(() => expect(within(row).getByText(/bridge/i)).toBeInTheDocument());
+    expect(within(row).queryByText(/needs macOS/i)).toBeNull();
+  });
+
   it('renders all four engine rows', async () => {
     mount({});
     await screen.findByRole('radiogroup', { name: 'Transcription engine' });
@@ -105,7 +123,7 @@ describe('TranscriptionSection', () => {
 
   it('selecting the unavailable Apple row never calls set_config', async () => {
     const setConfigSpy = vi.fn();
-    mount({ appleAvailable: false, setConfigSpy });
+    mount({ appleAvailability: 'not_built', setConfigSpy });
     await screen.findByRole('radiogroup', { name: 'Transcription engine' });
     const row = rowFor('Apple (on-device)');
     await fireEvent.click(row);
@@ -114,7 +132,7 @@ describe('TranscriptionSection', () => {
   });
 
   it('stock install (no whisper model, apple unavailable) shows Automatic as Needs setup, not Active', async () => {
-    mount({ appleAvailable: false, whisperDownloaded: {} });
+    mount({ appleAvailability: 'not_built', whisperDownloaded: {} });
     await screen.findByRole('radiogroup', { name: 'Transcription engine' });
     const row = rowFor('Automatic');
     await waitFor(() => expect(within(row).queryByText('Active')).toBeNull());
@@ -192,7 +210,7 @@ describe('TranscriptionSection', () => {
       if (cmd === 'set_config') {
         throw { kind: 'Internal', message: 'disk write failed' };
       }
-      if (cmd === 'asr_apple_native_available') return false;
+      if (cmd === 'asr_apple_native_available') return 'not_built';
       if (cmd === 'list_whisper_models') return MODELS;
       if (cmd === 'whisper_model_downloaded') return false;
     });
