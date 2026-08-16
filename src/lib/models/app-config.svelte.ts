@@ -1,6 +1,7 @@
-// Reactive whole-AppConfig snapshot (Svelte 5 runes, module singleton). Getters below are
-// authoritative ONLY for models/enrichment/asr/audioCloudConsent — every other AppConfig field
-// is written directly by its own section via updateConfig() and is not reflected here.
+// Reactive whole-AppConfig snapshot (Svelte 5 runes, module singleton); other AppConfig
+// fields are written via updateConfig() and aren't reflected here. Three non-sticky error
+// states, cleared independently: loadError (no snapshot yet), staleError (reload failed,
+// snapshot kept as-is), persistError (write landed, confirmation re-read failed).
 
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { updateConfig } from '$lib/config.js';
@@ -15,6 +16,7 @@ const DEFAULT_ENRICHMENT: EnrichmentConfig = {
 
 let cfg = $state<AppConfig | null>(null);
 let loadError = $state<string | null>(null);
+let staleError = $state<string | null>(null);
 let persistError = $state<string | null>(null);
 let loadPromise: Promise<void> | null = null;
 
@@ -26,15 +28,24 @@ async function load(): Promise<void> {
   if (!isTauri()) {
     cfg = null;
     loadError = null;
+    staleError = null;
     persistError = null;
     return;
   }
   try {
     cfg = await invoke<AppConfig>('get_config');
     loadError = null;
+    staleError = null;
     persistError = null;
   } catch (err) {
-    loadError = toErrorMessage(err);
+    const message = toErrorMessage(err);
+    // A snapshot already in hand means this failure only makes it stale, not absent —
+    // the two cases need different getters so callers can tell them apart.
+    if (cfg === null) {
+      loadError = message;
+    } else {
+      staleError = message;
+    }
   }
 }
 
@@ -51,13 +62,18 @@ export const appConfigStore = {
   get audioCloudConsent(): boolean {
     return cfg?.audio_cloud_consent ?? false;
   },
-  /** Non-null only while `cfg` itself is untrustworthy (still unloaded) — a `persist()`
-   *  re-read failure does not count, since `cfg` already holds a good optimistic value then. */
+  /** Non-null when no snapshot has ever loaded successfully — every getter above is
+   *  falling back to its unloaded default. */
   get loadError(): string | null {
-    return cfg === null ? loadError : null;
+    return loadError;
+  },
+  /** Non-null when a forced reload (`refreshConfig()`) failed while a prior snapshot was
+   *  already in hand — the getters above keep returning it, but it may not match the engine. */
+  get staleError(): string | null {
+    return staleError;
   },
   /** Non-null when a `persist()` write landed but its confirmation re-read failed. Distinct
-   *  from `loadError`: the caller's own write should surface this, not every other panel. */
+   *  from `loadError`/`staleError`: the caller's own write should surface this, not every other panel. */
   get persistError(): string | null {
     return persistError;
   }
@@ -104,6 +120,7 @@ export async function persist(mutate: (cfg: AppConfig) => AppConfig): Promise<vo
 export function resetConfig(): void {
   cfg = null;
   loadError = null;
+  staleError = null;
   persistError = null;
   loadPromise = null;
 }

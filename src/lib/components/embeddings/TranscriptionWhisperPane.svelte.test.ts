@@ -61,7 +61,7 @@ function mount(opts: {
       return downloaded[(args as { model: string }).model] ?? false;
     }
     if (cmd === 'download_whisper_model') {
-      const ch = (args as { onProgress: ProgressChannel }).onProgress;
+      const ch = (args as { on_progress: ProgressChannel }).on_progress;
       opts.onDownloadChannel?.(ch, (args as { model: string }).model);
       return null;
     }
@@ -72,10 +72,9 @@ function mount(opts: {
   return { ...result, onPresenceChange };
 }
 
-/** The radio button's accessible name is the bare model id (`aria-label={m.id}`),
- *  so rows are looked up by role+name rather than by visible text. The Download
- *  button/"Downloaded" badge live in a sibling slot outside the radio (see the
- *  a11y test below) — `.parentElement` is the shared row that contains both. */
+/** Rows are looked up by role+name since the radio's accessible name is the bare
+ *  model id (`aria-label={m.id}`); the Download button/"Downloaded" badge live in
+ *  a sibling slot, so `.parentElement` is the shared row containing both. */
 function rowFor(modelId: string): HTMLElement {
   return screen.getByRole('radio', { name: modelId }).parentElement as HTMLElement;
 }
@@ -133,7 +132,7 @@ describe('TranscriptionWhisperPane', () => {
         return probeCount > 1;
       }
       if (cmd === 'download_whisper_model') {
-        const ch = (args as { onProgress: ProgressChannel }).onProgress;
+        const ch = (args as { on_progress: ProgressChannel }).on_progress;
         // Fire the tick synchronously (mirrors a real streaming command) and hold
         // the invoke promise open until the test resolves it, like the terminal
         // event in production — see `resolveDownload` below.
@@ -174,7 +173,7 @@ describe('TranscriptionWhisperPane', () => {
         return model === 'base';
       }
       if (cmd === 'download_whisper_model') {
-        channel = (args as { onProgress: ProgressChannel }).onProgress;
+        channel = (args as { on_progress: ProgressChannel }).on_progress;
         return null;
       }
     });
@@ -215,6 +214,23 @@ describe('TranscriptionWhisperPane', () => {
     await fireEvent.click(screen.getByRole('radio', { name: 'small' }));
 
     await waitFor(() => expect(saved?.asr.whisper_model).toBe('small'));
+  });
+
+  it('surfaces a Tauri LensError message when persisting a selected (already-downloaded) model fails', async () => {
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return baseAppConfig();
+      if (cmd === 'list_whisper_models') return MODELS;
+      if (cmd === 'whisper_model_downloaded') return (args as { model: string }).model === 'small';
+      if (cmd === 'set_config') throw { kind: 'Io', message: 'config write failed' };
+    });
+
+    render(TranscriptionWhisperPane, { props: { onPresenceChange: vi.fn() } });
+    await waitFor(() =>
+      expect(within(rowFor('small')).getByText(/downloaded/i)).toBeInTheDocument()
+    );
+    await fireEvent.click(screen.getByRole('radio', { name: 'small' }));
+
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('config write failed'));
   });
 
   it('never persists an undownloaded selection (fail-closed: no degradation arm for LocalWhisper + missing model)', async () => {
@@ -284,6 +300,10 @@ describe('TranscriptionWhisperPane', () => {
     const downloadBtn = within(rowFor('tiny')).getByRole('button', { name: /download tiny/i });
 
     expect(downloadBtn).toBeDisabled();
+    // `disabled` alone would make this test pass even with the `id in activeDownloads`
+    // guard deleted (a disabled button never dispatches click). Clear it so the click
+    // actually reaches handleDownload and the guard itself is what stops a 2nd invoke.
+    (downloadBtn as HTMLButtonElement).disabled = false;
     await fireEvent.click(downloadBtn);
     expect(invokeCount).toBe(1);
   });
@@ -318,13 +338,113 @@ describe('TranscriptionWhisperPane', () => {
     await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('disk unavailable'));
   });
 
+  it('marks the persisted+downloaded model Active even while another row is being previewed', async () => {
+    mount({ whisperModel: 'base', downloaded: { base: true } });
+
+    await waitFor(() => expect(within(rowFor('base')).getByText(/^active$/i)).toBeInTheDocument());
+
+    await screen.findByRole('radio', { name: 'small' });
+    await fireEvent.click(screen.getByRole('radio', { name: 'small' }));
+    await waitFor(() =>
+      expect(screen.getByRole('radio', { name: 'small' })).toHaveAttribute('aria-checked', 'true')
+    );
+
+    // small is now the highlighted/previewed row, but base — the persisted model — still
+    // carries the Active badge, so "previewing" and "will run" stay visually distinct.
+    expect(within(rowFor('base')).getByText(/^active$/i)).toBeInTheDocument();
+    expect(within(rowFor('small')).queryByText(/^active$/i)).not.toBeInTheDocument();
+  });
+
+  it('allows two different models to download concurrently and completes both independently', async () => {
+    let resolveTiny: (() => void) | undefined;
+    let resolveSmall: (() => void) | undefined;
+    const channels: Partial<Record<'tiny' | 'small', ProgressChannel>> = {};
+
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return baseAppConfig();
+      if (cmd === 'list_whisper_models') return MODELS;
+      if (cmd === 'whisper_model_downloaded') return false;
+      if (cmd === 'download_whisper_model') {
+        const model = (args as { model: 'tiny' | 'small' }).model;
+        channels[model] = (args as { on_progress: ProgressChannel }).on_progress;
+        return new Promise((resolve) => {
+          if (model === 'tiny') resolveTiny = () => resolve(null);
+          else resolveSmall = () => resolve(null);
+        });
+      }
+    });
+
+    render(TranscriptionWhisperPane, { props: { onPresenceChange: vi.fn() } });
+    await screen.findByRole('radio', { name: 'tiny' });
+
+    await fireEvent.click(within(rowFor('tiny')).getByRole('button', { name: /download tiny/i }));
+    await fireEvent.click(within(rowFor('small')).getByRole('button', { name: /download small/i }));
+
+    await waitFor(() => {
+      expect(within(rowFor('tiny')).getByRole('progressbar')).toBeInTheDocument();
+      expect(within(rowFor('small')).getByRole('progressbar')).toBeInTheDocument();
+    });
+
+    channels.tiny?.onmessage({ received: 100, total: 100, done: true });
+    resolveTiny?.();
+
+    await waitFor(() =>
+      expect(within(rowFor('tiny')).queryByRole('progressbar')).not.toBeInTheDocument()
+    );
+    expect(
+      within(rowFor('tiny')).getByRole('button', { name: /download tiny/i })
+    ).not.toBeDisabled();
+    expect(within(rowFor('small')).getByRole('progressbar')).toBeInTheDocument();
+
+    channels.small?.onmessage({ received: 100, total: 100, done: true });
+    resolveSmall?.();
+
+    await waitFor(() =>
+      expect(within(rowFor('small')).queryByRole('progressbar')).not.toBeInTheDocument()
+    );
+    expect(
+      within(rowFor('small')).getByRole('button', { name: /download small/i })
+    ).not.toBeDisabled();
+  });
+
+  it('self-heals a wedged download once the watchdog window elapses, re-enabling the button', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return baseAppConfig();
+      if (cmd === 'list_whisper_models') return MODELS;
+      if (cmd === 'whisper_model_downloaded') return false;
+      if (cmd === 'download_whisper_model') return new Promise(() => {});
+    });
+
+    render(TranscriptionWhisperPane, { props: { onPresenceChange: vi.fn() } });
+    await screen.findByRole('radio', { name: 'tiny' });
+
+    // Fake timers must be installed before the click so the watchdog's own `setTimeout`
+    // (armed synchronously inside handleDownload) is one vitest can fast-forward.
+    vi.useFakeTimers();
+    try {
+      await fireEvent.click(within(rowFor('tiny')).getByRole('button', { name: /download tiny/i }));
+      expect(within(rowFor('tiny')).getByRole('button', { name: /download tiny/i })).toBeDisabled();
+
+      await vi.advanceTimersByTimeAsync(45_000);
+    } finally {
+      vi.useRealTimers();
+    }
+
+    await waitFor(() =>
+      expect(
+        within(rowFor('tiny')).getByRole('button', { name: /download tiny/i })
+      ).not.toBeDisabled()
+    );
+    expect(screen.getByRole('alert')).toHaveTextContent(/stalled/i);
+  });
+
   it('renders no Cancel control, including mid-download', async () => {
     mockIPC((cmd, args) => {
       if (cmd === 'get_config') return baseAppConfig();
       if (cmd === 'list_whisper_models') return MODELS;
       if (cmd === 'whisper_model_downloaded') return false;
       if (cmd === 'download_whisper_model') {
-        const ch = (args as { onProgress: ProgressChannel }).onProgress;
+        const ch = (args as { on_progress: ProgressChannel }).on_progress;
         ch.onmessage({ received: 10, total: 100, done: false });
         // Never resolves — keeps the download "in flight" for the assertion below.
         return new Promise(() => {});

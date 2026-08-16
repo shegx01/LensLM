@@ -71,6 +71,17 @@ fn lang_to_whisper_code(lang: &Lang) -> &str {
     }
 }
 
+/// Derives the whisper.cpp language code + translate flag from the caller's
+/// [`TranscribeConfig`]; split out so this config→params mapping is
+/// unit-testable without a loaded model (see `mod tests` below).
+fn resolve_transcribe_params(config: &TranscribeConfig) -> (Option<String>, bool) {
+    let language = config
+        .language
+        .as_ref()
+        .map(|l| lang_to_whisper_code(l).to_string());
+    (language, config.translate)
+}
+
 /// Runs the whole (blocking) inference: create a state, set params from config,
 /// call `full()`, and read segments back into [`TranscriptSegment`]s.
 fn run_inference(
@@ -150,11 +161,7 @@ impl WhisperEngine {
         // Move owned copies of the inputs into the blocking task; whisper.full is
         // CPU-blocking and must not run on the async runtime.
         let pcm = pcm.to_vec();
-        let language = config
-            .language
-            .as_ref()
-            .map(|l| lang_to_whisper_code(l).to_string());
-        let translate = config.translate;
+        let (language, translate) = resolve_transcribe_params(config);
         let ctx = Arc::clone(&self.ctx);
 
         tokio::task::spawn_blocking(move || {
@@ -187,5 +194,36 @@ impl AsrEngine for WhisperEngine {
             segments,
             confidence: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Catches a hard-coded/ignored language: reverting this mapping to always
+    /// return `None` (dropping the pinned code) turns this red.
+    #[test]
+    fn resolve_transcribe_params_forwards_the_pinned_language_code() {
+        let config = TranscribeConfig {
+            language: Some(Lang::Es),
+            translate: false,
+        };
+        let (language, translate) = resolve_transcribe_params(&config);
+        assert_eq!(language.as_deref(), Some("es"));
+        assert!(!translate);
+    }
+
+    /// Catches a hard-coded/ignored translate flag: reverting this mapping to
+    /// always return `false` turns this red.
+    #[test]
+    fn resolve_transcribe_params_forwards_the_translate_flag() {
+        let config = TranscribeConfig {
+            language: None,
+            translate: true,
+        };
+        let (language, translate) = resolve_transcribe_params(&config);
+        assert_eq!(language, None);
+        assert!(translate);
     }
 }

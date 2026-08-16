@@ -56,8 +56,12 @@
     savedApiKey = asr.cloud_api_key;
   });
 
-  /** Reject non-http(s) or malformed base URLs before saving — the base URL is the
-   *  endpoint the API key is bearer-transmitted to (`openai_compat.rs:59`). */
+  /** The API key is bearer-transmitted to this URL (`openai_compat.rs:59`), so plain
+   *  http: is only safe for a loopback host — anything else must be https:. */
+  function isLoopbackHost(hostname: string): boolean {
+    return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]';
+  }
+
   function isValidBaseUrl(raw: string): boolean {
     let parsed: URL;
     try {
@@ -65,7 +69,8 @@
     } catch {
       return false;
     }
-    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+    if (parsed.protocol === 'https:') return true;
+    return parsed.protocol === 'http:' && isLoopbackHost(parsed.hostname);
   }
 
   /** Reactive Cloud persist; no Save button. Only flips `backend` to `"cloud"` when the
@@ -74,7 +79,8 @@
     error = null;
     const trimmedBaseUrl = baseUrl.trim();
     if (trimmedBaseUrl !== '' && !isValidBaseUrl(trimmedBaseUrl)) {
-      error = 'Enter a valid base URL starting with http:// or https://.';
+      error =
+        'Enter an https:// URL. Plain http:// is only accepted for localhost, 127.0.0.1, or [::1].';
       return;
     }
     const trimmedModel = model.trim();
@@ -111,6 +117,7 @@
    *  clear all key state so the new provider starts unconfigured (and thus inactive)
    *  until the user enters its own key. */
   function handleProviderChange(value: string): void {
+    if (value === provider) return;
     provider = value as CloudAsrProvider;
     const preset = CLOUD_ASR_PRESETS[provider];
     baseUrl = preset.base_url;

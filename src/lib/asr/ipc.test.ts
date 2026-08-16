@@ -59,10 +59,27 @@ describe('whisperModelDownloaded', () => {
 });
 
 describe('downloadWhisperModel', () => {
+  // The command declares `rename_all = "snake_case"`, so Tauri looks up `on_progress` and a
+  // camelCase key rejects with `missing required key` before the download ever starts. Asserting
+  // the literal key set is the only way this surfaces in vitest — mockIPC echoes back whatever
+  // the caller sent, so a wrong key passes every behavioural test.
+  it('sends the snake_case argument keys the Rust command declares', async () => {
+    let seen: string[] = [];
+    mockIPC((cmd, args) => {
+      if (cmd === 'download_whisper_model') {
+        seen = Object.keys(args as Record<string, unknown>).sort();
+        return null;
+      }
+    });
+
+    await downloadWhisperModel('base', () => {});
+    expect(seen).toEqual(['model', 'on_progress']);
+  });
+
   it('emits the known percentage when total is present, then 100 on done', async () => {
     mockIPC((cmd, args) => {
       if (cmd === 'download_whisper_model') {
-        const ch = (args as { onProgress: ProgressChannel }).onProgress;
+        const ch = (args as { on_progress: ProgressChannel }).on_progress;
         ch.onmessage({ received: 50, total: 200, done: false });
         ch.onmessage({ received: 142_000_000, total: 142_000_000, done: true });
         return null;
@@ -77,7 +94,7 @@ describe('downloadWhisperModel', () => {
   it('emits null while the total is unknown', async () => {
     mockIPC((cmd, args) => {
       if (cmd === 'download_whisper_model') {
-        const ch = (args as { onProgress: ProgressChannel }).onProgress;
+        const ch = (args as { on_progress: ProgressChannel }).on_progress;
         ch.onmessage({ received: 0, total: null, done: false });
         return null;
       }

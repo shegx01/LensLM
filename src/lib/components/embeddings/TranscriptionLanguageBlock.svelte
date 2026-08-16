@@ -26,6 +26,7 @@
   } from '$lib/asr/catalog.js';
   import { whisperModelDownloaded } from '$lib/asr/ipc.js';
   import { appConfigStore, ensureLoaded, persist } from '$lib/models/app-config.svelte.js';
+  import { toLensError } from '$lib/sources/lens-error.js';
   import type { AsrLang } from '$lib/theme/types.js';
 
   let { activeEngine }: { activeEngine: AsrEngineId | null } = $props();
@@ -58,6 +59,8 @@
     if (isOtherAsrLanguage(language)) otherCode = language.Other;
   });
 
+  let error = $state<string | null>(null);
+
   const selectItems = [
     ...ASR_LANGUAGE_OPTIONS.map((option) => ({
       value: option.value ?? AUTO_TOKEN,
@@ -67,7 +70,12 @@
   ];
 
   async function persistLanguage(value: AsrLanguageValue): Promise<void> {
-    await persist((cfg) => ({ ...cfg, asr: { ...cfg.asr, language: value } }));
+    try {
+      error = null;
+      await persist((cfg) => ({ ...cfg, asr: { ...cfg.asr, language: value } }));
+    } catch (err) {
+      error = toLensError(err).message;
+    }
   }
 
   function handleLanguageSelect(token: string): void {
@@ -83,7 +91,12 @@
   }
 
   async function handleTranslateChange(checked: boolean): Promise<void> {
-    await persist((cfg) => ({ ...cfg, asr: { ...cfg.asr, translate: checked } }));
+    try {
+      error = null;
+      await persist((cfg) => ({ ...cfg, asr: { ...cfg.asr, translate: checked } }));
+    } catch (err) {
+      error = toLensError(err).message;
+    }
   }
 
   // Only the two cases that can land on Local Whisper via a translate reroute
@@ -120,20 +133,14 @@
     if (engine === null) return null;
     if (engine === 'automatic') {
       if (!translateOn) {
-        return {
-          tone: 'info',
-          text: 'Automatic prefers on-device Apple transcription where supported, otherwise Local Whisper — enabling translate always routes through Local Whisper either way.'
-        };
+        return { tone: 'info', text: automaticTranslateNotice(true) };
       }
       return { tone: 'warning', text: automaticTranslateNotice(whisperOn ?? false) };
     }
     const mode = asrCapability(engine, 'translate');
     if (mode === 'reroutes') {
       if (!translateOn) {
-        return {
-          tone: 'info',
-          text: 'Enabling translate reroutes Apple transcription to Local Whisper.'
-        };
+        return { tone: 'info', text: appleTranslateRerouteNotice(true) };
       }
       return { tone: 'warning', text: appleTranslateRerouteNotice(whisperOn ?? false) };
     }
@@ -194,6 +201,10 @@
       {/if}
     </div>
   </div>
+
+  {#if error}
+    <p class="text-[0.72rem] text-destructive" role="alert">{error}</p>
+  {/if}
 
   <label
     class="flex cursor-pointer items-center justify-between gap-4 rounded-[10px] border border-border bg-card px-4 py-3.5 transition-colors hover:border-border/80"

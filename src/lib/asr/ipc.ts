@@ -48,5 +48,7 @@ export async function downloadWhisperModel(
     }
     onProgress(toPct(p.received, p.total));
   };
-  await invoke<void>('download_whisper_model', { model, onProgress: channel });
+  // `on_progress`, NOT `onProgress`: the command declares `rename_all = "snake_case"`, so
+  // Tauri looks up the snake_case key and a camelCase one fails with `missing required key`.
+  await invoke<void>('download_whisper_model', { model, on_progress: channel });
 }

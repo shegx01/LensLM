@@ -1,13 +1,13 @@
 <!--
   TranscriptionApplePane — confidence-threshold presets for Apple on-device ASR.
-  Writing `apple_min_confidence` is allowed even when `available` is false (unlike
-  `asr.backend`, this field has no degradation path to break — lib.rs clamps it
-  regardless), so the machine is pre-configured for when the bridge is present.
+  Writes `apple_min_confidence` even when `available` is false — lib.rs clamps it
+  regardless, so the value is pre-configured for when the bridge appears.
 -->
 <script lang="ts">
   import { onMount } from 'svelte';
   import { cn } from '$lib/utils.js';
   import { appConfigStore, ensureLoaded, persist } from '$lib/models/app-config.svelte.js';
+  import { toLensError } from '$lib/sources/lens-error.js';
 
   let { available }: { available: boolean } = $props();
 
@@ -45,6 +45,7 @@
 
   let selected = $state<PresetId>('balanced');
   let ready = $state(false);
+  let error = $state<string | null>(null);
 
   onMount(async () => {
     await ensureLoaded();
@@ -52,12 +53,17 @@
     ready = true;
   });
 
-  function pick(preset: Preset): void {
+  async function pick(preset: Preset): Promise<void> {
     selected = preset.id;
-    void persist((cfg) => ({
-      ...cfg,
-      asr: { ...cfg.asr, apple_min_confidence: preset.value }
-    }));
+    try {
+      error = null;
+      await persist((cfg) => ({
+        ...cfg,
+        asr: { ...cfg.asr, apple_min_confidence: preset.value }
+      }));
+    } catch (err) {
+      error = toLensError(err).message;
+    }
   }
 </script>
 
@@ -82,7 +88,7 @@
           type="button"
           role="radio"
           aria-checked={checked}
-          onclick={() => pick(preset)}
+          onclick={() => void pick(preset)}
           class={cn(
             'flex flex-col items-start gap-0.5 rounded-[10px] border px-4 py-3 text-left transition-colors',
             checked ? 'border-primary/45 bg-primary/5' : 'border-border bg-card hover:bg-muted'
@@ -93,5 +99,9 @@
         </button>
       {/each}
     </div>
+  {/if}
+
+  {#if error}
+    <p class="text-[0.72rem] text-destructive" role="alert">{error}</p>
   {/if}
 </div>

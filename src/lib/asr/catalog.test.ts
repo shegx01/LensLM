@@ -1,6 +1,3 @@
-import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
-import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   ASR_CAPABILITY_MATRIX,
@@ -15,11 +12,6 @@ import {
 } from './catalog.js';
 import type { AsrEngineId } from './catalog.js';
 import type { AsrLang } from '$lib/theme/types.js';
-
-const asrCloudDir = path.resolve(
-  path.dirname(fileURLToPath(import.meta.url)),
-  '../../../lens-core/src/asr/cloud'
-);
 
 describe('ASR_ENGINE_CATALOG', () => {
   it('has exactly the four contract engine rows', () => {
@@ -65,16 +57,16 @@ describe('backend token mapping', () => {
   });
 });
 
+// The adapters' actual request paths (`{base_url}/v1/audio/transcriptions`,
+// `{base_url}/v1/listen`) are proven end-to-end against real wiremock requests
+// in lens-core/tests/asr_capability_matrix_sync_check.rs, not by reading Rust
+// source text here — a source-text match can't tell a live path from a comment.
 describe('CLOUD_ASR_PRESETS', () => {
   it("OpenAI-compatible base_url has no path that would double up with the adapter's own suffix", () => {
-    const adapterSrc = readFileSync(path.join(asrCloudDir, 'openai_compat.rs'), 'utf-8');
-    expect(adapterSrc).toContain('/v1/audio/transcriptions');
     expect(CLOUD_ASR_PRESETS.open_ai_compatible.base_url).not.toContain('/v1');
   });
 
   it("Deepgram base_url has no path that would double up with the adapter's own suffix", () => {
-    const adapterSrc = readFileSync(path.join(asrCloudDir, 'deepgram.rs'), 'utf-8');
-    expect(adapterSrc).toContain('/v1/listen');
     expect(CLOUD_ASR_PRESETS.deepgram.base_url).not.toContain('/v1');
   });
 });
@@ -104,8 +96,26 @@ describe('isOtherAsrLanguage', () => {
   });
 });
 
-// The honoured/ignored/reroutes values themselves are cross-checked against the
-// Rust engines in lens-core/tests/asr_capability_matrix_sync_check.rs, not here.
+// These literal cells are cross-checked against real engine behaviour in
+// lens-core/tests/asr_capability_matrix_sync_check.rs (parses this same object
+// literal); pinning them here too catches an accidental TS-only edit early.
+describe('ASR_CAPABILITY_MATRIX', () => {
+  it('apple_native honours language and reroutes translate', () => {
+    expect(ASR_CAPABILITY_MATRIX.apple_native.language).toBe('honoured');
+    expect(ASR_CAPABILITY_MATRIX.apple_native.translate).toBe('reroutes');
+  });
+
+  it('local_whisper honours both language and translate', () => {
+    expect(ASR_CAPABILITY_MATRIX.local_whisper.language).toBe('honoured');
+    expect(ASR_CAPABILITY_MATRIX.local_whisper.translate).toBe('honoured');
+  });
+
+  it('cloud honours language but ignores translate', () => {
+    expect(ASR_CAPABILITY_MATRIX.cloud.language).toBe('honoured');
+    expect(ASR_CAPABILITY_MATRIX.cloud.translate).toBe('ignored');
+  });
+});
+
 describe('asrCapability', () => {
   it('reads the exact [engine][field] cell for every combination', () => {
     for (const engine of ['apple_native', 'local_whisper', 'cloud'] as const) {

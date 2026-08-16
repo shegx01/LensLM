@@ -2,7 +2,7 @@ import { render, screen, fireEvent, waitFor, within } from '@testing-library/sve
 import { mockIPC, clearMocks } from '@tauri-apps/api/mocks';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { AppConfig } from '$lib/theme/types.js';
-import { appConfigStore, resetConfig } from '$lib/models/app-config.svelte.js';
+import { appConfigStore, refreshConfig, resetConfig } from '$lib/models/app-config.svelte.js';
 import PrivacySection from './PrivacySection.svelte';
 
 beforeEach(() => {
@@ -341,5 +341,30 @@ describe('PrivacySection', () => {
     );
     expect(screen.queryByText(/no data leaves this device/i)).not.toBeInTheDocument();
     expect(screen.queryByText('Local')).not.toBeInTheDocument();
+  });
+
+  it('says it could not verify egress instead of asserting everything is local when the shared snapshot goes stale (a later forced reload fails, not the initial load)', async () => {
+    let shouldFail = false;
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') {
+        if (shouldFail) throw new Error('reload failed');
+        return config({ textConsent: false, audioConsent: false });
+      }
+    });
+
+    render(PrivacySection);
+    await waitFor(() =>
+      expect(screen.getByText(/no data leaves this device/i)).toBeInTheDocument()
+    );
+
+    // Stand in for another panel's refreshConfig() call failing after this one already
+    // mounted with a good snapshot — the exact case the previous fix missed.
+    shouldFail = true;
+    await refreshConfig();
+
+    await waitFor(() =>
+      expect(screen.getByText(/couldn't verify what leaves this device/i)).toBeInTheDocument()
+    );
+    expect(screen.queryByText(/no data leaves this device/i)).not.toBeInTheDocument();
   });
 });

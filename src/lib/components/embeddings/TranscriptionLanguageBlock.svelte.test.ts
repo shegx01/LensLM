@@ -85,6 +85,26 @@ describe('TranscriptionLanguageBlock — language persistence', () => {
     expect(written?.asr.language).toEqual({ Other: 'ar' });
   });
 
+  it('surfaces a rejected language save as a real LensError shape, not the generic fallback', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return config({ language: 'Es' });
+      if (cmd === 'set_config') {
+        throw { kind: 'Io', message: 'failed to write config file' };
+      }
+    });
+
+    render(TranscriptionLanguageBlock, { props: { activeEngine: 'local_whisper' } });
+    await screen.findByLabelText(/spoken language/i);
+
+    await openLanguageSelect();
+    const option = await screen.findByRole('option', { name: 'Auto-detect' });
+    await fireEvent.pointerUp(option);
+
+    await waitFor(() =>
+      expect(screen.getByText('failed to write config file')).toBeInTheDocument()
+    );
+  });
+
   it('leaves the persisted language untouched when the free-text field is blurred empty', async () => {
     let setConfigCalls = 0;
     mockIPC((cmd) => {
@@ -122,6 +142,25 @@ describe('TranscriptionLanguageBlock — translate persistence', () => {
 
     await waitFor(() => expect(written).not.toBeUndefined());
     expect(written?.asr.translate).toBe(true);
+  });
+
+  it('surfaces a rejected save as a real LensError shape, not the generic fallback', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return config({ translate: false });
+      if (cmd === 'set_config') {
+        throw { kind: 'Io', message: 'failed to write config file' };
+      }
+    });
+
+    render(TranscriptionLanguageBlock, { props: { activeEngine: 'local_whisper' } });
+    const toggle = await screen.findByRole('switch', { name: /translate/i });
+    await waitFor(() => expect(toggle).toHaveAttribute('aria-checked', 'false'));
+
+    await fireEvent.click(toggle);
+
+    await waitFor(() =>
+      expect(screen.getByText('failed to write config file')).toBeInTheDocument()
+    );
   });
 });
 

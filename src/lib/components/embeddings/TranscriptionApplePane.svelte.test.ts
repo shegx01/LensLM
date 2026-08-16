@@ -59,6 +59,37 @@ describe('TranscriptionApplePane', () => {
     await waitFor(() => expect(row).toHaveAttribute('aria-checked', 'true'));
   });
 
+  it('surfaces a rejected save as a real LensError shape, not the generic fallback', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') {
+        return baseAppConfig({
+          asr: {
+            backend: '',
+            whisper_model: 'base',
+            language: null,
+            translate: false,
+            cloud_provider: null,
+            cloud_base_url: '',
+            cloud_model: '',
+            cloud_api_key: '',
+            apple_min_confidence: 0.5
+          }
+        });
+      }
+      if (cmd === 'set_config') {
+        throw { kind: 'Io', message: 'failed to write config file' };
+      }
+    });
+    render(TranscriptionApplePane, { props: { available: true } });
+
+    const row = (await screen.findByText('Strict')).closest('[role="radio"]') as HTMLElement;
+    await fireEvent.click(row);
+
+    await waitFor(() =>
+      expect(screen.getByText('failed to write config file')).toBeInTheDocument()
+    );
+  });
+
   it('clicking Strict persists apple_min_confidence 0.7', async () => {
     const setConfigSpy = vi.fn();
     mount({ setConfigSpy });

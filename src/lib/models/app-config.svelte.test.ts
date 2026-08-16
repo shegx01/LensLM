@@ -28,6 +28,7 @@ describe('appConfigStore unloaded-state contract', () => {
     expect(appConfigStore.asr).toBeNull();
     expect(appConfigStore.audioCloudConsent).toBe(false);
     expect(appConfigStore.loadError).toBeNull();
+    expect(appConfigStore.staleError).toBeNull();
     expect(appConfigStore.persistError).toBeNull();
   });
 });
@@ -184,6 +185,7 @@ describe('loadError', () => {
     await ensureLoaded();
 
     expect(appConfigStore.loadError).toBe('engine unreachable');
+    expect(appConfigStore.staleError).toBeNull();
     expect(appConfigStore.models).toEqual([]);
     expect(appConfigStore.enrichment).toEqual(DEFAULT_ENRICHMENT);
     expect(appConfigStore.asr).toBeNull();
@@ -219,6 +221,94 @@ describe('loadError', () => {
   });
 });
 
+describe('staleError', () => {
+  // The mechanism under test: load()'s `cfg === null ? loadError : staleError` branch. Every
+  // case here pins down one side of that branch so deleting or inverting it fails a test.
+  it('is set (not loadError) when a forced reload fails while a snapshot is already populated', async () => {
+    let shouldFail = false;
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') {
+        if (shouldFail) throw new Error('transient reload failure');
+        return baseAppConfig();
+      }
+    });
+
+    await ensureLoaded();
+    expect(appConfigStore.loadError).toBeNull();
+    expect(appConfigStore.staleError).toBeNull();
+
+    shouldFail = true;
+    await refreshConfig();
+
+    expect(appConfigStore.staleError).toBe('transient reload failure');
+    expect(appConfigStore.loadError).toBeNull();
+  });
+
+  it('is NOT set by an initial load failure with no snapshot yet — that is loadError', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') throw new Error('engine unreachable');
+    });
+
+    await ensureLoaded();
+
+    expect(appConfigStore.loadError).toBe('engine unreachable');
+    expect(appConfigStore.staleError).toBeNull();
+  });
+
+  it('surfaces the real Tauri {kind,message} rejection message on a stale-reload failure, not a generic fallback', async () => {
+    let shouldFail = false;
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') {
+        if (shouldFail) throw { kind: 'Io', message: 'disk unavailable' };
+        return baseAppConfig();
+      }
+    });
+
+    await ensureLoaded();
+    shouldFail = true;
+    await refreshConfig();
+
+    expect(appConfigStore.staleError).toBe('disk unavailable');
+  });
+
+  it('clears once a later reload succeeds', async () => {
+    let shouldFail = false;
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') {
+        if (shouldFail) throw new Error('transient');
+        return baseAppConfig();
+      }
+    });
+
+    await ensureLoaded();
+    shouldFail = true;
+    await refreshConfig();
+    expect(appConfigStore.staleError).not.toBeNull();
+
+    shouldFail = false;
+    await refreshConfig();
+    expect(appConfigStore.staleError).toBeNull();
+  });
+
+  it('is left untouched by a persist() re-read failure — that is persistError, not staleError', async () => {
+    let getConfigCalls = 0;
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') {
+        getConfigCalls += 1;
+        if (getConfigCalls === 3) throw new Error('reread failed');
+        return baseAppConfig();
+      }
+      if (cmd === 'set_config') return null;
+    });
+
+    await ensureLoaded();
+    await persist((cfg) => ({ ...cfg, audio_cloud_consent: true }));
+
+    expect(appConfigStore.persistError).not.toBeNull();
+    expect(appConfigStore.staleError).toBeNull();
+  });
+});
+
 describe('resetConfig', () => {
   it('clears cfg to null so the next ensureLoaded() performs a real reload, not a re-served default', async () => {
     let getConfigCalls = 0;
@@ -238,5 +328,24 @@ describe('resetConfig', () => {
 
     await ensureLoaded();
     expect(getConfigCalls).toBe(2);
+  });
+
+  it('clears a pending staleError so it cannot leak into the next reload cycle', async () => {
+    let shouldFail = false;
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') {
+        if (shouldFail) throw new Error('transient');
+        return baseAppConfig();
+      }
+    });
+
+    await ensureLoaded();
+    shouldFail = true;
+    await refreshConfig();
+    expect(appConfigStore.staleError).not.toBeNull();
+
+    resetConfig();
+
+    expect(appConfigStore.staleError).toBeNull();
   });
 });

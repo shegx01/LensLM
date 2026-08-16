@@ -134,9 +134,41 @@ describe('TranscriptionCloudPane', () => {
     await fireEvent.input(baseUrlInput, { target: { value: 'not-a-url' } });
     await fireEvent.blur(baseUrlInput);
 
-    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent(/valid base url/i));
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent(/https:\/\//i));
     expect(savedConfigs.length).toBe(0);
   });
+
+  it('rejects a cleartext http:// base URL on a non-loopback host — the API key is bearer-sent there', async () => {
+    const { savedConfigs } = mockBackend(cloudConfig());
+    render(TranscriptionCloudPane);
+
+    const baseUrlInput = await screen.findByLabelText<HTMLInputElement>(/base url/i);
+    await waitFor(() => expect(baseUrlInput.value).toBe('https://api.openai.com'));
+
+    await fireEvent.input(baseUrlInput, { target: { value: 'http://api.example.com' } });
+    await fireEvent.blur(baseUrlInput);
+
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent(/localhost/i));
+    expect(savedConfigs.length).toBe(0);
+  });
+
+  it.each(['http://localhost:8090', 'http://127.0.0.1:8090', 'http://[::1]:8090'])(
+    'accepts a loopback http:// base URL (%s) for self-hosted servers',
+    async (url) => {
+      const { savedConfigs } = mockBackend(cloudConfig());
+      render(TranscriptionCloudPane);
+
+      const baseUrlInput = await screen.findByLabelText<HTMLInputElement>(/base url/i);
+      await waitFor(() => expect(baseUrlInput.value).toBe('https://api.openai.com'));
+
+      await fireEvent.input(baseUrlInput, { target: { value: url } });
+      await fireEvent.blur(baseUrlInput);
+
+      await waitFor(() => expect(savedConfigs.length).toBeGreaterThan(0));
+      expect(savedConfigs.at(-1)?.asr.cloud_base_url).toBe(url);
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    }
+  );
 
   it('shows why cloud is unavailable and does not activate while consent is off', async () => {
     const { savedConfigs } = mockBackend(cloudConfig({ audioCloudConsent: false }));
@@ -168,6 +200,25 @@ describe('TranscriptionCloudPane', () => {
 
     expect(savedConfigs.length).toBe(1);
     expect(savedConfigs.at(-1)?.asr.backend).not.toBe('cloud');
+  });
+
+  it('a typeahead keypress resolving to the already-selected provider is a no-op that preserves the saved key', async () => {
+    const { savedConfigs } = mockBackend(cloudConfig());
+    render(TranscriptionCloudPane);
+
+    const baseUrlInput = await screen.findByLabelText<HTMLInputElement>(/base url/i);
+    await waitFor(() => expect(baseUrlInput.value).toBe('https://api.openai.com'));
+
+    // bits-ui's Select resolves a single "o" keypress on the (closed) trigger to
+    // "OpenAI-compatible" via typeahead and fires onValueChange unconditionally —
+    // even though it's already the selected provider. This must not clear the key.
+    const providerTrigger = screen.getByLabelText(/^provider$/i);
+    await fireEvent.keyDown(providerTrigger, { key: 'o' });
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(savedConfigs.length).toBe(0);
+    const keyInput = await screen.findByLabelText<HTMLInputElement>(/api key/i);
+    await waitFor(() => expect(keyInput.placeholder).toMatch(/saved/i));
   });
 
   it("switching provider clears the previous provider's API key instead of carrying it forward", async () => {

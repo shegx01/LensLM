@@ -65,7 +65,7 @@ function mount(opts: {
       return downloaded[(args as { model: string }).model] ?? false;
     }
     if (cmd === 'download_whisper_model') {
-      const ch = (args as { onProgress: ProgressChannel }).onProgress;
+      const ch = (args as { on_progress: ProgressChannel }).on_progress;
       opts.onDownloadChannel?.(ch, (args as { model: string }).model);
       return null;
     }

@@ -119,9 +119,10 @@ export const ASR_CAPABILITY_MATRIX: Record<
   Exclude<AsrEngineId, 'automatic'>,
   AsrCapabilityMatrixEntry
 > = {
-  // language: src-tauri/src/asr/mod.rs:278 (lang_to_bcp47); translate reroutes: lens-core/src/lib.rs:2099-2103.
+  // language: src-tauri/src/asr/mod.rs:278 (lang_to_bcp47); translate reroute
+  // chain is cited once, on appleTranslateRerouteNotice below.
   apple_native: { language: 'honoured', translate: 'reroutes' },
-  // whisper.rs:92 (language), :93 (translate) — both honoured.
+  // whisper.rs::resolve_transcribe_params forwards both — both honoured.
   local_whisper: { language: 'honoured', translate: 'honoured' },
   // deepgram.rs:52, openai_compat.rs:53-54 (language honoured); neither reads config.translate.
   cloud: { language: 'honoured', translate: 'ignored' }
@@ -136,7 +137,7 @@ export function asrCapability(
 
 /**
  * Notice copy for enabling translate while Apple is the resolved engine: the
- * reroute (lib.rs:2102-2104) sends it through the LocalWhisper arm (lib.rs:2158),
+ * reroute (lib.rs:2099-2104) sends it through the LocalWhisper arm (lib.rs:2158),
  * which errors out if no Whisper model is on disk (lib.rs:2343-2348).
  */
 export function appleTranslateRerouteNotice(whisperModelDownloaded: boolean): string {

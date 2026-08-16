@@ -29,8 +29,11 @@
 
   const audioConsent = $derived(appConfigStore.audioCloudConsent);
   // The egress list reads both this mount's own tts/enrichment fetch and the shared store;
-  // either failing means the list can't be trusted, so it must say so rather than assert "local".
-  const egressLoadError = $derived(appConfigStore.loadError ?? ttsLoadError);
+  // any of the three failing (no data, stale data, or this mount's own fetch) means the list
+  // can't be trusted, so it must say so rather than assert "local".
+  const egressLoadError = $derived(
+    appConfigStore.loadError ?? appConfigStore.staleError ?? ttsLoadError
+  );
 
   /** True when `url` is a non-empty base URL that is not a loopback host. */
   function isRemoteUrl(url: string | undefined): boolean {
