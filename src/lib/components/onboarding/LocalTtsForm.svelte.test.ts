@@ -246,6 +246,32 @@ describe('LocalTtsForm — reactive persist', () => {
     expect((written as unknown as AppConfig).voices).toEqual({ host: 'leo', guest: 'tara' });
     expect((written as unknown as AppConfig).tts.backend).toBe('orpheus');
   });
+
+  it('surfaces a set_config LensError message rather than a generic fallback', async () => {
+    let onDisk = false;
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return baseAppConfig();
+      if (cmd === 'tts_engine_catalog') return catalogFixture({});
+      if (cmd === 'tts_model_status') return onDisk ? 'complete' : 'absent';
+      if (cmd === 'download_tts_model') {
+        onDisk = true;
+        const ch = (args as { on_progress?: { onmessage?: (m: unknown) => void } }).on_progress;
+        ch?.onmessage?.({ received: 100, total: 100, done: true });
+        return null;
+      }
+      if (cmd === 'set_config') {
+        throw { kind: 'Validation', message: 'voice "leo" is not offered by this engine' };
+      }
+    });
+
+    renderLocal('orpheus');
+    await fireEvent.click(await screen.findByRole('button', { name: /download voice engine/i }));
+
+    await waitFor(() =>
+      expect(screen.getByText(/voice "leo" is not offered by this engine/i)).toBeInTheDocument()
+    );
+    expect(screen.queryByText(/could not save voice settings/i)).not.toBeInTheDocument();
+  });
 });
 
 describe('LocalTtsForm — indeterminate progress (null pct)', () => {

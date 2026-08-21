@@ -330,7 +330,7 @@
       }));
       onactivated?.(engine);
     } catch (err) {
-      saveError = err instanceof Error ? err.message : 'Could not save voice settings.';
+      saveError = toLensError(err).message;
     }
   }
 
