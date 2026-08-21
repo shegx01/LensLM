@@ -5,9 +5,14 @@
 -->
 <script module lang="ts">
   // Module-scope (not per-instance): survives a Settings-tab remount, so a download
-  // already streaming to disk stays visible and un-restartable — a second invoke
-  // would race the first onto the same `.part` path (download.rs `File::create`).
-  type DownloadState = { progress: number | null; indeterminate: boolean; token: symbol };
+  // already streaming to disk stays visible. Not the race guard — download.rs owns a
+  // per-`.part` write guard; a second invoke queues, then skips the finished file.
+  type DownloadState = {
+    progress: number | null;
+    indeterminate: boolean;
+    cancelling: boolean;
+    token: symbol;
+  };
   let activeDownloads = $state<Record<string, DownloadState>>({});
 
   /** Test hook: clears in-flight download state between tests (mirrors
@@ -22,6 +27,7 @@
   import Download from '@lucide/svelte/icons/download';
   import LoaderCircle from '@lucide/svelte/icons/loader-circle';
   import CircleCheck from '@lucide/svelte/icons/circle-check';
+  import X from '@lucide/svelte/icons/x';
   import { Button } from '$lib/components/ui/button/index.js';
   import ProgressBar from '$lib/components/ui/ProgressBar.svelte';
   import { cn } from '$lib/utils.js';
@@ -29,6 +35,7 @@
     listWhisperModels,
     whisperModelDownloaded,
     downloadWhisperModel,
+    cancelDownload,
     type WhisperModelInfo
   } from '$lib/asr/ipc.js';
   import { appConfigStore, ensureLoaded, persist } from '$lib/models/app-config.svelte.js';
@@ -37,11 +44,12 @@
   let { onPresenceChange }: { onPresenceChange: (modelId: string, downloaded: boolean) => void } =
     $props();
 
-  // Margin over download.rs's own idle-read timeout: normally that rejection clears the
-  // entry first via the catch/finally below; this only fires if the IPC bridge itself
-  // wedges after the Rust side has already settled.
+  // Sized against download.rs's 30 s idle-read timeout, and re-armed by its
+  // attempt-start progress tick, so a retry's ≈96 s worst case never trips it. Fires
+  // only when the bridge stops delivering events altogether.
   const WEDGE_TIMEOUT_MS = 45_000;
   const WEDGE_MESSAGE = 'Download stalled — no response from the server. Try again.';
+  const STORAGE_POINTER = 'Free up space in Settings → Storage.';
 
   let models = $state<WhisperModelInfo[]>([]);
   let selected = $state('');
@@ -100,7 +108,10 @@
     // intentional — each streams to its own `.part` file, so nothing is shared.
     if (id in activeDownloads) return;
     const token = Symbol(id);
-    activeDownloads = { ...activeDownloads, [id]: { progress: 0, indeterminate: false, token } };
+    activeDownloads = {
+      ...activeDownloads,
+      [id]: { progress: 0, indeterminate: false, cancelling: false, token }
+    };
     downloadError = null;
     let watchdog = armWatchdog(id, token);
     try {
@@ -116,9 +127,9 @@
         }
       });
       if (activeDownloads[id]?.token !== token) return;
-      // download.rs early-returns `done` for an already-complete file (its own
-      // sha256+rename already ran before this event) — re-probe disk rather
-      // than trust the event so presence never drifts from what's actually there.
+      // Re-probe disk rather than trust the event: download.rs early-returns `done`
+      // for a file that was already complete, and that skip compares length only, so
+      // the event alone never proves presence.
       const downloaded = await whisperModelDownloaded(id);
       downloadedMap = { ...downloadedMap, [id]: downloaded };
       if (downloaded && id === selected) {
@@ -126,13 +137,35 @@
       }
       onPresenceChange(id, downloaded);
     } catch (err) {
-      if (activeDownloads[id]?.token === token) downloadError = toLensError(err).message;
+      const lensErr = toLensError(err);
+      if (lensErr.kind === 'Cancelled') return;
+      if (activeDownloads[id]?.token !== token) return;
+      downloadError =
+        lensErr.kind === 'InsufficientSpace'
+          ? `${lensErr.message} ${STORAGE_POINTER}`
+          : lensErr.message;
     } finally {
       clearTimeout(watchdog);
       if (activeDownloads[id]?.token === token) {
         const { [id]: _removed, ...rest } = activeDownloads;
         activeDownloads = rest;
       }
+    }
+  }
+
+  // Deliberately leaves `activeDownloads` alone: the entry is owned by handleDownload's
+  // `finally`, so Download stays disabled until the invoke itself settles.
+  async function handleCancel(id: string): Promise<void> {
+    const entry = activeDownloads[id];
+    if (!entry || entry.cancelling) return;
+    const { token } = entry;
+    entry.cancelling = true;
+    try {
+      await cancelDownload({ kind: 'whisper', id });
+    } catch (err) {
+      if (activeDownloads[id]?.token !== token) return;
+      entry.cancelling = false;
+      downloadError = toLensError(err).message;
     }
   }
 </script>
@@ -203,7 +236,7 @@
             </div>
           </button>
 
-          <div class="shrink-0">
+          <div class="flex shrink-0 items-center gap-1.5">
             {#if isDownloaded}
               <span class="flex items-center gap-1 text-[0.72rem] font-bold text-primary">
                 <CircleCheck class="size-3.5" />
@@ -225,6 +258,20 @@
                   Download
                 {/if}
               </Button>
+              {#if isDownloadingThis}
+                {@const dl = activeDownloads[m.id]}
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  aria-label={`Cancel ${m.id} download`}
+                  disabled={dl?.cancelling ?? false}
+                  onclick={() => handleCancel(m.id)}
+                >
+                  <X class="size-3.5" />
+                  {dl?.cancelling ? 'Cancelling…' : 'Cancel'}
+                </Button>
+              {/if}
             {/if}
           </div>
         </div>
