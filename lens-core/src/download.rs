@@ -310,7 +310,10 @@ where
 
 /// One attempt. Emits a progress tick before any network work so a caller's stall
 /// watchdog re-arms across a retry that has not yet produced a byte.
-async fn download_attempt<F>(ctx: &AttemptCtx<'_>, on_progress: &mut F) -> Result<(), AttemptFailure>
+async fn download_attempt<F>(
+    ctx: &AttemptCtx<'_>,
+    on_progress: &mut F,
+) -> Result<(), AttemptFailure>
 where
     F: FnMut(DownloadProgress),
 {
@@ -501,9 +504,11 @@ fn preflight_space(ctx: &AttemptCtx<'_>, part_len: u64) -> Result<(), AttemptFai
         .saturating_sub(part_len)
         .saturating_add(ctx.policy.headroom);
     if available < required {
-        return Err(AttemptFailure::Fatal(LensError::InsufficientSpace(format!(
-            "this download needs {required} bytes of free space but only {available} bytes are available"
-        ))));
+        return Err(AttemptFailure::Fatal(LensError::InsufficientSpace(
+            format!(
+                "this download needs {required} bytes of free space but only {available} bytes are available"
+            ),
+        )));
     }
     Ok(())
 }
@@ -572,7 +577,9 @@ mod tests {
 
     async fn mount_head(server: &MockServer, len: u64) {
         Mock::given(method("HEAD"))
-            .respond_with(ResponseTemplate::new(200).insert_header("content-length", len.to_string()))
+            .respond_with(
+                ResponseTemplate::new(200).insert_header("content-length", len.to_string()),
+            )
             .mount(server)
             .await;
     }
@@ -859,7 +866,11 @@ mod tests {
 
         let requests = log.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let gets: Vec<&String> = requests.iter().filter(|r| r.starts_with("get")).collect();
-        assert_eq!(gets.len(), 2, "expected exactly one retry, saw {requests:?}");
+        assert_eq!(
+            gets.len(),
+            2,
+            "expected exactly one retry, saw {requests:?}"
+        );
         assert!(
             gets[1].contains(&format!("range: bytes={}-", body.len() / 2)),
             "the retry must resume from the retained .part, not restart at zero: {}",
@@ -1004,7 +1015,10 @@ mod tests {
         let received: Vec<u64> = events.iter().map(|e| e.received).collect();
         let mut sorted = received.clone();
         sorted.sort_unstable();
-        assert_eq!(received, sorted, "received must be monotonic across a resume");
+        assert_eq!(
+            received, sorted,
+            "received must be monotonic across a resume"
+        );
     }
 
     #[tokio::test]

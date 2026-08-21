@@ -236,8 +236,8 @@ mod tests {
             &CancellationToken::new(),
             |p| events.push(p),
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
 
         assert_eq!(std::fs::read(&dest).unwrap(), body);
         assert!(!events.is_empty());
@@ -274,8 +274,8 @@ mod tests {
             &CancellationToken::new(),
             |p| events.push(p),
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
 
         assert_eq!(events.len(), 1);
         assert!(events[0].done);
@@ -299,16 +299,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dest = whisper_model_path(dir.path(), "base");
 
-        let err =
-            crate::download::download_verified(
+        let err = crate::download::download_verified(
             &server.uri(),
             &dest,
             Some(&wrong_hash),
             &CancellationToken::new(),
             |_| {},
         )
-                .await
-                .unwrap_err();
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(err, LensError::Network(_)),
@@ -343,8 +342,8 @@ mod tests {
             &CancellationToken::new(),
             |_| {},
         )
-            .await
-            .unwrap_err();
+        .await
+        .unwrap_err();
         assert!(matches!(err, LensError::Network(_)));
         assert!(!dest.exists());
     }
@@ -389,8 +388,8 @@ mod tests {
             &CancellationToken::new(),
             |_| {},
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
 
         assert_eq!(std::fs::read(&dest).unwrap(), body);
         assert!(!dest.with_extension("part").exists());
