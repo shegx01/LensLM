@@ -112,22 +112,59 @@ fn content_range_total(headers: &reqwest::header::HeaderMap) -> Option<u64> {
         .ok()
 }
 
+fn content_range_start(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(reqwest::header::CONTENT_RANGE)?
+        .to_str()
+        .ok()?
+        .split_once("bytes")?
+        .1
+        .split('-')
+        .next()?
+        .trim()
+        .parse()
+        .ok()
+}
+
 fn cancelled() -> LensError {
     LensError::Cancelled("download cancelled".into())
 }
 
+/// Must stay in step with the frontend's `formatBytes` (`src/lib/format/bytes.ts`).
+pub fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{value:.0} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+#[derive(Debug)]
 enum AttemptFailure {
     Retryable(LensError),
     Fatal(LensError),
 }
 
-/// The raw `ENOSPC` check backs up `StorageFull`, which is only std's *mapping* of it and
-/// is lost whenever an error reaches us through a layer that preserved just the errno.
-fn map_write_error(err: &std::io::Error, tmp: &Path) -> AttemptFailure {
+/// Classifier only — never deletes `tmp`: leaving the `.part` is what lets the next attempt
+/// resume, and only a hash mismatch, a 416, an oversized partial or a 200 to a ranged request
+/// may. The raw-errno check backs up `StorageFull`, which layers keeping only the code lose.
+fn map_write_error(err: &std::io::Error, tmp: &Path, still_needed: Option<u64>) -> AttemptFailure {
     if err.kind() == std::io::ErrorKind::StorageFull || err.raw_os_error() == Some(28) {
-        return AttemptFailure::Fatal(LensError::InsufficientSpace(
-            "the disk filled up while downloading; free some space and try again".into(),
-        ));
+        let message = match still_needed {
+            Some(bytes) => format!(
+                "the disk filled up while downloading: free about {} and try again",
+                human_bytes(bytes)
+            ),
+            None => "the disk filled up while downloading; free some space and try again".into(),
+        };
+        return AttemptFailure::Fatal(LensError::InsufficientSpace(message));
     }
     AttemptFailure::Retryable(LensError::Io(format!("write {}: {err}", tmp.display())))
 }
@@ -145,6 +182,17 @@ fn finalize(tmp: &Path, dest: &Path) -> Result<(), AttemptFailure> {
     std::fs::rename(tmp, dest).map_err(|e| {
         AttemptFailure::Retryable(LensError::Io(format!("finalize {}: {e}", dest.display())))
     })
+}
+
+async fn sync_and_finalize(tmp: &Path, dest: &Path) -> Result<(), AttemptFailure> {
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(tmp)
+        .map_err(|e| map_write_error(&e, tmp, None))?;
+    sync_all_blocking(file)
+        .await
+        .map_err(|e| map_write_error(&e, tmp, None))?;
+    finalize(tmp, dest)
 }
 
 /// On macOS this is `F_FULLFSYNC` — a whole-device barrier, not a per-file flush — so on a
@@ -261,7 +309,10 @@ where
         .await
         .ok()
         .filter(|r| r.status().is_success())
-        .and_then(|r| content_length_header(r.headers()));
+        .and_then(|r| content_length_header(r.headers()))
+        // A proxy's `Content-Length: 0` answers "no length", not "empty artifact": kept as a
+        // length it matches an absent `.part`, hard-failing before a GET is ever issued.
+        .filter(|len| *len > 0);
 
     if let Some(progress) = completed_skip(dest, expected_len) {
         on_progress(progress);
@@ -274,6 +325,11 @@ where
     }
 
     let tmp = dest.with_extension("part");
+    on_progress(DownloadProgress {
+        received: std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0),
+        total: expected_len,
+        done: false,
+    });
     let lock = part_write_lock(&tmp);
     let _writer = lock.lock().await;
     if let Some(progress) = completed_skip(dest, expected_len) {
@@ -345,7 +401,7 @@ where
         } else if part_len == expected {
             match complete_part_matches(ctx).await {
                 Ok(true) => {
-                    finalize(ctx.tmp, ctx.dest)?;
+                    sync_and_finalize(ctx.tmp, ctx.dest).await?;
                     on_progress(DownloadProgress {
                         received: part_len,
                         total: ctx.expected_len,
@@ -378,50 +434,67 @@ where
     })?;
 
     let status = response.status();
-    let (mut file, mut received, total) = if status == reqwest::StatusCode::PARTIAL_CONTENT {
-        // On a 206 the response `Content-Length` is the PARTIAL body length, so the
-        // full artifact size must come from the HEAD probe or `Content-Range`.
-        let total = ctx
-            .expected_len
-            .or_else(|| content_range_total(response.headers()));
-        let file = std::fs::OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(ctx.tmp)
-            .map_err(|e| {
-                AttemptFailure::Retryable(LensError::Io(format!(
-                    "append {}: {e}",
-                    ctx.tmp.display()
-                )))
-            })?;
-        (file, part_len, total)
-    } else if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
-        let _ = std::fs::remove_file(ctx.tmp);
-        return Err(AttemptFailure::Retryable(LensError::Network(
-            "the server rejected the resume range; the partial file was discarded".into(),
-        )));
-    } else if status.is_success() {
-        let total = content_length_header(response.headers()).or(ctx.expected_len);
-        let file = std::fs::File::create(ctx.tmp).map_err(|e| {
-            AttemptFailure::Retryable(LensError::Io(format!("create {}: {e}", ctx.tmp.display())))
-        })?;
-        (file, 0, total)
-    } else if status.is_client_error()
-        && status != reqwest::StatusCode::REQUEST_TIMEOUT
-        && status != reqwest::StatusCode::TOO_MANY_REQUESTS
-    {
-        // A 4xx is the server's verdict on this request, not a transient fault, so
-        // retrying just makes the user wait out the backoffs for the same answer.
-        // 408 and 429 are the two that do invite one. (416 is handled above.)
-        return Err(AttemptFailure::Fatal(LensError::Network(format!(
-            "download failed with status {status}"
-        ))));
-    } else {
-        return Err(AttemptFailure::Retryable(LensError::Network(format!(
-            "download failed with status {status}"
-        ))));
-    };
+    // Append only where the server confirmed it resumed at our offset: a proxy that answers
+    // a ranged request with a 206 carrying the FULL body would otherwise be appended onto
+    // the partial, failing the digest — which deletes the very bytes resume exists to keep.
+    let resumed_at_our_offset = content_range_start(response.headers()) == Some(part_len);
+    let (mut file, mut received, total) =
+        if status == reqwest::StatusCode::PARTIAL_CONTENT && resumed_at_our_offset {
+            // On a 206 the response `Content-Length` is the PARTIAL body length, so the
+            // full artifact size must come from the HEAD probe or `Content-Range`.
+            let total = ctx
+                .expected_len
+                .or_else(|| content_range_total(response.headers()));
+            let file = std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(ctx.tmp)
+                .map_err(|e| {
+                    map_write_error(
+                        &e,
+                        ctx.tmp,
+                        ctx.expected_len.map(|len| len.saturating_sub(part_len)),
+                    )
+                })?;
+            (file, part_len, total)
+        } else if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+            let hash_proves_complete = ctx.expected_sha256.is_some()
+                && matches!(complete_part_matches(ctx).await, Ok(true));
+            if hash_proves_complete {
+                sync_and_finalize(ctx.tmp, ctx.dest).await?;
+                on_progress(DownloadProgress {
+                    received: part_len,
+                    total: ctx.expected_len,
+                    done: true,
+                });
+                return Ok(());
+            }
+            let _ = std::fs::remove_file(ctx.tmp);
+            return Err(AttemptFailure::Retryable(LensError::Network(
+                "the server rejected the resume range; the partial file was discarded".into(),
+            )));
+        } else if status.is_success() {
+            let total = content_length_header(response.headers()).or(ctx.expected_len);
+            let file = std::fs::File::create(ctx.tmp)
+                .map_err(|e| map_write_error(&e, ctx.tmp, ctx.expected_len))?;
+            (file, 0, total)
+        } else if status.is_client_error()
+            && status != reqwest::StatusCode::REQUEST_TIMEOUT
+            && status != reqwest::StatusCode::TOO_MANY_REQUESTS
+        {
+            // A 4xx is the server's verdict on this request, not a transient fault, so
+            // retrying just makes the user wait out the backoffs for the same answer.
+            // 408 and 429 are the two that do invite one. (416 is handled above.)
+            return Err(AttemptFailure::Fatal(LensError::Network(format!(
+                "download failed with status {status}"
+            ))));
+        } else {
+            return Err(AttemptFailure::Retryable(LensError::Network(format!(
+                "download failed with status {status}"
+            ))));
+        };
 
+    let still_needed = |written: u64| total.map(|len| len.saturating_sub(written));
     let mut stream = response.bytes_stream();
     let mut since_space_check: u64 = 0;
     loop {
@@ -440,7 +513,7 @@ where
         };
 
         if let Err(e) = file.write_all(&chunk) {
-            return Err(map_write_error(&e, ctx.tmp));
+            return Err(map_write_error(&e, ctx.tmp, still_needed(received)));
         }
         received = received.saturating_add(chunk.len() as u64);
         on_progress(DownloadProgress {
@@ -452,19 +525,20 @@ where
         since_space_check = since_space_check.saturating_add(chunk.len() as u64);
         if since_space_check >= ctx.policy.check_interval {
             since_space_check = 0;
-            if let Some(err) = mid_stream_space_error(ctx, received) {
+            if let Some(err) = mid_stream_space_error(ctx, total, received) {
                 return Err(AttemptFailure::Fatal(err));
             }
         }
     }
 
-    file.flush().map_err(|e| map_write_error(&e, ctx.tmp))?;
+    file.flush()
+        .map_err(|e| map_write_error(&e, ctx.tmp, still_needed(received)))?;
     // `sync_all` before the digest is what makes the hash cover DURABLE bytes: a
     // digest read back through the page cache would still let a crash between the
     // rename and writeback publish a file whose blocks never landed.
     sync_all_blocking(file)
         .await
-        .map_err(|e| map_write_error(&e, ctx.tmp))?;
+        .map_err(|e| map_write_error(&e, ctx.tmp, still_needed(received)))?;
 
     if let Some(expected) = ctx.expected_sha256 {
         let actual = sha256_file(ctx.tmp)
@@ -522,26 +596,33 @@ fn preflight_space(ctx: &AttemptCtx<'_>, part_len: u64) -> Result<(), AttemptFai
     if available < required {
         return Err(AttemptFailure::Fatal(LensError::InsufficientSpace(
             format!(
-                "this download needs {required} bytes of free space but only {available} bytes are available"
+                "this download needs {} of free space but only {} are available",
+                human_bytes(required),
+                human_bytes(available)
             ),
         )));
     }
     Ok(())
 }
 
-fn mid_stream_space_error(ctx: &AttemptCtx<'_>, received: u64) -> Option<LensError> {
+fn mid_stream_space_error(
+    ctx: &AttemptCtx<'_>,
+    total: Option<u64>,
+    received: u64,
+) -> Option<LensError> {
     let parent = ctx.dest.parent().unwrap_or_else(|| Path::new("."));
     let available = (ctx.policy.probe)(parent)?;
-    // `available - remaining` is invariant under our OWN writes, so the sized arm
-    // only ever trips on foreign consumption; a header-less download has no
-    // remainder to compare and can defend only the floor.
-    let required = match ctx.expected_len {
-        Some(expected) => expected.saturating_sub(received),
-        None => ctx.policy.mid_stream_floor,
-    };
+    // `available - remaining` is invariant under our OWN writes, so this only ever trips
+    // on foreign consumption; the floor keeps the guard armed where there is no remainder
+    // to defend — an unknown length, or a body that outran the one it advertised.
+    let required = total
+        .map_or(0, |total| total.saturating_sub(received))
+        .max(ctx.policy.mid_stream_floor);
     (available < required).then(|| {
         LensError::InsufficientSpace(format!(
-            "the disk ran low while downloading: {required} bytes still needed but only {available} bytes are available"
+            "the disk ran low while downloading: {} still needed but only {} are available",
+            human_bytes(required),
+            human_bytes(available)
         ))
     })
 }
@@ -1144,7 +1225,15 @@ mod tests {
         let server = MockServer::start().await;
         mount_head(&server, body.len() as u64).await;
         Mock::given(method("GET"))
+            .and(header_exists("range"))
+            .respond_with(ResponseTemplate::new(500))
+            .with_priority(1)
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .with_priority(2)
             .expect(1)
             .mount(&server)
             .await;
@@ -1284,16 +1373,24 @@ mod tests {
     #[test]
     fn a_write_time_enospc_is_a_fatal_insufficient_space() {
         let tmp = Path::new("artifact.part");
-        assert!(
-            matches!(
-                map_write_error(&std::io::Error::from_raw_os_error(28), tmp),
-                AttemptFailure::Fatal(LensError::InsufficientSpace(_))
+        match map_write_error(
+            &std::io::Error::from_raw_os_error(28),
+            tmp,
+            Some(2 * 1024 * 1024),
+        ) {
+            AttemptFailure::Fatal(LensError::InsufficientSpace(msg)) => assert!(
+                msg.contains("2.0 MB"),
+                "the last-line-of-defence arm must still tell the user how much to free: {msg}"
             ),
-            "raw ENOSPC must map to a non-retryable InsufficientSpace"
-        );
+            other => panic!("raw ENOSPC must be a fatal InsufficientSpace, got {other:?}"),
+        }
         assert!(
             matches!(
-                map_write_error(&std::io::Error::from(std::io::ErrorKind::StorageFull), tmp),
+                map_write_error(
+                    &std::io::Error::from(std::io::ErrorKind::StorageFull),
+                    tmp,
+                    None
+                ),
                 AttemptFailure::Fatal(LensError::InsufficientSpace(_))
             ),
             "ErrorKind::StorageFull must map to a non-retryable InsufficientSpace"
@@ -1302,7 +1399,8 @@ mod tests {
             matches!(
                 map_write_error(
                     &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
-                    tmp
+                    tmp,
+                    None
                 ),
                 AttemptFailure::Retryable(LensError::Io(_))
             ),
@@ -1323,16 +1421,16 @@ mod tests {
         let (_dir, dest) = scratch();
         let cancel = CancellationToken::new();
         let tight = DownloadPolicy {
-            probe: fixed_probe(4195),
-            headroom: 100,
+            probe: fixed_probe(1024 * 1024),
+            headroom: 4 * 1024 * 1024,
             ..policy()
         };
         let (result, _) = run(&server.uri(), &dest, None, &cancel, tight).await;
 
         match result {
             Err(LensError::InsufficientSpace(msg)) => assert!(
-                msg.contains("4196") && msg.contains("4195"),
-                "the message must name bytes required and available: {msg}"
+                msg.contains("needs 4.0 MB of free space but only 1.0 MB are available"),
+                "the message is user-facing: human units, required before available: {msg}"
             ),
             other => panic!("expected InsufficientSpace, got {other:?}"),
         }
@@ -1516,9 +1614,20 @@ mod tests {
             run(&uri, &dest, Some(&expected), &cancel, policy()),
         );
 
-        assert!(first.0.is_ok(), "got {:?}", first.0);
-        assert!(second.0.is_ok(), "got {:?}", second.0);
         assert_eq!(std::fs::read(&dest).unwrap(), body);
+        for (label, (result, events)) in [("first", first), ("second", second)] {
+            assert!(result.is_ok(), "{label}: {result:?}");
+            let done = events
+                .iter()
+                .position(|e| e.done)
+                .unwrap_or_else(|| panic!("{label} never reported done: {events:?}"));
+            assert!(
+                events[..done].iter().any(|e| !e.done),
+                "{label} emitted nothing before finishing; a caller queued on the write guard \
+                 waits out its predecessor's whole download, and a silent wait trips the UI \
+                 stall watchdog: {events:?}"
+            );
+        }
     }
 
     #[test]
@@ -1534,6 +1643,327 @@ mod tests {
             Arc::ptr_eq(&alpha, &alpha_again),
             "the same .part path must reuse its lock or the guard is bypassable"
         );
+    }
+
+    #[tokio::test]
+    async fn a_zero_content_length_head_still_downloads() {
+        let body = vec![12u8; 1024];
+        let expected = sha256_hex(&body);
+        let server = MockServer::start().await;
+        mount_head(&server, 0).await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (_dir, dest) = scratch();
+        let cancel = CancellationToken::new();
+        let (result, _) = run(&server.uri(), &dest, Some(&expected), &cancel, policy()).await;
+
+        assert!(
+            result.is_ok(),
+            "a HEAD answering content-length 0 must not hard-fail the download: {result:?}"
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+    }
+
+    #[tokio::test]
+    async fn a_body_longer_than_the_advertised_length_still_trips_the_mid_stream_guard() {
+        let body = vec![1u8; 256 * 1024];
+        let server = MockServer::start().await;
+        mount_head(&server, 1024).await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let (_dir, dest) = scratch();
+        let cancel = CancellationToken::new();
+        let overrun = DownloadPolicy {
+            probe: fixed_probe(2048),
+            check_interval: 512,
+            mid_stream_floor: 3000,
+            ..policy()
+        };
+        let (result, _) = run(&server.uri(), &dest, None, &cancel, overrun).await;
+
+        assert!(
+            matches!(result, Err(LensError::InsufficientSpace(_))),
+            "a body outrunning its advertised length must not disarm the guard: {result:?}"
+        );
+        assert!(!dest.exists(), "nothing may be published");
+        assert!(dest.with_extension("part").exists());
+    }
+
+    #[tokio::test]
+    async fn the_mid_stream_floor_holds_once_the_remainder_runs_out() {
+        let client = reqwest::Client::new();
+        let (_dir, dest) = scratch();
+        let tmp = dest.with_extension("part");
+        let cancel = CancellationToken::new();
+        let starved = AttemptCtx {
+            client: &client,
+            url: "http://example.invalid/artifact.bin",
+            dest: &dest,
+            tmp: &tmp,
+            expected_sha256: None,
+            expected_len: Some(1024),
+            cancel: &cancel,
+            policy: DownloadPolicy {
+                probe: fixed_probe(1023),
+                mid_stream_floor: 1024,
+                ..policy()
+            },
+        };
+
+        assert!(
+            mid_stream_space_error(&starved, Some(1024), 1024).is_some(),
+            "a fully-received body must not leave the guard permanently disarmed"
+        );
+        assert!(
+            mid_stream_space_error(&starved, None, 0).is_some(),
+            "an unknown length must fall back to the floor"
+        );
+
+        let exact = AttemptCtx {
+            policy: DownloadPolicy {
+                probe: fixed_probe(1024),
+                mid_stream_floor: 1024,
+                ..policy()
+            },
+            ..starved
+        };
+        assert!(
+            mid_stream_space_error(&exact, Some(1024), 1024).is_none(),
+            "an exactly-met floor must not fire"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unopenable_part_is_classified_by_the_write_mapper() {
+        let total: u64 = 1024 * 1024;
+        for resumed in [false, true] {
+            let server = MockServer::start().await;
+            mount_head(&server, total).await;
+
+            let (_dir, dest) = scratch();
+            let part = dest.with_extension("part");
+            std::fs::create_dir_all(&part).unwrap();
+            let part_len = std::fs::metadata(&part).unwrap().len();
+            assert!(
+                part_len > 0 && part_len < total,
+                "the fixture needs a directory whose reported size reads as a resumable offset"
+            );
+
+            if resumed {
+                Mock::given(method("GET"))
+                    .and(header_exists("range"))
+                    .respond_with(
+                        ResponseTemplate::new(206)
+                            .insert_header(
+                                "content-range",
+                                format!("bytes {part_len}-{}/{total}", total - 1),
+                            )
+                            .set_body_bytes(vec![1u8; 16]),
+                    )
+                    .mount(&server)
+                    .await;
+            } else {
+                Mock::given(method("GET"))
+                    .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![1u8; 16]))
+                    .mount(&server)
+                    .await;
+            }
+
+            let cancel = CancellationToken::new();
+            let (result, _) = run(&server.uri(), &dest, None, &cancel, policy()).await;
+
+            match result {
+                Err(LensError::Io(msg)) => assert!(
+                    msg.starts_with("write "),
+                    "both .part open sites must classify through map_write_error, or an ENOSPC \
+                     there surfaces as a bare Io with no InsufficientSpace arm (resumed: \
+                     {resumed}): {msg}"
+                ),
+                other => panic!("expected an Io failure (resumed: {resumed}), got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_206_that_ignores_the_requested_offset_truncates_instead_of_appending() {
+        let body: Vec<u8> = (0..1024u32).map(|i| (i % 131) as u8).collect();
+        let expected = sha256_hex(&body);
+        let server = MockServer::start().await;
+        mount_head(&server, body.len() as u64).await;
+        Mock::given(method("GET"))
+            .and(header("range", "bytes=100-"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header(
+                        "content-range",
+                        format!("bytes 0-{}/{}", body.len() - 1, body.len()),
+                    )
+                    .set_body_bytes(body.clone()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (_dir, dest) = scratch();
+        seed_part(&dest, &body[..100]);
+        let cancel = CancellationToken::new();
+        let (result, _) = run(&server.uri(), &dest, Some(&expected), &cancel, policy()).await;
+
+        assert!(result.is_ok(), "got {result:?}");
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            body,
+            "a proxy that restarted at zero must truncate, not append onto the retained bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_416_publishes_a_hash_verified_complete_partial() {
+        let body = vec![11u8; 1024];
+        let expected = sha256_hex(&body);
+        let server = MockServer::start().await;
+        mount_failing_head(&server).await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(416))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (_dir, dest) = scratch();
+        seed_part(&dest, &body);
+        let cancel = CancellationToken::new();
+        let (result, events) = run(&server.uri(), &dest, Some(&expected), &cancel, policy()).await;
+
+        assert!(result.is_ok(), "got {result:?}");
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            body,
+            "with no HEAD length a complete .part is only provable by its hash; deleting it \
+             costs the user the whole artifact"
+        );
+        assert!(events.last().is_some_and(|e| e.done));
+    }
+
+    #[test]
+    fn the_default_policy_wires_the_production_constants() {
+        let shipped = DownloadPolicy::default();
+        assert_eq!(shipped.headroom, DISK_HEADROOM_BYTES);
+        assert_eq!(shipped.check_interval, MID_STREAM_CHECK_INTERVAL);
+        assert_eq!(shipped.mid_stream_floor, MID_STREAM_FLOOR);
+        assert_eq!(shipped.max_attempts, MAX_ATTEMPTS);
+        assert_eq!(shipped.base_backoff, BASE_BACKOFF);
+
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            (shipped.probe)(dir.path()).is_some_and(|n| n > 0),
+            "every test injects its own probe, so only this pins the production one: a stub \
+             here abstains forever and the disk guard never fires for a real user"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_space_guards_probe_the_destination_directory() {
+        let body = vec![1u8; 4096];
+        let expected = sha256_hex(&body);
+        let server = MockServer::start().await;
+        mount_head(&server, body.len() as u64).await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+
+        let (_dir, dest) = scratch();
+        let seen: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        let watching: SpaceProbe = Arc::new(move |dir: &Path| {
+            recorded
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(dir.to_path_buf());
+            Some(u64::MAX)
+        });
+        let cancel = CancellationToken::new();
+        let watched = DownloadPolicy {
+            probe: watching,
+            check_interval: 512,
+            ..policy()
+        };
+        let (result, _) = run(&server.uri(), &dest, Some(&expected), &cancel, watched).await;
+
+        assert!(result.is_ok(), "got {result:?}");
+        let probed = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let parent = dest.parent().unwrap();
+        assert!(probed.len() >= 2, "both guards must run: {probed:?}");
+        assert!(
+            probed.iter().all(|dir| dir.as_path() == parent),
+            "#238 offload can put the model cache on a volume other than the data or temp \
+             dir, so the guards must stat the destination itself: {probed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_preflight_only_demands_the_bytes_still_missing() {
+        let body: Vec<u8> = (0..1024u32).map(|i| (i % 251) as u8).collect();
+        let expected = sha256_hex(&body);
+
+        for (available, fits) in [(224u64, true), (223, false)] {
+            let server = MockServer::start().await;
+            mount_head(&server, body.len() as u64).await;
+            Mock::given(method("GET"))
+                .and(header("range", "bytes=900-"))
+                .respond_with(
+                    ResponseTemplate::new(206)
+                        .insert_header(
+                            "content-range",
+                            format!("bytes 900-{}/{}", body.len() - 1, body.len()),
+                        )
+                        .set_body_bytes(body[900..].to_vec()),
+                )
+                .expect(if fits { 1 } else { 0 })
+                .mount(&server)
+                .await;
+
+            let (_dir, dest) = scratch();
+            seed_part(&dest, &body[..900]);
+            let cancel = CancellationToken::new();
+            let tight = DownloadPolicy {
+                probe: fixed_probe(available),
+                headroom: 100,
+                ..policy()
+            };
+            let (result, _) = run(&server.uri(), &dest, Some(&expected), &cancel, tight).await;
+
+            if fits {
+                assert!(
+                    result.is_ok(),
+                    "a resume needs only the 124 missing bytes plus headroom, not the whole \
+                     artifact: {result:?}"
+                );
+                assert_eq!(std::fs::read(&dest).unwrap(), body);
+            } else {
+                assert!(
+                    matches!(result, Err(LensError::InsufficientSpace(_))),
+                    "one byte short of the requirement must still fail closed: {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn human_bytes_matches_the_frontend_formatter() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(999), "999 B");
+        assert_eq!(human_bytes(1024), "1.0 KB");
+        assert_eq!(human_bytes(1024 * 1024), "1.0 MB");
+        assert_eq!(human_bytes(2_090_000_000), "1.9 GB");
+        assert_eq!(human_bytes(DISK_HEADROOM_BYTES), "256.0 MB");
     }
 
     #[tokio::test]

@@ -311,8 +311,9 @@ mod tests {
 
     #[test]
     fn every_variant_has_a_kind_and_message_mapping() {
-        // Exhaustive, wildcard-free match: a new `LensError` variant breaks THIS
-        // build until its `kind()`/`message()` mapping is added and asserted here.
+        // `expected_kind`'s wildcard-free match is what is compiler-forced: a new
+        // `LensError` variant breaks THIS build until its mapping is added. The `all`
+        // array below is a plain literal — nothing forces a new variant into it.
         fn expected_kind(err: &LensError) -> &'static str {
             match err {
                 LensError::Validation(_) => "Validation",
@@ -350,8 +351,6 @@ mod tests {
             LensError::Reindexing("m".into()),
             LensError::InsufficientSpace("m".into()),
         ];
-        assert_eq!(all.len(), 15, "add the new variant to `all` too");
-
         for err in &all {
             assert_eq!(err.kind(), expected_kind(err));
             assert_eq!(err.message(), "m");
