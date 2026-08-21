@@ -306,6 +306,10 @@ insta = { workspace = true }
 tempfile = { workspace = true }
 # In-process HTTP mock server for the LLM/embedding runtime probe tests.
 wiremock = "0.6"
+# `net`/`io-util` back the raw-TCP fixture that truncates a response body mid-stream
+# (wiremock rejects a body shorter than its Content-Length), which is the only way to
+# assert `.part` survives a transient stream error. Test-only feature union.
+tokio = { workspace = true, features = ["net", "io-util"] }
 # Direct LanceDB reads in the ingest integration tests (orphan-vector assertions
 # in the re-ingest/wipe test). Pinned to the same versions the lib already
 # resolves so no second copy is pulled into the lock tree.

@@ -34,6 +34,7 @@ const MID_STREAM_CHECK_INTERVAL: u64 = 64 * 1024 * 1024;
 // interval is followed by that many more writes, so a smaller floor could only
 // ever fire after ENOSPC had already filled the disk.
 const MID_STREAM_FLOOR: u64 = MID_STREAM_CHECK_INTERVAL + DISK_HEADROOM_BYTES;
+const _: () = assert!(MID_STREAM_FLOOR > MID_STREAM_CHECK_INTERVAL);
 
 const MAX_ATTEMPTS: u32 = 3;
 const BASE_BACKOFF: Duration = Duration::from_secs(2);
@@ -522,4 +523,952 @@ fn mid_stream_space_error(ctx: &AttemptCtx<'_>, received: u64) -> Option<LensErr
             "the disk ran low while downloading: {required} bytes still needed but only {available} bytes are available"
         ))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use wiremock::matchers::{header, header_exists, method};
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        crate::hex_encode(&Sha256::digest(bytes))
+    }
+
+    fn fixed_probe(bytes: u64) -> SpaceProbe {
+        Arc::new(move |_: &Path| Some(bytes))
+    }
+
+    fn abstaining_probe() -> SpaceProbe {
+        Arc::new(|_: &Path| None)
+    }
+
+    /// Fast retries and disarmed space guards, so each test re-arms only the knob
+    /// it is about.
+    fn policy() -> DownloadPolicy {
+        DownloadPolicy {
+            probe: fixed_probe(u64::MAX),
+            headroom: 0,
+            check_interval: u64::MAX,
+            mid_stream_floor: 0,
+            max_attempts: MAX_ATTEMPTS,
+            base_backoff: Duration::from_millis(1),
+        }
+    }
+
+    fn scratch() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("models").join("artifact.bin");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        (dir, dest)
+    }
+
+    fn seed_part(dest: &Path, bytes: &[u8]) {
+        std::fs::write(dest.with_extension("part"), bytes).unwrap();
+    }
+
+    async fn mount_head(server: &MockServer, len: u64) {
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(200).insert_header("content-length", len.to_string()))
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_failing_head(server: &MockServer) {
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(server)
+            .await;
+    }
+
+    async fn run(
+        url: &str,
+        dest: &Path,
+        sha: Option<&str>,
+        cancel: &CancellationToken,
+        policy: DownloadPolicy,
+    ) -> (Result<(), LensError>, Vec<DownloadProgress>) {
+        let mut events = Vec::new();
+        let result =
+            download_verified_with(url, dest, sha, cancel, |p| events.push(p), policy).await;
+        (result, events)
+    }
+
+    #[derive(Clone)]
+    struct Recorder {
+        log: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Recorder {
+        fn new() -> Self {
+            Self {
+                log: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+        fn push(&self, entry: impl Into<String>) {
+            self.log
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(entry.into());
+        }
+        fn entries(&self) -> Vec<String> {
+            self.log.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        }
+    }
+
+    struct RecordingResponse {
+        recorder: Recorder,
+        label: &'static str,
+        status: u16,
+        body: Option<Vec<u8>>,
+    }
+
+    impl Respond for RecordingResponse {
+        fn respond(&self, _: &Request) -> ResponseTemplate {
+            self.recorder.push(self.label);
+            let template = ResponseTemplate::new(self.status);
+            match &self.body {
+                Some(bytes) => template.set_body_bytes(bytes.clone()),
+                None => template,
+            }
+        }
+    }
+
+    /// Serves HEAD with the full length, truncates the first GET's body mid-stream
+    /// (a real `IncompleteMessage`, which wiremock cannot express), and answers later
+    /// GETs with a 206 from the requested offset. Returns the base URL + request log.
+    async fn truncating_then_resuming_server(body: Vec<u8>) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let log_for_task = Arc::clone(&log);
+        tokio::spawn(async move {
+            let total = body.len();
+            let mut gets = 0usize;
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 8192];
+                let Ok(read) = socket.read(&mut buf).await else {
+                    continue;
+                };
+                let request = String::from_utf8_lossy(&buf[..read]).to_ascii_lowercase();
+                log_for_task
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(request.clone());
+
+                if request.starts_with("head") {
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {total}\r\naccept-ranges: bytes\r\nconnection: close\r\n\r\n"
+                    );
+                    let _ = socket.write_all(head.as_bytes()).await;
+                } else {
+                    gets += 1;
+                    if gets == 1 {
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-length: {total}\r\nconnection: close\r\n\r\n"
+                        );
+                        let _ = socket.write_all(head.as_bytes()).await;
+                        let _ = socket.write_all(&body[..total / 2]).await;
+                    } else {
+                        let start = request
+                            .split("range: bytes=")
+                            .nth(1)
+                            .and_then(|rest| rest.split('-').next())
+                            .and_then(|n| n.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        let head = format!(
+                            "HTTP/1.1 206 Partial Content\r\ncontent-length: {}\r\ncontent-range: bytes {}-{}/{}\r\nconnection: close\r\n\r\n",
+                            total - start,
+                            start,
+                            total - 1,
+                            total
+                        );
+                        let _ = socket.write_all(head.as_bytes()).await;
+                        let _ = socket.write_all(&body[start..]).await;
+                    }
+                }
+                let _ = socket.flush().await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        (format!("http://{addr}"), log)
+    }
+
+    // ── cancellation ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn cancel_mid_stream_returns_cancelled_and_retains_the_partial() {
+        let body = vec![5u8; 64 * 1024];
+        let server = MockServer::start().await;
+        mount_head(&server, body.len() as u64).await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (_dir, dest) = scratch();
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        let mut last_received = 0u64;
+        let result = download_verified_with(
+            &server.uri(),
+            &dest,
+            None,
+            &cancel,
+            |p| {
+                if p.received > 0 && !p.done {
+                    last_received = p.received;
+                    trigger.cancel();
+                }
+            },
+            policy(),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(LensError::Cancelled(_))),
+            "got {result:?}"
+        );
+        let part = dest.with_extension("part");
+        assert!(part.exists(), ".part must be retained across a cancel");
+        assert_eq!(std::fs::metadata(&part).unwrap().len(), last_received);
+        assert!(!dest.exists());
+    }
+
+    #[tokio::test]
+    async fn cancel_before_the_first_byte_makes_no_request() {
+        let server = MockServer::start().await;
+        mount_head(&server, 1024).await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let (_dir, dest) = scratch();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let (result, events) = run(&server.uri(), &dest, None, &cancel, policy()).await;
+
+        assert!(
+            matches!(result, Err(LensError::Cancelled(_))),
+            "got {result:?}"
+        );
+        assert!(events.is_empty());
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty(),
+            "an already-cancelled download must not touch the network"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_during_backoff_returns_promptly() {
+        let server = MockServer::start().await;
+        mount_head(&server, 1024).await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(502))
+            .mount(&server)
+            .await;
+
+        let (_dir, dest) = scratch();
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            trigger.cancel();
+        });
+
+        let slow = DownloadPolicy {
+            base_backoff: Duration::from_secs(5),
+            ..policy()
+        };
+        let started = std::time::Instant::now();
+        let (result, _) = run(&server.uri(), &dest, None, &cancel, slow).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(result, Err(LensError::Cancelled(_))),
+            "got {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "cancel must not wait out the 5 s backoff; took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_during_a_slow_head_returns_promptly() {
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-length", "1024")
+                    .set_delay(Duration::from_secs(5)),
+            )
+            .mount(&server)
+            .await;
+
+        let (_dir, dest) = scratch();
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            trigger.cancel();
+        });
+
+        let started = std::time::Instant::now();
+        let (result, _) = run(&server.uri(), &dest, None, &cancel, policy()).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(result, Err(LensError::Cancelled(_))),
+            "got {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the hoisted HEAD must be cancellable well inside its 5 s delay; took {elapsed:?}"
+        );
+    }
+
+    // ── retry + resume ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn transient_stream_error_preserves_the_partial_and_the_retry_sends_range() {
+        let body: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        let expected = sha256_hex(&body);
+        let (url, log) = truncating_then_resuming_server(body.clone()).await;
+
+        let (_dir, dest) = scratch();
+        let cancel = CancellationToken::new();
+        let (result, _) = run(&url, &dest, Some(&expected), &cancel, policy()).await;
+
+        assert!(result.is_ok(), "got {result:?}");
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        assert!(!dest.with_extension("part").exists());
+
+        let requests = log.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let gets: Vec<&String> = requests.iter().filter(|r| r.starts_with("get")).collect();
+        assert_eq!(gets.len(), 2, "expected exactly one retry, saw {requests:?}");
+        assert!(
+            gets[1].contains(&format!("range: bytes={}-", body.len() / 2)),
+            "the retry must resume from the retained .part, not restart at zero: {}",
+            gets[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_byte_retry_emits_progress_before_the_second_get() {
+        let body = vec![1u8; 1024];
+        let recorder = Recorder::new();
+        let server = MockServer::start().await;
+        mount_head(&server, body.len() as u64).await;
+        Mock::given(method("GET"))
+            .respond_with(RecordingResponse {
+                recorder: recorder.clone(),
+                label: "get",
+                status: 502,
+                body: None,
+            })
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(RecordingResponse {
+                recorder: recorder.clone(),
+                label: "get",
+                status: 200,
+                body: Some(body.clone()),
+            })
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        let (_dir, dest) = scratch();
+        let cancel = CancellationToken::new();
+        let timeline = recorder.clone();
+        let result = download_verified_with(
+            &server.uri(),
+            &dest,
+            None,
+            &cancel,
+            |p| {
+                if !p.done {
+                    timeline.push(format!("progress:{}", p.received));
+                }
+            },
+            policy(),
+        )
+        .await;
+        assert!(result.is_ok(), "got {result:?}");
+
+        let entries = recorder.entries();
+        let gets: Vec<usize> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| *e == "get")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(gets.len(), 2, "timeline: {entries:?}");
+        assert!(
+            entries[gets[0] + 1..gets[1]]
+                .iter()
+                .any(|e| e == "progress:0"),
+            "an attempt-start tick must land between the two GETs so a stall watchdog re-arms; timeline: {entries:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_without_content_length_keeps_the_partial_and_sends_range() {
+        let body: Vec<u8> = (0..1024u32).map(|i| (i % 199) as u8).collect();
+        let expected = sha256_hex(&body);
+        let server = MockServer::start().await;
+        mount_failing_head(&server).await;
+        Mock::given(method("GET"))
+            .and(header("range", "bytes=100-"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header(
+                        "content-range",
+                        format!("bytes 100-{}/{}", body.len() - 1, body.len()),
+                    )
+                    .set_body_bytes(body[100..].to_vec()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (_dir, dest) = scratch();
+        seed_part(&dest, &body[..100]);
+        let cancel = CancellationToken::new();
+        let (result, events) = run(&server.uri(), &dest, Some(&expected), &cancel, policy()).await;
+
+        assert!(result.is_ok(), "got {result:?}");
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            body,
+            "the retained 100 bytes must survive an unknown-length resume"
+        );
+        assert!(
+            events.iter().any(|e| e.total == Some(body.len() as u64)),
+            "with no HEAD length the total must come from Content-Range: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| e.total == Some(924)),
+            "the 924-byte partial body must never be reported as the total: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_content_progress_reports_the_full_artifact_total() {
+        let body: Vec<u8> = (0..1024u32).map(|i| (i % 97) as u8).collect();
+        let expected = sha256_hex(&body);
+        let server = MockServer::start().await;
+        mount_head(&server, body.len() as u64).await;
+        Mock::given(method("GET"))
+            .and(header("range", "bytes=900-"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header(
+                        "content-range",
+                        format!("bytes 900-{}/{}", body.len() - 1, body.len()),
+                    )
+                    .set_body_bytes(body[900..].to_vec()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (_dir, dest) = scratch();
+        seed_part(&dest, &body[..900]);
+        let cancel = CancellationToken::new();
+        let (result, events) = run(&server.uri(), &dest, Some(&expected), &cancel, policy()).await;
+
+        assert!(result.is_ok(), "got {result:?}");
+        assert!(
+            events.iter().all(|e| e.total == Some(1024)),
+            "the 124-byte partial body must never be reported as the total: {events:?}"
+        );
+        assert_eq!(events.first().map(|e| e.received), Some(900));
+        let received: Vec<u64> = events.iter().map(|e| e.received).collect();
+        let mut sorted = received.clone();
+        sorted.sort_unstable();
+        assert_eq!(received, sorted, "received must be monotonic across a resume");
+    }
+
+    #[tokio::test]
+    async fn two_hundred_answer_to_a_ranged_request_truncates_the_partial() {
+        let body = vec![7u8; 1024];
+        let expected = sha256_hex(&body);
+        let server = MockServer::start().await;
+        mount_head(&server, body.len() as u64).await;
+        Mock::given(method("GET"))
+            .and(header("range", "bytes=100-"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (_dir, dest) = scratch();
+        seed_part(&dest, &[0xAAu8; 100]);
+        let cancel = CancellationToken::new();
+        let (result, events) = run(&server.uri(), &dest, Some(&expected), &cancel, policy()).await;
+
+        assert!(result.is_ok(), "got {result:?}");
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        assert!(events.iter().any(|e| e.received == 1024 && e.done));
+    }
+
+    #[tokio::test]
+    async fn range_not_satisfiable_discards_the_partial_then_succeeds() {
+        let body = vec![3u8; 1024];
+        let expected = sha256_hex(&body);
+        let server = MockServer::start().await;
+        mount_head(&server, body.len() as u64).await;
+        Mock::given(method("GET"))
+            .and(header_exists("range"))
+            .respond_with(ResponseTemplate::new(416))
+            .with_priority(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .with_priority(2)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (_dir, dest) = scratch();
+        seed_part(&dest, &[9u8; 100]);
+        let cancel = CancellationToken::new();
+        let (result, _) = run(&server.uri(), &dest, Some(&expected), &cancel, policy()).await;
+
+        assert!(result.is_ok(), "got {result:?}");
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+    }
+
+    #[tokio::test]
+    async fn oversized_partial_is_discarded_and_refetched_without_a_range() {
+        let body = vec![4u8; 1024];
+        let expected = sha256_hex(&body);
+        let server = MockServer::start().await;
+        mount_head(&server, body.len() as u64).await;
+        Mock::given(method("GET"))
+            .and(header_exists("range"))
+            .respond_with(ResponseTemplate::new(500))
+            .with_priority(1)
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .with_priority(2)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (_dir, dest) = scratch();
+        seed_part(&dest, &[0u8; 4096]);
+        let cancel = CancellationToken::new();
+        let (result, _) = run(&server.uri(), &dest, Some(&expected), &cancel, policy()).await;
+
+        assert!(result.is_ok(), "got {result:?}");
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+    }
+
+    #[tokio::test]
+    async fn complete_partial_with_a_matching_hash_is_renamed_without_a_get() {
+        let body = vec![6u8; 1024];
+        let expected = sha256_hex(&body);
+        let server = MockServer::start().await;
+        mount_head(&server, body.len() as u64).await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let (_dir, dest) = scratch();
+        seed_part(&dest, &body);
+        let cancel = CancellationToken::new();
+        let (result, events) = run(&server.uri(), &dest, Some(&expected), &cancel, policy()).await;
+
+        assert!(result.is_ok(), "got {result:?}");
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        assert!(!dest.with_extension("part").exists());
+        assert!(events.last().is_some_and(|e| e.done && e.received == 1024));
+    }
+
+    #[tokio::test]
+    async fn complete_partial_with_a_bad_hash_is_refetched_in_the_same_attempt() {
+        let body = vec![8u8; 1024];
+        let expected = sha256_hex(&body);
+        let server = MockServer::start().await;
+        mount_head(&server, body.len() as u64).await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (_dir, dest) = scratch();
+        seed_part(&dest, &[0xFFu8; 1024]);
+        let cancel = CancellationToken::new();
+        let (result, _) = run(&server.uri(), &dest, Some(&expected), &cancel, policy()).await;
+
+        assert!(result.is_ok(), "got {result:?}");
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+    }
+
+    #[tokio::test]
+    async fn retry_is_bounded_and_surfaces_the_last_network_error() {
+        let server = MockServer::start().await;
+        mount_head(&server, 1024).await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(502))
+            .expect(3)
+            .mount(&server)
+            .await;
+
+        let (_dir, dest) = scratch();
+        let cancel = CancellationToken::new();
+        let (result, _) = run(&server.uri(), &dest, None, &cancel, policy()).await;
+
+        assert!(
+            matches!(result, Err(LensError::Network(_))),
+            "got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hash_mismatch_fails_without_a_retry_and_discards_the_partial() {
+        let body = vec![2u8; 1024];
+        let wrong = sha256_hex(b"a completely different artifact");
+        let server = MockServer::start().await;
+        mount_head(&server, body.len() as u64).await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (_dir, dest) = scratch();
+        let cancel = CancellationToken::new();
+        let (result, _) = run(&server.uri(), &dest, Some(&wrong), &cancel, policy()).await;
+
+        assert!(
+            matches!(result, Err(LensError::Network(_))),
+            "got {result:?}"
+        );
+        assert!(!dest.exists());
+        assert!(!dest.with_extension("part").exists());
+    }
+
+    // ── disk-space guards ─────────────────────────────────────────────────────
+
+    #[test]
+    fn available_space_probes_a_real_directory_and_abstains_on_a_missing_one() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(available_space_bytes(dir.path()).is_some_and(|n| n > 0));
+        assert!(
+            available_space_bytes(&dir.path().join("nope")).is_none(),
+            "a missing directory reports ENOENT and must abstain, not read as zero space"
+        );
+    }
+
+    #[test]
+    fn a_write_time_enospc_is_a_fatal_insufficient_space() {
+        let tmp = Path::new("artifact.part");
+        assert!(
+            matches!(
+                map_write_error(&std::io::Error::from_raw_os_error(28), tmp),
+                AttemptFailure::Fatal(LensError::InsufficientSpace(_))
+            ),
+            "raw ENOSPC must map to a non-retryable InsufficientSpace"
+        );
+        assert!(
+            matches!(
+                map_write_error(&std::io::Error::from(std::io::ErrorKind::StorageFull), tmp),
+                AttemptFailure::Fatal(LensError::InsufficientSpace(_))
+            ),
+            "ErrorKind::StorageFull must map to a non-retryable InsufficientSpace"
+        );
+        assert!(
+            matches!(
+                map_write_error(
+                    &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+                    tmp
+                ),
+                AttemptFailure::Retryable(LensError::Io(_))
+            ),
+            "any other write failure must stay a retryable Io error"
+        );
+    }
+
+    #[tokio::test]
+    async fn preflight_rejects_before_issuing_a_get() {
+        let server = MockServer::start().await;
+        mount_head(&server, 4096).await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let (_dir, dest) = scratch();
+        let cancel = CancellationToken::new();
+        let tight = DownloadPolicy {
+            probe: fixed_probe(4195),
+            headroom: 100,
+            ..policy()
+        };
+        let (result, _) = run(&server.uri(), &dest, None, &cancel, tight).await;
+
+        match result {
+            Err(LensError::InsufficientSpace(msg)) => assert!(
+                msg.contains("4196") && msg.contains("4195"),
+                "the message must name bytes required and available: {msg}"
+            ),
+            other => panic!("expected InsufficientSpace, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tight_but_sufficient_space_completes() {
+        let body = vec![1u8; 4096];
+        let expected = sha256_hex(&body);
+        let server = MockServer::start().await;
+        mount_head(&server, body.len() as u64).await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+
+        let (_dir, dest) = scratch();
+        let cancel = CancellationToken::new();
+        let exact = DownloadPolicy {
+            probe: fixed_probe(4196),
+            headroom: 100,
+            check_interval: 512,
+            mid_stream_floor: 0,
+            ..policy()
+        };
+        let (result, _) = run(&server.uri(), &dest, Some(&expected), &cancel, exact).await;
+
+        assert!(
+            result.is_ok(),
+            "exactly-enough space must not abort: {result:?}"
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+    }
+
+    #[tokio::test]
+    async fn foreign_consumption_mid_stream_aborts_and_preserves_the_partial() {
+        let body = vec![1u8; 256 * 1024];
+        let server = MockServer::start().await;
+        mount_head(&server, body.len() as u64).await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (_dir, dest) = scratch();
+        let cancel = CancellationToken::new();
+        let calls = Arc::new(AtomicU64::new(0));
+        let seen = Arc::clone(&calls);
+        let plenty_then_full: SpaceProbe = Arc::new(move |_: &Path| {
+            Some(if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                u64::MAX
+            } else {
+                0
+            })
+        });
+        let draining = DownloadPolicy {
+            probe: plenty_then_full,
+            headroom: 0,
+            check_interval: 1024,
+            ..policy()
+        };
+        let (result, _) = run(&server.uri(), &dest, None, &cancel, draining).await;
+
+        assert!(
+            matches!(result, Err(LensError::InsufficientSpace(_))),
+            "got {result:?}"
+        );
+        assert!(
+            dest.with_extension("part").exists(),
+            ".part must survive so the user can resume after freeing space"
+        );
+        assert!(
+            calls.load(Ordering::SeqCst) >= 2,
+            "the mid-stream guard never ran"
+        );
+    }
+
+    #[tokio::test]
+    async fn header_less_mid_stream_check_defends_the_floor() {
+        let body = vec![1u8; 4096];
+        let server = MockServer::start().await;
+        mount_failing_head(&server).await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let (_dir, dest) = scratch();
+        let cancel = CancellationToken::new();
+        let starved = DownloadPolicy {
+            probe: fixed_probe(1023),
+            check_interval: 512,
+            mid_stream_floor: 1024,
+            ..policy()
+        };
+        let (result, _) = run(&server.uri(), &dest, None, &cancel, starved).await;
+
+        assert!(
+            matches!(result, Err(LensError::InsufficientSpace(_))),
+            "got {result:?}"
+        );
+        assert!(dest.with_extension("part").exists());
+    }
+
+    #[tokio::test]
+    async fn missing_content_length_abstains_from_the_preflight() {
+        let body = vec![1u8; 1024];
+        let expected = sha256_hex(&body);
+        let server = MockServer::start().await;
+        mount_failing_head(&server).await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+
+        let (_dir, dest) = scratch();
+        let cancel = CancellationToken::new();
+        let starved = DownloadPolicy {
+            probe: fixed_probe(0),
+            headroom: DISK_HEADROOM_BYTES,
+            ..policy()
+        };
+        let (result, _) = run(&server.uri(), &dest, Some(&expected), &cancel, starved).await;
+
+        assert!(
+            result.is_ok(),
+            "a header-less server must not become a download outage: {result:?}"
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+    }
+
+    #[tokio::test]
+    async fn a_failing_space_probe_abstains_from_the_preflight() {
+        let body = vec![1u8; 1024];
+        let expected = sha256_hex(&body);
+        let server = MockServer::start().await;
+        mount_head(&server, body.len() as u64).await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+
+        let (_dir, dest) = scratch();
+        let cancel = CancellationToken::new();
+        let blind = DownloadPolicy {
+            probe: abstaining_probe(),
+            headroom: DISK_HEADROOM_BYTES,
+            ..policy()
+        };
+        let (result, _) = run(&server.uri(), &dest, Some(&expected), &cancel, blind).await;
+
+        assert!(
+            result.is_ok(),
+            "an unstattable filesystem must not become a download outage: {result:?}"
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+    }
+
+    // ── single writer per .part ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn concurrent_downloads_of_one_artifact_issue_a_single_get() {
+        let body = vec![1u8; 1024];
+        let expected = sha256_hex(&body);
+        let server = MockServer::start().await;
+        mount_head(&server, body.len() as u64).await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(body.clone())
+                    .set_delay(Duration::from_millis(150)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (_dir, dest) = scratch();
+        let cancel = CancellationToken::new();
+        let uri = server.uri();
+        let (first, second) = tokio::join!(
+            run(&uri, &dest, Some(&expected), &cancel, policy()),
+            run(&uri, &dest, Some(&expected), &cancel, policy()),
+        );
+
+        assert!(first.0.is_ok(), "got {:?}", first.0);
+        assert!(second.0.is_ok(), "got {:?}", second.0);
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+    }
+
+    #[test]
+    fn write_locks_are_per_part_path() {
+        let alpha = part_write_lock(Path::new("/models/alpha.part"));
+        let beta = part_write_lock(Path::new("/models/beta.part"));
+        let alpha_again = part_write_lock(Path::new("/models/alpha.part"));
+        assert!(
+            !Arc::ptr_eq(&alpha, &beta),
+            "a single global gate would serialize concurrent downloads of different artifacts"
+        );
+        assert!(
+            Arc::ptr_eq(&alpha, &alpha_again),
+            "the same .part path must reuse its lock or the guard is bypassable"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_downloads_of_different_artifacts_each_fetch() {
+        let body = vec![1u8; 1024];
+        let expected = sha256_hex(&body);
+        let server = MockServer::start().await;
+        mount_head(&server, body.len() as u64).await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let alpha = dir.path().join("alpha.bin");
+        let beta = dir.path().join("beta.bin");
+        let cancel = CancellationToken::new();
+        let uri = server.uri();
+        let (a, b) = tokio::join!(
+            run(&uri, &alpha, Some(&expected), &cancel, policy()),
+            run(&uri, &beta, Some(&expected), &cancel, policy()),
+        );
+
+        assert!(a.0.is_ok() && b.0.is_ok(), "{:?} / {:?}", a.0, b.0);
+        assert_eq!(std::fs::read(&alpha).unwrap(), body);
+        assert_eq!(std::fs::read(&beta).unwrap(), body);
+    }
 }
