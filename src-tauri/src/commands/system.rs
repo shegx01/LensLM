@@ -1,11 +1,13 @@
 //! System / diagnostic commands.
 
 use lens_core::{
-    AsrBackend, CheckResult, CloudTtsConsent, CloudTtsKind, DownloadProgress, InstallProgress,
-    LensEngine, LensError, LlmDetection, StorageStats, TtsVoice, WHISPER_REGISTRY,
+    AsrBackend, CheckResult, CloudTtsConsent, CloudTtsKind, DownloadKey, DownloadKind,
+    DownloadProgress, InstallProgress, LensEngine, LensError, LlmDetection, StorageStats, TtsVoice,
+    WHISPER_REGISTRY,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use tauri::Manager;
 use tauri::ipc::Channel;
 
@@ -297,7 +299,13 @@ pub async fn download_tts_model(
     lens_engine: tauri::State<'_, LensEngine>,
 ) -> Result<(), LensError> {
     let cache_root = resolved_cache_root(&lens_engine).await;
-    lens_core::download_tts_model(&cache_root, &model, |progress| {
+    let key = DownloadKey {
+        kind: DownloadKind::Tts,
+        id: model.clone(),
+    };
+    let cancel = lens_engine.register_download(key.clone());
+    let _guard = lens_engine.download_cancel_guard(key, Arc::clone(&cancel));
+    lens_core::download_tts_model(&cache_root, &model, &cancel, |progress| {
         if let Err(e) = on_progress.send(progress) {
             tracing::warn!("download_tts_model: progress channel send failed: {e}");
         }
@@ -429,13 +437,30 @@ pub async fn download_whisper_model(
     engine: tauri::State<'_, LensEngine>,
 ) -> Result<(), LensError> {
     let cache_root = resolved_cache_root(&engine).await;
-    lens_core::download_whisper_model(&cache_root, &model, |progress| {
+    let key = DownloadKey {
+        kind: DownloadKind::Whisper,
+        id: model.clone(),
+    };
+    let cancel = engine.register_download(key.clone());
+    let _guard = engine.download_cancel_guard(key, Arc::clone(&cancel));
+    lens_core::download_whisper_model(&cache_root, &model, &cancel, |progress| {
         if let Err(e) = on_progress.send(progress) {
             tracing::warn!("download_whisper_model: progress channel send failed: {e}");
         }
     })
     .await
     .map(|_| ())
+}
+
+/// Cancels an in-flight TTS/Whisper model download (#37). Returns `true` if one was
+/// in flight; the retained `.part` lets a later download resume from it.
+#[tracing::instrument(skip_all)]
+#[tauri::command]
+pub async fn cancel_download(
+    key: DownloadKey,
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<bool, LensError> {
+    Ok(engine.cancel_download(&key))
 }
 
 /// Returns whether the given Whisper model is already on disk, so the

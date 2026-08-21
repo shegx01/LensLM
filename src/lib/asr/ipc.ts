@@ -86,3 +86,20 @@ export async function downloadWhisperModel(
   // Tauri looks up the snake_case key and a camelCase one fails with `missing required key`.
   await invoke<void>('download_whisper_model', { model, on_progress: channel });
 }
+
+// SYNC-CHECK: must match lens-core/src/lib.rs DownloadKey/DownloadKind. `DownloadKind`
+// derives rename_all = "snake_case", so the wire form is lowercase.
+export type DownloadKind = 'tts' | 'whisper';
+export interface DownloadKey {
+  kind: DownloadKind;
+  id: string;
+}
+
+/**
+ * Cancels an in-flight TTS/Whisper model download; `true` if one was in flight.
+ * Shared by both download UIs. Returns `false` outside Tauri.
+ */
+export async function cancelDownload(key: DownloadKey): Promise<boolean> {
+  if (!isTauri()) return false;
+  return invoke<boolean>('cancel_download', { key });
+}
