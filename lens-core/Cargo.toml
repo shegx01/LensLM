@@ -183,7 +183,7 @@ quick-xml = { version = "=0.41.0", default-features = false }
 # workspace (lance, reqwest, docx-rs). zlib-rs is a production-grade pure-Rust
 # backend and the full test suite passes; documented here so a future maintainer
 # isn't surprised by the Cargo.lock backend change.
-rbook = { version = "=0.7.9", default-features = false, features = ["threadsafe"] }
+rbook = { version = "=0.7.10", default-features = false, features = ["threadsafe"] }
 
 # --- M4 issue #76: tabular-format extractors (XLSX/XLS/CSV) ---
 # Excel/OpenDocument spreadsheet reader (XLSX + XLS) via the shared
@@ -191,7 +191,7 @@ rbook = { version = "=0.7.9", default-features = false, features = ["threadsafe"
 # `open_workbook_auto_from_rs(Cursor::new(raw))`. The cell enum is `Data`
 # (variants Int/Float/String/Bool/DateTime(ExcelDateTime)/DateTimeIso(String)/
 # DurationIso(String)/Error/Empty). MIT — deny.toml allowlist. Pinned exactly.
-calamine = "=0.35.0"
+calamine = "=0.36.1"
 # CSV reader (comma-delimited, RFC-4180 quoting) for the `csv.rs` extractor.
 # `ReaderBuilder::default()` does NOT strip a leading UTF-8 BOM; the extractor
 # strips it manually. MIT OR Unlicense — MIT in deny.toml allowlist. Pinned.
@@ -201,7 +201,7 @@ csv = "=1.4.0"
 # DOCX paragraph/heading/table extraction. MIT licence — in deny.toml allowlist.
 # Pinned exactly to avoid future breaking changes in a crate still at 0.x.
 # `default-features = false` drops the optional `image` dep (not needed for extraction).
-docx-rs = { version = "=0.4.20", default-features = false }
+docx-rs = { version = "=0.4.22", default-features = false }
 
 # --- M4 Source Grounding (Phase 2, Step 5) ---
 # PDF text + per-segment bounding-box extraction. `pdfium-render` is a pure-Rust
