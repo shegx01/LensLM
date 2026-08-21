@@ -396,6 +396,16 @@ where
             AttemptFailure::Retryable(LensError::Io(format!("create {}: {e}", ctx.tmp.display())))
         })?;
         (file, 0, total)
+    } else if status.is_client_error()
+        && status != reqwest::StatusCode::REQUEST_TIMEOUT
+        && status != reqwest::StatusCode::TOO_MANY_REQUESTS
+    {
+        // A 4xx is the server's verdict on this request, not a transient fault, so
+        // retrying just makes the user wait out the backoffs for the same answer.
+        // 408 and 429 are the two that do invite one. (416 is handled above.)
+        return Err(AttemptFailure::Fatal(LensError::Network(format!(
+            "download failed with status {status}"
+        ))));
     } else {
         return Err(AttemptFailure::Retryable(LensError::Network(format!(
             "download failed with status {status}"
@@ -1148,6 +1158,70 @@ mod tests {
         mount_head(&server, 1024).await;
         Mock::given(method("GET"))
             .respond_with(ResponseTemplate::new(502))
+            .expect(3)
+            .mount(&server)
+            .await;
+
+        let (_dir, dest) = scratch();
+        let cancel = CancellationToken::new();
+        let (result, _) = run(&server.uri(), &dest, None, &cancel, policy()).await;
+
+        assert!(
+            matches!(result, Err(LensError::Network(_))),
+            "got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_error_is_not_retried() {
+        let server = MockServer::start().await;
+        mount_head(&server, 1024).await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (_dir, dest) = scratch();
+        let cancel = CancellationToken::new();
+        let (result, _) = run(&server.uri(), &dest, None, &cancel, policy()).await;
+
+        assert!(
+            matches!(result, Err(LensError::Network(_))),
+            "got {result:?}"
+        );
+    }
+
+    /// Scopes the 4xx exemption: a 5xx must still exhaust the retry budget, or the
+    /// fatal arm has swallowed the transient failures the retry loop exists for.
+    #[tokio::test]
+    async fn a_server_error_is_still_retried() {
+        let server = MockServer::start().await;
+        mount_head(&server, 1024).await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(3)
+            .mount(&server)
+            .await;
+
+        let (_dir, dest) = scratch();
+        let cancel = CancellationToken::new();
+        let (result, _) = run(&server.uri(), &dest, None, &cancel, policy()).await;
+
+        assert!(
+            matches!(result, Err(LensError::Network(_))),
+            "got {result:?}"
+        );
+    }
+
+    /// 429 is a client error that *does* invite a retry, so it must not fall into
+    /// the fatal arm with the rest of the 4xx family.
+    #[tokio::test]
+    async fn too_many_requests_is_retried() {
+        let server = MockServer::start().await;
+        mount_head(&server, 1024).await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(429))
             .expect(3)
             .mount(&server)
             .await;
