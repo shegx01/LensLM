@@ -74,12 +74,12 @@ impl QwenPrepareCoordinator {
 
         // Re-check after acquiring: the caller we queued behind may have just
         // completed the download, so there is nothing left to do (AC-2).
-        // The disk guard below MUST come after this: it is the only thing that
-        // keeps a fully-cached snapshot from ever reaching the guard.
         if qwen_snapshot_present(&paths.hf_cache_dir) {
             return Ok(());
         }
 
+        // Ordering is the whole safety argument: the short-circuit above is what
+        // keeps a fully-cached snapshot from ever reaching this guard.
         let snapshot_dir = paths.hf_cache_dir.join("hub").join(QWEN_SNAPSHOT_DIR);
         let on_disk = path_size_bytes(&snapshot_dir).unwrap_or(0);
         let required = QWEN_SNAPSHOT_APPROX_BYTES
