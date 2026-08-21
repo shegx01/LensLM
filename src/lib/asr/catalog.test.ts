@@ -4,6 +4,7 @@ import {
   ASR_ENGINE_CATALOG,
   ASR_LANGUAGE_OPTIONS,
   CLOUD_ASR_PRESETS,
+  appleAsrUnavailableReason,
   appleTranslateRerouteNotice,
   asrBackendToken,
   asrCapability,
@@ -28,11 +29,26 @@ describe('ASR_ENGINE_CATALOG', () => {
     expect(automatic.description.toLowerCase()).not.toContain('cloud');
     expect(automatic.description.toLowerCase()).not.toMatch(/apple silicon|macos \d/);
   });
+});
 
-  it('Apple row states an unavailable reason naming both possible causes', () => {
-    const apple = ASR_ENGINE_CATALOG.find((e) => e.id === 'apple_native')!;
-    expect(apple.unavailableReason).toMatch(/apple silicon/i);
-    expect(apple.unavailableReason).toMatch(/macos 26/i);
+describe('appleAsrUnavailableReason', () => {
+  it('has no reason when Apple ASR is available', () => {
+    expect(appleAsrUnavailableReason('available')).toBeNull();
+  });
+
+  it('names each blocker distinctly so the user knows which action helps', () => {
+    const reasons = [
+      appleAsrUnavailableReason(null),
+      appleAsrUnavailableReason('not_built'),
+      appleAsrUnavailableReason({ unsupported: 'not_apple_silicon' }),
+      appleAsrUnavailableReason({ unsupported: 'version_probe_failed' }),
+      appleAsrUnavailableReason({ unsupported: { macos_too_old: { found: 15, required: 26 } } })
+    ];
+    expect(new Set(reasons).size).toBe(reasons.length);
+    expect(reasons[1]).toMatch(/bridge/i);
+    expect(reasons[2]).toMatch(/apple silicon/i);
+    expect(reasons[4]).toMatch(/macOS 26/);
+    expect(reasons[4]).toMatch(/macOS 15/);
   });
 });
 

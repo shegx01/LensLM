@@ -10,6 +10,7 @@ import {
   trashSource,
   restoreSource
 } from './ipc.js';
+import { SvelteMap } from 'svelte/reactivity';
 import type { Source, SourceStatus, StreamEvent, IngestProgress, ErrorMeta } from './types.js';
 import { notebookStore, refreshTrashedSources } from '$lib/notebooks/notebooks-state.svelte.js';
 
@@ -57,6 +58,11 @@ interface SourceViewerRequest {
 let sourceViewerRequest = $state<SourceViewerRequest | null>(null);
 let sourceViewerNonce = $state(0);
 
+// Which ASR backend actually transcribed each audio source. Session-scoped by design:
+// not persisted, so it vanishes on reload. SvelteMap, not Map — `$state(new Map())`
+// does not track `.set()`, so readers would never see a marker arrive.
+const effectiveBackendBySource = new SvelteMap<string, string>();
+
 // ---------------------------------------------------------------------------
 // Exported store object
 // ---------------------------------------------------------------------------
@@ -101,6 +107,10 @@ export const sourcesStore = {
   /** Bumps on every `openSourceViewer` call so reopening the same source+span re-fires. */
   get sourceViewerNonce(): number {
     return sourceViewerNonce;
+  },
+  /** The ASR marker captured for `sourceId`, or `null` if none was. */
+  effectiveBackendFor(sourceId: string): string | null {
+    return effectiveBackendBySource.get(sourceId) ?? null;
   }
 };
 
@@ -243,6 +253,9 @@ function makeIngestHandler(sourceId: string): (e: StreamEvent<IngestProgress>) =
   return function handleEvent(e: StreamEvent<IngestProgress>): void {
     if (e.type === 'chunk' && e.data) {
       updateSourceStatus(sourceId, phaseToStatus(e.data.phase));
+      if (e.data.effective_backend) {
+        effectiveBackendBySource.set(sourceId, e.data.effective_backend);
+      }
     } else if (e.type === 'progress') {
       // reserved for future progress bar
     } else if (e.type === 'done') {
@@ -422,6 +435,7 @@ export function resetSourcesStore(): void {
   focusNonce = 0;
   sourceViewerRequest = null;
   sourceViewerNonce = 0;
+  effectiveBackendBySource.clear();
   for (const entry of trashQueue) {
     clearTimeout(entry.timeoutId);
   }

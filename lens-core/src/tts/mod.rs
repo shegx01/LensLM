@@ -246,12 +246,56 @@ pub trait TtsProvider: Send + Sync {
     }
 }
 
+/// Whether the user has consented to sending text to a cloud TTS provider
+/// (`AppConfig::tts_cloud_consent`). Withheld is the default and a saved API key
+/// never implies Granted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloudTtsConsent {
+    Granted,
+    Withheld,
+}
+
+impl CloudTtsConsent {
+    pub fn from_flag(granted: bool) -> Self {
+        if granted {
+            Self::Granted
+        } else {
+            Self::Withheld
+        }
+    }
+}
+
+/// The ONE predicate every cloud-TTS gate consults — resolution, availability, the
+/// system check, the voice list, the engine catalog (#273). Its transport clause is
+/// the gate cloud ASR uses: a cleartext endpoint leaks the key AND the dialogue.
+pub fn cloud_tts_usable(cfg: &TtsConfig, kind: CloudTtsKind, consent: CloudTtsConsent) -> bool {
+    consent == CloudTtsConsent::Granted
+        && cfg.clouds.get(&kind).is_some_and(|c| !c.api_key.is_empty())
+        && crate::http::is_transport_safe_base_url(&effective_cloud_base_url(cfg, kind))
+}
+
+/// The endpoint a cloud request would actually hit: the stored base URL, or the
+/// vendor default when it is blank. Gate and adapter must read the same value.
+fn effective_cloud_base_url(cfg: &TtsConfig, kind: CloudTtsKind) -> String {
+    cfg.clouds
+        .get(&kind)
+        .map(|c| c.base_url.trim())
+        .filter(|b| !b.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| cloud::default_base_url(kind).to_string())
+}
+
+/// User-facing reason a cloud engine is unselectable because consent is withheld.
+/// Carries its own remediation — the reason surface renders it verbatim.
+pub const CLOUD_TTS_CONSENT_REASON: &str = "Cloud text-to-speech is off. Turn on \"Allow cloud text-to-speech\" in Privacy settings to use this voice.";
+
 /// Resolves a [`TtsProvider`] for `backend`, given an optional injected `sidecar`.
 /// Single dispatch path — [`resolve_tts_provider`] and `synthesize_overview` both
 /// route through it so the two entry points cannot diverge.
 pub fn resolve_tts_provider_full(
     backend: TtsBackend,
     cfg: &TtsConfig,
+    consent: CloudTtsConsent,
     cache_root: &Path,
     // Consumed only by the Apple-Silicon-gated `Qwen3Local` arm below.
     #[cfg_attr(
@@ -272,12 +316,11 @@ pub fn resolve_tts_provider_full(
         }
         TtsBackend::Cloud(kind) => {
             let creds = cfg.clouds.get(&kind);
-            let api_key = creds.map(|c| c.api_key.clone()).unwrap_or_default();
-            // #40 AC6: no key -> fall back to offline Orpheus iff its weights are on
-            // disk (agrees with the availability gate); else None. Selection-time only
-            // — a mid-request network failure is a Network error, not a silent swap.
-            // Probe with `tts_model_downloaded` (exact size), not paths-only `tts_model_path`.
-            if api_key.is_empty() {
+            // #40 AC6: unusable (no key, or consent withheld) -> fall back to offline
+            // Orpheus iff its weights are on disk (agrees with the availability gate);
+            // else None. Selection-time only — a mid-request network failure is a
+            // Network error, not a silent swap.
+            if !cloud_tts_usable(cfg, kind, consent) {
                 if !orpheus_ready(cache_root) {
                     return None;
                 }
@@ -285,10 +328,8 @@ pub fn resolve_tts_provider_full(
                 let snac = tts_model_path(cache_root, "snac")?;
                 return Some(Arc::new(orpheus::OrpheusAdapter::new(orpheus, snac)));
             }
-            let base_url = creds
-                .map(|c| c.base_url.clone())
-                .filter(|b| !b.is_empty())
-                .unwrap_or_else(|| cloud::default_base_url(kind).to_string());
+            let api_key = creds.map(|c| c.api_key.clone()).unwrap_or_default();
+            let base_url = effective_cloud_base_url(cfg, kind);
             let model = if cfg.model.is_empty() {
                 cloud::default_model(kind).to_string()
             } else {
@@ -317,9 +358,10 @@ pub(crate) fn orpheus_ready(cache_root: &Path) -> bool {
 pub fn resolve_tts_provider(
     backend: TtsBackend,
     cfg: &TtsConfig,
+    consent: CloudTtsConsent,
     cache_root: &Path,
 ) -> Option<Arc<dyn TtsProvider>> {
-    resolve_tts_provider_full(backend, cfg, cache_root, None)
+    resolve_tts_provider_full(backend, cfg, consent, cache_root, None)
 }
 
 /// Single source of truth for rendering an abstract [`Emotion`] per TTS modality:
@@ -385,7 +427,9 @@ mod tests {
             TtsBackend::Cloud(CloudTtsKind::ElevenLabs),
             TtsBackend::Cloud(CloudTtsKind::GoogleCloud),
         ] {
-            assert!(resolve_tts_provider(backend, &cfg, data_dir).is_none());
+            assert!(
+                resolve_tts_provider(backend, &cfg, CloudTtsConsent::Granted, data_dir).is_none()
+            );
         }
     }
 
@@ -415,32 +459,46 @@ mod tests {
             CloudTtsKind::GoogleCloud,
         ] {
             let cfg = cloud_cfg(kind, "sk-test", "https://api.example.com");
-            let provider = resolve_tts_provider(TtsBackend::Cloud(kind), &cfg, data_dir)
-                .expect("cloud resolves with a cloud config");
+            let provider = resolve_tts_provider(
+                TtsBackend::Cloud(kind),
+                &cfg,
+                CloudTtsConsent::Granted,
+                data_dir,
+            )
+            .expect("cloud resolves with a cloud config");
             assert_eq!(provider.info().backend, TtsBackend::Cloud(kind));
             // Empty `cfg.model` falls back to the PER-KIND default cloud model.
             assert_eq!(provider.info().model, cloud::default_model(kind));
         }
     }
 
-    #[test]
-    fn resolve_cloud_empty_key_falls_back_to_orpheus_when_on_disk() {
-        // Fake both Orpheus weights on disk at their exact pinned sizes (sparse
-        // files) so `orpheus_ready` is true without a real multi-GB download.
-        let dir = tempfile::tempdir().unwrap();
+    /// Fakes both Orpheus weights at their exact pinned sizes (sparse files) so
+    /// `orpheus_ready` is true without a real multi-GB download.
+    fn fake_orpheus_on_disk(cache_root: &Path) {
         for id in ["orpheus", "snac"] {
             let spec = resolve_tts(id).unwrap();
-            let path = tts_model_path(dir.path(), id).unwrap();
+            let path = tts_model_path(cache_root, id).unwrap();
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::File::create(&path)
                 .unwrap()
                 .set_len(spec.size_bytes)
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn resolve_cloud_empty_key_falls_back_to_orpheus_when_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_orpheus_on_disk(dir.path());
         let kind = CloudTtsKind::ElevenLabs;
         let cfg = cloud_cfg(kind, "", "");
-        let provider = resolve_tts_provider(TtsBackend::Cloud(kind), &cfg, dir.path())
-            .expect("empty key falls back to Orpheus when weights are on disk");
+        let provider = resolve_tts_provider(
+            TtsBackend::Cloud(kind),
+            &cfg,
+            CloudTtsConsent::Granted,
+            dir.path(),
+        )
+        .expect("empty key falls back to Orpheus when weights are on disk");
         assert_eq!(provider.info().backend, TtsBackend::Orpheus);
     }
 
@@ -449,15 +507,86 @@ mod tests {
         let kind = CloudTtsKind::GoogleCloud;
         let cfg = cloud_cfg(kind, "", "");
         // No Orpheus weights under /data → no fallback → None.
-        assert!(resolve_tts_provider(TtsBackend::Cloud(kind), &cfg, Path::new("/data")).is_none());
+        assert!(
+            resolve_tts_provider(
+                TtsBackend::Cloud(kind),
+                &cfg,
+                CloudTtsConsent::Granted,
+                Path::new("/data")
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn cloud_tts_usable_requires_both_consent_and_a_key() {
+        let kind = CloudTtsKind::OpenAiCompatible;
+        let keyed = cloud_cfg(kind, "sk-test", "https://api.example.com");
+        let keyless = cloud_cfg(kind, "", "https://api.example.com");
+        for (cfg, consent, expected) in [
+            (&keyed, CloudTtsConsent::Granted, true),
+            (&keyed, CloudTtsConsent::Withheld, false),
+            (&keyless, CloudTtsConsent::Granted, false),
+            (&keyless, CloudTtsConsent::Withheld, false),
+        ] {
+            assert_eq!(
+                cloud_tts_usable(cfg, kind, consent),
+                expected,
+                "consent {consent:?} with key {:?}",
+                cfg.clouds.get(&kind).map(|c| c.api_key.as_str())
+            );
+        }
+        // A key saved for a DIFFERENT provider never enables this one.
+        assert!(!cloud_tts_usable(
+            &keyed,
+            CloudTtsKind::Deepgram,
+            CloudTtsConsent::Granted
+        ));
+    }
+
+    #[test]
+    fn resolve_cloud_with_key_but_consent_withheld_takes_the_orpheus_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_orpheus_on_disk(dir.path());
+        let kind = CloudTtsKind::OpenAiCompatible;
+        let cfg = cloud_cfg(kind, "sk-test", "https://api.example.com");
+        let provider = resolve_tts_provider(
+            TtsBackend::Cloud(kind),
+            &cfg,
+            CloudTtsConsent::Withheld,
+            dir.path(),
+        )
+        .expect("withheld consent degrades to Orpheus when its weights are on disk");
+        assert_eq!(provider.info().backend, TtsBackend::Orpheus);
+    }
+
+    #[test]
+    fn resolve_cloud_with_key_but_consent_withheld_is_none_without_orpheus() {
+        let kind = CloudTtsKind::OpenAiCompatible;
+        let cfg = cloud_cfg(kind, "sk-test", "https://api.example.com");
+        assert!(
+            resolve_tts_provider(
+                TtsBackend::Cloud(kind),
+                &cfg,
+                CloudTtsConsent::Withheld,
+                Path::new("/data")
+            )
+            .is_none(),
+            "a keyed cloud backend must never resolve to a cloud provider without consent"
+        );
     }
 
     #[test]
     fn resolve_cloud_with_key_applies_per_kind_base_url_and_model_defaults() {
         let kind = CloudTtsKind::GoogleCloud;
         let cfg = cloud_cfg(kind, "key", "");
-        let provider = resolve_tts_provider(TtsBackend::Cloud(kind), &cfg, Path::new("/data"))
-            .expect("keyed cloud resolves");
+        let provider = resolve_tts_provider(
+            TtsBackend::Cloud(kind),
+            &cfg,
+            CloudTtsConsent::Granted,
+            Path::new("/data"),
+        )
+        .expect("keyed cloud resolves");
         assert_eq!(provider.info().model, cloud::default_model(kind));
     }
 
@@ -466,8 +595,13 @@ mod tests {
         // Cheap construct: an adapter is returned even when the weights are
         // absent (paths only, no load); availability is a separate file probe.
         let cfg = TtsConfig::default();
-        let provider = resolve_tts_provider(TtsBackend::Orpheus, &cfg, Path::new("/data"))
-            .expect("orpheus resolves to an adapter");
+        let provider = resolve_tts_provider(
+            TtsBackend::Orpheus,
+            &cfg,
+            CloudTtsConsent::Granted,
+            Path::new("/data"),
+        )
+        .expect("orpheus resolves to an adapter");
         assert_eq!(provider.info().backend, TtsBackend::Orpheus);
     }
 
@@ -476,13 +610,35 @@ mod tests {
     fn resolve_full_qwen3_local_needs_sidecar() {
         let cfg = TtsConfig::default();
         let data_dir = Path::new("/data");
-        assert!(resolve_tts_provider_full(TtsBackend::Qwen3Local, &cfg, data_dir, None).is_none());
-        assert!(resolve_tts_provider(TtsBackend::Qwen3Local, &cfg, data_dir).is_none());
+        assert!(
+            resolve_tts_provider_full(
+                TtsBackend::Qwen3Local,
+                &cfg,
+                CloudTtsConsent::Granted,
+                data_dir,
+                None
+            )
+            .is_none()
+        );
+        assert!(
+            resolve_tts_provider(
+                TtsBackend::Qwen3Local,
+                &cfg,
+                CloudTtsConsent::Granted,
+                data_dir
+            )
+            .is_none()
+        );
 
         let sidecar: Arc<dyn TtsSidecar> = Arc::new(NoopSidecar);
-        let provider =
-            resolve_tts_provider_full(TtsBackend::Qwen3Local, &cfg, data_dir, Some(sidecar))
-                .expect("qwen3_local resolves with a sidecar");
+        let provider = resolve_tts_provider_full(
+            TtsBackend::Qwen3Local,
+            &cfg,
+            CloudTtsConsent::Granted,
+            data_dir,
+            Some(sidecar),
+        )
+        .expect("qwen3_local resolves with a sidecar");
         assert_eq!(provider.info().backend, TtsBackend::Qwen3Local);
         assert_eq!(provider.info().model, "qwen3-tts-customvoice");
     }
@@ -490,8 +646,13 @@ mod tests {
     #[test]
     fn resolve_orpheus_via_wrapper_ignores_absent_sidecar() {
         let cfg = TtsConfig::default();
-        let provider = resolve_tts_provider(TtsBackend::Orpheus, &cfg, Path::new("/data"))
-            .expect("orpheus resolves without a sidecar");
+        let provider = resolve_tts_provider(
+            TtsBackend::Orpheus,
+            &cfg,
+            CloudTtsConsent::Granted,
+            Path::new("/data"),
+        )
+        .expect("orpheus resolves without a sidecar");
         assert_eq!(provider.info().backend, TtsBackend::Orpheus);
     }
 

@@ -157,6 +157,8 @@ export interface AppConfig {
   asr: AsrConfig;
   // SYNC-CHECK: must match lens-core/src/config.rs AppConfig.audio_cloud_consent (default false).
   audio_cloud_consent: boolean;
+  // SYNC-CHECK: must match lens-core/src/config.rs AppConfig.tts_cloud_consent (default false).
+  tts_cloud_consent: boolean;
   // SYNC-CHECK: must match lens-core/src/config.rs AppConfig.js_render_enabled (default true).
   js_render_enabled: boolean;
   // SYNC-CHECK: must match lens-core/src/config.rs AppConfig.reopen_last_notebook (default true).

@@ -2,7 +2,7 @@
 //! `queued → parsing → embedding → indexed` (or `error`) and streaming [`IngestProgress`].
 //!
 //! The whole pipeline holds a single permit of [`ingest_lock`](crate::LensEngine::ingest_lock)
-//! (serializes ONNX). Re-ingest wipes Lance vectors FIRST, then SQLite chunks (G5 ordering):
+//! (serializes ONNX). Re-ingest wipes Lance vectors FIRST, then SQLite chunks (wipe ordering):
 //! a completed wipe never leaves orphan rows; a mid-wipe crash is recovered by startup
 //! crash-recovery + idempotent re-ingest. The nomic tokenizer is resolved once and cached on
 //! the engine; the Lance store is constructed per-ingest (cheap embedded connection).
@@ -972,7 +972,7 @@ impl IngestContext<'_> {
             Some(chunks.len() as u64),
         ));
 
-        // G5 ordering: Lance vectors dropped FIRST, then SQLite chunks — a completed wipe
+        // Wipe ordering: Lance vectors dropped FIRST, then SQLite chunks — a completed wipe
         // never leaves orphan Lance rows; chunk delete+insert run inside ONE transaction.
         store.drop_source(&coord, source_id).await?;
         // #155: entity-vector drop (same ordering as the chunk-vector drop above).
@@ -1628,7 +1628,7 @@ async fn fetch_url_guarded_inner(
 }
 
 /// Sets a terminal-pending status (`needs_ocr`/`needs_js`/`render_failed`), wiping prior
-/// indexed content first (Lance FIRST then SQLite — G5 ordering). Caller returns `Ok(())`
+/// indexed content first (Lance FIRST then SQLite). Caller returns `Ok(())`
 /// so the `Err→error` flip in [`ingest_source`] never fires.
 async fn set_terminal_pending(
     repo: &crate::notebooks::NotebookRepo<'_>,

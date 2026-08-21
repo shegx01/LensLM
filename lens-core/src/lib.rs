@@ -128,13 +128,13 @@ pub use transcription::{WindowConfig, decode_and_resample_audio, decode_resample
 // the crate root — `asr::{Lang, Platform}` already own those names here. The TTS
 // language types stay reachable via `lens_core::tts::{Lang, Platform, ...}`.
 pub use tts::{
-    AudioBuffer, CloudTtsKind, DownloadProgress, EngineCapability, EngineCatalogEntry, Gender,
-    GuardVerdict, OffendingSource, QwenVoice, TTS_REGISTRY, TtsBackend, TtsEngineId, TtsModelSpec,
-    TtsPhase, TtsProvider, TtsProviderInfo, TtsSidecar, TtsVoice, code_to_lang, download_tts_model,
-    emotion_tag, evaluate_language_guard, lang_to_qwen_name, qwen_voice, read_wav_mono16,
-    resolve_tts, resolve_tts_provider, resolve_tts_provider_full, tts_catalog,
-    tts_catalog_serialized, tts_model_downloaded, tts_model_file_present, tts_model_path,
-    validate_qwen_language,
+    AudioBuffer, CLOUD_TTS_CONSENT_REASON, CloudTtsConsent, CloudTtsKind, DownloadProgress,
+    EngineCapability, EngineCatalogEntry, Gender, GuardVerdict, OffendingSource, QwenVoice,
+    TTS_REGISTRY, TtsBackend, TtsEngineId, TtsModelSpec, TtsPhase, TtsProvider, TtsProviderInfo,
+    TtsSidecar, TtsVoice, cloud_tts_usable, code_to_lang, download_tts_model, emotion_tag,
+    evaluate_language_guard, lang_to_qwen_name, qwen_voice, read_wav_mono16, resolve_tts,
+    resolve_tts_provider, resolve_tts_provider_full, tts_catalog, tts_catalog_serialized,
+    tts_model_downloaded, tts_model_file_present, tts_model_path, validate_qwen_language,
 };
 pub use vector_store::{LanceVectorStore, VectorStore};
 
@@ -355,6 +355,9 @@ pub struct LensEngine {
     /// version stamp but BEFORE the canonical updates (single-txn atomicity assertion).
     #[cfg(feature = "test-util")]
     resolution_write_fault: Arc<std::sync::atomic::AtomicBool>,
+    /// #297 test seam: counts `asr_engine()` reads; tests delta it around a call.
+    #[cfg(feature = "test-util")]
+    asr_engine_reads: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl LensEngine {
@@ -460,6 +463,8 @@ impl LensEngine {
             resolution_pass_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             #[cfg(feature = "test-util")]
             resolution_write_fault: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(feature = "test-util")]
+            asr_engine_reads: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         };
 
         enrichment::spawn_worker(engine.clone(), enrichment_rx);
@@ -552,6 +557,8 @@ impl LensEngine {
             resolution_pass_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             #[cfg(feature = "test-util")]
             resolution_write_fault: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(feature = "test-util")]
+            asr_engine_reads: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         };
         enrichment::spawn_worker(engine.clone(), enrichment_rx);
         crate::resolution::spawn_resolution_worker(engine.clone(), resolution_rx);
@@ -1055,6 +1062,10 @@ impl LensEngine {
         guard.config.cache_root(&data_dir)
     }
 
+    pub(crate) async fn cloud_tts_consent(&self) -> tts::CloudTtsConsent {
+        tts::CloudTtsConsent::from_flag(self.read().await.config.tts_cloud_consent)
+    }
+
     /// Test-only accessor: `pub(crate)` `data_dir` is unreachable from the test
     /// crate; this exposes it. Absent from production builds.
     #[cfg(feature = "test-util")]
@@ -1239,7 +1250,17 @@ impl LensEngine {
     /// Returns a clone of the injected Apple-native ASR engine, or `None` when
     /// none is installed (LocalWhisper is then the routed backend).
     pub async fn asr_engine(&self) -> Option<Arc<dyn asr::AsrEngine>> {
+        #[cfg(feature = "test-util")]
+        self.asr_engine_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.asr_engine.read().await.clone()
+    }
+
+    /// Current value of the `asr_engine_reads` seam.
+    #[cfg(feature = "test-util")]
+    pub fn asr_engine_reads(&self) -> u32 {
+        self.asr_engine_reads
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Registers a fresh cancellation token for an in-flight audio ingest,
@@ -1478,12 +1499,12 @@ impl LensEngine {
             return self.tts_sidecar().await.is_some();
         }
         let cache_root = self.cache_root().await;
-        // Cloud has no registry model of its own: usable when a key is configured OR
-        // when the offline Orpheus fallback (#40 AC6) is itself on disk, so this gate
-        // agrees with `resolve_tts_provider_full`'s no-key -> Orpheus fallback.
+        // Cloud has no registry model of its own: usable when consent and a key are
+        // both in place OR when the offline Orpheus fallback (#40 AC6) is itself on
+        // disk, so this gate agrees with `resolve_tts_provider_full`.
         if let tts::TtsBackend::Cloud(kind) = &cfg.backend {
-            let has_key = cfg.clouds.get(kind).is_some_and(|c| !c.api_key.is_empty());
-            return has_key || tts::orpheus_ready(&cache_root);
+            let consent = self.cloud_tts_consent().await;
+            return tts::cloud_tts_usable(cfg, *kind, consent) || tts::orpheus_ready(&cache_root);
         }
         let required = cfg.backend.required_model_ids();
         !required.is_empty()
@@ -1506,9 +1527,15 @@ impl LensEngine {
         // (Orpheus). `data_dir` supplies embedded model paths.
         let data_dir = self.data_dir().await;
         let cache_root = self.cache_root().await;
-        let provider =
-            tts::resolve_tts_provider_full(cfg.backend, cfg, &cache_root, self.tts_sidecar().await)
-                .ok_or_else(|| LensError::Tts("no TTS backend available".into()))?;
+        let consent = self.cloud_tts_consent().await;
+        let provider = tts::resolve_tts_provider_full(
+            cfg.backend,
+            cfg,
+            consent,
+            &cache_root,
+            self.tts_sidecar().await,
+        )
+        .ok_or_else(|| LensError::Tts(no_tts_backend_reason(cfg, consent).into()))?;
         let buffer: tts::AudioBuffer = provider
             .synthesize_script(script, voices, &on_phase, cancel)
             .await?;
@@ -2039,30 +2066,17 @@ impl LensEngine {
         Ok(rows.into_iter().collect())
     }
 
-    /// Transcribes 16 kHz mono f32 PCM (#41 output), selecting the backend via
-    /// [`select_asr_backend`](asr::select_asr_backend): an explicit `AsrConfig`
-    /// override wins, else the injected Apple engine when present, else LocalWhisper.
-    ///
-    /// Returns the segments plus a `&'static str` label of the backend actually
-    /// used (`"cloud"`, `"apple_native"`, `"local_whisper"`, a `"…(fallback)"`
-    /// variant, or — when a low-confidence Apple result is re-transcribed on
-    /// Whisper — `"local_whisper (degraded)"` on success, or `"apple_native
-    /// (degraded)"` if the re-run fails and the Apple result is kept) so ingest
-    /// can surface it to the UI (#45).
-    pub async fn transcribe(
+    /// The raw router decision [`transcribe`](Self::transcribe) dispatches on. It is
+    /// a *preference*: an arm it selects can still be unrunnable, which is what
+    /// [`demote_unrunnable_backend`] resolves and the `(fallback)` labels report.
+    async fn resolve_asr_route(
         &self,
-        pcm: &[f32],
-        config: &TranscribeConfig,
-        progress_tx: Option<mpsc::UnboundedSender<f32>>,
-        cancel: Option<tokio_util::sync::CancellationToken>,
-    ) -> Result<(Vec<TranscriptSegment>, &'static str), LensError> {
-        let asr_cfg = {
-            let guard = self.read().await;
-            guard.config.asr.clone()
-        };
-        let config_backend = asr::AsrBackend::from_opt_str(Some(asr_cfg.backend.as_str()));
-
-        let injected = self.asr_engine().await;
+        config: &config::AppConfig,
+        injected: Option<&Arc<dyn asr::AsrEngine>>,
+        language: Option<&asr::Lang>,
+        translate: bool,
+    ) -> Result<asr::AsrBackend, LensError> {
+        let config_backend = asr::AsrBackend::from_opt_str(Some(config.asr.backend.as_str()));
         let apple_available = injected.is_some();
 
         // lens-core stays OS-probe-free: authoritative platform/version facts are
@@ -2073,12 +2087,12 @@ impl LensEngine {
             is_apple_silicon_macos: apple_available,
             macos_major: apple_available.then_some(asr::MIN_MACOS_FOR_APPLE_ASR),
         };
-        // Probe the injected Apple engine for locale support, only for an explicit
-        // language, off the async runtime (the probe crosses blocking FFI in prod);
-        // auto-detect or no engine trusts Apple, with the downstream confidence
-        // check as the runtime backstop.
-        let apple_supports_locale = match (&config.language, &injected) {
-            (Some(lang), Some(engine)) => {
+        // The probe crosses blocking FFI in prod, so run it off the runtime — and
+        // only when it can change the answer: an explicit override or a translate
+        // request decides the backend without it.
+        let locale_decides = config_backend.is_none() && !translate;
+        let apple_supports_locale = match (language, injected) {
+            (Some(lang), Some(engine)) if locale_decides => {
                 let (engine, lang) = (engine.clone(), lang.clone());
                 tokio::task::spawn_blocking(move || engine.supports_locale(&lang))
                     .await
@@ -2099,9 +2113,77 @@ impl LensEngine {
         // SpeechTranscriber has no translate task (translation is Whisper-only).
         // If the caller requests translation and the router picked Apple, fall back
         // to LocalWhisper so the translate request can be fulfilled.
-        if config.translate && backend == asr::AsrBackend::AppleNative {
+        if translate && backend == asr::AsrBackend::AppleNative {
             backend = asr::AsrBackend::LocalWhisper;
         }
+        Ok(backend)
+    }
+
+    /// Total decision seam: the backend that will really run, so the UI reports
+    /// reality rather than the stored preference (#297). What no static decision can
+    /// foresee surfaces afterwards in the run's `effective_backend` label.
+    pub(crate) async fn resolve_asr_backend_with(
+        &self,
+        config: &config::AppConfig,
+        injected: Option<&Arc<dyn asr::AsrEngine>>,
+        language: Option<&asr::Lang>,
+        translate: bool,
+    ) -> Result<asr::AsrBackend, LensError> {
+        let routed = self
+            .resolve_asr_route(config, injected, language, translate)
+            .await?;
+        Ok(demote_unrunnable_backend(
+            routed,
+            config,
+            injected.is_some(),
+        ))
+    }
+
+    /// [`resolve_asr_backend_with`](Self::resolve_asr_backend_with) for callers
+    /// holding no router inputs of their own (the Tauri command).
+    pub async fn resolve_asr_backend(
+        &self,
+        language: Option<&asr::Lang>,
+        translate: bool,
+    ) -> Result<asr::AsrBackend, LensError> {
+        let config = self.read().await.config.clone();
+        let injected = self.asr_engine().await;
+        self.resolve_asr_backend_with(&config, injected.as_ref(), language, translate)
+            .await
+    }
+
+    /// Transcribes 16 kHz mono f32 PCM (#41 output), selecting the backend via
+    /// [`select_asr_backend`](asr::select_asr_backend): an explicit `AsrConfig`
+    /// override wins, else the injected Apple engine when present, else LocalWhisper.
+    ///
+    /// Returns the segments plus a `&'static str` label of the backend actually
+    /// used (`"cloud"`, `"apple_native"`, `"local_whisper"`, a `"…(fallback)"`
+    /// variant, or — when a low-confidence Apple result is re-transcribed on
+    /// Whisper — `"local_whisper (degraded)"` on success, or `"apple_native
+    /// (degraded)"` if the re-run fails and the Apple result is kept) so ingest
+    /// can surface it to the UI (#45).
+    pub async fn transcribe(
+        &self,
+        pcm: &[f32],
+        config: &TranscribeConfig,
+        progress_tx: Option<mpsc::UnboundedSender<f32>>,
+        cancel: Option<tokio_util::sync::CancellationToken>,
+    ) -> Result<(Vec<TranscriptSegment>, &'static str), LensError> {
+        // One config observation for the whole run: the resolution seam, the cloud
+        // pre-flight and the local cascade must not see three different snapshots.
+        let app_config = self.read().await.config.clone();
+        let asr_cfg = app_config.asr.clone();
+
+        let injected = self.asr_engine().await;
+
+        let backend = self
+            .resolve_asr_route(
+                &app_config,
+                injected.as_ref(),
+                config.language.as_ref(),
+                config.translate,
+            )
+            .await?;
 
         // The injected engine is the Apple-native seam (Apple in prod, a mock in
         // tests); it is used ONLY when the router selects AppleNative. LocalWhisper
@@ -2136,11 +2218,9 @@ impl LensEngine {
                             Ok((segments, "apple_native"))
                         }
                     }
-                    // Apple runtime failure (e.g. a missing on-device asset) must not
-                    // leave the user with no transcription — fall back to Whisper when
-                    // a local model is available. Skip the fallback on a genuine
-                    // user-cancel or when whisper is unavailable, returning the
-                    // original Apple error in those cases.
+                    // An Apple runtime failure (e.g. a missing on-device asset) must
+                    // not leave the user with no transcription. A user-cancel is the
+                    // exception: the user chose to stop, so keep the original error.
                     Err(apple_err) => {
                         if !is_user_cancel(&apple_err)
                             && self.local_whisper_available(&asr_cfg).await
@@ -2161,24 +2241,35 @@ impl LensEngine {
                     .await?;
                 Ok((segs, "local_whisper"))
             }
-            (asr::AsrBackend::AppleNative, None) => Err(LensError::Transcription(
-                "apple-native backend selected but no engine is injected".into(),
-            )),
-            // Cloud (#45): pre-flight (consent/key/provider) + request; any failure
+            // A forced apple_native with nothing injected (no Swift bridge, or the OS
+            // gate rejected it at startup). Same Whisper fallback as an Apple runtime
+            // failure, so the `(fallback)` label reports the demotion.
+            (asr::AsrBackend::AppleNative, None) => {
+                if self.local_whisper_available(&asr_cfg).await {
+                    let segs = self
+                        .transcribe_local_whisper(pcm, config, progress_tx, &asr_cfg, cancel)
+                        .await?;
+                    Ok((segs, "local_whisper (fallback)"))
+                } else {
+                    Err(LensError::Transcription(
+                        "apple-native backend selected but no engine is injected".into(),
+                    ))
+                }
+            }
+            // Cloud (#45): pre-flight (consent/key/provider/endpoint) + request; any failure
             // that is not a user-cancel transparently degrades to the local cascade
             // (Apple-if-injected → Whisper), mirroring the Apple→Whisper symmetry.
             (asr::AsrBackend::Cloud, injected_local) => {
-                let app_config = self.read().await.config.clone();
                 match self
                     .cloud_transcribe(pcm, config, &app_config, progress_tx.clone())
                     .await
                 {
                     Ok(segments) => Ok((segments, "cloud")),
-                    Err(cloud_err) => {
+                    Err((cloud_err, cause)) => {
                         if is_user_cancel(&cloud_err) {
                             return Err(cloud_err);
                         }
-                        tracing::warn!(error = %cloud_err, "cloud ASR failed, falling back to local");
+                        tracing::warn!(error = %cloud_err, ?cause, "cloud ASR failed, falling back to local");
                         self.cloud_fallback_to_local(
                             pcm,
                             config,
@@ -2186,6 +2277,7 @@ impl LensEngine {
                             injected_local,
                             progress_tx,
                             cloud_err,
+                            cause,
                             cancel,
                         )
                         .await
@@ -2197,32 +2289,48 @@ impl LensEngine {
 
     /// Runs the cloud pre-flight then a [`CloudAsrEngine`] transcription. Pre-flight
     /// failure returns before any request, so the fallback path issues zero cloud
-    /// requests when consent/key/provider are missing (#45).
+    /// requests when consent, key, provider, or a usable endpoint is missing (#45).
     async fn cloud_transcribe(
         &self,
         pcm: &[f32],
         config: &TranscribeConfig,
         app_config: &config::AppConfig,
         progress_tx: Option<mpsc::UnboundedSender<f32>>,
-    ) -> Result<Vec<TranscriptSegment>, LensError> {
-        asr::cloud::preflight_check(app_config)?;
+    ) -> Result<Vec<TranscriptSegment>, (LensError, CloudDegradeCause)> {
+        asr::cloud::preflight_check(app_config)
+            .map_err(|e| (e, CloudDegradeCause::Misconfigured))?;
         let asr_cfg = &app_config.asr;
-        let provider = asr_cfg
-            .cloud_provider
-            .ok_or_else(|| LensError::Validation("no cloud ASR provider configured".into()))?;
+        let provider = asr_cfg.cloud_provider.ok_or_else(|| {
+            (
+                LensError::Validation("no cloud ASR provider configured".into()),
+                CloudDegradeCause::Misconfigured,
+            )
+        })?;
+        // Trimmed to match what the pre-flight validated; a stored `" https://…"`
+        // would otherwise clear the gate and fail at request time instead.
         let engine = asr::cloud::CloudAsrEngine::new(
             provider,
-            asr_cfg.cloud_base_url.clone(),
-            asr_cfg.cloud_model.clone(),
-            asr_cfg.cloud_api_key.clone(),
+            asr_cfg.cloud_base_url.trim(),
+            asr_cfg.cloud_model.trim(),
+            asr_cfg.cloud_api_key.trim(),
         );
-        let TranscriptOutput { segments, .. } =
-            engine.transcribe_pcm(pcm, config, progress_tx).await?;
+        let TranscriptOutput { segments, .. } = engine
+            .transcribe_pcm(pcm, config, progress_tx)
+            .await
+            .map_err(|e| {
+                let cause = if asr::cloud::is_key_rejection(&e) {
+                    CloudDegradeCause::Misconfigured
+                } else {
+                    CloudDegradeCause::Transient
+                };
+                (e, cause)
+            })?;
         Ok(segments)
     }
 
-    /// Cloud→local degradation cascade: Apple-if-injected, else Whisper. Returns
-    /// the original `cloud_err` only when no local path can produce segments.
+    /// Cloud→local degradation cascade: Apple-if-injected, else Whisper. When no local
+    /// path produces segments either, [`CloudDegradeCause::preferred_error`] picks
+    /// which of the two failures the user is shown.
     #[allow(clippy::too_many_arguments)]
     async fn cloud_fallback_to_local(
         &self,
@@ -2232,29 +2340,34 @@ impl LensEngine {
         injected: Option<Arc<dyn asr::AsrEngine>>,
         progress_tx: Option<mpsc::UnboundedSender<f32>>,
         cloud_err: LensError,
+        cause: CloudDegradeCause,
         cancel: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<(Vec<TranscriptSegment>, &'static str), LensError> {
         if let Some(engine) = injected {
             match engine.transcribe_pcm(pcm, config, progress_tx).await {
-                Ok(TranscriptOutput { segments: segs, .. }) => {
-                    Ok((segs, "apple_native (fallback)"))
-                }
+                Ok(TranscriptOutput { segments: segs, .. }) => Ok((segs, cause.apple_label())),
                 Err(apple_err) => {
                     if !is_user_cancel(&apple_err) && self.local_whisper_available(asr_cfg).await {
-                        let segs = self
+                        match self
                             .transcribe_local_whisper(pcm, config, None, asr_cfg, cancel)
-                            .await?;
-                        Ok((segs, "local_whisper (fallback)"))
+                            .await
+                        {
+                            Ok(segs) => Ok((segs, cause.whisper_label())),
+                            Err(local_err) => Err(cause.preferred_error(cloud_err, local_err)),
+                        }
                     } else {
-                        Err(apple_err)
+                        Err(cause.preferred_error(cloud_err, apple_err))
                     }
                 }
             }
         } else if self.local_whisper_available(asr_cfg).await {
-            let segs = self
+            match self
                 .transcribe_local_whisper(pcm, config, progress_tx, asr_cfg, cancel)
-                .await?;
-            Ok((segs, "local_whisper (fallback)"))
+                .await
+            {
+                Ok(segs) => Ok((segs, cause.whisper_label())),
+                Err(local_err) => Err(cause.preferred_error(cloud_err, local_err)),
+            }
         } else {
             Err(cloud_err)
         }
@@ -3330,6 +3443,77 @@ fn remove_file_best_effort(path: &Path) {
     }
 }
 
+/// Why no provider resolved for `cfg.backend`. A cloud user whose only blocker is
+/// consent gets told so here — the catalog's reason surface lives in Settings and
+/// never reaches someone who just pressed Generate.
+fn no_tts_backend_reason(cfg: &config::TtsConfig, consent: tts::CloudTtsConsent) -> &'static str {
+    if let tts::TtsBackend::Cloud(kind) = cfg.backend
+        && consent == tts::CloudTtsConsent::Withheld
+        && tts::cloud_tts_usable(cfg, kind, tts::CloudTtsConsent::Granted)
+    {
+        return "Cloud text-to-speech is configured but not permitted. Turn on \
+                \"Allow cloud text-to-speech\" in Privacy settings, or install the \
+                on-device voice.";
+    }
+    "no TTS backend available"
+}
+
+/// Rewrites a routed backend the run cannot honour into the one it falls back to: an
+/// Apple arm with no injected engine, and a cloud arm whose pre-flight already fails.
+/// Mirrors the matching arms of [`LensEngine::transcribe`].
+fn demote_unrunnable_backend(
+    routed: asr::AsrBackend,
+    config: &config::AppConfig,
+    apple_available: bool,
+) -> asr::AsrBackend {
+    let local_cascade = if apple_available {
+        asr::AsrBackend::AppleNative
+    } else {
+        asr::AsrBackend::LocalWhisper
+    };
+    match routed {
+        asr::AsrBackend::Cloud if asr::cloud::preflight_check(config).is_err() => local_cascade,
+        asr::AsrBackend::AppleNative if !apple_available => asr::AsrBackend::LocalWhisper,
+        other => other,
+    }
+}
+
+/// Why the cloud ASR arm degraded to local, tracked explicitly because the error variant
+/// cannot carry it: 413 is also [`LensError::Validation`] yet is not something the user
+/// fixes in Settings, so each call site classifies its own failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CloudDegradeCause {
+    Misconfigured,
+    Transient,
+}
+
+impl CloudDegradeCause {
+    fn apple_label(self) -> &'static str {
+        match self {
+            Self::Misconfigured => "apple_native (cloud misconfigured)",
+            Self::Transient => "apple_native (fallback)",
+        }
+    }
+
+    fn whisper_label(self) -> &'static str {
+        match self {
+            Self::Misconfigured => "local_whisper (cloud misconfigured)",
+            Self::Transient => "local_whisper (fallback)",
+        }
+    }
+
+    /// Which error to report when the whole cascade failed. A user cancel always
+    /// wins (the user already knows), then a cloud misconfiguration, which is the
+    /// only carrier of "your cloud settings are broken".
+    fn preferred_error(self, cloud_err: LensError, local_err: LensError) -> LensError {
+        if is_user_cancel(&local_err) || self == Self::Transient {
+            local_err
+        } else {
+            cloud_err
+        }
+    }
+}
+
 /// Whether an Apple transcription error represents a genuine user-cancel (which
 /// must NOT trigger the Whisper fallback — the user chose to stop). Apple errors
 /// cross the bridge as [`LensError::Transcription`] strings, so this matches on
@@ -3723,6 +3907,256 @@ mod transcribe_tests {
             .expect("apple transcription");
         assert_eq!(label, "apple_native");
         assert_eq!(segs, canned);
+    }
+
+    fn mock_asr_engine(supports_locale: bool) -> Arc<dyn asr::AsrEngine> {
+        Arc::new(
+            asr::MockAsrEngine::new(canned_apple_segment()).with_locale_support(supports_locale),
+        )
+    }
+
+    fn config_with_backend(backend: Option<asr::AsrBackend>) -> config::AppConfig {
+        let mut cfg = config::AppConfig::default();
+        cfg.asr.backend = backend.map(|b| b.as_str()).unwrap_or_default().to_string();
+        cfg
+    }
+
+    /// A cloud config with nothing left to complain about, so only the consent flag
+    /// decides whether the pre-flight passes.
+    fn runnable_cloud_config(consent: bool) -> config::AppConfig {
+        let mut cfg = config_with_backend(Some(asr::AsrBackend::Cloud));
+        cfg.audio_cloud_consent = consent;
+        cfg.asr.cloud_provider = Some(config::CloudAsrProvider::OpenAiCompatible);
+        cfg.asr.cloud_base_url = "https://api.openai.com".to_string();
+        cfg.asr.cloud_model = "whisper-1".to_string();
+        cfg.asr.cloud_api_key = "sk-test".to_string();
+        cfg
+    }
+
+    /// `Platform` is deliberately absent from the inputs: it is derived inside the
+    /// seam from engine presence, so no caller can drive it — `asr::router`'s own
+    /// unit tests cover it.
+    #[tokio::test]
+    async fn route_config_override_wins_over_every_other_gate() {
+        let engine = LensEngine::for_test().await;
+        let mock = mock_asr_engine(true);
+        for (override_backend, injected) in [
+            (asr::AsrBackend::LocalWhisper, Some(&mock)),
+            (asr::AsrBackend::AppleNative, None),
+            (asr::AsrBackend::Cloud, Some(&mock)),
+        ] {
+            let routed = engine
+                .resolve_asr_route(
+                    &config_with_backend(Some(override_backend)),
+                    injected,
+                    None,
+                    false,
+                )
+                .await
+                .expect("route");
+            assert_eq!(routed, override_backend);
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_without_injected_engine_is_whisper() {
+        let engine = LensEngine::for_test().await;
+        let resolved = engine
+            .resolve_asr_backend_with(
+                &config_with_backend(None),
+                None,
+                Some(&asr::Lang::En),
+                false,
+            )
+            .await
+            .expect("resolve");
+        assert_eq!(resolved, asr::AsrBackend::LocalWhisper);
+    }
+
+    #[tokio::test]
+    async fn resolve_unsupported_locale_is_whisper() {
+        let engine = LensEngine::for_test().await;
+        let mock = mock_asr_engine(false);
+        let resolved = engine
+            .resolve_asr_backend_with(
+                &config_with_backend(None),
+                Some(&mock),
+                Some(&asr::Lang::En),
+                false,
+            )
+            .await
+            .expect("resolve");
+        assert_eq!(resolved, asr::AsrBackend::LocalWhisper);
+    }
+
+    #[tokio::test]
+    async fn resolve_supported_locale_with_engine_is_apple() {
+        let engine = LensEngine::for_test().await;
+        let mock = mock_asr_engine(true);
+        let resolved = engine
+            .resolve_asr_backend_with(
+                &config_with_backend(None),
+                Some(&mock),
+                Some(&asr::Lang::En),
+                false,
+            )
+            .await
+            .expect("resolve");
+        assert_eq!(resolved, asr::AsrBackend::AppleNative);
+    }
+
+    #[tokio::test]
+    async fn resolve_translate_demotes_apple_to_whisper() {
+        let engine = LensEngine::for_test().await;
+        let mock = mock_asr_engine(true);
+        let cfg = config_with_backend(None);
+        let resolved = engine
+            .resolve_asr_backend_with(&cfg, Some(&mock), None, true)
+            .await
+            .expect("resolve");
+        assert_eq!(resolved, asr::AsrBackend::LocalWhisper);
+        let resolved = engine
+            .resolve_asr_backend_with(&cfg, Some(&mock), None, false)
+            .await
+            .expect("resolve");
+        assert_eq!(resolved, asr::AsrBackend::AppleNative);
+    }
+
+    /// A forced `apple_native` with no engine injected runs on Whisper, so the seam
+    /// must not keep reporting Apple.
+    #[tokio::test]
+    async fn resolve_demotes_forced_apple_without_an_injected_engine() {
+        let engine = LensEngine::for_test().await;
+        let resolved = engine
+            .resolve_asr_backend_with(
+                &config_with_backend(Some(asr::AsrBackend::AppleNative)),
+                None,
+                None,
+                false,
+            )
+            .await
+            .expect("resolve");
+        assert_eq!(resolved, asr::AsrBackend::LocalWhisper);
+    }
+
+    /// The headline divergence: a fully configured cloud backend whose consent has
+    /// since been revoked. Every ingest runs local, so the seam must say local.
+    #[tokio::test]
+    async fn resolve_demotes_cloud_when_the_preflight_cannot_pass() {
+        let engine = LensEngine::for_test().await;
+        let mock = mock_asr_engine(true);
+
+        assert_eq!(
+            engine
+                .resolve_asr_backend_with(&runnable_cloud_config(false), None, None, false)
+                .await
+                .expect("resolve"),
+            asr::AsrBackend::LocalWhisper,
+            "revoked consent with no Apple engine → Whisper"
+        );
+        assert_eq!(
+            engine
+                .resolve_asr_backend_with(&runnable_cloud_config(false), Some(&mock), None, false)
+                .await
+                .expect("resolve"),
+            asr::AsrBackend::AppleNative,
+            "revoked consent with an Apple engine → the same cascade transcribe takes"
+        );
+
+        let mut cleartext = runnable_cloud_config(true);
+        cleartext.asr.cloud_base_url = "http://asr.vendor.example".to_string();
+        assert_eq!(
+            engine
+                .resolve_asr_backend_with(&cleartext, None, None, false)
+                .await
+                .expect("resolve"),
+            asr::AsrBackend::LocalWhisper,
+            "an endpoint the transport gate rejects → Whisper"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_keeps_cloud_when_the_preflight_passes() {
+        let engine = LensEngine::for_test().await;
+        let resolved = engine
+            .resolve_asr_backend_with(&runnable_cloud_config(true), None, None, false)
+            .await
+            .expect("resolve");
+        assert_eq!(resolved, asr::AsrBackend::Cloud);
+    }
+
+    /// The Apple locale probe blocks on FFI behind an unbounded semaphore, and the
+    /// seam runs on every Settings render — so it must not run when an override or a
+    /// translate request already decides the backend.
+    #[tokio::test]
+    async fn resolve_skips_the_blocking_locale_probe_when_it_cannot_change_the_answer() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let engine = LensEngine::for_test().await;
+        let probes = Arc::new(AtomicUsize::new(0));
+        let mock: Arc<dyn asr::AsrEngine> = Arc::new(
+            asr::MockAsrEngine::new(canned_apple_segment())
+                .counting_locale_probes(Arc::clone(&probes)),
+        );
+
+        engine
+            .resolve_asr_backend_with(
+                &config_with_backend(None),
+                Some(&mock),
+                Some(&asr::Lang::En),
+                true,
+            )
+            .await
+            .expect("resolve");
+        engine
+            .resolve_asr_backend_with(
+                &config_with_backend(Some(asr::AsrBackend::AppleNative)),
+                Some(&mock),
+                Some(&asr::Lang::En),
+                false,
+            )
+            .await
+            .expect("resolve");
+        assert_eq!(
+            probes.load(Ordering::Relaxed),
+            0,
+            "translate and an explicit override both decide without the probe"
+        );
+
+        engine
+            .resolve_asr_backend_with(
+                &config_with_backend(None),
+                Some(&mock),
+                Some(&asr::Lang::En),
+                false,
+            )
+            .await
+            .expect("resolve");
+        assert_eq!(
+            probes.load(Ordering::Relaxed),
+            1,
+            "the probe still runs when locale support is what decides"
+        );
+    }
+
+    #[test]
+    fn cloud_degrade_labels_name_both_the_engine_and_the_cause() {
+        assert_eq!(
+            CloudDegradeCause::Misconfigured.apple_label(),
+            "apple_native (cloud misconfigured)"
+        );
+        assert_eq!(
+            CloudDegradeCause::Transient.apple_label(),
+            "apple_native (fallback)"
+        );
+        assert_eq!(
+            CloudDegradeCause::Misconfigured.whisper_label(),
+            "local_whisper (cloud misconfigured)"
+        );
+        assert_eq!(
+            CloudDegradeCause::Transient.whisper_label(),
+            "local_whisper (fallback)"
+        );
     }
 }
 

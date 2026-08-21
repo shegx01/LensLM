@@ -106,6 +106,9 @@ export interface IngestProgress {
   phase: string;
   done: number;
   total: number | null;
+  /** ASR backend actually used; present only on the terminal transcribing chunk
+   * (#45), e.g. `"local_whisper (fallback)"`. Omitted (not null) when absent. */
+  effective_backend?: string;
 }
 
 /**

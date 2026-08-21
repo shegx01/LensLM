@@ -16,7 +16,9 @@ use lens_core::error::LensError;
 use lens_core::tts::TtsProvider;
 use lens_core::tts::audio::TARGET_RATE;
 use lens_core::tts::cloud::CloudTtsAdapter;
+use lens_core::tts::{CloudTtsConsent, cloud_tts_usable};
 use lens_core::{CloudTtsKind, TtsPhase};
+use rstest::rstest;
 use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -710,4 +712,125 @@ async fn google_safety_blocked_no_audio_maps_to_tts_not_panic() {
     .await
     .expect_err("no audio");
     assert!(matches!(err, LensError::Tts(_)));
+}
+
+// ===========================================================================
+// Consent gate: `tts_backend_available` (the notebook-side availability gate)
+// ===========================================================================
+
+/// Fakes both Orpheus weights at their exact pinned sizes so `orpheus_ready` is true
+/// without a real multi-GB download.
+fn fake_orpheus_on_disk(cache_root: &std::path::Path) {
+    for id in ["orpheus", "snac"] {
+        let spec = lens_core::resolve_tts(id).expect("registry spec");
+        let path = lens_core::tts_model_path(cache_root, id).expect("model path");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::File::create(&path)
+            .expect("create")
+            .set_len(spec.size_bytes)
+            .expect("set_len");
+    }
+}
+
+async fn tts_available(consent: bool, api_key: &str, orpheus_on_disk: bool) -> bool {
+    let dir = tempfile::tempdir().expect("tempdir");
+    if orpheus_on_disk {
+        fake_orpheus_on_disk(dir.path());
+    }
+    let engine = lens_core::LensEngine::for_test().await;
+    let mut config = engine.config().await;
+    config.paths.data_dir = dir.path().display().to_string();
+    config.tts_cloud_consent = consent;
+    config.tts = lens_core::config::TtsConfig {
+        version: 1,
+        backend: lens_core::TtsBackend::Cloud(CloudTtsKind::OpenAiCompatible),
+        model: String::new(),
+        clouds: std::collections::BTreeMap::from([(
+            CloudTtsKind::OpenAiCompatible,
+            lens_core::config::CloudTtsCreds {
+                api_key: api_key.to_string(),
+                base_url: String::new(),
+            },
+        )]),
+    };
+    let cfg = config.tts.clone();
+    engine.set_config(config).await;
+    engine.tts_backend_available(&cfg).await
+}
+
+/// The gate must equal `cloud_tts_usable || orpheus_ready`: a keyed cloud backend with
+/// consent withheld is available only because the offline voice can stand in for it.
+#[tokio::test]
+async fn tts_backend_available_tracks_consent_and_the_orpheus_fallback() {
+    assert!(tts_available(true, "sk-key", false).await);
+    assert!(!tts_available(false, "sk-key", false).await);
+    assert!(!tts_available(true, "", false).await);
+    assert!(tts_available(false, "sk-key", true).await);
+}
+
+fn tts_cfg_with_base_url(base_url: &str) -> lens_core::config::TtsConfig {
+    lens_core::config::TtsConfig {
+        version: 1,
+        backend: lens_core::TtsBackend::Cloud(CloudTtsKind::OpenAiCompatible),
+        model: String::new(),
+        clouds: std::collections::BTreeMap::from([(
+            CloudTtsKind::OpenAiCompatible,
+            lens_core::config::CloudTtsCreds {
+                api_key: "sk-key".to_string(),
+                base_url: base_url.to_string(),
+            },
+        )]),
+    }
+}
+
+// SYNC-CHECK: the cloud-ASR tables in `cloud_asr.rs` cover the same predicate; both
+// subsystems must reject the same endpoints.
+#[rstest]
+#[case::plain_http("http://tts.vendor.example")]
+#[case::http_lookalike_host("http://localhost.evil.example")]
+#[case::public_ipv4("http://93.184.216.34")]
+#[case::ftp("ftp://tts.vendor.example")]
+#[case::relative("tts.vendor.example")]
+#[case::file("file:///etc/passwd")]
+fn cloud_tts_is_unusable_over_a_cleartext_endpoint(#[case] base_url: &str) {
+    assert!(
+        !cloud_tts_usable(
+            &tts_cfg_with_base_url(base_url),
+            CloudTtsKind::OpenAiCompatible,
+            CloudTtsConsent::Granted,
+        ),
+        "{base_url} must not carry the API key and dialogue text"
+    );
+}
+
+#[rstest]
+#[case::blank_takes_the_https_vendor_default("")]
+#[case::https("https://api.openai.com")]
+#[case::loopback_name("http://localhost:9000")]
+#[case::loopback_v4("http://127.0.0.1:9000")]
+#[case::rfc1918("http://192.168.1.5:9000")]
+fn cloud_tts_stays_usable_over_a_transport_safe_endpoint(#[case] base_url: &str) {
+    assert!(
+        cloud_tts_usable(
+            &tts_cfg_with_base_url(base_url),
+            CloudTtsKind::OpenAiCompatible,
+            CloudTtsConsent::Granted,
+        ),
+        "{base_url} must remain usable"
+    );
+}
+
+/// The gate is load-bearing at the resolution seam too: a cleartext endpoint must
+/// not produce a cloud adapter, even with consent and a key.
+#[test]
+fn resolve_refuses_a_cloud_adapter_for_a_cleartext_endpoint() {
+    assert!(
+        lens_core::tts::resolve_tts_provider(
+            lens_core::TtsBackend::Cloud(CloudTtsKind::OpenAiCompatible),
+            &tts_cfg_with_base_url("http://tts.vendor.example"),
+            CloudTtsConsent::Granted,
+            std::path::Path::new("/data"),
+        )
+        .is_none()
+    );
 }

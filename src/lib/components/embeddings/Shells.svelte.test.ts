@@ -32,6 +32,7 @@ beforeEach(() => {
   mockIPC((cmd) => {
     if (cmd === 'get_config') return baseAppConfig();
     if (cmd === 'fastembed_models_cached') return [];
+    if (cmd === 'asr_apple_native_available') return 'not_built';
     if (cmd === 'list_ollama_models') return [];
     if (cmd === 'get_notebook_embedding_model')
       return { model_id: 'nomic-embed-text-v1.5', dim: 768, backend: 'fastembed', status: 'none' };

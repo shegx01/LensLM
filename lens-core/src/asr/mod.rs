@@ -67,9 +67,11 @@ pub struct TranscribeConfig {
     pub translate: bool,
 }
 
-/// Which speech-to-text backend runs a transcription. Strong-typed; selection is
-/// explicit/router-driven, so there is deliberately no `Default`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Which speech-to-text backend runs a transcription. Strong-typed, and no
+/// `Default` — selection is router-driven. `rename_all` is load-bearing: the wire
+/// form must equal the [`as_str`](AsrBackend::as_str) token the config persists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AsrBackend {
     AppleNative,
     LocalWhisper,
@@ -132,6 +134,8 @@ pub struct MockAsrEngine {
     confidence: Option<f32>,
     supports_locale: bool,
     seen_config: Option<std::sync::Arc<std::sync::Mutex<Option<TranscribeConfig>>>>,
+    failure: Option<String>,
+    locale_probes: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 #[cfg(any(test, feature = "test-util"))]
@@ -142,7 +146,27 @@ impl MockAsrEngine {
             confidence: None,
             supports_locale: true,
             seen_config: None,
+            failure: None,
+            locale_probes: None,
         }
+    }
+
+    /// Makes every `transcribe_pcm` fail, so a caller's degrade cascade is reachable.
+    pub fn failing(message: impl Into<String>) -> Self {
+        Self {
+            failure: Some(message.into()),
+            ..Self::new(Vec::new())
+        }
+    }
+
+    /// Counts [`supports_locale`](AsrEngine::supports_locale) calls, so a test can
+    /// assert the blocking probe was skipped rather than merely ignored.
+    pub fn counting_locale_probes(
+        mut self,
+        counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        self.locale_probes = Some(counter);
+        self
     }
 
     /// Records the [`TranscribeConfig`] each `transcribe_pcm` call receives, so a
@@ -182,6 +206,9 @@ impl AsrEngine for MockAsrEngine {
         {
             *slot = Some(config.clone());
         }
+        if let Some(message) = &self.failure {
+            return Err(LensError::Transcription(message.clone()));
+        }
         if let Some(tx) = progress_tx {
             let _ = tx.send(0.5);
             let _ = tx.send(1.0);
@@ -193,6 +220,9 @@ impl AsrEngine for MockAsrEngine {
     }
 
     fn supports_locale(&self, _lang: &Lang) -> bool {
+        if let Some(counter) = &self.locale_probes {
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         self.supports_locale
     }
 }
@@ -225,6 +255,21 @@ mod tests {
             AsrBackend::Cloud,
         ] {
             assert_eq!(AsrBackend::from_opt_str(Some(b.as_str())), Some(b));
+        }
+    }
+
+    /// A bare derive would emit `"AppleNative"` and pass every other test.
+    #[test]
+    fn asr_backend_wire_form_equals_as_str() {
+        for b in [
+            AsrBackend::AppleNative,
+            AsrBackend::LocalWhisper,
+            AsrBackend::Cloud,
+        ] {
+            let json = serde_json::to_string(&b).expect("serialize backend");
+            assert_eq!(json, format!("\"{}\"", b.as_str()));
+            let back: AsrBackend = serde_json::from_str(&json).expect("deserialize backend");
+            assert_eq!(back, b);
         }
     }
 

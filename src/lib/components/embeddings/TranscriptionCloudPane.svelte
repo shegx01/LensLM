@@ -1,7 +1,7 @@
 <!--
-  TranscriptionCloudPane — Cloud ASR detail pane. No props: every field it reads/writes
-  lives on the shared `appConfigStore` snapshot (`asr` + `audioCloudConsent`), so
-  PrivacySection's consent toggle and this pane can never disagree.
+  TranscriptionCloudPane — Cloud ASR detail pane. Every field it reads/writes lives on the
+  shared `appConfigStore` snapshot (`asr` + `audioCloudConsent`), so PrivacySection's
+  consent toggle and this pane can never disagree.
 -->
 <script lang="ts">
   import { onMount } from 'svelte';
@@ -16,9 +16,14 @@
   } from '$lib/components/ui/select/index.js';
   import CircleAlert from '@lucide/svelte/icons/circle-alert';
   import { CLOUD_ASR_PRESETS } from '$lib/asr/catalog.js';
+  import { isTransportSafeBaseUrl } from '$lib/net/transport.js';
   import type { CloudAsrProvider } from '$lib/theme/types.js';
   import { appConfigStore, ensureLoaded, persist } from '$lib/models/app-config.svelte.js';
   import { toLensError } from '$lib/sources/lens-error.js';
+
+  /** Fired after any write that can change what the ASR router resolves to, so the
+   *  owner can re-ask the engine instead of holding a stale answer until remount. */
+  let { onRouterInputChange }: { onRouterInputChange?: () => void } = $props();
 
   const PROVIDER_LABELS: Record<CloudAsrProvider, string> = {
     open_ai_compatible: 'OpenAI-compatible',
@@ -56,31 +61,15 @@
     savedApiKey = asr.cloud_api_key;
   });
 
-  /** The API key is bearer-transmitted to this URL (`openai_compat.rs:59`), so plain
-   *  http: is only safe for a loopback host — anything else must be https:. */
-  function isLoopbackHost(hostname: string): boolean {
-    return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]';
-  }
-
-  function isValidBaseUrl(raw: string): boolean {
-    let parsed: URL;
-    try {
-      parsed = new URL(raw);
-    } catch {
-      return false;
-    }
-    if (parsed.protocol === 'https:') return true;
-    return parsed.protocol === 'http:' && isLoopbackHost(parsed.hostname);
-  }
-
   /** Reactive Cloud persist; no Save button. Only flips `backend` to `"cloud"` when the
-   *  config is actually usable — an incomplete edit still saves its own field. */
+   *  config is usable; a blank required field demotes an active `"cloud"` backend so the
+   *  engine's blank-filling default can never keep a cleared endpoint live. */
   async function persistCloud(): Promise<void> {
     error = null;
     const trimmedBaseUrl = baseUrl.trim();
-    if (trimmedBaseUrl !== '' && !isValidBaseUrl(trimmedBaseUrl)) {
+    if (trimmedBaseUrl !== '' && !isTransportSafeBaseUrl(trimmedBaseUrl)) {
       error =
-        'Enter an https:// URL. Plain http:// is only accepted for localhost, 127.0.0.1, or [::1].';
+        'Enter an https:// URL. Plain http:// is only accepted for localhost or a private-network address.';
       return;
     }
     const trimmedModel = model.trim();
@@ -92,6 +81,9 @@
           trimmedModel !== '' &&
           keyToSave.trim() !== '' &&
           cfg.audio_cloud_consent;
+        let backend = cfg.asr.backend;
+        if (usable) backend = 'cloud';
+        else if (backend === 'cloud') backend = '';
         return {
           ...cfg,
           asr: {
@@ -100,7 +92,7 @@
             cloud_base_url: trimmedBaseUrl,
             cloud_model: trimmedModel,
             cloud_api_key: keyToSave,
-            backend: usable ? 'cloud' : cfg.asr.backend
+            backend
           }
         };
       });
@@ -108,6 +100,13 @@
       hasSavedKey = keyToSave.trim() !== '';
       editingKey = false;
       apiKey = '';
+      // Verbatim from the store, no preset fallback (unlike the mount-time hydration
+      // above) — the engine may have rewritten what was just sent.
+      if (appConfigStore.asr) {
+        baseUrl = appConfigStore.asr.cloud_base_url;
+        model = appConfigStore.asr.cloud_model;
+      }
+      onRouterInputChange?.();
     } catch (err) {
       error = toLensError(err).message;
     }
@@ -149,8 +148,8 @@
       class="flex items-center gap-2 rounded-[10px] bg-destructive/10 px-3.5 py-3 text-[0.72rem] text-destructive ring-1 ring-destructive/30"
     >
       <CircleAlert class="size-3.5 shrink-0" aria-hidden="true" />
-      Cloud transcription needs audio consent. Turn on "Allow cloud audio" in Privacy settings to enable
-      this provider.
+      Cloud transcription needs audio consent. Turn on "Allow cloud speech-to-text" in Privacy settings
+      to enable this provider.
     </p>
   {/if}
 

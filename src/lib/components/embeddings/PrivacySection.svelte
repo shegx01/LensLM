@@ -1,7 +1,8 @@
 <!--
   PrivacySection — the "Privacy" panel inside the global Preferences view. A
   transparency mirror: a read-only cloud-egress list (LLM/TTS/ASR) derived from
-  existing config, plus the two existing consent toggles. No new AppConfig fields.
+  existing config, plus one consent toggle per cloud direction (text, speech-to-text,
+  text-to-speech).
 -->
 <script lang="ts">
   import { onMount } from 'svelte';
@@ -23,11 +24,20 @@
   // same mount-time fetch that seeds textConsent.
   let ttsCfg = $state<AppConfig['tts'] | undefined>(undefined);
   let textConsent = $state(false);
-  let saving = $state(false);
-  let saveError = $state<string | null>(null);
   let ttsLoadError = $state<string | null>(null);
 
-  const audioConsent = $derived(appConfigStore.audioCloudConsent);
+  type ConsentKey = 'text' | 'stt' | 'tts';
+  // Per-toggle, not shared: a mid-write toggle must not disable its neighbours, and a
+  // failure must name which consent failed.
+  const saving = $state<Record<ConsentKey, boolean>>({ text: false, stt: false, tts: false });
+  const saveError = $state<Record<ConsentKey, string | null>>({
+    text: null,
+    stt: null,
+    tts: null
+  });
+
+  const sttConsent = $derived(appConfigStore.audioCloudConsent);
+  const ttsConsent = $derived(appConfigStore.ttsCloudConsent);
   // The egress list reads both this mount's own tts/enrichment fetch and the shared store;
   // any of the three failing (no data, stale data, or this mount's own fetch) means the list
   // can't be trusted, so it must say so rather than assert "local".
@@ -102,31 +112,36 @@
 
   async function handleTextConsent(checked: boolean): Promise<void> {
     textConsent = checked;
-    saving = true;
-    saveError = null;
+    saving.text = true;
+    saveError.text = null;
     try {
       await updateConfig((cfg) => ({
         ...cfg,
         enrichment: { ...cfg.enrichment, cloud_consent: checked }
       }));
     } catch (err) {
-      saveError = toLensError(err).message;
+      saveError.text = toLensError(err).message;
       textConsent = !checked;
     } finally {
-      saving = false;
+      saving.text = false;
     }
   }
 
-  async function handleAudioConsent(checked: boolean): Promise<void> {
-    saving = true;
-    saveError = null;
+  /** Writes exactly one consent field; the two audio directions never write each other. */
+  async function handleAudioConsent(
+    key: 'stt' | 'tts',
+    checked: boolean,
+    apply: (cfg: AppConfig) => AppConfig
+  ): Promise<void> {
+    saving[key] = true;
+    saveError[key] = null;
     try {
-      await persist((cfg) => ({ ...cfg, audio_cloud_consent: checked }));
-      if (appConfigStore.persistError) saveError = appConfigStore.persistError;
+      await persist(apply);
+      if (appConfigStore.persistError) saveError[key] = appConfigStore.persistError;
     } catch (err) {
-      saveError = toLensError(err).message;
+      saveError[key] = toLensError(err).message;
     } finally {
-      saving = false;
+      saving[key] = false;
     }
   }
 </script>
@@ -198,11 +213,16 @@
       </span>
       <Switch
         checked={textConsent}
-        disabled={saving}
+        disabled={saving.text}
         aria-label="Allow cloud text models"
         onCheckedChange={handleTextConsent}
       />
     </label>
+    {#if saveError.text}
+      <p class="mt-1.5 text-[0.75rem] text-destructive" role="alert">
+        Couldn't save cloud text consent — {saveError.text}
+      </p>
+    {/if}
 
     {#if appConfigStore.loadError}
       <p
@@ -216,22 +236,57 @@
         class="mt-3 flex cursor-pointer items-center justify-between gap-4 rounded-[10px] border border-border bg-card px-4 py-3.5 transition-colors hover:border-border/80"
       >
         <span class="min-w-0 flex-1">
-          <span class="block text-[0.78rem] font-bold text-foreground">Allow cloud audio</span>
+          <span class="block text-[0.78rem] font-bold text-foreground"
+            >Allow cloud speech-to-text</span
+          >
           <span class="mt-0.5 block text-[0.68rem] text-muted-foreground">
-            Lets text-to-speech and speech-to-text use a cloud provider when one is configured.
+            Lets transcription send audio to a cloud provider when one is configured.
           </span>
         </span>
         <Switch
-          checked={audioConsent}
-          disabled={saving}
-          aria-label="Allow cloud audio"
-          onCheckedChange={handleAudioConsent}
+          checked={sttConsent}
+          disabled={saving.stt}
+          aria-label="Allow cloud speech-to-text"
+          onCheckedChange={(checked) =>
+            handleAudioConsent('stt', checked, (cfg) => ({
+              ...cfg,
+              audio_cloud_consent: checked
+            }))}
         />
       </label>
+      {#if saveError.stt}
+        <p class="mt-1.5 text-[0.75rem] text-destructive" role="alert">
+          Couldn't save cloud speech-to-text consent — {saveError.stt}
+        </p>
+      {/if}
+
+      <label
+        class="mt-3 flex cursor-pointer items-center justify-between gap-4 rounded-[10px] border border-border bg-card px-4 py-3.5 transition-colors hover:border-border/80"
+      >
+        <span class="min-w-0 flex-1">
+          <span class="block text-[0.78rem] font-bold text-foreground"
+            >Allow cloud text-to-speech</span
+          >
+          <span class="mt-0.5 block text-[0.68rem] text-muted-foreground">
+            Lets audio overviews send text to a cloud voice provider when one is configured.
+          </span>
+        </span>
+        <Switch
+          checked={ttsConsent}
+          disabled={saving.tts}
+          aria-label="Allow cloud text-to-speech"
+          onCheckedChange={(checked) =>
+            handleAudioConsent('tts', checked, (cfg) => ({
+              ...cfg,
+              tts_cloud_consent: checked
+            }))}
+        />
+      </label>
+      {#if saveError.tts}
+        <p class="mt-1.5 text-[0.75rem] text-destructive" role="alert">
+          Couldn't save cloud text-to-speech consent — {saveError.tts}
+        </p>
+      {/if}
     {/if}
   </div>
-
-  {#if saveError}
-    <p class="mt-3 text-[0.75rem] text-destructive" role="alert">{saveError}</p>
-  {/if}
 </section>

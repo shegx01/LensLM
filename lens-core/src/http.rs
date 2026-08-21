@@ -1,5 +1,6 @@
-//! One hardened `reqwest` client builder, shared by every outbound HTTP path
-//! that must NOT follow redirects.
+//! Outbound HTTP policy: one hardened `reqwest` client builder shared by every
+//! path that must NOT follow redirects, plus the transport-safety predicate every
+//! user-supplied cloud endpoint is measured against.
 //!
 //! Three call sites (`llm::llm_client`, `system_check::probe_client`,
 //! `model_catalog::catalog_client`) previously each hand-rolled the same builder
@@ -71,6 +72,35 @@ fn build_hardened(
             .build()
             .expect("hardened reqwest client must build (rustls has no system deps)")
     })
+}
+
+/// The ONE transport gate for a user-supplied cloud endpoint, consulted by cloud ASR
+/// and cloud TTS alike: `set_config` takes whatever the webview sends, so this — not
+/// the UI — is the boundary control.
+/// SYNC-CHECK: mirrors `isValidBaseUrl` in `TranscriptionCloudPane.svelte`.
+pub(crate) fn is_transport_safe_base_url(raw: &str) -> bool {
+    let Ok(url) = url::Url::parse(raw) else {
+        return false;
+    };
+    match url.scheme() {
+        "https" => true,
+        "http" => url.host().is_some_and(is_private_network_host),
+        _ => false,
+    }
+}
+
+/// RESIDUAL RISK: a `Domain` host is re-resolved at connect time, so LAN-controlled
+/// mDNS/DNS can rebind `*.local` after this check. Closing it needs the
+/// resolve-then-pin flow of [`hardened_client_pinned`]; IP literals have no gap.
+fn is_private_network_host(host: url::Host<&str>) -> bool {
+    match host {
+        url::Host::Domain(name) => {
+            let name = name.to_ascii_lowercase();
+            name == "localhost" || name.ends_with(".local")
+        }
+        url::Host::Ipv4(ip) => ip.is_loopback() || ip.is_private(),
+        url::Host::Ipv6(ip) => ip.is_loopback(),
+    }
 }
 
 #[cfg(test)]

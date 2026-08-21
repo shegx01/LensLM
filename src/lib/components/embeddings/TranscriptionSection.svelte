@@ -6,16 +6,24 @@
 -->
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { invoke, isTauri } from '@tauri-apps/api/core';
   import { cn } from '$lib/utils.js';
   import { Button } from '$lib/components/ui/button/index.js';
   import {
     ASR_ENGINE_CATALOG,
+    appleAsrUnavailableReason,
+    asrBackendLabel,
     asrBackendToken,
     asrEngineIdFromBackend,
     type AsrEngineId
   } from '$lib/asr/catalog.js';
-  import { whisperModelDownloaded } from '$lib/asr/ipc.js';
+  import { isTransportSafeBaseUrl } from '$lib/net/transport.js';
+  import {
+    appleAsrAvailability,
+    whisperModelDownloaded,
+    resolveAsrBackend,
+    type AppleAsrAvailability,
+    type AsrBackend
+  } from '$lib/asr/ipc.js';
   import { appConfigStore, ensureLoaded, persist } from '$lib/models/app-config.svelte.js';
   import { toLensError } from '$lib/sources/lens-error.js';
   import TranscriptionApplePane from './TranscriptionApplePane.svelte';
@@ -24,19 +32,30 @@
   import TranscriptionLanguageBlock from './TranscriptionLanguageBlock.svelte';
 
   let selectedEngine = $state<AsrEngineId>('automatic');
-  let appleAvailable = $state(false);
+  let appleAvailability = $state<AppleAsrAvailability | null>(null);
   let whisperPresent = $state(false);
   let ready = $state(false);
   let error = $state<string | null>(null);
 
+  /** The router's real answer for "what runs right now" — never a client guess. */
+  type ResolvedBackend =
+    | { status: 'loading' }
+    | { status: 'ready'; backend: AsrBackend }
+    | { status: 'error' };
+  let resolvedBackend = $state<ResolvedBackend>({ status: 'loading' });
+
   const persistedEngine = $derived(asrEngineIdFromBackend(appConfigStore.asr?.backend ?? ''));
   const selectedEntry = $derived(ASR_ENGINE_CATALOG.find((e) => e.id === selectedEngine));
 
+  const appleAvailable = $derived(appleAvailability === 'available');
+  const appleReason = $derived(appleAsrUnavailableReason(appleAvailability));
   const automaticUsable = $derived(appleAvailable || whisperPresent);
 
-  // The engine actually powering transcription — persisted AND usable. Drives the
-  // language block's capability notice, which must describe the real engine, not the row.
-  const activeEngine = $derived(isUsable(persistedEngine) ? persistedEngine : null);
+  // Drives the language block's capability notice, sourced from resolveAsrBackend
+  // (the same seam transcribe() uses) rather than a persisted/usable guess.
+  const activeEngine = $derived(
+    resolvedBackend.status === 'ready' ? resolvedBackend.backend : null
+  );
 
   function isUsable(id: AsrEngineId): boolean {
     switch (id) {
@@ -46,14 +65,16 @@
         return appleAvailable;
       case 'local_whisper':
         return whisperPresent;
-      case 'cloud':
+      case 'cloud': {
+        const baseUrl = appConfigStore.asr?.cloud_base_url.trim() ?? '';
         return (
           !!appConfigStore.asr?.cloud_provider &&
-          !!appConfigStore.asr?.cloud_base_url.trim() &&
+          isTransportSafeBaseUrl(baseUrl) &&
           !!appConfigStore.asr?.cloud_model.trim() &&
           !!appConfigStore.asr?.cloud_api_key.trim() &&
           appConfigStore.audioCloudConsent
         );
+      }
     }
   }
 
@@ -66,12 +87,20 @@
       : { text: 'Needs setup', tone: 'setup' };
   }
 
-  async function probeAppleAvailable(): Promise<boolean> {
-    if (!isTauri()) return false;
+  async function probeAppleAvailability(): Promise<AppleAsrAvailability | null> {
     try {
-      return await invoke<boolean>('asr_apple_native_available');
+      return await appleAsrAvailability();
     } catch {
-      return false;
+      return null;
+    }
+  }
+
+  async function refreshResolvedBackend(): Promise<void> {
+    try {
+      const backend = await resolveAsrBackend();
+      resolvedBackend = { status: 'ready', backend };
+    } catch {
+      resolvedBackend = { status: 'error' };
     }
   }
 
@@ -80,11 +109,12 @@
     selectedEngine = asrEngineIdFromBackend(appConfigStore.asr?.backend ?? '');
     const model = appConfigStore.asr?.whisper_model ?? '';
     const [apple, whisper] = await Promise.all([
-      probeAppleAvailable(),
+      probeAppleAvailability(),
       model ? whisperModelDownloaded(model).catch(() => false) : Promise.resolve(false)
     ]);
-    appleAvailable = apple;
+    appleAvailability = apple;
     whisperPresent = whisper;
+    await refreshResolvedBackend();
     ready = true;
   });
 
@@ -92,6 +122,7 @@
     error = null;
     try {
       await persist((cfg) => ({ ...cfg, asr: { ...cfg.asr, backend } }));
+      await refreshResolvedBackend();
     } catch (err) {
       error = toLensError(err).message;
     }
@@ -111,9 +142,24 @@
     if (modelId !== appConfigStore.asr?.whisper_model) return;
     whisperPresent = downloaded;
     if (downloaded && selectedEngine === 'local_whisper') {
-      void persistBackend('local_whisper');
+      void persistBackend('local_whisper'); // already refreshes resolvedBackend
+    } else {
+      void refreshResolvedBackend();
     }
   }
+
+  const UNKNOWN_RESOLUTION = "Couldn't determine which engine Automatic will use right now.";
+
+  const automaticStatusText = $derived.by(() => {
+    if (!automaticUsable) {
+      return "Apple transcription isn't available on this device and no Local Whisper model is downloaded yet. Download a model to enable Automatic.";
+    }
+    const resolved = resolvedBackend;
+    if (resolved.status === 'loading') return 'Determining which engine Automatic will use…';
+    if (resolved.status === 'error') return UNKNOWN_RESOLUTION;
+    const label = asrBackendLabel(resolved.backend);
+    return label === null ? UNKNOWN_RESOLUTION : `Automatic currently resolves to ${label}.`;
+  });
 </script>
 
 <section class="flex flex-col" aria-label="Transcription settings">
@@ -140,7 +186,7 @@
         {#each ASR_ENGINE_CATALOG as e (e.id)}
           {@const checked = e.id === selectedEngine}
           {@const pill = rowPill(e.id)}
-          {@const unavailable = e.id === 'apple_native' && !appleAvailable}
+          {@const unavailableNote = e.id === 'apple_native' ? appleReason : null}
           <button
             type="button"
             role="radio"
@@ -174,7 +220,7 @@
                 {/if}
               </span>
               <span class="mt-px block truncate text-[0.68rem] text-muted-foreground">
-                {unavailable && e.unavailableReason ? e.unavailableReason : e.description}
+                {unavailableNote ?? e.description}
               </span>
             </span>
           </button>
@@ -190,32 +236,36 @@
         </div>
 
         <div class="mt-4">
-          {#if selectedEngine === 'automatic' && !automaticUsable}
+          {#if selectedEngine === 'automatic'}
             <div class="rounded-[10px] border border-border bg-muted/40 p-3">
               <p class="text-[0.72rem] text-muted-foreground">
-                Apple transcription isn't available on this device and no Local Whisper model is
-                downloaded yet. Download a model to enable Automatic.
+                {automaticStatusText}
               </p>
-              <Button
-                type="button"
-                size="sm"
-                class="mt-2"
-                onclick={() => pickEngine('local_whisper')}
-              >
-                Set up Local Whisper
-              </Button>
+              {#if !automaticUsable}
+                <Button
+                  type="button"
+                  size="sm"
+                  class="mt-2"
+                  onclick={() => pickEngine('local_whisper')}
+                >
+                  Set up Local Whisper
+                </Button>
+              {/if}
             </div>
           {:else if selectedEngine === 'apple_native'}
             <TranscriptionApplePane available={appleAvailable} />
           {:else if selectedEngine === 'local_whisper'}
             <TranscriptionWhisperPane onPresenceChange={handleWhisperPresenceChange} />
           {:else if selectedEngine === 'cloud'}
-            <TranscriptionCloudPane />
+            <TranscriptionCloudPane onRouterInputChange={() => void refreshResolvedBackend()} />
           {/if}
         </div>
       </div>
     </div>
 
-    <TranscriptionLanguageBlock {activeEngine} />
+    <TranscriptionLanguageBlock
+      {activeEngine}
+      onRouterInputChange={() => void refreshResolvedBackend()}
+    />
   {/if}
 </section>

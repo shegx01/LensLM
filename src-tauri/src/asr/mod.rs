@@ -1,8 +1,8 @@
 //! Apple-native ASR backend (issue #42): [`AppleSpeechEngine`] drives macOS 26's
 //! SpeechAnalyzer/SpeechTranscriber through the Swift `@_cdecl` C-ABI bridge
-//! (`bridge.swift`, declared in `bridge.h`). This whole module is gated to
-//! `aarch64-apple-darwin` + the `apple-native-asr` feature; it is the ONLY place
-//! Apple/OS speech code lives (lens-core stays headless).
+//! (`bridge.swift`, declared in `bridge.h`). This whole module is gated on the
+//! `apple_asr_bridge` cfg build.rs sets when that bridge actually compiled; it is
+//! the ONLY place Apple/OS speech code lives (lens-core stays headless).
 //!
 //! FFI ownership contract (see `bridge.h` for the authoritative statement):
 //! (a) result buffers are Swift-allocated, freed ONLY via `lens_asr_free` — the
@@ -356,7 +356,7 @@ mod tests {
 
     // Gated on-device smoke test (Unit 6 gate): drives the real SpeechAnalyzer
     // bridge end-to-end on a spoken sample. Requires a macOS-26 aarch64 host.
-    // Run: `LENS_RUN_MODEL_TESTS=1 cargo test -p lenslm --features apple-native-asr
+    // Run: `LENS_RUN_MODEL_TESTS=1 cargo test -p lenslm
     //       -- --ignored apple_speech --nocapture`
     //
     // MUST NOT SIGTRAP. Two outcomes are acceptable, per the "no platform without

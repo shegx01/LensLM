@@ -623,7 +623,7 @@ async fn app_config_disk_round_trip_default_and_malformed() {
     assert!(dir.path().join("config.json").exists());
 
     // Round-trip a non-default config.
-    let cfg = AppConfig {
+    let mut cfg = AppConfig {
         theme: "dark".into(),
         onboarding_complete: true,
         ..AppConfig::default()

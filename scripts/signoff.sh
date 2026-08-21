@@ -15,16 +15,22 @@ fi
 
 cargo test --workspace
 
-# issue #42: the Apple-native ASR bridge (SpeechAnalyzer via a Swift @_cdecl C ABI)
-# is behind the `apple-native-asr` feature, which `cargo test --workspace` does NOT
-# enable (a binary crate cannot self-activate a feature per-target — that would be a
-# Cargo cycle). On the shipping aarch64-apple-darwin host, compile it explicitly so
-# the Swift build (build.rs → swiftc) and the FFI declarations are proven under
-# signoff. The runtime transcription test stays `#[ignore]` (needs a real macOS-26
-# on-device model); this is a compile+link proof only.
+# issue #42: prove the Apple-native ASR bridge on the shipping host. The clean is
+# load-bearing: `tauri_build::build()` emits its own rerun-if-changed directives, so
+# a second consecutive run would replay cached link directives without rebuilding.
 if [[ "$(uname -s)" == "Darwin" && "$(uname -m)" == "arm64" ]]; then
-  echo "signoff: compiling the Apple-native ASR bridge (--features apple-native-asr)…"
-  cargo test -p lenslm --features apple-native-asr --no-run
+  echo "signoff: proving the Apple-native ASR bridge links (LENS_ASR_BRIDGE=require)…"
+  cargo clean -p lenslm
+  LENS_ASR_BRIDGE=require cargo build -p lenslm
+
+  # A green build only proves build.rs did not panic. `LC_RPATH /usr/lib/swift` is
+  # emitted solely on the bridge success path and, unlike a symbol, survives
+  # `[profile.release] strip = true` — so the binary itself is the evidence.
+  BRIDGE_BIN="${CARGO_TARGET_DIR:-${SCRIPT_DIR}/../target}/debug/LensLM"
+  if ! otool -l "$BRIDGE_BIN" | grep -q '/usr/lib/swift'; then
+    echo "signoff: FAILED — $BRIDGE_BIN carries no Swift runtime rpath; the bridge is not linked in." >&2
+    exit 1
+  fi
 fi
 
 gh signoff

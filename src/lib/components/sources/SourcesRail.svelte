@@ -33,6 +33,7 @@
   import { notebookStore } from '$lib/notebooks/index.js';
   import type { SourceStatus } from '$lib/sources/types.js';
   import { statusDotClass } from '$lib/sources/status.js';
+  import { asrBackendLabel } from '$lib/asr/catalog.js';
   import AddSourcesModal from './AddSourcesModal.svelte';
   import StudioPanel from './StudioPanel.svelte';
 
@@ -162,6 +163,29 @@
       return `~${approxWords} words`;
     }
     return '';
+  }
+
+  // SYNC-CHECK: the `"<backend> (<cause>)"` wire form and its three cause suffixes are
+  // produced by `CloudDegradeCause::apple_label`/`whisper_label` in lens-core/src/lib.rs;
+  // renaming a suffix there without matching it here silently drops this caption.
+  const ASR_MARKER_RE = /^(.+)\s\((fallback|degraded|cloud misconfigured)\)$/i;
+
+  /**
+   * Caption for a marked ASR run (#297). Additive-only: the marker is session-scoped, so
+   * its absence must never read as "clean" — only explicitly marked values render.
+   */
+  function fallbackCaption(marker: string): string | null {
+    const match = ASR_MARKER_RE.exec(marker);
+    if (!match) return null;
+    const label = asrBackendLabel(match[1]) ?? 'a different engine';
+    switch (match[2].toLowerCase()) {
+      case 'fallback':
+        return `Fell back to ${label} for this recording.`;
+      case 'degraded':
+        return `Ran in degraded mode (${label}) for this recording.`;
+      default:
+        return `Cloud transcription is misconfigured, so ${label} was used. Fix it in Settings → Transcription.`;
+    }
   }
 
   // statusDotClass is shared with EmbeddingsInspector — see $lib/sources/status.ts.
@@ -350,6 +374,9 @@
           {@const badge = typeBadge(source.kind, source.locator, source.title)}
           {@const meta = metaLine(source.token_count)}
           {@const status = source.status as SourceStatus}
+          {@const asrMarker =
+            source.kind === 'audio' ? sourcesStore.effectiveBackendFor(source.id) : null}
+          {@const asrCaption = asrMarker ? fallbackCaption(asrMarker) : null}
           <li
             data-source-id={source.id}
             data-pulsing={pulsingId === source.id}
@@ -393,6 +420,13 @@
                   <span class="text-xs text-muted-foreground/50">{meta}</span>
                 {/if}
               </div>
+              {#if asrCaption}
+                <!-- Wraps rather than truncating: the actionable half of the
+                     misconfiguration copy sits past the rail's width. -->
+                <p class="mt-0.5 text-[0.65rem] leading-snug text-destructive" title={asrCaption}>
+                  {asrCaption}
+                </p>
+              {/if}
             </div>
 
             <!-- Fixed-width slot: status dot fades out on hover, action buttons fade in.

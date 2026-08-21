@@ -1,6 +1,7 @@
 // Static ASR catalog data: engine rows, cloud presets, language options, and the
 // per-engine capability matrix. Pure data + lookups — no Tauri calls.
 
+import type { AppleAsrAvailability } from '$lib/asr/ipc.js';
 import type { AsrLang, CloudAsrProvider } from '$lib/theme/types.js';
 
 /** UI engine row id. Distinct from the wire `AsrConfig.backend` token — see `asrBackendToken`. */
@@ -10,8 +11,6 @@ export interface AsrEngineCatalogEntry {
   id: AsrEngineId;
   label: string;
   description: string;
-  /** Only set for rows whose unavailability needs explaining (today: `apple_native`). */
-  unavailableReason?: string;
 }
 
 // SYNC-CHECK: tokens must match lens-core/src/config.rs AsrConfig.backend doc and
@@ -26,9 +25,7 @@ export const ASR_ENGINE_CATALOG: AsrEngineCatalogEntry[] = [
   {
     id: 'apple_native',
     label: 'Apple (on-device)',
-    description: 'On-device transcription via the macOS Speech framework. Private, no network.',
-    unavailableReason:
-      'Unavailable — needs an Apple silicon Mac on macOS 26 with the Apple speech bridge built in.'
+    description: 'On-device transcription via the macOS Speech framework. Private, no network.'
   },
   {
     id: 'local_whisper',
@@ -41,6 +38,28 @@ export const ASR_ENGINE_CATALOG: AsrEngineCatalogEntry[] = [
     description: 'Sends audio to a cloud provider for transcription. Requires consent.'
   }
 ];
+
+/**
+ * Why the Apple row is unavailable, or `null` when it is available. Blockers read
+ * differently because they call for different actions; a `null` availability means
+ * the probe has not answered, which is not itself a claim about the device.
+ */
+export function appleAsrUnavailableReason(
+  availability: AppleAsrAvailability | null
+): string | null {
+  if (availability === null) return 'Unavailable — availability could not be determined.';
+  if (availability === 'available') return null;
+  if (availability === 'not_built') {
+    return 'Unavailable — this build of LensLM does not include the Apple speech bridge.';
+  }
+  const cause = availability.unsupported;
+  if (cause === 'not_apple_silicon') return 'Unavailable — needs an Apple silicon Mac.';
+  if (cause === 'version_probe_failed') {
+    return "Unavailable — this Mac's macOS version could not be read.";
+  }
+  const { found, required } = cause.macos_too_old;
+  return `Unavailable — needs macOS ${required} or later; this Mac runs macOS ${found}.`;
+}
 
 /** Maps a UI engine id to the wire `AsrConfig.backend` token (`""` for Automatic). */
 export function asrBackendToken(id: AsrEngineId): string {
@@ -65,14 +84,25 @@ export function asrEngineIdFromBackend(backend: string): AsrEngineId {
   }
 }
 
+/**
+ * Display label for a wire `AsrConfig.backend` token, or `null` when it names no engine
+ * row. Returning `null` rather than the token keeps a raw wire value out of UI copy, so
+ * a Rust-side rename surfaces as an explicit unknown state instead of leaking through.
+ */
+export function asrBackendLabel(backend: string): string | null {
+  const id = asrEngineIdFromBackend(backend);
+  if (id === 'automatic') return null;
+  return ASR_ENGINE_CATALOG.find((e) => e.id === id)?.label ?? null;
+}
+
 export interface CloudAsrPreset {
   base_url: string;
   model: string;
 }
 
-// SYNC-CHECK: base_url/model must match what each adapter actually requests —
-// openai_compat.rs posts to `{base_url}/v1/audio/transcriptions`; deepgram.rs
-// posts to `{base_url}/v1/listen`.
+// SYNC-CHECK: must match lens-core/src/asr/cloud/mod.rs default_base_url/default_model,
+// and what each adapter requests — openai_compat.rs posts to
+// `{base_url}/v1/audio/transcriptions`, deepgram.rs to `{base_url}/v1/listen`.
 export const CLOUD_ASR_PRESETS = {
   open_ai_compatible: { base_url: 'https://api.openai.com', model: 'whisper-1' },
   deepgram: { base_url: 'https://api.deepgram.com', model: 'nova-3' }
@@ -128,11 +158,13 @@ export const ASR_CAPABILITY_MATRIX: Record<
   cloud: { language: 'honoured', translate: 'ignored' }
 };
 
+/** `null` for an engine with no matrix row: the argument is a wire token at runtime,
+ *  so an unrecognized one must degrade to "no claim", not throw inside a render. */
 export function asrCapability(
   engine: Exclude<AsrEngineId, 'automatic'>,
   field: 'language' | 'translate'
-): AsrCapabilityMode {
-  return ASR_CAPABILITY_MATRIX[engine][field];
+): AsrCapabilityMode | null {
+  return ASR_CAPABILITY_MATRIX[engine]?.[field] ?? null;
 }
 
 /**
@@ -148,14 +180,13 @@ export function appleTranslateRerouteNotice(whisperModelDownloaded: boolean): st
 }
 
 /**
- * Notice copy for enabling translate under Automatic: whichever engine the
- * router resolves to, translate lands on Local Whisper either way (directly,
- * or via the Apple reroute above), so the same no-model failure applies.
+ * Notice copy when Local Whisper is the resolved engine. It honours translate itself,
+ * but the same missing-model failure as the reroute above applies — saying only
+ * "honoured" would promise a run that cannot happen.
  */
-export function automaticTranslateNotice(whisperModelDownloaded: boolean): string {
-  const base =
-    'Automatic prefers on-device Apple transcription where supported, otherwise Local Whisper — enabling translate always routes through Local Whisper either way.';
+export function whisperTranslateNotice(whisperModelDownloaded: boolean): string {
+  const base = 'This engine honours translate directly.';
   return whisperModelDownloaded
     ? base
-    : `${base} No Whisper model is downloaded yet, so translate will fail until one is.`;
+    : `${base} No Whisper model is downloaded yet, so transcription will fail until one is.`;
 }

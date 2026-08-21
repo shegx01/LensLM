@@ -9,7 +9,9 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 use crate::error::LensError;
-use crate::tts::{CloudTtsKind, Gender, TtsBackend, TtsVoice};
+use crate::tts::{
+    CLOUD_TTS_CONSENT_REASON, CloudTtsConsent, CloudTtsKind, Gender, TtsBackend, TtsVoice,
+};
 
 /// Lives here (not the Apple-Silicon-gated `qwen` adapter) so the catalog can
 /// enumerate presets on every platform.
@@ -359,15 +361,23 @@ pub struct EngineCatalogEntry {
 }
 
 impl EngineCatalogEntry {
-    fn from_capability(cap: &EngineCapability, keyed_cloud_kinds: &BTreeSet<CloudTtsKind>) -> Self {
+    fn from_capability(
+        cap: &EngineCapability,
+        keyed_cloud_kinds: &BTreeSet<CloudTtsKind>,
+        consent: CloudTtsConsent,
+    ) -> Self {
         let platform_available = cap.id.to_backend().is_some();
         // A cloud engine is available once ITS OWN provider kind has a saved key.
         let has_key = cap
             .id
             .cloud_kind()
             .is_some_and(|k| keyed_cloud_kinds.contains(&k));
+        // Consent precedes the key gate: with consent withheld, "Requires an API key"
+        // would send the user to add a key that still would not enable the engine.
         let (available, unavailable_reason) = if !platform_available {
             (false, Some("Requires Apple Silicon".to_string()))
+        } else if cap.needs_key && consent == CloudTtsConsent::Withheld {
+            (false, Some(CLOUD_TTS_CONSENT_REASON.to_string()))
         } else if cap.needs_key && !has_key {
             (false, Some("Requires an API key".to_string()))
         } else {
@@ -407,10 +417,11 @@ impl EngineCatalogEntry {
 /// provider kinds that currently have a saved key (each gates its own engine row).
 pub fn tts_catalog_serialized(
     keyed_cloud_kinds: &BTreeSet<CloudTtsKind>,
+    consent: CloudTtsConsent,
 ) -> Vec<EngineCatalogEntry> {
     CATALOG
         .iter()
-        .map(|cap| EngineCatalogEntry::from_capability(cap, keyed_cloud_kinds))
+        .map(|cap| EngineCatalogEntry::from_capability(cap, keyed_cloud_kinds, consent))
         .collect()
 }
 
@@ -753,7 +764,7 @@ mod tests {
 
     #[test]
     fn serialized_catalog_resolves_per_kind_availability() {
-        let entries = tts_catalog_serialized(&BTreeSet::new());
+        let entries = tts_catalog_serialized(&BTreeSet::new(), CloudTtsConsent::Granted);
         assert_eq!(entries.len(), 5);
 
         let orpheus = entries
@@ -784,7 +795,10 @@ mod tests {
         }
 
         // A key for ONE provider enables only that provider's row (#40).
-        let one_keyed = tts_catalog_serialized(&BTreeSet::from([CloudTtsKind::ElevenLabs]));
+        let one_keyed = tts_catalog_serialized(
+            &BTreeSet::from([CloudTtsKind::ElevenLabs]),
+            CloudTtsConsent::Granted,
+        );
         let eleven = one_keyed
             .iter()
             .find(|e| e.id == TtsEngineId::ElevenLabs)
@@ -810,5 +824,54 @@ mod tests {
                 Some("Requires Apple Silicon")
             );
         }
+    }
+
+    #[test]
+    fn consent_withheld_beats_the_key_gate_in_the_unavailable_reason() {
+        let all_keyed = BTreeSet::from([
+            CloudTtsKind::OpenAiCompatible,
+            CloudTtsKind::ElevenLabs,
+            CloudTtsKind::GoogleCloud,
+        ]);
+        let entries = tts_catalog_serialized(&all_keyed, CloudTtsConsent::Withheld);
+
+        for id in [
+            TtsEngineId::OpenAiCompatible,
+            TtsEngineId::ElevenLabs,
+            TtsEngineId::GoogleCloud,
+        ] {
+            let cloud = entries.iter().find(|e| e.id == id).unwrap();
+            assert!(
+                !cloud.available,
+                "{id:?} must be unavailable without consent"
+            );
+            // Telling a user who already has a key to "add an API key" sends them
+            // to a control that would not unblock the engine.
+            assert_eq!(
+                cloud.unavailable_reason.as_deref(),
+                Some(CLOUD_TTS_CONSENT_REASON)
+            );
+        }
+
+        // Local engines carry no key, so consent never touches their rows.
+        let orpheus = entries
+            .iter()
+            .find(|e| e.id == TtsEngineId::Orpheus)
+            .unwrap();
+        assert!(orpheus.available);
+        assert!(orpheus.unavailable_reason.is_none());
+    }
+
+    #[test]
+    fn consent_withheld_and_no_key_still_reports_consent_first() {
+        let entries = tts_catalog_serialized(&BTreeSet::new(), CloudTtsConsent::Withheld);
+        let cloud = entries
+            .iter()
+            .find(|e| e.id == TtsEngineId::OpenAiCompatible)
+            .unwrap();
+        assert_eq!(
+            cloud.unavailable_reason.as_deref(),
+            Some(CLOUD_TTS_CONSENT_REASON)
+        );
     }
 }

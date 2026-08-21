@@ -1,8 +1,8 @@
 //! System / diagnostic commands.
 
 use lens_core::{
-    CheckResult, CloudTtsKind, DownloadProgress, InstallProgress, LensEngine, LensError,
-    LlmDetection, StorageStats, TtsVoice, WHISPER_REGISTRY,
+    AsrBackend, CheckResult, CloudTtsConsent, CloudTtsKind, DownloadProgress, InstallProgress,
+    LensEngine, LensError, LlmDetection, StorageStats, TtsVoice, WHISPER_REGISTRY,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -220,12 +220,18 @@ pub async fn list_tts_voices(
 ) -> Result<Vec<TtsVoice>, LensError> {
     let cache_root = resolved_cache_root(&engine).await;
     let config = engine.config().await;
-    Ok(resolve_voices(&config.tts, &cache_root))
+    let consent = CloudTtsConsent::from_flag(config.tts_cloud_consent);
+    Ok(resolve_voices(&config.tts, consent, &cache_root))
 }
 
-/// Testable core of [`list_tts_voices`] (no `AppHandle`/engine state).
-fn resolve_voices(cfg: &lens_core::TtsConfig, cache_root: &std::path::Path) -> Vec<TtsVoice> {
-    lens_core::resolve_tts_provider(cfg.backend, cfg, cache_root)
+/// Testable core of [`list_tts_voices`] (no `AppHandle`/engine state). Takes consent
+/// so a consent-blocked cloud backend cannot leak its voice names into the picker.
+fn resolve_voices(
+    cfg: &lens_core::TtsConfig,
+    consent: CloudTtsConsent,
+    cache_root: &std::path::Path,
+) -> Vec<TtsVoice> {
+    lens_core::resolve_tts_provider(cfg.backend, cfg, consent, cache_root)
         .map(|provider| provider.voices())
         .unwrap_or_default()
 }
@@ -247,7 +253,10 @@ pub async fn tts_engine_catalog(
         .filter(|(_, creds)| !creds.api_key.is_empty())
         .map(|(kind, _)| *kind)
         .collect();
-    Ok(lens_core::tts_catalog_serialized(&keyed_cloud_kinds))
+    Ok(lens_core::tts_catalog_serialized(
+        &keyed_cloud_kinds,
+        CloudTtsConsent::from_flag(config.tts_cloud_consent),
+    ))
 }
 
 /// Installs an embedding model via Ollama `POST /api/pull`, streaming NDJSON progress.
@@ -441,24 +450,77 @@ pub async fn whisper_model_downloaded(
     Ok(lens_core::whisper_model_downloaded(&cache_root, &model))
 }
 
-/// Returns `true` when Apple-native ASR is available on this device:
-/// compiled with the `apple-native-asr` feature AND running on macOS >= 26.
-/// Used by the onboarding UI to skip the Whisper download step — this is a
-/// UI signal only, NOT a router input (backend selection is `select_asr_backend`).
+/// The backend the engine would resolve right now for the configured default
+/// language, so the UI reports reality instead of re-deriving it (#297). Per-source
+/// language is not in scope — this answers for the Settings default.
 #[tracing::instrument(skip_all)]
 #[tauri::command]
-pub async fn asr_apple_native_available() -> Result<bool, LensError> {
-    // Compile-time gate: the feature must be present and the target must be
-    // aarch64-apple-darwin; this is false on every other platform/feature.
-    if !cfg!(all(
-        target_os = "macos",
-        target_arch = "aarch64",
-        feature = "apple-native-asr"
-    )) {
-        return Ok(false);
+pub async fn resolve_asr_backend(
+    engine: tauri::State<'_, LensEngine>,
+) -> Result<AsrBackend, LensError> {
+    let asr = engine.config().await.asr;
+    engine
+        .resolve_asr_backend(asr.language.as_ref(), asr.translate)
+        .await
+}
+
+/// Whether Apple-native ASR is usable on this device, and when it is not, why.
+/// Externally tagged like `TtsBackend::Cloud(kind)`; `required` rides the wire so
+/// no TS constant has to mirror `MIN_MACOS_FOR_APPLE_ASR`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppleAsrAvailability {
+    Available,
+    NotBuilt,
+    Unsupported(AppleAsrUnsupported),
+}
+
+/// The blocker behind [`AppleAsrAvailability::Unsupported`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppleAsrUnsupported {
+    NotAppleSilicon,
+    MacosTooOld { found: u32, required: u32 },
+    VersionProbeFailed,
+}
+
+/// Reports Apple-native ASR availability. Used by the onboarding UI to skip the
+/// Whisper download step — a UI signal only, NOT a router input (backend selection
+/// is `select_asr_backend`).
+#[tracing::instrument(skip_all)]
+#[tauri::command]
+pub async fn asr_apple_native_available() -> Result<AppleAsrAvailability, LensError> {
+    Ok(classify_apple_asr(
+        cfg!(all(target_os = "macos", target_arch = "aarch64")),
+        cfg!(apple_asr_bridge),
+        macos_major_version(),
+    ))
+}
+
+/// Pure core of [`asr_apple_native_available`], so the precedence is testable off a
+/// Mac. The OS gate deliberately precedes the bridge gate: an outdated macOS is a
+/// blocker no rebuild clears, so `NotBuilt` would send the user to Xcode for nothing.
+fn classify_apple_asr(
+    apple_silicon_build: bool,
+    bridge_built: bool,
+    version: Result<u32, LensError>,
+) -> AppleAsrAvailability {
+    if !apple_silicon_build {
+        return AppleAsrAvailability::Unsupported(AppleAsrUnsupported::NotAppleSilicon);
     }
-    // Runtime gate: macOS >= 26 is required for SpeechAnalyzer/SpeechTranscriber.
-    Ok(macos_major_version()? >= lens_core::MIN_MACOS_FOR_APPLE_ASR)
+    let Ok(found) = version else {
+        return AppleAsrAvailability::Unsupported(AppleAsrUnsupported::VersionProbeFailed);
+    };
+    if found < lens_core::MIN_MACOS_FOR_APPLE_ASR {
+        return AppleAsrAvailability::Unsupported(AppleAsrUnsupported::MacosTooOld {
+            found,
+            required: lens_core::MIN_MACOS_FOR_APPLE_ASR,
+        });
+    }
+    if !bridge_built {
+        return AppleAsrAvailability::NotBuilt;
+    }
+    AppleAsrAvailability::Available
 }
 
 /// Parses the macOS major version from `sw_vers -productVersion`.
@@ -829,12 +891,148 @@ mod tests {
         assert!(matches!(err, LensError::Validation(_)));
     }
 
+    /// Stands in for the Apple-native seam: its presence is what makes the router
+    /// prefer `apple_native`, and `supports_locale` drives the locale gate.
+    struct StubAppleEngine {
+        supports_locale: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl lens_core::AsrEngine for StubAppleEngine {
+        async fn transcribe_pcm(
+            &self,
+            _pcm: &[f32],
+            _config: &lens_core::TranscribeConfig,
+            _progress_tx: Option<tokio::sync::mpsc::UnboundedSender<f32>>,
+        ) -> Result<lens_core::TranscriptOutput, LensError> {
+            Ok(lens_core::TranscriptOutput {
+                segments: Vec::new(),
+                confidence: None,
+            })
+        }
+
+        fn supports_locale(&self, _lang: &lens_core::Lang) -> bool {
+            self.supports_locale
+        }
+    }
+
+    async fn resolve_backend_via_command(
+        engine_state: &LensEngine,
+        stored_language: Option<lens_core::Lang>,
+        stored_translate: bool,
+        apple: Option<StubAppleEngine>,
+    ) -> AsrBackend {
+        let app = tauri::test::mock_app();
+        let mut config = engine_state.config().await;
+        config.asr.language = stored_language;
+        config.asr.translate = stored_translate;
+        engine_state.set_config(config).await;
+        engine_state
+            .set_asr_engine(
+                apple.map(|e| std::sync::Arc::new(e) as std::sync::Arc<dyn lens_core::AsrEngine>),
+            )
+            .await;
+        app.manage(engine_state.clone());
+        resolve_asr_backend(app.state::<LensEngine>())
+            .await
+            .expect("resolve_asr_backend command")
+    }
+
+    /// Drives the IPC command itself, not the engine method behind it: the frontend
+    /// mocks this command away, so nothing else proves the body forwards the stored
+    /// language and translate flag instead of defaults.
+    #[tokio::test]
+    async fn resolve_asr_backend_command_forwards_the_stored_asr_settings() {
+        let engine = LensEngine::for_test().await;
+
+        assert_eq!(
+            resolve_backend_via_command(&engine, None, false, None).await,
+            AsrBackend::LocalWhisper,
+            "no Apple engine → Whisper"
+        );
+        assert_eq!(
+            resolve_backend_via_command(
+                &engine,
+                None,
+                false,
+                Some(StubAppleEngine {
+                    supports_locale: true
+                })
+            )
+            .await,
+            AsrBackend::AppleNative,
+            "an injected Apple engine with nothing else set → Apple"
+        );
+        assert_eq!(
+            resolve_backend_via_command(
+                &engine,
+                None,
+                true,
+                Some(StubAppleEngine {
+                    supports_locale: true
+                })
+            )
+            .await,
+            AsrBackend::LocalWhisper,
+            "a stored translate=true must reach the router (Apple cannot translate)"
+        );
+        assert_eq!(
+            resolve_backend_via_command(
+                &engine,
+                Some(lens_core::Lang::Ko),
+                false,
+                Some(StubAppleEngine {
+                    supports_locale: false
+                })
+            )
+            .await,
+            AsrBackend::LocalWhisper,
+            "a stored language must reach the router (locale unsupported)"
+        );
+    }
+
     #[test]
     fn resolve_voices_default_orpheus_returns_named_catalog() {
         let cfg = lens_core::TtsConfig::default();
-        let voices = resolve_voices(&cfg, std::path::Path::new("/data"));
+        let voices = resolve_voices(
+            &cfg,
+            CloudTtsConsent::Granted,
+            std::path::Path::new("/data"),
+        );
         assert_eq!(voices.len(), 8);
         assert!(voices.iter().any(|v| v.id == "tara"));
+    }
+
+    /// Without consent the picker must not enumerate the provider's voices — a saved
+    /// key alone would otherwise list cloud voice names for a backend that cannot run.
+    #[test]
+    fn resolve_voices_lists_no_cloud_voices_without_consent() {
+        let kind = lens_core::CloudTtsKind::OpenAiCompatible;
+        let cfg = lens_core::TtsConfig {
+            version: 1,
+            backend: lens_core::TtsBackend::Cloud(kind),
+            model: String::new(),
+            clouds: std::collections::BTreeMap::from([(
+                kind,
+                lens_core::config::CloudTtsCreds {
+                    api_key: "sk-key".to_string(),
+                    base_url: String::new(),
+                },
+            )]),
+        };
+        let cloud_root = std::path::Path::new("/data");
+
+        let granted = resolve_voices(&cfg, CloudTtsConsent::Granted, cloud_root);
+        assert!(
+            !granted.is_empty(),
+            "a keyed cloud backend lists its voices"
+        );
+
+        let withheld = resolve_voices(&cfg, CloudTtsConsent::Withheld, cloud_root);
+        assert!(
+            withheld.is_empty(),
+            "consent withheld must leak no cloud voices, got {withheld:?}"
+        );
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -846,7 +1044,11 @@ mod tests {
             backend: lens_core::TtsBackend::Qwen3Local,
             ..lens_core::TtsConfig::default()
         };
-        let voices = resolve_voices(&cfg, std::path::Path::new("/data"));
+        let voices = resolve_voices(
+            &cfg,
+            CloudTtsConsent::Granted,
+            std::path::Path::new("/data"),
+        );
         assert!(voices.is_empty());
     }
 
@@ -883,5 +1085,88 @@ mod tests {
                 StreamEvent::Done,
             ]
         );
+    }
+
+    fn probe_failed() -> Result<u32, LensError> {
+        Err(LensError::Internal("sw_vers failed".into()))
+    }
+
+    #[test]
+    fn classify_apple_asr_reports_non_apple_hardware_first() {
+        for bridge_built in [false, true] {
+            assert_eq!(
+                classify_apple_asr(false, bridge_built, Ok(26)),
+                AppleAsrAvailability::Unsupported(AppleAsrUnsupported::NotAppleSilicon)
+            );
+        }
+        assert_eq!(
+            classify_apple_asr(false, true, probe_failed()),
+            AppleAsrAvailability::Unsupported(AppleAsrUnsupported::NotAppleSilicon)
+        );
+    }
+
+    #[test]
+    fn classify_apple_asr_reports_old_macos_before_missing_bridge() {
+        for bridge_built in [false, true] {
+            assert_eq!(
+                classify_apple_asr(true, bridge_built, Ok(15)),
+                AppleAsrAvailability::Unsupported(AppleAsrUnsupported::MacosTooOld {
+                    found: 15,
+                    required: 26,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn classify_apple_asr_reports_missing_bridge_on_a_capable_machine() {
+        assert_eq!(
+            classify_apple_asr(true, false, Ok(26)),
+            AppleAsrAvailability::NotBuilt
+        );
+    }
+
+    #[test]
+    fn classify_apple_asr_reports_available_when_everything_lines_up() {
+        assert_eq!(
+            classify_apple_asr(true, true, Ok(26)),
+            AppleAsrAvailability::Available
+        );
+    }
+
+    #[test]
+    fn classify_apple_asr_reports_a_failed_version_probe() {
+        for bridge_built in [false, true] {
+            assert_eq!(
+                classify_apple_asr(true, bridge_built, probe_failed()),
+                AppleAsrAvailability::Unsupported(AppleAsrUnsupported::VersionProbeFailed)
+            );
+        }
+    }
+
+    #[test]
+    fn apple_asr_availability_wire_form_is_externally_tagged() {
+        let cases = [
+            (AppleAsrAvailability::Available, r#""available""#),
+            (AppleAsrAvailability::NotBuilt, r#""not_built""#),
+            (
+                AppleAsrAvailability::Unsupported(AppleAsrUnsupported::NotAppleSilicon),
+                r#"{"unsupported":"not_apple_silicon"}"#,
+            ),
+            (
+                AppleAsrAvailability::Unsupported(AppleAsrUnsupported::MacosTooOld {
+                    found: 15,
+                    required: 26,
+                }),
+                r#"{"unsupported":{"macos_too_old":{"found":15,"required":26}}}"#,
+            ),
+        ];
+        for (value, wire) in cases {
+            assert_eq!(serde_json::to_string(&value).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_str::<AppleAsrAvailability>(wire).unwrap(),
+                value
+            );
+        }
     }
 }

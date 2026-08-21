@@ -15,7 +15,9 @@
     type TtsEngineCatalogEntry,
     type TtsEngineId
   } from '$lib/onboarding/system-check.js';
+  import { isTransportSafeBaseUrl } from '$lib/net/transport.js';
   import { prefersReducedMotion } from '$lib/motion/index.js';
+  import { appConfigStore, ensureLoaded } from '$lib/models/app-config.svelte.js';
   import type { AppConfig, CloudTtsKind } from '$lib/theme/types.js';
   import {
     Select,
@@ -228,21 +230,23 @@
     }
   }
 
-  /** Reject non-http(s) or malformed base URLs before saving — the base URL is the
-   *  endpoint the API key is transmitted to. */
-  function isValidBaseUrl(raw: string): boolean {
-    let parsed: URL;
-    try {
-      parsed = new URL(raw);
-    } catch {
-      return false;
-    }
-    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
-  }
+  /** Same gate the engine applies, so a URL this form accepts cannot be one that
+   *  `cloud_tts_usable` then refuses — which would disable cloud TTS with no visible cause. */
+  const isValidBaseUrl = isTransportSafeBaseUrl;
 
   /** Reactive Cloud persist (mirrors persistLocalTts); no Save button. */
   async function persistCloud(): Promise<void> {
     cloudError = null;
+    // Consent is read from the store alone (load-once; awaited so an early blur can't
+    // read a not-yet-loaded `false`). Keying this on `cloudEntry.available` would also
+    // swallow the keyless case that `pendingActivate` defers on purpose, and would drop
+    // the write outright whenever the catalog is empty or stale.
+    await ensureLoaded();
+    if (!appConfigStore.ttsCloudConsent) {
+      cloudError =
+        'Turn on "Allow cloud text-to-speech" in Privacy settings before selecting a cloud voice.';
+      return;
+    }
     const baseUrl = cloudBaseUrl.trim();
     // Don't activate an unusable cloud backend: require a base URL and either a
     // saved key or a freshly-typed one (this is the guard the old Save gate gave).
@@ -367,7 +371,7 @@
         role="status"
       >
         <CircleAlert class="size-3.5 shrink-0" aria-hidden="true" />
-        {cloudEntry.unavailable_reason ?? 'Cloud is unavailable.'} Add an API key below to enable it.
+        {cloudEntry.unavailable_reason ?? 'Cloud is unavailable.'}
       </p>
     {:else}
       <p

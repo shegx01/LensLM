@@ -16,8 +16,13 @@ afterEach(() => {
 });
 
 /** A get_config payload carrying only the fields this section reads. */
-function config(opts: { textConsent: boolean; audioConsent: boolean }): Partial<AppConfig> {
+function config(opts: {
+  textConsent: boolean;
+  audioConsent: boolean;
+  ttsConsent?: boolean;
+}): Partial<AppConfig> {
   return {
+    tts_cloud_consent: opts.ttsConsent ?? false,
     enrichment: {
       enabled: true,
       coref_strategy: 'none',
@@ -57,7 +62,7 @@ describe('PrivacySection', () => {
     render(PrivacySection);
 
     const textToggle = await screen.findByRole('switch', { name: /allow cloud text models/i });
-    const audioToggle = await screen.findByRole('switch', { name: /allow cloud audio/i });
+    const audioToggle = await screen.findByRole('switch', { name: /allow cloud speech-to-text/i });
     await waitFor(() => expect(textToggle).toHaveAttribute('aria-checked', 'true'));
     expect(audioToggle).toHaveAttribute('aria-checked', 'false');
   });
@@ -69,7 +74,7 @@ describe('PrivacySection', () => {
 
     render(PrivacySection);
 
-    const audioToggle = await screen.findByRole('switch', { name: /allow cloud audio/i });
+    const audioToggle = await screen.findByRole('switch', { name: /allow cloud speech-to-text/i });
     await waitFor(() => expect(audioToggle).toHaveAttribute('aria-checked', 'true'));
   });
 
@@ -82,7 +87,7 @@ describe('PrivacySection', () => {
 
     render(PrivacySection);
 
-    await screen.findByRole('switch', { name: /allow cloud audio/i });
+    await screen.findByRole('switch', { name: /allow cloud speech-to-text/i });
     expect(setConfigCalls).toBe(0);
   });
 
@@ -121,7 +126,7 @@ describe('PrivacySection', () => {
 
     render(PrivacySection);
 
-    const audioToggle = await screen.findByRole('switch', { name: /allow cloud audio/i });
+    const audioToggle = await screen.findByRole('switch', { name: /allow cloud speech-to-text/i });
     await waitFor(() => expect(audioToggle).toHaveAttribute('aria-checked', 'false'));
 
     await fireEvent.click(audioToggle);
@@ -173,7 +178,7 @@ describe('PrivacySection', () => {
 
     render(PrivacySection);
 
-    const audioToggle = await screen.findByRole('switch', { name: /allow cloud audio/i });
+    const audioToggle = await screen.findByRole('switch', { name: /allow cloud speech-to-text/i });
     await waitFor(() => expect(audioToggle).toHaveAttribute('aria-checked', 'false'));
 
     await fireEvent.click(audioToggle);
@@ -206,7 +211,7 @@ describe('PrivacySection', () => {
     });
 
     const { unmount } = render(PrivacySection);
-    const audioToggle = await screen.findByRole('switch', { name: /allow cloud audio/i });
+    const audioToggle = await screen.findByRole('switch', { name: /allow cloud speech-to-text/i });
     await fireEvent.click(audioToggle);
     await waitFor(() => expect(rereadAttempted).toBe(true));
     expect(appConfigStore.persistError).not.toBeNull();
@@ -215,7 +220,7 @@ describe('PrivacySection', () => {
     // A later, unrelated mount (standing in for another settings tab) must see a clean
     // load state, not the earlier write's stale reread failure.
     render(PrivacySection);
-    await screen.findByRole('switch', { name: /allow cloud audio/i });
+    await screen.findByRole('switch', { name: /allow cloud speech-to-text/i });
     expect(appConfigStore.loadError).toBeNull();
   });
 
@@ -241,8 +246,101 @@ describe('PrivacySection', () => {
     render(PrivacySection);
 
     await waitFor(() => expect(appConfigStore.loadError).not.toBeNull());
-    expect(screen.queryByRole('switch', { name: /allow cloud audio/i })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('switch', { name: /allow cloud speech-to-text/i })
+    ).not.toBeInTheDocument();
     expect(screen.getByText(/couldn't load cloud audio consent/i)).toBeInTheDocument();
+  });
+
+  it('renders three independent consent toggles reflecting their own persisted field', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config')
+        return config({ textConsent: true, audioConsent: false, ttsConsent: true });
+    });
+
+    render(PrivacySection);
+
+    const textToggle = await screen.findByRole('switch', { name: /allow cloud text models/i });
+    const sttToggle = await screen.findByRole('switch', { name: /allow cloud speech-to-text/i });
+    const ttsToggle = await screen.findByRole('switch', { name: /allow cloud text-to-speech/i });
+    await waitFor(() => expect(textToggle).toHaveAttribute('aria-checked', 'true'));
+    expect(sttToggle).toHaveAttribute('aria-checked', 'false');
+    await waitFor(() => expect(ttsToggle).toHaveAttribute('aria-checked', 'true'));
+  });
+
+  it('flipping the text-to-speech toggle writes tts_cloud_consent and leaves audio_cloud_consent alone', async () => {
+    let saved: AppConfig | undefined;
+    let current = config({
+      textConsent: false,
+      audioConsent: true,
+      ttsConsent: false
+    }) as AppConfig;
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return current;
+      if (cmd === 'set_config') {
+        saved = (args as { config: AppConfig }).config;
+        current = saved;
+      }
+    });
+
+    render(PrivacySection);
+
+    const ttsToggle = await screen.findByRole('switch', { name: /allow cloud text-to-speech/i });
+    await waitFor(() => expect(ttsToggle).toHaveAttribute('aria-checked', 'false'));
+
+    await fireEvent.click(ttsToggle);
+
+    await waitFor(() => expect(saved?.tts_cloud_consent).toBe(true));
+    expect(saved?.audio_cloud_consent).toBe(true);
+    expect(saved?.enrichment.cloud_consent).toBe(false);
+    await waitFor(() => expect(appConfigStore.ttsCloudConsent).toBe(true));
+  });
+
+  it('flipping the speech-to-text toggle does not write tts_cloud_consent', async () => {
+    let saved: AppConfig | undefined;
+    let current = config({
+      textConsent: false,
+      audioConsent: false,
+      ttsConsent: true
+    }) as AppConfig;
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return current;
+      if (cmd === 'set_config') {
+        saved = (args as { config: AppConfig }).config;
+        current = saved;
+      }
+    });
+
+    render(PrivacySection);
+
+    const sttToggle = await screen.findByRole('switch', { name: /allow cloud speech-to-text/i });
+    await waitFor(() => expect(sttToggle).toHaveAttribute('aria-checked', 'false'));
+
+    await fireEvent.click(sttToggle);
+
+    await waitFor(() => expect(saved?.audio_cloud_consent).toBe(true));
+    expect(saved?.tts_cloud_consent).toBe(true);
+  });
+
+  it('a failed write names which consent failed and leaves the other toggles enabled', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return config({ textConsent: false, audioConsent: false });
+      if (cmd === 'set_config') throw new Error('write failed');
+    });
+
+    render(PrivacySection);
+
+    const ttsToggle = await screen.findByRole('switch', { name: /allow cloud text-to-speech/i });
+    await fireEvent.click(ttsToggle);
+
+    await waitFor(() =>
+      expect(screen.getByRole('alert')).toHaveTextContent(
+        /couldn't save cloud text-to-speech consent/i
+      )
+    );
+    expect(screen.getAllByRole('alert')).toHaveLength(1);
+    expect(screen.getByRole('switch', { name: /allow cloud speech-to-text/i })).not.toBeDisabled();
+    expect(screen.getByRole('switch', { name: /allow cloud text models/i })).not.toBeDisabled();
   });
 
   it('shows "No data leaves this device" when everything is local', async () => {

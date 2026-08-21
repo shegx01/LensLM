@@ -6,7 +6,7 @@
 //! M4 Phase 1, Group g.1 — integration & snapshot tests for the text/Markdown
 //! ingestion slice: parser fidelity, chunk hierarchy, vector-store notebook
 //! isolation, the `embedding_index` registry, the embedder cached-once +
-//! concurrency invariants, re-ingest idempotency + G5 wipe ordering,
+//! concurrency invariants, re-ingest idempotency + wipe ordering,
 //! `ingest_source` streaming, and the real-model cosine ACs.
 //!
 //! # Network requirements
@@ -856,7 +856,7 @@ fn assert_subsequence(haystack: &[String], needles: &[&str]) {
 }
 
 // ===========================================================================
-// Re-ingest idempotency + G5 cross-store wipe ordering
+// Re-ingest idempotency + cross-store wipe ordering
 // ===========================================================================
 
 /// AC: re-ingesting an unchanged indexed source is a no-op (no duplicate

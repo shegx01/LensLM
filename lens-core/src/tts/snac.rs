@@ -742,7 +742,7 @@ mod tests {
         }
     }
 
-    // Micro-golden (AC1.2): the tiny synthetic decoder is fully deterministic, so
+    // Micro-golden: the tiny synthetic decoder is fully deterministic, so
     // its 1-frame output is a stable numeric fingerprint. A per-sample max-abs
     // drift ≥ 1e-3 means a conv/padding/activation regression. Golden values are
     // this decoder's committed output (regenerated only on an intentional change).
@@ -780,7 +780,7 @@ mod tests {
             .collect()
     }
 
-    // Bit-exact parity golden (AC1.3): loads the REAL snac_24khz weights and decodes
+    // Bit-exact parity golden: loads the REAL snac_24khz weights and decodes
     // the committed fixed Orpheus token stream, asserting per-sample agreement with a
     // committed golden produced by the upstream Python `snac` decoder run with every
     // NoiseBlock zeroed (identity forward) — the same determinism contract the port

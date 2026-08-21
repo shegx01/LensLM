@@ -635,11 +635,15 @@ pub struct AppConfig {
     /// [`ChatConfig::default`] (6 history turns, follow-up condensation on).
     #[serde(default)]
     pub chat: ChatConfig,
-    /// Explicit consent to upload raw audio to a cloud ASR provider (#45). A NEW
-    /// flag, SEPARATE from `EnrichmentConfig::cloud_consent` (audio is more
-    /// sensitive than text). Cloud ASR is refused (falls back to local) unless true.
+    /// Explicit consent to upload raw audio to a cloud SPEECH-TO-TEXT provider (#45);
+    /// cloud ASR falls back to local unless true. The serde key is load-bearing —
+    /// renaming it resets existing users' consent to false on their next load.
     #[serde(default)]
     pub audio_cloud_consent: bool,
+    /// Explicit consent to send text to a cloud TEXT-TO-SPEECH provider. Withheld by
+    /// default; a saved API key never implies it.
+    #[serde(default)]
+    pub tts_cloud_consent: bool,
     /// SPA JS-render fallback (#78). Defaults to `true`; absent key reads as `true`.
     #[serde(default = "default_js_render_enabled")]
     pub js_render_enabled: bool,
@@ -675,6 +679,7 @@ impl Default for AppConfig {
             retrieval: RetrievalConfig::default(),
             chat: ChatConfig::default(),
             audio_cloud_consent: false,
+            tts_cloud_consent: false,
             js_render_enabled: default_js_render_enabled(),
             reopen_last_notebook: default_reopen_last_notebook(),
             animations: default_animations(),
@@ -710,7 +715,7 @@ impl AppConfig {
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 tracing::debug!("no config at {}, writing default", path.display());
-                let config = AppConfig::default();
+                let mut config = AppConfig::default();
                 config.save(dir)?;
                 Ok(config)
             }
@@ -723,10 +728,49 @@ impl AppConfig {
         }
     }
 
-    /// Writes config to `{dir}/config.json` (pretty JSON) with `0o600` permissions
-    /// on Unix (plaintext `api_key` stopgap until M2).
+    /// Brings the stored cloud-ASR fields into a state the engine can run. Demotion
+    /// (consent withdrawn, or half-configured) runs before the vendor-default fill, so
+    /// the fill can never retarget an ACTIVE backend at a host the user did not pick.
+    pub(crate) fn normalize(&mut self) {
+        let cloud_selected = crate::asr::AsrBackend::from_opt_str(Some(&self.asr.backend))
+            == Some(crate::asr::AsrBackend::Cloud);
+        if cloud_selected && !self.audio_cloud_consent {
+            self.asr.backend.clear();
+            tracing::debug!("demoted cloud ASR backend: audio cloud consent is not granted");
+        }
+        let Some(provider) = self.asr.cloud_provider else {
+            return;
+        };
+        let blank_base = self.asr.cloud_base_url.trim().is_empty();
+        let blank_model = self.asr.cloud_model.trim().is_empty();
+        let demote = (blank_base || blank_model)
+            && crate::asr::AsrBackend::from_opt_str(Some(&self.asr.backend))
+                == Some(crate::asr::AsrBackend::Cloud);
+        if demote {
+            self.asr.backend.clear();
+        }
+        if blank_base {
+            self.asr.cloud_base_url = crate::asr::cloud::default_base_url(provider).to_string();
+        }
+        if blank_model {
+            self.asr.cloud_model = crate::asr::cloud::default_model(provider).to_string();
+        }
+        if demote || blank_base || blank_model {
+            tracing::debug!(
+                demoted_cloud_backend = demote,
+                filled_base_url = blank_base,
+                filled_model = blank_model,
+                "normalized stored cloud ASR config"
+            );
+        }
+    }
+
+    /// Normalizes, then writes `{dir}/config.json` (pretty JSON) via a private
+    /// temp file renamed into place — the plaintext `api_key` (stopgap until M2) is
+    /// never world-readable, not even for the instant between write and chmod.
     #[tracing::instrument(skip_all, fields(dir = %dir.as_ref().display()))]
-    pub fn save(&self, dir: impl AsRef<Path>) -> Result<(), LensError> {
+    pub fn save(&mut self, dir: impl AsRef<Path>) -> Result<(), LensError> {
+        self.normalize();
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir).map_err(|e| {
             tracing::error!("failed to create config dir {}: {e}", dir.display());
@@ -734,30 +778,42 @@ impl AppConfig {
         })?;
         let path = dir.join(CONFIG_FILE_NAME);
         let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, json).map_err(|e| {
+        write_private_file(&path, json.as_bytes()).map_err(|e| {
             tracing::error!("failed to write config at {}: {e}", path.display());
             LensError::Io(format!("failed to write {CONFIG_FILE_NAME}: {e}"))
         })?;
-        Self::restrict_permissions(&path)?;
         tracing::debug!("saved config to {}", path.display());
         Ok(())
     }
+}
 
+/// Creates a sibling temp file with `0o600` (Unix), fills it, and renames it over
+/// `path`. `create_new` plus the mode means the secret is private from the moment
+/// the inode exists, and the rename keeps readers off a half-written config.
+fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp = parent.join(format!(".{CONFIG_FILE_NAME}.{}.tmp", uuid::Uuid::now_v7()));
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
     #[cfg(unix)]
-    fn restrict_permissions(path: &Path) -> Result<(), LensError> {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(path, perms).map_err(|e| {
-            tracing::error!("failed to set permissions on {}: {e}", path.display());
-            LensError::Io(format!("failed to secure {CONFIG_FILE_NAME}: {e}"))
-        })?;
-        Ok(())
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
     }
 
-    #[cfg(not(unix))]
-    fn restrict_permissions(_path: &Path) -> Result<(), LensError> {
-        Ok(())
+    // No fsync: settings persist reactively on every blur, and the rename already
+    // rules out a half-written config. Durability across a power cut is not worth
+    // a disk sync per keystroke-blur.
+    let written = opts
+        .open(&tmp)
+        .and_then(|mut f| f.write_all(bytes))
+        .and_then(|()| std::fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
+    written
 }
 
 #[cfg(test)]
@@ -839,7 +895,7 @@ mod tests {
     #[test]
     fn explicit_user_name_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let config = AppConfig {
+        let mut config = AppConfig {
             user_name: "Jamie".to_string(),
             ..AppConfig::default()
         };
@@ -872,7 +928,7 @@ mod tests {
     #[test]
     fn explicit_embedding_model_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let config = AppConfig {
+        let mut config = AppConfig {
             embedding_model: "nomic-embed-text".to_string(),
             ..AppConfig::default()
         };
@@ -885,7 +941,7 @@ mod tests {
     #[test]
     fn credential_only_model_config_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let config = AppConfig {
+        let mut config = AppConfig {
             models: vec![ModelConfig {
                 provider: "anthropic".to_string(),
                 base_url: String::new(),
@@ -911,7 +967,7 @@ mod tests {
     #[test]
     fn model_config_context_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let config = AppConfig {
+        let mut config = AppConfig {
             models: vec![ModelConfig {
                 provider: "ollama".to_string(),
                 base_url: "http://localhost:11434".to_string(),
@@ -952,7 +1008,7 @@ mod tests {
     #[test]
     fn explicit_embedding_backend_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let config = AppConfig {
+        let mut config = AppConfig {
             embedding_backend: "ollama".to_string(),
             ..AppConfig::default()
         };
@@ -987,7 +1043,7 @@ mod tests {
     #[test]
     fn test_max_source_mb_explicit_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let config = AppConfig {
+        let mut config = AppConfig {
             max_source_mb: "100".to_string(),
             ..AppConfig::default()
         };
@@ -1093,7 +1149,7 @@ mod tests {
     #[test]
     fn explicit_asr_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let config = AppConfig {
+        let mut config = AppConfig {
             asr: AsrConfig {
                 backend: "apple_native".to_string(),
                 whisper_model: "small".to_string(),
@@ -1128,7 +1184,7 @@ mod tests {
     #[test]
     fn explicit_tts_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let config = AppConfig {
+        let mut config = AppConfig {
             tts: TtsConfig {
                 version: 1,
                 backend: TtsBackend::Cloud(CloudTtsKind::ElevenLabs),
@@ -1152,7 +1208,7 @@ mod tests {
     fn multiple_cloud_providers_round_trip_independently() {
         // Per-provider retention (#40): two providers' keys coexist in `clouds`.
         let dir = tempfile::tempdir().unwrap();
-        let config = AppConfig {
+        let mut config = AppConfig {
             tts: TtsConfig {
                 version: 1,
                 backend: TtsBackend::Cloud(CloudTtsKind::GoogleCloud),
@@ -1274,7 +1330,7 @@ mod tests {
     #[test]
     fn explicit_accent_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let config = AppConfig {
+        let mut config = AppConfig {
             accent: "emerald".to_string(),
             ..AppConfig::default()
         };
@@ -1357,7 +1413,7 @@ mod tests {
     #[test]
     fn explicit_enrichment_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let config = AppConfig {
+        let mut config = AppConfig {
             enrichment: EnrichmentConfig {
                 enabled: true,
                 coref_strategy: CorefStrategy::None,
@@ -1438,7 +1494,7 @@ mod tests {
     #[test]
     fn explicit_per_task_models_round_trip() {
         let dir = tempfile::tempdir().unwrap();
-        let config = AppConfig {
+        let mut config = AppConfig {
             enrichment: EnrichmentConfig {
                 enabled: true,
                 coref_model: Some(TaskModel {
@@ -1475,7 +1531,7 @@ mod tests {
     #[test]
     fn chat_model_round_trips_persist_and_reload() {
         let dir = tempfile::tempdir().unwrap();
-        let config = AppConfig {
+        let mut config = AppConfig {
             enrichment: EnrichmentConfig {
                 enabled: true,
                 chat_model: Some(TaskModel {
@@ -1643,7 +1699,7 @@ mod tests {
     #[test]
     fn explicit_retrieval_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let config = AppConfig {
+        let mut config = AppConfig {
             retrieval: RetrievalConfig {
                 hybrid_enabled: false,
                 reranker: RerankerConfig {
@@ -1730,7 +1786,7 @@ mod tests {
     #[test]
     fn explicit_animations_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let config = AppConfig {
+        let mut config = AppConfig {
             animations: "off".to_string(),
             ..AppConfig::default()
         };

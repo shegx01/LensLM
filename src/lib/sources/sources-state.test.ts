@@ -421,6 +421,38 @@ describe('ingest', () => {
     expect(sourcesStore.sources[0].status).toBe('embedding');
   });
 
+  it('captures effective_backend from a terminal transcribing chunk', async () => {
+    vi.mocked(listSources).mockResolvedValue([makeSource({ id: 'src-001', status: 'queued' })]);
+    await loadSources('nb-001');
+
+    let capturedHandler: ((e: unknown) => void) | null = null;
+    vi.mocked(ingestSource).mockImplementation(async (_id, onProgress) => {
+      capturedHandler = onProgress as (e: unknown) => void;
+    });
+
+    const ingestPromise = ingest('src-001');
+    if (capturedHandler) {
+      (capturedHandler as (e: unknown) => void)({
+        type: 'chunk',
+        data: {
+          phase: 'transcribing',
+          done: 100,
+          total: 100,
+          effective_backend: 'local_whisper (fallback)'
+        }
+      });
+    }
+    await ingestPromise;
+
+    expect(sourcesStore.effectiveBackendFor('src-001')).toBe('local_whisper (fallback)');
+  });
+
+  it('effectiveBackendFor is null when no chunk has carried the marker', async () => {
+    vi.mocked(listSources).mockResolvedValue([makeSource({ id: 'src-001', status: 'queued' })]);
+    await loadSources('nb-001');
+    expect(sourcesStore.effectiveBackendFor('src-001')).toBeNull();
+  });
+
   it('does NOT update status on progress event (no phase field)', async () => {
     vi.mocked(listSources).mockResolvedValue([makeSource({ id: 'src-001', status: 'queued' })]);
     await loadSources('nb-001');

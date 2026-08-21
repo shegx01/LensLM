@@ -11,6 +11,7 @@ const { mockSourcesStore, mockNotebookStore } = vi.hoisted(() => {
   let _recentlyTrashed = false;
   let _focusedSourceId: string | null = null;
   let _focusNonce = 0;
+  let _effectiveBackends = new Map<string, string>();
 
   const mockSourcesStore = {
     get sources() {
@@ -48,6 +49,15 @@ const { mockSourcesStore, mockNotebookStore } = vi.hoisted(() => {
     _resetFocus() {
       _focusedSourceId = null;
       _focusNonce = 0;
+    },
+    effectiveBackendFor(sourceId: string) {
+      return _effectiveBackends.get(sourceId) ?? null;
+    },
+    _setEffectiveBackend(sourceId: string, marker: string) {
+      _effectiveBackends.set(sourceId, marker);
+    },
+    _resetEffectiveBackends() {
+      _effectiveBackends = new Map();
     }
   };
 
@@ -155,6 +165,7 @@ beforeEach(() => {
   mockSourcesStore._setSources([]);
   mockSourcesStore._setRecentlyTrashed(false);
   mockSourcesStore._resetFocus();
+  mockSourcesStore._resetEffectiveBackends();
   mockNotebookStore._setRightRailCollapsed(false);
 });
 
@@ -162,6 +173,7 @@ afterEach(() => {
   mockSourcesStore._setSources([]);
   mockSourcesStore._setRecentlyTrashed(false);
   mockSourcesStore._resetFocus();
+  mockSourcesStore._resetEffectiveBackends();
   mockNotebookStore._setRightRailCollapsed(false);
 });
 
@@ -491,6 +503,68 @@ describe('SourcesRail — Studio shell', () => {
     mockNotebookStore._setRightRailCollapsed(true);
     render(SourcesRail);
     expect(screen.queryByText('Audio Overview')).not.toBeInTheDocument();
+  });
+});
+
+describe('SourcesRail — ASR degradation caption', () => {
+  it('shows a fallback caption for an audio source with a fallback marker', () => {
+    mockSourcesStore._setSources([makeSource({ id: 'src-001', kind: 'audio', title: 'Call.mp3' })]);
+    mockSourcesStore._setEffectiveBackend('src-001', 'local_whisper (fallback)');
+    render(SourcesRail);
+    expect(screen.getByText(/fell back to local whisper/i)).toBeInTheDocument();
+  });
+
+  it('points a cloud-misconfiguration marker at the setting that fixes it', () => {
+    mockSourcesStore._setSources([makeSource({ id: 'src-001', kind: 'audio', title: 'Call.mp3' })]);
+    mockSourcesStore._setEffectiveBackend('src-001', 'local_whisper (cloud misconfigured)');
+    render(SourcesRail);
+    const caption = screen.getByText(/cloud transcription is misconfigured/i);
+    expect(caption).toBeInTheDocument();
+    expect(caption).toHaveTextContent(/settings\s*→\s*transcription/i);
+    expect(screen.queryByText(/fell back to/i)).not.toBeInTheDocument();
+  });
+
+  it('shows no caption for an audio source with a clean (non-degraded) marker', () => {
+    mockSourcesStore._setSources([makeSource({ id: 'src-001', kind: 'audio', title: 'Call.mp3' })]);
+    mockSourcesStore._setEffectiveBackend('src-001', 'local_whisper');
+    render(SourcesRail);
+    expect(screen.queryByText(/fell back/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/misconfigured/i)).not.toBeInTheDocument();
+  });
+
+  it('shows no caption for an audio source with no marker at all (absence is not "clean")', () => {
+    mockSourcesStore._setSources([makeSource({ id: 'src-001', kind: 'audio', title: 'Call.mp3' })]);
+    render(SourcesRail);
+    expect(screen.queryByText(/fell back/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/degraded/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/misconfigured/i)).not.toBeInTheDocument();
+  });
+
+  it('shows no caption for a non-audio source even if a marker is somehow present', () => {
+    mockSourcesStore._setSources([makeSource({ id: 'src-001', kind: 'file', title: 'Doc.md' })]);
+    mockSourcesStore._setEffectiveBackend('src-001', 'local_whisper (fallback)');
+    render(SourcesRail);
+    expect(screen.queryByText(/fell back/i)).not.toBeInTheDocument();
+  });
+
+  it('never renders a raw wire token the engine catalog cannot name', () => {
+    mockSourcesStore._setSources([makeSource({ id: 'src-001', kind: 'audio', title: 'Call.mp3' })]);
+    mockSourcesStore._setEffectiveBackend('src-001', 'faster_whisper (fallback)');
+    render(SourcesRail);
+    const caption = screen.getByText(/fell back to/i);
+    expect(caption).toHaveTextContent('Fell back to a different engine for this recording.');
+    expect(document.body.textContent).not.toContain('faster_whisper');
+  });
+
+  // The misconfiguration copy is the longest caption and names the fix at its very end,
+  // so clipping it removes the only actionable half.
+  it('keeps the misconfiguration caption readable rather than clipping it', () => {
+    mockSourcesStore._setSources([makeSource({ id: 'src-001', kind: 'audio', title: 'Call.mp3' })]);
+    mockSourcesStore._setEffectiveBackend('src-001', 'local_whisper (cloud misconfigured)');
+    render(SourcesRail);
+    const caption = screen.getByText(/cloud transcription is misconfigured/i);
+    expect(caption.className).not.toMatch(/\btruncate\b/);
+    expect(caption).toHaveAttribute('title', caption.textContent?.trim() ?? '');
   });
 });
 

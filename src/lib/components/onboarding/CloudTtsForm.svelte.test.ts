@@ -3,6 +3,7 @@ import { mockIPC, clearMocks } from '@tauri-apps/api/mocks';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { AppConfig, CloudTtsKind } from '$lib/theme/types.js';
 import { baseAppConfig } from '$lib/test-fixtures.js';
+import { resetConfig } from '$lib/models/app-config.svelte.js';
 import type { TtsEngineCatalogEntry, TtsVoice } from '$lib/onboarding/system-check.js';
 import CloudTtsForm from './CloudTtsForm.svelte';
 
@@ -37,10 +38,11 @@ function catalogFixture(overrides?: {
   ];
 }
 
-/** A config with one cloud provider's credentials saved in the per-provider map. */
+/** A config with one cloud provider's credentials saved in the per-provider map.
+ *  Consent is granted unless a case is specifically about the consent gate. */
 function cloudKeyedConfig(kind: CloudTtsKind = 'open_ai_compatible'): AppConfig {
   return {
-    ...baseAppConfig(),
+    ...baseAppConfig({ tts_cloud_consent: true }),
     tts: {
       version: 1,
       backend: { cloud: kind },
@@ -59,6 +61,7 @@ beforeEach(() => {
 afterEach(() => {
   clearMocks();
   delete (globalThis as { isTauri?: boolean }).isTauri;
+  resetConfig();
 });
 
 describe('CloudTtsForm — single-sourced host/guest voice picker snippet (AC-6/AC-7)', () => {
@@ -145,7 +148,7 @@ describe('CloudTtsForm — per-provider config (#40)', () => {
   it('persists to the selected provider kind and writes into the clouds map', async () => {
     let written: AppConfig | null = null;
     mockIPC((cmd, args) => {
-      if (cmd === 'get_config') return baseAppConfig();
+      if (cmd === 'get_config') return baseAppConfig({ tts_cloud_consent: true });
       if (cmd === 'tts_engine_catalog')
         return catalogFixture({ kind: 'eleven_labs', cloudAvailable: false });
       if (cmd === 'set_config') {
@@ -168,7 +171,7 @@ describe('CloudTtsForm — per-provider config (#40)', () => {
 
   it('shows the provider-specific connection hint (ElevenLabs xi-api-key)', async () => {
     mockIPC((cmd) => {
-      if (cmd === 'get_config') return baseAppConfig();
+      if (cmd === 'get_config') return baseAppConfig({ tts_cloud_consent: true });
       if (cmd === 'tts_engine_catalog') return catalogFixture({ kind: 'eleven_labs' });
     });
 
@@ -181,7 +184,7 @@ describe('CloudTtsForm — key save refreshes availability', () => {
   it('entering a fresh key flips Cloud from unavailable to available via catalog re-fetch', async () => {
     let keySaved = false;
     mockIPC((cmd) => {
-      if (cmd === 'get_config') return baseAppConfig();
+      if (cmd === 'get_config') return baseAppConfig({ tts_cloud_consent: true });
       if (cmd === 'tts_engine_catalog') return catalogFixture({ cloudAvailable: keySaved });
       if (cmd === 'set_config') {
         keySaved = true;
@@ -226,7 +229,11 @@ describe('CloudTtsForm — base URL scheme validation (#245)', () => {
     ['javascript:alert(1)'],
     ['data:text/html,hi'],
     ['file:///etc/passwd'],
-    ['api.openai.com']
+    ['api.openai.com'],
+    // Cleartext to a public host would bearer-send the key over the open internet.
+    // The engine refuses it, so accepting it here would disable cloud TTS with no cause shown.
+    ['http://tts.vendor.example'],
+    ['http://172.32.0.1']
   ])('rejects %s with an inline error and does not save', async (value) => {
     let saved = false;
     mockIPC((cmd) => {
@@ -247,31 +254,33 @@ describe('CloudTtsForm — base URL scheme validation (#245)', () => {
     expect(saved).toBe(false);
   });
 
-  // http:// must stay accepted — plaintext localhost / self-hosted (LocalAI) is a
-  // supported endpoint, so the guard is an allowlist of schemes, not https-only.
-  it.each([['https://api.groq.com'], ['http://localhost:1234/v1']])(
-    'accepts %s and persists it',
-    async (value) => {
-      let written: AppConfig | null = null;
-      mockIPC((cmd, args) => {
-        if (cmd === 'get_config') return cloudKeyedConfig();
-        if (cmd === 'tts_engine_catalog') return catalogFixture({ cloudAvailable: true });
-        if (cmd === 'set_config') {
-          written = (args as { config: AppConfig }).config;
-          return null;
-        }
-      });
+  // http:// stays accepted for loopback and private/LAN hosts — self-hosted (LocalAI) is
+  // a supported endpoint. The guard is scheme plus host reach, matching the engine.
+  it.each([
+    ['https://api.groq.com'],
+    ['http://localhost:1234/v1'],
+    ['http://192.168.1.5:9000'],
+    ['http://10.0.0.5/v1']
+  ])('accepts %s and persists it', async (value) => {
+    let written: AppConfig | null = null;
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return cloudKeyedConfig();
+      if (cmd === 'tts_engine_catalog') return catalogFixture({ cloudAvailable: true });
+      if (cmd === 'set_config') {
+        written = (args as { config: AppConfig }).config;
+        return null;
+      }
+    });
 
-      renderOpenAiCompatible();
-      const field = await baseUrlField();
-      await fireEvent.input(field, { target: { value } });
-      await fireEvent.blur(field);
+    renderOpenAiCompatible();
+    const field = await baseUrlField();
+    await fireEvent.input(field, { target: { value } });
+    await fireEvent.blur(field);
 
-      await waitFor(() => expect(written).not.toBeNull());
-      expect((written as unknown as AppConfig).tts.clouds.open_ai_compatible?.base_url).toBe(value);
-      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
-    }
-  );
+    await waitFor(() => expect(written).not.toBeNull());
+    expect((written as unknown as AppConfig).tts.clouds.open_ai_compatible?.base_url).toBe(value);
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
 
   it('persists the trimmed (vetted) base URL, not the raw input', async () => {
     let written: AppConfig | null = null;
@@ -292,6 +301,109 @@ describe('CloudTtsForm — base URL scheme validation (#245)', () => {
     await waitFor(() => expect(written).not.toBeNull());
     expect((written as unknown as AppConfig).tts.clouds.open_ai_compatible?.base_url).toBe(
       'https://api.groq.com'
+    );
+  });
+});
+
+describe('CloudTtsForm — cloud TTS consent gate', () => {
+  const CONSENT_REASON =
+    'Cloud text-to-speech is off. Turn on "Allow cloud text-to-speech" in Privacy settings to use this voice.';
+
+  /** Catalog the backend produces when consent is the blocker — without it the case
+   *  passes trivially, since with no catalog nothing persists for ANY reason. */
+  function consentBlockedCatalog(): TtsEngineCatalogEntry[] {
+    const entry = catalogFixture()[0];
+    return [{ ...entry, available: false, unavailable_reason: CONSENT_REASON }];
+  }
+
+  it('renders the consent reason and not the deleted "add an API key" tail', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return baseAppConfig({ tts_cloud_consent: false });
+      if (cmd === 'tts_engine_catalog') return consentBlockedCatalog();
+    });
+
+    render(CloudTtsForm, {
+      props: { catalog: consentBlockedCatalog(), kind: 'open_ai_compatible', active: true }
+    });
+
+    await waitFor(() =>
+      expect(screen.getByText(new RegExp(CONSENT_REASON, 'i'))).toBeInTheDocument()
+    );
+    expect(screen.queryByText(/add an api key below to enable it/i)).not.toBeInTheDocument();
+  });
+
+  it('blocks activation with a visible reason instead of dropping the write silently', async () => {
+    let saved = false;
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return { ...cloudKeyedConfig(), tts_cloud_consent: false };
+      if (cmd === 'tts_engine_catalog') return consentBlockedCatalog();
+      if (cmd === 'set_config') {
+        saved = true;
+        return null;
+      }
+    });
+
+    render(CloudTtsForm, {
+      props: { catalog: consentBlockedCatalog(), kind: 'open_ai_compatible', active: true }
+    });
+
+    const field = await screen.findByLabelText(/base url/i);
+    await fireEvent.blur(field);
+
+    await waitFor(() =>
+      expect(screen.getByRole('alert')).toHaveTextContent(/allow cloud text-to-speech/i)
+    );
+    expect(saved).toBe(false);
+  });
+
+  it('still persists when the catalog is empty or stale, given consent and a saved key', async () => {
+    let written: AppConfig | null = null;
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return cloudKeyedConfig();
+      if (cmd === 'tts_engine_catalog') return [];
+      if (cmd === 'set_config') {
+        written = (args as { config: AppConfig }).config;
+        return null;
+      }
+    });
+
+    render(CloudTtsForm, { props: { catalog: [], kind: 'open_ai_compatible', active: true } });
+
+    const field = await screen.findByLabelText(/base url/i);
+    await waitFor(() => expect(field).toHaveValue('https://api.openai.com'));
+    await fireEvent.blur(field);
+
+    await waitFor(() => expect(written).not.toBeNull());
+    expect((written as unknown as AppConfig).tts.backend).toEqual({
+      cloud: 'open_ai_compatible'
+    });
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('defers a keyless activation and completes it once a key lands', async () => {
+    let written: AppConfig | null = null;
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return baseAppConfig({ tts_cloud_consent: true });
+      if (cmd === 'tts_engine_catalog') return catalogFixture();
+      if (cmd === 'set_config') {
+        written = (args as { config: AppConfig }).config;
+        return null;
+      }
+    });
+
+    render(CloudTtsForm, { props: { catalog: [], kind: 'open_ai_compatible', active: true } });
+
+    const keyField = await screen.findByLabelText(/api key/i);
+    // No saved key: activation must not persist an unusable backend, and must not error.
+    expect(written).toBeNull();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+
+    await fireEvent.input(keyField, { target: { value: 'sk-late-key' } });
+    await fireEvent.blur(keyField);
+
+    await waitFor(() => expect(written).not.toBeNull());
+    expect((written as unknown as AppConfig).tts.clouds.open_ai_compatible?.api_key).toBe(
+      'sk-late-key'
     );
   });
 });

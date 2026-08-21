@@ -3,7 +3,7 @@ import { mockIPC, clearMocks } from '@tauri-apps/api/mocks';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { AppConfig } from '$lib/theme/types.js';
 import { baseAppConfig } from '$lib/test-fixtures.js';
-import { persist, resetConfig } from '$lib/models/app-config.svelte.js';
+import { appConfigStore, persist, resetConfig } from '$lib/models/app-config.svelte.js';
 import TranscriptionCloudPane from './TranscriptionCloudPane.svelte';
 
 /** A config with a complete, ready-to-activate Cloud setup except for what `opts` overrides. */
@@ -138,7 +138,7 @@ describe('TranscriptionCloudPane', () => {
     expect(savedConfigs.length).toBe(0);
   });
 
-  it('rejects a cleartext http:// base URL on a non-loopback host — the API key is bearer-sent there', async () => {
+  it('names the accepted hosts when it rejects cleartext http:// on a public host', async () => {
     const { savedConfigs } = mockBackend(cloudConfig());
     render(TranscriptionCloudPane);
 
@@ -152,23 +152,62 @@ describe('TranscriptionCloudPane', () => {
     expect(savedConfigs.length).toBe(0);
   });
 
-  it.each(['http://localhost:8090', 'http://127.0.0.1:8090', 'http://[::1]:8090'])(
-    'accepts a loopback http:// base URL (%s) for self-hosted servers',
-    async (url) => {
-      const { savedConfigs } = mockBackend(cloudConfig());
-      render(TranscriptionCloudPane);
+  // SYNC-CHECK: these two tables mirror the transport-safety rstest tables in
+  // `lens-core/tests/cloud_asr.rs` case-for-case; a case added there belongs here too.
+  it.each([
+    'http://api.openai.com',
+    'http://api.example.com',
+    'http://localhost.evil.example',
+    'http://10.0.0.1.evil.com',
+    'http://172.15.0.1',
+    'http://172.32.0.1',
+    'http://169.254.1.1',
+    'http://0.0.0.0',
+    'http://93.184.216.34',
+    'ftp://x',
+    'api.example.com',
+    'not a url at all',
+    'file:///etc/passwd'
+  ])('rejects a base URL that is not transport-safe (%s)', async (url) => {
+    const { savedConfigs } = mockBackend(cloudConfig());
+    render(TranscriptionCloudPane);
 
-      const baseUrlInput = await screen.findByLabelText<HTMLInputElement>(/base url/i);
-      await waitFor(() => expect(baseUrlInput.value).toBe('https://api.openai.com'));
+    const baseUrlInput = await screen.findByLabelText<HTMLInputElement>(/base url/i);
+    await waitFor(() => expect(baseUrlInput.value).toBe('https://api.openai.com'));
 
-      await fireEvent.input(baseUrlInput, { target: { value: url } });
-      await fireEvent.blur(baseUrlInput);
+    await fireEvent.input(baseUrlInput, { target: { value: url } });
+    await fireEvent.blur(baseUrlInput);
 
-      await waitFor(() => expect(savedConfigs.length).toBeGreaterThan(0));
-      expect(savedConfigs.at(-1)?.asr.cloud_base_url).toBe(url);
-      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
-    }
-  );
+    await waitFor(() => expect(screen.getByRole('alert')).toBeInTheDocument());
+    expect(savedConfigs.length).toBe(0);
+  });
+
+  it.each([
+    'https://api.openai.com',
+    'https://asr.internal.example:8443/v1',
+    'http://localhost:9000',
+    'http://127.0.0.1',
+    'http://127.1.2.3',
+    'http://[::1]:1234',
+    'http://10.0.0.5:9000',
+    'http://172.16.0.1',
+    'http://172.31.255.254',
+    'http://192.168.1.5:9000',
+    'http://whisper.local'
+  ])('accepts a transport-safe base URL (%s) for self-hosted servers', async (url) => {
+    const { savedConfigs } = mockBackend(cloudConfig());
+    render(TranscriptionCloudPane);
+
+    const baseUrlInput = await screen.findByLabelText<HTMLInputElement>(/base url/i);
+    await waitFor(() => expect(baseUrlInput.value).toBe('https://api.openai.com'));
+
+    await fireEvent.input(baseUrlInput, { target: { value: url } });
+    await fireEvent.blur(baseUrlInput);
+
+    await waitFor(() => expect(savedConfigs.length).toBeGreaterThan(0));
+    expect(savedConfigs.at(-1)?.asr.cloud_base_url).toBe(url);
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
 
   it('shows why cloud is unavailable and does not activate while consent is off', async () => {
     const { savedConfigs } = mockBackend(cloudConfig({ audioCloudConsent: false }));
@@ -182,7 +221,7 @@ describe('TranscriptionCloudPane', () => {
     await fireEvent.blur(baseUrlInput);
 
     await waitFor(() => expect(savedConfigs.length).toBeGreaterThan(0));
-    expect(savedConfigs.at(-1)?.asr.backend).not.toBe('cloud');
+    expect(savedConfigs.at(-1)?.asr.backend).toBe('local_whisper');
   });
 
   it('granting consent through the shared store alone does not activate Cloud from this pane', async () => {
@@ -199,7 +238,7 @@ describe('TranscriptionCloudPane', () => {
     await new Promise((r) => setTimeout(r, 0));
 
     expect(savedConfigs.length).toBe(1);
-    expect(savedConfigs.at(-1)?.asr.backend).not.toBe('cloud');
+    expect(savedConfigs.at(-1)?.asr.backend).toBe('local_whisper');
   });
 
   it('a typeahead keypress resolving to the already-selected provider is a no-op that preserves the saved key', async () => {
@@ -236,7 +275,110 @@ describe('TranscriptionCloudPane', () => {
     await waitFor(() => expect(savedConfigs.length).toBeGreaterThan(0));
     expect(savedConfigs.at(-1)?.asr.cloud_provider).toBe('deepgram');
     expect(savedConfigs.at(-1)?.asr.cloud_api_key).toBe('');
-    expect(savedConfigs.at(-1)?.asr.backend).not.toBe('cloud');
+    expect(savedConfigs.at(-1)?.asr.backend).toBe('local_whisper');
+  });
+
+  it('clearing the Base URL while cloud is the active backend demotes it instead of leaving it pointed at cloud', async () => {
+    const { savedConfigs } = mockBackend(cloudConfig({ backend: 'cloud' }));
+    render(TranscriptionCloudPane);
+
+    const baseUrlInput = await screen.findByLabelText<HTMLInputElement>(/base url/i);
+    await waitFor(() => expect(baseUrlInput.value).toBe('https://api.openai.com'));
+
+    await fireEvent.input(baseUrlInput, { target: { value: '' } });
+    await fireEvent.blur(baseUrlInput);
+
+    await waitFor(() => expect(savedConfigs.length).toBeGreaterThan(0));
+    expect(savedConfigs.at(-1)?.asr.backend).toBe('');
+  });
+
+  // Every other test here asserts within a single mount. The pane's `hydrated` flag is
+  // component-local and the engine rows sit in an {:else if} chain, so switching rows
+  // and back genuinely remounts — that is where a key can end up under a wrong vendor.
+  it('keeps a saved key bound to its own provider across a remount after a required field is cleared', async () => {
+    const { savedConfigs } = mockBackend(
+      cloudConfig({
+        backend: 'cloud',
+        cloud_provider: 'deepgram',
+        cloud_base_url: 'https://api.deepgram.com',
+        cloud_model: 'nova-3',
+        cloud_api_key: 'dg-secret'
+      })
+    );
+    const firstMount = render(TranscriptionCloudPane);
+
+    const baseUrlInput = await screen.findByLabelText<HTMLInputElement>(/base url/i);
+    await waitFor(() => expect(baseUrlInput.value).toBe('https://api.deepgram.com'));
+
+    await fireEvent.input(baseUrlInput, { target: { value: '' } });
+    await fireEvent.blur(baseUrlInput);
+
+    // The store re-read lands after the write is recorded; the remount must hydrate from
+    // the settled snapshot, or it reads pre-write state and proves nothing.
+    await waitFor(() => expect(appConfigStore.asr?.cloud_base_url).toBe(''));
+    expect(savedConfigs.at(-1)?.asr.backend).toBe('');
+    expect(savedConfigs.at(-1)?.asr.cloud_provider).toBe('deepgram');
+
+    firstMount.unmount();
+    render(TranscriptionCloudPane);
+
+    const remountedBaseUrl = await screen.findByLabelText<HTMLInputElement>(/base url/i);
+    await waitFor(() => expect(remountedBaseUrl.value).toBe('https://api.deepgram.com'));
+
+    await fireEvent.input(remountedBaseUrl, { target: { value: 'https://api.deepgram.com/v2' } });
+    await fireEvent.blur(remountedBaseUrl);
+
+    await waitFor(() => expect(savedConfigs.length).toBeGreaterThan(1));
+    expect(savedConfigs.at(-1)?.asr.cloud_api_key).toBe('dg-secret');
+    expect(savedConfigs.at(-1)?.asr.cloud_provider).toBe('deepgram');
+  });
+
+  it('re-syncs the displayed model from the stored config after a successful persist, not the value that was typed', async () => {
+    let stored = cloudConfig();
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return stored;
+      if (cmd === 'set_config') {
+        const sent = (args as { config: AppConfig }).config;
+        // Simulates engine-side normalization returning a different value than what
+        // this pane sent — proves the resync reads the store, not the local echo.
+        stored = { ...sent, asr: { ...sent.asr, cloud_model: 'engine-assigned-model' } };
+        return null;
+      }
+    });
+    render(TranscriptionCloudPane);
+
+    const baseUrlInput = await screen.findByLabelText<HTMLInputElement>(/base url/i);
+    await waitFor(() => expect(baseUrlInput.value).toBe('https://api.openai.com'));
+
+    const modelInput = screen.getByLabelText<HTMLInputElement>(/model/i);
+    await fireEvent.input(modelInput, { target: { value: 'typed-model' } });
+    await fireEvent.blur(modelInput);
+
+    await waitFor(() => expect(modelInput.value).toBe('engine-assigned-model'));
+  });
+
+  it('after clearing the Base URL, displays what the engine stored — not the typed blank, nor the provider preset', async () => {
+    // The stored value is distinct from both the typed blank and the preset, so the
+    // assertion can only pass if the resync read the store.
+    const engineNormalized = 'https://engine-normalized.example';
+    let stored = cloudConfig({ backend: 'cloud' });
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return stored;
+      if (cmd === 'set_config') {
+        const sent = (args as { config: AppConfig }).config;
+        stored = { ...sent, asr: { ...sent.asr, cloud_base_url: engineNormalized } };
+        return null;
+      }
+    });
+    render(TranscriptionCloudPane);
+
+    const baseUrlInput = await screen.findByLabelText<HTMLInputElement>(/base url/i);
+    await waitFor(() => expect(baseUrlInput.value).toBe('https://api.openai.com'));
+
+    await fireEvent.input(baseUrlInput, { target: { value: '' } });
+    await fireEvent.blur(baseUrlInput);
+
+    await waitFor(() => expect(baseUrlInput.value).toBe(engineNormalized));
   });
 
   it('surfaces a Tauri LensError message instead of the generic fallback', async () => {
