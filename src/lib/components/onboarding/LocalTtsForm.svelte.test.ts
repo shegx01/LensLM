@@ -200,7 +200,7 @@ describe('LocalTtsForm — post-download re-check', () => {
       if (cmd === 'tts_engine_catalog') return catalogFixture();
       if (cmd === 'tts_model_status') return 'absent';
       if (cmd === 'download_tts_model') {
-        const ch = (args as { onProgress?: { onmessage?: (m: unknown) => void } }).onProgress;
+        const ch = (args as { on_progress?: { onmessage?: (m: unknown) => void } }).on_progress;
         ch?.onmessage?.({ received: 100, total: 100, done: true });
         return null;
       }
@@ -228,7 +228,7 @@ describe('LocalTtsForm — reactive persist', () => {
       if (cmd === 'tts_model_status') return onDisk ? 'complete' : 'absent';
       if (cmd === 'download_tts_model') {
         onDisk = true;
-        const ch = (args as { onProgress?: { onmessage?: (m: unknown) => void } }).onProgress;
+        const ch = (args as { on_progress?: { onmessage?: (m: unknown) => void } }).on_progress;
         ch?.onmessage?.({ received: 100, total: 100, done: true });
         return null;
       }
@@ -281,16 +281,16 @@ describe('LocalTtsForm — indeterminate progress (null pct)', () => {
       if (cmd === 'tts_engine_catalog') return catalogFixture();
       if (cmd === 'tts_model_status') return 'absent';
       if (cmd === 'download_tts_model') {
-        const a = args as { model: string; onProgress: ProgressChannel };
+        const a = args as { model: string; on_progress: ProgressChannel };
         if (a.model === 'orpheus') {
-          a.onProgress.onmessage({ received: 100, total: 100, done: true });
+          a.on_progress.onmessage({ received: 100, total: 100, done: true });
           return null;
         }
         // 'snac' (second model): report 40% then hold, so the composite reaches
         // 70% before the null tick below — a regression to `null/100 === 0`
         // would silently drop this to 50%, not crash.
-        a.onProgress.onmessage({ received: 40, total: 100, done: false });
-        secondCh = a.onProgress;
+        a.on_progress.onmessage({ received: 40, total: 100, done: false });
+        secondCh = a.on_progress;
         return new Promise(() => {});
       }
     });
@@ -417,7 +417,7 @@ describe('LocalTtsForm — superseded load cancellation (#246)', () => {
         return a.engine === 'qwen3_local' ? 'complete' : 'absent';
       }
       if (cmd === 'download_tts_model') {
-        orpheusDl.channel = (args as { onProgress: ProgressChannel }).onProgress;
+        orpheusDl.channel = (args as { on_progress: ProgressChannel }).on_progress;
         return new Promise<null>((res) => {
           orpheusDl.finish = () => res(null);
         });

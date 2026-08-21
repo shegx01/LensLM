@@ -103,7 +103,7 @@ function cloudKeyedConfig(): AppConfig {
 
 /** Drive the download progress channel to completion. */
 function driveDownload(args: unknown): null {
-  const ch = (args as { onProgress?: { onmessage?: (m: unknown) => void } }).onProgress;
+  const ch = (args as { on_progress?: { onmessage?: (m: unknown) => void } }).on_progress;
   ch?.onmessage?.({ received: 100, total: 100, done: true });
   return null;
 }
@@ -1029,7 +1029,7 @@ describe('TtsConfigPanel — incomplete-model re-download affordance', () => {
     // panel in the in-flight state — the re-download label must not appear.
     mockIPC((cmd, args) => {
       if (cmd === 'download_tts_model') {
-        const ch = (args as { onProgress?: { onmessage?: (m: unknown) => void } }).onProgress;
+        const ch = (args as { on_progress?: { onmessage?: (m: unknown) => void } }).on_progress;
         ch?.onmessage?.({ received: 50, total: 100, done: false });
         return new Promise(() => {});
       }

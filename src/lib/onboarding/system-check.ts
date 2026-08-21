@@ -140,7 +140,9 @@ export async function downloadTtsModel(
 ): Promise<void> {
   if (!isTauri()) return;
   const channel = makeProgressChannel(onProgress);
-  await invoke<void>('download_tts_model', { engine, model, onProgress: channel });
+  // `on_progress`, NOT `onProgress`: the command declares `rename_all = "snake_case"`, so
+  // Tauri looks up the snake_case key and a camelCase one fails with `missing required key`.
+  await invoke<void>('download_tts_model', { engine, model, on_progress: channel });
 }
 
 /**
