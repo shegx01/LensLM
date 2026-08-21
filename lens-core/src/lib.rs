@@ -327,8 +327,7 @@ pub struct LensEngine {
         Arc<std::sync::Mutex<HashMap<String, Arc<tokio_util::sync::CancellationToken>>>>,
     tts_cancel_tokens:
         Arc<std::sync::Mutex<HashMap<String, Arc<tokio_util::sync::CancellationToken>>>>,
-    download_cancel_tokens:
-        Arc<std::sync::Mutex<HashMap<DownloadKey, Arc<tokio_util::sync::CancellationToken>>>>,
+    download_cancel_tokens: Arc<std::sync::Mutex<DownloadRegistry>>,
     tts_sidecar: Arc<RwLock<Option<Arc<dyn tts::TtsSidecar>>>>,
     /// Lazily-built internal LocalWhisper engines, keyed by model id (#42). Mirrors
     /// the embedder cache but lighter — whisper has one active model at a time. The
@@ -1497,16 +1496,18 @@ impl LensEngine {
 
     /// Returns the cancel token for `key`, joining an already-registered download
     /// rather than superseding it: a second caller (e.g. a Settings remount) must
-    /// never cancel a healthy multi-gigabyte transfer already in flight (#37).
+    /// never cancel a healthy multi-gigabyte transfer already in flight (#37). Each
+    /// call counts one holder and MUST be paired with a `download_cancel_guard`.
     pub fn register_download(&self, key: DownloadKey) -> Arc<tokio_util::sync::CancellationToken> {
         let mut map = self
             .download_cancel_tokens
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let token = map
+        let entry = map
             .entry(key)
-            .or_insert_with(|| Arc::new(tokio_util::sync::CancellationToken::new()));
-        Arc::clone(token)
+            .or_insert_with(|| (Arc::new(tokio_util::sync::CancellationToken::new()), 0));
+        entry.1 += 1;
+        Arc::clone(&entry.0)
     }
 
     pub fn cancel_download(&self, key: &DownloadKey) -> bool {
@@ -1515,7 +1516,7 @@ impl LensEngine {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         match map.get(key) {
-            Some(token) => {
+            Some((token, _)) => {
                 token.cancel();
                 true
             }
@@ -1532,9 +1533,14 @@ impl LensEngine {
             .download_cancel_tokens
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if let Some(current) = map.get(key)
-            && Arc::ptr_eq(current, owner)
-        {
+        let last_holder = match map.get_mut(key) {
+            Some(entry) if Arc::ptr_eq(&entry.0, owner) => {
+                entry.1 = entry.1.saturating_sub(1);
+                entry.1 == 0
+            }
+            _ => false,
+        };
+        if last_holder {
             map.remove(key);
         }
     }
@@ -3366,9 +3372,14 @@ pub struct DownloadKey {
     pub id: String,
 }
 
-/// RAII guard clearing a download's cancellation-registry entry on drop. Required,
-/// not optional: a retained entry would hand a later download the previous
-/// (possibly already-cancelled) token, failing it instantly.
+/// Each in-flight download's cancel token, paired with the number of callers that
+/// registered for it (see `register_download`).
+type DownloadRegistry = HashMap<DownloadKey, (Arc<tokio_util::sync::CancellationToken>, usize)>;
+
+/// RAII guard releasing one holder of a download's cancellation-registry entry on
+/// drop, clearing the entry once the last holder is gone. Required, not optional: a
+/// retained entry would hand a later download the previous (possibly already-cancelled)
+/// token, failing it instantly.
 pub struct DownloadCancelGuard {
     engine: LensEngine,
     key: DownloadKey,

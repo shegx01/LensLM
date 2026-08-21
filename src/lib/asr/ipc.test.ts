@@ -119,8 +119,8 @@ describe('downloadWhisperModel', () => {
 });
 
 describe('cancelDownload', () => {
-  // The Rust `DownloadKind` derives rename_all = "snake_case", so `'Whisper'` would
-  // fail at deserialize-time — mockIPC echoes the payload back and cannot catch it.
+  // mockIPC echoes the payload back, so this pins only the shape this module sends;
+  // the serialized Rust form is asserted in lens-core's `download_cancel.rs`.
   it('sends the lowercase kind the Rust enum deserializes', async () => {
     let receivedArgs: unknown;
     mockIPC((cmd, args) => {

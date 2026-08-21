@@ -50,6 +50,7 @@
   const WEDGE_TIMEOUT_MS = 45_000;
   const WEDGE_MESSAGE = 'Download stalled — no response from the server. Try again.';
   const STORAGE_POINTER = 'Free up space in Settings → Storage.';
+  const CANCEL_MISSED = "Couldn't stop it — it may have already finished.";
 
   let models = $state<WhisperModelInfo[]>([]);
   let selected = $state('');
@@ -161,7 +162,10 @@
     const { token } = entry;
     entry.cancelling = true;
     try {
-      await cancelDownload({ kind: 'whisper', id });
+      const stopped = await cancelDownload({ kind: 'whisper', id });
+      if (activeDownloads[id]?.token !== token || stopped) return;
+      entry.cancelling = false;
+      downloadError = CANCEL_MISSED;
     } catch (err) {
       if (activeDownloads[id]?.token !== token) return;
       entry.cancelling = false;

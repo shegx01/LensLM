@@ -90,6 +90,44 @@ async fn guard_drop_clears_the_key_so_a_later_download_gets_a_live_token() {
 }
 
 #[tokio::test]
+async fn a_joiners_guard_keeps_the_cancel_address_alive() {
+    let engine = LensEngine::for_test().await;
+    let k = key(DownloadKind::Tts, "snac");
+
+    let first = engine.register_download(k.clone());
+    let second = engine.register_download(k.clone());
+    let first_guard = engine.download_cancel_guard(k.clone(), first);
+    let second_guard = engine.download_cancel_guard(k.clone(), second);
+
+    drop(first_guard);
+    assert!(
+        engine.cancel_download(&k),
+        "the joiner is still downloading, so evicting on the first finisher's drop leaves \
+         that transfer with no cancel address"
+    );
+
+    drop(second_guard);
+    assert!(
+        !engine.cancel_download(&k),
+        "the last holder's drop must still clear the entry"
+    );
+}
+
+#[test]
+fn the_download_key_serializes_snake_case_both_ways() {
+    for (kind, wire) in [(DownloadKind::Tts, "tts"), (DownloadKind::Whisper, "whisper")] {
+        let expected = key(kind, "small");
+        let json = serde_json::json!({ "kind": wire, "id": "small" });
+        assert_eq!(
+            serde_json::to_value(&expected).expect("serialize"),
+            json,
+            "the frontend sends {wire:?}, so that is what the enum must serialize as"
+        );
+        assert_eq!(serde_json::from_value::<DownloadKey>(json).expect("round-trip"), expected);
+    }
+}
+
+#[tokio::test]
 async fn stale_guard_drop_does_not_evict_a_later_token() {
     let engine = LensEngine::for_test().await;
     let k = key(DownloadKind::Whisper, "base");

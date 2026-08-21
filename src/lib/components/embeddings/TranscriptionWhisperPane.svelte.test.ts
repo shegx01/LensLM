@@ -535,6 +535,30 @@ describe('TranscriptionWhisperPane', () => {
     );
   });
 
+  it('re-enables Cancel and says so when nothing was in flight to stop', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return baseAppConfig();
+      if (cmd === 'list_whisper_models') return MODELS;
+      if (cmd === 'whisper_model_downloaded') return false;
+      if (cmd === 'download_whisper_model') return new Promise(() => {});
+      if (cmd === 'cancel_download') return false;
+    });
+
+    render(TranscriptionWhisperPane, { props: { onPresenceChange: vi.fn() } });
+    await screen.findByRole('radio', { name: 'tiny' });
+
+    const tinyRow = rowFor('tiny');
+    await fireEvent.click(within(tinyRow).getByRole('button', { name: /download tiny/i }));
+    await fireEvent.click(
+      await within(tinyRow).findByRole('button', { name: /cancel tiny download/i })
+    );
+
+    await waitFor(() =>
+      expect(within(tinyRow).getByRole('button', { name: /cancel tiny download/i })).toBeEnabled()
+    );
+    expect(screen.getByRole('alert')).toHaveTextContent(/may have already finished/i);
+  });
+
   it('shows no error banner when a download rejects as Cancelled', async () => {
     mockIPC((cmd) => {
       if (cmd === 'get_config') return baseAppConfig();

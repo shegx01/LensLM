@@ -71,6 +71,7 @@
   let inFlightModel = $state<string | null>(null);
   let cancelling = $state(false);
   const STORAGE_POINTER = 'Free up space in Settings → Storage.';
+  const CANCEL_MISSED = "Couldn't stop it — it may have already finished.";
 
   let voices = $state<TtsVoice[]>([]);
   let maleVoice = $state('');
@@ -261,6 +262,9 @@
         // This is a sequence (orpheus, then snac) and a cancel key names one
         // artifact, so it has to be whichever is streaming right now.
         for (const [i, model] of ids.entries()) {
+          // A superseded run must stop here: continuing would both keep downloading for an
+          // engine the user left and overwrite the live run's `inFlightModel` cancel target.
+          if (gen !== my) return;
           inFlightModel = model;
           await downloadTtsModel(dlId, model, (pct) => {
             if (gen === my)
@@ -310,10 +314,15 @@
   async function handleCancel(): Promise<void> {
     const target = inFlightModel;
     if (target === null || cancelling) return;
+    const my = gen;
     cancelling = true;
     try {
-      await cancelDownload({ kind: 'tts', id: target });
+      const stopped = await cancelDownload({ kind: 'tts', id: target });
+      if (gen !== my || stopped) return;
+      cancelling = false;
+      downloadError = CANCEL_MISSED;
     } catch {
+      if (gen !== my) return;
       cancelling = false;
     }
   }

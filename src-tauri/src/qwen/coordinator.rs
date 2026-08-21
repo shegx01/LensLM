@@ -182,6 +182,10 @@ mod tests {
         })
     }
 
+    fn ample_probe(_: &Path) -> Option<u64> {
+        Some(u64::MAX)
+    }
+
     fn write_stub(dir: &Path, body: &str) -> PathBuf {
         let path = dir.join("stub.py");
         std::fs::write(&path, body).unwrap();
@@ -247,15 +251,17 @@ sys.exit(1)
         let paths = paths_at(&hf);
 
         let (a, b) = tokio::join!(
-            coord.run_single_flight(
+            coord.run_single_flight_with_probe(
                 &paths,
                 counting_resolver(stub.clone(), extra.clone(), count.clone()),
                 |_| {},
+                ample_probe,
             ),
-            coord.run_single_flight(
+            coord.run_single_flight_with_probe(
                 &paths,
                 counting_resolver(stub.clone(), extra.clone(), count.clone()),
                 |_| {},
+                ample_probe,
             ),
         );
         a.expect("first prepare succeeds");
@@ -278,7 +284,7 @@ sys.exit(1)
         let paths = paths_at(&hf);
         let resolver = counting_resolver(stub, vec![], count);
 
-        let run = coord.run_single_flight(&paths, resolver, |_| {});
+        let run = coord.run_single_flight_with_probe(&paths, resolver, |_| {}, ample_probe);
         tokio::pin!(run);
         let result = loop {
             tokio::select! {
@@ -306,20 +312,22 @@ sys.exit(1)
         let paths = paths_at(&hf);
 
         let e1 = coord
-            .run_single_flight(
+            .run_single_flight_with_probe(
                 &paths,
                 counting_resolver(stub.clone(), vec![], count.clone()),
                 |_| {},
+                ample_probe,
             )
             .await
             .expect_err("failing stub errors");
         assert!(matches!(e1, LensError::Tts(_)));
 
         let e2 = coord
-            .run_single_flight(
+            .run_single_flight_with_probe(
                 &paths,
                 counting_resolver(stub, vec![], count.clone()),
                 |_| {},
+                ample_probe,
             )
             .await
             .expect_err("second re-enters (snapshot never completed) and also errors");
@@ -366,6 +374,43 @@ sys.exit(1)
     }
 
     #[tokio::test]
+    async fn a_partial_snapshot_only_demands_the_bytes_still_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hf = tmp.path().join("hf");
+        let snapshot_dir = hf.join("hub").join(QWEN_SNAPSHOT_DIR);
+        std::fs::create_dir_all(snapshot_dir.join("blobs")).unwrap();
+        std::fs::write(snapshot_dir.join("blobs").join("halfway"), vec![7u8; 64 * 1024]).unwrap();
+        let stub = write_stub(tmp.path(), SNAPSHOT_STUB);
+        let count = Arc::new(AtomicUsize::new(0));
+        let extra = vec![hf.to_string_lossy().into_owned(), QWEN_SNAPSHOT_DIR.to_string()];
+        let coord = QwenPrepareCoordinator::new();
+        let paths = paths_at(&hf);
+
+        let on_disk = path_size_bytes(&snapshot_dir).unwrap();
+        assert!(
+            on_disk >= 64 * 1024,
+            "the fixture must be a partially-populated snapshot, not an empty one: {on_disk}"
+        );
+        let just_enough = QWEN_SNAPSHOT_APPROX_BYTES - on_disk + DISK_HEADROOM_BYTES;
+
+        let result = coord
+            .run_single_flight_with_probe(
+                &paths,
+                counting_resolver(stub, extra, count.clone()),
+                |_| {},
+                move |_: &Path| Some(just_enough),
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "the {on_disk} bytes already cached must not be demanded a second time, or a user \
+             who is nearly finished can never finish: {result:?}"
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn present_snapshot_short_circuits_even_with_zero_space_probe() {
         let tmp = tempfile::tempdir().unwrap();
         let hf = tmp.path().join("hf");
@@ -380,10 +425,11 @@ sys.exit(1)
         let paths = paths_at(&hf);
 
         coord
-            .run_single_flight(
+            .run_single_flight_with_probe(
                 &paths,
                 counting_resolver(stub.clone(), extra.clone(), count.clone()),
                 |_| {},
+                ample_probe,
             )
             .await
             .expect("first prepare populates the on-disk snapshot");

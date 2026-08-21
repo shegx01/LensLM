@@ -553,7 +553,7 @@ describe('LocalTtsForm — explicit cancel targets the in-flight artifact of the
     rejectSnac: (err: unknown) => void;
   };
 
-  function mountMidSequence(): SeqRig {
+  function mountMidSequence(opts?: { cancelResult?: boolean }): SeqRig {
     let cancelArgs: unknown = null;
     let rejectSnac: ((err: unknown) => void) | undefined;
     mockIPC((cmd, args) => {
@@ -573,7 +573,7 @@ describe('LocalTtsForm — explicit cancel targets the in-flight artifact of the
       }
       if (cmd === 'cancel_download') {
         cancelArgs = args;
-        return true;
+        return opts?.cancelResult ?? true;
       }
       if (cmd === 'set_config') return null;
     });
@@ -598,6 +598,94 @@ describe('LocalTtsForm — explicit cancel targets the in-flight artifact of the
 
     await waitFor(() => expect(rig.cancelArgs()).not.toBeNull());
     expect(rig.cancelArgs()).toEqual({ key: { kind: 'tts', id: 'snac' } });
+  });
+
+  it('labels the button Cancelling… and disables it while the cancel invoke is in flight', async () => {
+    const rig = mountMidSequence();
+    await startAndReachSnac();
+
+    await fireEvent.click(screen.getByRole('button', { name: /^cancel$/i }));
+
+    await waitFor(() => expect(rig.cancelArgs()).not.toBeNull());
+    expect(screen.getByRole('button', { name: /cancelling/i })).toBeDisabled();
+    expect(screen.queryByRole('button', { name: /^cancel$/i })).not.toBeInTheDocument();
+  });
+
+  it('re-enables Cancel and says so when nothing was in flight to stop', async () => {
+    mountMidSequence({ cancelResult: false });
+    await startAndReachSnac();
+
+    await fireEvent.click(screen.getByRole('button', { name: /^cancel$/i }));
+
+    await waitFor(() =>
+      expect(screen.getByRole('alert')).toHaveTextContent(/may have already finished/i)
+    );
+    expect(screen.getByRole('button', { name: /^cancel$/i })).toBeEnabled();
+  });
+
+  it('renders no Cancel for a download that names no cancellable artifact (Qwen)', async () => {
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return baseAppConfig();
+      if (cmd === 'tts_engine_catalog') return catalogFixture({ qwenAvailable: true });
+      if (cmd === 'tts_model_status') return 'absent';
+      if (cmd === 'prepare_qwen_model') {
+        (args as { onProgress: ProgressChannel }).onProgress.onmessage({
+          received: 1,
+          total: 100,
+          done: false
+        });
+        return new Promise(() => {});
+      }
+    });
+
+    renderLocal('qwen3_local');
+    await fireEvent.click(await screen.findByRole('button', { name: /download voice engine/i }));
+
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: /downloading/i })).toBeInTheDocument()
+    );
+    expect(screen.queryByRole('button', { name: /^cancel$/i })).not.toBeInTheDocument();
+  });
+
+  it('a superseded sequence stops instead of retargeting the live download’s Cancel', async () => {
+    const cat = catalogFixture({ qwenAvailable: true });
+    let resolveOrpheus: (() => void) | undefined;
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return baseAppConfig();
+      if (cmd === 'tts_engine_catalog') return cat;
+      if (cmd === 'tts_model_status') return 'absent';
+      if (cmd === 'download_tts_model') {
+        if ((args as { model: string }).model !== 'orpheus') return new Promise(() => {});
+        return new Promise<null>((res) => {
+          resolveOrpheus = () => res(null);
+        });
+      }
+      if (cmd === 'prepare_qwen_model') {
+        (args as { onProgress: ProgressChannel }).onProgress.onmessage({
+          received: 1,
+          total: 100,
+          done: false
+        });
+        return new Promise(() => {});
+      }
+      if (cmd === 'set_config') return null;
+    });
+
+    const { rerender } = render(LocalTtsForm, {
+      props: { catalog: cat, engine: 'orpheus', active: true }
+    });
+    await fireEvent.click(await screen.findByRole('button', { name: /download voice engine/i }));
+    await waitFor(() => expect(resolveOrpheus).toBeDefined());
+
+    await rerender({ catalog: cat, engine: 'qwen3_local', active: true });
+    await fireEvent.click(await screen.findByRole('button', { name: /download voice engine/i }));
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: /downloading/i })).toBeInTheDocument()
+    );
+
+    resolveOrpheus?.();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(screen.queryByRole('button', { name: /^cancel$/i })).not.toBeInTheDocument();
   });
 
   it('keeps the download control disabled after the cancel click until the invoke settles', async () => {
