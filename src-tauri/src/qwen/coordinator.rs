@@ -9,7 +9,8 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 
 use lens_core::{
-    DISK_HEADROOM_BYTES, DownloadProgress, LensError, available_space_bytes, path_size_bytes,
+    DISK_HEADROOM_BYTES, DownloadProgress, LensError, available_space_bytes, human_bytes,
+    path_size_bytes,
 };
 
 use super::prepare::QWEN_SNAPSHOT_DIR;
@@ -88,7 +89,9 @@ impl QwenPrepareCoordinator {
         match probe(&paths.hf_cache_dir) {
             Some(available) if available < required => {
                 return Err(LensError::InsufficientSpace(format!(
-                    "the Qwen voice model needs {required} bytes of free space but only {available} bytes are available"
+                    "the Qwen voice model needs {} of free space but only {} are available",
+                    human_bytes(required),
+                    human_bytes(available)
                 )));
             }
             Some(_) => {}
