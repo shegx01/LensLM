@@ -80,6 +80,7 @@ pub use config::{
 #[cfg(feature = "test-util")]
 pub use dialogue::{DialogueCtx, generate_dialogue};
 pub use dialogue::{DialoguePhase, DialogueScript, Emotion, Length, OverviewFormat, Speaker, Turn};
+pub use download::available_space_bytes;
 pub use embedder::{
     CountingEmbedder, DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, Embedder, EmbeddingBackend,
     EmbeddingModelSpec, FastembedEmbedder, OllamaEmbedder, REGISTRY, resolve, resolve_opt,
@@ -117,7 +118,7 @@ pub use retrieval::router::{ContextUnit, Provenance, RouterOutput, Tier, tiered_
 #[cfg(feature = "test-util")]
 pub use retrieval::router::RESERVED_OUTPUT;
 pub use retrieval::{HitSource, Reranker, RetrievalHit, hybrid_search};
-pub use storage::StorageStats;
+pub use storage::{StorageStats, path_size_bytes};
 pub use system_check::{
     ALLOWED_EMBEDDING_MODELS, CheckAction, CheckId, CheckResult, CheckStatus, LlmDetection,
     ModelValidation, detect_llm, fastembed_weights_cached, is_allowlisted_embedding_id,

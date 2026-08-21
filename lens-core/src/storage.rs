@@ -146,7 +146,7 @@ fn partition_backend_dir(
 /// Symlinks are never followed — this both prevents cycle-induced infinite
 /// recursion and avoids double-counting a symlinked target. Shared with
 /// relocation/offload accounting (#238).
-pub(crate) fn path_size_bytes(path: &Path) -> Result<u64, LensError> {
+pub fn path_size_bytes(path: &Path) -> Result<u64, LensError> {
     let meta = match std::fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),

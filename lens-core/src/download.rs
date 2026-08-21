@@ -18,6 +18,19 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// (see `llm::LLM_GENERATION_IDLE_TIMEOUT` for the same idiom).
 const IDLE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Free bytes available to an unprivileged writer under `dir`, or `None` when the
+/// filesystem cannot be queried (a missing directory reports `ENOENT`, not zero).
+/// Callers treat `None` as "abstain", never as "no space".
+pub fn available_space_bytes(dir: &Path) -> Option<u64> {
+    match fs4::available_space(dir) {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            tracing::warn!(dir = %dir.display(), error = %e, "free-space probe failed");
+            None
+        }
+    }
+}
+
 /// Reads `Content-Length` from response headers (works for HEAD responses too).
 fn content_length_header(headers: &reqwest::header::HeaderMap) -> Option<u64> {
     headers
