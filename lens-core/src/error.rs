@@ -78,6 +78,12 @@ pub enum LensError {
     /// the caller retries shortly and persists nothing.
     #[error("reindexing: {0}")]
     Reindexing(String),
+
+    /// The target volume lacks the free space an operation needs (issue #37).
+    /// Never retried — the payload names the bytes required vs available so the UI
+    /// can point the user at Storage settings.
+    #[error("insufficient disk space: {0}")]
+    InsufficientSpace(String),
 }
 
 // Manual `From` mappings (NOT `#[from]`): source error types are not `Serialize`
@@ -160,6 +166,7 @@ impl LensError {
             LensError::Cancelled(_) => "Cancelled",
             LensError::Tts(_) => "Tts",
             LensError::Reindexing(_) => "Reindexing",
+            LensError::InsufficientSpace(_) => "InsufficientSpace",
         }
     }
 
@@ -181,7 +188,8 @@ impl LensError {
             | LensError::Transcription(m)
             | LensError::Cancelled(m)
             | LensError::Tts(m)
-            | LensError::Reindexing(m) => m,
+            | LensError::Reindexing(m)
+            | LensError::InsufficientSpace(m) => m,
         }
     }
 }
@@ -267,6 +275,11 @@ mod tests {
                 "Reindexing",
                 "embeddings rebuilding",
             ),
+            (
+                LensError::InsufficientSpace("needs 2 GB, 1 GB free".into()),
+                "InsufficientSpace",
+                "needs 2 GB, 1 GB free",
+            ),
         ];
         for (err, kind, message) in cases {
             let meta = ErrorMeta::from_error(&err, 1);
@@ -294,6 +307,58 @@ mod tests {
         let join_err = handle.await.expect_err("panicked task yields a JoinError");
         assert!(join_err.is_panic());
         assert!(matches!(LensError::from(join_err), LensError::Internal(_)));
+    }
+
+    #[test]
+    fn every_variant_has_a_kind_and_message_mapping() {
+        // Exhaustive, wildcard-free match: a new `LensError` variant breaks THIS
+        // build until its `kind()`/`message()` mapping is added and asserted here.
+        fn expected_kind(err: &LensError) -> &'static str {
+            match err {
+                LensError::Validation(_) => "Validation",
+                LensError::Internal(_) => "Internal",
+                LensError::Io(_) => "Io",
+                LensError::Parse(_) => "Parse",
+                LensError::Model(_) => "Model",
+                LensError::Network(_) => "Network",
+                LensError::Vector(_) => "Vector",
+                LensError::UnsupportedMediaCodec(_) => "UnsupportedMediaCodec",
+                LensError::MediaDecodeFailed(_) => "MediaDecodeFailed",
+                LensError::EmptyAudio(_) => "EmptyAudio",
+                LensError::Transcription(_) => "Transcription",
+                LensError::Cancelled(_) => "Cancelled",
+                LensError::Tts(_) => "Tts",
+                LensError::Reindexing(_) => "Reindexing",
+                LensError::InsufficientSpace(_) => "InsufficientSpace",
+            }
+        }
+
+        let all = [
+            LensError::Validation("m".into()),
+            LensError::Internal("m".into()),
+            LensError::Io("m".into()),
+            LensError::Parse("m".into()),
+            LensError::Model("m".into()),
+            LensError::Network("m".into()),
+            LensError::Vector("m".into()),
+            LensError::UnsupportedMediaCodec("m".into()),
+            LensError::MediaDecodeFailed("m".into()),
+            LensError::EmptyAudio("m".into()),
+            LensError::Transcription("m".into()),
+            LensError::Cancelled("m".into()),
+            LensError::Tts("m".into()),
+            LensError::Reindexing("m".into()),
+            LensError::InsufficientSpace("m".into()),
+        ];
+        assert_eq!(all.len(), 15, "add the new variant to `all` too");
+
+        for err in &all {
+            assert_eq!(err.kind(), expected_kind(err));
+            assert_eq!(err.message(), "m");
+            let wire = serde_json::to_value(err).unwrap();
+            assert_eq!(wire["kind"], err.kind());
+            assert_eq!(wire["message"], err.message());
+        }
     }
 
     #[test]
