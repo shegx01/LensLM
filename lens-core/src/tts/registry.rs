@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use tokio_util::sync::CancellationToken;
+
 use crate::LensError;
 use crate::tts::DownloadProgress;
 use crate::tts::orpheus::{
@@ -76,7 +78,14 @@ where
     let spec = resolve_tts(id)
         .ok_or_else(|| LensError::Validation(format!("unknown TTS model id: {id:?}")))?;
     let dest = cache_root.join(spec.relpath);
-    crate::download::download_verified(spec.url, &dest, Some(spec.sha256), on_progress).await?;
+    crate::download::download_verified(
+        spec.url,
+        &dest,
+        Some(spec.sha256),
+        &CancellationToken::new(),
+        on_progress,
+    )
+    .await?;
     Ok(dest)
 }
 
@@ -211,9 +220,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dest = tts_model_path(dir.path(), "orpheus").unwrap();
         let mut events = Vec::new();
-        crate::download::download_verified(&server.uri(), &dest, Some(&expected), |p| {
-            events.push(p)
-        })
+        crate::download::download_verified(
+            &server.uri(),
+            &dest,
+            Some(&expected),
+            &CancellationToken::new(),
+            |p| events.push(p),
+        )
         .await
         .unwrap();
 

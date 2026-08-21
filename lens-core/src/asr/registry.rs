@@ -8,6 +8,8 @@
 
 use std::path::{Path, PathBuf};
 
+use tokio_util::sync::CancellationToken;
+
 use crate::LensError;
 use crate::tts::DownloadProgress;
 
@@ -95,7 +97,14 @@ where
         ))
     })?;
     let dest = whisper_model_path(cache_root, model_id);
-    crate::download::download_verified(spec.url, &dest, Some(spec.sha256), on_progress).await?;
+    crate::download::download_verified(
+        spec.url,
+        &dest,
+        Some(spec.sha256),
+        &CancellationToken::new(),
+        on_progress,
+    )
+    .await?;
     Ok(dest)
 }
 
@@ -220,7 +229,13 @@ mod tests {
         let dest = whisper_model_path(dir.path(), "base");
 
         let mut events = Vec::new();
-        crate::download::download_verified(&server.uri(), &dest, None, |p| events.push(p))
+        crate::download::download_verified(
+            &server.uri(),
+            &dest,
+            None,
+            &CancellationToken::new(),
+            |p| events.push(p),
+        )
             .await
             .unwrap();
 
@@ -252,7 +267,13 @@ mod tests {
         std::fs::write(&dest, &body).unwrap();
 
         let mut events = Vec::new();
-        crate::download::download_verified(&server.uri(), &dest, None, |p| events.push(p))
+        crate::download::download_verified(
+            &server.uri(),
+            &dest,
+            None,
+            &CancellationToken::new(),
+            |p| events.push(p),
+        )
             .await
             .unwrap();
 
@@ -279,7 +300,13 @@ mod tests {
         let dest = whisper_model_path(dir.path(), "base");
 
         let err =
-            crate::download::download_verified(&server.uri(), &dest, Some(&wrong_hash), |_| {})
+            crate::download::download_verified(
+            &server.uri(),
+            &dest,
+            Some(&wrong_hash),
+            &CancellationToken::new(),
+            |_| {},
+        )
                 .await
                 .unwrap_err();
 
@@ -309,7 +336,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dest = whisper_model_path(dir.path(), "base");
 
-        let err = crate::download::download_verified(&server.uri(), &dest, None, |_| {})
+        let err = crate::download::download_verified(
+            &server.uri(),
+            &dest,
+            None,
+            &CancellationToken::new(),
+            |_| {},
+        )
             .await
             .unwrap_err();
         assert!(matches!(err, LensError::Network(_)));
@@ -349,7 +382,13 @@ mod tests {
             .mount(&server)
             .await;
 
-        crate::download::download_verified(&server.uri(), &dest, Some(&expected_hash), |_| {})
+        crate::download::download_verified(
+            &server.uri(),
+            &dest,
+            Some(&expected_hash),
+            &CancellationToken::new(),
+            |_| {},
+        )
             .await
             .unwrap();
 
