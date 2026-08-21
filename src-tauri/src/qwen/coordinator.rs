@@ -379,10 +379,17 @@ sys.exit(1)
         let hf = tmp.path().join("hf");
         let snapshot_dir = hf.join("hub").join(QWEN_SNAPSHOT_DIR);
         std::fs::create_dir_all(snapshot_dir.join("blobs")).unwrap();
-        std::fs::write(snapshot_dir.join("blobs").join("halfway"), vec![7u8; 64 * 1024]).unwrap();
+        std::fs::write(
+            snapshot_dir.join("blobs").join("halfway"),
+            vec![7u8; 64 * 1024],
+        )
+        .unwrap();
         let stub = write_stub(tmp.path(), SNAPSHOT_STUB);
         let count = Arc::new(AtomicUsize::new(0));
-        let extra = vec![hf.to_string_lossy().into_owned(), QWEN_SNAPSHOT_DIR.to_string()];
+        let extra = vec![
+            hf.to_string_lossy().into_owned(),
+            QWEN_SNAPSHOT_DIR.to_string(),
+        ];
         let coord = QwenPrepareCoordinator::new();
         let paths = paths_at(&hf);
 

@@ -115,7 +115,10 @@ async fn a_joiners_guard_keeps_the_cancel_address_alive() {
 
 #[test]
 fn the_download_key_serializes_snake_case_both_ways() {
-    for (kind, wire) in [(DownloadKind::Tts, "tts"), (DownloadKind::Whisper, "whisper")] {
+    for (kind, wire) in [
+        (DownloadKind::Tts, "tts"),
+        (DownloadKind::Whisper, "whisper"),
+    ] {
         let expected = key(kind, "small");
         let json = serde_json::json!({ "kind": wire, "id": "small" });
         assert_eq!(
@@ -123,7 +126,10 @@ fn the_download_key_serializes_snake_case_both_ways() {
             json,
             "the frontend sends {wire:?}, so that is what the enum must serialize as"
         );
-        assert_eq!(serde_json::from_value::<DownloadKey>(json).expect("round-trip"), expected);
+        assert_eq!(
+            serde_json::from_value::<DownloadKey>(json).expect("round-trip"),
+            expected
+        );
     }
 }
 
