@@ -84,6 +84,12 @@ pub enum LensError {
     /// can point the user at Storage settings.
     #[error("insufficient disk space: {0}")]
     InsufficientSpace(String),
+
+    /// A downloaded artifact's SHA256 did not match the pinned digest (issue #37).
+    /// Never retried, and distinct from `Network` so the UI can say "corrupt, not
+    /// flaky" instead of offering a retry that cannot succeed.
+    #[error("integrity check failed: {0}")]
+    IntegrityCheckFailed(String),
 }
 
 // Manual `From` mappings (NOT `#[from]`): source error types are not `Serialize`
@@ -167,6 +173,7 @@ impl LensError {
             LensError::Tts(_) => "Tts",
             LensError::Reindexing(_) => "Reindexing",
             LensError::InsufficientSpace(_) => "InsufficientSpace",
+            LensError::IntegrityCheckFailed(_) => "IntegrityCheckFailed",
         }
     }
 
@@ -189,7 +196,8 @@ impl LensError {
             | LensError::Cancelled(m)
             | LensError::Tts(m)
             | LensError::Reindexing(m)
-            | LensError::InsufficientSpace(m) => m,
+            | LensError::InsufficientSpace(m)
+            | LensError::IntegrityCheckFailed(m) => m,
         }
     }
 }
@@ -280,6 +288,11 @@ mod tests {
                 "InsufficientSpace",
                 "needs 2 GB, 1 GB free",
             ),
+            (
+                LensError::IntegrityCheckFailed("sha256 mismatch".into()),
+                "IntegrityCheckFailed",
+                "sha256 mismatch",
+            ),
         ];
         for (err, kind, message) in cases {
             let meta = ErrorMeta::from_error(&err, 1);
@@ -331,6 +344,7 @@ mod tests {
                 LensError::Tts(_) => "Tts",
                 LensError::Reindexing(_) => "Reindexing",
                 LensError::InsufficientSpace(_) => "InsufficientSpace",
+                LensError::IntegrityCheckFailed(_) => "IntegrityCheckFailed",
             }
         }
 
@@ -350,6 +364,7 @@ mod tests {
             LensError::Tts("m".into()),
             LensError::Reindexing("m".into()),
             LensError::InsufficientSpace("m".into()),
+            LensError::IntegrityCheckFailed("m".into()),
         ];
         for err in &all {
             assert_eq!(err.kind(), expected_kind(err));

@@ -305,8 +305,8 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            matches!(err, LensError::Network(_)),
-            "expected Network error, got {err:?}"
+            matches!(err, LensError::IntegrityCheckFailed(_)),
+            "expected IntegrityCheckFailed, got {err:?}"
         );
         assert!(!dest.exists(), "dest must not exist on mismatch");
         assert!(

@@ -551,9 +551,9 @@ where
             } else {
                 ""
             };
-            return Err(AttemptFailure::Fatal(LensError::Network(format!(
-                "downloaded file failed integrity check: expected sha256 {expected}, got {actual}.{hint}"
-            ))));
+            return Err(AttemptFailure::Fatal(LensError::IntegrityCheckFailed(
+                format!("expected sha256 {expected}, got {actual}.{hint}"),
+            )));
         }
     }
 
@@ -1353,8 +1353,8 @@ mod tests {
         let (result, _) = run(&server.uri(), &dest, Some(&wrong), &cancel, policy()).await;
 
         assert!(
-            matches!(result, Err(LensError::Network(_))),
-            "got {result:?}"
+            matches!(result, Err(LensError::IntegrityCheckFailed(_))),
+            "a corrupt artifact must be distinguishable from a flaky network, got {result:?}"
         );
         assert!(!dest.exists());
         assert!(!dest.with_extension("part").exists());
