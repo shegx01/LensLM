@@ -29,9 +29,10 @@ jobs:
       - name: Run cargo-deny
         uses: EmbarkStudios/cargo-deny-action@v2
         env:
-          # Stops rustup honouring rust-toolchain.toml and printing a fatal-looking
-          # "override toolchain ... is not installed" line above the real failure.
-          RUSTUP_TOOLCHAIN: stable
+          # Must name the toolchain already in the action's container so its
+          # `rustup show || rustup toolchain install` probe stops printing a
+          # fatal-looking "not installed" line above the real failure.
+          RUSTUP_TOOLCHAIN: 1.85.0
         with:
           # Policy (incl. all-features) lives in deny.toml at the repo root.
           command: check
