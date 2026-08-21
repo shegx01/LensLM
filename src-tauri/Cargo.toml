@@ -48,9 +48,6 @@ async-trait = "0.1"
 futures = "0.3"
 # Unique offscreen render-window labels (`lens-render-<uuid>`); v7 for time-order.
 uuid = { workspace = true }
-# Free-space probe for the Qwen prepare disk pre-flight (#37).
-fs4 = { workspace = true }
-
 # macOS: used ONLY by the inactive `OnscreenAlphaZero` render fallback (#78), which
 # sets the render window's native NSWindow alphaValue to 0 (a public AppKit API; no
 # `macos-private-api` needed). The production path is `Offscreen` (off-screen +
