@@ -346,10 +346,14 @@ mod tests {
     #[tokio::test]
     async fn download_whisper_model_unknown_id_is_validation_error() {
         let dir = tempfile::tempdir().unwrap();
-        let err =
-            download_whisper_model(dir.path(), "does-not-exist", &CancellationToken::new(), |_| {})
-                .await
-                .unwrap_err();
+        let err = download_whisper_model(
+            dir.path(),
+            "does-not-exist",
+            &CancellationToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(err, LensError::Validation(_)),
             "expected Validation, got {err:?}"
