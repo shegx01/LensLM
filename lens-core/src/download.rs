@@ -1140,10 +1140,15 @@ mod tests {
         let (_dir, dest) = scratch();
         seed_part(&dest, &[0xFFu8; 1024]);
         let cancel = CancellationToken::new();
-        let (result, _) = run(&server.uri(), &dest, Some(&expected), &cancel, policy()).await;
+        let (result, events) = run(&server.uri(), &dest, Some(&expected), &cancel, policy()).await;
 
         assert!(result.is_ok(), "got {result:?}");
         assert_eq!(std::fs::read(&dest).unwrap(), body);
+        assert!(
+            !events.iter().any(|e| e.received == 0),
+            "only an attempt start reports zero bytes, so a second one means the stale \
+             partial burned a retry instead of being refetched in place: {events:?}"
+        );
     }
 
     #[tokio::test]
