@@ -474,4 +474,123 @@ describe('LocalTtsForm — cancellation is not surfaced as a download failure', 
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     expect(screen.queryByText(/download failed/i)).not.toBeInTheDocument();
   });
+
+  it('a Cancelled error from download_tts_model resets to idle without an error alert', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return baseAppConfig();
+      if (cmd === 'tts_engine_catalog') return catalogFixture();
+      if (cmd === 'tts_model_status') return 'absent';
+      if (cmd === 'download_tts_model') {
+        throw { kind: 'Cancelled', message: 'download cancelled: orpheus' };
+      }
+    });
+
+    renderLocal('orpheus');
+    await fireEvent.click(await screen.findByRole('button', { name: /download voice engine/i }));
+
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: /download voice engine/i })).toBeEnabled()
+    );
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.queryByText(/download failed/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/cancelled/i)).not.toBeInTheDocument();
+  });
+});
+
+describe('LocalTtsForm — InsufficientSpace (DEC-11)', () => {
+  it('renders the IPC LensError message plus the Storage-settings pointer, not the generic fallback', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return baseAppConfig();
+      if (cmd === 'tts_engine_catalog') return catalogFixture();
+      if (cmd === 'tts_model_status') return 'absent';
+      if (cmd === 'download_tts_model') {
+        throw {
+          kind: 'InsufficientSpace',
+          message: 'Not enough disk space: 2.4 GB needed, 512 MB available.'
+        };
+      }
+    });
+
+    renderLocal('orpheus');
+    await fireEvent.click(await screen.findByRole('button', { name: /download voice engine/i }));
+
+    const alert = await waitFor(() => screen.getByRole('alert'));
+    expect(alert).toHaveTextContent('2.4 GB needed, 512 MB available.');
+    expect(alert).toHaveTextContent(/Settings → Storage/);
+    expect(screen.queryByText(/^Download failed\.$/)).not.toBeInTheDocument();
+  });
+});
+
+describe('LocalTtsForm — explicit cancel targets the in-flight artifact of the sequence', () => {
+  type SeqRig = {
+    cancelArgs: () => unknown;
+    rejectSnac: (err: unknown) => void;
+  };
+
+  function mountMidSequence(): SeqRig {
+    let cancelArgs: unknown = null;
+    let rejectSnac: ((err: unknown) => void) | undefined;
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return baseAppConfig();
+      if (cmd === 'tts_engine_catalog') return catalogFixture();
+      if (cmd === 'tts_model_status') return 'absent';
+      if (cmd === 'download_tts_model') {
+        const a = args as { model: string; on_progress: ProgressChannel };
+        if (a.model === 'orpheus') {
+          a.on_progress.onmessage({ received: 100, total: 100, done: true });
+          return null;
+        }
+        a.on_progress.onmessage({ received: 10, total: 100, done: false });
+        return new Promise<null>((_res, rej) => {
+          rejectSnac = rej;
+        });
+      }
+      if (cmd === 'cancel_download') {
+        cancelArgs = args;
+        return true;
+      }
+      if (cmd === 'set_config') return null;
+    });
+
+    renderLocal('orpheus');
+    return {
+      cancelArgs: () => cancelArgs,
+      rejectSnac: (err) => rejectSnac?.(err)
+    };
+  }
+
+  async function startAndReachSnac(): Promise<void> {
+    await fireEvent.click(await screen.findByRole('button', { name: /download voice engine/i }));
+    await waitFor(() => expect(screen.getByText(/55% downloaded/)).toBeInTheDocument());
+  }
+
+  it('sends cancel_download with the exact { key: { kind: "tts", id: "snac" } } payload', async () => {
+    const rig = mountMidSequence();
+    await startAndReachSnac();
+
+    await fireEvent.click(screen.getByRole('button', { name: /^cancel$/i }));
+
+    await waitFor(() => expect(rig.cancelArgs()).not.toBeNull());
+    expect(rig.cancelArgs()).toEqual({ key: { kind: 'tts', id: 'snac' } });
+  });
+
+  it('keeps the download control disabled after the cancel click until the invoke settles', async () => {
+    const rig = mountMidSequence();
+    await startAndReachSnac();
+
+    await fireEvent.click(screen.getByRole('button', { name: /^cancel$/i }));
+    await waitFor(() => expect(rig.cancelArgs()).not.toBeNull());
+
+    expect(screen.getByRole('button', { name: /downloading/i })).toBeDisabled();
+    expect(
+      screen.queryByRole('button', { name: /download voice engine/i })
+    ).not.toBeInTheDocument();
+
+    rig.rejectSnac({ kind: 'Cancelled', message: 'download cancelled: snac' });
+
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: /download voice engine/i })).toBeEnabled()
+    );
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
 });
