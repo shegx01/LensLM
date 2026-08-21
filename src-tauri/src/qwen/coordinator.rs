@@ -8,7 +8,9 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 
-use lens_core::{DownloadProgress, LensError, available_space_bytes, path_size_bytes};
+use lens_core::{
+    DISK_HEADROOM_BYTES, DownloadProgress, LensError, available_space_bytes, path_size_bytes,
+};
 
 use super::prepare::QWEN_SNAPSHOT_DIR;
 use super::{SidecarPaths, SpawnResolver, qwen_snapshot_present, run_prepare};
@@ -16,8 +18,6 @@ use super::{SidecarPaths, SpawnResolver, qwen_snapshot_present, run_prepare};
 /// The `~4.5 GB` snapshot size `system.rs` documents; no fetcher here exposes a
 /// real `Content-Length` to probe instead.
 const QWEN_SNAPSHOT_APPROX_BYTES: u64 = 4_500_000_000;
-
-const DISK_HEADROOM_BYTES: u64 = 256 * 1024 * 1024;
 
 pub struct QwenPrepareCoordinator {
     /// Serializes prepares: a second caller blocks here until the first finishes.

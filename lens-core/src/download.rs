@@ -22,7 +22,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// error surfaces.
 const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-const DISK_HEADROOM_BYTES: u64 = 256 * 1024 * 1024;
+pub const DISK_HEADROOM_BYTES: u64 = 256 * 1024 * 1024;
 
 const MID_STREAM_CHECK_INTERVAL: u64 = 64 * 1024 * 1024;
 

@@ -80,7 +80,7 @@ pub use config::{
 #[cfg(feature = "test-util")]
 pub use dialogue::{DialogueCtx, generate_dialogue};
 pub use dialogue::{DialoguePhase, DialogueScript, Emotion, Length, OverviewFormat, Speaker, Turn};
-pub use download::available_space_bytes;
+pub use download::{DISK_HEADROOM_BYTES, available_space_bytes};
 pub use embedder::{
     CountingEmbedder, DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, Embedder, EmbeddingBackend,
     EmbeddingModelSpec, FastembedEmbedder, OllamaEmbedder, REGISTRY, resolve, resolve_opt,
