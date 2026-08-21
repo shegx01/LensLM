@@ -624,7 +624,7 @@ fn mid_stream_space_error(
     // on foreign consumption; the floor keeps the guard armed where there is no remainder
     // to defend — an unknown length, or a body that outran the one it advertised.
     let required = match total {
-        Some(total) if received < total => total - received,
+        Some(total) if received <= total => total - received,
         _ => ctx.policy.mid_stream_floor,
     };
     (available < required).then(|| {
@@ -753,6 +753,38 @@ mod tests {
     /// Serves HEAD with the full length, truncates the first GET's body mid-stream
     /// (a real `IncompleteMessage`, which wiremock cannot express), and answers later
     /// GETs with a 206 from the requested offset. Returns the base URL + request log.
+    /// Serves the body with **no** `Content-Length` and no chunked framing, so hyper
+    /// terminates on connection close and `total` stays `None` — the one shape wiremock
+    /// cannot express, and the only way to reach the mid-stream guard's floor arm.
+    async fn lengthless_body_server(body: Vec<u8>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let Ok(read) = socket.read(&mut buf).await else {
+                    continue;
+                };
+                if read == 0 {
+                    continue;
+                }
+                // No length on the HEAD either, so the pre-flight abstains and the
+                // mid-stream guard is the only thing left defending the disk.
+                let is_head = String::from_utf8_lossy(&buf[..read])
+                    .to_ascii_lowercase()
+                    .starts_with("head");
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nconnection: close\r\n\r\n")
+                    .await;
+                if !is_head {
+                    let _ = socket.write_all(&body).await;
+                }
+                let _ = socket.shutdown().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
     async fn truncating_then_resuming_server(body: Vec<u8>) -> (String, Arc<Mutex<Vec<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1520,13 +1552,9 @@ mod tests {
 
     #[tokio::test]
     async fn header_less_mid_stream_check_defends_the_floor() {
-        let body = vec![1u8; 4096];
-        let server = MockServer::start().await;
-        mount_failing_head(&server).await;
-        Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
-            .mount(&server)
-            .await;
+        // wiremock always sets `Content-Length`, which would give the guard a real
+        // remainder and never reach the floor arm this test is named for.
+        let uri = lengthless_body_server(vec![1u8; 4096]).await;
 
         let (_dir, dest) = scratch();
         let cancel = CancellationToken::new();
@@ -1536,7 +1564,7 @@ mod tests {
             mid_stream_floor: 1024,
             ..policy()
         };
-        let (result, _) = run(&server.uri(), &dest, None, &cancel, starved).await;
+        let (result, _) = run(&uri, &dest, None, &cancel, starved).await;
 
         assert!(
             matches!(result, Err(LensError::InsufficientSpace(_))),
@@ -1729,12 +1757,17 @@ mod tests {
         };
 
         assert!(
-            mid_stream_space_error(&starved, Some(1024), 1024).is_some(),
-            "a fully-received body must not leave the guard permanently disarmed"
+            mid_stream_space_error(&starved, Some(1024), 1025).is_some(),
+            "a body that outran its advertised length must fall back to the floor"
         );
         assert!(
             mid_stream_space_error(&starved, None, 0).is_some(),
             "an unknown length must fall back to the floor"
+        );
+        assert!(
+            mid_stream_space_error(&starved, Some(1024), 1024).is_none(),
+            "a fully-received body has nothing left to write, so the floor must not \
+             fail a download whose bytes are already on disk"
         );
 
         let exact = AttemptCtx {
@@ -1746,7 +1779,7 @@ mod tests {
             ..starved
         };
         assert!(
-            mid_stream_space_error(&exact, Some(1024), 1024).is_none(),
+            mid_stream_space_error(&exact, Some(1024), 1025).is_none(),
             "an exactly-met floor must not fire"
         );
     }
@@ -1792,7 +1825,11 @@ mod tests {
             "8 MiB are still needed and 308 MiB are free: a floor-driven abort here kills a \
              download the pre-flight approved, after the bandwidth is spent and with no retry"
         );
-        assert_eq!(calls.load(Ordering::SeqCst), 2, "both guards must have probed");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "both guards must have probed"
+        );
     }
 
     #[tokio::test]
