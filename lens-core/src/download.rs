@@ -147,6 +147,16 @@ fn finalize(tmp: &Path, dest: &Path) -> Result<(), AttemptFailure> {
     })
 }
 
+/// On macOS this is `F_FULLFSYNC` — a whole-device barrier, not a per-file flush — so on a
+/// 2 GB artifact it can park its thread for seconds. Off the worker so it stays an await
+/// point and the caller's cancel arm can still fire while the barrier drains.
+async fn sync_all_blocking(file: std::fs::File) -> Result<(), std::io::Error> {
+    match tokio::task::spawn_blocking(move || file.sync_all()).await {
+        Ok(result) => result,
+        Err(join) => Err(std::io::Error::other(join)),
+    }
+}
+
 /// Streamed in fixed-size reads on a blocking thread so a multi-gigabyte artifact
 /// neither allocates its own size nor stalls a tokio worker.
 async fn sha256_file(path: &Path) -> Result<String, LensError> {
@@ -452,8 +462,9 @@ where
     // `sync_all` before the digest is what makes the hash cover DURABLE bytes: a
     // digest read back through the page cache would still let a crash between the
     // rename and writeback publish a file whose blocks never landed.
-    file.sync_all().map_err(|e| map_write_error(&e, ctx.tmp))?;
-    drop(file);
+    sync_all_blocking(file)
+        .await
+        .map_err(|e| map_write_error(&e, ctx.tmp))?;
 
     if let Some(expected) = ctx.expected_sha256 {
         let actual = sha256_file(ctx.tmp)
