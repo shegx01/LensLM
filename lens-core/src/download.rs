@@ -1,9 +1,4 @@
 //! Shared streaming downloader for the TTS and Whisper model artifacts.
-//!
-//! One place owns the whole hardening story: a free-space pre-flight, a bounded
-//! retry loop that resumes an interrupted transfer via HTTP `Range`, cooperative
-//! cancellation, and a SHA256 taken from the finished `.part` on disk immediately
-//! before the atomic rename.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -23,7 +18,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Idle read timeout: resets on each received chunk rather than bounding the whole
 /// request, so a large legitimate download never expires but a stalled body does.
-/// `MAX_ATTEMPTS` of these plus the backoffs is the ~96 s worst case before an error surfaces.
+/// `MAX_ATTEMPTS` of these plus the backoffs is the ~96 s worst case before an
+/// error surfaces.
 const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 const DISK_HEADROOM_BYTES: u64 = 256 * 1024 * 1024;
@@ -82,7 +78,8 @@ pub fn available_space_bytes(dir: &Path) -> Option<u64> {
 
 /// Per-`.part` write locks, keyed on the `.part` path — the resource actually shared —
 /// so different artifacts still download in parallel. Callers must re-check the
-/// finished-file skip after acquiring: a predecessor may have completed while they queued.
+/// finished-file skip after acquiring: a predecessor may have finished while
+/// they queued.
 fn part_write_lock(part: &Path) -> Arc<AsyncMutex<()>> {
     static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<AsyncMutex<()>>>>> = OnceLock::new();
     let mut map = LOCKS
@@ -119,13 +116,13 @@ fn cancelled() -> LensError {
     LensError::Cancelled("download cancelled".into())
 }
 
-/// A failed attempt, tagged with whether the retry loop may try again.
 enum AttemptFailure {
     Retryable(LensError),
     Fatal(LensError),
 }
 
-/// Classifies a `.part` write failure: a full disk is fatal, anything else retryable.
+/// The raw `ENOSPC` check backs up `StorageFull`, which is only std's *mapping* of it and
+/// is lost whenever an error reaches us through a layer that preserved just the errno.
 fn map_write_error(err: &std::io::Error, tmp: &Path) -> AttemptFailure {
     if err.kind() == std::io::ErrorKind::StorageFull || err.raw_os_error() == Some(28) {
         return AttemptFailure::Fatal(LensError::InsufficientSpace(
@@ -150,8 +147,8 @@ fn finalize(tmp: &Path, dest: &Path) -> Result<(), AttemptFailure> {
     })
 }
 
-/// SHA256 of `path`, streamed in fixed-size reads on a blocking thread so a
-/// multi-gigabyte artifact neither allocates its own size nor stalls a tokio worker.
+/// Streamed in fixed-size reads on a blocking thread so a multi-gigabyte artifact
+/// neither allocates its own size nor stalls a tokio worker.
 async fn sha256_file(path: &Path) -> Result<String, LensError> {
     let owned = path.to_path_buf();
     let digest = tokio::task::spawn_blocking(move || {
@@ -185,12 +182,11 @@ struct AttemptCtx<'a> {
 
 /// Streams `url` into `dest` with progress reporting and SHA256 verification.
 ///
-/// Flow: HEAD probe for the expected length, one writer per `.part` path, then up to
-/// [`MAX_ATTEMPTS`] attempts that resume via `Range`; each attempt SHA256s the finished
-/// `.part` read back from disk before the atomic rename, so integrity is enforced on
-/// every published file — including one an earlier attempt left complete.
-/// `expected_sha256 = None` skips verification (tests only). `cancel` aborts at any
-/// await and retains the `.part` so a later call resumes it.
+/// Up to [`MAX_ATTEMPTS`] attempts resume via `Range`, each hashing the finished `.part`
+/// from disk before the rename; `None` skips hashing (tests only). A pre-existing `dest`
+/// of the expected length is trusted on size alone — the hash guards only the
+/// files we rename.
+/// `cancel` aborts at any await and retains the `.part` so a later call resumes it.
 pub(crate) async fn download_verified<F>(
     url: &str,
     dest: &Path,
@@ -308,7 +304,7 @@ where
     }
 }
 
-/// One attempt. Emits a progress tick before any network work so a caller's stall
+/// Emits a progress tick before any network work so a caller's stall
 /// watchdog re-arms across a retry that has not yet produced a byte.
 async fn download_attempt<F>(
     ctx: &AttemptCtx<'_>,
@@ -475,8 +471,7 @@ where
     Ok(())
 }
 
-/// Whether a `.part` that already reached the expected length verifies. An absent
-/// `expected_sha256` has nothing to check, so it counts as a match.
+/// An absent `expected_sha256` has nothing to check, so it counts as a match.
 async fn complete_part_matches(ctx: &AttemptCtx<'_>) -> Result<bool, LensError> {
     match ctx.expected_sha256 {
         None => Ok(true),
@@ -707,8 +702,6 @@ mod tests {
         (format!("http://{addr}"), log)
     }
 
-    // ── cancellation ──────────────────────────────────────────────────────────
-
     #[tokio::test]
     async fn cancel_mid_stream_returns_cancelled_and_retains_the_partial() {
         let body = vec![5u8; 64 * 1024];
@@ -847,8 +840,6 @@ mod tests {
             "the hoisted HEAD must be cancellable well inside its 5 s delay; took {elapsed:?}"
         );
     }
-
-    // ── retry + resume ────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn transient_stream_error_preserves_the_partial_and_the_retry_sends_range() {
@@ -1195,8 +1186,6 @@ mod tests {
         assert!(!dest.with_extension("part").exists());
     }
 
-    // ── disk-space guards ─────────────────────────────────────────────────────
-
     #[test]
     fn available_space_probes_a_real_directory_and_abstains_on_a_missing_one() {
         let dir = tempfile::tempdir().unwrap();
@@ -1417,8 +1406,6 @@ mod tests {
         );
         assert_eq!(std::fs::read(&dest).unwrap(), body);
     }
-
-    // ── single writer per .part ───────────────────────────────────────────────
 
     #[tokio::test]
     async fn concurrent_downloads_of_one_artifact_issue_a_single_get() {
