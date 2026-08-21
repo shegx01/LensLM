@@ -86,6 +86,7 @@ pub fn whisper_model_downloaded(cache_root: &Path, model_id: &str) -> bool {
 pub async fn download_whisper_model<F>(
     cache_root: &Path,
     model_id: &str,
+    cancel: &CancellationToken,
     on_progress: F,
 ) -> Result<PathBuf, LensError>
 where
@@ -97,14 +98,8 @@ where
         ))
     })?;
     let dest = whisper_model_path(cache_root, model_id);
-    crate::download::download_verified(
-        spec.url,
-        &dest,
-        Some(spec.sha256),
-        &CancellationToken::new(),
-        on_progress,
-    )
-    .await?;
+    crate::download::download_verified(spec.url, &dest, Some(spec.sha256), cancel, on_progress)
+        .await?;
     Ok(dest)
 }
 
@@ -351,9 +346,10 @@ mod tests {
     #[tokio::test]
     async fn download_whisper_model_unknown_id_is_validation_error() {
         let dir = tempfile::tempdir().unwrap();
-        let err = download_whisper_model(dir.path(), "does-not-exist", |_| {})
-            .await
-            .unwrap_err();
+        let err =
+            download_whisper_model(dir.path(), "does-not-exist", &CancellationToken::new(), |_| {})
+                .await
+                .unwrap_err();
         assert!(
             matches!(err, LensError::Validation(_)),
             "expected Validation, got {err:?}"

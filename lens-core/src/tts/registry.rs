@@ -70,6 +70,7 @@ pub fn tts_model_file_present(cache_root: &Path, id: &str) -> bool {
 pub async fn download_tts_model<F>(
     cache_root: &Path,
     id: &str,
+    cancel: &CancellationToken,
     on_progress: F,
 ) -> Result<PathBuf, LensError>
 where
@@ -78,14 +79,8 @@ where
     let spec = resolve_tts(id)
         .ok_or_else(|| LensError::Validation(format!("unknown TTS model id: {id:?}")))?;
     let dest = cache_root.join(spec.relpath);
-    crate::download::download_verified(
-        spec.url,
-        &dest,
-        Some(spec.sha256),
-        &CancellationToken::new(),
-        on_progress,
-    )
-    .await?;
+    crate::download::download_verified(spec.url, &dest, Some(spec.sha256), cancel, on_progress)
+        .await?;
     Ok(dest)
 }
 
@@ -197,7 +192,7 @@ mod tests {
     #[tokio::test]
     async fn download_unknown_id_is_validation_error() {
         let dir = tempfile::tempdir().unwrap();
-        let err = download_tts_model(dir.path(), "nope", |_| {})
+        let err = download_tts_model(dir.path(), "nope", &CancellationToken::new(), |_| {})
             .await
             .unwrap_err();
         assert!(matches!(err, LensError::Validation(_)), "got {err:?}");

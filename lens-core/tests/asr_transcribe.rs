@@ -154,9 +154,14 @@ async fn transcribe_apple_fallback_reports_local_whisper_fallback() {
     }
 
     let cache = tempfile::tempdir().expect("tempdir");
-    download_whisper_model(cache.path(), DEFAULT_WHISPER_MODEL_ID, |_| {})
-        .await
-        .expect("download the default whisper model");
+    download_whisper_model(
+        cache.path(),
+        DEFAULT_WHISPER_MODEL_ID,
+        &tokio_util::sync::CancellationToken::new(),
+        |_| {},
+    )
+    .await
+    .expect("download the default whisper model");
 
     let engine = LensEngine::for_test().await;
     let mut config = engine.config().await;
