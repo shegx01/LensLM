@@ -37,14 +37,24 @@ async fn captures_events_from_spawn_blocking() {
     );
 }
 
+/// Self-contained on purpose: keying off another test's needle is vacuous under
+/// nextest, which runs each test in its own process.
 #[tokio::test]
-async fn buffer_holds_only_this_tests_events() {
-    let cap = capture_logs();
-    tracing::info!(marker = "isolation_probe", "here");
-    assert!(cap.any_with(&["isolation_probe"]));
+async fn a_fresh_capture_does_not_see_the_previous_ones_events() {
+    {
+        let first = capture_logs();
+        tracing::info!(marker = "stale_probe", "from the first capture");
+        assert!(
+            first.any_with(&["stale_probe"]),
+            "control: first sees its own"
+        );
+    }
+    let second = capture_logs();
+    tracing::info!(marker = "fresh_probe", "from the second capture");
+    assert!(second.any_with(&["fresh_probe"]));
     assert!(
-        !cap.any_with(&["quiesce_probe"]),
-        "a previous test's events must not leak into this buffer"
+        !second.any_with(&["stale_probe"]),
+        "dropping a Capture must clear the sink; the new buffer holds only its own events"
     );
 }
 

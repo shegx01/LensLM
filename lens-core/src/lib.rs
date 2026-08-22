@@ -297,10 +297,10 @@ pub struct LensEngine {
     tokenizer: Arc<OnceCell<Arc<Tokenizer>>>,
     /// Single-permit gate serializing ingest runs (ONNX session is single-threaded).
     ingest_lock: Arc<Semaphore>,
-    /// Blocks background Lance writers while the data dir is copied. Total lock
-    /// order is `ingest_lock` → `notebook_lock` → `quiesce`, and `quiesce` is never
-    /// held across any other lock acquisition — shared holders guard one Lance
-    /// statement, so a relocation cannot deadlock behind a pool or model load.
+    /// Blocks background Lance writers while the data dir is copied. Order is
+    /// `ingest_lock` → `notebook_lock` → `quiesce`; SHARED holders acquire nothing
+    /// else, and nothing may acquire `quiesce` while holding a pool connection. The
+    /// exclusive holder deliberately spans the whole copy, pool checkouts included.
     quiesce: Arc<RwLock<()>>,
     /// Sender half of the background enrichment queue (M4 Phase 3). `Clone` so it
     /// rides `#[derive(Clone)]`. Dropping every clone closes the channel.
@@ -2717,12 +2717,10 @@ impl LensEngine {
         Self::gc_orphan_entity_tables(db, data_dir).await
     }
 
-    /// Startup-GC for `vec__` tables that no `embedding_index` row names. A THIRD,
-    /// listing-driven pass: the scan above is registry-driven and so cannot see a
-    /// table whose row is gone, and `create_building_table` picks its generation
-    /// from the registry alone while erroring on an existing physical name — so
-    /// such an orphan permanently bricks re-embed and streaming ingest for that
-    /// notebook until it is reclaimed.
+    /// Startup-GC for `vec__` tables that no `embedding_index` row names. Listing-
+    /// driven, unlike the registry-driven scan it runs before, which cannot see a
+    /// table whose row is gone. Such an orphan also used to brick re-embed for the
+    /// notebook; `create_building_table` now skips it, so this reclaims the bytes.
     ///
     /// Safe only because `init` awaits the GC before spawning any worker; moving
     /// this to a periodic task would need `ingest_lock` or the quiesce guard.
@@ -2734,12 +2732,29 @@ impl LensEngine {
         }
         // The WHOLE column, every status. Deliberately NOT falsifiable at startup —
         // the registry pass below reclaims exactly the non-active rows, so an
-        // `active`-only query would reach the same end state. It is load-bearing
-        // only if this sweep is ever called from anywhere else.
+        // `active`-only query would reach the same end state.
         let registered: Vec<String> =
             sqlx::query_scalar("SELECT lance_table_name FROM embedding_index")
                 .fetch_all(db)
                 .await?;
+
+        // Floor: an empty registry beside notebooks that exist means the DB lost the
+        // index (a restored older lens.db, a failed migration), not that every table
+        // is garbage. Leaking bytes is recoverable; deleting every vector is not.
+        if registered.is_empty() {
+            let notebooks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notebooks")
+                .fetch_one(db)
+                .await?;
+            if notebooks > 0 {
+                tracing::warn!(
+                    physical = physical.len(),
+                    notebooks,
+                    "startup-GC: embedding_index is empty but notebooks exist; refusing to \
+                     sweep vec tables"
+                );
+                return Ok(());
+            }
+        }
 
         let mut dropped = Vec::new();
         for name in physical {

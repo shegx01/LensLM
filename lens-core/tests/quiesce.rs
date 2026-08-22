@@ -18,7 +18,7 @@ const COMPLETES: Duration = Duration::from_secs(30);
 
 #[tokio::test(flavor = "multi_thread")]
 async fn relocation_waits_for_an_in_flight_entity_vector_write() {
-    let (dir, engine, nb) = resolution_ready_engine().await;
+    let (_dir, engine, nb) = resolution_ready_engine().await;
     let to_parent = tempfile::tempdir().expect("to_parent");
     let to = to_parent.path().join("moved");
 
@@ -45,21 +45,24 @@ async fn relocation_waits_for_an_in_flight_entity_vector_write() {
     );
 
     gate.release.notify_one();
-    pass.await.expect("join").expect("resolution pass");
+    timeout(COMPLETES, pass)
+        .await
+        .expect("the released pass must finish")
+        .expect("join")
+        .expect("resolution pass");
     engine.set_quiesce_upsert_gate_for_test(None).await;
 
     timeout(COMPLETES, engine.relocate_data_dir(&to, &[]))
         .await
         .expect("relocation must not hang once the writer released")
         .expect("relocation succeeds");
-    drop(dir);
 }
 
 /// AC-1.4: with nothing holding the guard, the same relocation completes — so the
 /// test above is proving the guard, not an unrelated stall.
 #[tokio::test(flavor = "multi_thread")]
 async fn relocation_completes_when_no_writer_holds_the_guard() {
-    let (dir, engine, _nb) = resolution_ready_engine().await;
+    let (_dir, engine, _nb) = resolution_ready_engine().await;
     let to_parent = tempfile::tempdir().expect("to_parent");
     let to = to_parent.path().join("moved");
 
@@ -67,13 +70,12 @@ async fn relocation_completes_when_no_writer_holds_the_guard() {
         .await
         .expect("an unguarded relocation must finish well inside the blocked budget")
         .expect("relocation succeeds");
-    drop(dir);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn relocation_logs_the_quiesce_acquisition() {
     let cap = capture_logs();
-    let (dir, engine, _nb) = resolution_ready_engine().await;
+    let (_dir, engine, _nb) = resolution_ready_engine().await;
     let to_parent = tempfile::tempdir().expect("to_parent");
     let to = to_parent.path().join("moved");
 
@@ -86,5 +88,4 @@ async fn relocation_logs_the_quiesce_acquisition() {
         cap.any_with(&["relocate"]),
         "the quiesce acquisition must name its reason"
     );
-    drop(dir);
 }

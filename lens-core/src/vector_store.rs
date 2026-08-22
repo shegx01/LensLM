@@ -275,15 +275,15 @@ fn model_slug(model: &str) -> String {
     }
 }
 
+/// Every physical chunk-vector table starts with this, in any naming generation.
+pub(crate) const VEC_TABLE_PREFIX: &str = "vec__";
+
 /// Resolves the physical LanceDB table name for a new coordinate (slug A1, M4
 /// Phase 4b-B): `vec__{notebook}__{backend}__{model_slug}__d{dim}`.
 ///
 /// CRITICAL: for existing tables, always use the name stored in the registry —
 /// never re-derive it. A pre-4b-B table (`vec__{nb}__nomic_v15__d768`) keeps
 /// its stored name; only new coordinates flow through this function.
-/// Every physical chunk-vector table starts with this, in any naming generation.
-pub(crate) const VEC_TABLE_PREFIX: &str = "vec__";
-
 fn table_name(notebook: &str, backend: EmbeddingBackend, model: &str, dim: usize) -> String {
     format!(
         "{VEC_TABLE_PREFIX}{notebook}__{}__{}__d{dim}",

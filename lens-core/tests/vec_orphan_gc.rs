@@ -263,3 +263,24 @@ async fn active_survives_and_building_stale_are_reclaimed_by_the_earlier_pass() 
         );
     }
 }
+
+/// Floor: an empty `embedding_index` beside notebooks that exist means the DB lost
+/// its index, not that every vector table is garbage. Leaking bytes is recoverable;
+/// deleting every vector is not.
+#[tokio::test]
+async fn empty_registry_with_live_notebooks_refuses_to_sweep() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    pin_catalog_offline(dir.path());
+    let nb = new_notebook(dir.path()).await;
+
+    let orphan = format!("vec__{nb}__fastembed__nomic_v15__d768__1");
+    make_unregistered_table(dir.path(), &orphan).await;
+
+    init_and_drop(dir.path()).await;
+
+    assert!(
+        table_names(dir.path()).await.contains(&orphan),
+        "with notebooks present and a wiped registry, the sweep must refuse rather \
+         than delete every vec table"
+    );
+}
