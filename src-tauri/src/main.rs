@@ -19,6 +19,8 @@ mod commands;
 // an out-of-process Python sidecar (via `uv`), so the module compiles out elsewhere.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod qwen;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use tokio::signal::unix::{SignalKind, signal};
 // The offscreen SPA-render impl (issue #78). Its `TauriJsRenderer` is injected
 // into the engine in the `.setup` block below (Layer f), so its items are live.
 mod render;
@@ -147,6 +149,24 @@ fn main() {
 
                 // Single-flight + cancel coordinator for `--prepare` (#202); see qwen::coordinator.
                 app.manage(qwen::QwenPrepareCoordinator::new());
+
+                tauri::async_runtime::spawn(async {
+                    let (Ok(mut int), Ok(mut term)) = (
+                        signal(SignalKind::interrupt()),
+                        signal(SignalKind::terminate()),
+                    ) else {
+                        tracing::warn!(
+                            "could not install signal handlers; sidecar groups may leak"
+                        );
+                        return;
+                    };
+                    tokio::select! {
+                        _ = int.recv() => {}
+                        _ = term.recv() => {}
+                    }
+                    qwen::kill_all_sidecar_groups();
+                    std::process::exit(130);
+                });
             }
 
             Ok(())

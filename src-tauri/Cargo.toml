@@ -78,8 +78,9 @@ lens-core = { path = "../lens-core", features = ["native-ml-metal", "local-whisp
 # `TtsSidecar::synthesize_turn` signature takes. MLX itself lives in the
 # uv-managed sidecar venv (sidecar/qwen3-tts), fetched on first run — no MLX
 # crate here, so this module compiles out on every other target.
-tokio = { workspace = true, features = ["process", "io-util"] }
+tokio = { workspace = true, features = ["process", "io-util", "signal"] }
 tokio-util = { workspace = true }
+libc = { workspace = true }
 # issue #193: the resolver's one-time `uv` provisioning download. `blocking`
 # because the resolver is a sync `Fn` driven via `spawn_blocking`; `rustls` (no
 # OpenSSL) mirrors the workspace HTTP policy. Same `=0.13.4` pin as elsewhere so

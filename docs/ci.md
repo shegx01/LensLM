@@ -8,24 +8,33 @@ app is ready to distribute.
 
 ### `CI` — `.github/workflows/ci.yml`
 
-Runs on every pull request and on pushes to `main`. Linux-only (`ubuntu-latest`);
+Runs on every pull request and on pushes to `main`. Linux (`ubuntu-latest`) for
+everything portable, plus one `macos-15` leg for the Apple-only sidecar host;
 cross-platform bundling is verified later at release time.
 
-| Job               | What it runs                                            | Blocks merge? |
-| ----------------- | ------------------------------------------------------- | ------------- |
-| **Rust (fmt)**    | `cargo fmt --all -- --check`                            | Yes           |
-| **Rust (clippy)** | `cargo clippy --workspace --all-targets -- -D warnings` | Yes           |
-| **Frontend**      | `bun run format:check`, `bun run check`, `bun run test` | Yes           |
-| **E2E**           | Playwright against the SvelteKit dev server             | Yes           |
-| **`signoff`**     | The Rust test suite, run locally — see below            | Yes           |
+| Job                           | What it runs                                            | Blocks merge? |
+| ----------------------------- | ------------------------------------------------------- | ------------- |
+| **Rust (fmt)**                | `cargo fmt --all -- --check`                            | Yes           |
+| **Rust (clippy)**             | `cargo clippy --workspace --all-targets -- -D warnings` | Yes           |
+| **Rust (macOS sidecar host)** | `clippy` + `nextest` for `-p lenslm` on `macos-15`      | Yes           |
+| **Frontend**                  | `bun run format:check`, `bun run check`, `bun run test` | Yes           |
+| **E2E**                       | Playwright against the SvelteKit dev server             | Yes           |
+| **`signoff`**                 | The Rust test suite, run locally — see below            | Yes           |
+
+The macOS leg exists because `src-tauri/src/qwen` is `cfg`-gated to
+`aarch64-apple-darwin`, so the Linux jobs compile none of it — including the
+workspace's only process-signalling `unsafe` and the process-group teardown tests
+that constrain it (#241). It is scoped to `lenslm` to keep runtime down, and does
+not use the Linux-only `rust-env` composite (which installs apt packages).
 
 CI runs fmt + clippy (the Linux compile/lint canary; `clippy --all-targets` also
 compiles the test code) plus the frontend and E2E suites. Since Phase 3 of the
 genai→rig migration (epic #255) removed the legacy backend, `rig` is the sole LLM
 backend, exercised by the `--workspace` clippy job and the `signoff` test gate. The **Rust test suite
 runs locally** and is gated by the `signoff` commit status, not by a CI job —
-dev hardware runs it faster than a shared runner, and the macOS-gated tests only
-run there anyway. The shared `.github/actions/rust-env` composite installs the
+dev hardware runs it faster than a shared runner. The one exception is the macOS
+sidecar leg above, which runs its crate's tests in CI because no Linux job can
+even compile that code. The shared `.github/actions/rust-env` composite installs the
 Tauri v2 WebKitGTK system libraries (cached) so `src-tauri` compiles; clippy is
 the sole Rust compile job, so it writes the shared cargo cache. Toolchains are
 pinned: Rust `1.94.1` (`rust-toolchain.toml`), Bun `1.2.15` and Node `22.16.0`
@@ -72,6 +81,7 @@ required:
 3. Add these checks (they appear after the first CI run):
    - `Rust (fmt)`
    - `Rust (clippy)`
+   - `Rust (macOS sidecar host)`
    - `Frontend (format + check + unit tests)`
    - `E2E (Playwright, non-blocking)`
    - `signoff` (posted locally — see [Local test signoff](#local-test-signoff))

@@ -139,7 +139,120 @@ where
 
 /// A live sidecar: the child process plus its owned stdin sink and buffered stdout
 /// source. Held together so acquiring the cell's guard grants exclusive IO access.
-type ChildTriple = (Child, ChildStdin, BufReader<ChildStdout>);
+type ChildTriple = (GroupChild, ChildStdin, BufReader<ChildStdout>);
+
+/// Signal handlers only — a signal exit never unwinds, so no `Drop` runs.
+static SIDECAR_GROUPS: std::sync::Mutex<Vec<libc::pid_t>> = std::sync::Mutex::new(Vec::new());
+
+fn sidecar_groups() -> std::sync::MutexGuard<'static, Vec<libc::pid_t>> {
+    SIDECAR_GROUPS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+pub fn kill_all_sidecar_groups() {
+    for pgid in sidecar_groups().iter() {
+        kill_pgid(*pgid);
+    }
+}
+
+fn kill_pgid(pgid: libc::pid_t) {
+    // SAFETY: callers pass an unreaped group of ours, so `pgid` cannot have been
+    // recycled. Any errno but ESRCH means it is NOT ours — the invariant broke.
+    if unsafe { libc::killpg(pgid, libc::SIGKILL) } != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::ESRCH) {
+            tracing::warn!(pgid, error = %err, "killpg on a Qwen sidecar group failed");
+        }
+    }
+}
+
+/// Leads its own process group so teardown reaches the `huggingface_hub` grandchild,
+/// not just `uv` (#241). `armed` holds while the group is ours and unreaped; POSIX
+/// reserves the pgid until the group empties, so signalling an armed group is safe.
+/// No `Deref<Target = Child>`: a reachable `kill`/`try_wait` silently disarms it.
+pub(super) struct GroupChild {
+    child: Child,
+    pgid: libc::pid_t,
+    armed: bool,
+}
+
+impl GroupChild {
+    pub(super) fn spawn(
+        spec: &SidecarSpawn,
+        stdio: impl FnOnce(&mut Command),
+    ) -> std::io::Result<Self> {
+        let mut cmd = Command::new(&spec.program);
+        cmd.args(&spec.args)
+            .envs(spec.envs.iter().cloned())
+            .process_group(0)
+            .kill_on_drop(true);
+        stdio(&mut cmd);
+        let child = cmd.spawn()?;
+        let pgid = child
+            .id()
+            .and_then(|p| libc::pid_t::try_from(p).ok())
+            .filter(|p| *p > 1)
+            .ok_or_else(|| std::io::Error::other("spawned sidecar has no usable pid"))?;
+        sidecar_groups().push(pgid);
+        Ok(Self {
+            child,
+            pgid,
+            armed: true,
+        })
+    }
+
+    pub(super) fn stdin(&mut self) -> Option<ChildStdin> {
+        self.child.stdin.take()
+    }
+
+    pub(super) fn stdout(&mut self) -> Option<ChildStdout> {
+        self.child.stdout.take()
+    }
+
+    pub(super) fn kill_group(&mut self) {
+        if self.disarm() {
+            kill_pgid(self.pgid);
+        }
+        let _ = self.child.start_kill();
+    }
+
+    pub(super) async fn kill_group_and_reap(&mut self) {
+        self.kill_group();
+        let _ = self.child.wait().await;
+    }
+
+    pub(super) async fn wait_clean(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let status = self.child.wait().await;
+        self.disarm();
+        status
+    }
+
+    pub(super) fn is_running(&mut self) -> bool {
+        match self.child.try_wait() {
+            Ok(None) => true,
+            Ok(Some(_)) => {
+                if self.disarm() {
+                    kill_pgid(self.pgid);
+                }
+                false
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn disarm(&mut self) -> bool {
+        if !std::mem::replace(&mut self.armed, false) {
+            return false;
+        }
+        sidecar_groups().retain(|p| *p != self.pgid);
+        true
+    }
+}
+
+impl Drop for GroupChild {
+    fn drop(&mut self) {
+        self.kill_group();
+    }
+}
 
 /// The default host/guest preset voices (stable ids; the picker to switch among
 /// the presets is #194). Applied when the config leaves a voice unset — a male
@@ -255,22 +368,19 @@ impl QwenSidecar {
                 tts_err()
             })??;
 
-        let mut child = Command::new(&spec.program)
-            .args(&spec.args)
-            .envs(spec.envs)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            // Sidecar diagnostics go to our stderr — never onto the JSON pipe.
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| {
-                tracing::warn!(error = %e, "failed to spawn Qwen sidecar");
-                tts_err()
-            })?;
+        let mut child = GroupChild::spawn(&spec, |cmd| {
+            cmd.stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                // Sidecar diagnostics go to our stderr — never onto the JSON pipe.
+                .stderr(Stdio::inherit());
+        })
+        .map_err(|e| {
+            tracing::warn!(error = %e, "failed to spawn Qwen sidecar");
+            tts_err()
+        })?;
 
-        let stdin = child.stdin.take().ok_or_else(tts_err)?;
-        let stdout = child.stdout.take().ok_or_else(tts_err)?;
+        let stdin = child.stdin().ok_or_else(tts_err)?;
+        let stdout = child.stdout().ok_or_else(tts_err)?;
         let mut reader = BufReader::new(stdout);
 
         // We hold the cell guard across this bounded, cancellable wait (acceptable
@@ -317,10 +427,8 @@ impl QwenSidecar {
     /// Kills and clears the child so the next turn respawns cleanly.
     fn kill_locked(&self, cell: &mut Option<ChildTriple>) {
         self.ready.store(false, Ordering::SeqCst);
-        if let Some((mut child, _stdin, _reader)) = cell.take()
-            && let Err(e) = child.start_kill()
-        {
-            tracing::warn!(error = %e, "failed to kill Qwen sidecar child");
+        if let Some((mut child, _stdin, _reader)) = cell.take() {
+            child.kill_group();
         }
     }
 
@@ -468,9 +576,7 @@ impl TtsSidecar for QwenSidecar {
             // Closing stdin ends the sidecar's read loop (graceful); the kill+wait
             // then guarantees a reap so no zombie survives shutdown.
             drop(stdin);
-            if let Err(e) = child.kill().await {
-                tracing::warn!(error = %e, "failed to reap Qwen sidecar on stop");
-            }
+            child.kill_group_and_reap().await;
         }
         Ok(())
     }
@@ -481,7 +587,7 @@ impl TtsSidecar for QwenSidecar {
         }
         let mut guard = self.child.lock().await;
         match guard.as_mut() {
-            Some((child, _, _)) => matches!(child.try_wait(), Ok(None)),
+            Some((child, _, _)) => child.is_running(),
             None => false,
         }
     }
@@ -938,5 +1044,97 @@ for line in sys.stdin:
             "run after cancel must recover via correlation-id drain, got {recovered:?}"
         );
         assert_eq!(recovered.unwrap().sample_rate, 24_000);
+    }
+}
+
+#[cfg(test)]
+mod group_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn spec_for(stub: &Path, extra: Vec<String>) -> SidecarSpawn {
+        let mut args = vec![stub.to_string_lossy().into_owned()];
+        args.extend(extra);
+        SidecarSpawn {
+            program: PathBuf::from("python3"),
+            args,
+            envs: vec![],
+        }
+    }
+
+    fn sentinel_len(p: &Path) -> u64 {
+        std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn is_running_kills_group_when_leader_already_exited() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sentinel = tmp.path().join("alive");
+        let grandchild = tmp.path().join("gc.py");
+        std::fs::write(
+            &grandchild,
+            concat!(
+                "import sys, time\n",
+                "deadline = time.time() + 30\n",
+                "while time.time() < deadline:\n",
+                "    with open(sys.argv[1], 'a') as f:\n",
+                "        f.write('.'); f.flush()\n",
+                "    time.sleep(0.02)\n",
+            ),
+        )
+        .unwrap();
+        let stub = tmp.path().join("stub.py");
+        std::fs::write(
+            &stub,
+            concat!(
+                "import sys, subprocess\n",
+                "subprocess.Popen([sys.executable, sys.argv[1], sys.argv[2]])\n",
+            ),
+        )
+        .unwrap();
+
+        let spec = spec_for(
+            &stub,
+            vec![
+                grandchild.to_string_lossy().into_owned(),
+                sentinel.to_string_lossy().into_owned(),
+            ],
+        );
+        let mut child = GroupChild::spawn(&spec, |cmd| {
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+        })
+        .expect("stub spawns");
+
+        for _ in 0..200 {
+            if sentinel_len(&sentinel) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            sentinel_len(&sentinel) > 0,
+            "grandchild never started writing"
+        );
+
+        let mut running = true;
+        for _ in 0..200 {
+            running = child.is_running();
+            if !running {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(!running, "leader never observed as exited");
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let after = sentinel_len(&sentinel);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            sentinel_len(&sentinel),
+            after,
+            "grandchild survived the dead leader — group kill was disarmed by the reap"
+        );
     }
 }
