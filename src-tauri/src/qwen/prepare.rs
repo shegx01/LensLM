@@ -6,13 +6,15 @@ use std::path::Path;
 use std::process::Stdio;
 
 use tokio::io::BufReader;
-use tokio::process::Command;
 use tokio::time::{Duration, timeout};
 use tokio_util::sync::CancellationToken;
 
 use lens_core::{DownloadProgress, LensError};
 
-use super::{MAX_REPLY_BYTES, ReadLineOutcome, SpawnResolver, read_capped_line, tts_err};
+use super::{
+    GroupChild, MAX_REPLY_BYTES, ReadLineOutcome, SpawnResolver, grouped_command, read_capped_line,
+    tts_err,
+};
 
 /// huggingface_hub's on-disk cache subdir for the Qwen model (under `<hf>/hub`).
 /// Kept in lockstep with the sidecar's `CACHE_SUBDIR`.
@@ -62,19 +64,17 @@ where
         tts_err()
     })??;
 
-    let mut child = Command::new(&spec.program)
-        .args(&spec.args)
-        .envs(spec.envs)
+    let mut child: GroupChild = grouped_command(&spec)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         // Sidecar diagnostics (and tqdm bars) go to our stderr — never the pipe.
         .stderr(Stdio::inherit())
-        .kill_on_drop(true)
         .spawn()
         .map_err(|e| {
             tracing::warn!(error = %e, "failed to spawn Qwen prepare sidecar");
             tts_err()
-        })?;
+        })?
+        .into();
 
     let stdout = child.stdout.take().ok_or_else(tts_err)?;
     let mut reader = BufReader::new(stdout);
@@ -125,11 +125,12 @@ where
                 }
             }
         }) => res,
-        // Cancel path mirrors the err/timeout paths: kill and let `kill_on_drop`
-        // reap. `read_line` is not cancel-safe, but we never reuse the reader.
+        // Cancel path mirrors the err/timeout paths: kill the group and let
+        // `kill_on_drop` reap. `read_line` is not cancel-safe, but we never reuse
+        // the reader.
         _ = cancel.cancelled() => {
-            tracing::info!("Qwen prepare cancelled; killing child");
-            let _ = child.start_kill();
+            tracing::info!("Qwen prepare cancelled; killing child group");
+            child.kill_group();
             return Err(LensError::Cancelled("prepare cancelled".into()));
         }
     };
@@ -138,19 +139,19 @@ where
     // completes at the same instant a cancel arrives wins and counts as success;
     // only a loop that did NOT complete under an in-flight cancel is Cancelled.
     if cancel.is_cancelled() && !matches!(outcome, Ok(Ok(_))) {
-        let _ = child.start_kill();
+        child.kill_group();
         return Err(LensError::Cancelled("prepare cancelled".into()));
     }
 
     let last = match outcome {
         Ok(Ok(last)) => last,
         Ok(Err(e)) => {
-            let _ = child.start_kill();
+            child.kill_group();
             return Err(e);
         }
         Err(_) => {
             tracing::warn!("Qwen prepare timed out");
-            let _ = child.start_kill();
+            child.kill_group();
             return Err(tts_err());
         }
     };
@@ -347,6 +348,66 @@ mod tests {
             .await
             .expect_err("EOF before done is an error");
         assert!(matches!(err, LensError::Tts(_)));
+    }
+
+    /// #241: the real sidecar is `uv` -> `python` -> `huggingface_hub`, so the stub
+    /// must fork — signalling the direct child alone leaves the downloader running.
+    #[tokio::test]
+    async fn run_prepare_cancel_kills_download_grandchild() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sentinel = tmp.path().join("alive");
+        let grandchild = tmp.path().join("grandchild.py");
+        std::fs::write(
+            &grandchild,
+            concat!(
+                "import sys, time\n",
+                "while True:\n",
+                "    with open(sys.argv[1], 'a') as f:\n",
+                "        f.write('.'); f.flush()\n",
+                "    time.sleep(0.02)\n",
+            ),
+        )
+        .unwrap();
+        let stub = write_stub(
+            tmp.path(),
+            &format!(
+                concat!(
+                    "import sys, json, subprocess, time\n",
+                    "subprocess.Popen([sys.executable, {grandchild:?}, {sentinel:?}])\n",
+                    "sys.stdout.write(json.dumps({{'progress': {{'received': 1, 'total': 9}}}})+'\\n')\n",
+                    "sys.stdout.flush()\n",
+                    "time.sleep(600)\n",
+                ),
+                grandchild = grandchild.to_string_lossy(),
+                sentinel = sentinel.to_string_lossy(),
+            ),
+        );
+
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_prepare(resolver_for(stub), cancel.clone(), |_| {}));
+
+        for _ in 0..200 {
+            if std::fs::metadata(&sentinel).is_ok_and(|m| m.len() > 0) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let grew = std::fs::metadata(&sentinel).map(|m| m.len()).unwrap_or(0);
+        assert!(grew > 0, "grandchild never started writing the sentinel");
+
+        cancel.cancel();
+        let err = task.await.unwrap().expect_err("cancel surfaces");
+        assert!(matches!(err, LensError::Cancelled(_)));
+
+        // Settle past any in-flight write before sampling.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let after_kill = std::fs::metadata(&sentinel).unwrap().len();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            std::fs::metadata(&sentinel).unwrap().len(),
+            after_kill,
+            "download grandchild survived cancellation"
+        );
     }
 
     #[tokio::test]

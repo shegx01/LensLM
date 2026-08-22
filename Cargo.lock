@@ -5608,6 +5608,7 @@ dependencies = [
  "chrono",
  "futures",
  "lens-core",
+ "libc",
  "objc2",
  "reqwest 0.13.4",
  "serde",

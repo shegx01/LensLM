@@ -139,7 +139,62 @@ where
 
 /// A live sidecar: the child process plus its owned stdin sink and buffered stdout
 /// source. Held together so acquiring the cell's guard grants exclusive IO access.
-type ChildTriple = (Child, ChildStdin, BufReader<ChildStdout>);
+type ChildTriple = (GroupChild, ChildStdin, BufReader<ChildStdout>);
+
+/// Builds the sidecar launch command as the leader of a fresh process group (see
+/// [`GroupChild`]). Callers add their own stdio wiring.
+pub(super) fn grouped_command(spec: &SidecarSpawn) -> Command {
+    let mut cmd = Command::new(&spec.program);
+    cmd.args(&spec.args)
+        .envs(spec.envs.iter().cloned())
+        .process_group(0)
+        .kill_on_drop(true);
+    cmd
+}
+
+/// A sidecar child that is its own process-group leader, so every teardown path
+/// reaches the `python`/`huggingface_hub` grandchild and not just `uv` (#241).
+pub(super) struct GroupChild(Child);
+
+impl GroupChild {
+    pub(super) fn kill_group(&mut self) {
+        if let Some(pid) = self.0.id() {
+            // SAFETY: `pid` is our own child, made a group leader by `process_group(0)`,
+            // so `pgid == pid`; a failure means it already exited and is not actionable.
+            unsafe { libc::killpg(pid as libc::pid_t, libc::SIGKILL) };
+        }
+        let _ = self.0.start_kill();
+    }
+}
+
+impl From<Child> for GroupChild {
+    fn from(child: Child) -> Self {
+        Self(child)
+    }
+}
+
+impl std::ops::Deref for GroupChild {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for GroupChild {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+impl Drop for GroupChild {
+    fn drop(&mut self) {
+        // Covers the drop-only teardowns (handshake failure, task abort, app quit).
+        // Skipped once reaped: `killpg` on a recycled pid could hit a foreign group.
+        if matches!(self.0.try_wait(), Ok(None)) {
+            self.kill_group();
+        }
+    }
+}
 
 /// The default host/guest preset voices (stable ids; the picker to switch among
 /// the presets is #194). Applied when the config leaves a voice unset — a male
@@ -255,19 +310,17 @@ impl QwenSidecar {
                 tts_err()
             })??;
 
-        let mut child = Command::new(&spec.program)
-            .args(&spec.args)
-            .envs(spec.envs)
+        let mut child: GroupChild = grouped_command(&spec)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // Sidecar diagnostics go to our stderr — never onto the JSON pipe.
             .stderr(Stdio::inherit())
-            .kill_on_drop(true)
             .spawn()
             .map_err(|e| {
                 tracing::warn!(error = %e, "failed to spawn Qwen sidecar");
                 tts_err()
-            })?;
+            })?
+            .into();
 
         let stdin = child.stdin.take().ok_or_else(tts_err)?;
         let stdout = child.stdout.take().ok_or_else(tts_err)?;
@@ -317,10 +370,8 @@ impl QwenSidecar {
     /// Kills and clears the child so the next turn respawns cleanly.
     fn kill_locked(&self, cell: &mut Option<ChildTriple>) {
         self.ready.store(false, Ordering::SeqCst);
-        if let Some((mut child, _stdin, _reader)) = cell.take()
-            && let Err(e) = child.start_kill()
-        {
-            tracing::warn!(error = %e, "failed to kill Qwen sidecar child");
+        if let Some((mut child, _stdin, _reader)) = cell.take() {
+            child.kill_group();
         }
     }
 

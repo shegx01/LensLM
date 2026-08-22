@@ -48,6 +48,8 @@ async-trait = "0.1"
 futures = "0.3"
 # Unique offscreen render-window labels (`lens-render-<uuid>`); v7 for time-order.
 uuid = { workspace = true }
+# `killpg` for the Qwen sidecar's process-group teardown (#241).
+libc = { workspace = true }
 # macOS: used ONLY by the inactive `OnscreenAlphaZero` render fallback (#78), which
 # sets the render window's native NSWindow alphaValue to 0 (a public AppKit API; no
 # `macos-private-api` needed). The production path is `Offscreen` (off-screen +

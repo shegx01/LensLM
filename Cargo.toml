@@ -21,6 +21,10 @@ thiserror = "2"
 # new external crate; pinned to that resolved version so no second copy is added.
 # MIT OR Apache-2.0 (deny.toml allowlist).
 base64 = "=0.22.1"
+# `killpg` for the Qwen sidecar's process-group teardown (#241). ALREADY in the lock
+# tree (transitive via tokio/rustix), so this pulls NO new external crate; pinned to
+# that resolved version so no second copy is added. MIT OR Apache-2.0.
+libc = "=0.2.186"
 # `rt`/`macros` enable the async runtime + `#[tokio::test]`; `sync` for RwLock;
 # `time` for the timeout APIs used by the system-check HTTP probes.
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
