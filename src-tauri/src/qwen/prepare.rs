@@ -12,8 +12,7 @@ use tokio_util::sync::CancellationToken;
 use lens_core::{DownloadProgress, LensError};
 
 use super::{
-    GroupChild, MAX_REPLY_BYTES, ReadLineOutcome, SpawnResolver, grouped_command, read_capped_line,
-    tts_err,
+    GroupChild, MAX_REPLY_BYTES, ReadLineOutcome, SpawnResolver, read_capped_line, tts_err,
 };
 
 /// huggingface_hub's on-disk cache subdir for the Qwen model (under `<hf>/hub`).
@@ -64,19 +63,18 @@ where
         tts_err()
     })??;
 
-    let mut child: GroupChild = grouped_command(&spec)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        // Sidecar diagnostics (and tqdm bars) go to our stderr — never the pipe.
-        .stderr(Stdio::inherit())
-        .spawn()
-        .map_err(|e| {
-            tracing::warn!(error = %e, "failed to spawn Qwen prepare sidecar");
-            tts_err()
-        })?
-        .into();
+    let mut child = GroupChild::spawn(&spec, |cmd| {
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            // Sidecar diagnostics (and tqdm bars) go to our stderr — never the pipe.
+            .stderr(Stdio::inherit());
+    })
+    .map_err(|e| {
+        tracing::warn!(error = %e, "failed to spawn Qwen prepare sidecar");
+        tts_err()
+    })?;
 
-    let stdout = child.stdout.take().ok_or_else(tts_err)?;
+    let stdout = child.stdout().ok_or_else(tts_err)?;
     let mut reader = BufReader::new(stdout);
 
     let outcome = tokio::select! {
@@ -157,7 +155,7 @@ where
     };
 
     // Require a clean exit before declaring success (and reap the child).
-    match child.wait().await {
+    match child.wait_clean().await {
         Ok(status) if status.success() => {}
         Ok(_) => {
             tracing::warn!("Qwen prepare exited non-zero after reporting done");
@@ -253,10 +251,16 @@ mod tests {
     }
 
     fn resolver_for(stub: PathBuf) -> SpawnResolver {
+        resolver_with_args(stub, vec![])
+    }
+
+    fn resolver_with_args(stub: PathBuf, extra: Vec<String>) -> SpawnResolver {
         Arc::new(move || {
+            let mut args = vec![stub.to_string_lossy().into_owned()];
+            args.extend(extra.iter().cloned());
             Ok(SidecarSpawn {
                 program: PathBuf::from("python3"),
-                args: vec![stub.to_string_lossy().into_owned()],
+                args,
                 envs: vec![],
             })
         })
@@ -350,8 +354,6 @@ mod tests {
         assert!(matches!(err, LensError::Tts(_)));
     }
 
-    /// #241: the real sidecar is `uv` -> `python` -> `huggingface_hub`, so the stub
-    /// must fork — signalling the direct child alone leaves the downloader running.
     #[tokio::test]
     async fn run_prepare_cancel_kills_download_grandchild() {
         let tmp = tempfile::tempdir().unwrap();
@@ -361,7 +363,8 @@ mod tests {
             &grandchild,
             concat!(
                 "import sys, time\n",
-                "while True:\n",
+                "deadline = time.time() + 30\n",
+                "while time.time() < deadline:\n",
                 "    with open(sys.argv[1], 'a') as f:\n",
                 "        f.write('.'); f.flush()\n",
                 "    time.sleep(0.02)\n",
@@ -370,21 +373,24 @@ mod tests {
         .unwrap();
         let stub = write_stub(
             tmp.path(),
-            &format!(
-                concat!(
-                    "import sys, json, subprocess, time\n",
-                    "subprocess.Popen([sys.executable, {grandchild:?}, {sentinel:?}])\n",
-                    "sys.stdout.write(json.dumps({{'progress': {{'received': 1, 'total': 9}}}})+'\\n')\n",
-                    "sys.stdout.flush()\n",
-                    "time.sleep(600)\n",
-                ),
-                grandchild = grandchild.to_string_lossy(),
-                sentinel = sentinel.to_string_lossy(),
+            concat!(
+                "import sys, json, subprocess, time\n",
+                "subprocess.Popen([sys.executable, sys.argv[1], sys.argv[2]])\n",
+                "sys.stdout.write(json.dumps({'progress': {'received': 1, 'total': 9}})+'\\n')\n",
+                "sys.stdout.flush()\n",
+                "time.sleep(600)\n",
             ),
         );
 
         let cancel = CancellationToken::new();
-        let task = tokio::spawn(run_prepare(resolver_for(stub), cancel.clone(), |_| {}));
+        let resolver = resolver_with_args(
+            stub,
+            vec![
+                grandchild.to_string_lossy().into_owned(),
+                sentinel.to_string_lossy().into_owned(),
+            ],
+        );
+        let task = tokio::spawn(run_prepare(resolver, cancel.clone(), |_| {}));
 
         for _ in 0..200 {
             if std::fs::metadata(&sentinel).is_ok_and(|m| m.len() > 0) {
@@ -399,7 +405,6 @@ mod tests {
         let err = task.await.unwrap().expect_err("cancel surfaces");
         assert!(matches!(err, LensError::Cancelled(_)));
 
-        // Settle past any in-flight write before sampling.
         tokio::time::sleep(Duration::from_millis(200)).await;
         let after_kill = std::fs::metadata(&sentinel).unwrap().len();
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -408,6 +413,48 @@ mod tests {
             after_kill,
             "download grandchild survived cancellation"
         );
+    }
+
+    #[tokio::test]
+    async fn run_prepare_cancel_preserves_incomplete_blob() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blobs = tmp.path().join("hub").join(QWEN_SNAPSHOT_DIR).join("blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let partial = blobs.join("deadbeef.incomplete");
+        let stub = write_stub(
+            tmp.path(),
+            concat!(
+                "import sys, json, time\n",
+                "open(sys.argv[1], 'ab').write(b'partial')\n",
+                "sys.stdout.write(json.dumps({'progress': {'received': 7, 'total': 99}})+'\\n')\n",
+                "sys.stdout.flush()\n",
+                "time.sleep(600)\n",
+            ),
+        );
+
+        let cancel = CancellationToken::new();
+        let resolver = resolver_with_args(stub, vec![partial.to_string_lossy().into_owned()]);
+        let seen = Arc::new(Mutex::new(false));
+        let flag = seen.clone();
+        let task = tokio::spawn(run_prepare(resolver, cancel.clone(), move |_| {
+            *flag.lock().unwrap() = true
+        }));
+
+        for _ in 0..200 {
+            if *seen.lock().unwrap() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        cancel.cancel();
+        let err = task.await.unwrap().expect_err("cancel surfaces");
+        assert!(matches!(err, LensError::Cancelled(_)));
+
+        assert!(
+            partial.exists(),
+            "cancel destroyed the partial blob, forcing a restart instead of a resume"
+        );
+        assert!(!qwen_snapshot_present(tmp.path()), "still incomplete");
     }
 
     #[tokio::test]
