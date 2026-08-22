@@ -530,3 +530,50 @@ async fn r2_flip_guard_aborts_on_concurrent_backend_change() {
         0
     );
 }
+
+/// AC-1.9: retirement runs INSIDE the flip window's `ingest_lock`, not after it.
+/// Unlocked, a data-dir copy could snapshot SQLite before the demote and `lancedb/`
+/// after the drop, producing a new dir whose `active` row names a table that is
+/// gone — silently empty search, worse than the stranded table it replaces.
+#[tokio::test(flavor = "multi_thread")]
+async fn retirement_holds_ingest_lock_so_relocation_cannot_interleave() {
+    use lens_core::QuiesceGate;
+    use tokio::time::timeout;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = LensEngine::init(dir.path()).await.unwrap();
+    inject_embedder(&engine, BGE);
+    let (nb, _src) = seed_nomic_notebook(&engine).await;
+    set_model(&engine, &nb, BGE).await;
+
+    let gate = Arc::new(QuiesceGate::default());
+    engine
+        .set_reembed_retire_gate_for_test(Some(gate.clone()))
+        .await;
+
+    let e2 = engine.clone();
+    let nb2 = nb.clone();
+    let reembed =
+        tokio::spawn(async move { e2.reembed_notebook(&NotebookId::from(nb2), |_, _| {}).await });
+
+    timeout(Duration::from_secs(10), gate.reached.notified())
+        .await
+        .expect("reembed must park inside the retirement loop");
+
+    let to_parent = tempfile::tempdir().unwrap();
+    let to = to_parent.path().join("moved");
+    let blocked = timeout(
+        Duration::from_millis(750),
+        engine.relocate_data_dir(&to, &[]),
+    )
+    .await;
+    assert!(
+        blocked.is_err(),
+        "relocation must not interleave with retirement, got {:?}",
+        blocked.map(|r| r.is_ok())
+    );
+
+    gate.release.notify_one();
+    let outcome = reembed.await.unwrap().expect("reembed");
+    assert!(matches!(outcome, ReembedOutcome::Switched { .. }));
+}

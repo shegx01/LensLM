@@ -104,7 +104,8 @@ pub(crate) async fn reembed_and_flip(
     #[cfg(feature = "test-util")]
     engine.reembed_preflip_gate().await;
 
-    // FLIP-ONLY lock window: hold `ingest_lock` only for the atomic flip txn (sub-second).
+    // FLIP-ONLY lock window: the populate above ran lock-free; only the atomic flip
+    // txn holds `ingest_lock` here.
     {
         let _permit = engine
             .ingest_lock()
@@ -253,7 +254,9 @@ pub(crate) async fn reembed_notebook(
     #[cfg(feature = "test-util")]
     engine.reembed_preflip_gate().await;
 
-    // FLIP-ONLY lock window (sub-second): atomic flip txn + old-coordinate retirement.
+    // FLIP + RETIRE lock window: the atomic flip txn and the retirement below. NOT
+    // sub-second — retirement recursively removes N table directories, which on an
+    // external or network volume is seconds. Accepted, on model switch only.
     {
         let _permit = engine
             .ingest_lock()
@@ -282,18 +285,21 @@ pub(crate) async fn reembed_notebook(
         }
 
         store.flip_active(&new_coord, &building_name).await?;
-    }
-
-    // Retire old coordinates (R3, idempotent): a crash mid-retire leaves a `stale`
-    // row the startup-GC reclaims; the new coordinate already serves search.
-    for (old_model, old_dim, old_backend) in &old_coords {
-        let old_coord = crate::vector_store::Coordinate::new(
-            nb.clone(),
-            *old_backend,
-            old_model.clone(),
-            *old_dim,
-        );
-        store.retire_coordinate(&old_coord).await?;
+        // Retire inside the SAME window (R3, idempotent). Unlocked, this demotes the
+        // registry row and drops the table without a permit, so a data-dir copy could
+        // snapshot SQLite before the demote and `lancedb/` after the drop — leaving an
+        // `active` row whose table directory is gone, and silently empty search.
+        for (old_model, old_dim, old_backend) in &old_coords {
+            #[cfg(feature = "test-util")]
+            engine.reembed_retire_gate().await;
+            let old_coord = crate::vector_store::Coordinate::new(
+                nb.clone(),
+                *old_backend,
+                old_model.clone(),
+                *old_dim,
+            );
+            store.retire_coordinate(&old_coord).await?;
+        }
     }
 
     Ok(ReembedOutcome::Switched {

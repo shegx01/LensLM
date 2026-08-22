@@ -364,6 +364,9 @@ pub struct LensEngine {
     /// INSIDE the guarded region — a gate before it lets relocation win the race.
     #[cfg(feature = "test-util")]
     quiesce_upsert_gate: Arc<RwLock<Option<Arc<QuiesceGate>>>>,
+    /// #248 AC-1.9 test seam: parks inside the flip+retire `ingest_lock` window.
+    #[cfg(feature = "test-util")]
+    reembed_retire_gate: Arc<RwLock<Option<Arc<QuiesceGate>>>>,
     /// When `true`, `tokenizer()` fails fast so Step-4 tests run fully offline.
     #[cfg(feature = "test-util")]
     skip_tokenizer: Arc<std::sync::atomic::AtomicBool>,
@@ -482,6 +485,8 @@ impl LensEngine {
             #[cfg(feature = "test-util")]
             quiesce_upsert_gate: Arc::new(RwLock::new(None)),
             #[cfg(feature = "test-util")]
+            reembed_retire_gate: Arc::new(RwLock::new(None)),
+            #[cfg(feature = "test-util")]
             skip_tokenizer: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "test-util")]
             enrichment_max_calls_override: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -579,6 +584,8 @@ impl LensEngine {
             reembed_preflip_gate: Arc::new(RwLock::new(None)),
             #[cfg(feature = "test-util")]
             quiesce_upsert_gate: Arc::new(RwLock::new(None)),
+            #[cfg(feature = "test-util")]
+            reembed_retire_gate: Arc::new(RwLock::new(None)),
             #[cfg(feature = "test-util")]
             skip_tokenizer: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "test-util")]
@@ -2837,6 +2844,21 @@ impl LensEngine {
         *self.quiesce_upsert_gate.write().await = gate;
     }
 
+    #[cfg(feature = "test-util")]
+    pub(crate) async fn reembed_retire_gate(&self) {
+        let gate = self.reembed_retire_gate.read().await.clone();
+        if let Some(gate) = gate {
+            gate.reached.notify_one();
+            gate.release.notified().await;
+        }
+    }
+
+    /// Installs (or clears) the in-window retirement gate for #248 AC-1.9 tests.
+    #[cfg(feature = "test-util")]
+    pub async fn set_reembed_retire_gate_for_test(&self, gate: Option<Arc<QuiesceGate>>) {
+        *self.reembed_retire_gate.write().await = gate;
+    }
+
     /// Test-only seam: directly enqueue a source onto the enrichment queue (the
     /// production enqueue is internal to the ingest path). Gated behind
     /// `test-util`; absent from production builds.
@@ -3314,7 +3336,8 @@ impl LensEngine {
 
     /// Re-embeds every chunk into the notebook's configured coordinate and retires
     /// previous coordinates (M4 Phase 4b, Step 9). Populate runs lock-free; only
-    /// the brief flip takes `ingest_lock`. No-op when already at the active coordinate.
+    /// the flip and old-coordinate retirement take `ingest_lock`. No-op when already
+    /// at the active coordinate.
     #[tracing::instrument(skip_all, fields(notebook = %notebook_id.as_str()))]
     pub async fn reembed_notebook(
         &self,
