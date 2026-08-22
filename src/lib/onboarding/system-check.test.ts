@@ -68,7 +68,7 @@ describe('shared progress channel factory (downloadTtsModel / prepareQwenModel)'
   it('downloadTtsModel emits null while total is unknown, then 100 on done', async () => {
     mockIPC((cmd, args) => {
       if (cmd === 'download_tts_model') {
-        const ch = (args as { onProgress: ProgressChannel }).onProgress;
+        const ch = (args as { on_progress: ProgressChannel }).on_progress;
         ch.onmessage({ received: 0, total: null, done: false });
         ch.onmessage({ received: 1, total: null, done: false });
         ch.onmessage({ received: 100, total: 100, done: true });
@@ -84,7 +84,7 @@ describe('shared progress channel factory (downloadTtsModel / prepareQwenModel)'
   it('downloadTtsModel emits the known percentage when total is present', async () => {
     mockIPC((cmd, args) => {
       if (cmd === 'download_tts_model') {
-        const ch = (args as { onProgress: ProgressChannel }).onProgress;
+        const ch = (args as { on_progress: ProgressChannel }).on_progress;
         ch.onmessage({ received: 50, total: 200, done: false });
         return null;
       }
@@ -108,6 +108,31 @@ describe('shared progress channel factory (downloadTtsModel / prepareQwenModel)'
     const calls: (number | null)[] = [];
     await prepareQwenModel((pct) => calls.push(pct));
     expect(calls).toEqual([null, 100]);
+  });
+
+  // `download_tts_model` declares `rename_all = "snake_case"` while `prepare_qwen_model`
+  // does not, so the two channel keys differ ON PURPOSE. Asserting the payload is the only
+  // way to catch a regression here: mockIPC forwards whatever key it is handed, so a
+  // camelCase key drives every other test in this file green while failing in a real host.
+  it('sends the channel under the snake_case key each command actually declares', async () => {
+    const seen: Record<string, unknown> = {};
+    mockIPC((cmd, args) => {
+      seen[cmd] = args;
+      const a = args as Record<string, unknown>;
+      const ch = (a.on_progress ?? a.onProgress) as ProgressChannel | undefined;
+      ch?.onmessage({ received: 1, total: 1, done: true });
+      return null;
+    });
+
+    await downloadTtsModel('orpheus', 'orpheus', () => {});
+    await prepareQwenModel(() => {});
+
+    expect(Object.keys(seen.download_tts_model as object).sort()).toEqual([
+      'engine',
+      'model',
+      'on_progress'
+    ]);
+    expect(Object.keys(seen.prepare_qwen_model as object)).toEqual(['onProgress']);
   });
 });
 

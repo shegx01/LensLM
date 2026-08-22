@@ -20,6 +20,7 @@
     type TtsProvider,
     type TtsModelStatus
   } from '$lib/onboarding/system-check.js';
+  import { cancelDownload } from '$lib/asr/ipc.js';
   import { toLensError } from '../../sources/lens-error.js';
   import type { AppConfig } from '$lib/theme/types.js';
   import {
@@ -67,6 +68,10 @@
   const downloaded = $derived(status === 'complete');
   const incomplete = $derived(status === 'partial');
   let downloadError = $state<string | null>(null);
+  let inFlightModel = $state<string | null>(null);
+  let cancelling = $state(false);
+  const STORAGE_POINTER = 'Free up space in Settings → Storage.';
+  const CANCEL_MISSED = "Couldn't stop it — it may have already finished.";
 
   let voices = $state<TtsVoice[]>([]);
   let maleVoice = $state('');
@@ -242,6 +247,8 @@
     status = 'absent';
     downloadProgress = 0;
     downloadIndeterminate = false;
+    inFlightModel = null;
+    cancelling = false;
     // Pin the model list at the start: `modelIds` is a derived that recomputes to
     // the newly-selected engine on a mid-download switch (0-length for Qwen →
     // division by zero), and the `gen === my` guard drops stale progress ticks.
@@ -252,7 +259,13 @@
           if (gen === my) applyProgress(pct, (p) => p);
         });
       } else {
+        // This is a sequence (orpheus, then snac) and a cancel key names one
+        // artifact, so it has to be whichever is streaming right now.
         for (const [i, model] of ids.entries()) {
+          // A superseded run must stop here: continuing would both keep downloading for an
+          // engine the user left and overwrite the live run's `inFlightModel` cancel target.
+          if (gen !== my) return;
+          inFlightModel = model;
           await downloadTtsModel(dlId, model, (pct) => {
             if (gen === my)
               applyProgress(pct, (p) => Math.round(((i + p / 100) / ids.length) * 100));
@@ -280,10 +293,37 @@
       if (gen !== my) return;
       downloadIndeterminate = false;
       downloadProgress = null;
-      // A deliberate cancel (unmount during a Qwen download) isn't a failure —
-      // don't surface "Download failed" for it.
-      if (toLensError(err).kind === 'Cancelled') return;
-      downloadError = err instanceof Error ? err.message : 'Download failed.';
+      // A deliberate cancel (the Cancel button, or unmount during a Qwen download)
+      // isn't a failure — don't surface "Download failed" for it.
+      const lensErr = toLensError(err);
+      if (lensErr.kind === 'Cancelled') return;
+      downloadError =
+        lensErr.kind === 'InsufficientSpace'
+          ? `${lensErr.message} ${STORAGE_POINTER}`
+          : lensErr.message;
+    } finally {
+      if (gen === my) {
+        inFlightModel = null;
+        cancelling = false;
+      }
+    }
+  }
+
+  // Deliberately leaves the progress state alone: handleDownload owns it, so the
+  // download control stays disabled until the invoke itself settles.
+  async function handleCancel(): Promise<void> {
+    const target = inFlightModel;
+    if (target === null || cancelling) return;
+    const my = gen;
+    cancelling = true;
+    try {
+      const stopped = await cancelDownload({ kind: 'tts', id: target });
+      if (gen !== my || stopped) return;
+      cancelling = false;
+      downloadError = CANCEL_MISSED;
+    } catch {
+      if (gen !== my) return;
+      cancelling = false;
     }
   }
 
@@ -299,7 +339,7 @@
       }));
       onactivated?.(engine);
     } catch (err) {
-      saveError = err instanceof Error ? err.message : 'Could not save voice settings.';
+      saveError = toLensError(err).message;
     }
   }
 
@@ -382,18 +422,25 @@
         </p>
       {/if}
 
-      <Button class="mt-4 h-10 w-full" onclick={handleDownload} disabled={isDownloading}>
-        {#if isDownloading}
-          <LoaderCircle class="size-4 animate-spin" />
-          Downloading…
-        {:else if incomplete}
-          <Download class="size-4" />
-          Model incomplete — re-download
-        {:else}
-          <Download class="size-4" />
-          Download voice engine
+      <div class="mt-4 flex items-center gap-2">
+        <Button class="h-10 flex-1" onclick={handleDownload} disabled={isDownloading}>
+          {#if isDownloading}
+            <LoaderCircle class="size-4 animate-spin" />
+            Downloading…
+          {:else if incomplete}
+            <Download class="size-4" />
+            Model incomplete — re-download
+          {:else}
+            <Download class="size-4" />
+            Download voice engine
+          {/if}
+        </Button>
+        {#if isDownloading && inFlightModel !== null}
+          <Button variant="outline" class="h-10" onclick={handleCancel} disabled={cancelling}>
+            {cancelling ? 'Cancelling…' : 'Cancel'}
+          </Button>
         {/if}
-      </Button>
+      </div>
     </div>
   {:else if voicesUnavailable}
     <p class="text-[0.72rem] text-destructive" role="alert">

@@ -80,6 +80,7 @@ pub use config::{
 #[cfg(feature = "test-util")]
 pub use dialogue::{DialogueCtx, generate_dialogue};
 pub use dialogue::{DialoguePhase, DialogueScript, Emotion, Length, OverviewFormat, Speaker, Turn};
+pub use download::{DISK_HEADROOM_BYTES, available_space_bytes, human_bytes};
 pub use embedder::{
     CountingEmbedder, DEFAULT_EMBED_DIM, DEFAULT_EMBED_MODEL_ID, Embedder, EmbeddingBackend,
     EmbeddingModelSpec, FastembedEmbedder, OllamaEmbedder, REGISTRY, resolve, resolve_opt,
@@ -117,7 +118,7 @@ pub use retrieval::router::{ContextUnit, Provenance, RouterOutput, Tier, tiered_
 #[cfg(feature = "test-util")]
 pub use retrieval::router::RESERVED_OUTPUT;
 pub use retrieval::{HitSource, Reranker, RetrievalHit, hybrid_search};
-pub use storage::StorageStats;
+pub use storage::{StorageStats, path_size_bytes};
 pub use system_check::{
     ALLOWED_EMBEDDING_MODELS, CheckAction, CheckId, CheckResult, CheckStatus, LlmDetection,
     ModelValidation, detect_llm, fastembed_weights_cached, is_allowlisted_embedding_id,
@@ -326,6 +327,7 @@ pub struct LensEngine {
         Arc<std::sync::Mutex<HashMap<String, Arc<tokio_util::sync::CancellationToken>>>>,
     tts_cancel_tokens:
         Arc<std::sync::Mutex<HashMap<String, Arc<tokio_util::sync::CancellationToken>>>>,
+    download_cancel_tokens: Arc<std::sync::Mutex<DownloadRegistry>>,
     tts_sidecar: Arc<RwLock<Option<Arc<dyn tts::TtsSidecar>>>>,
     /// Lazily-built internal LocalWhisper engines, keyed by model id (#42). Mirrors
     /// the embedder cache but lighter — whisper has one active model at a time. The
@@ -447,6 +449,7 @@ impl LensEngine {
             ask_cancel_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
             dialogue_cancel_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
             tts_cancel_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            download_cancel_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
             tts_sidecar: Arc::new(RwLock::new(None)),
             #[cfg(feature = "local-whisper")]
             whisper_engines: Arc::new(Mutex::new(HashMap::new())),
@@ -541,6 +544,7 @@ impl LensEngine {
             ask_cancel_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
             dialogue_cancel_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
             tts_cancel_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            download_cancel_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
             tts_sidecar: Arc::new(RwLock::new(None)),
             #[cfg(feature = "local-whisper")]
             whisper_engines: Arc::new(Mutex::new(HashMap::new())),
@@ -1486,6 +1490,69 @@ impl LensEngine {
         TtsCancelGuard {
             engine: self.clone(),
             notebook_id: notebook_id.to_string(),
+            owner,
+        }
+    }
+
+    /// Returns the cancel token for `key`, joining an already-registered download
+    /// rather than superseding it: a second caller (e.g. a Settings remount) must
+    /// never cancel a healthy multi-gigabyte transfer already in flight (#37). Each
+    /// call counts one holder and MUST be paired with a `download_cancel_guard`.
+    pub fn register_download(&self, key: DownloadKey) -> Arc<tokio_util::sync::CancellationToken> {
+        let mut map = self
+            .download_cancel_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let entry = map
+            .entry(key)
+            .or_insert_with(|| (Arc::new(tokio_util::sync::CancellationToken::new()), 0));
+        entry.1 += 1;
+        Arc::clone(&entry.0)
+    }
+
+    pub fn cancel_download(&self, key: &DownloadKey) -> bool {
+        let map = self
+            .download_cancel_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match map.get(key) {
+            Some((token, _)) => {
+                token.cancel();
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn remove_download_if_owner(
+        &self,
+        key: &DownloadKey,
+        owner: &Arc<tokio_util::sync::CancellationToken>,
+    ) {
+        let mut map = self
+            .download_cancel_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let last_holder = match map.get_mut(key) {
+            Some(entry) if Arc::ptr_eq(&entry.0, owner) => {
+                entry.1 = entry.1.saturating_sub(1);
+                entry.1 == 0
+            }
+            _ => false,
+        };
+        if last_holder {
+            map.remove(key);
+        }
+    }
+
+    pub fn download_cancel_guard(
+        &self,
+        key: DownloadKey,
+        owner: Arc<tokio_util::sync::CancellationToken>,
+    ) -> DownloadCancelGuard {
+        DownloadCancelGuard {
+            engine: self.clone(),
+            key,
             owner,
         }
     }
@@ -3289,6 +3356,39 @@ impl Drop for TtsCancelGuard {
     fn drop(&mut self) {
         self.engine
             .remove_tts_if_owner(&self.notebook_id, &self.owner);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DownloadKind {
+    Tts,
+    Whisper,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct DownloadKey {
+    pub kind: DownloadKind,
+    pub id: String,
+}
+
+/// Each in-flight download's cancel token, paired with the number of callers that
+/// registered for it (see `register_download`).
+type DownloadRegistry = HashMap<DownloadKey, (Arc<tokio_util::sync::CancellationToken>, usize)>;
+
+/// RAII guard releasing one holder of a download's cancellation-registry entry on
+/// drop, clearing the entry once the last holder is gone. Required, not optional: a
+/// retained entry would hand a later download the previous (possibly already-cancelled)
+/// token, failing it instantly.
+pub struct DownloadCancelGuard {
+    engine: LensEngine,
+    key: DownloadKey,
+    owner: Arc<tokio_util::sync::CancellationToken>,
+}
+
+impl Drop for DownloadCancelGuard {
+    fn drop(&mut self) {
+        self.engine.remove_download_if_owner(&self.key, &self.owner);
     }
 }
 

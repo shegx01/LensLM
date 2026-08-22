@@ -56,6 +56,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # WAV (RIFF) encoding for the TTS overview audio pipeline (#190). Pure-Rust, no ABI lock.
 hound = "3.5"
+# Free-space probe for the model-download disk pre-flight (#37). The `sync` feature
+# is REQUIRED — the crate is backend-feature-gated and `available_space` is absent
+# without it. MIT OR Apache-2.0 (deny.toml allowlist).
+fs4 = { version = "1.1.0", features = ["sync"] }
 # Test-only dependencies (consumed via each crate's [dev-dependencies]).
 rstest = "0.26"
 insta = { version = "1", features = ["json"] }

@@ -438,7 +438,7 @@ describe('TranscriptionWhisperPane', () => {
     expect(screen.getByRole('alert')).toHaveTextContent(/stalled/i);
   });
 
-  it('renders no Cancel control, including mid-download', async () => {
+  it('renders a Cancel control only for the row that is downloading', async () => {
     mockIPC((cmd, args) => {
       if (cmd === 'get_config') return baseAppConfig();
       if (cmd === 'list_whisper_models') return MODELS;
@@ -446,7 +446,7 @@ describe('TranscriptionWhisperPane', () => {
       if (cmd === 'download_whisper_model') {
         const ch = (args as { on_progress: ProgressChannel }).on_progress;
         ch.onmessage({ received: 10, total: 100, done: false });
-        // Never resolves — keeps the download "in flight" for the assertion below.
+        // Never resolves — keeps the download "in flight" for the assertions below.
         return new Promise(() => {});
       }
     });
@@ -454,10 +454,188 @@ describe('TranscriptionWhisperPane', () => {
     render(TranscriptionWhisperPane, { props: { onPresenceChange: vi.fn() } });
 
     await screen.findByRole('radio', { name: 'tiny' });
+    expect(screen.queryByRole('button', { name: /cancel/i })).not.toBeInTheDocument();
+
     const tinyRow = rowFor('tiny');
     await fireEvent.click(within(tinyRow).getByRole('button', { name: /download tiny/i }));
 
-    await waitFor(() => expect(within(tinyRow).getByRole('progressbar')).toBeInTheDocument());
-    expect(screen.queryByRole('button', { name: /cancel/i })).not.toBeInTheDocument();
+    await waitFor(() =>
+      expect(within(tinyRow).getByRole('button', { name: /cancel tiny download/i })).toBeEnabled()
+    );
+    expect(
+      within(rowFor('small')).queryByRole('button', { name: /cancel/i })
+    ).not.toBeInTheDocument();
+  });
+
+  it('cancels via the per-row key, targeting the clicked row and not the other in-flight download', async () => {
+    const cancelArgs: unknown[] = [];
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return baseAppConfig();
+      if (cmd === 'list_whisper_models') return MODELS;
+      if (cmd === 'whisper_model_downloaded') return false;
+      if (cmd === 'download_whisper_model') return new Promise(() => {});
+      if (cmd === 'cancel_download') {
+        cancelArgs.push(args);
+        return true;
+      }
+    });
+
+    render(TranscriptionWhisperPane, { props: { onPresenceChange: vi.fn() } });
+    await screen.findByRole('radio', { name: 'tiny' });
+
+    await fireEvent.click(within(rowFor('tiny')).getByRole('button', { name: /download tiny/i }));
+    await fireEvent.click(within(rowFor('small')).getByRole('button', { name: /download small/i }));
+    await waitFor(() =>
+      expect(
+        within(rowFor('small')).getByRole('button', { name: /cancel small download/i })
+      ).toBeInTheDocument()
+    );
+
+    await fireEvent.click(
+      within(rowFor('small')).getByRole('button', { name: /cancel small download/i })
+    );
+
+    // Exact keys, not just "was called": mockIPC forwards whatever it is handed, so a
+    // camelCase or mis-shaped payload would pass a looser assertion yet fail for real.
+    await waitFor(() => expect(cancelArgs).toEqual([{ key: { kind: 'whisper', id: 'small' } }]));
+  });
+
+  it('keeps Download disabled after a cancel click until the invoke promise settles', async () => {
+    let rejectTiny: ((e: unknown) => void) | undefined;
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return baseAppConfig();
+      if (cmd === 'list_whisper_models') return MODELS;
+      if (cmd === 'whisper_model_downloaded') return false;
+      if (cmd === 'download_whisper_model') {
+        return new Promise((_resolve, reject) => {
+          rejectTiny = reject;
+        });
+      }
+      if (cmd === 'cancel_download') return true;
+    });
+
+    render(TranscriptionWhisperPane, { props: { onPresenceChange: vi.fn() } });
+    await screen.findByRole('radio', { name: 'tiny' });
+
+    const tinyRow = rowFor('tiny');
+    await fireEvent.click(within(tinyRow).getByRole('button', { name: /download tiny/i }));
+    await fireEvent.click(
+      await within(tinyRow).findByRole('button', { name: /cancel tiny download/i })
+    );
+
+    await waitFor(() =>
+      expect(within(tinyRow).getByRole('button', { name: /cancel tiny download/i })).toBeDisabled()
+    );
+    expect(within(tinyRow).getByRole('button', { name: /download tiny/i })).toBeDisabled();
+
+    rejectTiny?.({ kind: 'Cancelled', message: 'cancelled: download' });
+
+    await waitFor(() =>
+      expect(within(tinyRow).getByRole('button', { name: /download tiny/i })).toBeEnabled()
+    );
+  });
+
+  it('re-enables Cancel and says so when nothing was in flight to stop', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return baseAppConfig();
+      if (cmd === 'list_whisper_models') return MODELS;
+      if (cmd === 'whisper_model_downloaded') return false;
+      if (cmd === 'download_whisper_model') return new Promise(() => {});
+      if (cmd === 'cancel_download') return false;
+    });
+
+    render(TranscriptionWhisperPane, { props: { onPresenceChange: vi.fn() } });
+    await screen.findByRole('radio', { name: 'tiny' });
+
+    const tinyRow = rowFor('tiny');
+    await fireEvent.click(within(tinyRow).getByRole('button', { name: /download tiny/i }));
+    await fireEvent.click(
+      await within(tinyRow).findByRole('button', { name: /cancel tiny download/i })
+    );
+
+    await waitFor(() =>
+      expect(within(tinyRow).getByRole('button', { name: /cancel tiny download/i })).toBeEnabled()
+    );
+    expect(screen.getByRole('alert')).toHaveTextContent(/may have already finished/i);
+  });
+
+  it('shows no error banner when a download rejects as Cancelled', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return baseAppConfig();
+      if (cmd === 'list_whisper_models') return MODELS;
+      if (cmd === 'whisper_model_downloaded') return false;
+      if (cmd === 'download_whisper_model') {
+        throw { kind: 'Cancelled', message: 'cancelled: whisper small' };
+      }
+    });
+
+    render(TranscriptionWhisperPane, { props: { onPresenceChange: vi.fn() } });
+    await screen.findByRole('radio', { name: 'tiny' });
+
+    const tinyRow = rowFor('tiny');
+    await fireEvent.click(within(tinyRow).getByRole('button', { name: /download tiny/i }));
+
+    await waitFor(() =>
+      expect(within(tinyRow).getByRole('button', { name: /download tiny/i })).toBeEnabled()
+    );
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.queryByText(/cancelled/i)).not.toBeInTheDocument();
+  });
+
+  it('renders the InsufficientSpace byte counts plus the Storage-settings pointer', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return baseAppConfig();
+      if (cmd === 'list_whisper_models') return MODELS;
+      if (cmd === 'whisper_model_downloaded') return false;
+      if (cmd === 'download_whisper_model') {
+        throw {
+          kind: 'InsufficientSpace',
+          message: 'Not enough disk space: 487 MB needed, 112 MB available.'
+        };
+      }
+    });
+
+    render(TranscriptionWhisperPane, { props: { onPresenceChange: vi.fn() } });
+    await screen.findByRole('radio', { name: 'tiny' });
+    await fireEvent.click(within(rowFor('tiny')).getByRole('button', { name: /download tiny/i }));
+
+    const alert = await waitFor(() => screen.getByRole('alert'));
+    expect(alert).toHaveTextContent('487 MB needed, 112 MB available.');
+    expect(alert).toHaveTextContent(/Settings → Storage/);
+  });
+
+  it('does not fire the wedge watchdog across a retry-length gap that keeps ticking', async () => {
+    let channel: ProgressChannel | undefined;
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') return baseAppConfig();
+      if (cmd === 'list_whisper_models') return MODELS;
+      if (cmd === 'whisper_model_downloaded') return false;
+      if (cmd === 'download_whisper_model') {
+        channel = (args as { on_progress: ProgressChannel }).on_progress;
+        return new Promise(() => {});
+      }
+    });
+
+    render(TranscriptionWhisperPane, { props: { onPresenceChange: vi.fn() } });
+    await screen.findByRole('radio', { name: 'tiny' });
+
+    vi.useFakeTimers();
+    try {
+      await fireEvent.click(within(rowFor('tiny')).getByRole('button', { name: /download tiny/i }));
+
+      // Three attempts' worth of idle-read timeout plus backoff (≈96 s), each attempt
+      // announcing itself with the engine's attempt-start tick — total elapsed far
+      // exceeds WEDGE_TIMEOUT_MS, so only the re-arming keeps the watchdog quiet.
+      for (const total of [null, 4_000, 4_000]) {
+        await vi.advanceTimersByTimeAsync(32_000);
+        channel?.onmessage({ received: 1_000, total, done: false });
+      }
+      await vi.advanceTimersByTimeAsync(6_000);
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(within(rowFor('tiny')).getByRole('button', { name: /download tiny/i })).toBeDisabled();
   });
 });

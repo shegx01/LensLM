@@ -1,6 +1,11 @@
 import { mockIPC, clearMocks } from '@tauri-apps/api/mocks';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { listWhisperModels, whisperModelDownloaded, downloadWhisperModel } from './ipc.js';
+import {
+  listWhisperModels,
+  whisperModelDownloaded,
+  downloadWhisperModel,
+  cancelDownload
+} from './ipc.js';
 
 type ProgressChannel = {
   onmessage: (m: { received: number; total: number | null; done: boolean }) => void;
@@ -110,5 +115,35 @@ describe('downloadWhisperModel', () => {
     const calls: (number | null)[] = [];
     await expect(downloadWhisperModel('base', (pct) => calls.push(pct))).resolves.toBeUndefined();
     expect(calls).toEqual([]);
+  });
+});
+
+describe('cancelDownload', () => {
+  // mockIPC echoes the payload back, so this pins only the shape this module sends;
+  // the serialized Rust form is asserted in lens-core's `download_cancel.rs`.
+  it('sends the lowercase kind the Rust enum deserializes', async () => {
+    let receivedArgs: unknown;
+    mockIPC((cmd, args) => {
+      if (cmd === 'cancel_download') {
+        receivedArgs = args;
+        return true;
+      }
+    });
+
+    await expect(cancelDownload({ kind: 'whisper', id: 'small' })).resolves.toBe(true);
+    expect(receivedArgs).toEqual({ key: { kind: 'whisper', id: 'small' } });
+  });
+
+  it('reports false when nothing was in flight', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'cancel_download') return false;
+    });
+
+    await expect(cancelDownload({ kind: 'tts', id: 'orpheus' })).resolves.toBe(false);
+  });
+
+  it('returns false outside a Tauri host', async () => {
+    delete (globalThis as { isTauri?: boolean }).isTauri;
+    await expect(cancelDownload({ kind: 'tts', id: 'orpheus' })).resolves.toBe(false);
   });
 });

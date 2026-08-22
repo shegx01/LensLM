@@ -8,6 +8,8 @@
 
 use std::path::{Path, PathBuf};
 
+use tokio_util::sync::CancellationToken;
+
 use crate::LensError;
 use crate::tts::DownloadProgress;
 
@@ -84,6 +86,7 @@ pub fn whisper_model_downloaded(cache_root: &Path, model_id: &str) -> bool {
 pub async fn download_whisper_model<F>(
     cache_root: &Path,
     model_id: &str,
+    cancel: &CancellationToken,
     on_progress: F,
 ) -> Result<PathBuf, LensError>
 where
@@ -95,7 +98,8 @@ where
         ))
     })?;
     let dest = whisper_model_path(cache_root, model_id);
-    crate::download::download_verified(spec.url, &dest, Some(spec.sha256), on_progress).await?;
+    crate::download::download_verified(spec.url, &dest, Some(spec.sha256), cancel, on_progress)
+        .await?;
     Ok(dest)
 }
 
@@ -220,9 +224,15 @@ mod tests {
         let dest = whisper_model_path(dir.path(), "base");
 
         let mut events = Vec::new();
-        crate::download::download_verified(&server.uri(), &dest, None, |p| events.push(p))
-            .await
-            .unwrap();
+        crate::download::download_verified(
+            &server.uri(),
+            &dest,
+            None,
+            &CancellationToken::new(),
+            |p| events.push(p),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(std::fs::read(&dest).unwrap(), body);
         assert!(!events.is_empty());
@@ -252,9 +262,15 @@ mod tests {
         std::fs::write(&dest, &body).unwrap();
 
         let mut events = Vec::new();
-        crate::download::download_verified(&server.uri(), &dest, None, |p| events.push(p))
-            .await
-            .unwrap();
+        crate::download::download_verified(
+            &server.uri(),
+            &dest,
+            None,
+            &CancellationToken::new(),
+            |p| events.push(p),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(events.len(), 1);
         assert!(events[0].done);
@@ -278,14 +294,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dest = whisper_model_path(dir.path(), "base");
 
-        let err =
-            crate::download::download_verified(&server.uri(), &dest, Some(&wrong_hash), |_| {})
-                .await
-                .unwrap_err();
+        let err = crate::download::download_verified(
+            &server.uri(),
+            &dest,
+            Some(&wrong_hash),
+            &CancellationToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap_err();
 
         assert!(
-            matches!(err, LensError::Network(_)),
-            "expected Network error, got {err:?}"
+            matches!(err, LensError::IntegrityCheckFailed(_)),
+            "expected IntegrityCheckFailed, got {err:?}"
         );
         assert!(!dest.exists(), "dest must not exist on mismatch");
         assert!(
@@ -309,9 +330,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dest = whisper_model_path(dir.path(), "base");
 
-        let err = crate::download::download_verified(&server.uri(), &dest, None, |_| {})
-            .await
-            .unwrap_err();
+        let err = crate::download::download_verified(
+            &server.uri(),
+            &dest,
+            None,
+            &CancellationToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, LensError::Network(_)));
         assert!(!dest.exists());
     }
@@ -319,9 +346,14 @@ mod tests {
     #[tokio::test]
     async fn download_whisper_model_unknown_id_is_validation_error() {
         let dir = tempfile::tempdir().unwrap();
-        let err = download_whisper_model(dir.path(), "does-not-exist", |_| {})
-            .await
-            .unwrap_err();
+        let err = download_whisper_model(
+            dir.path(),
+            "does-not-exist",
+            &CancellationToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(err, LensError::Validation(_)),
             "expected Validation, got {err:?}"
@@ -349,9 +381,15 @@ mod tests {
             .mount(&server)
             .await;
 
-        crate::download::download_verified(&server.uri(), &dest, Some(&expected_hash), |_| {})
-            .await
-            .unwrap();
+        crate::download::download_verified(
+            &server.uri(),
+            &dest,
+            Some(&expected_hash),
+            &CancellationToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
 
         assert_eq!(std::fs::read(&dest).unwrap(), body);
         assert!(!dest.with_extension("part").exists());

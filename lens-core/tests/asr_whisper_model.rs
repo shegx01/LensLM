@@ -50,9 +50,14 @@ async fn whisper_transcribes_fixture() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     // Fetch the base model into the standard cache layout, then load it offline.
-    download_whisper_model(dir.path(), DEFAULT_WHISPER_MODEL_ID, |_| {})
-        .await
-        .expect("download base whisper model");
+    download_whisper_model(
+        dir.path(),
+        DEFAULT_WHISPER_MODEL_ID,
+        &tokio_util::sync::CancellationToken::new(),
+        |_| {},
+    )
+    .await
+    .expect("download base whisper model");
     let model_path = whisper_model_path(dir.path(), DEFAULT_WHISPER_MODEL_ID);
     let engine = WhisperEngine::load(&model_path).expect("load whisper engine");
 
@@ -100,9 +105,14 @@ async fn whisper_precancelled_token_aborts_transcription() {
     }
 
     let dir = tempfile::tempdir().expect("tempdir");
-    download_whisper_model(dir.path(), DEFAULT_WHISPER_MODEL_ID, |_| {})
-        .await
-        .expect("download base whisper model");
+    download_whisper_model(
+        dir.path(),
+        DEFAULT_WHISPER_MODEL_ID,
+        &tokio_util::sync::CancellationToken::new(),
+        |_| {},
+    )
+    .await
+    .expect("download base whisper model");
     let model_path = whisper_model_path(dir.path(), DEFAULT_WHISPER_MODEL_ID);
     let engine = WhisperEngine::load(&model_path).expect("load whisper engine");
 

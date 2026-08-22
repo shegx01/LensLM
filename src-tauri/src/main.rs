@@ -235,6 +235,7 @@ fn main() {
             commands::system::cancel_prepare,
             commands::system::list_whisper_models,
             commands::system::download_whisper_model,
+            commands::system::cancel_download,
             commands::system::whisper_model_downloaded,
             commands::system::asr_apple_native_available,
             commands::system::resolve_asr_backend,

@@ -2,14 +2,23 @@
 //! serializes concurrent prepares to one download (second caller re-checks the on-disk
 //! snapshot after the gate) and holds the cancel slot. Bridge-crate only, like the sidecar.
 
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 
-use lens_core::{DownloadProgress, LensError};
+use lens_core::{
+    DISK_HEADROOM_BYTES, DownloadProgress, LensError, available_space_bytes, human_bytes,
+    path_size_bytes,
+};
 
+use super::prepare::QWEN_SNAPSHOT_DIR;
 use super::{SidecarPaths, SpawnResolver, qwen_snapshot_present, run_prepare};
+
+/// The `~4.5 GB` snapshot size `system.rs` documents; no fetcher here exposes a
+/// real `Content-Length` to probe instead.
+const QWEN_SNAPSHOT_APPROX_BYTES: u64 = 4_500_000_000;
 
 pub struct QwenPrepareCoordinator {
     /// Serializes prepares: a second caller blocks here until the first finishes.
@@ -44,6 +53,21 @@ impl QwenPrepareCoordinator {
     where
         F: FnMut(DownloadProgress) + Send,
     {
+        self.run_single_flight_with_probe(paths, resolver, on_progress, available_space_bytes)
+            .await
+    }
+
+    async fn run_single_flight_with_probe<F, P>(
+        &self,
+        paths: &SidecarPaths,
+        resolver: SpawnResolver,
+        on_progress: F,
+        probe: P,
+    ) -> Result<(), LensError>
+    where
+        F: FnMut(DownloadProgress) + Send,
+        P: Fn(&Path) -> Option<u64> + Send + Sync,
+    {
         // Declared FIRST so it outlives the clear guard (reverse drop order): the
         // slot is cleared before the gate releases, so the next caller queued
         // behind us never observes a stale token.
@@ -53,6 +77,28 @@ impl QwenPrepareCoordinator {
         // completed the download, so there is nothing left to do (AC-2).
         if qwen_snapshot_present(&paths.hf_cache_dir) {
             return Ok(());
+        }
+
+        // Ordering is the whole safety argument: the short-circuit above is what
+        // keeps a fully-cached snapshot from ever reaching this guard.
+        let snapshot_dir = paths.hf_cache_dir.join("hub").join(QWEN_SNAPSHOT_DIR);
+        let on_disk = path_size_bytes(&snapshot_dir).unwrap_or(0);
+        let required = QWEN_SNAPSHOT_APPROX_BYTES
+            .saturating_sub(on_disk)
+            .saturating_add(DISK_HEADROOM_BYTES);
+        match probe(&paths.hf_cache_dir) {
+            Some(available) if available < required => {
+                return Err(LensError::InsufficientSpace(format!(
+                    "the Qwen voice model needs {} of free space but only {} are available",
+                    human_bytes(required),
+                    human_bytes(available)
+                )));
+            }
+            Some(_) => {}
+            None => tracing::warn!(
+                dir = %paths.hf_cache_dir.display(),
+                "Qwen disk pre-flight skipped: the free-space probe failed"
+            ),
         }
 
         let token = Arc::new(CancellationToken::new());
@@ -136,6 +182,10 @@ mod tests {
         })
     }
 
+    fn ample_probe(_: &Path) -> Option<u64> {
+        Some(u64::MAX)
+    }
+
     fn write_stub(dir: &Path, body: &str) -> PathBuf {
         let path = dir.join("stub.py");
         std::fs::write(&path, body).unwrap();
@@ -201,15 +251,17 @@ sys.exit(1)
         let paths = paths_at(&hf);
 
         let (a, b) = tokio::join!(
-            coord.run_single_flight(
+            coord.run_single_flight_with_probe(
                 &paths,
                 counting_resolver(stub.clone(), extra.clone(), count.clone()),
                 |_| {},
+                ample_probe,
             ),
-            coord.run_single_flight(
+            coord.run_single_flight_with_probe(
                 &paths,
                 counting_resolver(stub.clone(), extra.clone(), count.clone()),
                 |_| {},
+                ample_probe,
             ),
         );
         a.expect("first prepare succeeds");
@@ -232,7 +284,7 @@ sys.exit(1)
         let paths = paths_at(&hf);
         let resolver = counting_resolver(stub, vec![], count);
 
-        let run = coord.run_single_flight(&paths, resolver, |_| {});
+        let run = coord.run_single_flight_with_probe(&paths, resolver, |_| {}, ample_probe);
         tokio::pin!(run);
         let result = loop {
             tokio::select! {
@@ -260,20 +312,22 @@ sys.exit(1)
         let paths = paths_at(&hf);
 
         let e1 = coord
-            .run_single_flight(
+            .run_single_flight_with_probe(
                 &paths,
                 counting_resolver(stub.clone(), vec![], count.clone()),
                 |_| {},
+                ample_probe,
             )
             .await
             .expect_err("failing stub errors");
         assert!(matches!(e1, LensError::Tts(_)));
 
         let e2 = coord
-            .run_single_flight(
+            .run_single_flight_with_probe(
                 &paths,
                 counting_resolver(stub, vec![], count.clone()),
                 |_| {},
+                ample_probe,
             )
             .await
             .expect_err("second re-enters (snapshot never completed) and also errors");
@@ -282,6 +336,162 @@ sys.exit(1)
             count.load(Ordering::SeqCst),
             2,
             "a failed run does not block re-entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn insufficient_probe_rejects_before_any_prepare() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hf = tmp.path().join("hf");
+        std::fs::create_dir_all(&hf).unwrap();
+        let stub = write_stub(tmp.path(), SNAPSHOT_STUB);
+        let count = Arc::new(AtomicUsize::new(0));
+        let extra = vec![
+            hf.to_string_lossy().into_owned(),
+            crate::qwen::prepare::QWEN_SNAPSHOT_DIR.to_string(),
+        ];
+        let coord = QwenPrepareCoordinator::new();
+        let paths = paths_at(&hf);
+
+        let result = coord
+            .run_single_flight_with_probe(
+                &paths,
+                counting_resolver(stub, extra, count.clone()),
+                |_| {},
+                |_: &Path| Some(0u64),
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(LensError::InsufficientSpace(_))),
+            "an insufficient probe must reject, got {result:?}"
+        );
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            0,
+            "no prepare must be spawned when the pre-flight rejects"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_partial_snapshot_only_demands_the_bytes_still_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hf = tmp.path().join("hf");
+        let snapshot_dir = hf.join("hub").join(QWEN_SNAPSHOT_DIR);
+        std::fs::create_dir_all(snapshot_dir.join("blobs")).unwrap();
+        std::fs::write(
+            snapshot_dir.join("blobs").join("halfway"),
+            vec![7u8; 64 * 1024],
+        )
+        .unwrap();
+        let stub = write_stub(tmp.path(), SNAPSHOT_STUB);
+        let count = Arc::new(AtomicUsize::new(0));
+        let extra = vec![
+            hf.to_string_lossy().into_owned(),
+            QWEN_SNAPSHOT_DIR.to_string(),
+        ];
+        let coord = QwenPrepareCoordinator::new();
+        let paths = paths_at(&hf);
+
+        let on_disk = path_size_bytes(&snapshot_dir).unwrap();
+        assert!(
+            on_disk >= 64 * 1024,
+            "the fixture must be a partially-populated snapshot, not an empty one: {on_disk}"
+        );
+        let just_enough = QWEN_SNAPSHOT_APPROX_BYTES - on_disk + DISK_HEADROOM_BYTES;
+
+        let result = coord
+            .run_single_flight_with_probe(
+                &paths,
+                counting_resolver(stub, extra, count.clone()),
+                |_| {},
+                move |_: &Path| Some(just_enough),
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "the {on_disk} bytes already cached must not be demanded a second time, or a user \
+             who is nearly finished can never finish: {result:?}"
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn present_snapshot_short_circuits_even_with_zero_space_probe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hf = tmp.path().join("hf");
+        std::fs::create_dir_all(&hf).unwrap();
+        let stub = write_stub(tmp.path(), SNAPSHOT_STUB);
+        let count = Arc::new(AtomicUsize::new(0));
+        let extra = vec![
+            hf.to_string_lossy().into_owned(),
+            crate::qwen::prepare::QWEN_SNAPSHOT_DIR.to_string(),
+        ];
+        let coord = QwenPrepareCoordinator::new();
+        let paths = paths_at(&hf);
+
+        coord
+            .run_single_flight_with_probe(
+                &paths,
+                counting_resolver(stub.clone(), extra.clone(), count.clone()),
+                |_| {},
+                ample_probe,
+            )
+            .await
+            .expect("first prepare populates the on-disk snapshot");
+
+        let result = coord
+            .run_single_flight_with_probe(
+                &paths,
+                counting_resolver(stub, extra, count.clone()),
+                |_| {},
+                |_: &Path| Some(0u64),
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "a fully-cached snapshot must short-circuit before the disk guard, got {result:?}"
+        );
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "the second call must not spawn a prepare"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_that_cannot_answer_lets_prepare_proceed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hf = tmp.path().join("hf");
+        std::fs::create_dir_all(&hf).unwrap();
+        let stub = write_stub(tmp.path(), SNAPSHOT_STUB);
+        let count = Arc::new(AtomicUsize::new(0));
+        let extra = vec![
+            hf.to_string_lossy().into_owned(),
+            crate::qwen::prepare::QWEN_SNAPSHOT_DIR.to_string(),
+        ];
+        let coord = QwenPrepareCoordinator::new();
+        let paths = paths_at(&hf);
+
+        let result = coord
+            .run_single_flight_with_probe(
+                &paths,
+                counting_resolver(stub, extra, count.clone()),
+                |_| {},
+                |_: &Path| None,
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "a probe that cannot answer must abstain, got {result:?}"
+        );
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "abstaining must let the prepare proceed"
         );
     }
 

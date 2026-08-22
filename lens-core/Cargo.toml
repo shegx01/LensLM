@@ -97,6 +97,8 @@ reqwest = { version = "=0.13.4", default-features = false, features = [
 ] }
 # Stream combinators (`StreamExt::next`) for consuming `reqwest`'s byte stream.
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# Free-space probe behind `download::available_space_bytes` (#37 disk pre-flight).
+fs4 = { workspace = true }
 
 # Gunzip the committed `bundled-catalog.json.gz` offline-floor catalog in
 # `model_catalog::ModelCatalog::bundled()`. flate2 is ALREADY in the lock tree
@@ -304,6 +306,10 @@ insta = { workspace = true }
 tempfile = { workspace = true }
 # In-process HTTP mock server for the LLM/embedding runtime probe tests.
 wiremock = "0.6"
+# `net`/`io-util` back the raw-TCP fixture that truncates a response body mid-stream
+# (wiremock rejects a body shorter than its Content-Length), which is the only way to
+# assert `.part` survives a transient stream error. Test-only feature union.
+tokio = { workspace = true, features = ["net", "io-util"] }
 # Direct LanceDB reads in the ingest integration tests (orphan-vector assertions
 # in the re-ingest/wipe test). Pinned to the same versions the lib already
 # resolves so no second copy is pulled into the lock tree.
