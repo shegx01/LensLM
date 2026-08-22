@@ -258,6 +258,17 @@ pub struct LensEngineInner {
     pub(crate) config: AppConfig,
 }
 
+/// Two-way handshake for #248 quiesce tests: the engine signals `reached` once it
+/// is inside the guarded region, then waits on `release`. Without the `reached`
+/// half a test cannot know the shared guard is held, and would assert against a
+/// relocation that simply won the race.
+#[cfg(feature = "test-util")]
+#[derive(Default)]
+pub struct QuiesceGate {
+    pub reached: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
+}
+
 /// Thread-safe, cheaply-cloneable handle to the LensLM engine state.
 ///
 /// # Concurrency invariants (load-bearing)
@@ -286,6 +297,11 @@ pub struct LensEngine {
     tokenizer: Arc<OnceCell<Arc<Tokenizer>>>,
     /// Single-permit gate serializing ingest runs (ONNX session is single-threaded).
     ingest_lock: Arc<Semaphore>,
+    /// Blocks background Lance writers while the data dir is copied. Total lock
+    /// order is `ingest_lock` → `notebook_lock` → `quiesce`, and `quiesce` is never
+    /// held across any other lock acquisition — shared holders guard one Lance
+    /// statement, so a relocation cannot deadlock behind a pool or model load.
+    quiesce: Arc<RwLock<()>>,
     /// Sender half of the background enrichment queue (M4 Phase 3). `Clone` so it
     /// rides `#[derive(Clone)]`. Dropping every clone closes the channel.
     enrichment_tx: mpsc::Sender<EnrichmentJob>,
@@ -344,6 +360,10 @@ pub struct LensEngine {
     /// Fix-#2 test seam: blocks reembed after populate, before the flip window.
     #[cfg(feature = "test-util")]
     reembed_preflip_gate: Arc<RwLock<Option<Arc<tokio::sync::Notify>>>>,
+    /// #248 test seam: holds a shared `quiesce` reader in flight. Must be awaited
+    /// INSIDE the guarded region — a gate before it lets relocation win the race.
+    #[cfg(feature = "test-util")]
+    quiesce_upsert_gate: Arc<RwLock<Option<Arc<QuiesceGate>>>>,
     /// When `true`, `tokenizer()` fails fast so Step-4 tests run fully offline.
     #[cfg(feature = "test-util")]
     skip_tokenizer: Arc<std::sync::atomic::AtomicBool>,
@@ -439,6 +459,7 @@ impl LensEngine {
             accelerator: crate::embedder::default_accelerator(),
             tokenizer: Arc::new(OnceCell::new()),
             ingest_lock: Arc::new(Semaphore::new(1)),
+            quiesce: Arc::new(RwLock::new(())),
             enrichment_tx,
             resolution_tx,
             notebook_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -458,6 +479,8 @@ impl LensEngine {
             enrichment_gate: Arc::new(RwLock::new(None)),
             #[cfg(feature = "test-util")]
             reembed_preflip_gate: Arc::new(RwLock::new(None)),
+            #[cfg(feature = "test-util")]
+            quiesce_upsert_gate: Arc::new(RwLock::new(None)),
             #[cfg(feature = "test-util")]
             skip_tokenizer: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "test-util")]
@@ -534,6 +557,7 @@ impl LensEngine {
             accelerator: crate::embedder::default_accelerator(),
             tokenizer: Arc::new(OnceCell::new()),
             ingest_lock: Arc::new(Semaphore::new(1)),
+            quiesce: Arc::new(RwLock::new(())),
             enrichment_tx,
             resolution_tx,
             notebook_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -553,6 +577,8 @@ impl LensEngine {
             enrichment_gate: Arc::new(RwLock::new(None)),
             #[cfg(feature = "test-util")]
             reembed_preflip_gate: Arc::new(RwLock::new(None)),
+            #[cfg(feature = "test-util")]
+            quiesce_upsert_gate: Arc::new(RwLock::new(None)),
             #[cfg(feature = "test-util")]
             skip_tokenizer: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "test-util")]
@@ -1081,6 +1107,11 @@ impl LensEngine {
         &self.ingest_lock
     }
 
+    /// See the `quiesce` field for the lock order this participates in.
+    pub(crate) fn quiesce(&self) -> &Arc<RwLock<()>> {
+        &self.quiesce
+    }
+
     /// Byte-usage breakdown of the data directory (corpus / reclaimable cache /
     /// retained). Read-only. The recursive fs walk runs under `spawn_blocking`
     /// so a multi-GB directory never blocks an async executor thread; missing
@@ -1134,6 +1165,11 @@ impl LensEngine {
             .map_err(|e| LensError::Internal(format!("ingest semaphore closed: {e}")))?;
         let from = self.data_dir().await;
         let pool = self.pool().await;
+        // Taken AFTER the permit and after the reads above: the declared order is
+        // `ingest_lock` → `quiesce`, and inverting it would deadlock any future
+        // shared-guard site inside an `ingest_lock` region.
+        let _quiesce = self.quiesce.write().await;
+        tracing::info!(reason = "relocate", "acquired quiesce for data-dir move");
         crate::relocate::relocate_data_dir(&pool, &from, to, extra_regenerable).await?;
         Ok(from)
     }
@@ -2728,6 +2764,23 @@ impl LensEngine {
     #[cfg(feature = "test-util")]
     pub async fn set_reembed_preflip_gate_for_test(&self, gate: Option<Arc<tokio::sync::Notify>>) {
         *self.reembed_preflip_gate.write().await = gate;
+    }
+
+    /// Awaited while the shared `quiesce` guard is held, so a #248 test can pin a
+    /// Lance write in flight and observe a relocation blocking behind it.
+    #[cfg(feature = "test-util")]
+    pub(crate) async fn quiesce_upsert_gate(&self) {
+        let gate = self.quiesce_upsert_gate.read().await.clone();
+        if let Some(gate) = gate {
+            gate.reached.notify_one();
+            gate.release.notified().await;
+        }
+    }
+
+    /// Installs (or clears) the in-guard quiesce gate for #248 tests.
+    #[cfg(feature = "test-util")]
+    pub async fn set_quiesce_upsert_gate_for_test(&self, gate: Option<Arc<QuiesceGate>>) {
+        *self.quiesce_upsert_gate.write().await = gate;
     }
 
     /// Test-only seam: directly enqueue a source onto the enrichment queue (the

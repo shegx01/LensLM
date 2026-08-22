@@ -358,12 +358,20 @@ async fn relocate_into(
     extra_skip: &[&str],
 ) -> Result<(), LensError> {
     snapshot_db(pool, &to.join("lens.db")).await?;
-    let skip: Vec<&str> = COPY_SKIP
+    // Owned, because the multi-GB walk moves to the blocking pool rather than
+    // pinning a runtime worker while the exclusive quiesce guard is held.
+    let skip: Vec<String> = COPY_SKIP
         .iter()
-        .copied()
-        .chain(extra_skip.iter().copied())
+        .chain(extra_skip.iter())
+        .map(|s| (*s).to_string())
         .collect();
-    copy_tree(from, to, &skip)?;
+    let (copy_from, copy_to) = (from.to_path_buf(), to.to_path_buf());
+    tokio::task::spawn_blocking(move || {
+        let skip_refs: Vec<&str> = skip.iter().map(String::as_str).collect();
+        copy_tree(&copy_from, &copy_to, &skip_refs)
+    })
+    .await
+    .map_err(|e| LensError::Io(format!("data-dir copy task panicked: {e}")))??;
 
     // Verify + rewrite against the copied DB via its own pool; close it on every
     // path so no stray connection holds the new file open.

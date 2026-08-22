@@ -136,7 +136,15 @@ pub(crate) async fn resolve_one(engine: &LensEngine, notebook_id: &str) -> Resul
         });
         vector_by_id.insert(node.id.clone(), vector);
     }
-    store.upsert_entity_vectors(&coord, rows).await?;
+    // The only live-table Lance write outside `ingest_lock`. Its body is
+    // delete-then-insert, so a relocation copy landing mid-write captures rows
+    // removed and not reinserted. Holds no other lock — see `LensEngine::quiesce`.
+    {
+        let _quiesce = engine.quiesce().read().await;
+        #[cfg(feature = "test-util")]
+        engine.quiesce_upsert_gate().await;
+        store.upsert_entity_vectors(&coord, rows).await?;
+    }
 
     // `None` provider degrades the cascade to Tiers 1-2 (never fails the pass).
     let provider = engine.llm_provider().await;

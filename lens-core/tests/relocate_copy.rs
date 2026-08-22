@@ -2,6 +2,9 @@
 //! every entry it does not explicitly skip must reach the new dir, including ones
 //! no static enumeration names. Converting it to an allow-list is the regression.
 
+mod common;
+
+use common::pin_catalog_offline;
 use lens_core::LensEngine;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -43,12 +46,6 @@ fn write_at(root: &Path, rel: &str, body: &[u8]) {
         std::fs::create_dir_all(parent).expect("create parent");
     }
     std::fs::write(&p, body).expect("write seed");
-}
-
-/// A fresh catalog cache makes `refresh_if_stale` return before its HTTP call, so
-/// `LensEngine::init` stays offline (CLAUDE.md: tests are offline by default).
-fn pin_catalog_offline(root: &Path) {
-    write_at(root, lens_core::MODELS_CATALOG_RELPATH, b"{\"models\":[]}");
 }
 
 fn seed(root: &Path) {
