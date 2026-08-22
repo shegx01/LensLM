@@ -153,7 +153,10 @@ async fn torn_vec_table_is_reclaimed_without_erroring_the_sweep() {
         .join(format!("{torn}.lance"))
         .join("_versions");
     for entry in std::fs::read_dir(&versions).expect("read _versions") {
-        std::fs::remove_file(entry.expect("entry").path()).expect("remove manifest");
+        let path = entry.expect("entry").path();
+        if path.is_file() {
+            std::fs::remove_file(&path).expect("remove manifest");
+        }
     }
     assert!(
         table_names(dir.path()).await.iter().any(|t| t == torn),

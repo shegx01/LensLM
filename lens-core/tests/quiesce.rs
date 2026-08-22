@@ -29,13 +29,19 @@ async fn relocation_waits_for_an_in_flight_entity_vector_write() {
 
     let pass_engine = engine.clone();
     let pass_nb = nb.clone();
-    let pass = tokio::spawn(async move { pass_engine.resolve_notebook_for_test(&pass_nb).await });
+    let mut pass =
+        tokio::spawn(async move { pass_engine.resolve_notebook_for_test(&pass_nb).await });
 
     // Without this handshake the assertion below could pass simply because the
     // relocation ran before the guard was ever taken.
-    timeout(REACHED, gate.reached.notified())
-        .await
-        .expect("resolution pass must reach the in-guard seam");
+    // Select rather than plain timeout: `resolve_one` has pre-gate exits, and a bare
+    // timeout would report "never reached the seam" while dropping the real error.
+    tokio::select! {
+        r = timeout(REACHED, gate.reached.notified()) => {
+            r.expect("resolution pass must reach the in-guard seam");
+        }
+        early = &mut pass => panic!("pass ended before the seam: {early:?}"),
+    }
 
     let blocked = timeout(BLOCKED, engine.relocate_data_dir(&to, &[])).await;
     assert!(
