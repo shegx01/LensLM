@@ -168,6 +168,46 @@ async fn torn_vec_table_is_reclaimed_without_erroring_the_sweep() {
     );
 }
 
+/// The union in `create_building_table`: with an unregistered orphan still on disk
+/// and NO restart, a re-embed must pick a different generation instead of erroring.
+/// This is the half the startup sweep cannot fix — it makes the brick recoverable
+/// at next launch, not impossible within the session.
+#[tokio::test]
+async fn building_table_skips_a_live_unregistered_orphan() {
+    use lens_core::vector_store::{Coordinate, LanceVectorStore, VectorStore};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    pin_catalog_offline(dir.path());
+    let engine = LensEngine::init(dir.path()).await.expect("init engine");
+    let pool = engine.pool().await;
+    let nb = engine
+        .create_notebook("nb", None, None)
+        .await
+        .expect("create notebook")
+        .id
+        .to_string();
+
+    let coord = Coordinate::new(
+        nb.clone(),
+        lens_core::EmbeddingBackend::Fastembed,
+        "nomic-embed-text-v1.5".to_string(),
+        768,
+    );
+    // Occupies exactly the name the registry-only search would return first.
+    let squatter = format!("vec__{nb}__fastembed__nomic_v15__d768__1");
+    make_unregistered_table(dir.path(), &squatter).await;
+
+    let store = LanceVectorStore::new(dir.path(), pool.clone());
+    let picked = VectorStore::create_building_table(&store, &coord)
+        .await
+        .expect("create_building_table must skip the orphan, not error on it");
+    assert_ne!(
+        picked, squatter,
+        "the generation search must not hand back an occupied physical name"
+    );
+    pool.close().await;
+}
+
 /// The `active` table survives; `building`/`stale` are reclaimed — but by the
 /// PRE-EXISTING registry-driven pass, which drops those tables and deletes their
 /// rows before the `vec__` sweep runs. The sweep therefore only ever sees a

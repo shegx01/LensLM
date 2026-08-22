@@ -1288,6 +1288,15 @@ impl VectorStore for LanceVectorStore {
             .registry
             .lance_table_names_for_coordinate(coord)
             .await?;
+        let conn = self.connect().await?;
+        // Union the physical names: the registry alone hands back a generation that
+        // `create_empty_table` then rejects. EXACT equality — the listing spans all
+        // notebooks and both table families, so prefix matching would be wrong here.
+        let physical = conn
+            .table_names()
+            .execute()
+            .await
+            .map_err(|e| LensError::Vector(format!("lancedb table_names failed: {e}")))?;
         let mut generation = 1u32;
         let building_name = loop {
             let candidate = gen_table_name(
@@ -1297,16 +1306,15 @@ impl VectorStore for LanceVectorStore {
                 dim,
                 generation,
             );
-            if !existing.iter().any(|n| n == &candidate) {
+            if !existing.contains(&candidate) && !physical.contains(&candidate) {
                 break candidate;
             }
             generation += 1;
         };
 
-        // Create the physical table first: a crash before the registry insert
-        // leaves a harmless unregistered orphan; a crash after leaves a `building`
-        // row the startup-GC reclaims.
-        let conn = self.connect().await?;
+        // Physical table first: a crash before the registry insert leaves an orphan
+        // the union above skips and the startup sweep reclaims; a crash after leaves
+        // a `building` row the startup-GC reclaims.
         conn.create_empty_table(building_name.as_str(), vector_schema(dim))
             .execute()
             .await
