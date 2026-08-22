@@ -2684,6 +2684,9 @@ impl LensEngine {
     /// delete its registry row. Static helper (no engine handle) so `init` can call
     /// it early. The `active` row is never touched.
     async fn gc_orphan_embedding_tables(db: &SqlitePool, data_dir: &Path) -> Result<(), LensError> {
+        // FIRST, while `embedding_index` still holds every row: the sweep drops what
+        // the registry cannot name, so the fuller the registry the safer it is.
+        Self::gc_unregistered_vec_tables(db, data_dir).await?;
         let table_names: Vec<String> = sqlx::query_scalar(
             "SELECT lance_table_name FROM embedding_index WHERE status IN ('building', 'stale')",
         )
@@ -2705,6 +2708,57 @@ impl LensEngine {
         // ent__ tables carry no registry, so their GC runs regardless of the
         // building/stale scan above (a crashed purge_notebook orphans them alone).
         Self::gc_orphan_entity_tables(db, data_dir).await
+    }
+
+    /// Startup-GC for `vec__` tables that no `embedding_index` row names. A THIRD,
+    /// listing-driven pass: the scan above is registry-driven and so cannot see a
+    /// table whose row is gone, and `create_building_table` picks its generation
+    /// from the registry alone while erroring on an existing physical name — so
+    /// such an orphan permanently bricks re-embed and streaming ingest for that
+    /// notebook until it is reclaimed.
+    ///
+    /// Safe only because `init` awaits the GC before spawning any worker; moving
+    /// this to a periodic task would need `ingest_lock` or the quiesce guard.
+    async fn gc_unregistered_vec_tables(db: &SqlitePool, data_dir: &Path) -> Result<(), LensError> {
+        let store = crate::vector_store::LanceVectorStore::new(data_dir, db.clone());
+        let physical = crate::vector_store::VectorStore::vec_table_names(&store).await?;
+        if physical.is_empty() {
+            return Ok(());
+        }
+        // The WHOLE column, every status. Deliberately NOT falsifiable at startup —
+        // the registry pass below reclaims exactly the non-active rows, so an
+        // `active`-only query would reach the same end state. It is load-bearing
+        // only if this sweep is ever called from anywhere else.
+        let registered: Vec<String> =
+            sqlx::query_scalar("SELECT lance_table_name FROM embedding_index")
+                .fetch_all(db)
+                .await?;
+
+        let mut dropped = Vec::new();
+        for name in physical {
+            if registered.contains(&name) {
+                continue;
+            }
+            // One name per call, never the batch: `drop_tables` propagates a
+            // per-table failure out of its own loop, which would abort the sweep
+            // and leave both the orphan and its generation collision in place.
+            match crate::vector_store::VectorStore::drop_tables(&store, std::slice::from_ref(&name))
+                .await
+            {
+                Ok(()) => dropped.push(name),
+                Err(e) => {
+                    tracing::warn!(table = %name, error = %e, "unregistered vec table drop failed")
+                }
+            }
+        }
+        if !dropped.is_empty() {
+            tracing::info!(
+                count = dropped.len(),
+                tables = ?dropped,
+                "startup-GC reclaimed unregistered vec tables"
+            );
+        }
+        Ok(())
     }
 
     /// Startup-GC for `ent__` entity-vector tables (#155): drops Lance dirs for

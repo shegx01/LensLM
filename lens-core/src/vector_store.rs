@@ -247,6 +247,10 @@ pub trait VectorStore: Send + Sync {
 
     /// Enumerates every `ent__` table, paired with its encoded notebook id (startup GC).
     async fn entity_tables_with_notebook(&self) -> Result<Vec<(String, String)>, LensError>;
+
+    /// Physical `vec__` table names on disk, independent of `embedding_index`.
+    /// The registry-driven GC cannot see a table whose row is gone; this can.
+    async fn vec_table_names(&self) -> Result<Vec<String>, LensError>;
 }
 
 /// Slugifies a model id into a table-safe token: `nomic-embed-text-v1.5` →
@@ -277,9 +281,12 @@ fn model_slug(model: &str) -> String {
 /// CRITICAL: for existing tables, always use the name stored in the registry —
 /// never re-derive it. A pre-4b-B table (`vec__{nb}__nomic_v15__d768`) keeps
 /// its stored name; only new coordinates flow through this function.
+/// Every physical chunk-vector table starts with this, in any naming generation.
+pub(crate) const VEC_TABLE_PREFIX: &str = "vec__";
+
 fn table_name(notebook: &str, backend: EmbeddingBackend, model: &str, dim: usize) -> String {
     format!(
-        "vec__{notebook}__{}__{}__d{dim}",
+        "{VEC_TABLE_PREFIX}{notebook}__{}__{}__d{dim}",
         backend.as_str(),
         model_slug(model)
     )
@@ -1574,6 +1581,22 @@ impl VectorStore for LanceVectorStore {
         Ok(existing
             .into_iter()
             .filter_map(|t| entity_table_notebook(&t).map(|nb| (t, nb)))
+            .collect())
+    }
+
+    async fn vec_table_names(&self) -> Result<Vec<String>, LensError> {
+        let conn = self.connect().await?;
+        let existing = conn
+            .table_names()
+            .execute()
+            .await
+            .map_err(|e| LensError::Vector(format!("lancedb table_names failed: {e}")))?;
+        // Match the PREFIX, never `table_name`'s current format: a pre-4b-B table
+        // (`vec__{nb}__nomic_v15__d768`) does not match the formula and would be
+        // missed. Selecting positively also keeps every `ent__` table out.
+        Ok(existing
+            .into_iter()
+            .filter(|t| t.starts_with(VEC_TABLE_PREFIX))
             .collect())
     }
 }
