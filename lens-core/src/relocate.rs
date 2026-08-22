@@ -17,34 +17,10 @@ use crate::error::LensError;
 pub const LOCATION_FILE: &str = "location.json";
 const LOCATION_PENDING: &str = "location.json.pending";
 
-/// On-disk entries that make up a data dir. Used to copy (relocation) and to clean
-/// up a superseded old dir without ever removing the directory itself or a pointer
-/// file that may share it. `models`/`hf-cache` are absent when the cache is
-/// offloaded elsewhere — removing a missing path is a no-op.
-const DATA_ENTRIES: &[&str] = &[
-    "lens.db",
-    "lens.db-wal",
-    "lens.db-shm",
-    "lancedb",
-    "sources",
-    "notebooks",
-    "config.json",
-    "models",
-    "hf-cache",
-];
-
-/// Re-downloadable model-cache dirs, moved together on offload/reset.
-const CACHE_ENTRIES: &[&str] = &["models", "hf-cache"];
-
-/// Entries handled specially by [`relocate_data_dir`] and never bulk-copied: the DB
-/// files (snapshotted via `VACUUM INTO`) and the anchor-only pointer files.
-const COPY_SKIP: &[&str] = &[
-    "lens.db",
-    "lens.db-wal",
-    "lens.db-shm",
-    LOCATION_FILE,
-    LOCATION_PENDING,
-];
+// The three enumerations below are DERIVED from `crate::layout::LAYOUT`; adding a
+// subsystem there updates copy, cleanup and accounting together. `copy_tree` stays
+// a DENY-list driven by `copy_skip()` — an allow-list over these would silently
+// stop copying anything the descriptor does not name.
 
 /// Pointer describing where the active data dir lives, plus an optional old dir
 /// awaiting best-effort cleanup on the next successful boot.
@@ -139,7 +115,7 @@ pub fn run_boot_cleanup(anchor: &Path, active_data_dir: &Path, extra: &[&str]) {
         );
         return;
     }
-    for entry in DATA_ENTRIES.iter().chain(extra) {
+    for entry in crate::layout::data_entries().iter().chain(extra) {
         let path = old.join(entry);
         if let Err(e) = remove_if_exists(&path) {
             tracing::warn!(path = %path.display(), error = %e, "old-dir cleanup entry failed");
@@ -360,7 +336,7 @@ async fn relocate_into(
     snapshot_db(pool, &to.join("lens.db")).await?;
     // Owned, because the multi-GB walk moves to the blocking pool rather than
     // pinning a runtime worker while the exclusive quiesce guard is held.
-    let skip: Vec<String> = COPY_SKIP
+    let skip: Vec<String> = crate::layout::copy_skip()
         .iter()
         .chain(extra_skip.iter())
         .map(|s| (*s).to_string())
@@ -406,7 +382,7 @@ pub fn copy_cache(from_root: &Path, to_root: &Path) -> Result<u64, LensError> {
         ));
     }
     let mut copied = 0u64;
-    for entry in CACHE_ENTRIES {
+    for entry in crate::layout::cache_entries() {
         let src = from_root.join(entry);
         if !src.exists() {
             continue;
@@ -426,7 +402,7 @@ pub fn copy_cache(from_root: &Path, to_root: &Path) -> Result<u64, LensError> {
 /// Removes the model-cache dirs under `root` (the old cache root after a successful
 /// offload, or the offload target when resetting). Best-effort per entry.
 pub fn remove_cache(root: &Path) -> Result<(), LensError> {
-    for entry in CACHE_ENTRIES {
+    for entry in crate::layout::cache_entries() {
         remove_if_exists(&root.join(entry))?;
     }
     Ok(())

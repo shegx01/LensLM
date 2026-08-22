@@ -27,6 +27,7 @@ pub mod extract;
 pub mod graph;
 pub(crate) mod http;
 pub mod ingest;
+pub(crate) mod layout;
 pub mod llm;
 pub mod model_catalog;
 pub mod notebooks;

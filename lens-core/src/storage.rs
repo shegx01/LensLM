@@ -56,29 +56,17 @@ struct DataLayout {
 /// missing backend dir contributes nothing. `embedding_model` is the configured
 /// id (empty resolves to the registry default at the embedder boundary).
 fn data_layout(paths: &StoragePaths, embedding_model: &str) -> DataLayout {
-    let data_dir = paths.data_dir();
-    let db_paths = vec![
-        paths.db_path(),
-        data_dir.join("lens.db-wal"),
-        data_dir.join("lens.db-shm"),
-    ];
-    let vectors_paths = vec![paths.lancedb_root()];
-    let sources_paths = vec![paths.sources_dir()];
-    let audio_paths = vec![paths.notebooks_dir()];
+    use crate::layout::{CorpusBucket, EntryRole, paths_with_role};
 
-    let models = paths.models_dir();
+    let db_paths = paths_with_role(paths, EntryRole::Corpus(CorpusBucket::Db));
+    let vectors_paths = paths_with_role(paths, EntryRole::Corpus(CorpusBucket::Vectors));
+    let sources_paths = paths_with_role(paths, EntryRole::Corpus(CorpusBucket::Sources));
+    let audio_paths = paths_with_role(paths, EntryRole::Corpus(CorpusBucket::Audio));
+    let mut reclaimable_cache_paths = paths_with_role(paths, EntryRole::CacheReclaimable);
 
-    // Re-downloadable bundles: voice + ASR weights are always reclaimable.
-    // Qwen3-TTS (mlx-audio) caches its snapshot here; switching TTS backend re-downloads, so the whole dir is reclaimable.
-    let mut reclaimable_cache_paths = vec![
-        models.join("orpheus"),
-        models.join("snac"),
-        paths.whisper_dir(),
-        paths.hf_cache(),
-    ];
-
-    // Catalog is retained (tiny; its loss forces a network re-fetch and degrades
-    // the Providers UI).
+    // AC-3.6 exception 2: the catalog is a FILE under `cache_root`, and StoragePaths
+    // owns directory roots, so it has no accessor and no LAYOUT row. Retained
+    // because losing it forces a network re-fetch and degrades the Providers UI.
     let mut retained_paths = vec![
         paths
             .cache_root()
@@ -226,6 +214,13 @@ pub(crate) fn clear_model_cache_blocking(
     let layout = data_layout(paths, embedding_model);
     let mut freed = 0u64;
     for path in &layout.reclaimable_cache_paths {
+        // Last line of defence against a mis-roled descriptor entry (PM-2, the #238
+        // data-loss class): refuse anything the layout roots under `data_dir`. Only
+        // reachable when the cache is offloaded, since otherwise the roots coincide.
+        if paths.cache_root() != paths.data_dir() && crate::layout::is_data_rooted(paths, path) {
+            tracing::error!(path = %path.display(), "refusing to clear a corpus-rooted path");
+            continue;
+        }
         freed = freed.saturating_add(remove_path(path)?);
     }
     Ok(freed)
