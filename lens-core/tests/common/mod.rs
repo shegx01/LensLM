@@ -72,6 +72,25 @@ pub async fn resolution_ready_engine() -> (TempDir, LensEngine, String) {
     .await
     .expect("seed active coord");
 
+    // The physical table must exist too: an `active` row naming a table that was
+    // never created is the corruption shape the relocation copy-check rejects, so a
+    // fixture without it models a state the engine treats as broken.
+    {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Utf8,
+            false,
+        )]));
+        lancedb::connect(&dir.path().join("lancedb").to_string_lossy())
+            .execute()
+            .await
+            .expect("lancedb connect")
+            .create_empty_table(format!("chunks__{nb}"), schema)
+            .execute()
+            .await
+            .expect("create active chunk table");
+    }
+
     for name in ["Gamma", "gamma"] {
         let source_id = uuid::Uuid::now_v7().to_string();
         sqlx::query(

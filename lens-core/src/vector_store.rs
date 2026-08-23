@@ -792,6 +792,29 @@ impl LanceVectorStore {
     }
 
     /// Opens a physical table by exact name, or returns `None`. Never creates anything.
+    /// Opens each named table, failing on the first that will not open. Used by the
+    /// relocation copy check; the detail is logged, never returned across IPC.
+    pub(crate) async fn verify_tables_open(&self, names: &[String]) -> Result<(), LensError> {
+        for name in names {
+            match self.open_table_by_name(name).await {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    tracing::error!(table = %name, "copied vector table is missing");
+                    return Err(LensError::Io(
+                        "the copied vector index did not verify; the move was cancelled".into(),
+                    ));
+                }
+                Err(e) => {
+                    tracing::error!(table = %name, error = %e, "copied vector table will not open");
+                    return Err(LensError::Io(
+                        "the copied vector index did not verify; the move was cancelled".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn open_table_by_name(&self, name: &str) -> Result<Option<Table>, LensError> {
         let conn = self.connect().await?;
         let existing = conn

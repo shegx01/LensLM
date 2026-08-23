@@ -156,6 +156,74 @@ fn remove_if_exists(path: &Path) -> Result<(), LensError> {
     res.map_err(|e| LensError::Io(format!("remove failed: {e}")))
 }
 
+/// AC-4.1: opens the copied `active` vector tables. Deliberately NOT every table —
+/// `building`/`stale` are GC-reclaimed and not load-bearing, so a mid-write one
+/// captured by the copy must not abort an otherwise valid multi-minute move.
+async fn verify_active_vector_tables(new_pool: &SqlitePool, to: &Path) -> Result<(), LensError> {
+    let names: Vec<String> =
+        sqlx::query_scalar("SELECT lance_table_name FROM embedding_index WHERE status = 'active'")
+            .fetch_all(new_pool)
+            .await?;
+    if names.is_empty() {
+        return Ok(());
+    }
+    let store = crate::vector_store::LanceVectorStore::new(to, new_pool.clone());
+    store.verify_tables_open(&names).await
+}
+
+/// AC-4.2: checks audio only for `ready` rows, and only fails when the file exists
+/// in the source and is missing from the copy — a genuine copy failure. A row that
+/// was already dangling before the move warns and does not block, because `ready`
+/// legitimately outlives its file and a blanket check would refuse every such user.
+async fn verify_ready_audio(
+    new_pool: &SqlitePool,
+    old_prefix: &str,
+    new_prefix: &str,
+) -> Result<(), LensError> {
+    let paths: Vec<String> =
+        sqlx::query_scalar("SELECT path FROM audio_overviews WHERE status = 'ready'")
+            .fetch_all(new_pool)
+            .await?;
+    for copied in paths {
+        // `rewrite_paths` already ran, so `copied` is new-prefixed; map back to find
+        // what the source held.
+        let Some(rel) = copied.strip_prefix(new_prefix) else {
+            continue;
+        };
+        let source = PathBuf::from(format!("{old_prefix}{rel}"));
+        if !source.exists() {
+            tracing::warn!(
+                reason = "audio_pre_dangling",
+                "a ready audio overview had no file before the move; not blocking"
+            );
+            continue;
+        }
+        if !PathBuf::from(&copied).exists() {
+            tracing::error!(
+                reason = "audio_copy_missing",
+                "a ready audio overview did not copy"
+            );
+            return Err(LensError::Io(
+                "an audio overview did not copy; the move was cancelled".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Empties `dir` in place. Used on a relocation failure: `validate_target` accepts
+/// an existing empty folder, so preserving the directory keeps a retry unblocked
+/// while still leaving no residue.
+fn clear_dir_contents(dir: &Path) -> Result<(), LensError> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Ok(());
+    };
+    for entry in entries.flatten() {
+        remove_if_exists(&entry.path())?;
+    }
+    Ok(())
+}
+
 /// Recursively copies `from` into `to`, skipping symlinks (never followed — matches
 /// the storage-scan discipline) and any top-level names in `skip`. `to` is created.
 fn copy_tree(from: &Path, to: &Path, skip: &[&str]) -> Result<(), LensError> {
@@ -287,8 +355,9 @@ fn prefix_of(path: &Path) -> Result<String, LensError> {
 /// Copies the data dir `from` → `to`, verifies the snapshot, and rewrites the
 /// absolute-path DB columns in the copy. `extra_skip` names regenerable top-level
 /// dirs the caller wants re-provisioned at the destination rather than copied (e.g.
-/// the Qwen sidecar venv). On ANY failure the partial target is removed so a retry
-/// into the same folder is not blocked and no private residue is left behind. On
+/// the Qwen sidecar venv). On ANY failure the target's CONTENTS are removed so a
+/// retry is not blocked and no private residue is left behind — the directory itself
+/// is preserved, since deleting a folder the user chose is its own surprise. On
 /// success the caller writes the anchor pointer (with `cleanup = from`) and prompts a
 /// restart; the live pool is never touched. Runs behind the engine `ingest_lock`.
 pub async fn relocate_data_dir(
@@ -305,9 +374,9 @@ pub async fn relocate_data_dir(
     std::fs::create_dir_all(to)
         .map_err(|e| LensError::Io(format!("failed to create the new location: {e}")))?;
 
-    // Any failure after the target dir exists must leave nothing behind (partial
-    // corpus + a copied config.json holding a plaintext api_key would otherwise
-    // strand in a user folder and block retry).
+    // Any failure after the target dir exists must leave nothing OF OURS behind: a
+    // partial corpus plus a copied config.json holding a plaintext api_key would
+    // strand in a user folder and block retry.
     let result = relocate_into(
         pool,
         from,
@@ -319,7 +388,7 @@ pub async fn relocate_data_dir(
     )
     .await;
     if result.is_err() {
-        let _ = remove_if_exists(to);
+        let _ = clear_dir_contents(to);
     }
     result
 }
@@ -358,7 +427,9 @@ async fn relocate_into(
                 "the copied database did not verify; the move was cancelled".into(),
             ));
         }
-        rewrite_paths(&new_pool, old_prefix, new_prefix).await
+        rewrite_paths(&new_pool, old_prefix, new_prefix).await?;
+        verify_active_vector_tables(&new_pool, to).await?;
+        verify_ready_audio(&new_pool, old_prefix, new_prefix).await
     }
     .await;
     new_pool.close().await;
