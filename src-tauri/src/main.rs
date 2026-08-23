@@ -56,6 +56,25 @@ fn main() {
         .init();
 
     tauri::Builder::default()
+        // FIRST in the chain so the siblings below never run their setup inside a
+        // process that is about to exit. That ordering is tidiness, not the safety
+        // property: plugin init runs as a phase before app setup, so the duplicate
+        // dies before `LensEngine::init` at any position.
+        //
+        // Two field gotchas: the socket lives at the shared, NOT per-user, path
+        // /tmp/<identifier>_si.sock; and because dev builds share the identifier, a
+        // running installed app makes `bun run tauri dev` exit 0 with no window.
+        .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
+            tracing::info!(
+                reason = "second_instance",
+                cwd = %cwd,
+                argv = ?args,
+                "another instance tried to start against this data dir; it exited"
+            );
+            if let Some(w) = app.webview_windows().values().next() {
+                let _ = w.set_focus();
+            }
+        }))
         // Native file picker for the onboarding "Add sources" step.
         .plugin(tauri_plugin_dialog::init())
         // Write exported notes to the path chosen via the save-file dialog (issue #25).

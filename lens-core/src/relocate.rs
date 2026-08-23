@@ -363,12 +363,17 @@ fn copy_tree(from: &Path, to: &Path, skip: &[&str]) -> Result<(), LensError> {
 /// Rejects a target that is the source itself, nested inside it, or (for a target
 /// that already exists) non-empty. A cross-device target is fine — we always copy.
 fn validate_target(from: &Path, to: &Path) -> Result<(), LensError> {
-    if to == from {
+    // AC-5.3: `starts_with` is LEXICAL, so a symlinked parent or a `..` segment can
+    // present a nested target as unrelated — and nesting the target inside the source
+    // makes the copy walk into its own output. The native picker returns canonical
+    // paths; this is defence for every other route in.
+    let (from_c, to_c) = (canonical_or_ancestor(from), canonical_or_ancestor(to));
+    if to_c == from_c {
         return Err(LensError::Validation(
             "the new location is the same as the current one".into(),
         ));
     }
-    if to.starts_with(from) {
+    if to_c.starts_with(&from_c) {
         return Err(LensError::Validation(
             "the new location cannot be inside the current data folder".into(),
         ));
@@ -380,6 +385,31 @@ fn validate_target(from: &Path, to: &Path) -> Result<(), LensError> {
         ));
     }
     Ok(())
+}
+
+/// Resolves symlinks and `..` in `path`. A target that does not exist yet resolves
+/// its nearest existing ancestor and re-appends the tail, so a not-yet-created
+/// folder is still compared on its real location.
+fn canonical_or_ancestor(path: &Path) -> PathBuf {
+    if let Ok(c) = path.canonicalize() {
+        return c;
+    }
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = path;
+    while let Some(parent) = cur.parent() {
+        if let Some(name) = cur.file_name() {
+            tail.push(name.to_os_string());
+        }
+        if let Ok(c) = parent.canonicalize() {
+            let mut out = c;
+            for seg in tail.iter().rev() {
+                out = out.join(seg);
+            }
+            return out;
+        }
+        cur = parent;
+    }
+    path.to_path_buf()
 }
 
 /// Snapshots the live DB into `dest` with `VACUUM INTO` — transactionally consistent
@@ -631,6 +661,50 @@ mod tests {
         std::fs::create_dir_all(&nested).expect("mkdir");
         assert!(validate_target(from.path(), from.path()).is_err());
         assert!(validate_target(from.path(), &nested).is_err());
+    }
+
+    /// A `..` path resolving back inside the data dir is rejected. NOT a proof of
+    /// canonicalization — `from/sub/../sub` is lexically nested too, so this passes
+    /// either way; the symlink case below is the discriminating one.
+    #[test]
+    fn validate_rejects_a_dotdot_path_that_lands_inside_the_source() {
+        let from = tempfile::tempdir().expect("from");
+        let nested = from.path().join("sub");
+        std::fs::create_dir_all(&nested).expect("mkdir");
+        let sneaky = nested.join("..").join("sub");
+        assert!(
+            validate_target(from.path(), &sneaky).is_err(),
+            "a `..` path resolving inside the data dir must be rejected"
+        );
+    }
+
+    /// AC-5.3: a symlinked parent hides nesting from a lexical check entirely.
+    #[cfg(unix)]
+    #[test]
+    fn validate_rejects_a_symlink_pointing_into_the_source() {
+        let from = tempfile::tempdir().expect("from");
+        let elsewhere = tempfile::tempdir().expect("elsewhere");
+        let inside = from.path().join("inside");
+        std::fs::create_dir_all(&inside).expect("mkdir");
+        let link = elsewhere.path().join("link");
+        std::os::unix::fs::symlink(&inside, &link).expect("symlink");
+        assert!(
+            validate_target(from.path(), &link).is_err(),
+            "a symlink resolving into the data dir must be rejected"
+        );
+    }
+
+    /// Canonicalization must not break the normal case: the picker hands back a
+    /// folder that does not exist yet.
+    #[test]
+    fn validate_accepts_a_target_that_does_not_exist_yet() {
+        let from = tempfile::tempdir().expect("from");
+        let parent = tempfile::tempdir().expect("parent");
+        let target = parent.path().join("not-created-yet");
+        assert!(
+            validate_target(from.path(), &target).is_ok(),
+            "a not-yet-created target must still be accepted"
+        );
     }
 
     #[test]
