@@ -242,3 +242,38 @@ async fn relocate_honours_caller_supplied_skips() {
     assert_copy_complete(from.path(), &to, &skip);
     pool.close().await;
 }
+
+/// AC-4.8: a real move runs against a live data dir — the catalog refresh, config
+/// saves and SQLite journals all write there — so an entry can vanish between
+/// `read_dir` listing it and the copy reaching it. That must skip the entry, not
+/// abort the whole relocation and wipe the target.
+#[tokio::test]
+async fn an_entry_vanishing_mid_copy_does_not_abort_the_move() {
+    let from = tempfile::tempdir().expect("from");
+    let to_parent = tempfile::tempdir().expect("to_parent");
+    let to = to_parent.path().join("moved");
+
+    pin_catalog_offline(from.path());
+    let engine = LensEngine::init(from.path()).await.expect("init engine");
+    let pool = engine.pool().await;
+    seed(from.path());
+
+    let doomed = from.path().join("vanishing.tmp");
+    std::fs::write(&doomed, b"about to disappear").expect("seed doomed");
+    *lens_core::relocate::VANISH_DURING_COPY
+        .lock()
+        .expect("seam lock") = Some(doomed.clone());
+
+    lens_core::relocate::relocate_data_dir(&pool, from.path(), &to, &[])
+        .await
+        .expect("a vanishing entry must not cancel the move");
+
+    assert!(!doomed.exists(), "control: the seam actually removed it");
+    assert!(
+        !to.join("vanishing.tmp").exists(),
+        "a file gone from the source must not appear in the copy"
+    );
+    // Everything else still made it.
+    assert_copy_complete(from.path(), &to, &[]);
+    pool.close().await;
+}

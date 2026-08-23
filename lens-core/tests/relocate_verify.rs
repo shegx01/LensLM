@@ -67,6 +67,16 @@ async fn register(pool: &sqlx::SqlitePool, nb: &str, name: &str, status: &str) {
     .expect("register");
 }
 
+/// Sets an mtime so the old-vs-active freshness guard is deterministic (no sleeps).
+fn stamp(path: &Path, secs: u64) {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("open for stamp")
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+        .expect("set mtime");
+}
+
 async fn seed_notebook(engine: &LensEngine) -> String {
     engine
         .create_notebook("nb", None, None)
@@ -199,6 +209,102 @@ async fn a_ready_file_lost_in_the_copy_blocks_relocation() {
     assert!(
         err.is_err(),
         "a ready overview present in the source but absent from the copy must cancel"
+    );
+    pool.close().await;
+}
+
+/// AC-4.6: the deletion gate is the only moment both directories exist, so it
+/// re-verifies before deleting the source of truth. On refusal the old dir and the
+/// cleanup marker are both kept, and the log names the failing check.
+#[tokio::test]
+async fn the_deletion_gate_refuses_when_the_active_index_is_unreadable() {
+    let cap = capture_logs();
+    let anchor = tempfile::tempdir().expect("anchor");
+    let old = tempfile::tempdir().expect("old");
+    let active = tempfile::tempdir().expect("active");
+
+    let engine = engine(active.path()).await;
+    let pool = engine.pool().await;
+    let nb = seed_notebook(&engine).await;
+
+    // An active row whose table will not open: exactly what a bad copy leaves.
+    let name = format!("vec__{nb}__fastembed__nomic_v15__d768__1");
+    make_table(active.path(), &name).await;
+    register(&pool, &nb, &name, "active").await;
+    tear_table(active.path(), &name);
+
+    // Stamp mtimes so the mtime guard PASSES: otherwise it short-circuits first and
+    // the refusal under test is never reached.
+    std::fs::write(old.path().join("lens.db"), b"db").expect("seed old db");
+    stamp(&old.path().join("lens.db"), 100);
+    stamp(&active.path().join("lens.db"), 900);
+    std::fs::create_dir_all(old.path().join("sources")).expect("seed old corpus");
+    lens_core::relocate::write_location(
+        anchor.path(),
+        &lens_core::relocate::DataLocation {
+            data_dir: active.path().display().to_string(),
+            cleanup: Some(old.path().display().to_string()),
+        },
+    )
+    .expect("write pointer");
+
+    lens_core::relocate::run_boot_cleanup(anchor.path(), active.path(), &[], &pool).await;
+
+    assert!(
+        old.path().join("sources").exists(),
+        "the old dir must survive when the new one does not verify"
+    );
+    assert!(
+        cap.any_with(&["active_vector_table_unreadable"]),
+        "the refusal must name which check failed"
+    );
+    pool.close().await;
+}
+
+/// AC-4.10: `config.json` holds a plaintext cloud API key. A refusal keeps the old
+/// dir indefinitely — the mtime guard never self-heals — so the secret is erased
+/// even then. It is settings, already copied, and not corpus.
+#[tokio::test]
+async fn a_refused_cleanup_still_erases_the_old_config() {
+    let anchor = tempfile::tempdir().expect("anchor");
+    let old = tempfile::tempdir().expect("old");
+    let active = tempfile::tempdir().expect("active");
+
+    let engine = engine(active.path()).await;
+    let pool = engine.pool().await;
+
+    // Old dir newer than the active snapshot → the mtime guard refuses.
+    for (dir, secs) in [(old.path(), 900u64), (active.path(), 100u64)] {
+        let db = dir.join("lens.db");
+        std::fs::write(&db, b"db").expect("seed db");
+        stamp(&db, secs);
+    }
+    let secret = old.path().join("config.json");
+    std::fs::write(&secret, br#"{"api_key":"sk-secret"}"#).expect("seed secret");
+    std::fs::create_dir_all(old.path().join("sources")).expect("seed corpus");
+
+    lens_core::relocate::write_location(
+        anchor.path(),
+        &lens_core::relocate::DataLocation {
+            data_dir: active.path().display().to_string(),
+            cleanup: Some(old.path().display().to_string()),
+        },
+    )
+    .expect("write pointer");
+
+    lens_core::relocate::run_boot_cleanup(anchor.path(), active.path(), &[], &pool).await;
+
+    assert!(
+        !secret.exists(),
+        "the plaintext key must not outlive a refusal"
+    );
+    assert!(
+        old.path().join("sources").exists(),
+        "corpus the refusal is protecting must be untouched"
+    );
+    assert!(
+        old.path().join("lens.db").exists(),
+        "the newer old DB the guard protects must be untouched"
     );
     pool.close().await;
 }

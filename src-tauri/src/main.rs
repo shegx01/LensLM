@@ -92,11 +92,14 @@ fn main() {
             let anchor = app.path().app_data_dir()?;
             let data_dir = lens_core::relocate::resolve_data_dir(&anchor);
             let engine = tauri::async_runtime::block_on(LensEngine::init(&data_dir))?;
-            lens_core::relocate::run_boot_cleanup(
+            // Reuses the engine's pool: the deletion gate verifies the dir that is
+            // about to become the only copy, so it must read the live DB.
+            tauri::async_runtime::block_on(lens_core::relocate::run_boot_cleanup(
                 &anchor,
                 &data_dir,
                 commands::system::REGENERABLE_DIRS,
-            );
+                &tauri::async_runtime::block_on(engine.pool()),
+            ));
             app.manage(engine);
 
             // Inject the offscreen-webview JS renderer (issue #78, Layer f) so
@@ -214,6 +217,7 @@ fn main() {
             commands::notebooks::run_notebook_graph_eval,
             commands::system::health_check,
             commands::system::get_storage_stats,
+            commands::system::get_retained_cleanup,
             commands::system::clear_model_cache,
             commands::system::relocate_data_dir,
             commands::system::offload_cache,

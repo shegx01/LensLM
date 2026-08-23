@@ -35,6 +35,8 @@
 
   let dataDir = $state('');
   let stats = $state<StorageStats | null>(null);
+  // [path, bytes] of an old data folder a refused boot-cleanup is still holding.
+  let retainedCleanup = $state<[string, number] | null>(null);
   let loadError = $state<string | null>(null);
   let revealError = $state<string | null>(null);
   let copied = $state(false);
@@ -88,6 +90,7 @@
 
   async function loadStats(): Promise<void> {
     stats = await invoke<StorageStats>('get_storage_stats');
+    retainedCleanup = await invoke<[string, number] | null>('get_retained_cleanup');
   }
 
   onMount(async () => {
@@ -404,6 +407,35 @@
           </span>
           <span class="shrink-0 text-[0.85rem] font-semibold tabular-nums text-muted-foreground">
             {formatBytes(stats.retained_bytes)}
+          </span>
+        </div>
+      {/if}
+
+      {#if retainedCleanup}
+        <div
+          class="flex items-center justify-between gap-4 rounded-[10px] border border-border bg-card px-4 py-3.5"
+        >
+          <span class="min-w-0 flex-1">
+            <span class="block text-[0.78rem] font-bold text-foreground">Previous data folder</span>
+            <span class="mt-0.5 block text-[0.68rem] text-muted-foreground">
+              A move finished, but this older folder could not be verified as safe to delete, so it
+              was kept. Nothing here is in use — you can remove it yourself once you are satisfied.
+            </span>
+            <span class="mt-1 block truncate font-mono text-[0.66rem] text-muted-foreground">
+              {retainedCleanup[0]}
+            </span>
+          </span>
+          <span class="flex shrink-0 items-center gap-2">
+            <span class="text-[0.85rem] font-semibold tabular-nums text-foreground">
+              {formatBytes(retainedCleanup[1])}
+            </span>
+            <Button
+              variant="outline"
+              size="sm"
+              onclick={() => revealItemInDir(retainedCleanup![0])}
+            >
+              Reveal
+            </Button>
           </span>
         </div>
       {/if}

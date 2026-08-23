@@ -77,6 +77,21 @@ pub async fn get_storage_stats(
     engine.storage_stats(REGENERABLE_DIRS).await
 }
 
+/// The old data folder a refused boot-cleanup is still holding, and its size.
+/// Surfaced so a retained dir is visible rather than an invisible multi-GB leak —
+/// both refusal paths otherwise dead-end with only a log line.
+#[tracing::instrument(skip_all)]
+#[tauri::command]
+pub async fn get_retained_cleanup(
+    app: tauri::AppHandle,
+) -> Result<Option<(String, u64)>, LensError> {
+    let anchor = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| LensError::Io(format!("app data dir unavailable: {e}")))?;
+    Ok(lens_core::relocate::retained_cleanup(&anchor))
+}
+
 /// Thin wrapper over [`LensEngine::clear_model_cache`].
 #[tracing::instrument(skip_all)]
 #[tauri::command]
