@@ -229,10 +229,10 @@ pub(crate) fn clear_model_cache_blocking(
     let layout = data_layout(paths, embedding_model);
     let mut freed = 0u64;
     for path in &layout.reclaimable_cache_paths {
-        // Last line of defence against a mis-roled descriptor entry (PM-2, the #238
-        // data-loss class): refuse anything the layout roots under `data_dir`. Only
-        // reachable when the cache is offloaded, since otherwise the roots coincide.
-        if paths.cache_root() != paths.data_dir() && crate::layout::is_data_rooted(paths, path) {
+        // Last defence against a mis-roled entry (PM-2, the #238 data-loss class). No
+        // root guard: no Data relpath prefixes a cache relpath, so it cannot
+        // false-positive when roots coincide — which is the default, where it matters.
+        if crate::layout::is_data_rooted(paths, path) {
             tracing::error!(path = %path.display(), "refusing to clear a corpus-rooted path");
             continue;
         }

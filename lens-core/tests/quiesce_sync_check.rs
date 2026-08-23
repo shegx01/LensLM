@@ -1,10 +1,6 @@
-//! SYNC-CHECK (#248 AC-1.8(b)): the quiesce guard's coverage is *enumerable*, not
-//! structural — a future background Lance writer must remember to take it. This
-//! parses the engine source so that changing the enumeration fails the gate.
-//!
-//! It also pins what the runtime tests cannot: they prove a guard is held when the
-//! seam is reached, but moving the guarded Lance call one line below the closing
-//! brace leaves every one of them green.
+//! SYNC-CHECK (#248 AC-1.8(b)): quiesce coverage is enumerable, not structural, so
+//! this parses the source to fail when the enumeration changes — and pins what the
+//! runtime tests cannot, that the guarded call is still inside the guarded block.
 
 use std::path::{Path, PathBuf};
 

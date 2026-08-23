@@ -32,10 +32,9 @@ async fn relocation_waits_for_an_in_flight_entity_vector_write() {
     let mut pass =
         tokio::spawn(async move { pass_engine.resolve_notebook_for_test(&pass_nb).await });
 
-    // Without this handshake the assertion below could pass simply because the
-    // relocation ran before the guard was ever taken.
-    // Select rather than plain timeout: `resolve_one` has pre-gate exits, and a bare
-    // timeout would report "never reached the seam" while dropping the real error.
+    // The handshake stops the assertion below passing merely because relocation won
+    // the race; `select!` rather than a bare timeout so a pre-gate exit reports its
+    // real error instead of "never reached the seam".
     tokio::select! {
         r = timeout(REACHED, gate.reached.notified()) => {
             r.expect("resolution pass must reach the in-guard seam");

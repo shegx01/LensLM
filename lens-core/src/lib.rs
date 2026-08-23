@@ -259,10 +259,9 @@ pub struct LensEngineInner {
     pub(crate) config: AppConfig,
 }
 
-/// Two-way handshake for #248 quiesce tests: the engine signals `reached` once it
-/// is inside the guarded region, then waits on `release`. Without the `reached`
-/// half a test cannot know the shared guard is held, and would assert against a
-/// relocation that simply won the race.
+/// Two-way handshake for #248 quiesce tests: the engine signals `reached` inside the
+/// guarded region, then waits on `release`. Without `reached` a test cannot know the
+/// guard is held, and would assert against a relocation that merely lost the race.
 #[cfg(feature = "test-util")]
 #[derive(Default)]
 pub struct QuiesceGate {
@@ -299,9 +298,8 @@ pub struct LensEngine {
     /// Single-permit gate serializing ingest runs (ONNX session is single-threaded).
     ingest_lock: Arc<Semaphore>,
     /// Blocks background Lance writers while the data dir is copied. Order is
-    /// `ingest_lock` → `notebook_lock` → `quiesce`; SHARED holders acquire nothing
-    /// else, and nothing may acquire `quiesce` while holding a pool connection. The
-    /// exclusive holder deliberately spans the whole copy, pool checkouts included.
+    /// `ingest_lock` → `notebook_lock` → `quiesce`; SHARED holders acquire nothing else
+    /// and nothing takes `quiesce` holding a pool conn. The writer spans the whole copy.
     quiesce: Arc<RwLock<()>>,
     /// Sender half of the background enrichment queue (M4 Phase 3). `Clone` so it
     /// rides `#[derive(Clone)]`. Dropping every clone closes the channel.
@@ -2722,13 +2720,9 @@ impl LensEngine {
         Self::gc_orphan_entity_tables(db, data_dir).await
     }
 
-    /// Startup-GC for `vec__` tables that no `embedding_index` row names. Listing-
-    /// driven, unlike the registry-driven scan it runs before, which cannot see a
-    /// table whose row is gone. Such an orphan also used to brick re-embed for the
-    /// notebook; `create_building_table` now skips it, so this reclaims the bytes.
-    ///
-    /// Safe only because `init` awaits the GC before spawning any worker; moving
-    /// this to a periodic task would need `ingest_lock` or the quiesce guard.
+    /// Startup-GC for `vec__` tables no `embedding_index` row names — listing-driven,
+    /// unlike the registry scan it precedes, which cannot see a table whose row is
+    /// gone. `init` awaits it before workers spawn; moving it later would need a lock.
     async fn gc_unregistered_vec_tables(db: &SqlitePool, data_dir: &Path) -> Result<(), LensError> {
         let store = crate::vector_store::LanceVectorStore::new(data_dir, db.clone());
         let physical = crate::vector_store::VectorStore::vec_table_names(&store).await?;

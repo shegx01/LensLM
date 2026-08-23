@@ -89,7 +89,11 @@ pub async fn get_retained_cleanup(
         .path()
         .app_data_dir()
         .map_err(|e| LensError::Io(format!("app data dir unavailable: {e}")))?;
-    Ok(lens_core::relocate::retained_cleanup(&anchor))
+    // Recursive walk over a whole superseded corpus — off the async runtime, same as
+    // `storage_stats`.
+    tokio::task::spawn_blocking(move || lens_core::relocate::retained_cleanup(&anchor))
+        .await
+        .map_err(|e| LensError::Internal(format!("retained_cleanup task join failed: {e}")))
 }
 
 /// Thin wrapper over [`LensEngine::clear_model_cache`].

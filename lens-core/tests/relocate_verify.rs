@@ -1,9 +1,6 @@
-//! AC-4.1/4.2: the relocation copy is verified beyond a `sources` row count, without
-//! the tightening refusing moves that were previously fine.
-//!
-//! Both ACs are bound narrowly on purpose. Checking every Lance table would abort a
-//! valid multi-minute move over a mid-write `building` table; checking every `ready`
-//! audio row would refuse every user who has one failed overview on disk.
+//! AC-4.1/4.2: verify the copy beyond a row count, without refusing moves that were
+//! fine. Both are bound narrowly — all Lance tables would abort on a mid-write
+//! `building` one; all `ready` audio would refuse anyone with a failed overview.
 
 mod common;
 
@@ -305,6 +302,51 @@ async fn a_refused_cleanup_still_erases_the_old_config() {
     assert!(
         old.path().join("lens.db").exists(),
         "the newer old DB the guard protects must be untouched"
+    );
+    pool.close().await;
+}
+
+/// The FIRST relocation always leaves the anchor as the old dir. Refusing there
+/// stranded the whole previous corpus in the OS app-data dir AND cleared the marker,
+/// so nothing could surface it. Cleaning is safe because `data_entries()` omits the
+/// pointer files — the corpus goes, the pointer that finds the new dir stays.
+#[tokio::test]
+async fn the_first_relocation_cleans_the_anchor_but_keeps_its_pointer() {
+    let anchor = tempfile::tempdir().expect("anchor");
+    let active = tempfile::tempdir().expect("active");
+    let engine = engine(active.path()).await;
+    let pool = engine.pool().await;
+
+    // Anchor is the OLD dir: it holds the previous corpus and the pointer.
+    std::fs::write(anchor.path().join("lens.db"), b"db").expect("seed old db");
+    stamp(&anchor.path().join("lens.db"), 100);
+    stamp(&active.path().join("lens.db"), 900);
+    std::fs::create_dir_all(anchor.path().join("sources")).expect("seed corpus");
+    std::fs::write(anchor.path().join("sources").join("a.txt"), b"corpus").expect("seed file");
+
+    lens_core::relocate::write_location(
+        anchor.path(),
+        &lens_core::relocate::DataLocation {
+            data_dir: active.path().display().to_string(),
+            cleanup: Some(anchor.path().display().to_string()),
+        },
+    )
+    .expect("write pointer");
+
+    lens_core::relocate::run_boot_cleanup(anchor.path(), active.path(), &[], &pool).await;
+
+    assert!(
+        !anchor.path().join("sources").exists(),
+        "the previous corpus must actually be reclaimed"
+    );
+    assert!(
+        anchor.path().join("location.json").exists(),
+        "the pointer MUST survive — without it the app cannot find its data"
+    );
+    assert_eq!(
+        lens_core::relocate::resolve_data_dir(anchor.path()),
+        active.path(),
+        "the anchor must still resolve to the relocated data dir"
     );
     pool.close().await;
 }

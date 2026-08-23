@@ -1,8 +1,6 @@
-//! #248 AC-1.12: the startup sweep that reclaims physical `vec__` tables no
-//! `embedding_index` row names.
-//!
-//! Every test re-inits an engine on the same dir, because the sweep runs only in
-//! `LensEngine::init` — `for_test()` runs no GC at all and would pass vacuously.
+//! #248 AC-1.12: the startup sweep reclaiming physical `vec__` tables no
+//! `embedding_index` row names. Every test re-inits on the same dir — the sweep runs
+//! only in `init`, and `for_test()` runs no GC, so it would pass vacuously.
 
 mod common;
 
@@ -171,10 +169,9 @@ async fn torn_vec_table_is_reclaimed_without_erroring_the_sweep() {
     );
 }
 
-/// The union in `create_building_table`: with an unregistered orphan still on disk
-/// and NO restart, a re-embed must pick a different generation instead of erroring.
-/// This is the half the startup sweep cannot fix — it makes the brick recoverable
-/// at next launch, not impossible within the session.
+/// The union in `create_building_table`: with an orphan on disk and NO restart, a
+/// re-embed picks a different generation instead of erroring. The sweep alone only
+/// makes that brick recoverable at next launch, not impossible within the session.
 #[tokio::test]
 async fn building_table_skips_a_live_unregistered_orphan() {
     use lens_core::vector_store::{Coordinate, LanceVectorStore, VectorStore};
@@ -211,10 +208,9 @@ async fn building_table_skips_a_live_unregistered_orphan() {
     pool.close().await;
 }
 
-/// The `active` table survives; `building`/`stale` are reclaimed — but by the
-/// PRE-EXISTING registry-driven pass, which drops those tables and deletes their
-/// rows before the `vec__` sweep runs. The sweep therefore only ever sees a
-/// leftover the earlier pass could not name, which is the whole point of it.
+/// `active` survives; `building`/`stale` are reclaimed by the PRE-EXISTING
+/// registry-driven pass, which runs first. The sweep only ever sees a leftover that
+/// pass could not name, which is the whole point of it.
 #[tokio::test]
 async fn active_survives_and_building_stale_are_reclaimed_by_the_earlier_pass() {
     let dir = tempfile::tempdir().expect("tempdir");

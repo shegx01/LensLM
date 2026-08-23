@@ -56,14 +56,9 @@ fn main() {
         .init();
 
     tauri::Builder::default()
-        // FIRST in the chain so the siblings below never run their setup inside a
-        // process that is about to exit. That ordering is tidiness, not the safety
-        // property: plugin init runs as a phase before app setup, so the duplicate
-        // dies before `LensEngine::init` at any position.
-        //
-        // Two field gotchas: the socket lives at the shared, NOT per-user, path
-        // /tmp/<identifier>_si.sock; and because dev builds share the identifier, a
-        // running installed app makes `bun run tauri dev` exit 0 with no window.
+        // FIRST so the siblings never run setup in a doomed process — tidiness, not
+        // the safety property (plugin init precedes app setup at any position). Socket
+        // is the SHARED /tmp path; a running install makes `tauri dev` exit 0 silently.
         .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
             tracing::info!(
                 reason = "second_instance",

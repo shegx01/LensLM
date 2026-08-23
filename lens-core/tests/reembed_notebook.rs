@@ -538,10 +538,9 @@ async fn r2_flip_guard_aborts_on_concurrent_backend_change() {
     );
 }
 
-/// AC-1.9: retirement runs INSIDE the flip window's `ingest_lock`, not after it.
-/// Unlocked, a data-dir copy could snapshot SQLite before the demote and `lancedb/`
-/// after the drop, producing a new dir whose `active` row names a table that is
-/// gone — silently empty search, worse than the stranded table it replaces.
+/// AC-1.9: retirement runs INSIDE the flip window's `ingest_lock`. Unlocked, a copy
+/// could snapshot SQLite before the demote and `lancedb/` after the drop, producing
+/// an `active` row naming a table that is gone — silently empty search.
 #[tokio::test(flavor = "multi_thread")]
 async fn retirement_holds_ingest_lock_so_relocation_cannot_interleave() {
     use lens_core::QuiesceGate;

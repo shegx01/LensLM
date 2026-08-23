@@ -28,10 +28,9 @@ pub async fn file_engine() -> (TempDir, LensEngine) {
     (dir, engine)
 }
 
-/// A file-backed engine (relocation needs a real data dir) with a deterministic
-/// embedder, an `active` coordinate, and two same-name nodes across two sources —
-/// enough for `resolve_notebook_for_test` to reach the entity-vector write.
-/// Returns the dir guard, the engine, and the notebook id.
+/// File-backed engine (relocation needs a real dir) with a deterministic embedder,
+/// an `active` coordinate and two same-name nodes — enough for
+/// `resolve_notebook_for_test` to reach the entity-vector write.
 pub async fn resolution_ready_engine() -> (TempDir, LensEngine, String) {
     use lens_core::{CountingEmbedder, Embedder, EmbeddingBackend};
     use std::sync::atomic::AtomicUsize;
@@ -189,10 +188,9 @@ impl Drop for Capture {
     }
 }
 
-/// Captures `tracing` events for the calling test, including those emitted from
-/// `tokio::spawn` and `spawn_blocking` — the subscriber is process-global because a
-/// thread-local one does not reach spawned tasks. Serialized across tests, so the
-/// global sink only ever holds one test's buffer.
+/// Captures `tracing` events including from `tokio::spawn` and `spawn_blocking` —
+/// process-global, because a thread-local subscriber does not reach spawned tasks.
+/// Serialized across tests, so the global sink holds one test's buffer at a time.
 pub fn capture_logs() -> Capture {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;

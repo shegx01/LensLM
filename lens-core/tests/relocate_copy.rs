@@ -34,10 +34,9 @@ const NOT_BULK_COPIED: &[&str] = &[
     "location.json.pending",
 ];
 
-/// The subset whose absence is actually observable. `lens.db` arrives via `VACUUM
-/// INTO`, and `-wal`/`-shm` are unlinked by the target pool's clean close whatever
-/// was copied — asserting those would pass for the wrong reason. DB lineage is
-/// covered by the committed-row check instead.
+/// The subset whose absence is observable. `-wal`/`-shm` are unlinked by the target
+/// pool's clean close whatever was copied, so asserting those passes for the wrong
+/// reason; DB lineage is covered by the committed-row check instead.
 const ASSERTED_ABSENT: &[&str] = &["location.json", "location.json.pending"];
 
 fn write_at(root: &Path, rel: &str, body: &[u8]) {
@@ -243,10 +242,9 @@ async fn relocate_honours_caller_supplied_skips() {
     pool.close().await;
 }
 
-/// AC-4.8: a real move runs against a live data dir — the catalog refresh, config
-/// saves and SQLite journals all write there — so an entry can vanish between
-/// `read_dir` listing it and the copy reaching it. That must skip the entry, not
-/// abort the whole relocation and wipe the target.
+/// AC-4.8: a real move runs against a live data dir (catalog refresh, config saves,
+/// SQLite journals), so an entry can vanish between `read_dir` and the copy. That
+/// skips the entry rather than aborting the relocation and clearing the target.
 #[tokio::test]
 async fn an_entry_vanishing_mid_copy_does_not_abort_the_move() {
     let from = tempfile::tempdir().expect("from");

@@ -1,8 +1,6 @@
-//! One descriptor for the engine's on-disk layout (#248 item 3).
-//!
-//! Relocation, old-dir cleanup and storage accounting each used to enumerate the
-//! layout by hand, so adding a subsystem could silently miss one — the class of bug
-//! that made the Qwen hf-cache invisible. They all derive from `LAYOUT` instead.
+//! One descriptor for the engine's on-disk layout (#248 item 3). Relocation,
+//! cleanup and accounting each enumerated it by hand, so a new subsystem could be
+//! missed by one — the bug that made the Qwen hf-cache invisible.
 
 use std::path::{Path, PathBuf};
 

@@ -106,14 +106,17 @@ pub async fn run_boot_cleanup(
         return;
     };
     let old = PathBuf::from(&cleanup);
-    if old == active_data_dir || old == anchor || cleanup.is_empty() {
-        tracing::warn!(dir = %cleanup, "refusing to clean the active data dir / anchor");
+    // NOT `old == anchor`: the first relocation always leaves the anchor as the old
+    // dir, and refusing there stranded the previous corpus invisibly. `data_entries()`
+    // omits the pointer files, so the corpus goes and the pointer stays.
+    if old == active_data_dir || cleanup.is_empty() {
+        tracing::warn!(dir = %cleanup, "refusing to clean the active data dir");
         loc.cleanup = None;
         let _ = write_location(anchor, &loc);
         return;
     }
     if old_dir_is_newer(&old, active_data_dir) {
-        erase_old_config(&old);
+        erase_config_files(&old);
         tracing::warn!(
             reason = "old_dir_newer",
             dir = %cleanup,
@@ -127,7 +130,7 @@ pub async fn run_boot_cleanup(
     // moment both still exist. On refusal keep the marker so the old dir survives
     // for manual reclaim, and name the check that failed.
     if let Err(reason) = verify_before_delete(pool, &old, active_data_dir).await {
-        erase_old_config(&old);
+        erase_config_files(&old);
         tracing::warn!(
             reason = %reason,
             dir = %cleanup,
@@ -147,14 +150,25 @@ pub async fn run_boot_cleanup(
     }
 }
 
-/// AC-4.10: erases `config.json` from the old dir even when cleanup is refused.
-/// It holds a plaintext cloud API key, is settings rather than corpus, and was
-/// already copied — so erasing it closes an otherwise indefinite exposure while
-/// leaving everything the refusal is protecting.
-fn erase_old_config(old: &Path) {
-    let cfg = old.join("config.json");
-    if let Err(e) = remove_if_exists(&cfg) {
-        tracing::warn!(error = %e, "failed to erase the old config during a refused cleanup");
+/// AC-4.10: erases `config.json*` from `dir` — the old dir even when cleanup is
+/// refused, and the target during a rollback —
+/// it holds a plaintext cloud API key and is settings, not corpus, so erasing closes
+/// an otherwise indefinite exposure without touching what the refusal protects.
+fn erase_config_files(dir: &Path) {
+    // By PREFIX: `config.json.bak` and the `.corrupt-*.bak` siblings carry the same
+    // `api_key`, so erasing only the exact name leaves the secret behind.
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with("config.json"))
+            && let Err(e) = remove_if_exists(&entry.path())
+        {
+            tracing::warn!(error = %e, "failed to erase an old config during a refused cleanup");
+        }
     }
 }
 
@@ -224,10 +238,9 @@ async fn verify_active_vector_tables(new_pool: &SqlitePool, to: &Path) -> Result
     store.verify_tables_open(&names).await
 }
 
-/// AC-4.2: checks audio only for `ready` rows, and only fails when the file exists
-/// in the source and is missing from the copy — a genuine copy failure. A row that
-/// was already dangling before the move warns and does not block, because `ready`
-/// legitimately outlives its file and a blanket check would refuse every such user.
+/// AC-4.2: `ready` rows only, failing only when the file exists in the source and is
+/// missing from the copy. `ready` legitimately outlives its file, so a pre-dangling
+/// row warns rather than blocking — a blanket check would refuse those users.
 async fn verify_ready_audio(
     new_pool: &SqlitePool,
     old_prefix: &str,
@@ -289,11 +302,26 @@ pub fn retained_cleanup(anchor: &Path) -> Option<(String, u64)> {
 /// an existing empty folder, so preserving the directory keeps a retry unblocked
 /// while still leaving no residue.
 fn clear_dir_contents(dir: &Path) -> Result<(), LensError> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Ok(());
+    // Secrets first, then continue past a failure: `?` here aborted the sweep on the
+    // first un-removable entry, so whether the plaintext config survived depended on
+    // readdir order.
+    erase_config_files(dir);
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not read the target while rolling back");
+            return Ok(());
+        }
     };
+    let mut failed = 0usize;
     for entry in entries.flatten() {
-        remove_if_exists(&entry.path())?;
+        if let Err(e) = remove_if_exists(&entry.path()) {
+            failed += 1;
+            tracing::warn!(error = %e, "failed to remove an entry while rolling back");
+        }
+    }
+    if failed > 0 {
+        tracing::warn!(failed, "rollback left entries behind in the target");
     }
     Ok(())
 }
@@ -311,13 +339,9 @@ fn copy_tree(from: &Path, to: &Path, skip: &[&str]) -> Result<(), LensError> {
         if name.to_str().is_some_and(|n| skip.contains(&n)) {
             continue;
         }
-        // AC-4.8: the data dir has live writers during a real move (catalog refresh,
-        // config save, SQLite journals), so an entry can vanish between `read_dir`
-        // and here. Skipping is correct — but it is a fail-open in a copier, so it
-        // must be logged; the copy verification is what guards a NEEDED file.
-        // Deleting here — after `read_dir` yielded the entry, before we stat it — is
-        // the only way to reproduce the window; `read_dir` is lazy, so removing the
-        // file earlier just means it is never listed.
+        // Deleting HERE — after `read_dir` yielded the entry, before the stat — is the
+        // only way to reproduce the vanishing-entry window: `read_dir` is lazy, so
+        // removing the file earlier just means it is never listed.
         #[cfg(feature = "test-util")]
         if let Ok(mut slot) = VANISH_DURING_COPY.lock()
             && slot.as_deref() == Some(entry.path().as_path())
@@ -346,7 +370,10 @@ fn copy_tree(from: &Path, to: &Path, skip: &[&str]) -> Result<(), LensError> {
         } else {
             match std::fs::copy(&src, &dst) {
                 Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Only when the SOURCE went away: `fs::copy` also reports NotFound for
+                // a missing destination, and skipping that drops a needed file while
+                // reporting success — after which cleanup deletes the original.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && !src.exists() => {
                     tracing::warn!(
                         reason = "copy_entry_vanished",
                         "an entry disappeared mid-copy"
@@ -363,10 +390,9 @@ fn copy_tree(from: &Path, to: &Path, skip: &[&str]) -> Result<(), LensError> {
 /// Rejects a target that is the source itself, nested inside it, or (for a target
 /// that already exists) non-empty. A cross-device target is fine — we always copy.
 fn validate_target(from: &Path, to: &Path) -> Result<(), LensError> {
-    // AC-5.3: `starts_with` is LEXICAL, so a symlinked parent or a `..` segment can
-    // present a nested target as unrelated — and nesting the target inside the source
-    // makes the copy walk into its own output. The native picker returns canonical
-    // paths; this is defence for every other route in.
+    // AC-5.3: `starts_with` is LEXICAL, so a symlinked parent can present a nested
+    // target as unrelated — and nesting the target inside the source makes the copy
+    // walk into its own output.
     let (from_c, to_c) = (canonical_or_ancestor(from), canonical_or_ancestor(to));
     if to_c == from_c {
         return Err(LensError::Validation(

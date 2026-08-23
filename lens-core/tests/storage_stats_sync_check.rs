@@ -1,9 +1,6 @@
-//! SYNC-CHECK: `StorageStats` crosses IPC into `src/lib/theme/types.ts`, which
-//! carries a "must match" comment that nothing enforced. Adding a field to one side
-//! only is silent — the panel just never shows the bytes.
-//!
-//! Compares the REAL serialized shape (serde, not the struct definition) against the
-//! TS interface, so a `#[serde(rename)]` or `skip` is caught too.
+//! SYNC-CHECK: `StorageStats` crosses IPC into `types.ts`, whose "must match"
+//! comment nothing enforced. Compares the real serde shape rather than the struct,
+//! so a `rename` or `skip` is caught too.
 
 use std::collections::BTreeSet;
 use std::path::Path;

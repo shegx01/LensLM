@@ -285,10 +285,9 @@ pub(crate) async fn reembed_notebook(
         }
 
         store.flip_active(&new_coord, &building_name).await?;
-        // Retire inside the SAME window (R3, idempotent). Unlocked, this demotes the
-        // registry row and drops the table without a permit, so a data-dir copy could
-        // snapshot SQLite before the demote and `lancedb/` after the drop — leaving an
-        // `active` row whose table directory is gone, and silently empty search.
+        // Retire inside the SAME window (R3, idempotent). Unlocked, a copy could
+        // snapshot SQLite before the demote and `lancedb/` after the drop, leaving an
+        // `active` row whose table is gone — silently empty search.
         for (old_model, old_dim, old_backend) in &old_coords {
             #[cfg(feature = "test-util")]
             engine.reembed_retire_gate().await;
