@@ -42,7 +42,7 @@ function config(
   };
 }
 
-function stats(reclaimable: number): StorageStats {
+function stats(reclaimable: number, sidecar = 0): StorageStats {
   const db = 1_048_576; // 1.0 MB
   const vectors = 2_097_152; // 2.0 MB
   const sources = 1_572_864; // 1.5 MB
@@ -56,7 +56,8 @@ function stats(reclaimable: number): StorageStats {
     corpus_bytes: corpus,
     reclaimable_cache_bytes: reclaimable,
     retained_bytes: 274_000_000,
-    total_bytes: corpus + reclaimable + 274_000_000
+    sidecar_runtime_bytes: sidecar,
+    total_bytes: corpus + reclaimable + 274_000_000 + sidecar
   };
 }
 
@@ -353,5 +354,33 @@ describe('StorageSection', () => {
 
     await waitFor(() => expect(screen.getByText(/1\.4 GB/)).toBeInTheDocument());
     expect(screen.queryByText(/exceeds your limit/i)).not.toBeInTheDocument();
+  });
+});
+
+describe('StorageSection voice-engine row', () => {
+  it('shows the sidecar runtime and says a cache clear keeps it', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return config();
+      if (cmd === 'get_storage_stats') return stats(1_500_000_000, 3_221_225_472);
+    });
+
+    render(StorageSection);
+
+    expect(await screen.findByText('Voice engine')).toBeInTheDocument();
+    expect(screen.getByText('3.0 GB')).toBeInTheDocument();
+    expect(screen.getByText(/Kept when you clear the cache/i)).toBeInTheDocument();
+  });
+
+  it('omits the row entirely when no sidecar runtime is installed', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return config();
+      if (cmd === 'get_storage_stats') return stats(1_500_000_000, 0);
+    });
+
+    render(StorageSection);
+
+    // Wait for a row that always renders, so absence below is not just "not yet loaded".
+    expect(await screen.findByText('Reclaimable model cache')).toBeInTheDocument();
+    expect(screen.queryByText('Voice engine')).not.toBeInTheDocument();
   });
 });

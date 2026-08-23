@@ -12,7 +12,8 @@ use crate::paths::StoragePaths;
 /// as plain JSON numbers; consumed by the Storage settings panel.
 ///
 /// `corpus_bytes == db_bytes + vectors_bytes + sources_bytes + audio_bytes` and
-/// `total_bytes == corpus_bytes + reclaimable_cache_bytes + retained_bytes`.
+/// `total_bytes == corpus_bytes + reclaimable_cache_bytes + retained_bytes
+/// + sidecar_runtime_bytes`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct StorageStats {
     /// SQLite database (data + WAL + shared-memory index).
@@ -31,6 +32,10 @@ pub struct StorageStats {
     /// Model state kept even when clearing: the active embedding model (needed
     /// for offline query) and the model catalog.
     pub retained_bytes: u64,
+    /// Desktop-owned sidecar runtime dirs (Apple-Silicon TTS venv and its caches).
+    /// Regenerable, but NOT removed by "Clear model cache": re-provisioning them
+    /// costs a multi-minute reinstall, so they are surfaced rather than swept.
+    pub sidecar_runtime_bytes: u64,
     pub total_bytes: u64,
 }
 
@@ -174,9 +179,12 @@ fn sum_paths(paths: &[PathBuf]) -> Result<u64, LensError> {
 }
 
 /// Blocking byte scan; invoked under `spawn_blocking` by [`crate::LensEngine::storage_stats`].
+/// `sidecar_dirs` are top-level names under `data_dir` owned by the desktop layer
+/// (the engine must not learn them); an empty slice is the headless default.
 pub(crate) fn storage_stats_blocking(
     paths: &StoragePaths,
     embedding_model: &str,
+    sidecar_dirs: &[&str],
 ) -> Result<StorageStats, LensError> {
     let layout = data_layout(paths, embedding_model);
     let db_bytes = sum_paths(&layout.db_paths)?;
@@ -189,9 +197,15 @@ pub(crate) fn storage_stats_blocking(
         .saturating_add(audio_bytes);
     let reclaimable_cache_bytes = sum_paths(&layout.reclaimable_cache_paths)?;
     let retained_bytes = sum_paths(&layout.retained_paths)?;
+    let sidecar_paths: Vec<PathBuf> = sidecar_dirs
+        .iter()
+        .map(|d| paths.data_dir().join(d))
+        .collect();
+    let sidecar_runtime_bytes = sum_paths(&sidecar_paths)?;
     let total_bytes = corpus_bytes
         .saturating_add(reclaimable_cache_bytes)
-        .saturating_add(retained_bytes);
+        .saturating_add(retained_bytes)
+        .saturating_add(sidecar_runtime_bytes);
     Ok(StorageStats {
         db_bytes,
         vectors_bytes,
@@ -200,6 +214,7 @@ pub(crate) fn storage_stats_blocking(
         corpus_bytes,
         reclaimable_cache_bytes,
         retained_bytes,
+        sidecar_runtime_bytes,
         total_bytes,
     })
 }
@@ -329,7 +344,7 @@ mod tests {
         let paths = StoragePaths::new(dir.path(), None);
         seed_all(&paths);
 
-        let stats = storage_stats_blocking(&paths, "").expect("stats");
+        let stats = storage_stats_blocking(&paths, "", &[]).expect("stats");
         assert_eq!(stats.db_bytes, 10);
         assert_eq!(stats.vectors_bytes, 20);
         assert_eq!(stats.sources_bytes, 30);
@@ -341,17 +356,100 @@ mod tests {
         );
         assert_eq!(stats.reclaimable_cache_bytes, 100 + 200 + 300 + 400 + 700);
         assert_eq!(stats.retained_bytes, 500 + 50);
+        assert_eq!(stats.sidecar_runtime_bytes, 0, "no sidecar dirs supplied");
         assert_eq!(
             stats.total_bytes,
-            stats.corpus_bytes + stats.reclaimable_cache_bytes + stats.retained_bytes
+            stats.corpus_bytes
+                + stats.reclaimable_cache_bytes
+                + stats.retained_bytes
+                + stats.sidecar_runtime_bytes
         );
+    }
+
+    /// AC-2.3: caller-supplied sidecar dirs are counted, rooted at `data_dir` —
+    /// NOT `cache_root`, since the venv bakes absolute paths and never offloads.
+    #[test]
+    fn sidecar_dirs_are_counted_under_data_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = tempfile::tempdir().expect("cache");
+        let paths = StoragePaths::new(dir.path(), Some(&cache.path().display().to_string()));
+        seed_all(&paths);
+        write_file(&dir.path().join("qwen-venv").join("lib"), &[0u8; 1234]);
+        write_file(&dir.path().join("uv-cache").join("wheel"), &[0u8; 66]);
+        // Same names under the offload root must NOT be picked up.
+        write_file(&cache.path().join("qwen-venv").join("decoy"), &[0u8; 9999]);
+
+        let stats =
+            storage_stats_blocking(&paths, "", &["qwen-venv", "uv-cache", "bin"]).expect("stats");
+        assert_eq!(stats.sidecar_runtime_bytes, 1234 + 66);
+        assert_eq!(
+            stats.total_bytes,
+            stats.corpus_bytes
+                + stats.reclaimable_cache_bytes
+                + stats.retained_bytes
+                + stats.sidecar_runtime_bytes
+        );
+    }
+
+    /// AC-2.4: the sidecar bucket is additive — it must not move bytes out of any
+    /// existing bucket, or the Storage panel's breakdown silently changes.
+    #[test]
+    fn sidecar_bucket_does_not_disturb_the_others() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = StoragePaths::new(dir.path(), None);
+        seed_all(&paths);
+        write_file(&dir.path().join("qwen-venv").join("lib"), &[0u8; 4096]);
+
+        let without = storage_stats_blocking(&paths, "", &[]).expect("stats");
+        let with = storage_stats_blocking(&paths, "", &["qwen-venv"]).expect("stats");
+
+        assert_eq!(with.corpus_bytes, without.corpus_bytes);
+        assert_eq!(
+            with.reclaimable_cache_bytes,
+            without.reclaimable_cache_bytes
+        );
+        assert_eq!(with.retained_bytes, without.retained_bytes);
+        assert_eq!(with.sidecar_runtime_bytes, 4096);
+        assert_eq!(without.sidecar_runtime_bytes, 0);
+        assert_eq!(with.total_bytes, without.total_bytes + 4096);
+    }
+
+    /// AC-2.6: off Apple Silicon the desktop layer passes an empty slice, and the
+    /// row must read as a clean zero rather than a missing field.
+    #[test]
+    fn no_sidecar_dirs_reads_as_zero() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = StoragePaths::new(dir.path(), None);
+        seed_all(&paths);
+        let stats = storage_stats_blocking(&paths, "", &[]).expect("stats");
+        assert_eq!(stats.sidecar_runtime_bytes, 0);
+    }
+
+    /// "Clear model cache" must never reclaim the sidecar runtime: re-provisioning
+    /// it is a multi-minute reinstall, not a re-download.
+    #[test]
+    fn clearing_the_cache_leaves_the_sidecar_runtime_intact() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = StoragePaths::new(dir.path(), None);
+        seed_all(&paths);
+        let venv = dir.path().join("qwen-venv");
+        write_file(&venv.join("lib"), &[0u8; 512]);
+
+        clear_model_cache_blocking(&paths, "").expect("clear");
+
+        assert!(
+            venv.join("lib").exists(),
+            "sidecar venv must survive a clear"
+        );
+        let stats = storage_stats_blocking(&paths, "", &["qwen-venv"]).expect("stats");
+        assert_eq!(stats.sidecar_runtime_bytes, 512);
     }
 
     #[test]
     fn storage_stats_missing_dirs_are_zero() {
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = StoragePaths::new(dir.path(), None);
-        let stats = storage_stats_blocking(&paths, "").expect("stats");
+        let stats = storage_stats_blocking(&paths, "", &[]).expect("stats");
         assert_eq!(stats.corpus_bytes, 0);
         assert_eq!(stats.reclaimable_cache_bytes, 0);
         assert_eq!(stats.retained_bytes, 0);
@@ -406,7 +504,7 @@ mod tests {
         );
 
         // Reclaimable figure drops to 0; retained unchanged.
-        let stats = storage_stats_blocking(&paths, "").expect("stats after clear");
+        let stats = storage_stats_blocking(&paths, "", &[]).expect("stats after clear");
         assert_eq!(stats.reclaimable_cache_bytes, 0);
         assert_eq!(stats.retained_bytes, 500 + 50);
         assert_eq!(stats.corpus_bytes, 10 + 20 + 30 + 40);
@@ -430,7 +528,7 @@ mod tests {
         // The Qwen3-TTS HF snapshot counts as reclaimable.
         let hf_cache = paths.hf_cache();
         assert!(hf_cache.exists());
-        let before = storage_stats_blocking(&paths, "").expect("stats");
+        let before = storage_stats_blocking(&paths, "", &[]).expect("stats");
         assert_eq!(before.reclaimable_cache_bytes, 100 + 200 + 300 + 400 + 700);
 
         clear_model_cache_blocking(&paths, "").expect("clear");
@@ -465,7 +563,7 @@ mod tests {
         let link = paths.whisper_dir().join("link-to-db");
         std::os::unix::fs::symlink(&target, &link).expect("symlink");
 
-        let stats = storage_stats_blocking(&paths, "").expect("stats");
+        let stats = storage_stats_blocking(&paths, "", &[]).expect("stats");
         assert_eq!(stats.reclaimable_cache_bytes, 100 + 200 + 300 + 400 + 700);
 
         clear_model_cache_blocking(&paths, "").expect("clear");
@@ -488,7 +586,7 @@ mod tests {
         assert!(!data.path().join("models").exists());
         assert!(data.path().join("lens.db").exists());
 
-        let stats = storage_stats_blocking(&paths, "").expect("stats");
+        let stats = storage_stats_blocking(&paths, "", &[]).expect("stats");
         assert_eq!(stats.corpus_bytes, 10 + 20 + 30 + 40);
         assert_eq!(stats.reclaimable_cache_bytes, 100 + 200 + 300 + 400 + 700);
         assert_eq!(stats.retained_bytes, 500 + 50);

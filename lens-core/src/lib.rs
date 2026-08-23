@@ -1124,13 +1124,17 @@ impl LensEngine {
     /// retained). Read-only. The recursive fs walk runs under `spawn_blocking`
     /// so a multi-GB directory never blocks an async executor thread; missing
     /// dirs on a fresh install read as 0.
-    pub async fn storage_stats(&self) -> Result<StorageStats, LensError> {
+    /// `sidecar_dirs`: top-level `data_dir` names owned by the desktop layer, passed
+    /// in so the engine stays headless. Headless callers pass `&[]`.
+    pub async fn storage_stats(&self, sidecar_dirs: &[&str]) -> Result<StorageStats, LensError> {
         let data_dir = self.data_dir().await;
         let config = self.config().await;
         let embedding_model = config.embedding_model.clone();
         let paths = crate::paths::StoragePaths::from_config(&config, &data_dir);
+        let sidecar: Vec<String> = sidecar_dirs.iter().map(|d| (*d).to_string()).collect();
         tokio::task::spawn_blocking(move || {
-            crate::storage::storage_stats_blocking(&paths, &embedding_model)
+            let refs: Vec<&str> = sidecar.iter().map(String::as_str).collect();
+            crate::storage::storage_stats_blocking(&paths, &embedding_model, &refs)
         })
         .await
         .map_err(|e| LensError::Internal(format!("storage_stats task join failed: {e}")))?

@@ -407,6 +407,23 @@
           </span>
         </div>
       {/if}
+
+      {#if stats && stats.sidecar_runtime_bytes > 0}
+        <div
+          class="flex items-center justify-between gap-4 rounded-[10px] border border-border bg-card px-4 py-3.5"
+        >
+          <span class="min-w-0 flex-1">
+            <span class="block text-[0.78rem] font-bold text-muted-foreground">Voice engine</span>
+            <span class="mt-0.5 block text-[0.68rem] text-muted-foreground">
+              Runtime the on-device voice generator installs for itself. Kept when you clear the
+              cache — rebuilding it takes several minutes.
+            </span>
+          </span>
+          <span class="shrink-0 text-[0.85rem] font-semibold tabular-nums text-muted-foreground">
+            {formatBytes(stats.sidecar_runtime_bytes)}
+          </span>
+        </div>
+      {/if}
     </div>
 
     {#if loadError}
