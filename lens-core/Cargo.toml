@@ -228,7 +228,7 @@ pdfium-render = { version = "=0.9.2", default-features = false, features = [
 # Local embeddings: nomic-embed-text-v1.5 (768d) via ONNX. fastembed transitively
 # pins `ort = =2.0.0-rc.12` (download-binaries default → onnxruntime bundled, no
 # system install). This is the only `ort` in the workspace.
-fastembed = "5.17.2"
+fastembed = "6.0.0"
 # Embedded vector store. lancedb 0.30.0 pins Arrow 58 — every arrow crate below
 # MUST match that major or the binary hits an ABI break (verify: `cargo tree -d`).
 lancedb = "0.30.0"
