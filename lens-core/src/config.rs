@@ -626,15 +626,17 @@ pub enum ActionId {
     PlayerRateUp,
 }
 
-/// Tolerant deserializer for [`AppConfig::keymap`]: an entry whose key is not a known
-/// [`ActionId`], or whose value is not a string, is dropped instead of failing the whole
-/// load. Dropping is lossy — the next [`AppConfig::save`] re-serializes only what
-/// survived — which is the deliberate price of never bricking a hand-edited config.
+/// Tolerant deserializer for [`AppConfig::keymap`]: entries whose key is not a known
+/// [`ActionId`], or whose value is not a string, are dropped rather than fatal. Dropping is
+/// lossy — the next [`AppConfig::save`] re-serializes only what survived.
 fn deserialize_keymap<'de, D>(deserializer: D) -> Result<BTreeMap<ActionId, String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let raw = BTreeMap::<String, serde_json::Value>::deserialize(deserializer)?;
+    // `Option` so an explicit `null` reads as absent: no value in a shortcuts map may make
+    // the rest of the config (theme, models, api keys, onboarding) unloadable.
+    let raw = Option::<BTreeMap<String, serde_json::Value>>::deserialize(deserializer)?
+        .unwrap_or_default();
     let mut keymap = BTreeMap::new();
     for (key, value) in raw {
         let serde_json::Value::String(token) = value else {

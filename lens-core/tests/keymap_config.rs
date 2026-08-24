@@ -104,12 +104,21 @@ fn non_string_value_is_dropped_not_fatal() {
 }
 
 #[test]
-fn explicit_null_keymap_fails_the_load() {
-    // Chosen, not accidental: `deserialize_with` runs on an explicit `null`, and the app
-    // never writes one (serde emits `{}` for an empty map), so `null` is a malformed file.
+fn explicit_null_keymap_loads_as_empty() {
+    let config = load_with_keymap(serde_json::Value::Null)
+        .expect("null is JSON's idiomatic absent, and must never cost the user their config");
+
+    assert!(config.keymap.is_empty());
+}
+
+#[test]
+fn keymap_shapes_that_are_not_a_map_stay_fatal() {
+    // Chosen, not incidental: an array or a bare string is a structural mistake with no
+    // salvage, unlike `null`. Both surface as `LensError::Parse` on the real `load()` path.
+    assert!(load_with_keymap(json!([])).is_err(), "array is not a map");
     assert!(
-        load_with_keymap(serde_json::Value::Null).is_err(),
-        "an explicit null keymap is a malformed config, not an empty one"
+        load_with_keymap(json!("Mod+K")).is_err(),
+        "a bare token is not a map"
     );
 }
 

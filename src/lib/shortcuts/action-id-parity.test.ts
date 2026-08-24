@@ -131,6 +131,8 @@ describe('ActionId parity with lens-core/src/config.rs', () => {
     expect([...ids].sort()).toEqual([...ACTION_IDS].sort());
   });
 
+  // Deliberately strict: any future `rename` elsewhere in config.rs reds this test. That
+  // is the tripwire working — re-scope it consciously rather than loosening the pattern.
   it('declares no serde rename outside the ActionId enum', () => {
     const total = stripped.split(RENAME_ATTR).length - 1;
     expect(total).toBe(ACTION_IDS.length);
