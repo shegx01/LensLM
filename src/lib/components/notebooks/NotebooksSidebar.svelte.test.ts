@@ -7,6 +7,19 @@
 
 import { render, screen, fireEvent, waitFor, within } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { resetConfig } from '$lib/models/app-config.svelte.js';
+import { setPlatform } from '$lib/shortcuts/platform.js';
+import { baseAppConfig } from '$lib/test-fixtures.js';
+import type { AppConfig } from '$lib/theme/types.js';
+
+// `invoke` must resolve a real config: a bare `vi.fn()` yields `undefined`, which never
+// clears `ensureLoaded`'s load-once guard, so the keymap would stay empty forever.
+const configRef = vi.hoisted(() => ({ current: null as AppConfig | null }));
+
+vi.mock('@tauri-apps/api/core', () => ({
+  isTauri: () => true,
+  invoke: async (cmd: string) => (cmd === 'get_config' ? configRef.current : undefined)
+}));
 
 const { storeProxy, mockOpenTrash, mockSelectNotebook, mockResetStore } = vi.hoisted(() => {
   const state = {
@@ -110,6 +123,7 @@ function makeNotebook(id: string, title: string, sourceCount = 2): NotebookSumma
 }
 
 beforeEach(() => {
+  (globalThis as { isTauri?: boolean }).isTauri = true;
   storeProxy.notebooks = [];
   storeProxy.trashCount = 0;
   storeProxy.activeNotebookId = null;
@@ -118,10 +132,16 @@ beforeEach(() => {
   storeProxy.viewMode = 'notebook';
   mockOpenTrash.mockClear();
   mockSelectNotebook.mockClear();
+  configRef.current = baseAppConfig();
+  // The frontend CI job runs on ubuntu, so the expected glyph is only stable
+  // with the platform pinned rather than relying on ambient detection.
+  setPlatform('darwin');
 });
 
 afterEach(() => {
   vi.clearAllMocks();
+  resetConfig();
+  setPlatform(null);
 });
 
 describe('NotebooksSidebar (expanded)', () => {
@@ -294,5 +314,62 @@ describe('NotebooksSidebar (collapsed prop fallback)', () => {
     render(NotebooksSidebar, { props: { collapsed: false } });
     expect(screen.getByText('Notebooks')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /collapse sidebar/i })).toBeInTheDocument();
+  });
+});
+
+describe('NotebooksSidebar (search shortcut hint follows the keymap)', () => {
+  it('renders the platform default binding in the kbd and tooltip when unremapped', async () => {
+    const { container } = render(NotebooksSidebar);
+    await waitFor(() => {
+      expect(container.querySelector('kbd')?.textContent?.trim()).toBe('⌘K');
+    });
+    const trigger = screen.getByRole('button', { name: 'Search notebooks (Command plus K)' });
+    expect(trigger).toBeInTheDocument();
+  });
+
+  it('an override retitles the visible kbd, the tooltip glyph, and the aria-label words', async () => {
+    configRef.current = baseAppConfig({ keymap: { 'palette.toggle': 'Mod+P' } });
+    resetConfig();
+    const { container } = render(NotebooksSidebar);
+
+    await waitFor(() => {
+      expect(container.querySelector('kbd')?.textContent?.trim()).toBe('⌘P');
+    });
+    expect(container.querySelector('kbd')?.textContent?.trim()).not.toBe('⌘K');
+
+    expect(
+      screen.getByRole('button', { name: 'Search notebooks (Command plus P)' })
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: /Search notebooks \(⌘K\)/ })
+    ).not.toBeInTheDocument();
+  });
+
+  it('honours a persisted override with the Shortcuts panel never mounted', async () => {
+    configRef.current = baseAppConfig({ keymap: { 'palette.toggle': 'Mod+P' } });
+    resetConfig();
+    render(NotebooksSidebar);
+
+    await waitFor(() => {
+      expect(
+        screen.getByRole('button', { name: 'Search notebooks (Command plus P)' })
+      ).toBeInTheDocument();
+    });
+  });
+
+  it('the tooltip (shown collapsed) also follows the override glyph, not ⌘K', async () => {
+    configRef.current = baseAppConfig({ keymap: { 'palette.toggle': 'Mod+P' } });
+    resetConfig();
+    render(NotebooksSidebar, { props: { collapsed: true } });
+
+    const trigger = await screen.findByRole('button', {
+      name: 'Search notebooks (Command plus P)'
+    });
+    await fireEvent.pointerEnter(trigger);
+    await fireEvent.focus(trigger);
+
+    const tooltip = await screen.findByText('Search notebooks (⌘P)');
+    expect(tooltip).toBeInTheDocument();
+    expect(screen.queryByText('Search notebooks (⌘K)')).not.toBeInTheDocument();
   });
 });
