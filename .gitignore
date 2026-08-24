@@ -27,6 +27,9 @@ src-tauri/lancedb/
 # Icon generation source (regenerated on demand)
 /app-icon.png
 .omc/
+# Agent-tooling scratch state. Untracked but NOT ignored, it fails `gh signoff`'s
+# clean-tree check and the whole-tree prettier gate.
+.omx/
 
 # Git worktrees (feature work is isolated in worktrees; never tracked)
 worktrees/

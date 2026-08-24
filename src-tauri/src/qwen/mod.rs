@@ -154,12 +154,20 @@ pub fn kill_all_sidecar_groups() {
     }
 }
 
+/// Whether a `killpg` errno means the group simply no longer exists. Darwin reports
+/// an empty group as EPERM rather than ESRCH, so EPERM cannot be read as "not ours".
+fn group_already_gone(errno: Option<i32>) -> bool {
+    matches!(errno, Some(libc::ESRCH) | Some(libc::EPERM))
+}
+
 fn kill_pgid(pgid: libc::pid_t) {
     // SAFETY: callers pass an unreaped group of ours, so `pgid` cannot have been
-    // recycled. Any errno but ESRCH means it is NOT ours — the invariant broke.
+    // recycled.
     if unsafe { libc::killpg(pgid, libc::SIGKILL) } != 0 {
         let err = std::io::Error::last_os_error();
-        if err.raw_os_error() != Some(libc::ESRCH) {
+        if group_already_gone(err.raw_os_error()) {
+            tracing::debug!(pgid, error = %err, "Qwen sidecar group already gone");
+        } else {
             tracing::warn!(pgid, error = %err, "killpg on a Qwen sidecar group failed");
         }
     }
@@ -1064,6 +1072,15 @@ mod group_tests {
 
     fn sentinel_len(p: &Path) -> u64 {
         std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+    }
+
+    #[test]
+    fn eperm_counts_as_group_gone_not_as_a_failure() {
+        assert!(group_already_gone(Some(libc::ESRCH)));
+        // The Darwin case that was warning in production.
+        assert!(group_already_gone(Some(libc::EPERM)));
+        assert!(!group_already_gone(Some(libc::EINVAL)));
+        assert!(!group_already_gone(None));
     }
 
     #[tokio::test]
