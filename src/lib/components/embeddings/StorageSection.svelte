@@ -35,7 +35,7 @@
 
   let dataDir = $state('');
   let stats = $state<StorageStats | null>(null);
-  // [path, bytes] of an old data folder a refused boot-cleanup is still holding.
+  // Set only when a refused boot-cleanup is still holding an old data folder.
   let retainedCleanup = $state<[string, number] | null>(null);
   let loadError = $state<string | null>(null);
   let revealError = $state<string | null>(null);

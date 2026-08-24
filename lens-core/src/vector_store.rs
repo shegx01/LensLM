@@ -791,9 +791,8 @@ impl LanceVectorStore {
             .map_err(|e| LensError::Vector(format!("lancedb connect failed: {e}")))
     }
 
-    /// Opens a physical table by exact name, or returns `None`. Never creates anything.
-    /// Opens each named table, failing on the first that will not open. Used by the
-    /// relocation copy check; the detail is logged, never returned across IPC.
+    /// Opens each named table, failing on the first that will not open. Detail is
+    /// logged, never returned across IPC.
     pub(crate) async fn verify_tables_open(&self, names: &[String]) -> Result<(), LensError> {
         for name in names {
             match self.open_table_by_name(name).await {
@@ -815,6 +814,7 @@ impl LanceVectorStore {
         Ok(())
     }
 
+    /// Opens a physical table by exact name, or returns `None`. Never creates anything.
     async fn open_table_by_name(&self, name: &str) -> Result<Option<Table>, LensError> {
         let conn = self.connect().await?;
         let existing = conn

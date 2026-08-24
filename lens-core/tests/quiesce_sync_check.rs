@@ -86,9 +86,8 @@ fn the_guarded_block_still_contains_the_lance_write() {
     let text = std::fs::read_to_string(file).expect("read worker");
     let lines: Vec<&str> = text.lines().collect();
 
-    // Walk forward from the guard, tracking brace depth. Depth going negative is
-    // the close of the block the guard was declared in; everything before that is
-    // the guarded region.
+    // Depth going negative closes the block the guard was declared in; everything
+    // before that is the guarded region.
     let mut depth: i32 = 0;
     let mut region = String::new();
     for line in &lines[*line_no..] {

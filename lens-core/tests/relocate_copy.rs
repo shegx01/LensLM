@@ -271,7 +271,6 @@ async fn an_entry_vanishing_mid_copy_does_not_abort_the_move() {
         !to.join("vanishing.tmp").exists(),
         "a file gone from the source must not appear in the copy"
     );
-    // Everything else still made it.
     assert_copy_complete(from.path(), &to, &[]);
     pool.close().await;
 }

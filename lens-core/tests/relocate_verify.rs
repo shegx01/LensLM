@@ -306,10 +306,9 @@ async fn a_refused_cleanup_still_erases_the_old_config() {
     pool.close().await;
 }
 
-/// The FIRST relocation always leaves the anchor as the old dir. Refusing there
-/// stranded the whole previous corpus in the OS app-data dir AND cleared the marker,
-/// so nothing could surface it. Cleaning is safe because `data_entries()` omits the
-/// pointer files — the corpus goes, the pointer that finds the new dir stays.
+/// The FIRST relocation always leaves the anchor as the old dir, and refusing there
+/// stranded the previous corpus while clearing the marker that could surface it.
+/// Safe because `data_entries()` omits the pointer files.
 #[tokio::test]
 async fn the_first_relocation_cleans_the_anchor_but_keeps_its_pointer() {
     let anchor = tempfile::tempdir().expect("anchor");

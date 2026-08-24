@@ -17,11 +17,6 @@ use crate::error::LensError;
 pub const LOCATION_FILE: &str = "location.json";
 const LOCATION_PENDING: &str = "location.json.pending";
 
-// The three enumerations below are DERIVED from `crate::layout::LAYOUT`; adding a
-// subsystem there updates copy, cleanup and accounting together. `copy_tree` stays
-// a DENY-list driven by `copy_skip()` — an allow-list over these would silently
-// stop copying anything the descriptor does not name.
-
 /// Pointer describing where the active data dir lives, plus an optional old dir
 /// awaiting best-effort cleanup on the next successful boot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,10 +145,9 @@ pub async fn run_boot_cleanup(
     }
 }
 
-/// AC-4.10: erases `config.json*` from `dir` — the old dir even when cleanup is
-/// refused, and the target during a rollback —
-/// it holds a plaintext cloud API key and is settings, not corpus, so erasing closes
-/// an otherwise indefinite exposure without touching what the refusal protects.
+/// Erases `config.json*` from `dir` — the old dir even when cleanup is refused, and
+/// the target during a rollback. It holds a plaintext cloud API key and is settings
+/// rather than corpus, so erasing closes an otherwise indefinite exposure.
 fn erase_config_files(dir: &Path) {
     // By PREFIX: `config.json.bak` and the `.corrupt-*.bak` siblings carry the same
     // `api_key`, so erasing only the exact name leaves the secret behind.
@@ -536,9 +530,6 @@ pub async fn relocate_data_dir(
     std::fs::create_dir_all(to)
         .map_err(|e| LensError::Io(format!("failed to create the new location: {e}")))?;
 
-    // Any failure after the target dir exists must leave nothing OF OURS behind: a
-    // partial corpus plus a copied config.json holding a plaintext api_key would
-    // strand in a user folder and block retry.
     let result = relocate_into(
         pool,
         from,

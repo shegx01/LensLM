@@ -71,9 +71,8 @@ pub async fn health_check(engine: tauri::State<'_, LensEngine>) -> Result<Health
 pub async fn get_storage_stats(
     engine: tauri::State<'_, LensEngine>,
 ) -> Result<StorageStats, LensError> {
-    // The engine cannot know these names (headless invariant), so the desktop layer
-    // that creates them supplies them. Deliberately NOT passed to clear_model_cache:
-    // re-provisioning the venv is a multi-minute reinstall, not a re-download.
+    // Headless invariant: the engine cannot know these names, so the layer that
+    // creates them supplies them.
     engine.storage_stats(REGENERABLE_DIRS).await
 }
 
