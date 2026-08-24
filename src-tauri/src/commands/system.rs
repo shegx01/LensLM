@@ -381,6 +381,12 @@ pub async fn prepare_qwen_model(
     // coalesce to one download, and the prepare is cancellable via `cancel_prepare`.
     coordinator
         .run_single_flight(&paths, resolver, move |progress| {
+            tracing::debug!(
+                received = progress.received,
+                total = ?progress.total,
+                done = progress.done,
+                "prepare_qwen_model: forwarding progress tick"
+            );
             if let Err(e) = on_progress.send(progress) {
                 tracing::warn!("prepare_qwen_model: progress channel send failed: {e}");
             }
