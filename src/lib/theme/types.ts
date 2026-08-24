@@ -170,5 +170,5 @@ export interface AppConfig {
   animations: string;
   // SYNC-CHECK: must match lens-core/src/config.rs AppConfig.keymap
   // (BTreeMap<ActionId, String>, #[serde(default)], empty by default).
-  keymap?: Partial<Record<ActionId, string>>;
+  keymap: Partial<Record<ActionId, string>>;
 }

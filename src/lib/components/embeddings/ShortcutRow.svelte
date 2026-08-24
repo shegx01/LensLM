@@ -14,6 +14,7 @@
 <script lang="ts">
   import RotateCcw from '@lucide/svelte/icons/rotate-ccw';
   import {
+    describe as describeBinding,
     render as renderBinding,
     toToken,
     type Binding,
@@ -28,6 +29,8 @@
     armedId: ActionId | null;
     candidate: Binding | null;
     message: string | null;
+    /** True until the durable keymap has loaded; arming earlier validates against an empty map. */
+    disabled: boolean;
     onarm: (id: ActionId) => void;
     oncapture: (event: KeyboardEvent) => void;
     ondisarm: () => void;
@@ -42,6 +45,7 @@
     armedId,
     candidate,
     message,
+    disabled,
     onarm,
     oncapture,
     ondisarm,
@@ -55,6 +59,17 @@
 
   const rowArmed = $derived(chips.some((chip) => chip.id === armedId));
   const reserved = $derived(chips.every((chip) => !chip.remappable));
+
+  // aria-label wins over name-from-content, so the spoken name has to carry the state the
+  // <kbd> shows — otherwise every chip sounds identical whatever it renders.
+  function chipLabel(chip: RowChip, armed: boolean): string {
+    const current = describeBinding(chip.token, platform);
+    if (!armed) return `Change shortcut for ${chip.action}, currently ${current}`;
+    if (candidate === null)
+      return `Change shortcut for ${chip.action}, currently ${current}. Recording, press a key.`;
+    const pending = describeBinding(toToken(candidate), platform);
+    return `Change shortcut for ${chip.action}, currently ${current}. Recording ${pending}, press Enter to save.`;
+  }
 
   // Without focus the capture listener is element-scoped on an unfocused element, so
   // keystrokes bypass it and reach AppShell's window listener while the row still
@@ -76,15 +91,13 @@
     <span class="block text-[0.78rem] font-bold text-foreground">{label}</span>
     <span class="mt-0.5 block text-[0.68rem] text-muted-foreground">{description}</span>
     {#if message}
-      <span class="mt-1 block text-[0.68rem] text-destructive" role="alert">{message}</span>
+      <span class="mt-1 block text-[0.68rem] text-destructive">{message}</span>
     {/if}
   </span>
 
   <span class="flex shrink-0 items-center gap-1.5">
     {#if reserved}
-      <span
-        class="text-[0.62rem] font-semibold uppercase tracking-[0.06em] text-muted-foreground/70"
-      >
+      <span class="text-[0.62rem] font-semibold uppercase tracking-[0.06em] text-muted-foreground">
         Conventional
       </span>
     {/if}
@@ -95,8 +108,8 @@
         <button
           type="button"
           bind:this={refs[chip.id]}
-          aria-label={`Change shortcut for ${chip.action}`}
-          aria-pressed={armed}
+          {disabled}
+          aria-label={chipLabel(chip, armed)}
           onclick={() => onarm(chip.id)}
           onkeydown={(event) => {
             if (armed) oncapture(event);
@@ -120,7 +133,11 @@
           <button
             type="button"
             aria-label={`Reset ${chip.action} to default`}
-            onclick={() => onreset(chip.id)}
+            onclick={() => {
+              // Resetting unmounts this button, so hand focus to the chip before it goes.
+              refs[chip.id]?.focus();
+              onreset(chip.id);
+            }}
             class="text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
             <RotateCcw class="size-3" />

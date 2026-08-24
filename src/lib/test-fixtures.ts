@@ -36,6 +36,7 @@ export function baseAppConfig(overrides?: Partial<AppConfig>): AppConfig {
     js_render_enabled: true,
     reopen_last_notebook: true,
     animations: 'system',
+    keymap: {},
     ...overrides
   };
 }

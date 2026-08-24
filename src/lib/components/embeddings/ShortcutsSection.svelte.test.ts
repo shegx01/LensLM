@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/svelte';
 import { clearMocks, mockIPC } from '@tauri-apps/api/mocks';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { appConfigStore, resetConfig } from '$lib/models/app-config.svelte.js';
@@ -43,6 +43,18 @@ function recordingIpc(keymap: AppConfig['keymap'] = {}) {
 
 function chip(action: string): HTMLElement {
   return screen.getByRole('button', { name: new RegExp(`change shortcut for ${action}`, 'i') });
+}
+
+function rowOf(action: string): HTMLElement {
+  const row = chip(action).closest('[data-shortcut-row]');
+  if (row === null) throw new Error(`no row around the ${action} chip`);
+  return row as HTMLElement;
+}
+
+/** Chips stay disabled until the durable keymap lands, so every edit test waits for that. */
+async function renderReady(): Promise<void> {
+  render(ShortcutsSection);
+  await waitFor(() => expect(chip('skip forward')).toBeEnabled());
 }
 
 describe('ShortcutsSection', () => {
@@ -104,8 +116,7 @@ describe('ShortcutsSection', () => {
 describe('ShortcutsSection rebinding', () => {
   it('accepting a candidate with Enter writes the new entry and spreads the rest of the config verbatim', async () => {
     const written = recordingIpc();
-    render(ShortcutsSection);
-    await waitFor(() => expect(appConfigStore.keymap).toEqual({}));
+    await renderReady();
 
     await fireEvent.click(chip('skip forward'));
     await fireEvent.keyDown(chip('skip forward'), { key: 'q' });
@@ -119,10 +130,24 @@ describe('ShortcutsSection rebinding', () => {
     expect(written.config?.animations).toBe('system');
   });
 
+  it('announces the saved binding through a persistent live region', async () => {
+    recordingIpc();
+    await renderReady();
+    // Always mounted, so a repeated message still lands — a node created with its text does not.
+    expect(screen.getByRole('status')).toBeInTheDocument();
+
+    await fireEvent.click(chip('skip forward'));
+    await fireEvent.keyDown(chip('skip forward'), { key: 'q' });
+    await fireEvent.keyDown(chip('skip forward'), { key: 'Enter' });
+
+    await waitFor(() =>
+      expect(screen.getByRole('status')).toHaveTextContent('Skip forward is now Q.')
+    );
+  });
+
   it('cancelling with Escape writes nothing and restores the chip', async () => {
     const written = recordingIpc();
-    render(ShortcutsSection);
-    await waitFor(() => expect(appConfigStore.keymap).toEqual({}));
+    await renderReady();
 
     await fireEvent.click(chip('skip forward'));
     await fireEvent.keyDown(chip('skip forward'), { key: 'q' });
@@ -135,29 +160,33 @@ describe('ShortcutsSection rebinding', () => {
 
   it('blocks a player-vs-player collision, naming the occupying action, and writes nothing', async () => {
     const written = recordingIpc();
-    render(ShortcutsSection);
-    await waitFor(() => expect(appConfigStore.keymap).toEqual({}));
+    await renderReady();
 
     await fireEvent.click(chip('skip forward'));
     await fireEvent.keyDown(chip('skip forward'), { key: ' ' });
 
-    const alert = await screen.findByRole('alert');
-    expect(alert).toHaveTextContent(/play or pause/i);
+    await waitFor(() =>
+      expect(within(rowOf('skip forward')).getByText(/play or pause/i)).toBeInTheDocument()
+    );
+    expect(screen.getByRole('status')).toHaveTextContent(/already used by “Play or pause”/i);
 
     await fireEvent.keyDown(chip('skip forward'), { key: 'Enter' });
+    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent(/^Not saved\./));
     expect(written.config).toBeNull();
   });
 
   it('blocks a window-vs-player collision (window is a universal conflict domain)', async () => {
     const written = recordingIpc();
-    render(ShortcutsSection);
-    await waitFor(() => expect(appConfigStore.keymap).toEqual({}));
+    await renderReady();
 
     await fireEvent.click(chip('toggle command palette'));
     await fireEvent.keyDown(chip('toggle command palette'), { key: ' ' });
 
-    const alert = await screen.findByRole('alert');
-    expect(alert).toHaveTextContent(/play or pause/i);
+    await waitFor(() =>
+      expect(
+        within(rowOf('toggle command palette')).getByText(/play or pause/i)
+      ).toBeInTheDocument()
+    );
 
     await fireEvent.keyDown(chip('toggle command palette'), { key: 'Enter' });
     expect(written.config).toBeNull();
@@ -165,26 +194,74 @@ describe('ShortcutsSection rebinding', () => {
 
   it('rejects a typeable window candidate and writes nothing', async () => {
     const written = recordingIpc();
-    render(ShortcutsSection);
-    await waitFor(() => expect(appConfigStore.keymap).toEqual({}));
+    await renderReady();
 
     await fireEvent.click(chip('toggle command palette'));
     await fireEvent.keyDown(chip('toggle command palette'), { key: 'q' });
 
-    expect(await screen.findByRole('alert')).toHaveTextContent(/modifier/i);
+    const row = rowOf('toggle command palette');
+    await waitFor(() => expect(within(row).getByText(/modifier/i)).toBeInTheDocument());
 
-    // Shift+Q is how a capital Q is typed, so it is rejected on the same grounds.
     await fireEvent.keyDown(chip('toggle command palette'), { key: 'Q', shiftKey: true });
-    expect(screen.getByRole('alert')).toHaveTextContent(/modifier/i);
+    expect(within(row).getByText(/modifier/i)).toBeInTheDocument();
 
     await fireEvent.keyDown(chip('toggle command palette'), { key: 'Enter' });
     expect(written.config).toBeNull();
   });
 
+  it('names only Command on macOS: Option cannot be recorded there', async () => {
+    recordingIpc();
+    await renderReady();
+
+    await fireEvent.click(chip('toggle command palette'));
+    await fireEvent.keyDown(chip('toggle command palette'), { key: 'q' });
+
+    const message = await within(rowOf('toggle command palette')).findByText(/modifier/i);
+    expect(message).toHaveTextContent(/Command modifier/);
+    expect(message).not.toHaveTextContent(/Option/);
+  });
+
+  it('says which keys are recordable when a keystroke is refused outright', async () => {
+    recordingIpc();
+    await renderReady();
+
+    await fireEvent.click(chip('skip forward'));
+    await fireEvent.keyDown(chip('skip forward'), { key: ',' });
+
+    const message = await within(rowOf('skip forward')).findByText(/can’t be recorded/i);
+    expect(message).toHaveTextContent(/letter/i);
+    expect(message).toHaveTextContent(/Space/);
+    expect(message).toHaveTextContent(/arrow key/i);
+  });
+
+  it('re-validates against the config the write mutates, not the snapshot the UI validated', async () => {
+    const written: { config: AppConfig | null } = { config: null };
+    let reads = 0;
+    mockIPC((cmd, args) => {
+      if (cmd === 'get_config') {
+        reads += 1;
+        return reads === 1
+          ? baseAppConfig()
+          : baseAppConfig({ keymap: { 'player.playPause': 'Q' } });
+      }
+      if (cmd === 'set_config') written.config = (args as { config: AppConfig }).config;
+      return undefined;
+    });
+    await renderReady();
+
+    await fireEvent.click(chip('skip forward'));
+    await fireEvent.keyDown(chip('skip forward'), { key: 'q' });
+    expect(screen.queryByText(/already used by/i)).toBeNull();
+
+    await fireEvent.keyDown(chip('skip forward'), { key: 'Enter' });
+
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent(/already used by/i));
+    expect(written.config).toBeNull();
+  });
+
   it('accepts a modified window candidate', async () => {
     const written = recordingIpc();
-    render(ShortcutsSection);
-    await waitFor(() => expect(appConfigStore.keymap).toEqual({}));
+    await renderReady();
 
     await fireEvent.click(chip('toggle command palette'));
     await fireEvent.keyDown(chip('toggle command palette'), { key: 'p', metaKey: true });
@@ -193,8 +270,8 @@ describe('ShortcutsSection rebinding', () => {
     await waitFor(() => expect(written.config?.keymap).toEqual({ 'palette.toggle': 'Mod+P' }));
   });
 
-  it('arms one row at a time', async () => {
-    render(ShortcutsSection);
+  it('arms one row at a time, and says so in each chip’s accessible name', async () => {
+    await renderReady();
 
     await fireEvent.click(chip('skip forward'));
     expect(screen.getAllByText(/press a key/i)).toHaveLength(1);
@@ -202,12 +279,40 @@ describe('ShortcutsSection rebinding', () => {
     await fireEvent.click(chip('play or pause'));
 
     expect(screen.getAllByText(/press a key/i)).toHaveLength(1);
-    expect(chip('play or pause')).toHaveAttribute('aria-pressed', 'true');
-    expect(chip('skip forward')).toHaveAttribute('aria-pressed', 'false');
+    expect(chip('play or pause')).toHaveAccessibleName(/recording/i);
+    expect(chip('skip forward')).not.toHaveAccessibleName(/recording/i);
+  });
+
+  it('carries no aria-pressed, which would announce a toggle the chip does not implement', async () => {
+    await renderReady();
+
+    await fireEvent.click(chip('skip forward'));
+
+    expect(chip('skip forward')).not.toHaveAttribute('aria-pressed');
+  });
+
+  it('cannot be armed before the durable keymap has loaded', async () => {
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    mockIPC(async (cmd) => {
+      if (cmd !== 'get_config') return undefined;
+      await gate;
+      return baseAppConfig({ keymap: { 'player.playPause': 'Q' } });
+    });
+    render(ShortcutsSection);
+
+    expect(chip('skip forward')).toBeDisabled();
+    await fireEvent.click(chip('skip forward'));
+    expect(screen.queryByText(/press a key/i)).toBeNull();
+
+    release?.();
+    await waitFor(() => expect(chip('skip forward')).toBeEnabled());
   });
 
   it('focuses the armed chip, so its element-scoped listener actually receives the keystrokes', async () => {
-    render(ShortcutsSection);
+    await renderReady();
 
     await fireEvent.click(chip('skip forward'));
 
@@ -215,7 +320,7 @@ describe('ShortcutsSection rebinding', () => {
   });
 
   it('disarms on blur so a live-looking row can never record through the window listener', async () => {
-    render(ShortcutsSection);
+    await renderReady();
 
     await fireEvent.click(chip('skip forward'));
     expect(screen.getByText(/press a key/i)).toBeInTheDocument();
@@ -233,7 +338,7 @@ describe('ShortcutsSection rebinding', () => {
     };
     window.addEventListener('keydown', spy);
     try {
-      render(ShortcutsSection);
+      await renderReady();
 
       await fireEvent.click(chip('skip forward'));
       await fireEvent.keyDown(chip('skip forward'), { key: 'k', metaKey: true });
@@ -245,7 +350,7 @@ describe('ShortcutsSection rebinding', () => {
   });
 
   it('leaves Tab uncaptured so an armed row cannot trap focus', async () => {
-    render(ShortcutsSection);
+    await renderReady();
 
     await fireEvent.click(chip('skip forward'));
     const event = new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true });
@@ -257,8 +362,7 @@ describe('ShortcutsSection rebinding', () => {
 
   it('takes effect for the dispatcher without a remount', async () => {
     recordingIpc();
-    render(ShortcutsSection);
-    await waitFor(() => expect(appConfigStore.keymap).toEqual({}));
+    await renderReady();
 
     await fireEvent.click(chip('skip forward'));
     await fireEvent.keyDown(chip('skip forward'), { key: 'q' });
@@ -278,11 +382,19 @@ describe('ShortcutsSection resets', () => {
     render(ShortcutsSection);
     await waitFor(() => expect(screen.getByText('Q')).toBeInTheDocument());
 
-    await fireEvent.click(screen.getByRole('button', { name: /reset skip forward to default/i }));
+    const reset = screen.getByRole('button', { name: /reset skip forward to default/i });
+    reset.focus();
+    await fireEvent.click(reset);
 
     await waitFor(() => expect(written.config).not.toBeNull());
     expect(written.config?.keymap).toEqual({ 'player.skipBack': 'B' });
     await waitFor(() => expect(screen.getByText('L')).toBeInTheDocument());
+    // The reset button unmounts under the user, so focus must land on the chip, not <body>.
+    expect(screen.queryByRole('button', { name: /reset skip forward to default/i })).toBeNull();
+    expect(document.activeElement).toBe(chip('skip forward'));
+    await waitFor(() =>
+      expect(screen.getByRole('status')).toHaveTextContent(/Skip forward reset/i)
+    );
   });
 
   it('offers no reset affordance for a row that is not overridden', async () => {
@@ -301,17 +413,22 @@ describe('ShortcutsSection resets', () => {
     render(ShortcutsSection);
     await waitFor(() => expect(screen.getByText('Q')).toBeInTheDocument());
 
-    await fireEvent.click(screen.getByRole('button', { name: /reset all/i }));
+    const resetAll = screen.getByRole('button', { name: /reset all/i });
+    resetAll.focus();
+    await fireEvent.click(resetAll);
 
     await waitFor(() => expect(written.config?.keymap).toEqual({}));
     await waitFor(() => expect(screen.getByText('L')).toBeInTheDocument());
     expect(screen.getByText('⌘K')).toBeInTheDocument();
+    // Reset all disables itself here, and a disabled element is blurred to <body>.
+    await waitFor(() => expect(resetAll).toBeDisabled());
+    expect(document.activeElement).toBe(screen.getByRole('heading', { name: 'Shortcuts' }));
+    expect(screen.getByRole('status')).toHaveTextContent(/All shortcuts reset/i);
   });
 
   it('disables Reset all when nothing is overridden', async () => {
     recordingIpc();
-    render(ShortcutsSection);
-    await waitFor(() => expect(appConfigStore.keymap).toEqual({}));
+    await renderReady();
 
     expect(screen.getByRole('button', { name: /reset all/i })).toBeDisabled();
   });
@@ -324,8 +441,7 @@ describe('ShortcutsSection persist failures', () => {
       if (cmd === 'set_config') throw new Error('write failed');
       return undefined;
     });
-    render(ShortcutsSection);
-    await waitFor(() => expect(appConfigStore.keymap).toEqual({}));
+    await renderReady();
 
     await fireEvent.click(chip('skip forward'));
     await fireEvent.keyDown(chip('skip forward'), { key: 'q' });
@@ -351,8 +467,7 @@ describe('ShortcutsSection persist failures', () => {
       if (cmd === 'set_config') written = (args as { config: AppConfig }).config;
       return undefined;
     });
-    render(ShortcutsSection);
-    await waitFor(() => expect(appConfigStore.keymap).toEqual({}));
+    await renderReady();
 
     await fireEvent.click(chip('skip forward'));
     await fireEvent.keyDown(chip('skip forward'), { key: 'q' });

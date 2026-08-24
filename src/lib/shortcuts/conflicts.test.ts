@@ -60,7 +60,6 @@ describe('isValidForScope', () => {
   it('rejects a typeable window candidate, Shift included', () => {
     expect(isValidForScope('window', parse('Q'))).toBe(false);
     expect(isValidForScope('window', parse('ArrowDown'))).toBe(false);
-    // Shift is not a qualifying modifier: Shift+Q is how a capital Q is typed.
     expect(isValidForScope('window', parse('Shift+Q'))).toBe(false);
   });
 

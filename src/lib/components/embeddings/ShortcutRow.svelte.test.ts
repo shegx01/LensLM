@@ -23,6 +23,7 @@ function props(overrides: Partial<Props> = {}): Props {
     armedId: null,
     candidate: null,
     message: null,
+    disabled: false,
     onarm: () => {},
     oncapture: () => {},
     ondisarm: () => {},
@@ -122,7 +123,7 @@ describe('ShortcutRow', () => {
     expect(oncapture).not.toHaveBeenCalled();
   });
 
-  it('announces the inline message', () => {
+  it('shows the inline message', () => {
     render(ShortcutRow, {
       props: props({
         armedId: 'palette.toggle',
@@ -131,7 +132,7 @@ describe('ShortcutRow', () => {
       })
     });
 
-    expect(screen.getByRole('alert')).toHaveTextContent(/already used by/i);
+    expect(screen.getByText(/already used by/i)).toBeInTheDocument();
   });
 
   it('renders a reserved row as static, with no edit affordance and a conventional label', () => {
@@ -180,5 +181,92 @@ describe('ShortcutRow', () => {
     const reset = screen.getByRole('button', { name: /reset toggle command palette/i });
     await fireEvent.click(reset);
     expect(onreset).toHaveBeenCalledWith('palette.toggle');
+  });
+
+  it('keeps focus on the chip when the reset button unmounts under the user', async () => {
+    const overridden: Props['chips'] = [
+      {
+        id: 'palette.toggle',
+        action: 'Toggle command palette',
+        token: 'Mod+P',
+        overridden: true,
+        remappable: true
+      }
+    ];
+    render(ShortcutRow, { props: props({ chips: overridden }) });
+
+    const reset = screen.getByRole('button', { name: /reset toggle command palette/i });
+    reset.focus();
+    await fireEvent.click(reset);
+
+    expect(document.activeElement).toBe(
+      screen.getByRole('button', { name: /change shortcut for toggle command palette/i })
+    );
+    expect(document.activeElement).not.toBe(document.body);
+  });
+
+  it('disables the chip until the durable keymap has loaded', () => {
+    render(ShortcutRow, { props: props({ disabled: true }) });
+
+    expect(
+      screen.getByRole('button', { name: /change shortcut for toggle command palette/i })
+    ).toBeDisabled();
+  });
+});
+
+// aria-label overrides name-from-content, so these assert the ACCESSIBLE NAME: a getByText
+// on the <kbd> passes even when every chip is named identically to a screen reader.
+describe('ShortcutRow accessible name', () => {
+  it('names the current binding when idle', () => {
+    render(ShortcutRow, { props: props() });
+
+    expect(
+      screen.getByRole('button', {
+        name: 'Change shortcut for Toggle command palette, currently Command plus K'
+      })
+    ).toBeInTheDocument();
+  });
+
+  it('names the recording state when armed with nothing captured', () => {
+    render(ShortcutRow, { props: props({ armedId: 'palette.toggle' }) });
+
+    expect(
+      screen.getByRole('button', {
+        name: 'Change shortcut for Toggle command palette, currently Command plus K. Recording, press a key.'
+      })
+    ).toBeInTheDocument();
+  });
+
+  it('names the captured candidate while armed', () => {
+    render(ShortcutRow, {
+      props: props({ armedId: 'palette.toggle', candidate: parse('Mod+Shift+P') })
+    });
+
+    expect(
+      screen.getByRole('button', {
+        name: 'Change shortcut for Toggle command palette, currently Command plus K. Recording Command plus Shift plus P, press Enter to save.'
+      })
+    ).toBeInTheDocument();
+  });
+
+  it('distinguishes the two chips of a paired row by their bindings', () => {
+    render(ShortcutRow, { props: props({ label: 'Seek', chips: pairedChips }) });
+
+    expect(
+      screen.getByRole('button', { name: 'Change shortcut for Seek back, currently Left arrow' })
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole('button', {
+        name: 'Change shortcut for Seek forward, currently Right arrow'
+      })
+    ).toBeInTheDocument();
+  });
+
+  it('carries no aria-pressed: activating an armed chip re-arms, it does not unpress', () => {
+    render(ShortcutRow, { props: props({ armedId: 'palette.toggle' }) });
+
+    expect(
+      screen.getByRole('button', { name: /change shortcut for toggle command palette/i })
+    ).not.toHaveAttribute('aria-pressed');
   });
 });
