@@ -265,7 +265,9 @@ mod tests {
 
         let token = "Mod+Shift+P".to_string();
         let mut remapped = ollama_local_config("dark");
-        remapped.keymap.insert(ActionId::PaletteToggle, token.clone());
+        remapped
+            .keymap
+            .insert(ActionId::PaletteToggle, token.clone());
         apply_config(&engine, remapped).await.unwrap();
 
         assert_eq!(
