@@ -33,7 +33,7 @@ export interface ShortcutEntry {
 // Conflict detection blocks only *user* edits, so nothing at runtime guards these:
 // the shipped defaults must stay collision-free across `window` ∪ every other scope,
 // because player keys bubble to the window listener.
-const SHORTCUTS_BY_ID = {
+export const SHORTCUTS_BY_ID = {
   'palette.toggle': {
     id: 'palette.toggle',
     group: 'Global',
