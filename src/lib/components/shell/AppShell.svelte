@@ -22,6 +22,9 @@
   import NotebookSettingsSheet from '$lib/components/embeddings/NotebookSettingsSheet.svelte';
   import ChatPane from '$lib/components/chat/ChatPane.svelte';
   import NotesPane from '$lib/components/notes/NotesPane.svelte';
+  import { resolve } from '$lib/shortcuts/dispatcher.js';
+  import { currentPlatform } from '$lib/shortcuts/platform.js';
+  import { appConfigStore, ensureLoaded } from '$lib/models/app-config.svelte.js';
 
   let createOpen = $state(false);
   let userName = $state('');
@@ -46,8 +49,6 @@
     return 'grid-cols-[256px_1fr_320px]';
   });
 
-  // ⌘K handler — macOS-first / metaKey only for M3.
-
   function isTypingTarget(el: Element | null): boolean {
     if (!el) return false;
     const tag = el.tagName;
@@ -55,22 +56,25 @@
   }
 
   function handleKeydown(e: KeyboardEvent): void {
-    if (!(e.metaKey && e.key === 'k')) return;
-    e.preventDefault();
+    if (resolve(e, 'window', appConfigStore.keymap, currentPlatform()) !== 'palette.toggle') return;
     if (notebookStore.paletteOpen) {
       // Unconditional close — no active-element guard so the palette's own
       // search input can't block its own close.
+      e.preventDefault();
       notebookStore.paletteOpen = false;
       return;
     }
     // Guard on open only: don't steal focus while typing in an input/textarea/
     // contenteditable (e.g. the create-dialog name field or inline rename).
     if (isTypingTarget(document.activeElement)) return;
+    // Prevent only once acting: a bare-letter binding must still type everywhere else.
+    e.preventDefault();
     notebookStore.paletteOpen = true;
   }
 
   onMount(() => {
     window.addEventListener('keydown', handleKeydown);
+    void ensureLoaded();
 
     // Load notebooks + config in parallel. Auto-select the most-recently-active
     // notebook only after BOTH have resolved, so there is no race between the
