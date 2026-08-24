@@ -1,9 +1,15 @@
 import { render, screen } from '@testing-library/svelte';
-import { describe, expect, it } from 'vitest';
-import { SHORTCUTS } from '$lib/shortcuts/registry.js';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { setPlatform } from '$lib/shortcuts/platform.js';
+import { ROWS } from '$lib/shortcuts/registry.js';
 import ShortcutsSection from './ShortcutsSection.svelte';
 
 describe('ShortcutsSection', () => {
+  // Chips are platform-rendered; the frontend CI job runs on ubuntu, so the
+  // expected glyphs are only stable with the platform pinned.
+  beforeEach(() => setPlatform('darwin'));
+  afterEach(() => setPlatform(null));
+
   it('renders a heading for every group present in the registry', () => {
     render(ShortcutsSection);
 
@@ -21,10 +27,10 @@ describe('ShortcutsSection', () => {
     expect(screen.getByText('L')).toBeInTheDocument();
   });
 
-  it('renders exactly one row per registry entry (drift guard)', () => {
+  it('renders exactly one row per display row (drift guard)', () => {
     const { container } = render(ShortcutsSection);
 
     const rows = container.querySelectorAll('[data-shortcut-row]');
-    expect(rows.length).toBe(SHORTCUTS.length);
+    expect(rows.length).toBe(ROWS.length);
   });
 });

@@ -28,9 +28,22 @@ describe('appConfigStore unloaded-state contract', () => {
     expect(appConfigStore.asr).toBeNull();
     expect(appConfigStore.audioCloudConsent).toBe(false);
     expect(appConfigStore.ttsCloudConsent).toBe(false);
+    expect(appConfigStore.keymap).toEqual({});
     expect(appConfigStore.loadError).toBeNull();
     expect(appConfigStore.staleError).toBeNull();
     expect(appConfigStore.persistError).toBeNull();
+  });
+});
+
+describe('appConfigStore.keymap', () => {
+  it('returns {} when a loaded config omits keymap', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return baseAppConfig();
+    });
+
+    await ensureLoaded();
+
+    expect(appConfigStore.keymap).toEqual({});
   });
 });
 

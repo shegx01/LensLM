@@ -1,6 +1,8 @@
 // SYNC-CHECK: must match lens-core/src/config.rs AppConfig — update both together.
 // serde uses verbatim snake_case; set_config replaces the whole struct so all fields must round-trip.
 
+import type { ActionId } from '$lib/shortcuts/registry.js';
+
 export interface ModelConfig {
   provider: string;
   base_url: string;
@@ -166,4 +168,7 @@ export interface AppConfig {
   // SYNC-CHECK: must match lens-core/src/config.rs AppConfig.animations (default "system").
   // Applied as `data-motion` on <html>: 'system' | 'on' | 'off'.
   animations: string;
+  // SYNC-CHECK: must match lens-core/src/config.rs AppConfig.keymap
+  // (BTreeMap<ActionId, String>, #[serde(default)], empty by default).
+  keymap?: Partial<Record<ActionId, string>>;
 }

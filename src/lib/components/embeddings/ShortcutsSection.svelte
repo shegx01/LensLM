@@ -4,12 +4,19 @@
   Remapping is deferred to #239 (central dispatcher + AppConfig keymap).
 -->
 <script lang="ts">
-  import { SHORTCUTS, type ShortcutEntry } from '$lib/shortcuts/registry.js';
+  import { render } from '$lib/shortcuts/binding.js';
+  import { currentPlatform } from '$lib/shortcuts/platform.js';
+  import { GROUP_ORDER, ROWS, SHORTCUTS } from '$lib/shortcuts/registry.js';
 
-  const GROUP_ORDER: ShortcutEntry['group'][] = ['Global', 'Chat', 'Audio player'];
+  const platform = currentPlatform();
+  const defaultBindings = new Map(SHORTCUTS.map((entry) => [entry.id, entry.defaultBinding]));
+
   const groups = GROUP_ORDER.map((group) => ({
     group,
-    items: SHORTCUTS.filter((item) => item.group === group)
+    items: ROWS.filter((row) => row.group === group).map((row) => ({
+      ...row,
+      keys: row.ids.map((id) => render(defaultBindings.get(id) ?? id, platform))
+    }))
   })).filter((g) => g.items.length > 0);
 </script>
 
@@ -25,13 +32,13 @@
         {group}
       </p>
       <div class="mt-3 flex flex-col gap-2">
-        {#each items as item (item.action)}
+        {#each items as item (item.label)}
           <div
             data-shortcut-row
             class="flex items-center justify-between gap-4 rounded-[10px] border border-border bg-card px-4 py-3.5"
           >
             <span class="min-w-0 flex-1">
-              <span class="block text-[0.78rem] font-bold text-foreground">{item.action}</span>
+              <span class="block text-[0.78rem] font-bold text-foreground">{item.label}</span>
               <span class="mt-0.5 block text-[0.68rem] text-muted-foreground"
                 >{item.description}</span
               >
