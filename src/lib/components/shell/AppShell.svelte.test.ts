@@ -5,6 +5,8 @@ import { notebookStore, resetNotebookStore } from '$lib/notebooks/notebooks-stat
 import { listTrashed } from '$lib/notebooks/ipc.js';
 import { listTrashedSources } from '$lib/sources/ipc.js';
 import { invoke } from '@tauri-apps/api/core';
+import { setPlatform } from '$lib/shortcuts/platform.js';
+import type { ActionId } from '$lib/shortcuts/registry.js';
 
 // AppShell mounts NotebooksSidebar (loads notebooks via the store) + CommandPalette
 // + NotebookCreateDialog. Mock the IPC layer so the store's loadNotebooks() resolves
@@ -40,6 +42,65 @@ vi.mock('@tauri-apps/api/core', () => ({
   invoke: vi.fn()
 }));
 
+// The `isTauri` mock above defaults to false, so the real store's load() early-returns and
+// `mockIPC` can never feed it a keymap — inject one through the store module instead.
+let mockKeymap: Partial<Record<ActionId, string>> = {};
+const ensureLoaded = vi.fn(async () => {});
+
+vi.mock('$lib/models/app-config.svelte.js', () => ({
+  appConfigStore: {
+    get models() {
+      return [];
+    },
+    get enrichment() {
+      return { enabled: false, coref_strategy: 'llm_inline', cloud_consent: false };
+    },
+    get asr() {
+      return null;
+    },
+    get audioCloudConsent() {
+      return false;
+    },
+    get ttsCloudConsent() {
+      return false;
+    },
+    get keymap() {
+      return mockKeymap;
+    },
+    get loadError() {
+      return null;
+    },
+    get staleError() {
+      return null;
+    },
+    get persistError() {
+      return null;
+    }
+  },
+  ensureLoaded: () => ensureLoaded(),
+  refreshConfig: vi.fn(async () => {}),
+  persist: vi.fn(async () => {}),
+  resetConfig: vi.fn()
+}));
+
+// Left in place across tests it would keep document.activeElement typing-shaped and
+// silently arm the open-guard in every later case — afterEach removes it.
+function focusTypingTarget(): HTMLInputElement {
+  const input = document.createElement('input');
+  input.dataset.typingFixture = '';
+  document.body.appendChild(input);
+  input.focus();
+  return input;
+}
+
+function pressKey(init: KeyboardEventInit): KeyboardEvent {
+  // cancelable+bubbles are load-bearing: `defaultPrevented` is permanently false on a
+  // non-cancelable event, which would make the preventDefault assertions vacuous.
+  const event = new KeyboardEvent('keydown', { bubbles: true, cancelable: true, ...init });
+  window.dispatchEvent(event);
+  return event;
+}
+
 // Minimal NotebookSummary fixture.
 function makeNotebook(id: string): import('$lib/notebooks/types.js').NotebookSummary {
   return {
@@ -71,6 +132,9 @@ function makeConfig(
 beforeEach(async () => {
   vi.clearAllMocks();
   resetNotebookStore();
+  notebookStore.paletteOpen = false;
+  mockKeymap = {};
+  setPlatform('darwin');
   mockIsTauri.mockReturnValue(false);
   const { listNotebooks } = await import('$lib/notebooks/ipc.js');
   vi.mocked(listNotebooks).mockResolvedValue([]);
@@ -85,6 +149,8 @@ beforeEach(async () => {
 
 afterEach(() => {
   resetNotebookStore();
+  setPlatform(null);
+  for (const el of document.querySelectorAll('input[data-typing-fixture]')) el.remove();
 });
 
 describe('AppShell.svelte', () => {
@@ -235,5 +301,92 @@ describe('AppShell.svelte', () => {
     await vi.waitFor(() => {
       expect(notebookStore.activeNotebookId).toBe('nb-1');
     });
+  });
+});
+
+describe('AppShell keyboard dispatch', () => {
+  it('Meta+k on darwin toggles the palette open, then closed', () => {
+    render(AppShell);
+
+    const open = pressKey({ key: 'k', metaKey: true });
+    expect(notebookStore.paletteOpen).toBe(true);
+    expect(open.defaultPrevented).toBe(true);
+
+    const close = pressKey({ key: 'k', metaKey: true });
+    expect(notebookStore.paletteOpen).toBe(false);
+    expect(close.defaultPrevented).toBe(true);
+  });
+
+  it('Ctrl+k on linux toggles the palette open, then closed', () => {
+    setPlatform('linux');
+    render(AppShell);
+
+    pressKey({ key: 'k', ctrlKey: true });
+    expect(notebookStore.paletteOpen).toBe(true);
+
+    pressKey({ key: 'k', ctrlKey: true });
+    expect(notebookStore.paletteOpen).toBe(false);
+  });
+
+  it('Meta+k on linux does nothing', () => {
+    setPlatform('linux');
+    render(AppShell);
+
+    const event = pressKey({ key: 'k', metaKey: true });
+
+    expect(notebookStore.paletteOpen).toBe(false);
+    expect(event.defaultPrevented).toBe(false);
+  });
+
+  it('the typing guard blocks the open but never the close', () => {
+    render(AppShell);
+    focusTypingTarget();
+
+    pressKey({ key: 'k', metaKey: true });
+    expect(notebookStore.paletteOpen).toBe(false);
+
+    notebookStore.paletteOpen = true;
+    pressKey({ key: 'k', metaKey: true });
+    expect(notebookStore.paletteOpen).toBe(false);
+  });
+
+  it('leaves defaultPrevented false when the typing guard suppresses the open', () => {
+    render(AppShell);
+    focusTypingTarget();
+
+    const event = pressKey({ key: 'k', metaKey: true });
+
+    expect(notebookStore.paletteOpen).toBe(false);
+    expect(event.defaultPrevented).toBe(false);
+  });
+
+  it('a bare-letter override still types into an input instead of being swallowed', () => {
+    mockKeymap = { 'palette.toggle': 'P' };
+    render(AppShell);
+    focusTypingTarget();
+
+    const event = pressKey({ key: 'p' });
+
+    expect(notebookStore.paletteOpen).toBe(false);
+    expect(event.defaultPrevented).toBe(false);
+  });
+
+  it('a keymap override fires instead of the default binding', () => {
+    mockKeymap = { 'palette.toggle': 'P' };
+    render(AppShell);
+
+    const overridden = pressKey({ key: 'p' });
+    expect(notebookStore.paletteOpen).toBe(true);
+    expect(overridden.defaultPrevented).toBe(true);
+
+    notebookStore.paletteOpen = false;
+    const stale = pressKey({ key: 'k', metaKey: true });
+    expect(notebookStore.paletteOpen).toBe(false);
+    expect(stale.defaultPrevented).toBe(false);
+  });
+
+  it('loads the keymap on mount so window-scope bindings work without the Settings panel', () => {
+    render(AppShell);
+    expect(ensureLoaded).toHaveBeenCalled();
   });
 });

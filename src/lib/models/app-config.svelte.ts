@@ -7,6 +7,7 @@ import { invoke, isTauri } from '@tauri-apps/api/core';
 import { updateConfig } from '$lib/config.js';
 import { toLensError } from '$lib/sources/lens-error.js';
 import type { AppConfig, AsrConfig, EnrichmentConfig, ModelConfig } from '$lib/theme/types.js';
+import type { ActionId } from '$lib/shortcuts/registry.js';
 
 const DEFAULT_ENRICHMENT: EnrichmentConfig = {
   enabled: false,
@@ -64,6 +65,9 @@ export const appConfigStore = {
   },
   get ttsCloudConsent(): boolean {
     return cfg?.tts_cloud_consent ?? false;
+  },
+  get keymap(): Partial<Record<ActionId, string>> {
+    return cfg?.keymap ?? {};
   },
   /** Non-null when no snapshot has ever loaded successfully — every getter above is
    *  falling back to its unloaded default. */

@@ -100,6 +100,7 @@ pub async fn has_chat_provider(engine: tauri::State<'_, LensEngine>) -> Result<b
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lens_core::ActionId;
     use lens_core::EnrichmentConfig;
     use lens_core::config::ModelConfig;
 
@@ -250,6 +251,33 @@ mod tests {
         assert!(
             engine.llm_provider().await.is_none(),
             "an unrelated (theme) change must not trigger a provider rebind"
+        );
+    }
+
+    /// Weak by construction: `llm_config_changed` reads only `models` + five `enrichment`
+    /// fields, so a keymap-only delta cannot return true. It is kept because it compiles
+    /// `AppConfig::keymap` under `-p lenslm` and pins the no-rebind path for keymap writes.
+    #[tokio::test]
+    async fn apply_config_does_not_rebind_on_keymap_change() {
+        let engine = LensEngine::for_test().await;
+        engine.set_config(ollama_local_config("dark")).await;
+        assert!(engine.llm_provider().await.is_none());
+
+        let token = "Mod+Shift+P".to_string();
+        let mut remapped = ollama_local_config("dark");
+        remapped
+            .keymap
+            .insert(ActionId::PaletteToggle, token.clone());
+        apply_config(&engine, remapped).await.unwrap();
+
+        assert_eq!(
+            engine.config().await.keymap.get(&ActionId::PaletteToggle),
+            Some(&token),
+            "the keymap write reaches the in-memory config"
+        );
+        assert!(
+            engine.llm_provider().await.is_none(),
+            "a keymap-only change must not trigger a provider rebind"
         );
     }
 }

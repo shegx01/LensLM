@@ -18,6 +18,10 @@
   import NotebookRow from '$lib/components/notebooks/NotebookRow.svelte';
   import AccountFooter from '$lib/components/notebooks/AccountFooter.svelte';
   import { notebookStore, openTrash, getInitials } from '$lib/notebooks/index.js';
+  import { appConfigStore, ensureLoaded } from '$lib/models/app-config.svelte.js';
+  import { describe as describeBinding, render as renderBinding } from '$lib/shortcuts/binding.js';
+  import { currentPlatform } from '$lib/shortcuts/platform.js';
+  import { SHORTCUTS_BY_ID } from '$lib/shortcuts/registry.js';
 
   // `collapsed` is the effective layout state from AppShell; falls back to the
   // store's `sidebarCollapsed` when omitted so existing direct usage/tests work.
@@ -43,6 +47,19 @@
   let indicatorEl = $state<HTMLElement | null>(null);
   // First placement snaps (no glide from y=0); every later one glides.
   let firstPosition = true;
+
+  const platform = currentPlatform();
+  // Glyphs for the visible kbd/tooltip, spoken words for the aria-label — never mix the two.
+  const paletteBinding = $derived(
+    appConfigStore.keymap['palette.toggle'] ?? SHORTCUTS_BY_ID['palette.toggle'].defaultBinding
+  );
+  const paletteGlyph = $derived(renderBinding(paletteBinding, platform));
+  const paletteSpoken = $derived(describeBinding(paletteBinding, platform));
+
+  // The Shortcuts panel may never have mounted, so the sidebar loads the keymap itself.
+  $effect(() => {
+    void ensureLoaded();
+  });
 
   // Slide the active indicator to the active row using a rect delta against the
   // list container (wrapper-agnostic). Row height is not transitioned, so the rect
@@ -166,7 +183,7 @@
     <!-- search -->
     <Tooltip disabled={!collapsed}>
       <TooltipTrigger
-        aria-label="Search notebooks (⌘K)"
+        aria-label={`Search notebooks (${paletteSpoken})`}
         data-search-trigger
         onclick={openPalette}
         class={cn(
@@ -189,10 +206,10 @@
           )}
           aria-hidden="true"
         >
-          ⌘K
+          {paletteGlyph}
         </kbd>
       </TooltipTrigger>
-      <TooltipContent side="right">Search notebooks (⌘K)</TooltipContent>
+      <TooltipContent side="right">Search notebooks ({paletteGlyph})</TooltipContent>
     </Tooltip>
 
     {#if !collapsed}

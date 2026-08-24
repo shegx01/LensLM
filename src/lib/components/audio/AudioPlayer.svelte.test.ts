@@ -12,10 +12,24 @@
 
 import { render, screen, fireEvent, waitFor } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { persist, resetConfig } from '$lib/models/app-config.svelte.js';
+import { setPlatform } from '$lib/shortcuts/platform.js';
+import type { ActionId } from '$lib/shortcuts/registry.js';
+import { baseAppConfig } from '$lib/test-fixtures.js';
+import type { AppConfig } from '$lib/theme/types.js';
 import AudioPlayer from './AudioPlayer.svelte';
 
+// `invoke` must resolve a real config: a bare `vi.fn()` yields `undefined`, which never
+// clears `ensureLoaded`'s load-once guard, so the keymap would stay empty forever.
+const configRef = vi.hoisted(() => ({ current: null as AppConfig | null }));
+
 vi.mock('@tauri-apps/api/core', () => ({
-  convertFileSrc: (path: string) => `asset://localhost/${path}`
+  convertFileSrc: (path: string) => `asset://localhost/${path}`,
+  isTauri: () => true,
+  invoke: async (cmd: string, args?: Record<string, unknown>) => {
+    if (cmd === 'set_config') configRef.current = args?.config as AppConfig;
+    return cmd === 'get_config' ? configRef.current : undefined;
+  }
 }));
 
 const TEST_PATH = '/data/notebooks/nb-001/overview.wav';
@@ -50,6 +64,8 @@ let originalPlay: typeof HTMLMediaElement.prototype.play;
 let originalPause: typeof HTMLMediaElement.prototype.pause;
 
 beforeEach(() => {
+  configRef.current = baseAppConfig();
+  setPlatform('darwin');
   vi.stubGlobal(
     'fetch',
     vi.fn(() =>
@@ -78,6 +94,10 @@ afterEach(() => {
   HTMLMediaElement.prototype.pause = originalPause;
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
+  // The config store is a module singleton: without this the first test to load
+  // poisons the keymap for every test after it.
+  resetConfig();
+  setPlatform(null);
 });
 
 describe('AudioPlayer — blob loading', () => {
@@ -154,12 +174,14 @@ describe('AudioPlayer', () => {
     expect(screen.getByText('0:00 / 0:00')).toBeInTheDocument();
   });
 
-  it('the outer group carries an aria-label describing every keyboard shortcut', async () => {
+  it('generates the group aria-label from the effective bindings, in spoken words', async () => {
     await renderLoaded();
 
-    const group = screen.getByRole('group');
-    expect(group).toHaveAttribute('aria-label', expect.stringContaining('Space plays or pauses'));
-    expect(group).toHaveAttribute('aria-label', expect.stringContaining('J and L skip 15 seconds'));
+    expect(screen.getByRole('group')).toHaveAttribute(
+      'aria-label',
+      'Audio overview player. Space plays or pauses. Left arrow and Right arrow seek 5 seconds. ' +
+        'J and L skip 15 seconds. Left bracket and Right bracket change playback speed.'
+    );
   });
 
   it('clicking Play toggles the button to Pause (native play event flips state)', async () => {
@@ -288,5 +310,108 @@ describe('AudioPlayer', () => {
       await fireEvent.keyDown(group, { key: 'ArrowLeft' });
       expect(audio.currentTime).toBe(0);
     });
+  });
+});
+
+describe('AudioPlayer — remappable shortcuts', () => {
+  async function renderWithKeymap(keymap: Partial<Record<ActionId, string>>) {
+    configRef.current = baseAppConfig({ keymap });
+    resetConfig();
+    const utils = await renderLoaded();
+    const hint = utils.container.querySelector('.hint');
+    if (!hint) throw new Error('keyboard hint not rendered');
+    return { ...utils, hint: hint as HTMLElement };
+  }
+
+  it('presents one binding model two ways: glyphs in the hint, words in the aria-label', async () => {
+    const { hint } = await renderWithKeymap({});
+
+    expect(hint).toHaveTextContent('←');
+    expect(hint).toHaveTextContent('[');
+
+    const label = screen.getByRole('group').getAttribute('aria-label') ?? '';
+    expect(label).toContain('Left arrow');
+    expect(label).toContain('Left bracket');
+    expect(label).not.toContain('←');
+    expect(label).not.toContain('[');
+  });
+
+  it('an override retitles both the visible hint and the aria-label', async () => {
+    const { hint } = await renderWithKeymap({ 'player.playPause': 'Mod+P' });
+
+    await waitFor(() => {
+      expect(hint).toHaveTextContent('⌘P');
+      expect(hint).not.toHaveTextContent('Space');
+    });
+    expect(screen.getByRole('group')).toHaveAttribute(
+      'aria-label',
+      expect.stringContaining('Command plus P plays or pauses')
+    );
+  });
+
+  it('honours a persisted override with the Shortcuts panel never mounted', async () => {
+    const { hint } = await renderWithKeymap({ 'player.playPause': 'P' });
+    await waitFor(() => {
+      expect(hint).toHaveTextContent('P');
+      expect(hint).not.toHaveTextContent('Space');
+    });
+    const group = screen.getByRole('group');
+
+    await fireEvent.keyDown(group, { key: ' ' });
+    expect(screen.getByRole('button', { name: 'Play' })).toBeInTheDocument();
+
+    await fireEvent.keyDown(group, { key: 'p' });
+    expect(screen.getByRole('button', { name: 'Pause' })).toBeInTheDocument();
+  });
+
+  it('picks up a rebind without a remount', async () => {
+    const { hint } = await renderWithKeymap({ 'player.playPause': 'P' });
+    await waitFor(() => expect(hint).not.toHaveTextContent('Space'));
+    const group = screen.getByRole('group');
+
+    await fireEvent.keyDown(group, { key: 'p' });
+    expect(screen.getByRole('button', { name: 'Pause' })).toBeInTheDocument();
+
+    await persist((cfg) => ({ ...cfg, keymap: { 'player.playPause': 'K' } }));
+    await waitFor(() => expect(hint).toHaveTextContent('K'));
+
+    await fireEvent.keyDown(group, { key: 'p' });
+    expect(screen.getByRole('button', { name: 'Pause' })).toBeInTheDocument();
+
+    await fireEvent.keyDown(group, { key: 'k' });
+    expect(screen.getByRole('button', { name: 'Play' })).toBeInTheDocument();
+  });
+
+  it('swallows a matched chord but lets an unmatched one bubble to the window', async () => {
+    await renderWithKeymap({});
+    const group = screen.getByRole('group');
+    const seen: KeyboardEvent[] = [];
+    const listener = (e: Event) => seen.push(e as KeyboardEvent);
+    document.addEventListener('keydown', listener);
+
+    try {
+      await fireEvent.keyDown(group, { key: 'k', metaKey: true });
+      expect(seen).toHaveLength(1);
+      expect(seen[0].defaultPrevented).toBe(false);
+
+      await fireEvent.keyDown(group, { key: ' ' });
+      expect(seen).toHaveLength(1);
+    } finally {
+      document.removeEventListener('keydown', listener);
+    }
+  });
+
+  it('does not fire skipBack for Shift+J — modifiers must match exactly', async () => {
+    const { audio } = await renderWithKeymap({});
+    await setDuration(audio, 200);
+    await setCurrentTime(audio, 30);
+    const group = screen.getByRole('group');
+
+    await fireEvent.keyDown(group, { key: 'J', shiftKey: true });
+    expect(audio.currentTime).toBe(30);
+    expect(screen.queryByText('Skipped back 15 seconds')).not.toBeInTheDocument();
+
+    await fireEvent.keyDown(group, { key: 'j' });
+    expect(audio.currentTime).toBe(15);
   });
 });
