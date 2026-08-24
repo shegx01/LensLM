@@ -597,6 +597,60 @@ fn default_animations() -> String {
     "system".to_string()
 }
 
+/// Stable identifier for a remappable keyboard action (#239). The `rename`
+/// strings are the wire contract shared with `src/lib/shortcuts/registry.ts`;
+/// they are explicit because `rename_all` cannot produce the dotted form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum ActionId {
+    #[serde(rename = "palette.toggle")]
+    PaletteToggle,
+    #[serde(rename = "palette.close")]
+    PaletteClose,
+    #[serde(rename = "chat.send")]
+    ChatSend,
+    #[serde(rename = "chat.newline")]
+    ChatNewline,
+    #[serde(rename = "player.playPause")]
+    PlayerPlayPause,
+    #[serde(rename = "player.seekBack")]
+    PlayerSeekBack,
+    #[serde(rename = "player.seekFwd")]
+    PlayerSeekFwd,
+    #[serde(rename = "player.skipBack")]
+    PlayerSkipBack,
+    #[serde(rename = "player.skipFwd")]
+    PlayerSkipFwd,
+    #[serde(rename = "player.rateDown")]
+    PlayerRateDown,
+    #[serde(rename = "player.rateUp")]
+    PlayerRateUp,
+}
+
+/// Tolerant deserializer for [`AppConfig::keymap`]: an entry whose key is not a known
+/// [`ActionId`], or whose value is not a string, is dropped instead of failing the whole
+/// load. Dropping is lossy — the next [`AppConfig::save`] re-serializes only what
+/// survived — which is the deliberate price of never bricking a hand-edited config.
+fn deserialize_keymap<'de, D>(deserializer: D) -> Result<BTreeMap<ActionId, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = BTreeMap::<String, serde_json::Value>::deserialize(deserializer)?;
+    let mut keymap = BTreeMap::new();
+    for (key, value) in raw {
+        let serde_json::Value::String(token) = value else {
+            tracing::debug!("dropping keymap entry {key}: value is not a string");
+            continue;
+        };
+        match serde_json::from_value::<ActionId>(serde_json::Value::String(key)) {
+            Ok(action) => {
+                keymap.insert(action, token);
+            }
+            Err(e) => tracing::debug!("dropping keymap entry: {e}"),
+        }
+    }
+    Ok(keymap)
+}
+
 /// Top-level application configuration. Loaded from / saved to `{data_dir}/config.json`;
 /// missing file writes the default back; malformed file yields [`LensError::Parse`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -658,6 +712,11 @@ pub struct AppConfig {
     #[serde(default)]
     pub storage: StorageConfig,
     pub tier_thresholds: TierThresholds,
+    /// User keybinding overrides (#239). The value is an opaque token (`"Mod+P"`);
+    /// the engine never parses it — only the frontend does — so an unparseable
+    /// token survives a round-trip instead of being silently reset.
+    #[serde(default, deserialize_with = "deserialize_keymap")]
+    pub keymap: BTreeMap<ActionId, String>,
     pub onboarding_complete: bool,
 }
 
@@ -686,6 +745,7 @@ impl Default for AppConfig {
             paths: PathConfig::default(),
             storage: StorageConfig::default(),
             tier_thresholds: TierThresholds::default(),
+            keymap: BTreeMap::default(),
             onboarding_complete: false,
         }
     }
@@ -732,6 +792,8 @@ impl AppConfig {
     /// (consent withdrawn, or half-configured) runs before the vendor-default fill, so
     /// the fill can never retarget an ACTIVE backend at a host the user did not pick.
     pub(crate) fn normalize(&mut self) {
+        // No `keymap` branch here on purpose: `save()` normalizes unconditionally, so any
+        // rewrite would silently drop user bindings during an unrelated write (a theme toggle).
         let cloud_selected = crate::asr::AsrBackend::from_opt_str(Some(&self.asr.backend))
             == Some(crate::asr::AsrBackend::Cloud);
         if cloud_selected && !self.audio_cloud_consent {
