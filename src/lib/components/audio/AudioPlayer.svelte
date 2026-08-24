@@ -11,6 +11,13 @@
   import { convertFileSrc } from '@tauri-apps/api/core';
   import Play from '@lucide/svelte/icons/play';
   import Pause from '@lucide/svelte/icons/pause';
+  import { appConfigStore, ensureLoaded } from '$lib/models/app-config.svelte.js';
+  import { describe as describeBinding, render as renderBinding } from '$lib/shortcuts/binding.js';
+  import { resolve } from '$lib/shortcuts/dispatcher.js';
+  import { currentPlatform } from '$lib/shortcuts/platform.js';
+  import { SHORTCUTS, type ActionId } from '$lib/shortcuts/registry.js';
+
+  type PlayerActionId = Extract<ActionId, `player.${string}`>;
 
   let { path }: { path: string } = $props();
 
@@ -31,6 +38,38 @@
 
   const rate = $derived(RATES[rateIndex]);
   const maxDuration = $derived(Number.isFinite(duration) ? duration : 0);
+
+  const platform = currentPlatform();
+
+  /** The one binding model behind both presenters: glyphs for the hint, words for the label. */
+  const bindings = $derived.by(() => {
+    const map = {} as Record<PlayerActionId, string>;
+    for (const entry of SHORTCUTS) {
+      if (entry.scope !== 'player') continue;
+      map[entry.id as PlayerActionId] = appConfigStore.keymap[entry.id] ?? entry.defaultBinding;
+    }
+    return map;
+  });
+
+  function glyph(id: PlayerActionId): string {
+    return renderBinding(bindings[id], platform);
+  }
+
+  function spoken(id: PlayerActionId): string {
+    return describeBinding(bindings[id], platform);
+  }
+
+  const ariaLabel = $derived(
+    `Audio overview player. ${spoken('player.playPause')} plays or pauses. ` +
+      `${spoken('player.seekBack')} and ${spoken('player.seekFwd')} seek ${SEEK_STEP_S} seconds. ` +
+      `${spoken('player.skipBack')} and ${spoken('player.skipFwd')} skip ${SKIP_STEP_S} seconds. ` +
+      `${spoken('player.rateDown')} and ${spoken('player.rateUp')} change playback speed.`
+  );
+
+  // The Shortcuts panel may never have mounted, so the player loads the keymap itself.
+  $effect(() => {
+    void ensureLoaded();
+  });
 
   $effect(() => {
     const src = convertFileSrc(path);
@@ -97,28 +136,33 @@
   /** Scoped to this element's focus (tabindex on the wrapper) — never a document-level listener. */
   function handleKeydown(e: KeyboardEvent): void {
     if (!objectUrl) return;
-    const key = e.key.toLowerCase();
-    if (key === ' ' || key === 'spacebar') {
-      e.preventDefault();
-      togglePlay();
-    } else if (key === 'arrowright') {
-      e.preventDefault();
-      seekTo(currentTime + SEEK_STEP_S);
-    } else if (key === 'arrowleft') {
-      e.preventDefault();
-      seekTo(currentTime - SEEK_STEP_S);
-    } else if (key === '[') {
-      e.preventDefault();
-      cycleRate(-1);
-    } else if (key === ']') {
-      e.preventDefault();
-      cycleRate(1);
-    } else if (key === 'j') {
-      e.preventDefault();
-      skip(-SKIP_STEP_S);
-    } else if (key === 'l') {
-      e.preventDefault();
-      skip(SKIP_STEP_S);
+    const action = resolve(e, 'player', appConfigStore.keymap, platform);
+    // A miss bubbles untouched, so window-scoped chords (Mod+K) still reach AppShell.
+    if (action === null) return;
+    e.preventDefault();
+    e.stopPropagation();
+    switch (action) {
+      case 'player.playPause':
+        togglePlay();
+        break;
+      case 'player.seekBack':
+        seekTo(currentTime - SEEK_STEP_S);
+        break;
+      case 'player.seekFwd':
+        seekTo(currentTime + SEEK_STEP_S);
+        break;
+      case 'player.skipBack':
+        skip(-SKIP_STEP_S);
+        break;
+      case 'player.skipFwd':
+        skip(SKIP_STEP_S);
+        break;
+      case 'player.rateDown':
+        cycleRate(-1);
+        break;
+      case 'player.rateUp':
+        cycleRate(1);
+        break;
     }
   }
 </script>
@@ -131,7 +175,7 @@
 <div
   class="audio-player flex flex-col gap-2 rounded-lg border border-border/70 bg-card p-2.5"
   role="group"
-  aria-label="Audio overview player. Space plays or pauses. Left and right arrows seek 5 seconds. J and L skip 15 seconds. Bracket keys change playback speed."
+  aria-label={ariaLabel}
   tabindex="0"
   onkeydown={handleKeydown}
 >
@@ -198,8 +242,11 @@
     {/if}
 
     <p class="hint text-[0.65rem] leading-relaxed text-muted-foreground/60">
-      <kbd>Space</kbd> play/pause &middot; <kbd>&larr;</kbd>/<kbd>&rarr;</kbd> seek &middot;
-      <kbd>J</kbd>/<kbd>L</kbd> skip 15s &middot; <kbd>[</kbd>/<kbd>]</kbd> speed
+      <kbd>{glyph('player.playPause')}</kbd> play/pause &middot;
+      <kbd>{glyph('player.seekBack')}</kbd>/<kbd>{glyph('player.seekFwd')}</kbd> seek &middot;
+      <kbd>{glyph('player.skipBack')}</kbd>/<kbd>{glyph('player.skipFwd')}</kbd>
+      skip {SKIP_STEP_S}s &middot;
+      <kbd>{glyph('player.rateDown')}</kbd>/<kbd>{glyph('player.rateUp')}</kbd> speed
     </p>
 
     <span class="sr-only" aria-live="polite">{announcement}</span>
