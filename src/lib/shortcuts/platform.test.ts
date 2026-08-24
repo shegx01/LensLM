@@ -39,8 +39,6 @@ describe('currentPlatform', () => {
     expect(currentPlatform()).toBe('win32');
 
     setPlatform(null);
-    // happy-dom's userAgent (X11; Darwin arm64 ...) matches none of detectPlatform's
-    // mac/windows patterns, so ambient detection always lands on 'linux' here.
     expect(currentPlatform()).toBe('linux');
   });
 

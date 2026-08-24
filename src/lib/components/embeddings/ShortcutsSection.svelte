@@ -30,7 +30,7 @@
   const RECORDABLE_KEYS =
     'Use a letter, a number, Space, an arrow key, or [ or ], on its own or with modifiers.';
 
-  // One nullable slot, so AC-18's single-arm rule is structural rather than a per-row flag.
+  // One nullable slot, so "only one row armed at a time" is structural rather than a per-row flag.
   let capture = $state<{ id: ActionId; candidate: Binding | null; message: string | null } | null>(
     null
   );

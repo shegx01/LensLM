@@ -49,8 +49,7 @@
   let firstPosition = true;
 
   const platform = currentPlatform();
-  // Registry default, overridden by a persisted rebind — one binding, glyphs for
-  // the visible kbd/tooltip, spoken words for the aria-label (never mix the two).
+  // Glyphs for the visible kbd/tooltip, spoken words for the aria-label — never mix the two.
   const paletteBinding = $derived(
     appConfigStore.keymap['palette.toggle'] ?? SHORTCUTS_BY_ID['palette.toggle'].defaultBinding
   );

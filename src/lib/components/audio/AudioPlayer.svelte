@@ -1,8 +1,6 @@
 <!-- Minimal Audio Overview player (#29): visible play/pause + draggable seek + time.
-     Speed and ±15s skip are keyboard-only. Player keys are part of the shortcut map
-     itself (registry.ts, scope 'player'); conflicts.ts (#35) prevents collisions at
-     edit time rather than by construction — a visible hint + aria-live
-     announcements make the keyboard-only functions discoverable and accessible.
+     Player keys live in the shortcut map (registry.ts, scope 'player') and are
+     user-remappable (#239), so the hint + aria-live text are derived, never hardcoded.
 
      Plays from a Blob objectURL rather than the asset: src directly: WKWebView's
      AVFoundation media loader deadlocks the whole app on pause/seek over the custom
@@ -168,9 +166,9 @@
   }
 </script>
 
-<!-- Composite media-player widget (ARIA APG pattern): the group itself is the
-     focus target for the keyboard-only transport shortcuts (space/arrows/J/L/[/]),
-     so tabindex + keydown on a non-interactive role are intentional here. -->
+<!-- Composite media-player widget (ARIA APG pattern): the group is the focus
+     target for the player-scoped transport shortcuts, so tabindex + keydown
+     on a non-interactive role are intentional. -->
 <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
 <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
 <div

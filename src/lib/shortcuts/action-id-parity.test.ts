@@ -1,4 +1,4 @@
-// AC-5 lexical tripwire: the TS union and the Rust `ActionId` enum must serialize
+// Lexical tripwire: the TS union and the Rust `ActionId` enum must serialize
 // the same 11 dotted ids. The behavioural half (serde_json::to_value over every
 // variant) lives in lens-core/tests/keymap_config.rs — this half only reads text.
 
@@ -11,9 +11,7 @@ const RENAME_ATTR = '#[serde(rename = "';
 
 /**
  * Removes Rust comments so a commented-out variant cannot leave its `rename`
- * literal behind and yield a false green. String literals (plain and raw) are
- * tracked so a `//` inside one survives; char literals are only skipped when
- * unambiguous, because `'de` lifetimes are indistinguishable without a parser.
+ * literal behind and yield a false green.
  */
 function stripComments(source: string): string {
   let out = '';

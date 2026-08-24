@@ -24,9 +24,9 @@ export function findConflict(
 }
 
 /**
- * A `window` binding needs Mod or Alt: AppShell's close branch is unguarded and CommandPalette's
- * arrows do not stop propagation, so a typeable global shortcut swallows characters no typing
- * guard can protect. Shift does not qualify — `Shift+Q` is how a capital Q is typed.
+ * A `window` binding needs Mod or Alt: AppShell's close branch is unguarded, so a
+ * typeable global shortcut swallows characters no typing guard can protect. Shift
+ * does not qualify — `Shift+Q` is how a capital Q is typed.
  */
 export function isValidForScope(scope: Scope, binding: Binding | null): boolean {
   if (binding === null) return false;

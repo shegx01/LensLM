@@ -65,8 +65,6 @@ let originalPause: typeof HTMLMediaElement.prototype.pause;
 
 beforeEach(() => {
   configRef.current = baseAppConfig();
-  // Hints are platform-rendered and the frontend CI job runs on ubuntu, so the
-  // expected glyphs are only stable with the platform pinned.
   setPlatform('darwin');
   vi.stubGlobal(
     'fetch',

@@ -12,8 +12,6 @@ import { setPlatform } from '$lib/shortcuts/platform.js';
 import { baseAppConfig } from '$lib/test-fixtures.js';
 import type { AppConfig } from '$lib/theme/types.js';
 
-// `invoke` must resolve a real config: a bare `vi.fn()` yields `undefined`, which never
-// clears `ensureLoaded`'s load-once guard, so the keymap would stay empty forever.
 const configRef = vi.hoisted(() => ({ current: null as AppConfig | null }));
 
 vi.mock('@tauri-apps/api/core', () => ({
@@ -133,8 +131,6 @@ beforeEach(() => {
   mockOpenTrash.mockClear();
   mockSelectNotebook.mockClear();
   configRef.current = baseAppConfig();
-  // The frontend CI job runs on ubuntu, so the expected glyph is only stable
-  // with the platform pinned rather than relying on ambient detection.
   setPlatform('darwin');
 });
 

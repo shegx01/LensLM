@@ -10,9 +10,9 @@ export function detectPlatform(userAgent: string): Platform {
 }
 
 /**
- * Test-only override: happy-dom's userAgent is built from `process.platform`, so
- * ambient detection resolves to 'linux' even when the test host is macOS/Windows.
- * Pass `null` to clear the override and fall back to detection.
+ * Test-only override: happy-dom's userAgent is (X11; Darwin arm64 …), which matches
+ * none of detectPlatform's mac/windows patterns, so ambient detection always lands
+ * on 'linux'.
  */
 export function setPlatform(platform: Platform | null): void {
   override = platform;

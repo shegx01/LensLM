@@ -13,8 +13,6 @@ import ShortcutsSection from './ShortcutsSection.svelte';
 // "writes nothing" assertion below passes trivially.
 beforeEach(() => {
   (globalThis as { isTauri?: boolean }).isTauri = true;
-  // Chips are platform-rendered; the frontend CI job runs on ubuntu, and happy-dom's
-  // navigator is not macOS-shaped even on a mac, so the glyphs need the platform pinned.
   setPlatform('darwin');
   mockIPC((cmd) => (cmd === 'get_config' ? baseAppConfig() : undefined));
 });
@@ -133,7 +131,6 @@ describe('ShortcutsSection rebinding', () => {
   it('announces the saved binding through a persistent live region', async () => {
     recordingIpc();
     await renderReady();
-    // Always mounted, so a repeated message still lands — a node created with its text does not.
     expect(screen.getByRole('status')).toBeInTheDocument();
 
     await fireEvent.click(chip('skip forward'));
@@ -389,7 +386,6 @@ describe('ShortcutsSection resets', () => {
     await waitFor(() => expect(written.config).not.toBeNull());
     expect(written.config?.keymap).toEqual({ 'player.skipBack': 'B' });
     await waitFor(() => expect(screen.getByText('L')).toBeInTheDocument());
-    // The reset button unmounts under the user, so focus must land on the chip, not <body>.
     expect(screen.queryByRole('button', { name: /reset skip forward to default/i })).toBeNull();
     expect(document.activeElement).toBe(chip('skip forward'));
     await waitFor(() =>
@@ -420,7 +416,6 @@ describe('ShortcutsSection resets', () => {
     await waitFor(() => expect(written.config?.keymap).toEqual({}));
     await waitFor(() => expect(screen.getByText('L')).toBeInTheDocument());
     expect(screen.getByText('⌘K')).toBeInTheDocument();
-    // Reset all disables itself here, and a disabled element is blurred to <body>.
     await waitFor(() => expect(resetAll).toBeDisabled());
     expect(document.activeElement).toBe(screen.getByRole('heading', { name: 'Shortcuts' }));
     expect(screen.getByRole('status')).toHaveTextContent(/All shortcuts reset/i);

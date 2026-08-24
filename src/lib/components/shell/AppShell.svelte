@@ -67,7 +67,7 @@
     // Guard on open only: don't steal focus while typing in an input/textarea/
     // contenteditable (e.g. the create-dialog name field or inline rename).
     if (isTypingTarget(document.activeElement)) return;
-    // Prevent only once acting: a bare-letter binding must still type everywhere else.
+    // Prevent only once acting; a hand-edited config.json can still carry a typeable binding.
     e.preventDefault();
     notebookStore.paletteOpen = true;
   }
