@@ -302,6 +302,9 @@ llama-cpp-2 = { workspace = true, features = ["metal"] }
 lens-core = { path = ".", features = ["test-util"] }
 rstest = { workspace = true }
 insta = { workspace = true }
+# Backs the log-capture helper in `tests/common` that asserts observability events
+# (quiesce waits, verification refusals) actually fire. Root is the single source.
+tracing-subscriber = { workspace = true }
 # Temp-dir DBs for integration tests that need real on-disk files / concurrency.
 tempfile = { workspace = true }
 # In-process HTTP mock server for the LLM/embedding runtime probe tests.

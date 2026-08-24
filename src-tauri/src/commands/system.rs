@@ -71,7 +71,28 @@ pub async fn health_check(engine: tauri::State<'_, LensEngine>) -> Result<Health
 pub async fn get_storage_stats(
     engine: tauri::State<'_, LensEngine>,
 ) -> Result<StorageStats, LensError> {
-    engine.storage_stats().await
+    // Headless invariant: the engine cannot know these names, so the layer that
+    // creates them supplies them.
+    engine.storage_stats(REGENERABLE_DIRS).await
+}
+
+/// The old data folder a refused boot-cleanup is still holding, and its size.
+/// Surfaced so a retained dir is visible rather than an invisible multi-GB leak —
+/// both refusal paths otherwise dead-end with only a log line.
+#[tracing::instrument(skip_all)]
+#[tauri::command]
+pub async fn get_retained_cleanup(
+    app: tauri::AppHandle,
+) -> Result<Option<(String, u64)>, LensError> {
+    let anchor = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| LensError::Io(format!("app data dir unavailable: {e}")))?;
+    // Recursive walk over a whole superseded corpus — off the async runtime, same as
+    // `storage_stats`.
+    tokio::task::spawn_blocking(move || lens_core::relocate::retained_cleanup(&anchor))
+        .await
+        .map_err(|e| LensError::Internal(format!("retained_cleanup task join failed: {e}")))
 }
 
 /// Thin wrapper over [`LensEngine::clear_model_cache`].

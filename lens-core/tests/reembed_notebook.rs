@@ -10,6 +10,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
+mod common;
+
 use lens_core::embedder::{CountingEmbedder, Embedder, resolve};
 use lens_core::enrichment::reembed::ReembedOutcome;
 use lens_core::vector_store::{Coordinate, LanceVectorStore, VectorRow, VectorStore};
@@ -210,6 +212,7 @@ async fn coord_count(engine: &LensEngine, nb: &str, model: &str, dim: usize, sta
 #[tokio::test]
 async fn model_change_reembeds_into_new_coordinate_and_retires_old() {
     let dir = tempfile::tempdir().unwrap();
+    common::pin_catalog_offline(dir.path());
     let engine = LensEngine::init(dir.path()).await.unwrap();
     inject_embedder(&engine, BGE);
     let (nb, _src) = seed_nomic_notebook(&engine).await;
@@ -279,6 +282,7 @@ async fn model_change_reembeds_into_new_coordinate_and_retires_old() {
 #[tokio::test]
 async fn noop_when_model_already_matches() {
     let dir = tempfile::tempdir().unwrap();
+    common::pin_catalog_offline(dir.path());
     let engine = LensEngine::init(dir.path()).await.unwrap();
     inject_embedder(&engine, DEFAULT_EMBED_MODEL_ID);
     let (nb, _src) = seed_nomic_notebook(&engine).await;
@@ -308,6 +312,7 @@ async fn noop_when_model_already_matches() {
 #[tokio::test]
 async fn r2_second_switch_mid_build_aborts_flip() {
     let dir = tempfile::tempdir().unwrap();
+    common::pin_catalog_offline(dir.path());
     let engine = LensEngine::init(dir.path()).await.unwrap();
     inject_embedder(&engine, BGE);
     inject_embedder(&engine, "all-minilm");
@@ -364,6 +369,7 @@ async fn r2_second_switch_mid_build_aborts_flip() {
 #[tokio::test]
 async fn r2_same_dim_cross_backend_switch_reembeds_and_retires_old() {
     let dir = tempfile::tempdir().unwrap();
+    common::pin_catalog_offline(dir.path());
     let engine = LensEngine::init(dir.path()).await.unwrap();
     // The TARGET embedder is an ollama-valid 768-dim model (same dim as the
     // fastembed source; issue #80 strict partition forbids nomic-v1.5 on ollama).
@@ -462,6 +468,7 @@ async fn r2_same_dim_cross_backend_switch_reembeds_and_retires_old() {
 #[tokio::test]
 async fn r2_flip_guard_aborts_on_concurrent_backend_change() {
     let dir = tempfile::tempdir().unwrap();
+    common::pin_catalog_offline(dir.path());
     let engine = LensEngine::init(dir.path()).await.unwrap();
     // First switch targets the OLLAMA backend (ollama-valid 768-dim model); the
     // second switches back so the in-lock re-resolve disagrees with what we built.
@@ -529,4 +536,55 @@ async fn r2_flip_guard_aborts_on_concurrent_backend_change() {
         .await,
         0
     );
+}
+
+/// AC-1.9: retirement runs INSIDE the flip window's `ingest_lock`. Unlocked, a copy
+/// could snapshot SQLite before the demote and `lancedb/` after the drop, producing
+/// an `active` row naming a table that is gone — silently empty search.
+#[tokio::test(flavor = "multi_thread")]
+async fn retirement_holds_ingest_lock_so_relocation_cannot_interleave() {
+    use lens_core::QuiesceGate;
+    use tokio::time::timeout;
+
+    let dir = tempfile::tempdir().unwrap();
+    common::pin_catalog_offline(dir.path());
+    let engine = LensEngine::init(dir.path()).await.unwrap();
+    inject_embedder(&engine, BGE);
+    let (nb, _src) = seed_nomic_notebook(&engine).await;
+    set_model(&engine, &nb, BGE).await;
+
+    let gate = Arc::new(QuiesceGate::default());
+    engine
+        .set_reembed_retire_gate_for_test(Some(gate.clone()))
+        .await;
+
+    let e2 = engine.clone();
+    let nb2 = nb.clone();
+    let reembed =
+        tokio::spawn(async move { e2.reembed_notebook(&NotebookId::from(nb2), |_, _| {}).await });
+
+    timeout(Duration::from_secs(10), gate.reached.notified())
+        .await
+        .expect("reembed must park inside the retirement loop");
+
+    let to_parent = tempfile::tempdir().unwrap();
+    let to = to_parent.path().join("moved");
+    let blocked = timeout(
+        Duration::from_millis(750),
+        engine.relocate_data_dir(&to, &[]),
+    )
+    .await;
+    assert!(
+        blocked.is_err(),
+        "relocation must not interleave with retirement, got {:?}",
+        blocked.map(|r| r.is_ok())
+    );
+
+    gate.release.notify_one();
+    let outcome = timeout(Duration::from_secs(30), reembed)
+        .await
+        .expect("the released reembed must finish")
+        .unwrap()
+        .expect("reembed");
+    assert!(matches!(outcome, ReembedOutcome::Switched { .. }));
 }

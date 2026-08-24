@@ -122,6 +122,7 @@ export interface StorageStats {
   corpus_bytes: number;
   reclaimable_cache_bytes: number;
   retained_bytes: number;
+  sidecar_runtime_bytes: number;
   total_bytes: number;
 }
 

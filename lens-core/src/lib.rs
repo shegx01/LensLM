@@ -27,6 +27,7 @@ pub mod extract;
 pub mod graph;
 pub(crate) mod http;
 pub mod ingest;
+pub(crate) mod layout;
 pub mod llm;
 pub mod model_catalog;
 pub mod notebooks;
@@ -258,6 +259,16 @@ pub struct LensEngineInner {
     pub(crate) config: AppConfig,
 }
 
+/// Two-way handshake for #248 quiesce tests: the engine signals `reached` inside the
+/// guarded region, then waits on `release`. Without `reached` a test cannot know the
+/// guard is held, and would assert against a relocation that merely lost the race.
+#[cfg(feature = "test-util")]
+#[derive(Default)]
+pub struct QuiesceGate {
+    pub reached: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
+}
+
 /// Thread-safe, cheaply-cloneable handle to the LensLM engine state.
 ///
 /// # Concurrency invariants (load-bearing)
@@ -286,6 +297,10 @@ pub struct LensEngine {
     tokenizer: Arc<OnceCell<Arc<Tokenizer>>>,
     /// Single-permit gate serializing ingest runs (ONNX session is single-threaded).
     ingest_lock: Arc<Semaphore>,
+    /// Blocks background Lance writers while the data dir is copied. Order is
+    /// `ingest_lock` → `notebook_lock` → `quiesce`; SHARED holders acquire nothing else
+    /// and nothing takes `quiesce` holding a pool conn. The writer spans the whole copy.
+    quiesce: Arc<RwLock<()>>,
     /// Sender half of the background enrichment queue (M4 Phase 3). `Clone` so it
     /// rides `#[derive(Clone)]`. Dropping every clone closes the channel.
     enrichment_tx: mpsc::Sender<EnrichmentJob>,
@@ -344,6 +359,13 @@ pub struct LensEngine {
     /// Fix-#2 test seam: blocks reembed after populate, before the flip window.
     #[cfg(feature = "test-util")]
     reembed_preflip_gate: Arc<RwLock<Option<Arc<tokio::sync::Notify>>>>,
+    /// #248 test seam: holds a shared `quiesce` reader in flight. Must be awaited
+    /// INSIDE the guarded region — a gate before it lets relocation win the race.
+    #[cfg(feature = "test-util")]
+    quiesce_upsert_gate: Arc<RwLock<Option<Arc<QuiesceGate>>>>,
+    /// #248 AC-1.9 test seam: parks inside the flip+retire `ingest_lock` window.
+    #[cfg(feature = "test-util")]
+    reembed_retire_gate: Arc<RwLock<Option<Arc<QuiesceGate>>>>,
     /// When `true`, `tokenizer()` fails fast so Step-4 tests run fully offline.
     #[cfg(feature = "test-util")]
     skip_tokenizer: Arc<std::sync::atomic::AtomicBool>,
@@ -439,6 +461,7 @@ impl LensEngine {
             accelerator: crate::embedder::default_accelerator(),
             tokenizer: Arc::new(OnceCell::new()),
             ingest_lock: Arc::new(Semaphore::new(1)),
+            quiesce: Arc::new(RwLock::new(())),
             enrichment_tx,
             resolution_tx,
             notebook_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -458,6 +481,10 @@ impl LensEngine {
             enrichment_gate: Arc::new(RwLock::new(None)),
             #[cfg(feature = "test-util")]
             reembed_preflip_gate: Arc::new(RwLock::new(None)),
+            #[cfg(feature = "test-util")]
+            quiesce_upsert_gate: Arc::new(RwLock::new(None)),
+            #[cfg(feature = "test-util")]
+            reembed_retire_gate: Arc::new(RwLock::new(None)),
             #[cfg(feature = "test-util")]
             skip_tokenizer: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "test-util")]
@@ -534,6 +561,7 @@ impl LensEngine {
             accelerator: crate::embedder::default_accelerator(),
             tokenizer: Arc::new(OnceCell::new()),
             ingest_lock: Arc::new(Semaphore::new(1)),
+            quiesce: Arc::new(RwLock::new(())),
             enrichment_tx,
             resolution_tx,
             notebook_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -553,6 +581,10 @@ impl LensEngine {
             enrichment_gate: Arc::new(RwLock::new(None)),
             #[cfg(feature = "test-util")]
             reembed_preflip_gate: Arc::new(RwLock::new(None)),
+            #[cfg(feature = "test-util")]
+            quiesce_upsert_gate: Arc::new(RwLock::new(None)),
+            #[cfg(feature = "test-util")]
+            reembed_retire_gate: Arc::new(RwLock::new(None)),
             #[cfg(feature = "test-util")]
             skip_tokenizer: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "test-util")]
@@ -1081,17 +1113,26 @@ impl LensEngine {
         &self.ingest_lock
     }
 
+    /// See the `quiesce` field for the lock order this participates in.
+    pub(crate) fn quiesce(&self) -> &Arc<RwLock<()>> {
+        &self.quiesce
+    }
+
     /// Byte-usage breakdown of the data directory (corpus / reclaimable cache /
     /// retained). Read-only. The recursive fs walk runs under `spawn_blocking`
     /// so a multi-GB directory never blocks an async executor thread; missing
     /// dirs on a fresh install read as 0.
-    pub async fn storage_stats(&self) -> Result<StorageStats, LensError> {
+    /// `sidecar_dirs`: top-level `data_dir` names owned by the desktop layer, passed
+    /// in so the engine stays headless. Headless callers pass `&[]`.
+    pub async fn storage_stats(&self, sidecar_dirs: &[&str]) -> Result<StorageStats, LensError> {
         let data_dir = self.data_dir().await;
         let config = self.config().await;
         let embedding_model = config.embedding_model.clone();
         let paths = crate::paths::StoragePaths::from_config(&config, &data_dir);
+        let sidecar: Vec<String> = sidecar_dirs.iter().map(|d| (*d).to_string()).collect();
         tokio::task::spawn_blocking(move || {
-            crate::storage::storage_stats_blocking(&paths, &embedding_model)
+            let refs: Vec<&str> = sidecar.iter().map(String::as_str).collect();
+            crate::storage::storage_stats_blocking(&paths, &embedding_model, &refs)
         })
         .await
         .map_err(|e| LensError::Internal(format!("storage_stats task join failed: {e}")))?
@@ -1134,6 +1175,11 @@ impl LensEngine {
             .map_err(|e| LensError::Internal(format!("ingest semaphore closed: {e}")))?;
         let from = self.data_dir().await;
         let pool = self.pool().await;
+        // Taken AFTER the permit and after the reads above: the declared order is
+        // `ingest_lock` → `quiesce`, and inverting it would deadlock any future
+        // shared-guard site inside an `ingest_lock` region.
+        let _quiesce = self.quiesce.write().await;
+        tracing::info!(reason = "relocate", "acquired quiesce for data-dir move");
         crate::relocate::relocate_data_dir(&pool, &from, to, extra_regenerable).await?;
         Ok(from)
     }
@@ -2648,6 +2694,9 @@ impl LensEngine {
     /// delete its registry row. Static helper (no engine handle) so `init` can call
     /// it early. The `active` row is never touched.
     async fn gc_orphan_embedding_tables(db: &SqlitePool, data_dir: &Path) -> Result<(), LensError> {
+        // FIRST, while `embedding_index` still holds every row: the sweep drops what
+        // the registry cannot name, so the fuller the registry the safer it is.
+        Self::gc_unregistered_vec_tables(db, data_dir).await?;
         let table_names: Vec<String> = sqlx::query_scalar(
             "SELECT lance_table_name FROM embedding_index WHERE status IN ('building', 'stale')",
         )
@@ -2669,6 +2718,68 @@ impl LensEngine {
         // ent__ tables carry no registry, so their GC runs regardless of the
         // building/stale scan above (a crashed purge_notebook orphans them alone).
         Self::gc_orphan_entity_tables(db, data_dir).await
+    }
+
+    /// Startup-GC for `vec__` tables no `embedding_index` row names — listing-driven,
+    /// unlike the registry scan it precedes, which cannot see a table whose row is
+    /// gone. `init` awaits it before workers spawn; moving it later would need a lock.
+    async fn gc_unregistered_vec_tables(db: &SqlitePool, data_dir: &Path) -> Result<(), LensError> {
+        let store = crate::vector_store::LanceVectorStore::new(data_dir, db.clone());
+        let physical = crate::vector_store::VectorStore::vec_table_names(&store).await?;
+        if physical.is_empty() {
+            return Ok(());
+        }
+        // The WHOLE column, every status. Deliberately NOT falsifiable at startup —
+        // the registry pass below reclaims exactly the non-active rows, so an
+        // `active`-only query would reach the same end state.
+        let registered: Vec<String> =
+            sqlx::query_scalar("SELECT lance_table_name FROM embedding_index")
+                .fetch_all(db)
+                .await?;
+
+        // Floor: an empty registry beside notebooks that exist means the DB lost the
+        // index (a restored older lens.db, a failed migration), not that every table
+        // is garbage. Leaking bytes is recoverable; deleting every vector is not.
+        if registered.is_empty() {
+            let notebooks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notebooks")
+                .fetch_one(db)
+                .await?;
+            if notebooks > 0 {
+                tracing::warn!(
+                    physical = physical.len(),
+                    notebooks,
+                    "startup-GC: embedding_index is empty but notebooks exist; refusing to \
+                     sweep vec tables"
+                );
+                return Ok(());
+            }
+        }
+
+        let mut dropped = Vec::new();
+        for name in physical {
+            if registered.contains(&name) {
+                continue;
+            }
+            // One name per call, never the batch: `drop_tables` propagates a
+            // per-table failure out of its own loop, which would abort the sweep
+            // and leave both the orphan and its generation collision in place.
+            match crate::vector_store::VectorStore::drop_tables(&store, std::slice::from_ref(&name))
+                .await
+            {
+                Ok(()) => dropped.push(name),
+                Err(e) => {
+                    tracing::warn!(table = %name, error = %e, "unregistered vec table drop failed")
+                }
+            }
+        }
+        if !dropped.is_empty() {
+            tracing::info!(
+                count = dropped.len(),
+                tables = ?dropped,
+                "startup-GC reclaimed unregistered vec tables"
+            );
+        }
+        Ok(())
     }
 
     /// Startup-GC for `ent__` entity-vector tables (#155): drops Lance dirs for
@@ -2728,6 +2839,38 @@ impl LensEngine {
     #[cfg(feature = "test-util")]
     pub async fn set_reembed_preflip_gate_for_test(&self, gate: Option<Arc<tokio::sync::Notify>>) {
         *self.reembed_preflip_gate.write().await = gate;
+    }
+
+    /// Awaited while the shared `quiesce` guard is held, so a #248 test can pin a
+    /// Lance write in flight and observe a relocation blocking behind it.
+    #[cfg(feature = "test-util")]
+    pub(crate) async fn quiesce_upsert_gate(&self) {
+        let gate = self.quiesce_upsert_gate.read().await.clone();
+        if let Some(gate) = gate {
+            gate.reached.notify_one();
+            gate.release.notified().await;
+        }
+    }
+
+    /// Installs (or clears) the in-guard quiesce gate for #248 tests.
+    #[cfg(feature = "test-util")]
+    pub async fn set_quiesce_upsert_gate_for_test(&self, gate: Option<Arc<QuiesceGate>>) {
+        *self.quiesce_upsert_gate.write().await = gate;
+    }
+
+    #[cfg(feature = "test-util")]
+    pub(crate) async fn reembed_retire_gate(&self) {
+        let gate = self.reembed_retire_gate.read().await.clone();
+        if let Some(gate) = gate {
+            gate.reached.notify_one();
+            gate.release.notified().await;
+        }
+    }
+
+    /// Installs (or clears) the in-window retirement gate for #248 AC-1.9 tests.
+    #[cfg(feature = "test-util")]
+    pub async fn set_reembed_retire_gate_for_test(&self, gate: Option<Arc<QuiesceGate>>) {
+        *self.reembed_retire_gate.write().await = gate;
     }
 
     /// Test-only seam: directly enqueue a source onto the enrichment queue (the
@@ -3207,7 +3350,8 @@ impl LensEngine {
 
     /// Re-embeds every chunk into the notebook's configured coordinate and retires
     /// previous coordinates (M4 Phase 4b, Step 9). Populate runs lock-free; only
-    /// the brief flip takes `ingest_lock`. No-op when already at the active coordinate.
+    /// the flip and old-coordinate retirement take `ingest_lock`. No-op when already
+    /// at the active coordinate.
     #[tracing::instrument(skip_all, fields(notebook = %notebook_id.as_str()))]
     pub async fn reembed_notebook(
         &self,

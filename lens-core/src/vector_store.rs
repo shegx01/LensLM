@@ -247,6 +247,10 @@ pub trait VectorStore: Send + Sync {
 
     /// Enumerates every `ent__` table, paired with its encoded notebook id (startup GC).
     async fn entity_tables_with_notebook(&self) -> Result<Vec<(String, String)>, LensError>;
+
+    /// Physical `vec__` table names on disk, independent of `embedding_index`.
+    /// The registry-driven GC cannot see a table whose row is gone; this can.
+    async fn vec_table_names(&self) -> Result<Vec<String>, LensError>;
 }
 
 /// Slugifies a model id into a table-safe token: `nomic-embed-text-v1.5` →
@@ -271,6 +275,9 @@ fn model_slug(model: &str) -> String {
     }
 }
 
+/// Every physical chunk-vector table starts with this, in any naming generation.
+pub(crate) const VEC_TABLE_PREFIX: &str = "vec__";
+
 /// Resolves the physical LanceDB table name for a new coordinate (slug A1, M4
 /// Phase 4b-B): `vec__{notebook}__{backend}__{model_slug}__d{dim}`.
 ///
@@ -279,7 +286,7 @@ fn model_slug(model: &str) -> String {
 /// its stored name; only new coordinates flow through this function.
 fn table_name(notebook: &str, backend: EmbeddingBackend, model: &str, dim: usize) -> String {
     format!(
-        "vec__{notebook}__{}__{}__d{dim}",
+        "{VEC_TABLE_PREFIX}{notebook}__{}__{}__d{dim}",
         backend.as_str(),
         model_slug(model)
     )
@@ -784,6 +791,29 @@ impl LanceVectorStore {
             .map_err(|e| LensError::Vector(format!("lancedb connect failed: {e}")))
     }
 
+    /// Opens each named table, failing on the first that will not open. Detail is
+    /// logged, never returned across IPC.
+    pub(crate) async fn verify_tables_open(&self, names: &[String]) -> Result<(), LensError> {
+        for name in names {
+            match self.open_table_by_name(name).await {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    tracing::error!(table = %name, "copied vector table is missing");
+                    return Err(LensError::Io(
+                        "the copied vector index did not verify; the move was cancelled".into(),
+                    ));
+                }
+                Err(e) => {
+                    tracing::error!(table = %name, error = %e, "copied vector table will not open");
+                    return Err(LensError::Io(
+                        "the copied vector index did not verify; the move was cancelled".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Opens a physical table by exact name, or returns `None`. Never creates anything.
     async fn open_table_by_name(&self, name: &str) -> Result<Option<Table>, LensError> {
         let conn = self.connect().await?;
@@ -1281,6 +1311,15 @@ impl VectorStore for LanceVectorStore {
             .registry
             .lance_table_names_for_coordinate(coord)
             .await?;
+        let conn = self.connect().await?;
+        // Union the physical names: the registry alone hands back a generation that
+        // `create_empty_table` then rejects. EXACT equality — the listing spans all
+        // notebooks and both table families, so prefix matching would be wrong here.
+        let physical = conn
+            .table_names()
+            .execute()
+            .await
+            .map_err(|e| LensError::Vector(format!("lancedb table_names failed: {e}")))?;
         let mut generation = 1u32;
         let building_name = loop {
             let candidate = gen_table_name(
@@ -1290,16 +1329,15 @@ impl VectorStore for LanceVectorStore {
                 dim,
                 generation,
             );
-            if !existing.iter().any(|n| n == &candidate) {
+            if !existing.contains(&candidate) && !physical.contains(&candidate) {
                 break candidate;
             }
             generation += 1;
         };
 
-        // Create the physical table first: a crash before the registry insert
-        // leaves a harmless unregistered orphan; a crash after leaves a `building`
-        // row the startup-GC reclaims.
-        let conn = self.connect().await?;
+        // Physical table first: a crash before the registry insert leaves an orphan
+        // the union above skips and the startup sweep reclaims; a crash after leaves
+        // a `building` row the startup-GC reclaims.
         conn.create_empty_table(building_name.as_str(), vector_schema(dim))
             .execute()
             .await
@@ -1574,6 +1612,22 @@ impl VectorStore for LanceVectorStore {
         Ok(existing
             .into_iter()
             .filter_map(|t| entity_table_notebook(&t).map(|nb| (t, nb)))
+            .collect())
+    }
+
+    async fn vec_table_names(&self) -> Result<Vec<String>, LensError> {
+        let conn = self.connect().await?;
+        let existing = conn
+            .table_names()
+            .execute()
+            .await
+            .map_err(|e| LensError::Vector(format!("lancedb table_names failed: {e}")))?;
+        // Match the PREFIX, never `table_name`'s current format: a pre-4b-B table
+        // (`vec__{nb}__nomic_v15__d768`) does not match the formula and would be
+        // missed. Selecting positively also keeps every `ent__` table out.
+        Ok(existing
+            .into_iter()
+            .filter(|t| t.starts_with(VEC_TABLE_PREFIX))
             .collect())
     }
 }

@@ -58,6 +58,20 @@ fn main() {
         .init();
 
     tauri::Builder::default()
+        // FIRST so the siblings never run setup in a doomed process — tidiness, not
+        // the safety property (plugin init precedes app setup at any position). Socket
+        // is the SHARED /tmp path; a running install makes `tauri dev` exit 0 silently.
+        .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
+            tracing::info!(
+                reason = "second_instance",
+                cwd = %cwd,
+                argv = ?args,
+                "another instance tried to start against this data dir; it exited"
+            );
+            if let Some(w) = app.webview_windows().values().next() {
+                let _ = w.set_focus();
+            }
+        }))
         // Native file picker for the onboarding "Add sources" step.
         .plugin(tauri_plugin_dialog::init())
         // Write exported notes to the path chosen via the save-file dialog (issue #25).
@@ -94,11 +108,13 @@ fn main() {
             let anchor = app.path().app_data_dir()?;
             let data_dir = lens_core::relocate::resolve_data_dir(&anchor);
             let engine = tauri::async_runtime::block_on(LensEngine::init(&data_dir))?;
-            lens_core::relocate::run_boot_cleanup(
+            // Reuses the engine's pool — the deletion gate reads the live DB.
+            tauri::async_runtime::block_on(lens_core::relocate::run_boot_cleanup(
                 &anchor,
                 &data_dir,
                 commands::system::REGENERABLE_DIRS,
-            );
+                &tauri::async_runtime::block_on(engine.pool()),
+            ));
             app.manage(engine);
 
             // Inject the offscreen-webview JS renderer (issue #78, Layer f) so
@@ -234,6 +250,7 @@ fn main() {
             commands::notebooks::run_notebook_graph_eval,
             commands::system::health_check,
             commands::system::get_storage_stats,
+            commands::system::get_retained_cleanup,
             commands::system::clear_model_cache,
             commands::system::relocate_data_dir,
             commands::system::offload_cache,

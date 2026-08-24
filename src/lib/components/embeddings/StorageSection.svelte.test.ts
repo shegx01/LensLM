@@ -42,7 +42,7 @@ function config(
   };
 }
 
-function stats(reclaimable: number): StorageStats {
+function stats(reclaimable: number, sidecar = 0): StorageStats {
   const db = 1_048_576; // 1.0 MB
   const vectors = 2_097_152; // 2.0 MB
   const sources = 1_572_864; // 1.5 MB
@@ -56,7 +56,8 @@ function stats(reclaimable: number): StorageStats {
     corpus_bytes: corpus,
     reclaimable_cache_bytes: reclaimable,
     retained_bytes: 274_000_000,
-    total_bytes: corpus + reclaimable + 274_000_000
+    sidecar_runtime_bytes: sidecar,
+    total_bytes: corpus + reclaimable + 274_000_000 + sidecar
   };
 }
 
@@ -64,6 +65,7 @@ describe('StorageSection', () => {
   it('renders the data directory path on mount', async () => {
     mockIPC((cmd) => {
       if (cmd === 'get_config') return config();
+      if (cmd === 'get_retained_cleanup') return null;
       if (cmd === 'get_storage_stats') return stats(1_500_000_000);
     });
 
@@ -75,6 +77,7 @@ describe('StorageSection', () => {
   it('renders both the reclaimable cache and corpus figures', async () => {
     mockIPC((cmd) => {
       if (cmd === 'get_config') return config();
+      if (cmd === 'get_retained_cleanup') return null;
       if (cmd === 'get_storage_stats') return stats(1_500_000_000);
     });
 
@@ -87,6 +90,7 @@ describe('StorageSection', () => {
   it('renders the per-bucket usage breakdown', async () => {
     mockIPC((cmd) => {
       if (cmd === 'get_config') return config();
+      if (cmd === 'get_retained_cleanup') return null;
       if (cmd === 'get_storage_stats') return stats(0);
     });
 
@@ -138,6 +142,7 @@ describe('StorageSection', () => {
   it('copies the path and reveals it in Finder', async () => {
     mockIPC((cmd) => {
       if (cmd === 'get_config') return config();
+      if (cmd === 'get_retained_cleanup') return null;
       if (cmd === 'get_storage_stats') return stats(0);
     });
 
@@ -162,6 +167,7 @@ describe('StorageSection', () => {
     let restartCalled = false;
     mockIPC((cmd, args) => {
       if (cmd === 'get_config') return config();
+      if (cmd === 'get_retained_cleanup') return null;
       if (cmd === 'get_storage_stats') return stats(0);
       if (cmd === 'relocate_data_dir') {
         relocateArgs = args;
@@ -197,6 +203,7 @@ describe('StorageSection', () => {
 
     mockIPC((cmd) => {
       if (cmd === 'get_config') return config();
+      if (cmd === 'get_retained_cleanup') return null;
       if (cmd === 'get_storage_stats') return stats(0);
       if (cmd === 'relocate_data_dir') throw new Error('disk full');
     });
@@ -218,6 +225,7 @@ describe('StorageSection', () => {
     let offloadArgs: unknown;
     mockIPC((cmd, args) => {
       if (cmd === 'get_config') return config();
+      if (cmd === 'get_retained_cleanup') return null;
       if (cmd === 'get_storage_stats') return stats(0);
       if (cmd === 'offload_cache') {
         offloadArgs = args;
@@ -267,6 +275,7 @@ describe('StorageSection', () => {
     let resetCalled = false;
     mockIPC((cmd) => {
       if (cmd === 'get_config') return config({ cache_dir: '/Volumes/External/models' });
+      if (cmd === 'get_retained_cleanup') return null;
       if (cmd === 'get_storage_stats') return stats(0);
       if (cmd === 'reset_cache_location') {
         resetCalled = true;
@@ -286,6 +295,7 @@ describe('StorageSection', () => {
     let setConfigArg: AppConfig | undefined;
     mockIPC((cmd, args) => {
       if (cmd === 'get_config') return config();
+      if (cmd === 'get_retained_cleanup') return null;
       if (cmd === 'get_storage_stats') return stats(0);
       if (cmd === 'set_config') {
         setConfigArg = (args as { config: AppConfig }).config;
@@ -308,6 +318,7 @@ describe('StorageSection', () => {
     let setConfigArg: AppConfig | undefined;
     mockIPC((cmd, args) => {
       if (cmd === 'get_config') return config({}, { cache_quota_bytes: 1_000_000_000 });
+      if (cmd === 'get_retained_cleanup') return null;
       if (cmd === 'get_storage_stats') return stats(0);
       if (cmd === 'set_config') {
         setConfigArg = (args as { config: AppConfig }).config;
@@ -330,6 +341,7 @@ describe('StorageSection', () => {
   it('shows an over-limit warning and reclaims via the same confirm flow', async () => {
     mockIPC((cmd) => {
       if (cmd === 'get_config') return config({}, { cache_quota_bytes: 1_000_000_000 });
+      if (cmd === 'get_retained_cleanup') return null;
       if (cmd === 'get_storage_stats') return stats(1_500_000_000);
     });
 
@@ -346,6 +358,7 @@ describe('StorageSection', () => {
   it('does not render an over-limit warning when under the quota', async () => {
     mockIPC((cmd) => {
       if (cmd === 'get_config') return config({}, { cache_quota_bytes: 5_000_000_000 });
+      if (cmd === 'get_retained_cleanup') return null;
       if (cmd === 'get_storage_stats') return stats(1_500_000_000);
     });
 
@@ -353,5 +366,64 @@ describe('StorageSection', () => {
 
     await waitFor(() => expect(screen.getByText(/1\.4 GB/)).toBeInTheDocument());
     expect(screen.queryByText(/exceeds your limit/i)).not.toBeInTheDocument();
+  });
+});
+
+describe('StorageSection voice-engine row', () => {
+  it('shows the sidecar runtime and says a cache clear keeps it', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return config();
+      if (cmd === 'get_retained_cleanup') return null;
+      if (cmd === 'get_storage_stats') return stats(1_500_000_000, 3_221_225_472);
+    });
+
+    render(StorageSection);
+
+    expect(await screen.findByText('Voice engine')).toBeInTheDocument();
+    expect(screen.getByText('3.0 GB')).toBeInTheDocument();
+    expect(screen.getByText(/Kept when you clear the cache/i)).toBeInTheDocument();
+  });
+
+  it('omits the row entirely when no sidecar runtime is installed', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return config();
+      if (cmd === 'get_retained_cleanup') return null;
+      if (cmd === 'get_storage_stats') return stats(1_500_000_000, 0);
+    });
+
+    render(StorageSection);
+
+    // Wait for a row that always renders, so absence below is not just "not yet loaded".
+    expect(await screen.findByText('Reclaimable model cache')).toBeInTheDocument();
+    expect(screen.queryByText('Voice engine')).not.toBeInTheDocument();
+  });
+});
+
+describe('StorageSection retained-cleanup row', () => {
+  it('surfaces an old folder a refused cleanup kept, with its size', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return config();
+      if (cmd === 'get_retained_cleanup') return ['/Volumes/Old/LensLM', 4_294_967_296];
+      if (cmd === 'get_storage_stats') return stats(1_500_000_000);
+    });
+
+    render(StorageSection);
+
+    expect(await screen.findByText('Previous data folder')).toBeInTheDocument();
+    expect(screen.getByText('/Volumes/Old/LensLM')).toBeInTheDocument();
+    expect(screen.getByText('4.0 GB')).toBeInTheDocument();
+  });
+
+  it('stays hidden when nothing is retained', async () => {
+    mockIPC((cmd) => {
+      if (cmd === 'get_config') return config();
+      if (cmd === 'get_retained_cleanup') return null;
+      if (cmd === 'get_storage_stats') return stats(1_500_000_000);
+    });
+
+    render(StorageSection);
+
+    expect(await screen.findByText('Reclaimable model cache')).toBeInTheDocument();
+    expect(screen.queryByText('Previous data folder')).not.toBeInTheDocument();
   });
 });
