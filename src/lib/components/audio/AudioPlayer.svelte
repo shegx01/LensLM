@@ -1,6 +1,7 @@
 <!-- Minimal Audio Overview player (#29): visible play/pause + draggable seek + time.
-     Speed and ±15s skip are keyboard-only, scoped to this player's focus so they never
-     collide with the app-wide shortcut map (#35) — a visible hint + aria-live
+     Speed and ±15s skip are keyboard-only. Player keys are part of the shortcut map
+     itself (registry.ts, scope 'player'); conflicts.ts (#35) prevents collisions at
+     edit time rather than by construction — a visible hint + aria-live
      announcements make the keyboard-only functions discoverable and accessible.
 
      Plays from a Blob objectURL rather than the asset: src directly: WKWebView's

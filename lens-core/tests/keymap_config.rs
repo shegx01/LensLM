@@ -112,6 +112,21 @@ fn explicit_null_keymap_loads_as_empty() {
 }
 
 #[test]
+fn absent_keymap_key_loads_as_empty() {
+    // Every existing install upgrades through this path (no `keymap` key at all),
+    // distinct from the explicit-`null` case covered above.
+    let mut raw = serde_json::to_value(AppConfig::default()).expect("default config serializes");
+    raw.as_object_mut()
+        .expect("config serializes as an object")
+        .remove("keymap");
+
+    let config: AppConfig =
+        serde_json::from_value(raw).expect("an absent keymap key must not fail the load");
+
+    assert!(config.keymap.is_empty());
+}
+
+#[test]
 fn keymap_shapes_that_are_not_a_map_stay_fatal() {
     // Chosen, not incidental: an array or a bare string is a structural mistake with no
     // salvage, unlike `null`. Both surface as `LensError::Parse` on the real `load()` path.

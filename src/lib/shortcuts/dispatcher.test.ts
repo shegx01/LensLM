@@ -1,14 +1,7 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { resolve } from './dispatcher.js';
-import { setPlatform } from './platform.js';
 import type { ActionId } from './registry.js';
 import type { KeyEventLike } from './binding.js';
-
-// Ambient detection under happy-dom resolves to non-darwin even on macOS; every case
-// here turns on modifier resolution, so pin it.
-beforeEach(() => {
-  setPlatform('darwin');
-});
 
 type Keymap = Partial<Record<ActionId, string>>;
 
@@ -36,8 +29,6 @@ describe('resolve', () => {
     expect(resolve(ev('l', { metaKey: true }), 'player', {}, 'darwin')).toBeNull();
   });
 
-  // Deliberate behaviour change: AudioPlayer.svelte:100 lowercases e.key, so Shift+J
-  // fires skipBack today. Exact-modifier equality removes that.
   it('requires exact modifier equality — Shift+J is not player.skipBack', () => {
     expect(resolve(ev('J', { shiftKey: true }), 'player', {}, 'darwin')).toBeNull();
     expect(resolve(ev('j'), 'player', {}, 'darwin')).toBe('player.skipBack');

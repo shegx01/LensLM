@@ -132,9 +132,8 @@ function makeConfig(
 beforeEach(async () => {
   vi.clearAllMocks();
   resetNotebookStore();
+  notebookStore.paletteOpen = false;
   mockKeymap = {};
-  // happy-dom builds its userAgent from process.platform, so ambient detection resolves
-  // to linux even on macOS — every modifier assertion here needs it pinned.
   setPlatform('darwin');
   mockIsTauri.mockReturnValue(false);
   const { listNotebooks } = await import('$lib/notebooks/ipc.js');

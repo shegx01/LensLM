@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { currentPlatform, detectPlatform, setPlatform } from './platform.js';
 
 const MAC_UA =
@@ -39,10 +39,23 @@ describe('currentPlatform', () => {
     expect(currentPlatform()).toBe('win32');
 
     setPlatform(null);
-    expect(currentPlatform()).toBe(detectPlatform(navigator.userAgent));
+    // happy-dom's userAgent (X11; Darwin arm64 ...) matches none of detectPlatform's
+    // mac/windows patterns, so ambient detection always lands on 'linux' here.
+    expect(currentPlatform()).toBe('linux');
   });
 
-  it('memoizes detection', () => {
-    expect(currentPlatform()).toBe(currentPlatform());
+  it('memoizes detection: navigator.userAgent is read at most once, and a later UA change does not retroactively change the cached result', async () => {
+    vi.resetModules();
+    const fresh = await import('./platform.js');
+    const uaSpy = vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue(LINUX_UA);
+
+    const first = fresh.currentPlatform();
+    fresh.currentPlatform();
+    expect(uaSpy).toHaveBeenCalledTimes(1);
+
+    uaSpy.mockReturnValue(WINDOWS_UA);
+    expect(fresh.currentPlatform()).toBe(first);
+
+    uaSpy.mockRestore();
   });
 });
