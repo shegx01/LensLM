@@ -2267,3 +2267,161 @@ async fn a_cloud_misconfiguration_outranks_the_local_failure_that_follows_it() {
     assert_eq!(err.kind(), "Validation", "got {err:?}");
     assert_eq!(err.message(), "audio cloud consent not granted");
 }
+
+// ===========================================================================
+// Integration: cancellation during an in-flight cloud request (#135)
+// ===========================================================================
+
+/// Builds a cloud-backed engine pointed at `base_url` with a local engine injected that
+/// would SUCCEED — so any result other than `Cancelled` proves a fallback ran.
+async fn cloud_engine_with_working_local(base_url: &str) -> LensEngine {
+    let engine = LensEngine::for_test().await;
+    let mut config = engine.config().await;
+    config.asr.backend = "cloud".to_string();
+    config.asr.cloud_base_url = base_url.to_string();
+    config.asr.cloud_model = "whisper-1".to_string();
+    config.asr.cloud_api_key = "sk-cancel-test".to_string();
+    config.asr.cloud_provider = Some(CloudAsrProvider::OpenAiCompatible);
+    config.audio_cloud_consent = true;
+    engine.set_config(config).await;
+
+    engine
+        .set_asr_engine(Some(Arc::new(MockAsrEngine::new(vec![
+            TranscriptSegment {
+                text: "local fallback ran".into(),
+                start_second: 0.0,
+                end_second: 1.0,
+            },
+        ]))))
+        .await;
+    engine
+}
+
+/// #135 core AC: a cancel that lands while the request is in flight must abort the
+/// request itself, not wait it out. The endpoint stalls for 10s, so the elapsed-time
+/// assertion is what separates a real in-flight abort from a post-request boundary check.
+#[tokio::test]
+async fn a_cancel_during_an_in_flight_cloud_request_aborts_without_local_fallback() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/audio/transcriptions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(openai_segments_response())
+                .set_delay(std::time::Duration::from_secs(10)),
+        )
+        .mount(&server)
+        .await;
+
+    let engine = cloud_engine_with_working_local(&server.uri()).await;
+    let token = tokio_util::sync::CancellationToken::new();
+    let trip = token.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        trip.cancel();
+    });
+
+    let started = std::time::Instant::now();
+    let err = engine
+        .transcribe(&tiny_pcm(), &TranscribeConfig::default(), None, Some(token))
+        .await
+        .expect_err("a cancelled clip must not return cloud or fallback segments");
+    let elapsed = started.elapsed();
+
+    assert_eq!(err.kind(), "Cancelled", "message: {}", err.message());
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "the in-flight request was waited out rather than aborted: {elapsed:?}"
+    );
+}
+
+/// The window the issue names: a cancel arriving while a NON-cancel cloud failure is in
+/// flight. The responder trips the token and then fails, so the race is deterministic —
+/// ungated, the 500 would degrade to the injected local engine and return segments.
+#[tokio::test]
+async fn a_cancel_racing_a_cloud_failure_does_not_start_the_local_fallback() {
+    struct CancelThenFail(tokio_util::sync::CancellationToken);
+    impl wiremock::Respond for CancelThenFail {
+        fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
+            self.0.cancel();
+            ResponseTemplate::new(500)
+        }
+    }
+
+    let token = tokio_util::sync::CancellationToken::new();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/audio/transcriptions"))
+        .respond_with(CancelThenFail(token.clone()))
+        .mount(&server)
+        .await;
+
+    let engine = cloud_engine_with_working_local(&server.uri()).await;
+
+    let err = engine
+        .transcribe(&tiny_pcm(), &TranscribeConfig::default(), None, Some(token))
+        .await
+        .expect_err("a cancel racing a cloud failure must not degrade to local");
+
+    assert_eq!(err.kind(), "Cancelled", "message: {}", err.message());
+}
+
+/// An already-cancelled clip must issue ZERO requests: the token is polled before the
+/// request future, so nothing is sent, billed, or logged upstream. This is what the
+/// `biased` select! ordering buys — without it the poll order is random.
+#[tokio::test]
+async fn an_already_cancelled_clip_issues_no_cloud_request() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/audio/transcriptions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_segments_response()))
+        .mount(&server)
+        .await;
+
+    let engine = cloud_engine_with_working_local(&server.uri()).await;
+    let token = tokio_util::sync::CancellationToken::new();
+    token.cancel();
+
+    let err = engine
+        .transcribe(&tiny_pcm(), &TranscribeConfig::default(), None, Some(token))
+        .await
+        .expect_err("an already-cancelled clip must not transcribe");
+
+    assert_eq!(err.kind(), "Cancelled", "message: {}", err.message());
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock server records requests");
+    assert!(
+        requests.is_empty(),
+        "a cancelled clip must not reach the provider: {} request(s)",
+        requests.len()
+    );
+}
+
+/// The gate must key on the token being TRIPPED, not merely present: a live token has to
+/// leave the existing cloud→local degradation untouched.
+#[tokio::test]
+async fn a_live_token_leaves_the_cloud_fallback_intact() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/audio/transcriptions"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    let engine = cloud_engine_with_working_local(&server.uri()).await;
+
+    let (segments, label) = engine
+        .transcribe(
+            &tiny_pcm(),
+            &TranscribeConfig::default(),
+            None,
+            Some(tokio_util::sync::CancellationToken::new()),
+        )
+        .await
+        .expect("an uncancelled 500 must still degrade to local");
+
+    assert_eq!(label, "apple_native (fallback)");
+    assert_eq!(segments[0].text, "local fallback ran");
+}

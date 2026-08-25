@@ -310,6 +310,158 @@ fn saving_a_config_without_audio_consent_demotes_a_cloud_backend() {
     );
 }
 
+/// An Apple-seam stand-in that trips `token` from inside `transcribe_pcm`, reproducing
+/// a cancel that lands mid-run — the only window the engine cannot observe, since Apple
+/// FFI is uninterruptible (#43). `confidence: None` makes the call fail instead.
+struct CancellingAppleEngine {
+    token: tokio_util::sync::CancellationToken,
+    confidence: Option<f32>,
+}
+
+#[async_trait::async_trait]
+impl lens_core::asr::AsrEngine for CancellingAppleEngine {
+    async fn transcribe_pcm(
+        &self,
+        _pcm: &[f32],
+        _config: &TranscribeConfig,
+        _progress_tx: Option<tokio::sync::mpsc::UnboundedSender<f32>>,
+    ) -> Result<lens_core::asr::TranscriptOutput, lens_core::LensError> {
+        self.token.cancel();
+        match self.confidence {
+            Some(confidence) => Ok(lens_core::asr::TranscriptOutput {
+                segments: canned(),
+                confidence: Some(confidence),
+            }),
+            None => Err(lens_core::LensError::Transcription(
+                "on-device speech model for locale en-US is not installed".into(),
+            )),
+        }
+    }
+}
+
+/// Makes `local_whisper_available` say yes while any real load still fails. The fixture
+/// MUST stay 0 bytes (see `transcribe_apple_forced_without_engine_falls_back_to_whisper`).
+/// The returned dir must outlive the call.
+#[cfg(feature = "local-whisper")]
+async fn seed_available_whisper(engine: &LensEngine) -> tempfile::TempDir {
+    let cache = tempfile::tempdir().expect("tempdir");
+    let mut config = engine.config().await;
+    config.paths.cache_dir = Some(cache.path().to_string_lossy().into_owned());
+    let spec = resolve_whisper(&config.asr.whisper_model)
+        .or_else(|| resolve_whisper(DEFAULT_WHISPER_MODEL_ID))
+        .expect("configured or default whisper spec resolves");
+    engine.set_config(config).await;
+
+    let model_path = whisper_model_path(cache.path(), spec.id);
+    std::fs::create_dir_all(model_path.parent().expect("model path has a parent"))
+        .expect("create whisper model dir");
+    std::fs::write(&model_path, b"").expect("write 0-byte ggml fixture");
+    cache
+}
+
+/// #135: an Apple runtime failure normally degrades to Whisper, but when the user
+/// cancelled during the (uninterruptible) Apple run the cascade must stop instead of
+/// paying a second, equally uninterruptible transcription. Whisper is made available so
+/// the ungated path would really enter it — and would surface a whisper load error.
+#[cfg(feature = "local-whisper")]
+#[tokio::test]
+async fn a_cancel_during_the_apple_run_skips_the_whisper_fallback() {
+    let engine = LensEngine::for_test().await;
+    let _cache = seed_available_whisper(&engine).await;
+    let mut config = engine.config().await;
+    config.asr.backend = "apple_native".to_string();
+    engine.set_config(config).await;
+
+    let token = tokio_util::sync::CancellationToken::new();
+    engine
+        .set_asr_engine(Some(Arc::new(CancellingAppleEngine {
+            token: token.clone(),
+            confidence: None,
+        })))
+        .await;
+
+    let err = engine
+        .transcribe(
+            &[0.0_f32; 16],
+            &TranscribeConfig::default(),
+            None,
+            Some(token),
+        )
+        .await
+        .expect_err("a cancelled clip must not start the Whisper fallback");
+
+    assert_eq!(err.kind(), "Cancelled", "message: {}", err.message());
+}
+
+/// #135: the same gap on the low-confidence re-run. Apple SUCCEEDS here, so without the
+/// gate the cancel is invisible and a full Whisper re-transcription of the clip starts.
+#[cfg(feature = "local-whisper")]
+#[tokio::test]
+async fn a_cancel_during_the_apple_run_skips_the_degraded_re_run() {
+    let engine = LensEngine::for_test().await;
+    let _cache = seed_available_whisper(&engine).await;
+    let mut config = engine.config().await;
+    config.asr.backend = "apple_native".to_string();
+    // Below the 0.5 default floor, so the re-run is what the ungated path would do.
+    config.asr.apple_min_confidence = 0.5;
+    engine.set_config(config).await;
+
+    let token = tokio_util::sync::CancellationToken::new();
+    engine
+        .set_asr_engine(Some(Arc::new(CancellingAppleEngine {
+            token: token.clone(),
+            confidence: Some(0.1),
+        })))
+        .await;
+
+    let err = engine
+        .transcribe(
+            &[0.0_f32; 16],
+            &TranscribeConfig::default(),
+            None,
+            Some(token),
+        )
+        .await
+        .expect_err("a cancelled clip must not start the degraded re-run");
+
+    assert_eq!(err.kind(), "Cancelled", "message: {}", err.message());
+}
+
+/// The gate is keyed on the token, not on merely having one: an uncancelled token must
+/// leave the existing Apple→Whisper degradation exactly as it was.
+#[cfg(feature = "local-whisper")]
+#[tokio::test]
+async fn a_live_token_leaves_the_apple_fallback_intact() {
+    let engine = LensEngine::for_test().await;
+    let _cache = seed_available_whisper(&engine).await;
+    let mut config = engine.config().await;
+    config.asr.backend = "apple_native".to_string();
+    engine.set_config(config).await;
+
+    engine
+        .set_asr_engine(Some(Arc::new(MockAsrEngine::failing(
+            "on-device speech model for locale en-US is not installed",
+        ))))
+        .await;
+
+    let err = engine
+        .transcribe(
+            &[0.0_f32; 16],
+            &TranscribeConfig::default(),
+            None,
+            Some(tokio_util::sync::CancellationToken::new()),
+        )
+        .await
+        .expect_err("the 0-byte ggml cannot load");
+
+    assert_eq!(err.kind(), "Transcription");
+    let msg = err.message();
+    assert!(
+        msg.contains("whisper"),
+        "the Whisper fallback must still run for an uncancelled token: {msg}"
+    );
+}
+
 /// Equal answers alone would not catch a re-read across an await racing a concurrent
 /// `set_asr_engine`, so the single-observation property is asserted too.
 #[tokio::test]
