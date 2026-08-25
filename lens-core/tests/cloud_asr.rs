@@ -2272,9 +2272,17 @@ async fn a_cloud_misconfiguration_outranks_the_local_failure_that_follows_it() {
 // Integration: cancellation during an in-flight cloud request (#135)
 // ===========================================================================
 
-/// Builds a cloud-backed engine pointed at `base_url` with a local engine injected that
-/// would SUCCEED — so any result other than `Cancelled` proves a fallback ran.
-async fn cloud_engine_with_working_local(base_url: &str) -> LensEngine {
+fn fallback_segments() -> Vec<TranscriptSegment> {
+    vec![TranscriptSegment {
+        text: "local fallback ran".into(),
+        start_second: 0.0,
+        end_second: 1.0,
+    }]
+}
+
+/// Builds a cloud-backed engine pointed at `base_url` with `local` injected as the Apple
+/// seam the cloud arm degrades to.
+async fn cloud_engine_with(base_url: &str, local: MockAsrEngine) -> LensEngine {
     let engine = LensEngine::for_test().await;
     let mut config = engine.config().await;
     config.asr.backend = "cloud".to_string();
@@ -2285,41 +2293,63 @@ async fn cloud_engine_with_working_local(base_url: &str) -> LensEngine {
     config.audio_cloud_consent = true;
     engine.set_config(config).await;
 
-    engine
-        .set_asr_engine(Some(Arc::new(MockAsrEngine::new(vec![
-            TranscriptSegment {
-                text: "local fallback ran".into(),
-                start_second: 0.0,
-                end_second: 1.0,
-            },
-        ]))))
-        .await;
+    engine.set_asr_engine(Some(Arc::new(local))).await;
     engine
 }
 
+/// The injected local engine SUCCEEDS, so any result other than `Cancelled` proves a
+/// fallback ran. The returned sink stays empty unless that engine was actually invoked,
+/// which states the "zero local-engine invocation" criterion directly rather than
+/// inferring it from the returned error.
+async fn cloud_engine_with_working_local(
+    base_url: &str,
+) -> (LensEngine, Arc<std::sync::Mutex<Option<TranscribeConfig>>>) {
+    let sink = Arc::new(std::sync::Mutex::new(None));
+    let local = MockAsrEngine::new(fallback_segments()).recording_config(Arc::clone(&sink));
+    (cloud_engine_with(base_url, local).await, sink)
+}
+
+fn assert_local_untouched(sink: &Arc<std::sync::Mutex<Option<TranscribeConfig>>>) {
+    assert!(
+        sink.lock().expect("sink lock").is_none(),
+        "the local fallback engine was invoked for a cancelled clip"
+    );
+}
+
+/// Trips `token` when the request arrives, then answers with `response`. Tripping from
+/// the responder makes "the cancel landed mid-request" deterministic — a timer-based
+/// cancel races the scheduler and flakes on a loaded runner.
+struct CancelOnRequest {
+    token: tokio_util::sync::CancellationToken,
+    response: ResponseTemplate,
+}
+
+impl wiremock::Respond for CancelOnRequest {
+    fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
+        self.token.cancel();
+        self.response.clone()
+    }
+}
+
 /// #135 core AC: a cancel that lands while the request is in flight must abort the
-/// request itself, not wait it out. The endpoint stalls for 10s, so the elapsed-time
-/// assertion is what separates a real in-flight abort from a post-request boundary check.
+/// request itself, not wait it out. The endpoint stalls, so the elapsed-time assertion is
+/// what separates a real in-flight abort from a post-request boundary check.
 #[tokio::test]
 async fn a_cancel_during_an_in_flight_cloud_request_aborts_without_local_fallback() {
     let server = MockServer::start().await;
+    let token = tokio_util::sync::CancellationToken::new();
     Mock::given(method("POST"))
         .and(path("/v1/audio/transcriptions"))
-        .respond_with(
-            ResponseTemplate::new(200)
+        .respond_with(CancelOnRequest {
+            token: token.clone(),
+            response: ResponseTemplate::new(200)
                 .set_body_json(openai_segments_response())
-                .set_delay(std::time::Duration::from_secs(10)),
-        )
+                .set_delay(std::time::Duration::from_secs(30)),
+        })
         .mount(&server)
         .await;
 
-    let engine = cloud_engine_with_working_local(&server.uri()).await;
-    let token = tokio_util::sync::CancellationToken::new();
-    let trip = token.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        trip.cancel();
-    });
+    let (engine, sink) = cloud_engine_with_working_local(&server.uri()).await;
 
     let started = std::time::Instant::now();
     let err = engine
@@ -2329,34 +2359,39 @@ async fn a_cancel_during_an_in_flight_cloud_request_aborts_without_local_fallbac
     let elapsed = started.elapsed();
 
     assert_eq!(err.kind(), "Cancelled", "message: {}", err.message());
+    assert_local_untouched(&sink);
+    // Load-independent proof this was an in-flight abort and not a never-issued request:
+    // wiremock records on receipt, and the responder is the only thing that trips the token.
     assert!(
-        elapsed < std::time::Duration::from_secs(2),
+        !server
+            .received_requests()
+            .await
+            .expect("the mock server records requests")
+            .is_empty(),
+        "the request was never issued, so this proves nothing about in-flight aborts"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
         "the in-flight request was waited out rather than aborted: {elapsed:?}"
     );
 }
 
-/// The window the issue names: a cancel arriving while a NON-cancel cloud failure is in
-/// flight. The responder trips the token and then fails, so the race is deterministic —
-/// ungated, the 500 would degrade to the injected local engine and return segments.
+/// A cancel arriving while a NON-cancel cloud failure is in flight; the responder makes
+/// that race deterministic. Ungated, the 500 would degrade to local and return segments.
 #[tokio::test]
 async fn a_cancel_racing_a_cloud_failure_does_not_start_the_local_fallback() {
-    struct CancelThenFail(tokio_util::sync::CancellationToken);
-    impl wiremock::Respond for CancelThenFail {
-        fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
-            self.0.cancel();
-            ResponseTemplate::new(500)
-        }
-    }
-
     let token = tokio_util::sync::CancellationToken::new();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/audio/transcriptions"))
-        .respond_with(CancelThenFail(token.clone()))
+        .respond_with(CancelOnRequest {
+            token: token.clone(),
+            response: ResponseTemplate::new(500),
+        })
         .mount(&server)
         .await;
 
-    let engine = cloud_engine_with_working_local(&server.uri()).await;
+    let (engine, sink) = cloud_engine_with_working_local(&server.uri()).await;
 
     let err = engine
         .transcribe(&tiny_pcm(), &TranscribeConfig::default(), None, Some(token))
@@ -2364,11 +2399,35 @@ async fn a_cancel_racing_a_cloud_failure_does_not_start_the_local_fallback() {
         .expect_err("a cancel racing a cloud failure must not degrade to local");
 
     assert_eq!(err.kind(), "Cancelled", "message: {}", err.message());
+    assert_local_untouched(&sink);
 }
 
-/// An already-cancelled clip must issue ZERO requests: the token is polled before the
-/// request future, so nothing is sent, billed, or logged upstream. This is what the
-/// `biased` select! ordering buys — without it the poll order is random.
+/// The cloud→local cascade has its own Apple leg, equally uninterruptible: a cancel
+/// landing there must discard the fallback's result rather than return it. The 418 is
+/// deliberately non-retryable, so the cascade reaches Apple without any backoff sleeps.
+#[tokio::test]
+async fn a_cancel_during_the_fallback_apple_run_discards_its_result() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/audio/transcriptions"))
+        .respond_with(ResponseTemplate::new(418))
+        .mount(&server)
+        .await;
+
+    let token = tokio_util::sync::CancellationToken::new();
+    let local = MockAsrEngine::new(fallback_segments()).cancelling(token.clone());
+    let engine = cloud_engine_with(&server.uri(), local).await;
+
+    let err = engine
+        .transcribe(&tiny_pcm(), &TranscribeConfig::default(), None, Some(token))
+        .await
+        .expect_err("a cancel during the fallback Apple run must not return its segments");
+
+    assert_eq!(err.kind(), "Cancelled", "message: {}", err.message());
+}
+
+/// An already-cancelled clip must issue ZERO requests — nothing sent, billed, or logged
+/// upstream.
 #[tokio::test]
 async fn an_already_cancelled_clip_issues_no_cloud_request() {
     let server = MockServer::start().await;
@@ -2378,7 +2437,7 @@ async fn an_already_cancelled_clip_issues_no_cloud_request() {
         .mount(&server)
         .await;
 
-    let engine = cloud_engine_with_working_local(&server.uri()).await;
+    let (engine, sink) = cloud_engine_with_working_local(&server.uri()).await;
     let token = tokio_util::sync::CancellationToken::new();
     token.cancel();
 
@@ -2388,6 +2447,7 @@ async fn an_already_cancelled_clip_issues_no_cloud_request() {
         .expect_err("an already-cancelled clip must not transcribe");
 
     assert_eq!(err.kind(), "Cancelled", "message: {}", err.message());
+    assert_local_untouched(&sink);
     let requests = server
         .received_requests()
         .await
@@ -2399,18 +2459,18 @@ async fn an_already_cancelled_clip_issues_no_cloud_request() {
     );
 }
 
-/// The gate must key on the token being TRIPPED, not merely present: a live token has to
-/// leave the existing cloud→local degradation untouched.
+/// The gate must key on the token being TRIPPED, not merely present. The 418 is
+/// non-retryable, so this control costs no backoff sleeps.
 #[tokio::test]
 async fn a_live_token_leaves_the_cloud_fallback_intact() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/audio/transcriptions"))
-        .respond_with(ResponseTemplate::new(500))
+        .respond_with(ResponseTemplate::new(418))
         .mount(&server)
         .await;
 
-    let engine = cloud_engine_with_working_local(&server.uri()).await;
+    let (engine, _sink) = cloud_engine_with_working_local(&server.uri()).await;
 
     let (segments, label) = engine
         .transcribe(

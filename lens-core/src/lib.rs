@@ -2276,8 +2276,9 @@ impl LensEngine {
     /// (degraded)"` if the re-run fails and the Apple result is kept) so ingest
     /// can surface it to the UI (#45).
     ///
-    /// A tripped `cancel` yields [`LensError::Cancelled`] instead of degrading to the
-    /// next backend; on the cloud path it also aborts the request in flight (#135).
+    /// A tripped `cancel` yields [`LensError::Cancelled`] and discards the run —
+    /// including a transcription that already succeeded — rather than returning it or
+    /// degrading to the next backend (#135).
     pub async fn transcribe(
         &self,
         pcm: &[f32],
@@ -2285,6 +2286,9 @@ impl LensEngine {
         progress_tx: Option<mpsc::UnboundedSender<f32>>,
         cancel: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<(Vec<TranscriptSegment>, &'static str), LensError> {
+        // Ahead of route resolution: that seam may block on an FFI locale probe, and
+        // the Apple leg below is uninterruptible once entered.
+        check_cancelled(cancel.as_ref())?;
         // One config observation for the whole run: the resolution seam, the cloud
         // pre-flight and the local cascade must not see three different snapshots.
         let app_config = self.read().await.config.clone();
@@ -2309,9 +2313,7 @@ impl LensEngine {
                 let apple_result = engine.transcribe_pcm(pcm, config, progress_tx).await;
                 // Checked here rather than per-arm so a cancel also discards a SUCCESSFUL
                 // Apple run — otherwise ingest would persist a source the user abandoned.
-                if let Some(cancelled) = cancelled_now(&cancel) {
-                    return Err(cancelled);
-                }
+                check_cancelled(cancel.as_ref())?;
                 match apple_result {
                     // Apple succeeded but the aggregate confidence is below the
                     // configured floor: re-transcribe the whole clip on Whisper when
@@ -2331,6 +2333,10 @@ impl LensEngine {
                                 .await
                             {
                                 Ok(segs) => Ok((segs, "local_whisper (degraded)")),
+                                // Whisper is cancellable mid-inference, so its cancel must
+                                // propagate; keeping the Apple result here would turn a
+                                // cancelled run into a completed, indexed source.
+                                Err(e) if is_user_cancel(&e) => Err(e),
                                 Err(e) => {
                                     tracing::warn!(error = %e, "degraded whisper re-run failed; keeping low-confidence Apple result");
                                     Ok((segments, "apple_native (degraded)"))
@@ -2382,30 +2388,29 @@ impl LensEngine {
             // that is not a user-cancel transparently degrades to the local cascade
             // (Apple-if-injected → Whisper), mirroring the Apple→Whisper symmetry.
             (asr::AsrBackend::Cloud, injected_local) => {
-                // Race the request itself, so a cancel lands DURING a slow provider call:
-                // dropping the future aborts the reqwest send and any pending retry backoff.
-                // `biased` + cancel-first also keeps an already-cancelled clip from sending.
-                let request = self.cloud_transcribe(pcm, config, &app_config, progress_tx.clone());
-                let cloud_result = match cancel.as_ref() {
-                    Some(token) => tokio::select! {
-                        biased;
-                        _ = token.cancelled() => {
-                            return Err(LensError::Cancelled("cloud transcription cancelled".into()));
-                        }
-                        result = request => result,
-                    },
-                    None => request.await,
+                // Raced rather than checked afterwards: dropping the future aborts the
+                // in-flight send and any pending retry backoff. `biased` makes the token
+                // win a tie instead of leaving it to the poll order.
+                // A default token is never cancelled, so the no-token case takes the same
+                // path rather than duplicating the awaited expression.
+                let token = cancel.clone().unwrap_or_default();
+                let cloud_result = tokio::select! {
+                    biased;
+                    _ = token.cancelled() => return Err(cancelled()),
+                    result = self.cloud_transcribe(pcm, config, &app_config, progress_tx.clone()) => result,
                 };
                 match cloud_result {
                     Ok(segments) => Ok((segments, "cloud")),
                     Err((cloud_err, cause)) => {
+                        // Token before error text: `is_user_cancel` substring-matches, so a
+                        // provider message containing "cancel" must not outrank a genuinely
+                        // tripped token. Also covers the window the select! cannot see.
+                        if check_cancelled(cancel.as_ref()).is_err() {
+                            tracing::debug!(error = %cloud_err, ?cause, "cloud ASR failed but the run was cancelled; not falling back");
+                            return Err(cancelled());
+                        }
                         if is_user_cancel(&cloud_err) {
                             return Err(cloud_err);
-                        }
-                        // The window the select! cannot see: a cancel that arrives while a
-                        // NON-cancel failure is already resolving (#135).
-                        if let Some(cancelled) = cancelled_now(&cancel) {
-                            return Err(cancelled);
                         }
                         tracing::warn!(error = %cloud_err, ?cause, "cloud ASR failed, falling back to local");
                         self.cloud_fallback_to_local(
@@ -2483,9 +2488,7 @@ impl LensEngine {
     ) -> Result<(Vec<TranscriptSegment>, &'static str), LensError> {
         if let Some(engine) = injected {
             let apple_result = engine.transcribe_pcm(pcm, config, progress_tx).await;
-            if let Some(cancelled) = cancelled_now(&cancel) {
-                return Err(cancelled);
-            }
+            check_cancelled(cancel.as_ref())?;
             match apple_result {
                 Ok(TranscriptOutput { segments: segs, .. }) => Ok((segs, cause.apple_label())),
                 Err(apple_err) => {
@@ -2548,6 +2551,9 @@ impl LensEngine {
         asr_cfg: &config::AsrConfig,
         cancel: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<Vec<TranscriptSegment>, LensError> {
+        // Loading a ggml model is hundreds of MB and uninterruptible, so an
+        // already-cancelled clip must not reach `whisper_engine_for` at all.
+        check_cancelled(cancel.as_ref())?;
         let engine = self.whisper_engine_for(asr_cfg).await?;
         engine
             .transcribe_pcm_cancellable(pcm, config, progress_tx, cancel)
@@ -3787,14 +3793,19 @@ impl CloudDegradeCause {
     }
 }
 
-/// The cancel token is only observable *between* legs of the cascade — neither the
-/// Apple FFI nor a whisper.cpp model load can be interrupted once entered — so each
-/// leg re-checks it before starting the next (#135).
-fn cancelled_now(cancel: &Option<tokio_util::sync::CancellationToken>) -> Option<LensError> {
-    cancel
-        .as_ref()
-        .filter(|token| token.is_cancelled())
-        .map(|_| LensError::Cancelled("transcription cancelled".into()))
+/// One cancel error for the whole cascade: the message crosses IPC, so it must not
+/// vary by which backend happened to be running when the token tripped.
+fn cancelled() -> LensError {
+    LensError::Cancelled("transcription cancelled".into())
+}
+
+/// The token is only observable *between* legs of the cascade: neither the Apple FFI
+/// nor a whisper.cpp model load can be interrupted once entered (#135).
+fn check_cancelled(cancel: Option<&tokio_util::sync::CancellationToken>) -> Result<(), LensError> {
+    match cancel {
+        Some(token) if token.is_cancelled() => Err(cancelled()),
+        _ => Ok(()),
+    }
 }
 
 /// Whether an Apple transcription error represents a genuine user-cancel (which
