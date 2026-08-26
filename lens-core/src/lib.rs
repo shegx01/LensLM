@@ -2473,7 +2473,8 @@ impl LensEngine {
 
     /// Cloud→local degradation cascade: Apple-if-injected, else Whisper. When no local
     /// path produces segments either, [`CloudDegradeCause::preferred_error`] picks
-    /// which of the two failures the user is shown.
+    /// which of the two failures the user is shown — unless the run was cancelled, which
+    /// preempts it and discards both errors.
     #[allow(clippy::too_many_arguments)]
     async fn cloud_fallback_to_local(
         &self,
@@ -3793,8 +3794,9 @@ impl CloudDegradeCause {
     }
 }
 
-/// One cancel error for the whole cascade: the message crosses IPC, so it must not
-/// vary by which backend happened to be running when the token tripped.
+/// One error for every gate below, so the message does not vary by which gate tripped.
+/// Engines still raise their own (e.g. `asr/whisper.rs`), per the per-module
+/// `CANCELLED_MSG` convention; consumers branch on `kind`, never on the text.
 fn cancelled() -> LensError {
     LensError::Cancelled("transcription cancelled".into())
 }
