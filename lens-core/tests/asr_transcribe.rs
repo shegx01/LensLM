@@ -28,10 +28,9 @@ fn canned() -> Vec<TranscriptSegment> {
     ]
 }
 
-/// Points `cache_dir` at a tempdir holding a 0-byte ggml, so `local_whisper_available`
-/// reports the fallback is possible while the load itself still fails. The fixture MUST
-/// stay 0 bytes: a file whose first four bytes match the ggml magic makes whisper.cpp
-/// SIGSEGV on garbage header fields. The returned dir must outlive the call.
+/// Makes `local_whisper_available` say yes while the load itself still fails. The fixture
+/// MUST stay 0 bytes — four bytes matching the ggml magic make whisper.cpp SIGSEGV on
+/// garbage header fields. The returned dir must outlive the call.
 #[cfg(feature = "local-whisper")]
 async fn seed_available_whisper(engine: &LensEngine) -> tempfile::TempDir {
     let cache = tempfile::tempdir().expect("tempdir");

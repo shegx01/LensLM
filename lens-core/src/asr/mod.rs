@@ -187,9 +187,8 @@ impl MockAsrEngine {
         self
     }
 
-    /// Trips `token` from inside `transcribe_pcm`, reproducing a cancel that lands
-    /// mid-run — the window a caller cannot otherwise reach, since this seam takes no
-    /// token and real Apple FFI is uninterruptible.
+    /// Trips `token` from inside `transcribe_pcm`: the mid-run cancel window a caller
+    /// cannot otherwise reach, since this seam takes no token.
     pub fn cancelling(mut self, token: tokio_util::sync::CancellationToken) -> Self {
         self.cancel_on_call = Some(token);
         self

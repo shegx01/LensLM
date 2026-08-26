@@ -2298,9 +2298,8 @@ async fn cloud_engine_with(base_url: &str, local: MockAsrEngine) -> LensEngine {
 }
 
 /// The injected local engine SUCCEEDS, so any result other than `Cancelled` proves a
-/// fallback ran. The returned sink stays empty unless that engine was actually invoked,
-/// which states the "zero local-engine invocation" criterion directly rather than
-/// inferring it from the returned error.
+/// fallback ran. The sink stays empty unless it was invoked, stating the "zero
+/// local-engine invocation" criterion directly rather than inferring it from the error.
 async fn cloud_engine_with_working_local(
     base_url: &str,
 ) -> (LensEngine, Arc<std::sync::Mutex<Option<TranscribeConfig>>>) {
@@ -2402,9 +2401,8 @@ async fn a_cancel_racing_a_cloud_failure_does_not_start_the_local_fallback() {
     assert_local_untouched(&sink);
 }
 
-/// The cloud→local cascade has its own Apple leg, equally uninterruptible: a cancel
-/// landing there must discard the fallback's result rather than return it. The 418 is
-/// deliberately non-retryable, so the cascade reaches Apple without any backoff sleeps.
+/// A cancel landing in the cascade's own Apple leg must discard the fallback's result
+/// rather than return it. The 418 is non-retryable, so this reaches Apple without sleeps.
 #[tokio::test]
 async fn a_cancel_during_the_fallback_apple_run_discards_its_result() {
     let server = MockServer::start().await;
