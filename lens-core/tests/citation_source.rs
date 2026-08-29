@@ -23,6 +23,7 @@ use tempfile::TempDir;
 async fn base_engine() -> (TempDir, LensEngine) {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = LensEngine::init(dir.path()).await.expect("engine init");
+    support::seed_tokenizer(dir.path()).await;
     let e: Arc<dyn Embedder> = Arc::new(CountingEmbedder::new(
         Arc::new(AtomicUsize::new(0)),
         Arc::new(AtomicUsize::new(0)),

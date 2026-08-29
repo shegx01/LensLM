@@ -33,6 +33,7 @@ mod support;
 async fn file_engine() -> (TempDir, LensEngine) {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = LensEngine::init(dir.path()).await.expect("engine init");
+    support::seed_tokenizer(dir.path()).await;
     {
         let mut cfg = engine.config().await;
         cfg.enrichment.enabled = true;
