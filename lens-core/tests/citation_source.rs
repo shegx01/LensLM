@@ -163,7 +163,7 @@ async fn ac2_real_ingest_end_to_end_pipeline() {
         eprintln!("skipping ac2_real_ingest_end_to_end_pipeline: no tokenizer (offline)");
         return;
     }
-    support::seed_tokenizer_from_env(&data_dir);
+    support::seed_tokenizer(&data_dir).await;
 
     let nb = engine.create_notebook("nb", None, None).await.unwrap().id;
     let body = "# Heading\n\nThe first sentence introduces the topic. \
@@ -251,7 +251,7 @@ async fn retention_survives_reingest_byte_identical() {
     assert_eq!(before, body);
 
     if support::tokenizer_available().await {
-        support::seed_tokenizer_from_env(&data_dir);
+        support::seed_tokenizer(&data_dir).await;
         engine
             .ingest_source(&src.id, |_p| {})
             .await
@@ -460,7 +460,7 @@ async fn concurrent_read_during_real_ingest_rewrite_never_partial() {
         );
         return;
     }
-    support::seed_tokenizer_from_env(&data_dir);
+    support::seed_tokenizer(&data_dir).await;
 
     let nb = engine.create_notebook("nb", None, None).await.unwrap().id;
 

@@ -43,3 +43,6 @@ src-tauri/frameworks/libpdfium.dylib
 .claude/
 # Throwaway scratch crate agents create to probe a lint in isolation; never tracked.
 /ofc/
+
+# Test-suite tokenizer cache (populated by lens-core/tests/support).
+lens-core/models/

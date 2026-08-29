@@ -782,7 +782,7 @@ async fn reingest_changed_content_purges_stale_nodes() {
         return;
     }
     let (dir, engine) = support::inject_counting_engine().await;
-    support::seed_tokenizer_from_env(dir.path());
+    support::seed_tokenizer(dir.path()).await;
     {
         let mut cfg = engine.config().await;
         cfg.enrichment.enabled = false;
@@ -927,7 +927,7 @@ async fn reingest_drops_entity_vectors() {
         return;
     }
     let (dir, engine) = support::inject_counting_engine().await;
-    support::seed_tokenizer_from_env(dir.path());
+    support::seed_tokenizer(dir.path()).await;
     {
         let mut cfg = engine.config().await;
         cfg.enrichment.enabled = false;
