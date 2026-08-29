@@ -27,7 +27,7 @@ use lens_core::vector_store::{
 };
 
 mod support;
-use support::{inject_fake_embedder, tokenizer_available};
+use support::{inject_fake_embedder, seed_tokenizer, tokenizer_available};
 
 /// Serializes the crash tests WITHIN this binary. They share the process-global
 /// `CRASH_*` flags, so running them in parallel (the default for `#[tokio::test]`)
@@ -200,6 +200,7 @@ async fn test_crash_mid_stream_no_active_rows() {
     let _guard = CRASH_SERIAL.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let engine = LensEngine::init(dir.path()).await.unwrap();
+    seed_tokenizer(dir.path()).await;
     inject_fake_embedder(&engine);
     let nb = engine
         .create_notebook("crash-mid", None, None)
@@ -259,6 +260,7 @@ async fn test_crash_mid_stream_gc_on_restart() {
     let _guard = CRASH_SERIAL.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let engine = LensEngine::init(dir.path()).await.unwrap();
+    seed_tokenizer(dir.path()).await;
     inject_fake_embedder(&engine);
     let nb = engine
         .create_notebook("crash-gc", None, None)
@@ -312,6 +314,7 @@ async fn test_crash_after_flip_before_stale_drop() {
     let _guard = CRASH_SERIAL.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let engine = LensEngine::init(dir.path()).await.unwrap();
+    seed_tokenizer(dir.path()).await;
     inject_fake_embedder(&engine);
     let nb = engine
         .create_notebook("crash-flip", None, None)

@@ -47,7 +47,7 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 mod support;
-use support::{file_engine, inject_fake_embedder, seed_tokenizer_from_env, vector_row_count};
+use support::{file_engine, inject_fake_embedder, seed_tokenizer, vector_row_count};
 
 // ===========================================================================
 // Shared helpers
@@ -427,7 +427,7 @@ async fn url_indexes_real_article() {
     inject_fake_embedder(&engine);
 
     // Seed the tokenizer so the ingest pipeline doesn't attempt a network download.
-    seed_tokenizer_from_env(&engine.data_dir_for_test().await);
+    seed_tokenizer(&engine.data_dir_for_test().await).await;
 
     let nb = engine
         .create_notebook("NB", None, None)
@@ -510,7 +510,7 @@ async fn url_indexes_content_rich_page_despite_low_ratio() {
 
     let (_dir, engine) = file_engine().await;
     inject_fake_embedder(&engine);
-    seed_tokenizer_from_env(&engine.data_dir_for_test().await);
+    seed_tokenizer(&engine.data_dir_for_test().await).await;
 
     let nb = engine
         .create_notebook("NB", None, None)
@@ -573,7 +573,7 @@ async fn url_force_js_render_diverts_content_rich_page_to_render() {
 
     let (_dir, engine) = file_engine().await;
     inject_fake_embedder(&engine);
-    seed_tokenizer_from_env(&engine.data_dir_for_test().await);
+    seed_tokenizer(&engine.data_dir_for_test().await).await;
 
     let nb = engine
         .create_notebook("NB", None, None)
@@ -1050,7 +1050,7 @@ async fn reingest_into_needs_js_wipes_stale_chunks_and_vectors() {
     let data_dir = engine.data_dir_for_test().await;
 
     // Seed the tokenizer from NOMIC_TOKENIZER_PATH if present (offline path).
-    seed_tokenizer_from_env(&data_dir);
+    seed_tokenizer(&data_dir).await;
 
     let nb = engine
         .create_notebook("NB", None, None)
@@ -1171,7 +1171,7 @@ async fn js_render_fallback_indexes_when_renderer_populates() {
     let (_dir, engine) = file_engine().await;
     inject_fake_embedder(&engine);
     let data_dir = engine.data_dir_for_test().await;
-    seed_tokenizer_from_env(&data_dir);
+    seed_tokenizer(&data_dir).await;
 
     // The renderer "renders" the SPA into a real article with >200 chars of prose.
     inject_fake_renderer(&engine, Some(real_article_html()));
