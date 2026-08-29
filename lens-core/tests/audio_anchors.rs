@@ -234,6 +234,7 @@ async fn enrichment_preserves_source_anchor() {
     let engine = lens_core::LensEngine::init(dir.path())
         .await
         .expect("engine re-init");
+    support::seed_tokenizer(dir.path()).await;
     support::inject_fake_embedder(&engine);
     use_mock_asr(&engine, many_segments()).await;
 

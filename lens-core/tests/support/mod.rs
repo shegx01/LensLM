@@ -12,7 +12,7 @@
 //! regardless of which binary compiles it.
 #![allow(dead_code)]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
@@ -20,6 +20,7 @@ use lens_core::LensEngine;
 use lens_core::embedder::{CountingEmbedder, Embedder};
 use tempfile::TempDir;
 use tokenizers::Tokenizer;
+use tokio::sync::OnceCell;
 
 // ---------------------------------------------------------------------------
 // Engine construction
@@ -27,10 +28,13 @@ use tokenizers::Tokenizer;
 
 /// Builds a file-backed engine over a fresh temp dir. Ingest tests need a
 /// file-backed engine (text sources are written under `{data_dir}/sources/`),
-/// not the in-memory `for_test()`.
+/// not the in-memory `for_test()`. The tokenizer cache is seeded here so an ingest
+/// on this engine never reaches for the network — every caller gets that for free
+/// rather than each test remembering to ask.
 pub async fn file_engine() -> (TempDir, LensEngine) {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = LensEngine::init(dir.path()).await.expect("engine init");
+    seed_tokenizer(dir.path()).await;
     (dir, engine)
 }
 
@@ -58,69 +62,82 @@ pub async fn inject_counting_engine() -> (TempDir, LensEngine) {
 // Tokenizer seeding / availability
 // ---------------------------------------------------------------------------
 
-/// Attempts to load the nomic tokenizer the ingest pipeline would use: from the
-/// `NOMIC_TOKENIZER_PATH` env var (fast offline path) or by performing the
-/// pipeline's own download into `data_dir`. Returns `None` if neither works
-/// (offline + no cached tokenizer) so tokenizer-dependent tests skip cleanly.
-pub async fn tokenizer_for(data_dir: &Path) -> Option<Tokenizer> {
-    if let Ok(path) = std::env::var("NOMIC_TOKENIZER_PATH")
-        && let Ok(t) = Tokenizer::from_file(&path)
-    {
-        // Seed the engine's expected location too, so a subsequent ingest in
-        // the same data dir does not re-download.
-        let dest = data_dir
-            .join("models")
-            .join("fastembed")
-            .join("tokenizer.json");
-        if let Some(parent) = dest.parent() {
-            let _ = std::fs::create_dir_all(parent);
-            let _ = std::fs::copy(&path, &dest);
-        }
-        return Some(t);
-    }
-    download_tokenizer_into(data_dir).await
+/// Deliberately the path an engine built from `AppConfig::default()` resolves:
+/// its `data_dir` is empty, so the cache root is CWD-relative and such an engine
+/// reads this exact file.
+fn shared_cache_path() -> PathBuf {
+    PathBuf::from("models")
+        .join("fastembed")
+        .join("tokenizer.json")
 }
 
-/// Best-effort: download the nomic `tokenizer.json` into the engine's fastembed
-/// cache so the ingest pipeline finds it without a second fetch. Returns the
-/// loaded tokenizer, or `None` on any network failure.
-pub async fn download_tokenizer_into(data_dir: &Path) -> Option<Tokenizer> {
-    let url = "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5/resolve/main/tokenizer.json";
+static SHARED_TOKENIZER: OnceCell<Option<PathBuf>> = OnceCell::const_new();
+
+/// Resolves the nomic tokenizer ONCE per test binary: `NOMIC_TOKENIZER_PATH`, else
+/// the on-disk cache, else a single download. Serializing the acquisition is the
+/// point — every tokenizer-dependent test used to fetch its own copy in parallel
+/// and the provider cut the concurrent streams.
+pub async fn shared_tokenizer() -> Option<PathBuf> {
+    SHARED_TOKENIZER
+        .get_or_init(|| async {
+            if let Ok(path) = std::env::var("NOMIC_TOKENIZER_PATH") {
+                let path = PathBuf::from(path);
+                if path.is_file() {
+                    return Some(path);
+                }
+            }
+            let cached = shared_cache_path();
+            if cached.is_file() {
+                return Some(cached);
+            }
+            download_shared_tokenizer(&cached).await
+        })
+        .await
+        .clone()
+}
+
+/// Published by rename so a killed run cannot leave a truncated tokenizer that
+/// every later run would happily load.
+async fn download_shared_tokenizer(dest: &Path) -> Option<PathBuf> {
+    const URL: &str =
+        "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5/resolve/main/tokenizer.json";
+    std::fs::create_dir_all(dest.parent()?).ok()?;
+    let bytes = reqwest::get(URL).await.ok()?.bytes().await.ok()?;
+    let tmp = dest.with_extension("part");
+    std::fs::write(&tmp, &bytes).ok()?;
+    std::fs::rename(&tmp, dest).ok()?;
+    Some(dest.to_path_buf())
+}
+
+/// Copies the shared tokenizer into `data_dir`'s fastembed cache so an ingest there
+/// issues no download. No-op when none could be acquired (offline, no cache), which
+/// leaves [`tokenizer_available`] to skip the test.
+pub async fn seed_tokenizer(data_dir: &Path) {
+    let Some(src) = shared_tokenizer().await else {
+        return;
+    };
     let dest = data_dir
         .join("models")
         .join("fastembed")
         .join("tokenizer.json");
-    if dest.is_file() {
-        return Tokenizer::from_file(&dest).ok();
+    if let Some(parent) = dest.parent() {
+        let _ = std::fs::create_dir_all(parent);
     }
-    std::fs::create_dir_all(dest.parent()?).ok()?;
-    let bytes = reqwest::get(url).await.ok()?.bytes().await.ok()?;
-    std::fs::write(&dest, &bytes).ok()?;
-    Tokenizer::from_file(&dest).ok()
+    let _ = std::fs::copy(&src, &dest);
 }
 
-/// True if a tokenizer is reachable (env path or network). Used to skip
-/// tokenizer-dependent tests cleanly when offline with no cached tokenizer.
+/// Loads the tokenizer the ingest pipeline would use, seeding `data_dir` on the way
+/// so a later ingest there stays offline. `None` when offline with no cache.
+pub async fn tokenizer_for(data_dir: &Path) -> Option<Tokenizer> {
+    let src = shared_tokenizer().await?;
+    seed_tokenizer(data_dir).await;
+    Tokenizer::from_file(&src).ok()
+}
+
+/// True if a tokenizer is available. Used to skip tokenizer-dependent tests cleanly
+/// when offline with no cache.
 pub async fn tokenizer_available() -> bool {
-    let dir = tempfile::tempdir().expect("tempdir");
-    tokenizer_for(dir.path()).await.is_some()
-}
-
-/// Seeds the engine's fastembed tokenizer cache from `NOMIC_TOKENIZER_PATH` (if
-/// set) so an ingest in `data_dir` does not attempt a network download. A no-op
-/// when the env var is unset or the copy fails (the test then relies on the
-/// pipeline's own best-effort download / skips offline).
-pub fn seed_tokenizer_from_env(data_dir: &Path) {
-    if let Ok(path_str) = std::env::var("NOMIC_TOKENIZER_PATH") {
-        let dest = data_dir
-            .join("models")
-            .join("fastembed")
-            .join("tokenizer.json");
-        if let Some(parent) = dest.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::copy(&path_str, &dest);
-    }
+    shared_tokenizer().await.is_some()
 }
 
 // ---------------------------------------------------------------------------
