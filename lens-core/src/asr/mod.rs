@@ -136,6 +136,7 @@ pub struct MockAsrEngine {
     seen_config: Option<std::sync::Arc<std::sync::Mutex<Option<TranscribeConfig>>>>,
     failure: Option<String>,
     locale_probes: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    cancel_on_call: Option<tokio_util::sync::CancellationToken>,
 }
 
 #[cfg(any(test, feature = "test-util"))]
@@ -148,6 +149,7 @@ impl MockAsrEngine {
             seen_config: None,
             failure: None,
             locale_probes: None,
+            cancel_on_call: None,
         }
     }
 
@@ -185,6 +187,13 @@ impl MockAsrEngine {
         self
     }
 
+    /// Trips `token` from inside `transcribe_pcm`: the mid-run cancel window a caller
+    /// cannot otherwise reach, since this seam takes no token.
+    pub fn cancelling(mut self, token: tokio_util::sync::CancellationToken) -> Self {
+        self.cancel_on_call = Some(token);
+        self
+    }
+
     /// Sets what [`supports_locale`](AsrEngine::supports_locale) returns.
     pub fn with_locale_support(mut self, supported: bool) -> Self {
         self.supports_locale = supported;
@@ -205,6 +214,9 @@ impl AsrEngine for MockAsrEngine {
             && let Ok(mut slot) = sink.lock()
         {
             *slot = Some(config.clone());
+        }
+        if let Some(token) = &self.cancel_on_call {
+            token.cancel();
         }
         if let Some(message) = &self.failure {
             return Err(LensError::Transcription(message.clone()));

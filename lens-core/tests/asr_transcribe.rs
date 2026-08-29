@@ -28,6 +28,26 @@ fn canned() -> Vec<TranscriptSegment> {
     ]
 }
 
+/// Makes `local_whisper_available` say yes while the load itself still fails. The fixture
+/// MUST stay 0 bytes — four bytes matching the ggml magic make whisper.cpp SIGSEGV on
+/// garbage header fields. The returned dir must outlive the call.
+#[cfg(feature = "local-whisper")]
+async fn seed_available_whisper(engine: &LensEngine) -> tempfile::TempDir {
+    let cache = tempfile::tempdir().expect("tempdir");
+    let mut config = engine.config().await;
+    config.paths.cache_dir = Some(cache.path().to_string_lossy().into_owned());
+    let spec = resolve_whisper(&config.asr.whisper_model)
+        .or_else(|| resolve_whisper(DEFAULT_WHISPER_MODEL_ID))
+        .expect("configured or default whisper spec resolves");
+    engine.set_config(config).await;
+
+    let model_path = whisper_model_path(cache.path(), spec.id);
+    std::fs::create_dir_all(model_path.parent().expect("model path has a parent"))
+        .expect("create whisper model dir");
+    std::fs::write(&model_path, b"").expect("write 0-byte ggml fixture");
+    cache
+}
+
 /// The injected engine is the Apple-native seam (Apple in prod, a mock in tests).
 /// Forcing `apple_native` routes to it, so its canned segments come back.
 #[tokio::test]
@@ -102,26 +122,15 @@ async fn transcribe_apple_forced_without_engine_or_whisper_errors() {
 
 /// With a Whisper model present, that same forced `apple_native` routes into
 /// the LocalWhisper fallback — the loader error proves it, since a preserved-original
-/// run would still say "no engine is injected". The fixture MUST stay 0 bytes: a file
-/// whose first four bytes match the ggml magic makes whisper.cpp SIGSEGV on garbage
-/// header fields.
+/// run would still say "no engine is injected".
 #[cfg(feature = "local-whisper")]
 #[tokio::test]
 async fn transcribe_apple_forced_without_engine_falls_back_to_whisper() {
-    let cache = tempfile::tempdir().expect("tempdir");
     let engine = LensEngine::for_test().await;
+    let _cache = seed_available_whisper(&engine).await;
     let mut config = engine.config().await;
     config.asr.backend = "apple_native".to_string();
-    config.paths.cache_dir = Some(cache.path().to_string_lossy().into_owned());
-    let spec = resolve_whisper(&config.asr.whisper_model)
-        .or_else(|| resolve_whisper(DEFAULT_WHISPER_MODEL_ID))
-        .expect("configured or default whisper spec resolves");
     engine.set_config(config).await;
-
-    let model_path = whisper_model_path(cache.path(), spec.id);
-    std::fs::create_dir_all(model_path.parent().expect("model path has a parent"))
-        .expect("create whisper model dir");
-    std::fs::write(&model_path, b"").expect("write 0-byte ggml fixture");
 
     let err = engine
         .transcribe(&[0.0_f32; 16], &TranscribeConfig::default(), None, None)
@@ -307,6 +316,108 @@ fn saving_a_config_without_audio_consent_demotes_a_cloud_backend() {
             .asr
             .backend,
         ""
+    );
+}
+
+/// #135: an Apple runtime failure normally degrades to Whisper; a cancel during the run
+/// must stop the cascade instead. Whisper is made available so the ungated path would
+/// really enter it.
+#[cfg(feature = "local-whisper")]
+#[tokio::test]
+async fn a_cancel_during_the_apple_run_skips_the_whisper_fallback() {
+    let engine = LensEngine::for_test().await;
+    let _cache = seed_available_whisper(&engine).await;
+    let mut config = engine.config().await;
+    config.asr.backend = "apple_native".to_string();
+    engine.set_config(config).await;
+
+    let token = tokio_util::sync::CancellationToken::new();
+    engine
+        .set_asr_engine(Some(Arc::new(
+            MockAsrEngine::failing("on-device speech model for locale en-US is not installed")
+                .cancelling(token.clone()),
+        )))
+        .await;
+
+    let err = engine
+        .transcribe(
+            &[0.0_f32; 16],
+            &TranscribeConfig::default(),
+            None,
+            Some(token),
+        )
+        .await
+        .expect_err("a cancelled clip must not start the Whisper fallback");
+
+    assert_eq!(err.kind(), "Cancelled", "message: {}", err.message());
+}
+
+/// #135: the same gap on the low-confidence re-run. Apple SUCCEEDS here, so without the
+/// gate the cancel is invisible and a full Whisper re-transcription of the clip starts.
+#[cfg(feature = "local-whisper")]
+#[tokio::test]
+async fn a_cancel_during_the_apple_run_skips_the_degraded_re_run() {
+    let engine = LensEngine::for_test().await;
+    let _cache = seed_available_whisper(&engine).await;
+    let mut config = engine.config().await;
+    config.asr.backend = "apple_native".to_string();
+    // Pinned so a future default change cannot invalidate the 0.1 fixture below.
+    config.asr.apple_min_confidence = 0.5;
+    engine.set_config(config).await;
+
+    let token = tokio_util::sync::CancellationToken::new();
+    engine
+        .set_asr_engine(Some(Arc::new(
+            MockAsrEngine::new(canned())
+                .with_confidence(0.1)
+                .cancelling(token.clone()),
+        )))
+        .await;
+
+    let err = engine
+        .transcribe(
+            &[0.0_f32; 16],
+            &TranscribeConfig::default(),
+            None,
+            Some(token),
+        )
+        .await
+        .expect_err("a cancelled clip must not start the degraded re-run");
+
+    assert_eq!(err.kind(), "Cancelled", "message: {}", err.message());
+}
+
+/// The gate must key on the token being TRIPPED, not merely present.
+#[cfg(feature = "local-whisper")]
+#[tokio::test]
+async fn a_live_token_leaves_the_apple_fallback_intact() {
+    let engine = LensEngine::for_test().await;
+    let _cache = seed_available_whisper(&engine).await;
+    let mut config = engine.config().await;
+    config.asr.backend = "apple_native".to_string();
+    engine.set_config(config).await;
+
+    engine
+        .set_asr_engine(Some(Arc::new(MockAsrEngine::failing(
+            "on-device speech model for locale en-US is not installed",
+        ))))
+        .await;
+
+    let err = engine
+        .transcribe(
+            &[0.0_f32; 16],
+            &TranscribeConfig::default(),
+            None,
+            Some(tokio_util::sync::CancellationToken::new()),
+        )
+        .await
+        .expect_err("the 0-byte ggml cannot load");
+
+    assert_eq!(err.kind(), "Transcription");
+    let msg = err.message();
+    assert!(
+        msg.contains("whisper"),
+        "the Whisper fallback must still run for an uncancelled token: {msg}"
     );
 }
 
