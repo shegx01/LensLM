@@ -1051,7 +1051,7 @@ dependencies = [
  "encoding_rs",
  "fast-float2",
  "log",
- "quick-xml",
+ "quick-xml 0.41.0",
  "serde",
  "zip 8.6.0",
 ]
@@ -2727,7 +2727,7 @@ checksum = "7fdf00e8af6d0b3e92d4bbf9b76f773d8b84ea80f310324ad16cbdc2e653e02c"
 dependencies = [
  "base64 0.22.1",
  "crc32fast",
- "quick-xml",
+ "quick-xml 0.41.0",
  "serde",
  "serde_json",
  "smallvec",
@@ -5570,7 +5570,7 @@ dependencies = [
  "petgraph",
  "printpdf",
  "pulldown-cmark",
- "quick-xml",
+ "quick-xml 0.42.0",
  "rbook",
  "reqwest 0.13.4",
  "rig-core",
@@ -7238,7 +7238,7 @@ checksum = "7da1d65da6dd5d1e44199ac0f58712d241c0f439f80adea8924d832384087f85"
 dependencies = [
  "base64 0.22.1",
  "indexmap 2.14.0",
- "quick-xml",
+ "quick-xml 0.41.0",
  "serde",
  "time",
 ]
@@ -7630,6 +7630,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "quick-xml"
+version = "0.42.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41b1177fdf999d2321d3fb46ff47159d9c1fb9ad66a4879f8c50a0b504615e9b"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "quick_html2md"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7937,7 +7946,7 @@ checksum = "663ec1a8b0a945c8bb9c9912b1f8b328ba698a05165a81072e16604be019f45d"
 dependencies = [
  "indexmap 2.14.0",
  "percent-encoding",
- "quick-xml",
+ "quick-xml 0.41.0",
  "thiserror 2.0.18",
  "zip 8.6.0",
 ]
@@ -11405,7 +11414,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "338e30461b3a2b67d70eb30a6d89f8e0c93a833e07d2ae89085cd070c4a00ac0"
 dependencies = [
  "proc-macro2",
- "quick-xml",
+ "quick-xml 0.41.0",
  "quote",
 ]
 

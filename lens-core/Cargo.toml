@@ -173,7 +173,7 @@ zip = { version = "=0.6.6", default-features = false, features = ["deflate"] }
 # XHTML/XML streaming parser for ODT `content.xml` and EPUB XHTML spine entries.
 # A NEW direct dep (existing transitive versions resolve independently). MIT —
 # deny.toml allowlist. Pinned exactly per repo convention.
-quick-xml = { version = "=0.41.0", default-features = false }
+quick-xml = { version = "=0.42.0", default-features = false }
 # EPUB2/3 reader for the EPUB extractor. `default-features = false` drops the
 # optional `write`/`prelude` features not needed for read-only extraction;
 # `threadsafe` is REQUIRED so the parsed Epub is Send + Sync (the extractor lives
