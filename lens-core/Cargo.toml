@@ -105,7 +105,7 @@ fs4 = { workspace = true }
 # (transitive via fastembed/lancedb), so this pulls NO new external crate — it
 # just makes the already-compiled crate a direct dependency. Pinned to that
 # resolved version so no second copy is added. MIT OR Apache-2.0 (deny.toml).
-flate2 = "=1.1.9"
+flate2 = "=1.1.10"
 
 # --- M12 issue #41: audio decode + resample to 16kHz mono PCM ---
 # Pure-Rust, in-RAM media decode (no C toolchain, no sidecar, no temp files).
