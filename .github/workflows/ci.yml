@@ -87,7 +87,7 @@ jobs:
         run: scripts/fetch-pdfium.sh --verify
       # SHA-pinned: this action downloads + executes a prebuilt nextest binary.
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@c93ccc03e00cd0e08e494f5fd058a6c55a6a1907 # v2.82.8
+        uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
         with:
           tool: nextest
       - name: Clippy
